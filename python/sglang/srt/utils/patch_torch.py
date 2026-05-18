@@ -16,10 +16,11 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_musa, is_npu, torch_release
+from sglang.srt.utils.common import is_musa, is_npu, is_tpu, torch_release
 
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
 
 if _is_npu:
     from torch_npu.multiprocessing import reductions as npu_reductions
@@ -101,6 +102,29 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
 
 def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
+
+
+def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
+    """Set torchrun-style env vars for torch_tpu's PJRT slicebuilder.
+
+    torch_tpu's PJRT slicebuilder reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/
+    MASTER_PORT to coordinate multi-process init. sglang's mp.Process spawn path
+    doesn't otherwise set them. Must run before any model/distributed code
+    imports torch_tpu so PJRT lazy-init in each worker sees the correct rank
+    info. No-op for non-TPU runs.
+    """
+    if not _is_tpu and server_args.device != "tpu":
+        return
+
+    import os
+
+    world_size = server_args.tp_size * server_args.nnodes
+    os.environ["RANK"] = str(tp_rank + server_args.node_rank * server_args.tp_size)
+    os.environ["LOCAL_RANK"] = str(tp_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_WORLD_SIZE"] = str(server_args.tp_size)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
 
 
 def monkey_patch_torch_compile():

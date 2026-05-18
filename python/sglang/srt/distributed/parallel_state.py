@@ -55,6 +55,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_shm_available,
+    is_tpu,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -62,6 +63,7 @@ from sglang.srt.utils.network import get_local_ip_auto
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 
@@ -582,7 +584,7 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
-        if input_.device.type == "tpu":
+        if _is_tpu:
             # sglang's registered custom op (inplace_all_reduce) is CUDA-only.
             # Route to _all_reduce_in_place which falls through to
             # torch.distributed.all_reduce with the tpu_dist backend (native
@@ -761,7 +763,7 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or input.device.type == "tpu":
+        if _is_npu or _is_tpu:
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
@@ -824,7 +826,7 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu or input.device.type == "tpu":
+        if _is_npu or _is_xpu or _is_tpu:
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)

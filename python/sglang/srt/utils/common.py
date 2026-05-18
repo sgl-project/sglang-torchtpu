@@ -149,6 +149,11 @@ def is_xpu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_tpu() -> bool:
+    return hasattr(torch, "tpu") and torch.tpu.is_available()
+
+
+@lru_cache(maxsize=1)
 def is_npu() -> bool:
     if not hasattr(torch, "npu"):
         return False
