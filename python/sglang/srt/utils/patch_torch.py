@@ -16,11 +16,10 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_musa, is_npu, is_tpu, torch_release
+from sglang.srt.utils.common import is_musa, is_npu, torch_release
 
 _is_npu = is_npu()
 _is_musa = is_musa()
-_is_tpu = is_tpu()
 
 if _is_npu:
     from torch_npu.multiprocessing import reductions as npu_reductions
@@ -113,7 +112,7 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     imports torch_tpu so PJRT lazy-init in each worker sees the correct rank
     info. No-op for non-TPU runs.
     """
-    if not _is_tpu and server_args.device != "tpu":
+    if server_args.device != "tpu":
         return
 
     import os
