@@ -108,6 +108,32 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     )
 
 
+_aten_fallbacks_registered = False
+
+
+def _register_aten_fallbacks() -> None:
+    """Register Python fallbacks for ATen ops not yet implemented in torch_tpu.
+
+    These should eventually move into torch_tpu's C++ kernel set (see
+    torch_tpu/ops/* for the registration pattern). Kept here as a stopgap
+    until those land — each fallback is a pure-torch equivalent of the
+    missing op.
+    """
+    global _aten_fallbacks_registered
+    if _aten_fallbacks_registered:
+        return
+    _aten_fallbacks_registered = True
+
+    import torch
+
+    # aten::count_nonzero.dim_IntList — equivalent to (x != 0).sum over dims.
+    @torch.library.register_kernel("aten::count_nonzero.dim_IntList", "PrivateUse1")
+    def _count_nonzero_dim_intlist(self, dim):
+        return (self != 0).to(torch.int64).sum(dim=dim)
+
+    logger.info("Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList")
+
+
 _set_device_patched = False
 
 
@@ -554,6 +580,256 @@ def _patch_mha_kv_pool_for_rpa_v3() -> None:
     )
 
 
+_moe_forward_native_patched = False
+
+
+def _tpu_tensorized_moe_forward(
+    layer, x, topk_weights, topk_ids, moe_runner_config
+):
+    """TPU bmm-grouped equivalent of fused_moe_native.moe_forward_native.
+
+    Pure function — module-level so tests can import it. The patch installer
+    below wraps this with the TPU device gate.
+
+    The reference moe_forward_native iterates over local experts in Python
+    (F.linear -> silu -> F.linear -> index_put_ per expert). On torch_tpu
+    eager (DEFER_AND_FUSE) a 64-iteration loop queues a deep deferred graph
+    that wedges a subsequent .cpu() on tsl::BlockUntilReady.
+
+    This variant groups tokens by selected expert, pads each bucket to a
+    common length, and runs the gate-up / activation / down projections as
+    two batched matmuls (bmm) over the [E_local, B_max, *] layout. Each
+    bmm is a dense [B_max, H] @ [H, 2I] (or [B_max, I] @ [I, H]) per
+    expert — both M and N are large enough to fill the MXU, unlike the
+    per-token einsum form (M=1) which underutilizes it.
+
+    Contract: assumes StandardDispatcher-style topk_ids (local-or-(-1)). The
+    standard dispatcher remaps non-local experts to -1; those slots are
+    mapped to expert 0 with weight 0 (zero contribution). The caller's
+    post-MoE all-reduce combines partial EP/TP contributions. Fused shared
+    experts under EP are rejected because the post-MoE all-reduce would
+    over-count the replicated shared contribution.
+
+    Cost: one device->host sync per forward at `bincount().tolist()`
+    (unavoidable on torch_tpu per its bincount kernel). Worst-case ~2x
+    FLOPs from pad waste vs. ideal valid-slot-only compute; on TPU this
+    is still a large net win because the wasted FLOPs land on the MXU
+    where they are nearly free, while the einsum form runs on degenerate
+    M=1 shapes that spill to the VPU.
+    """
+    import torch
+
+    from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+
+    num_fused_shared = (
+        getattr(moe_runner_config, "num_fused_shared_experts", 0) or 0
+    )
+    moe_ep_size = getattr(layer, "moe_ep_size", 1)
+    if num_fused_shared > 0 and moe_ep_size > 1:
+        raise NotImplementedError(
+            "moe_forward_native TPU path does not support fused shared "
+            f"experts under EP (num_fused_shared_experts={num_fused_shared}, "
+            f"moe_ep_size={moe_ep_size}); the post-MoE all-reduce would "
+            "over-count the replicated shared contribution."
+        )
+
+    T, K = topk_ids.shape
+    H = x.shape[1]
+    E_local = layer.w13_weight.shape[0]
+    TK = T * K
+    device = x.device
+
+    # Flatten and prepare per-(token, slot) views.
+    flat_x = x.repeat_interleave(K, dim=0)              # [TK, H]
+    flat_ids = topk_ids.reshape(-1)                     # [TK]
+    flat_weights = topk_weights.reshape(-1)             # [TK]
+    flat_valid = (flat_ids >= 0).to(flat_weights.dtype) # [TK]
+    safe_ids = flat_ids.clamp(min=0).to(torch.long)     # [TK]; -1 -> 0
+
+    # Sort by expert id so tokens routed to the same expert are contiguous.
+    order = torch.argsort(safe_ids)                     # [TK]
+    sorted_ids = safe_ids[order]                        # [TK]
+    sorted_x = flat_x[order]                            # [TK, H]
+    # Zero out invalid-slot weights so padded contributions sum to 0 later.
+    sorted_w = (flat_weights * flat_valid)[order]       # [TK]
+    sorted_token_idx = (order // K).to(torch.long)      # [TK]; target token
+
+    # Per-expert counts. bincount graph-breaks on torch_tpu (unavoidable per
+    # the torch_tpu kernel); .tolist() forces a single D->H sync per forward.
+    counts = torch.bincount(sorted_ids, minlength=E_local).tolist()
+    B_max = max(counts) if counts else 0
+    if B_max == 0:
+        return torch.zeros_like(x)
+
+    # Cumulative offset of each expert in the sorted layout.
+    cum_off = [0]
+    for c in counts:
+        cum_off.append(cum_off[-1] + c)
+    # per_expert_offset[e] maps "sorted position i" -> "dense position e*B_max + (i - cum_off[e])"
+    # via dense_pos[i] = i + per_expert_offset[sorted_ids[i]].
+    per_expert_offset = torch.tensor(
+        [e * B_max - cum_off[e] for e in range(E_local)],
+        dtype=torch.long,
+        device=device,
+    )
+    dense_pos = torch.arange(TK, device=device) + per_expert_offset.gather(
+        0, sorted_ids
+    )                                                   # [TK]
+
+    # Scatter sorted activations / weights into the padded [E_local, B_max] grid.
+    EB = E_local * B_max
+    padded_x = sorted_x.new_zeros(EB, H)
+    padded_x.scatter_(0, dense_pos.unsqueeze(1).expand(-1, H), sorted_x)
+    padded_x = padded_x.view(E_local, B_max, H)
+
+    padded_w = sorted_w.new_zeros(EB)
+    padded_w.scatter_(0, dense_pos, sorted_w)
+    padded_w = padded_w.view(E_local, B_max)
+
+    # ===== bmm 1: gate-up =====
+    # padded_x: [E_local, B_max, H]; w13: [E_local, 2I, H]
+    # -> [E_local, B_max, 2I]
+    gate_up = torch.bmm(padded_x, layer.w13_weight.transpose(1, 2))
+
+    w13_bias = getattr(layer, "w13_weight_bias", None)
+    if w13_bias is not None:
+        # w13_bias: [E_local, 2I] -> broadcast over B_max.
+        gate_up = (gate_up.float() + w13_bias.unsqueeze(1)).to(x.dtype)
+
+    # ===== activation =====
+    if (
+        moe_runner_config.activation == "silu"
+        and moe_runner_config.gemm1_alpha is not None
+    ):
+        # Interleaved [::2]/[1::2] matches the reference GPT-OSS
+        # swiglu_gpt_oss_sigmoid_alpha (fused_moe.py); only GPT-OSS uses
+        # this variant and its w13_weight is laid out interleaved, not
+        # concatenated halves.
+        assert moe_runner_config.gemm1_clamp_limit is not None
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+        gate = gate.clamp(max=moe_runner_config.gemm1_clamp_limit)
+        up = up.clamp(
+            min=-moe_runner_config.gemm1_clamp_limit,
+            max=moe_runner_config.gemm1_clamp_limit,
+        )
+        hidden = (
+            gate
+            * torch.sigmoid(gate * moe_runner_config.gemm1_alpha)
+            * (up + 1)
+        )
+    elif moe_runner_config.activation == "silu":
+        hidden = SiluAndMul().forward_native(gate_up)
+    elif moe_runner_config.activation == "gelu":
+        hidden = GeluAndMul().forward_native(gate_up)
+    else:
+        raise ValueError(
+            f"Unsupported activation: {moe_runner_config.activation=}"
+        )
+    # hidden: [E_local, B_max, I]
+
+    # ===== bmm 2: down =====
+    # hidden: [E_local, B_max, I]; w2: [E_local, H, I] -> [E_local, B_max, H]
+    expert_outs = torch.bmm(hidden, layer.w2_weight.transpose(1, 2))
+
+    w2_bias = getattr(layer, "w2_weight_bias", None)
+    if w2_bias is not None:
+        expert_outs = (expert_outs.float() + w2_bias.unsqueeze(1)).to(x.dtype)
+
+    # Apply per-slot routing weights in fp32 and accumulate the K-way sum
+    # in fp32 to match the reference moe_forward_native semantic (which
+    # upcasts expert_outs to topk_weights dtype before mul+sum). For
+    # bf16 activations this is the difference between bf16*bf16+bf16 sum
+    # (visible drift on long generations) and the reference's fp32 reduction.
+    # Padding slots have padded_w == 0, so their contribution is zero.
+    expert_outs_fp32 = expert_outs.float() * padded_w.unsqueeze(-1).float()
+
+    # ===== scatter back to [T, H] =====
+    # Map each dense slot to its target token id. Padding slots scatter to
+    # token 0 with zeroed values (harmless no-op via index_add_).
+    inv_idx = sorted_token_idx.new_zeros(EB)
+    inv_idx.scatter_(0, dense_pos, sorted_token_idx)
+
+    out_fp32 = torch.zeros(T, H, dtype=torch.float32, device=device)
+    out_fp32.index_add_(0, inv_idx, expert_outs_fp32.reshape(EB, H))
+    return out_fp32.to(x.dtype)
+
+
+def _patch_moe_forward_native() -> None:
+    """Replace fused_moe_native.moe_forward_native with a TPU-tensorized
+    variant when the input is on a TPU device. CPU/CUDA inputs fall through
+    to the original implementation. Body lives in
+    `_tpu_tensorized_moe_forward` above (module-level for testability).
+    """
+    global _moe_forward_native_patched
+    if _moe_forward_native_patched:
+        return
+    _moe_forward_native_patched = True
+
+    import torch
+
+    from sglang.srt.layers.moe import fused_moe_native
+
+    original_moe_forward_native = fused_moe_native.moe_forward_native
+
+    def _is_tpu(x: torch.Tensor) -> bool:
+        return x.device.type == "tpu" or str(x.device).startswith("tpu")
+
+    def moe_forward_native_tpu_dispatch(
+        layer, x, topk_output, moe_runner_config
+    ):
+        if moe_runner_config.apply_router_weight_on_input:
+            raise NotImplementedError()
+        if _is_tpu(x):
+            topk_weights, topk_ids, _ = topk_output
+            return _tpu_tensorized_moe_forward(
+                layer, x, topk_weights, topk_ids, moe_runner_config
+            )
+        return original_moe_forward_native(
+            layer, x, topk_output, moe_runner_config
+        )
+
+    fused_moe_native.moe_forward_native = moe_forward_native_tpu_dispatch
+
+
+_total_memory_patched = False
+
+
+def _patch_total_memory_for_shared_chip() -> None:
+    """Divide TpuSRTPlatform.get_device_total_memory by cores-per-chip when
+    multiple ranks share one chip's HBM.
+
+    TPU v7 only exposes topology slices with 2 cores per chip (e.g. "1,1,1,2"
+    for world_size=2). Both TP ranks land on the same chip and share its
+    192GB HBM, but the platform reports 192GB per rank — sglang then sizes
+    the KV pool as `mem_fraction_static * 192GB` per rank, so the combined
+    pool exceeds the chip and the first prefill OOMs. Read cores_per_chip
+    from `TORCH_TPU_TOPOLOGY` (4th dim) and scale total memory down.
+    """
+    global _total_memory_patched
+    if _total_memory_patched:
+        return
+    _total_memory_patched = True
+
+    from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
+
+    original = TpuSRTPlatform.get_device_total_memory
+
+    def get_device_total_memory(self, device_id: int = 0) -> int:
+        hbm = original(self, device_id)
+        topo = os.environ.get("TORCH_TPU_TOPOLOGY")
+        if topo:
+            try:
+                dims = [int(x) for x in topo.split(",")]
+                cores_per_chip = dims[3] if len(dims) >= 4 else 1
+                if cores_per_chip > 1:
+                    hbm //= cores_per_chip
+            except (ValueError, IndexError):
+                pass
+        return hbm
+
+    TpuSRTPlatform.get_device_total_memory = get_device_total_memory
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -565,4 +841,7 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
+    _patch_moe_forward_native()
+    _patch_total_memory_for_shared_chip()
+    _register_aten_fallbacks()
     logger.info("TPU patches applied.")
