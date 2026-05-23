@@ -1,5 +1,11 @@
 """TPU compatibility patches for SGLang.
 
+These are *monkey-patches* on upstream sglang internals (functions /
+classes that core code calls directly without going through the
+platform abstraction). TPU init code that does NOT mutate upstream
+state — eager-mode setup, env-var prep, attention backend registration,
+DeviceMixin overrides — lives in tpu_platform.py, not here.
+
 Ported from torchtpu-vllm/tpu_inference/platforms/tpu_platform.py.
 Must run in every process (including spawned workers) because
 module-level state is re-initialized on import in spawned processes.
@@ -10,7 +16,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +24,6 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
-
-
-def _configure_eager_mode() -> None:
-    from torch_tpu._internal import execution_mode
-
-    execution_mode.set_eager_mode(execution_mode.EagerMode.DEFER_AND_FUSE)
-    logger.info("TorchTPU eager mode set to DEFER_AND_FUSE.")
 
 
 def _unwrap_dynamic_compile_fns() -> None:
@@ -47,99 +45,6 @@ def _unwrap_dynamic_compile_fns() -> None:
                 module_path,
                 fn_name,
             )
-
-
-def _prepare_tpu_env(world_size: int = 1) -> None:
-    """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
-
-    Ported from torchtpu-vllm: _prepare_singlehost_tpu_env().
-    Slicebuilder addresses must match exactly the number of TP workers
-    (world_size), not the total process count — detokenizer and tokenizer
-    processes do not participate in PjRt coordination.
-    """
-    if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
-        return
-
-    try:
-        import portpicker
-
-        sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
-    except ImportError:
-        import socket
-
-        # Hold sockets open until env var is written so OS doesn't reassign.
-        _held = [socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)]
-        for s in _held:
-            s.bind(("", 0))
-        sb_ports = [s.getsockname()[1] for s in _held]
-        for s in _held:
-            s.close()
-
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"localhost:{p}" for p in sb_ports
-    )
-
-    if world_size == 1:
-        os.environ.setdefault("TORCH_TPU_TOPOLOGY", "1,1,1")
-    else:
-        try:
-            from torch_tpu._internal.utils import hardware
-
-            topo = hardware.get_tpu_topology(world_size)
-            if topo:
-                os.environ.setdefault("TORCH_TPU_TOPOLOGY", topo)
-        except Exception:
-            pass
-
-    logger.info(
-        "TPU env: TORCH_TPU_SLICEBUILDER_ADDRESSES=%s, TORCH_TPU_TOPOLOGY=%s",
-        os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES"),
-        os.environ.get("TORCH_TPU_TOPOLOGY"),
-    )
-
-
-_set_device_patched = False
-
-
-def _patch_set_device_tolerate_mismatch() -> None:
-    """Make torch.tpu.set_device tolerant of sglang/torch_tpu chiplet-index
-    disagreements.
-
-    sglang's ModelRunner.init_torch_distributed calls set_device(self.gpu_id).
-    torch_tpu auto-binds each process to a chiplet at first PJRT init based
-    on env vars set by run_scheduler_process; if the auto-bound chiplet
-    index doesn't match sglang's gpu_id (e.g. on v7 where PJRT may assign
-    chiplet 5 to local_rank=3 depending on slicebuilder coordination),
-    torch_tpu raises "Cannot set TPU device to index X, current process is
-    bound to device index Y". Accept the existing binding — chiplet
-    assignment is owned by torch_tpu/PJRT, sglang's gpu_id is just a label.
-    """
-    global _set_device_patched
-    if _set_device_patched:
-        return
-    _set_device_patched = True
-
-    from torch_tpu._internal.device import _device_module
-
-    orig_set_device = _device_module._DeviceModule.set_device
-
-    def wrapped(cls, device):
-        try:
-            return orig_set_device(device)
-        except ValueError as e:
-            if "Cannot set TPU device" in str(e):
-                idx = (
-                    device.index
-                    if hasattr(device, "index") and device.index is not None
-                    else int(device)
-                )
-                logger.warning(
-                    "TPU set_device(idx=%s) skipped: %s", idx, e,
-                )
-                return
-            raise
-
-    _device_module._DeviceModule.set_device = classmethod(wrapped)
 
 
 _compute_position_torch_patched = False
@@ -464,53 +369,10 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
-_pallas_attention_registered = False
-
-
-def _register_pallas_attention_backend() -> None:
-    """Register the TPU Pallas attention backend ("pallas_tpu") in SGLang's
-    attention registry at runtime, without editing upstream
-    attention_registry.py.
-
-    `register_attention_backend(name)` is a plain function returning a
-    decorator that mutates the module-global ATTENTION_BACKENDS dict, so
-    calling it programmatically is equivalent to the upstream
-    @register_attention_backend decorator — keeps upstream untouched.
-
-    Ordering: this runs from apply_tpu_patches() via init_backend(), which
-    executes at `model_runner` module import (model_runner.py:236-238),
-    strictly before ModelRunner.init_attention_backend() (model_runner.py:776)
-    looks the name up. The backend module itself is imported lazily inside the
-    factory so importing patches does not pull in jax/torch_tpu early.
-    """
-    global _pallas_attention_registered
-    if _pallas_attention_registered:
-        return
-    _pallas_attention_registered = True
-
-    from sglang.srt.layers.attention.attention_registry import (
-        register_attention_backend,
-    )
-
-    def create_pallas_tpu_backend(runner):
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
-            TpuPallasAttnBackend,
-        )
-
-        return TpuPallasAttnBackend(runner)
-
-    register_attention_backend("pallas_tpu")(create_pallas_tpu_backend)
-    logger.info("Registered 'pallas_tpu' attention backend.")
-
-
-def apply_tpu_patches(world_size: int = 1) -> None:
-    _prepare_tpu_env(world_size)
-    _configure_eager_mode()
+def apply_tpu_patches() -> None:
     _unwrap_dynamic_compile_fns()
-    _patch_set_device_tolerate_mismatch()
     _patch_compute_position_torch()
     _patch_torch_native_attn_backend()
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
-    _register_pallas_attention_backend()
     logger.info("TPU patches applied.")

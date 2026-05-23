@@ -1034,7 +1034,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logger.info("Init torch distributed begin.")
 
         try:
-            torch.get_device_module(self.device).set_device(self.gpu_id)
+            if _is_tpu:
+                # Route through the platform so TpuDeviceMixin.set_device can
+                # tolerate PJRT chiplet-bind mismatches (gpu_id label vs the
+                # chiplet index torch_tpu auto-bound the process to).
+                current_platform.set_device(self.gpu_id)
+            else:
+                torch.get_device_module(self.device).set_device(self.gpu_id)
         except Exception:
             logger.warning(
                 f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"

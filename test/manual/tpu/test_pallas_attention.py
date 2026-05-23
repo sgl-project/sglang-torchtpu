@@ -155,22 +155,20 @@ class TestReqToTokenPoolRoundingPatch(CustomTestCase):
 
 
 class TestPallasRegistration(CustomTestCase):
-    """_register_pallas_attention_backend must put 'pallas_tpu' in the
-    attention registry without editing upstream attention_registry.py."""
+    """TpuSRTPlatform.init_backend must put 'pallas_tpu' in the attention
+    registry without editing upstream attention_registry.py."""
 
     def test_registered(self):
-        from sglang.srt.hardware_backend.tpu.patches import (
-            _register_pallas_attention_backend,
-        )
+        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
         from sglang.srt.layers.attention.attention_registry import (
             ATTENTION_BACKENDS,
         )
 
-        _register_pallas_attention_backend()
+        TpuSRTPlatform().init_backend()
         self.assertIn("pallas_tpu", ATTENTION_BACKENDS)
         self.assertTrue(callable(ATTENTION_BACKENDS["pallas_tpu"]))
-        # Idempotent.
-        _register_pallas_attention_backend()
+        # Idempotent — second call re-registers the same factory.
+        TpuSRTPlatform().init_backend()
         self.assertIn("pallas_tpu", ATTENTION_BACKENDS)
 
 

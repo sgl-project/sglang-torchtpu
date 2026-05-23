@@ -119,7 +119,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         )
         platform = TpuSRTPlatform()
         with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+            "sglang.srt.hardware_backend.tpu.tpu_platform._prepare_tpu_env"
         ):
             platform.apply_server_args_defaults(args)
 
@@ -144,7 +144,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         )
         platform = TpuSRTPlatform()
         with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+            "sglang.srt.hardware_backend.tpu.tpu_platform._prepare_tpu_env"
         ):
             platform.apply_server_args_defaults(args)
 
@@ -163,7 +163,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         )
         platform = TpuSRTPlatform()
         with patch(
-            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+            "sglang.srt.hardware_backend.tpu.tpu_platform._prepare_tpu_env"
         ):
             platform.apply_server_args_defaults(args)
 
