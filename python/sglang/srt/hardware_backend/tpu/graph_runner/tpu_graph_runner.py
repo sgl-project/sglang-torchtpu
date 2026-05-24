@@ -7,9 +7,9 @@ factory method contract in TpuSRTPlatform.
 
 from __future__ import annotations
 
-import logging
+from sglang.srt.hardware_backend.tpu._logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TpuGraphRunner:

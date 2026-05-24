@@ -6,18 +6,18 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 
 if TYPE_CHECKING:
     pass
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class TpuSRTPlatform(SRTPlatform):

@@ -9,10 +9,11 @@ All patches are idempotent.
 from __future__ import annotations
 
 import importlib
-import logging
 import os
 
-logger = logging.getLogger(__name__)
+from sglang.srt.hardware_backend.tpu._logging import get_logger
+
+logger = get_logger(__name__)
 
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("sglang.srt.layers.vocab_parallel_embedding", "get_masked_input_and_mask"),

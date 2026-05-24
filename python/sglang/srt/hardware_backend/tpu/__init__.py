@@ -5,9 +5,9 @@ The ``activate`` function is called during platform discovery and returns
 the fully-qualified platform class name when TPU hardware is available.
 """
 
-import logging
+from sglang.srt.hardware_backend.tpu._logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def activate():
