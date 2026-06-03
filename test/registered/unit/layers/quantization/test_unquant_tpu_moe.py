@@ -13,9 +13,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestUnquantTpuMoe(CustomTestCase):
     def test_masks_ep_non_local_expert_slots(self):
-        topk_weights = torch.tensor(
-            [[0.25, 0.75], [0.60, 0.40]], dtype=torch.float32
-        )
+        topk_weights = torch.tensor([[0.25, 0.75], [0.60, 0.40]], dtype=torch.float32)
         topk_ids = torch.tensor([[3, -1], [-1, 2]], dtype=torch.int32)
 
         masked_weights, masked_ids = _mask_tpu_moe_non_local_experts(

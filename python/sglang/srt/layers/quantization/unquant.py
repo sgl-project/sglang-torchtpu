@@ -769,9 +769,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights, topk_ids = _mask_tpu_moe_non_local_experts(
-            topk_weights, topk_ids
-        )
+        topk_weights, topk_ids = _mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout —
         # the swap from SGLang's (num_experts, n, k) happens once in
