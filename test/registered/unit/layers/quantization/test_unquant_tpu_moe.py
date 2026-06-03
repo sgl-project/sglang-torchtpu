@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.srt.layers.quantization.unquant import _mask_tpu_moe_non_local_experts
+from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,7 +16,7 @@ class TestUnquantTpuMoe(CustomTestCase):
         topk_weights = torch.tensor([[0.25, 0.75], [0.60, 0.40]], dtype=torch.float32)
         topk_ids = torch.tensor([[3, -1], [-1, 2]], dtype=torch.int32)
 
-        masked_weights, masked_ids = _mask_tpu_moe_non_local_experts(
+        masked_weights, masked_ids = mask_tpu_moe_non_local_experts(
             topk_weights, topk_ids
         )
 
@@ -41,7 +41,7 @@ class TestUnquantTpuMoe(CustomTestCase):
         topk_weights = torch.tensor([[0.2, 0.8]], dtype=torch.float32)
         topk_ids = torch.tensor([[1, 3]], dtype=torch.int32)
 
-        masked_weights, masked_ids = _mask_tpu_moe_non_local_experts(
+        masked_weights, masked_ids = mask_tpu_moe_non_local_experts(
             topk_weights, topk_ids
         )
 

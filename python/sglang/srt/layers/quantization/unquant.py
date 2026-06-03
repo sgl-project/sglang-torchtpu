@@ -57,22 +57,6 @@ _is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-def _mask_tpu_moe_non_local_experts(
-    topk_weights: torch.Tensor, topk_ids: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask EP non-local expert slots before the TPU Pallas MoE kernel.
-
-    StandardDispatcher remaps experts not owned by the current EP rank to -1.
-    The TPU Pallas fused-MoE kernel expects non-negative local expert IDs, so
-    route those slots to expert 0 and zero their routing weights.
-    """
-    valid = topk_ids >= 0
-    return (
-        topk_weights * valid.to(topk_weights.dtype),
-        torch.where(valid, topk_ids, torch.zeros_like(topk_ids)),
-    )
-
-
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
@@ -757,6 +741,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     ) -> CombineInput:
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.tpu_moe_utils import (
+            mask_tpu_moe_non_local_experts,
+        )
 
         moe_runner_config = self.moe_runner_config
         if moe_runner_config.apply_router_weight_on_input:
@@ -769,7 +756,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_weights, topk_ids, _ = topk_output
         topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights, topk_ids = _mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
+        topk_weights, topk_ids = mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout —
         # the swap from SGLang's (num_experts, n, k) happens once in
