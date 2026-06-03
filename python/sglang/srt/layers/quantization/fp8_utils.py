@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     offloader,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -59,6 +60,7 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -459,6 +461,8 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
+    elif _is_tpu:
+        return tpu_w8a8_block_fp8_linear
     else:
         return triton_w8a8_block_fp8_linear
 
@@ -832,6 +836,30 @@ def triton_w8a8_block_fp8_linear(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def tpu_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if input_scale is not None:
+        raise NotImplementedError(
+            "TPU FP8 block-linear fallback expects dynamic input scale."
+        )
+
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+    dequant_weight = block_quant_dequant(
+        weight, weight_scale, block_size, input_2d.dtype
+    )
+    output = torch.matmul(input_2d, dequant_weight.t())
+    if bias is not None:
+        output += bias
+    return output.view(*output_shape)
 
 
 @lru_cache(maxsize=1)

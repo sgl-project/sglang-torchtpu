@@ -55,6 +55,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -91,6 +92,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -107,6 +109,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -1798,6 +1801,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        if _is_tpu:
+            return self.forward_tpu(layer, dispatch_output)
+
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
 
@@ -1982,6 +1988,58 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         return self.runner.run(dispatch_output, quant_info)
+
+    def forward_tpu(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.quantization.unquant import (
+            _mask_tpu_moe_non_local_experts,
+        )
+
+        moe_runner_config = self.moe_runner_config
+        if moe_runner_config.apply_router_weight_on_input:
+            raise NotImplementedError(
+                "apply_router_weight_on_input is not supported on TPU yet."
+            )
+        if not self.block_quant:
+            raise NotImplementedError("TPU FP8 MoE fallback requires block scales.")
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+        topk_weights = topk_weights.to(x.dtype)
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights, topk_ids = _mask_tpu_moe_non_local_experts(
+            topk_weights, topk_ids
+        )
+
+        w13 = block_quant_dequant(
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            self.quant_config.weight_block_size,
+            x.dtype,
+        )
+        w2 = block_quant_dequant(
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            self.quant_config.weight_block_size,
+            x.dtype,
+        )
+
+        output = fused_moe_call(
+            hidden_states=x,
+            w1=w13.transpose(1, 2).contiguous(),
+            w2=w2.transpose(1, 2).contiguous(),
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            topk=int(topk_ids.shape[-1]),
+            activation=moe_runner_config.activation,
+        )
+        return StandardCombineInput(hidden_states=output)
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):
