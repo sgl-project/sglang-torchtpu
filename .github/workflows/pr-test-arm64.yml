@@ -3,8 +3,10 @@ name: PR Test (Arm64)
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  # Disabled in sglang-torchtpu: TPU PRs should not spawn Arm64 checks.
+  # Arm64 CI remains available via push, workflow_dispatch, and workflow_call.
+  # pull_request:
+  #   branches: [ main ]
   workflow_dispatch:
   workflow_call:
     inputs:

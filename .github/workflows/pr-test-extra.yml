@@ -14,13 +14,15 @@ name: PR Test Extra
 # `_pr-test-stage.yml` and `_pr-test-check-changes.yml` from pr-test.yml.
 
 on:
-  pull_request:
-    branches: [main]
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push — otherwise GHA leaves the stale
-    # skipped run in place and there's no way to enable extra without
-    # another push. See check-changes.if below for the matching guard.
-    types: [opened, synchronize, reopened, labeled]
+  # Disabled in sglang-torchtpu: TPU PRs should not spawn extra GPU checks.
+  # Extra CI remains available via workflow_dispatch and workflow_call.
+  # pull_request:
+  #   branches: [main]
+  #   # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
+  #   # is added after the latest push — otherwise GHA leaves the stale
+  #   # skipped run in place and there's no way to enable extra without
+  #   # another push. See check-changes.if below for the matching guard.
+  #   types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       force_continue_on_error:

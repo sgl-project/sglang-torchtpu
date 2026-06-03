@@ -3,8 +3,10 @@ name: PR Test (MUSA)
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  # Disabled in sglang-torchtpu: TPU PRs should not spawn MUSA checks.
+  # MUSA CI remains available via push, workflow_dispatch, and workflow_call.
+  # pull_request:
+  #   branches: [ main ]
   workflow_dispatch:
     input:
       target_stage:

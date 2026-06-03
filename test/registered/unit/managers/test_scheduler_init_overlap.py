@@ -143,9 +143,7 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s.use_overlap_streams = use_overlap_streams
         s.forward_stream_ctx = nullcontext()
         s.future_map = MagicMock()
-        s.cur_batch = SimpleNamespace(
-            return_logprob=False, return_hidden_states=False
-        )
+        s.cur_batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
         return s
 
     def test_single_queue_skips_wait_stream(self):
