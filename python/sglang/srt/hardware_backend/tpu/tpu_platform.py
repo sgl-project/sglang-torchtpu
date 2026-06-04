@@ -6,7 +6,6 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -167,30 +166,12 @@ class TpuSRTPlatform(SRTPlatform):
     # Device identity & operations (DeviceMixin)
     # ------------------------------------------------------------------
 
-    _TPU_HBM_BYTES = {
-        "TPU v4": 32 * (1 << 30),
-        "TPU v5p": 95 * (1 << 30),
-        "TPU v5e": 16 * (1 << 30),
-        "TPU v6e": 32 * (1 << 30),
-        "TPU v7": 192 * (1 << 30),
-    }
-
     def get_device_total_memory(self, device_id: int = 0) -> int:
-        name = self.get_device_name(device_id)
-        hbm = self._TPU_HBM_BYTES.get(name)
-        if hbm is None:
-            hbm = 32 * (1 << 30)
-
-        topo = os.environ.get("TORCH_TPU_TOPOLOGY")
-        if topo:
-            try:
-                dims = [int(x) for x in topo.split(",")]
-                cores_per_chip = dims[3] if len(dims) >= 4 else 1
-                if cores_per_chip > 1:
-                    hbm //= cores_per_chip
-            except (ValueError, IndexError):
-                pass
-        return hbm
+        # Per-process HBM limit. Each worker is pinned to one core
+        # (TPU_VISIBLE_CHIPS=local_rank), so this already reflects v7 megacore
+        # sharing (2 cores split a chip's HBM) — no cores-per-chip math needed.
+        _, limit = torch.accelerator.get_memory_info(self.get_device(device_id))
+        return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         return 0.0
