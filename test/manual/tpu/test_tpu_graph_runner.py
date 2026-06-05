@@ -4,12 +4,21 @@ Mocks torch.compile and the tpu dynamo backend registration so the
 tests run on any machine without TPU hardware.
 """
 
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    TpuCompiledForwardShim,
+)
 from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
 from sglang.test.test_utils import CustomTestCase
+
+PRECOMPILE_ALL = (
+    "sglang.srt.hardware_backend.tpu.compilation."
+    "compilation_manager.CompilationManager.precompile_all"
+)
 
 
 def _model_with(**attrs):
@@ -35,9 +44,18 @@ class TestTpuGraphRunner(CustomTestCase):
 
     def setUp(self):
         # Stub torch.compile so the test doesn't need the tpu dynamo backend.
+        # Return a MagicMock that records the wrapped fn/kwargs and lets
+        # tpu_graph_runner assign ``__signature__`` on the result (a tuple
+        # would raise AttributeError on attribute set).
+        def _fake_compile(fn, **kwargs):
+            m = MagicMock(name="compiled")
+            m._wrapped_fn = fn
+            m._wrapped_kwargs = kwargs
+            return m
+
         compile_patcher = patch(
             "sglang.srt.model_executor.tpu_graph_runner.torch.compile",
-            side_effect=lambda fn, **kwargs: (fn, kwargs),
+            side_effect=_fake_compile,
         )
         self.mock_compile = compile_patcher.start()
         self.addCleanup(compile_patcher.stop)
@@ -47,20 +65,37 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         self.mock_register = register_patcher.start()
         self.addCleanup(register_patcher.stop)
+        # Stub the in-process precompile so the test doesn't need a real
+        # attn_backend / model_runner.device — CompilationManager
+        # behavior is covered separately in test_compilation_manager.py.
+        precompile_patcher = patch(PRECOMPILE_ALL)
+        self.mock_precompile = precompile_patcher.start()
+        self.addCleanup(precompile_patcher.stop)
 
     def _runner_for(self, model, enable_torch_compile=True):
         return SimpleNamespace(
             model=model,
+            model_config=SimpleNamespace(context_len=2048),
+            max_running_requests=1,
             server_args=SimpleNamespace(
                 enable_torch_compile=enable_torch_compile,
+                tpu_compile_tokens=None,
+                tpu_compile_bs=None,
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
             ),
         )
 
     def test_wraps_forward_when_enabled(self):
-        original = MagicMock()
+        def original(input_ids, positions, forward_batch, input_embeds=None):
+            pass
+
         model = _model_with(forward=original)
-        TpuGraphRunner(self._runner_for(model))
+        runner = self._runner_for(model)
+        TpuGraphRunner(runner)
         self.assertIsNot(model.forward, original)
+        self.assertIn("input_embeds", inspect.signature(model.forward).parameters)
+        self.assertIsInstance(runner.compiled_forward_shim, TpuCompiledForwardShim)
         self.mock_compile.assert_called_once()
         _, kwargs = self.mock_compile.call_args
         # Pinned compile kwargs — these are correctness-critical for the
@@ -73,6 +108,10 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_register.assert_called_once()
 
     def test_wraps_both_entry_points_when_present(self):
+        # ``forward_split_prefill`` is wrapped so first invocation
+        # populates the HLO cache, even though CompilationManager only
+        # precompiles ``forward`` today (a warning is logged for the
+        # gap — see TODO in CompilationManager.__init__).
         model = _model_with(
             forward=MagicMock(),
             forward_split_prefill=MagicMock(),

@@ -29,6 +29,10 @@
 #   TP_SIZE=8                      # tensor-parallel ranks (= chiplets)
 #   MAX_RUNNING=64                 # in-flight request cap (>= bench concurrency)
 #   PAGE_SIZE=64
+#   CHUNKED_PREFILL_SIZE=4096      # per-forward token cap
+#   TPU_COMPILE_TOKENS="512 2048 4096"
+#                                  # token bucket list (space-separated).
+#   TPU_COMPILE_BS="1 4 $TORCH_COMPILE_MAX_BS"  # bs bucket list; dedupes via Bucketer.
 #   MEM_FRACTION_STATIC=           # passed through if set (sglang default
 #                                  # 0.4; bump to 0.85 for high-concurrency
 #                                  # to leave more HBM for KV cache)
@@ -178,19 +182,22 @@ HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-30000}
 MAX_RUNNING=${MAX_RUNNING:-64}
 PAGE_SIZE=${PAGE_SIZE:-64}
+# Pin the runtime prefill cap so the largest TPU token bucket is stable;
+# smaller TPU_COMPILE_TOKENS buckets keep short prefills from over-padding.
+CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-4096}
+# Maximum batch size cap for torch.compile and bucketing grids.
+TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-32}
+# Shape bucket lists used by the TPU precompile + pad shim. Runtime
+# batches outside these grids cold-compile on first hit (and may raise
+# if larger than the max).
+TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-512 2048 4096}
+TPU_COMPILE_BS=${TPU_COMPILE_BS:-1 4 $TORCH_COMPILE_MAX_BS}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
 # 1 → pass --disable-radix-cache to sglang. Useful when validating warmup
 # scripts: with radix on, repeated synthetic prompts share a long prefix
 # and sglang short-circuits the prefill, hiding the larger-bucket compiles.
 DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
-# sglang's torch.compile only pre-warms decode batch sizes up to this
-# value at server startup. If the bench's max-concurrency exceeds it,
-# the first batch-N decode forward at runtime triggers a fresh compile
-# (one-off latency bump on the first wave's TTFT). Default (empty) keeps
-# sglang's own default of 32; bump to the largest concurrency you'll bench
-# against so all measurement buckets are pre-compiled.
-TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-}
 
 echo "==== launch config ===="
 echo "  model              = $MODEL"
@@ -199,9 +206,11 @@ echo "  tp_size            = $TP_SIZE"
 echo "  host:port          = $HOST:$PORT"
 echo "  max_running        = $MAX_RUNNING"
 echo "  page_size          = $PAGE_SIZE"
+echo "  tpu_compile_tokens = $TPU_COMPILE_TOKENS"
+echo "  tpu_compile_bs     = $TPU_COMPILE_BS"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
-echo "  torch_compile_max_bs = ${TORCH_COMPILE_MAX_BS:-<sglang default (32)>}"
+echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
 echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
 echo "  compile_cache        = $ENABLE_COMPILE_CACHE  (tier2=${TORCH_TPU_TIER2_NAME}, tier3=${TORCH_TPU_TIER3_ROOT})"
 echo "  ENABLE_HLO_DUMP        = $ENABLE_HLO_DUMP  ($HLO_DUMP_DIR)"
@@ -216,13 +225,16 @@ args=(
     --model-path "$MODEL"
     --dtype bfloat16
     --device tpu
-    --tp "$TP_SIZE"
+    --tp-size "$TP_SIZE"
     --grammar-backend none
     --enable-torch-compile
     --host "$HOST"
     --port "$PORT"
     --max-running-requests "$MAX_RUNNING"
     --page-size "$PAGE_SIZE"
+    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
+    --tpu-compile-tokens $TPU_COMPILE_TOKENS
+    --tpu-compile-bs $TPU_COMPILE_BS
 )
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")

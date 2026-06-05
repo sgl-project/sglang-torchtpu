@@ -23,13 +23,15 @@ for that instance only — every existing call site in ``ModelRunner``
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import inspect
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 # This module lives outside the tpu/ tree, so __name__ does not start with
@@ -49,12 +51,14 @@ def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
     fn = getattr(model, attr_name, None)
     if fn is None:
         return False
+    signature = inspect.signature(fn)
     compiled = torch.compile(
         torch.no_grad()(fn),
         backend="tpu",
         fullgraph=True,
         dynamic=False,
     )
+    compiled.__signature__ = signature
     setattr(model, attr_name, compiled)
     return True
 
@@ -63,12 +67,19 @@ class TpuGraphRunner:
     """Install ``torch.compile(backend='tpu')`` on the model backbone."""
 
     # Entry points wrapped with torch.compile. ``forward`` is hit by
-    # forward_decode / forward_extend / forward_idle. ``forward_split_prefill``
-    # is hit by the split-prefill path on the models that expose it
-    # (e.g. qwen2, qwen3_moe, glm4, gemma).
+    # forward_decode / forward_extend / forward_idle.
+    # ``forward_split_prefill`` is hit by the split-prefill path on
+    # models that expose it (qwen2/qwen3 family, glm4, gemma); it is
+    # wrapped so first invocation populates the HLO cache, but
+    # ``CompilationManager`` only precompiles ``forward`` today — see
+    # the warning in ``CompilationManager.__init__``.
     _COMPILE_TARGETS: tuple[str, ...] = ("forward", "forward_split_prefill")
 
     def __init__(self, model_runner: ModelRunner):
+        assert (
+            model_runner.server_args.enable_torch_compile
+        ), "TpuGraphRunner should only be initialized when enable_torch_compile=True."
+
         # Side-effectful import: registers the "tpu" dynamo backend so that
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does
         # this in init_backend; redo it defensively in case the runner is
@@ -98,7 +109,7 @@ class TpuGraphRunner:
 
         # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph
         # per distinct input shape, and the TPU backbone is hit with many: one
-        # per prefill token bucket ({16..4096}) plus the decode batch-size
+        # per configured prefill token bucket plus the decode batch-size
         # buckets. dynamo's default cache_size_limit=8 is far too low — under
         # fullgraph=True it trips FailOnRecompileLimitHit (killing the
         # scheduler) as soon as warmup or a multi-shape benchmark walks past
@@ -107,6 +118,9 @@ class TpuGraphRunner:
         torch._dynamo.config.accumulated_cache_size_limit = 1024
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
+        # Fail loudly on compile-limit hits to expose latency cliffs early.
+        if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
+            torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
 
@@ -131,7 +145,30 @@ class TpuGraphRunner:
             ", ".join(wrapped),
         )
 
-    def can_run(self, forward_batch) -> bool:
+        from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+            TpuCompiledForwardShim,
+        )
+
+        compiled_fns: dict[str, Callable] = {
+            name: getattr(self.model, name) for name in wrapped
+        }
+        compiled_forward_shim = TpuCompiledForwardShim(
+            model_runner, compiled_fns=compiled_fns
+        ).install()
+        model_runner.compiled_forward_shim = compiled_forward_shim
+
+        from sglang.srt.hardware_backend.tpu.compilation.compilation_manager import (
+            CompilationManager,
+        )
+
+        CompilationManager(
+            model_runner=model_runner,
+            compiled_fns=compiled_fns,
+            t_bucketer=compiled_forward_shim.t_bucketer,
+            b_bucketer=compiled_forward_shim.b_bucketer,
+        ).precompile_all()
+
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
 
         PJRT/libtpu caches HLO compilations internally and dispatches

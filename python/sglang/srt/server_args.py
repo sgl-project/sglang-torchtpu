@@ -826,6 +826,10 @@ class ServerArgs:
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
+    # For TPU backend
+    tpu_compile_tokens: Optional[List[int]] = None
+    tpu_compile_bs: Optional[List[int]] = None
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -6754,6 +6758,26 @@ class ServerArgs:
             type=str,
             default=ServerArgs.msprobe_dump_config,
             help="The path of the JSON configuration file for msProbe. If specified, enables msProbe dump.",
+        )
+
+        # For TPU backend
+        parser.add_argument(
+            "--tpu-compile-tokens",
+            type=int,
+            nargs="+",
+            help=(
+                "Token bucket sizes for TPU torch.compile precompile. "
+                "Defaults to powers of two when unset."
+            ),
+        )
+        parser.add_argument(
+            "--tpu-compile-bs",
+            type=int,
+            nargs="+",
+            help=(
+                "Batch size buckets for TPU torch.compile precompile. "
+                "Defaults to powers of two when unset."
+            ),
         )
 
     @classmethod
