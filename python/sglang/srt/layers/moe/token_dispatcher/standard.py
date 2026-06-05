@@ -32,7 +32,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.utils.common import (
     get_bool_env_var,
-    get_device,
     is_hip,
 )
 
@@ -170,7 +169,7 @@ class StandardDispatcher(BaseDispatcher):
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:
-                device = get_device()
+                device = hidden_states.device
                 self.local_expert_mapping = torch.full(
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
