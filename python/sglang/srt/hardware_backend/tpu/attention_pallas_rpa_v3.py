@@ -356,12 +356,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # backends use; they default to 1.0 when the checkpoint carries no KV
         # scales (e.g. a bf16-weight model run with --kv-cache-dtype fp8_e4m3).
         if self.kv_cache_quant_dtype is not None:
-            k_scale = (
-                layer.k_scale_float if layer.k_scale_float is not None else 1.0
-            )
-            v_scale = (
-                layer.v_scale_float if layer.v_scale_float is not None else 1.0
-            )
+            k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+            v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
             k = _quantize_kv_to_fp8(k, k_scale, self.kv_cache_quant_dtype)
             v = _quantize_kv_to_fp8(v, v_scale, self.kv_cache_quant_dtype)
         else:

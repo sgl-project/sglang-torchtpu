@@ -105,6 +105,8 @@ class TpuGraphRunner:
         # ~8 shapes. Match the CUDA / CPU / piecewise graph runners, which all
         # set 1024 (see cuda_graph_runner.set_torch_compile_config).
         torch._dynamo.config.accumulated_cache_size_limit = 1024
+        torch._dynamo.config.accumulated_recompile_limit = 1024
+        torch._dynamo.config.recompile_limit = 1024
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
 

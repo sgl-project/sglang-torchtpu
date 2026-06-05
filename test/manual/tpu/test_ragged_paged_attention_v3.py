@@ -462,9 +462,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         inputs = self._build_fp8_inputs(
             [(17, 1)], kv_dtype=jnp.float8_e5m2, k_scale=1.0, v_scale=1.0
         )
-        self._run_and_compare(
-            inputs, distribution=(1, 1, 1), tolerance=0.2
-        )
+        self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
 
 
 if __name__ == "__main__":
