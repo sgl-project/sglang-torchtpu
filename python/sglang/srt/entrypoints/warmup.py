@@ -31,6 +31,13 @@ async def execute_warmups(
     tokenizer_manager: TokenizerManager,
 ):
     for warmup_name in warmup_names:
+        if warmup_name.startswith("tpu_"):
+            # TPU warmups are registered from the fork-owned TPU backend. Import
+            # lazily so non-TPU installs do not need TPU-only dependencies.
+            try:
+                import sglang.srt.hardware_backend.tpu.warmups  # noqa: F401
+            except Exception as e:
+                logger.warning("Could not import TPU warmups: %s", e)
         if warmup_name not in _warmup_registry:
             logger.warning(f"Could not find custom warmup {warmup_name}")
             continue
