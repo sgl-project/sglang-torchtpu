@@ -1523,6 +1523,51 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        num_continuous_decode_steps = max(
+            1, self.server_args.num_continuous_decode_steps
+        )
+        delay_tpu_decode_results = (
+            current_platform.is_tpu() and num_continuous_decode_steps > 1
+        )
+        pending_decode_results = []
+
+        def drain_pending_decode_results():
+            while pending_decode_results:
+                tmp_batch, tmp_result = pending_decode_results.pop(0)
+                self.process_batch_result(tmp_batch, tmp_result)
+
+        def process_or_delay_result(batch, result):
+            # On TPU, use the continuous decode window as the result-processing
+            # window too. Keeping both on one knob avoids a second platform flag
+            # and guarantees queued results are drained before request polling.
+            if (
+                delay_tpu_decode_results
+                and batch is not None
+                and batch.forward_mode.is_decode()
+                and batch.spec_algorithm.is_none()
+                and not batch.has_grammar
+                and not batch.return_logprob
+                and not batch.return_hidden_states
+                and all(req.sampling_params.ignore_eos for req in batch.reqs)
+            ):
+                pending_decode_results.append((batch.copy(), result))
+                pending_steps = len(pending_decode_results)
+                min_remaining = min(
+                    req.sampling_params.max_new_tokens - len(req.output_ids)
+                    for req in batch.reqs
+                )
+                if (
+                    pending_steps < num_continuous_decode_steps
+                    and pending_steps < min_remaining
+                ):
+                    return
+
+                drain_pending_decode_results()
+                return
+
+            drain_pending_decode_results()
+            self.process_batch_result(batch, result)
+
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1537,13 +1582,43 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                process_or_delay_result(batch, result)
             else:
+                drain_pending_decode_results()
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
 
             # Update last_batch
             self.last_batch = batch
+
+            # Run additional decode-only steps without returning to the
+            # request receiver. This is opt-in because it can trade TTFT/abort
+            # responsiveness for lower scheduler overhead on long decode waves.
+            for _ in range(num_continuous_decode_steps - 1):
+                if (
+                    batch is None
+                    or not batch.forward_mode.is_decode()
+                    or self._engine_paused
+                ):
+                    drain_pending_decode_results()
+                    break
+
+                batch = self.get_next_batch_to_run()
+                if batch is None:
+                    drain_pending_decode_results()
+                    self.last_batch = batch
+                    break
+
+                self.cur_batch = batch
+                result = self.run_batch(batch)
+                process_or_delay_result(batch, result)
+                self.last_batch = batch
+                if not batch.forward_mode.is_decode():
+                    drain_pending_decode_results()
+                    break
+
+            drain_pending_decode_results()
+
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
