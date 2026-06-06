@@ -2030,6 +2030,24 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    if server_args.warmups is not None and "tpu_compilation_warmup" in set(
+        server_args.warmups.split(",")
+    ):
+        try:
+            from sglang.srt.hardware_backend.tpu.warmups import (
+                run_tpu_http_compilation_warmup,
+            )
+
+            _global_state.tokenizer_manager.server_status = ServerStatus.Starting
+            run_tpu_http_compilation_warmup(server_args)
+            _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        except Exception:
+            last_traceback = get_exception_traceback()
+            logger.error(f"Initialization failed. TPU warmup error: {last_traceback}")
+            _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            kill_process_tree(os.getpid())
+            return
+
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
