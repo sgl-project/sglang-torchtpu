@@ -21,6 +21,7 @@ buffer.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -45,6 +46,47 @@ def _torch_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+# HiCache TPU staging: max pages staged per layer per transfer in the dedicated
+# device/host staging buffers. Transfers larger than this fall back to a
+# per-call allocation. Kept modest so the per-layer-sliced reservation
+# (layer_num * stage_blocks * block) stays small.
+_DEFAULT_HICACHE_TPU_STAGE_BLOCKS = 64
+
+
+def hicache_tpu_stage_blocks() -> int:
+    return int(
+        os.environ.get(
+            "SGLANG_HICACHE_TPU_STAGE_BLOCKS", _DEFAULT_HICACHE_TPU_STAGE_BLOCKS
+        )
+    )
+
+
+def fused_block_dims(head_num: int, head_dim: int, store_dtype: torch.dtype):
+    """Fused-layout (rpa_v3) derived dims: (num_kv_heads_x2, kv_packing, padded_head_dim).
+
+    Mirrors ``TpuFusedMHATokenToKVPool`` so callers can reason about the fused
+    block geometry before the pool object exists (e.g. to size the HiCache
+    staging reserve at KV-cache-sizing time).
+    """
+    padded_head_dim = _cdiv(head_dim, TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT) * (
+        TpuFusedMHATokenToKVPool.HEAD_DIM_ALIGNMENT
+    )
+    kv_packing = _torch_dtype_packing(store_dtype)
+    num_kv_heads_x2 = _cdiv(head_num * 2, kv_packing) * kv_packing
+    return num_kv_heads_x2, kv_packing, padded_head_dim
+
+
+def fused_block_nbytes(
+    head_num: int, head_dim: int, store_dtype: torch.dtype, page_size: int
+) -> int:
+    """Bytes of one fused KV block (page): page_size * num_kv_heads_x2 * padded_hd."""
+    num_kv_heads_x2, _, padded_head_dim = fused_block_dims(
+        head_num, head_dim, store_dtype
+    )
+    elems = page_size * num_kv_heads_x2 * padded_head_dim
+    return elems * torch.empty((), dtype=store_dtype).element_size()
 
 
 class TpuFusedMHATokenToKVPool(MHATokenToKVPool):

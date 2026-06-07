@@ -9,6 +9,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
     from sglang.srt.mem_cache.hicache_storage import PoolName
 
 import numpy as np
@@ -208,11 +209,30 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_tpu_host(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+) -> torch.Tensor:
+    """
+    Allocate plain unpinned host memory for the TPU KV offload pool.
+
+    TPU host<->device staging goes through libtpu's premapped pool
+    (TPU_PREMAPPED_BUFFER_SIZE); self-pinning hundreds of GB here would starve
+    that region, so we always allocate plain unpinned host memory regardless of
+    ``pin_memory`` (matches the torchtpu-vllm reference cpu_tpu.py choice).
+    """
+    return torch.empty(dims, dtype=dtype, device="cpu")
+
+
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        "tpu": alloc_tpu_host,
     },
 )
 
@@ -848,6 +868,213 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class TpuFusedMHATokenToKVPoolHost(HostKVCache):
+    """Host (L2) pool for the TPU fused MHA device pool (rpa_v3), layer-wise overlapped.
+
+    Stores the device's fused 5D row VERBATIM, page-major (``page_first_fused``)::
+
+        kv_buffer[page_num, layer_num, page_size, kv_heads_packed,
+                  kv_packing, padded_head_dim]
+
+    so a page's all-layer KV round-trips as a contiguous per-page copy with no
+    de-interleave / un-pad (the gather/scatter kernels are layout-agnostic on
+    dims >= 1).
+
+    OVERLAP MODEL: ``load_to_device_per_layer`` issues the Pallas scatter into
+    the **live** ``kv_cache`` buffer **without a blocking sync**. The controller
+    runs it inside its load-stream context and records a per-layer event after
+    each layer; the forward's read of the same ``kv_cache[layer_id]`` tensor is
+    the data dependency XLA schedules around, so the per-layer load DMA can
+    overlap the earlier layers' compute (the existing HiCache ``LayerDoneCounter``
+    / ``wait_until`` machinery is reused unchanged).
+    """
+
+    device_pool: "TpuFusedMHATokenToKVPool"
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = False,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            "page_first_fused",
+            pin_memory=False,
+            device=device,
+            allocator_type=allocator_type,
+        )
+        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import (
+            prewarm_offload_kernels,
+        )
+        from sglang.srt.hardware_backend.tpu.kv_pool import hicache_tpu_stage_blocks
+
+        prewarm_offload_kernels(device_pool.kv_buffer, device_pool.device)
+
+        # Dedicated, per-layer-sliced staging buffers reused across transfers
+        # (avoids per-call torch.empty churn). Per-layer slices let consecutive
+        # layers stage into distinct memory, so the load scatters stay
+        # independent and XLA can overlap them. The device buffer's HBM is
+        # reserved up front by the KV-cache sizing path
+        # (model_runner_kv_cache_mixin._hicache_tpu_staging_reserve_bytes), so
+        # it does not eat into the KV cache proportion.
+        self.stage_blocks = hicache_tpu_stage_blocks()
+        block_shape = tuple(device_pool.kv_buffer[0].shape[1:])
+        stage_shape = (self.layer_num, self.stage_blocks) + block_shape
+        # device staging = H2D load target / scatter source.
+        self.device_stage = torch.zeros(
+            stage_shape, dtype=self.dtype, device=device_pool.device
+        )
+        # host staging = D2H backup target.
+        self.host_stage = torch.empty(stage_shape, dtype=self.dtype, device="cpu")
+        self._stage_overflow_warned = False
+
+    def get_size_per_token(self):
+        dp = self.device_pool
+        self.layer_num = dp.layer_num
+        self.kv_packing = dp.kv_packing
+        self.kv_heads_packed = dp.num_kv_heads_x2 // dp.kv_packing
+        self.padded_head_dim = dp.padded_head_dim
+        self.fused_row_elems = dp.num_kv_heads_x2 * dp.padded_head_dim
+        return self.fused_row_elems * self.layer_num * self.dtype.itemsize
+
+    def init_kv_buffer(self):
+        if self.layout != "page_first_fused":
+            raise ValueError(
+                "TpuFusedMHATokenToKVPoolHost only supports 'page_first_fused', "
+                f"got {self.layout!r}"
+            )
+        dims = (
+            self.page_num,
+            self.layer_num,
+            self.page_size,
+            self.kv_heads_packed,
+            self.kv_packing,
+            self.padded_head_dim,
+        )
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        return alloc_func(
+            dims,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+
+    def _to_page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """token-granular, page-aligned indices -> page-granular ids."""
+        return token_indices[:: self.page_size] // self.page_size
+
+    def _padded_ids(self, device_indices: torch.Tensor):
+        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import pad_to_pow2
+
+        dev_pages = self._to_page_ids(device_indices).cpu().numpy()
+        n = len(dev_pages)
+        if n == 0:
+            return None, 0, 0
+        padded_np, _ = pad_to_pow2(dev_pages.astype(np.int64))
+        ids = torch.from_numpy(padded_np.astype(np.int32)).to(self.device_pool.device)
+        return ids, n, len(padded_np)
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend != "pallas_tpu":
+            raise ValueError(
+                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
+                f"got {io_backend!r}"
+            )
+        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _scatter_fn
+
+        dst_ids, n, p = self._padded_ids(device_indices)
+        if n == 0:
+            return
+        host_pages = self._to_page_ids(host_indices).cpu()
+        host_g = self.kv_buffer[host_pages, layer_id]  # CPU gather [n, page, ...]
+        if p > n:
+            pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
+            host_g = torch.cat([host_g, pad], dim=0)
+        if p <= self.stage_blocks:
+            dev_src = self.device_stage[layer_id, :p]  # dedicated, per-layer slice
+        else:
+            self._warn_stage_overflow(p)
+            dev_src = torch.empty(
+                (p,) + tuple(host_g.shape[1:]),
+                dtype=self.dtype,
+                device=device_pool.device,
+            )
+        dev_src.copy_(host_g)  # PCIe H2D into the dedicated device staging buffer
+        fused = device_pool.kv_buffer[layer_id]
+        # Overlapped: scatter into the LIVE kv_cache; NO blocking sync. XLA
+        # orders the forward's read of this buffer after the scatter, and can
+        # overlap this layer's DMA with the earlier layers' compute.
+        fused[:] = _scatter_fn(fused, dev_src, dst_ids)
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if io_backend != "pallas_tpu":
+            raise ValueError(
+                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
+                f"got {io_backend!r}"
+            )
+        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _gather_fn
+
+        src_ids, n, p = self._padded_ids(device_indices)
+        if n == 0:
+            return
+        host_pages = self._to_page_ids(host_indices).cpu()
+        for layer_id in range(self.layer_num):
+            fused = device_pool.kv_buffer[layer_id]
+            gathered = _gather_fn(fused, src_ids)  # HBM->HBM [p, page, ...]
+            if p <= self.stage_blocks:
+                hstage = self.host_stage[layer_id, :p]  # dedicated host buffer
+            else:
+                self._warn_stage_overflow(p)
+                hstage = torch.empty(
+                    (p,) + tuple(gathered.shape[1:]), dtype=self.dtype, device="cpu"
+                )
+            hstage.copy_(gathered)  # PCIe D2H into the dedicated host staging buffer
+            self.kv_buffer[host_pages, layer_id] = hstage[:n]
+
+    def _warn_stage_overflow(self, p: int) -> None:
+        if not self._stage_overflow_warned:
+            logger.warning(
+                "[hicache-tpu] transfer of %d padded blocks exceeds the "
+                "dedicated staging buffer (stage_blocks=%d); falling back to a "
+                "per-call allocation. Raise SGLANG_HICACHE_TPU_STAGE_BLOCKS to "
+                "cover it (costs layer_num * stage_blocks * block HBM).",
+                p,
+                self.stage_blocks,
+            )
+            self._stage_overflow_warned = True
+
+    # -- L3 storage hooks (not supported in the 2-tier TPU phase) -------- #
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError(
+            "L3 storage is not supported by the TPU fused host pool yet."
+        )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise NotImplementedError(
+            "L3 storage is not supported by the TPU fused host pool yet."
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "L3 storage is not supported by the TPU fused host pool yet."
+        )
 
 
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):

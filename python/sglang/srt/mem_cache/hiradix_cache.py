@@ -74,7 +74,24 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+            # The TPU fused pool subclasses MHATokenToKVPool but stores a fused
+            # 5D layout; route it to the fused host pool. Guarded import keeps
+            # non-TPU builds unaffected.
+            host_pool_cls = MHATokenToKVPoolHost
+            try:
+                from sglang.srt.hardware_backend.tpu.kv_pool import (
+                    TpuFusedMHATokenToKVPool,
+                )
+
+                if isinstance(self.kv_cache, TpuFusedMHATokenToKVPool):
+                    from sglang.srt.mem_cache.memory_pool_host import (
+                        TpuFusedMHATokenToKVPoolHost,
+                    )
+
+                    host_pool_cls = TpuFusedMHATokenToKVPoolHost
+            except ImportError:
+                pass
+            self.token_to_kv_pool_host = host_pool_cls(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,

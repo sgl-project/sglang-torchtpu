@@ -106,6 +106,31 @@ class LayerDoneCounter:
         self.consumer_index = -1
 
 
+class _SyncDoneEvent:
+    """Always-complete sentinel satisfying the HiCacheAck event protocol.
+
+    The TPU (``pallas_tpu``) path uses NO torch.tpu streams or device events
+    (unsupported); the load/backup are issued as plain lazy ops and XLA orders
+    them by tensor-level data dependency. Completion bookkeeping
+    (``writing_check`` / ``loading_check``) only needs ``query()`` -> True /
+    ``synchronize()`` -> no-op, since the lazy transfer has materialized by the
+    time those run (a forward step, which reads the loaded ``kv_cache``,
+    executes in between).
+    """
+
+    def query(self) -> bool:
+        return True
+
+    def synchronize(self) -> None:
+        pass
+
+    def record(self, *args, **kwargs) -> None:
+        pass
+
+    def wait(self, *args, **kwargs) -> None:
+        pass
+
+
 class CacheOperation:
 
     counter = 0
@@ -717,6 +742,24 @@ class HiCacheController:
         )
         self.write_queue.clear()
 
+        if self.io_backend == "pallas_tpu":
+            # No torch.tpu streams: issue the D2H backup as plain lazy ops.
+            # XLA orders the gather after the forward's KV writes by program
+            # order; the host copy_ inside the pool materializes the result.
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device, host_indices, device_indices, self.io_backend
+            )
+            if self.has_draft:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
+            done = _SyncDoneEvent()
+            self.ack_write_queue.append(HiCacheAck(done, done, op.node_ids))
+            return
+
         start_event = _get_device_module().Event()
         finish_event = _get_device_module().Event()
 
@@ -780,11 +823,51 @@ class HiCacheController:
                 )
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
+        elif self.io_backend == "pallas_tpu":
+            # Host-side gather/scatter run on CPU; device indices stay on device
+            # for the Pallas HBM<->HBM kernels. No torch.tpu streams are used
+            # (unsupported); overlap is left entirely to XLA's tensor-level
+            # dependency scheduling (see start_loading).
+            return host_indices.cpu(), device_indices
         else:
             raise ValueError(f"Unsupported io backend")
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
+            return -1
+
+        if self.io_backend == "pallas_tpu":
+            # No torch.tpu streams / per-layer events (unsupported). Issue the
+            # per-layer load scatters as plain lazy ops writing the live
+            # kv_cache. XLA schedules them by tensor-level dependency: the
+            # forward's read of kv_cache[L] waits on layer L's scatter, while
+            # the independent layer (L+1) load DMA overlaps layer L compute.
+            # No blocking sync; wait_until stays a no-op (return -1, no consumer).
+            op = CacheOperation.merge_ops(self.load_queue)
+            host_indices, device_indices = self.move_indices(
+                op.host_indices, op.device_indices
+            )
+            self.load_queue.clear()
+            for i in range(self.layer_num):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    i,
+                    self.io_backend,
+                )
+                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+            done = _SyncDoneEvent()
+            self.ack_load_queue.append(
+                HiCacheAck(start_event=done, finish_event=done, node_ids=op.node_ids)
+            )
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
