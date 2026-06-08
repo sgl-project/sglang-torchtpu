@@ -34,6 +34,25 @@ MODEL=Qwen/Qwen3-0.6B TP_SIZE=1 PAGE_SIZE=32 ./launch_server.sh
 MODEL=Qwen/Qwen3-0.6B TP_SIZE=1 ./bench_serving.sh
 ```
 
+TP8/EP8 MoE throughput run:
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=2048 \
+CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
+TORCH_COMPILE_MAX_BS=64 \
+TPU_COMPILE_TOKENS="64 128 256 512 1024" \
+TPU_COMPILE_BS="1 2 4 8 16 32 64" \
+SGLANG_TPU_DECODE_PROCESS_INTERVAL=8 \
+./launch_server.sh
+
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 \
+NUM_PROMPTS=640 \
+./bench_serving.sh
+```
+
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
 

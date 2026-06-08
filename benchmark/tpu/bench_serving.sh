@@ -6,6 +6,9 @@
 # Example — Qwen3-32B, default single run (bs=64, isl=1024, osl=1024):
 #   MODEL=Qwen/Qwen3-32B ./bench_serving.sh
 #
+# Example — exact 1k/1k random-id workload used for TPU compile/EP runs:
+#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 NUM_PROMPTS=640 ./bench_serving.sh
+#
 # Example — Qwen3-32B concurrency/shape sweep:
 #   MODEL=Qwen/Qwen3-32B SWEEP="16:8192:512 64:8192:512" WARMUP_REQUESTS=auto ./bench_serving.sh
 # Each SWEEP token is "concurrency:isl:osl". The server's max-running-requests
@@ -24,7 +27,9 @@
 # Overridable env vars (defaults shown):
 #   MODEL=                          # REQUIRED — must match the served model
 #   BASE_URL=http://127.0.0.1:30000
-#   BACKEND=sglang-oai
+#   BACKEND=sglang
+#   DATASET_NAME=random-ids
+#   TOKENIZE_PROMPT=1              # send exact input_ids to native /generate
 #   ISL=1024                        # single-run input length
 #   OSL=1024                        # single-run output length
 #   BATCH_SIZE=64                   # single-run max-concurrency
@@ -59,7 +64,9 @@ fi
 MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
 
 BASE_URL=${BASE_URL:-http://127.0.0.1:30000}
-BACKEND=${BACKEND:-sglang-oai}
+BACKEND=${BACKEND:-sglang}
+DATASET_NAME=${DATASET_NAME:-random-ids}
+TOKENIZE_PROMPT=${TOKENIZE_PROMPT:-1}
 ISL=${ISL:-1024}
 OSL=${OSL:-1024}
 BATCH_SIZE=${BATCH_SIZE:-64}
@@ -136,7 +143,7 @@ run_one() {
         --backend "$BACKEND"
         --base-url "$BASE_URL"
         --model "$MODEL"
-        --dataset-name random
+        --dataset-name "$DATASET_NAME"
         --random-input-len "$isl"
         --random-output-len "$osl"
         --random-range-ratio "$RANDOM_RANGE_RATIO"
@@ -146,6 +153,7 @@ run_one() {
         --seed "$SEED"
         --output-file "$output_file"
     )
+    [[ "$TOKENIZE_PROMPT" == "1" ]] && args+=(--tokenize-prompt)
 
     if [[ "$PROFILE" == "1" ]]; then
         local pdir="${PROFILE_OUTPUT_DIR:-$OUTPUT_DIR/profile-${tag}}"
@@ -162,6 +170,9 @@ run_one() {
     echo "==== bench_serving config ($tag) ===="
     echo "  base_url        = $BASE_URL"
     echo "  model           = $MODEL"
+    echo "  backend         = $BACKEND"
+    echo "  dataset         = $DATASET_NAME"
+    echo "  tokenize_prompt = $TOKENIZE_PROMPT"
     echo "  isl/osl         = $isl / $osl"
     echo "  concurrency     = $bs"
     echo "  num_prompts     = $num_prompts  (= $bs x $PROMPTS_PER_CONCURRENCY)"
