@@ -71,6 +71,14 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     (world_size), not the total process count — detokenizer and tokenizer
     processes do not participate in PjRt coordination.
     """
+    # Apply LIBTPU_INIT_ARGS overrides before the early return and before
+    # any torch_tpu import; libtpu reads these flags at load time.
+    from sglang.srt.hardware_backend.tpu.env_override import (
+        apply_tpu_env_overrides,
+    )
+
+    apply_tpu_env_overrides()
+
     if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
         return
 

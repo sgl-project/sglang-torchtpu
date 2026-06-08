@@ -8,6 +8,7 @@ no per-model files. (For the separate sglang-jax engine, see
 ```
 launch_server.sh     # start the server
 bench_serving.sh     # run sglang.bench_serving (single run or sweep)
+run_eval.sh          # run sglang.test.run_eval (e.g. MMLU, GSM8K)
 warmup.sh            # optional compile-bucket pre-warmup (stopgap)
 warmup_buckets.py    # request-sender used by warmup.sh
 ```
@@ -25,6 +26,10 @@ MODEL=Qwen/Qwen3-32B ./bench_serving.sh
 
 # Concurrency/shape sweep ("concurrency:isl:osl" per leg)
 MODEL=Qwen/Qwen3-32B SWEEP="16:1024:1024 64:1024:1024" ./bench_serving.sh
+
+# 3. Eval — defaults to EVAL_NAME=mmlu, API=chat, NUM_THREADS=4
+MODEL=Qwen/Qwen3-4B ./run_eval.sh
+MODEL=Qwen/Qwen3-4B EVAL_NAME=gsm8k ./run_eval.sh
 ```
 
 Single-chip smoke (tp=1 auto-pins chiplet 0):
