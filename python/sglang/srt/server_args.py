@@ -3478,6 +3478,18 @@ class ServerArgs:
             self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
+        if self.hicache_io_backend == "pallas_tpu":
+            # The TPU fused host pool stores the device's fused 5D row verbatim
+            # and only supports the "page_first_fused" layout; force it so users
+            # need only pass --hicache-io-backend pallas_tpu.
+            if self.hicache_mem_layout != "page_first_fused":
+                logger.warning(
+                    "pallas_tpu io backend requires the page_first_fused layout, "
+                    f"switching from {self.hicache_mem_layout} to page_first_fused"
+                )
+                self.hicache_mem_layout = "page_first_fused"
+            return
+
         if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
@@ -5885,7 +5897,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend"],
+            choices=["direct", "kernel", "kernel_ascend", "pallas_tpu"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )
@@ -5898,6 +5910,7 @@ class ServerArgs:
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "page_first_fused",
             ],
             default=ServerArgs.hicache_mem_layout,
             help="The layout of host memory pool for hierarchical cache.",
