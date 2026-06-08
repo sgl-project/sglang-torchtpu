@@ -138,6 +138,18 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             start_layer,
             end_layer,
         )
+        # The Pallas RPA kernel reads and writes the KV cache as a
+        # floating-point buffer: it statically validates the cache dtype is
+        # floating, and TPU natively supports fp8 (e4m3/e5m2) as a *storage*
+        # dtype. ``KVCache.__init__`` remaps fp8 -> uint8 storage to work
+        # around CUDA's missing ``index_put`` for float8; that workaround does
+        # not apply here because the kernel performs the cache writes itself
+        # (``set_kv_buffer`` is a no-op on the steady-state path). Keep the
+        # real fp8 dtype as the storage dtype so the kernel accepts the buffer
+        # and ``kv_packing`` (computed from ``store_dtype`` below) is 4 for fp8.
+        # For bf16 this is a no-op (``store_dtype`` already equals ``dtype``).
+        self.store_dtype = self.dtype
+
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -208,10 +220,25 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # allocate. The parent ``KVCache.__init__`` still populates
         # ``memory_saver_adapter`` / ``enable_custom_mem_pool`` as no-ops so
         # inherited methods that touch them keep working.
-        self.kv_buffer = [
-            torch.zeros(shape, dtype=self.store_dtype, device=self.device)
-            for _ in range(self.layer_num)
-        ]
+        #
+        # ``torch.zeros`` cannot materialize an fp8 tensor on TPU
+        # ("unsupported at::Scalar type"), so for fp8 storage we allocate a
+        # zeroed uint8 buffer (all-zero bytes == +0.0 in both e4m3 and e5m2)
+        # and reinterpret it as the fp8 dtype via ``view``. The buffer the
+        # kernel sees is genuinely fp8-typed (required: it validates the cache
+        # dtype is floating). For bf16 this is a plain ``torch.zeros``.
+        if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            self.kv_buffer = [
+                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
+                    self.store_dtype
+                )
+                for _ in range(self.layer_num)
+            ]
+        else:
+            self.kv_buffer = [
+                torch.zeros(shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
 
         # Mirrors used by the rest of SGLang. These are recomputed lazily; the
         # fused buffer is the source of truth.

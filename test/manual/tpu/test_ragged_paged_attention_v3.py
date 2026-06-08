@@ -66,6 +66,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         seed: int = 0,
         num_q_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
+        kv_dtype=None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ):
         """Build matching kernel/reference inputs for one or more sequences.
 
@@ -105,10 +108,31 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         ), "too many sequences for the configured page table"
 
         dtype = jnp.bfloat16
+        # KV storage dtype: bf16 by default, or fp8 (e4m3 / e5m2) to exercise
+        # the quantized-cache path. Q always stays bf16 — only K/V are
+        # quantized, matching the backend (q_scale is left unset).
+        kv_dtype = kv_dtype if kv_dtype is not None else dtype
+        is_fp8 = kv_dtype in (jnp.float8_e4m3fn, jnp.float8_e5m2)
         total_q_tokens = sum(q for _, q in seqs)
         # Pad max_num_tokens to a multiple of 8 so the kernel's tile shapes
         # are happy; the real q region is total_q_tokens.
         max_num_tokens = max(8, ((total_q_tokens + 7) // 8) * 8)
+
+        def _maybe_quant(t, scale):
+            """Quantize bf16 -> kv_dtype if fp8, else pass through.
+
+            Mirrors the backend's ``_quantize_kv_to_fp8`` (divide by the
+            per-tensor scale, clamp to the fp8 range, cast). Both the kernel
+            and the reference then consume these *same* fp8 values, so the
+            quantization error is common-mode; the kernel's internal dequant
+            (``*= k_scale`` / ``*= v_scale``) is what's actually under test.
+            """
+            if not is_fp8:
+                return t
+            finfo = jnp.finfo(kv_dtype)
+            s = t.astype(jnp.float32) / (scale if scale is not None else 1.0)
+            s = jnp.clip(s, float(finfo.min), float(finfo.max))
+            return s.astype(kv_dtype)
 
         key = jax.random.PRNGKey(seed)
         k_q, k_new_k, k_new_v, k_kpages, k_vpages = jax.random.split(key, 5)
@@ -116,25 +140,37 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         q = jax.random.normal(
             k_q, (max_num_tokens, num_q_heads, self.HEAD_DIM), dtype=dtype
         )
-        new_k = jax.random.normal(
-            k_new_k, (max_num_tokens, num_kv_heads, self.HEAD_DIM), dtype=dtype
+        new_k = _maybe_quant(
+            jax.random.normal(
+                k_new_k, (max_num_tokens, num_kv_heads, self.HEAD_DIM), dtype=dtype
+            ),
+            k_scale,
         )
-        new_v = jax.random.normal(
-            k_new_v, (max_num_tokens, num_kv_heads, self.HEAD_DIM), dtype=dtype
+        new_v = _maybe_quant(
+            jax.random.normal(
+                k_new_v, (max_num_tokens, num_kv_heads, self.HEAD_DIM), dtype=dtype
+            ),
+            v_scale,
         )
 
         # Unpacked KV pages for the reference. The kernel will write its new
         # K / V into the cache itself; we pre-populate the reference's pages
         # at the same slots so both impls attend over the same KV state.
-        k_pages = jax.random.normal(
-            k_kpages,
-            (self.TOTAL_NUM_PAGES, self.PAGE_SIZE, num_kv_heads, self.HEAD_DIM),
-            dtype=dtype,
+        k_pages = _maybe_quant(
+            jax.random.normal(
+                k_kpages,
+                (self.TOTAL_NUM_PAGES, self.PAGE_SIZE, num_kv_heads, self.HEAD_DIM),
+                dtype=dtype,
+            ),
+            k_scale,
         )
-        v_pages = jax.random.normal(
-            k_vpages,
-            (self.TOTAL_NUM_PAGES, self.PAGE_SIZE, num_kv_heads, self.HEAD_DIM),
-            dtype=dtype,
+        v_pages = _maybe_quant(
+            jax.random.normal(
+                k_vpages,
+                (self.TOTAL_NUM_PAGES, self.PAGE_SIZE, num_kv_heads, self.HEAD_DIM),
+                dtype=dtype,
+            ),
+            v_scale,
         )
 
         # 2D ref page table [num_seqs, pages_per_seq] with disjoint, contiguous
@@ -163,7 +199,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         # (not [K0, K1, ..., V0, V1, ...]), so build the same order here —
         # otherwise GQA cases with num_kv_heads > 1 silently mis-feed the
         # kernel even though they'd accidentally match for num_kv_heads == 1.
-        kv_packing = get_dtype_packing(dtype)
+        kv_packing = get_dtype_packing(kv_dtype)
         kv_interleaved = jnp.stack([k_pages, v_pages], axis=3).reshape(
             self.TOTAL_NUM_PAGES,
             self.PAGE_SIZE,
@@ -211,9 +247,13 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             "num_seqs": num_seqs,
             "num_q_heads": num_q_heads,
             "num_kv_heads": num_kv_heads,
+            "k_scale": k_scale,
+            "v_scale": v_scale,
         }
 
-    def _run_and_compare(self, inputs, *, distribution, **kernel_kwargs):
+    def _run_and_compare(
+        self, inputs, *, distribution, tolerance=None, **kernel_kwargs
+    ):
         """Run kernel + reference with matching kwargs and assert close."""
         import jax.numpy as jnp
 
@@ -230,6 +270,14 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             for k, v in kernel_kwargs.items()
             if k in ("sliding_window", "soft_cap", "xai_temperature_len")
         }
+        # fp8 KV cache: feed the same per-tensor scales to both impls so each
+        # dequantizes the (identical) fp8 K/V the same way. ``None`` for the
+        # bf16 path leaves the kernel's scale logic disabled.
+        scale_kwargs = {}
+        if inputs.get("k_scale") is not None:
+            scale_kwargs["k_scale"] = inputs["k_scale"]
+        if inputs.get("v_scale") is not None:
+            scale_kwargs["v_scale"] = inputs["v_scale"]
 
         ref_out = ref_ragged_paged_attention(
             inputs["q"][: inputs["total_q_tokens"]],
@@ -241,6 +289,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             jnp.array([inputs["num_seqs"]], dtype=jnp.int32),
             sm_scale=sm_scale,
             **ref_kwargs,
+            **scale_kwargs,
         )
 
         kernel_out, _ = ragged_paged_attention(
@@ -257,6 +306,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             None,  # attention_sink
             sm_scale=sm_scale,
             **kernel_kwargs,
+            **scale_kwargs,
         )
         kernel_out = kernel_out[: inputs["total_q_tokens"]]
 
@@ -264,8 +314,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             ref_out.astype(jnp.float32) - kernel_out.astype(jnp.float32)
         ).max()
         # bf16 has ~3 decimal digits of precision; outputs are O(1).
+        tol = tolerance if tolerance is not None else self.TOLERANCE
         self.assertLess(
-            float(diff), self.TOLERANCE, f"max abs diff {float(diff)} >= tolerance"
+            float(diff), tol, f"max abs diff {float(diff)} >= tolerance {tol}"
         )
 
     # ------------------------------------------------------------------ #
@@ -322,6 +373,96 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         index 0 is decode, index 1 is mixed."""
         inputs = self._build_inputs([(17, 1), (33, 8)])
         self._run_and_compare(inputs, distribution=(1, 1, 2))
+
+    # ------------------------------------------------------------------ #
+    # fp8 KV cache cases.
+    #
+    # The cache is stored as fp8 (e4m3 / e5m2); K/V are quantized before the
+    # kernel and dequantized inside it via ``k_scale`` / ``v_scale``. Both the
+    # kernel and the reference consume the *same* fp8 K/V, so the fp8 rounding
+    # error is common-mode and cancels in the diff — what these assert is that
+    # the kernel's fp8 read path (fp8 matmul + scale-based dequant) matches the
+    # reference's (f32 upcast + scale). The kernel uses an fp8 K in the QK
+    # matmul where the reference upcasts to f32 first, so the residual diff is
+    # a little larger than the bf16 cases; the tolerance is loosened to match.
+    # ------------------------------------------------------------------ #
+
+    FP8_TOLERANCE = 0.1
+    # fp8 packs 4 elems per 32-bit lane, so the fused KV layout needs
+    # ``num_kv_heads * 2`` aligned to 4. Use ``num_kv_heads = 2`` (2*2 == 4),
+    # the natural aligned case GQA models use, so the hand-built fused cache
+    # matches the kernel without replicating the pool's odd-head-count padding
+    # (that padding is exercised by the bf16 cases and the pool unit tests).
+    FP8_NUM_Q_HEADS = 4
+    FP8_NUM_KV_HEADS = 2
+
+    def _build_fp8_inputs(self, seqs, *, kv_dtype, k_scale, v_scale):
+        return self._build_inputs(
+            seqs,
+            num_q_heads=self.FP8_NUM_Q_HEADS,
+            num_kv_heads=self.FP8_NUM_KV_HEADS,
+            kv_dtype=kv_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+
+    def test_decode_single_seq_fp8_e4m3(self):
+        """fp8 e4m3 KV cache, unit scales, decode path."""
+        import jax.numpy as jnp
+
+        inputs = self._build_fp8_inputs(
+            [(17, 1)], kv_dtype=jnp.float8_e4m3fn, k_scale=1.0, v_scale=1.0
+        )
+        self._run_and_compare(
+            inputs, distribution=(1, 1, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_extend_single_seq_fp8_e4m3(self):
+        """fp8 e4m3 KV cache, extend path (kernel writes new fp8 K/V)."""
+        import jax.numpy as jnp
+
+        inputs = self._build_fp8_inputs(
+            [(33, 8)], kv_dtype=jnp.float8_e4m3fn, k_scale=1.0, v_scale=1.0
+        )
+        self._run_and_compare(
+            inputs, distribution=(0, 0, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_decode_fp8_e4m3_nonunit_scales(self):
+        """fp8 e4m3 with non-unit per-tensor scales (k != v) — verifies the
+        kernel threads k_scale / v_scale independently and that scaled
+        quantization round-trips correctly."""
+        import jax.numpy as jnp
+
+        inputs = self._build_fp8_inputs(
+            [(33, 1)], kv_dtype=jnp.float8_e4m3fn, k_scale=0.5, v_scale=2.0
+        )
+        self._run_and_compare(
+            inputs, distribution=(1, 1, 1), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_decode_multi_seq_fp8_e4m3(self):
+        """fp8 e4m3 across a multi-sequence decode batch."""
+        import jax.numpy as jnp
+
+        inputs = self._build_fp8_inputs(
+            [(17, 1), (33, 1), (49, 1)],
+            kv_dtype=jnp.float8_e4m3fn,
+            k_scale=1.0,
+            v_scale=1.0,
+        )
+        self._run_and_compare(
+            inputs, distribution=(3, 3, 3), tolerance=self.FP8_TOLERANCE
+        )
+
+    def test_decode_single_seq_fp8_e5m2(self):
+        """fp8 e5m2 KV cache (wider range, coarser mantissa) — looser tol."""
+        import jax.numpy as jnp
+
+        inputs = self._build_fp8_inputs(
+            [(17, 1)], kv_dtype=jnp.float8_e5m2, k_scale=1.0, v_scale=1.0
+        )
+        self._run_and_compare(inputs, distribution=(1, 1, 1), tolerance=0.2)
 
 
 if __name__ == "__main__":

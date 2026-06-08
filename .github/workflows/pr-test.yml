@@ -104,6 +104,7 @@ jobs:
       !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
+      needs.check-changes.outputs.gpu_ci_enabled == 'true' &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
@@ -132,6 +133,7 @@ jobs:
       !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.test_parallel_dispatch != true &&
+      needs.check-changes.outputs.gpu_ci_enabled == 'true' &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
       (needs.wait-for-base-a.result == 'success' || needs.wait-for-base-a.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
@@ -214,6 +216,7 @@ jobs:
     if: |
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
+      needs.check-changes.outputs.gpu_ci_enabled == 'true' &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/pr-test-sgl-kernel.yml
     with:
@@ -233,6 +236,7 @@ jobs:
       !failure() && !cancelled() &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
+      needs.check-changes.outputs.gpu_ci_enabled == 'true' &&
       needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
@@ -250,7 +254,7 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   base-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-a-test-1-gpu-small
@@ -329,7 +333,7 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-1-gpu-small
@@ -343,7 +347,7 @@ jobs:
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-1-gpu-large
@@ -357,7 +361,7 @@ jobs:
 
   base-b-test-2-gpu-large:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-2-gpu-large
@@ -370,7 +374,7 @@ jobs:
 
   base-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-4-gpu-b200
@@ -388,6 +392,7 @@ jobs:
       always() &&
       !cancelled() &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
+      needs.check-changes.outputs.gpu_ci_enabled == 'true' &&
       needs.check-changes.outputs.multimodal_gen == 'true'
     uses: ./.github/workflows/pr-test-multimodal-gen.yml
     with:
@@ -404,7 +409,7 @@ jobs:
 
   base-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-h100
@@ -417,7 +422,7 @@ jobs:
 
   base-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-h200
@@ -437,7 +442,7 @@ jobs:
 
   base-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-h20
@@ -450,7 +455,7 @@ jobs:
 
   base-c-test-deepep-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-deepep-4-gpu-h100
@@ -465,7 +470,7 @@ jobs:
 
   base-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-b200
@@ -479,7 +484,7 @@ jobs:
 
   base-c-test-dsv4-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-dsv4-4-gpu-b200
@@ -493,7 +498,7 @@ jobs:
 
   base-c-test-dsv4-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.outputs.gpu_ci_enabled == 'true' }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-dsv4-8-gpu-h200

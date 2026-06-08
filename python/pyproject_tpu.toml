@@ -14,11 +14,11 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 
-# torch, torch_tpu, libtpu and jax[tpu] are installed by
-# scripts/ci/tpu/tpu_ci_install_dependency.sh from a private package
-# server (workload-identity auth on CI; gcloud ADC on dev). They are
-# deliberately omitted from `dependencies` so this file remains
-# installable on machines without TPU credentials.
+# torch_tpu and libtpu are pinned to specific wheels published to a private
+# package server (workload-identity auth on CI; gcloud ADC on dev); see the
+# [[tool.uv.index]] block below. torch and jax[tpu] are installed alongside by
+# scripts/ci/tpu/tpu_ci_install_dependency.sh. Installing this pyproject
+# requires credentials for the torch-tpu virtual registry.
 dependencies = [
   "IPython",
   "aiohttp",
@@ -69,6 +69,10 @@ dependencies = [
   "uvloop",
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
+  "torch-tpu==0.1.1.dev20260515095303",
+  # Keep libtpu (PJRT runtime) pinned with the torch-tpu wheel. libtpu 0.0.41
+  # regresses GDN compilation with scoped VMEM OOMs in CI.
+  "libtpu==0.0.40",
 ]
 
 [project.optional-dependencies]
@@ -94,8 +98,8 @@ test = [
   "tabulate",
 ]
 
-# Mirrors srt_npu / all_npu / dev_npu shape. Runtime TPU bits (torch_tpu,
-# libtpu, jax[tpu]) are installed out-of-band by the CI script; see header.
+# Mirrors srt_npu / all_npu / dev_npu shape. torch_tpu and libtpu are
+# pinned in `dependencies`; jax[tpu] is installed by the CI script. See header.
 srt_tpu = []
 all_tpu = []
 dev_tpu = ["sglang[all_tpu]", "sglang[test]"]
@@ -144,3 +148,12 @@ version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+
+[tool.uv]
+keyring-provider = "subprocess"
+
+[[tool.uv.index]]
+name = "torch-tpu-registry"
+# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
+# and the PyPI index. It prioritizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
+url = "https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"

@@ -177,6 +177,11 @@ benchmark/mmlu/data.tar
 benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
+
+# TPU benchmark run artifacts (results/profiles/HLO dumps land next to cwd)
+benchmark/tpu/**/results/
+benchmark/tpu/**/profile/
+benchmark/tpu/**/hlo_dump/
 tmp*.txt
 /tmp/
 

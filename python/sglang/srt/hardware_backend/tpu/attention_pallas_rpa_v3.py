@@ -64,6 +64,22 @@ class PallasForwardMetadata:
 _PALLAS_RPA_OP = None
 
 
+def _quantize_kv_to_fp8(
+    t: torch.Tensor, scale: float, fp8_dtype: torch.dtype
+) -> torch.Tensor:
+    """Static per-tensor quantization of K or V into ``fp8_dtype``.
+
+    Mirrors the GPU path's ``set_kv_buffer`` quantization (``cache_k.div_(scale)
+    .to(fp8)``) and torchtpu-vllm's ``quantize_kv``: divide by the per-tensor
+    scale, clamp to the fp8 representable range, then cast. The kernel undoes
+    this by multiplying the attention scores / output by the same scale.
+    """
+    finfo = torch.finfo(fp8_dtype)
+    scaled = t.to(torch.float32) / scale
+    scaled = torch.clamp(scaled, finfo.min, finfo.max)
+    return scaled.to(fp8_dtype)
+
+
 def _build_pallas_kernel_op():
     """Lazily register the ragged_paged_attention kernel as a torch custom op.
 
@@ -100,6 +116,8 @@ def _build_pallas_kernel_op():
         sm_scale: float = 1.0,
         sliding_window: Optional[int] = None,
         soft_cap: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_rpa(
             queries,
@@ -117,6 +135,13 @@ def _build_pallas_kernel_op():
             sm_scale=sm_scale,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
+            # For fp8 KV cache: K/V are quantized to fp8 before this call, so
+            # the kernel dequantizes on read by multiplying the attention
+            # scores / output by these per-tensor scales. ``q_scale`` is left
+            # unset (None) so queries stay bf16 — only K/V are quantized,
+            # matching the GPU backends and torchtpu-vllm.
+            k_scale=k_scale,
+            v_scale=v_scale,
         )
 
     # Donate ``kv_cache_fused`` (index 3) so XLA can reuse its storage for
@@ -158,11 +183,26 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     backend is active.
     """
 
+    # RPA-v3 writes updated KV pages back via copy_(), outside returned tensors.
+    requires_kv_sync_after_compile = True
+
     def __init__(self, model_runner: "ModelRunner") -> None:
         super().__init__()
         self.device = model_runner.device
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
+
+        # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
+        # before the kernel call and the kernel dequantizes on read via
+        # ``k_scale``/``v_scale``. ``None`` for bf16 caches (the default path).
+        # e4m3 is the default/tested fp8 storage format (TPU's natural one);
+        # e5m2 is accepted for parity. With per-tensor scaling, e4m3's extra
+        # mantissa bit gives better KV-cache accuracy.
+        kv_cache_dtype = getattr(model_runner, "kv_cache_dtype", None)
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+        self.kv_cache_quant_dtype: Optional[torch.dtype] = (
+            kv_cache_dtype if kv_cache_dtype in fp8_dtypes else None
+        )
 
         self.forward_metadata: Optional[PallasForwardMetadata] = None
         # Register the custom op eagerly so the (Python-introspection-heavy)
@@ -312,6 +352,21 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
 
+        # fp8 KV cache: quantize new K/V to fp8 here (the kernel writes them to
+        # the fp8 cache itself and reads them back for the current tokens), and
+        # hand the per-tensor scales to the kernel for dequant-on-read. The
+        # scales come from the same ``k_scale_float``/``v_scale_float`` the GPU
+        # backends use; they default to 1.0 when the checkpoint carries no KV
+        # scales (e.g. a bf16-weight model run with --kv-cache-dtype fp8_e4m3).
+        if self.kv_cache_quant_dtype is not None:
+            k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+            v_scale = layer.v_scale_float if layer.v_scale_float is not None else 1.0
+            k = _quantize_kv_to_fp8(k, k_scale, self.kv_cache_quant_dtype)
+            v = _quantize_kv_to_fp8(v, v_scale, self.kv_cache_quant_dtype)
+        else:
+            k_scale = None
+            v_scale = None
+
         out, updated_kv = op(
             q,
             k,
@@ -325,6 +380,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             float(layer.scaling),
             sliding_window,
             soft_cap,
+            k_scale,
+            v_scale,
         )
         # ``donate_argnums=(3,)`` lets XLA alias the input KV cache with the
         # output; in that common path the explicit ``copy_`` below is a

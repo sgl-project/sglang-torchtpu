@@ -35,6 +35,8 @@ on:
         value: ${{ jobs.run.outputs.enable_retry }}
       continue_on_error:
         value: ${{ jobs.run.outputs.continue_on_error }}
+      gpu_ci_enabled:
+        value: ${{ jobs.run.outputs.gpu_ci_enabled }}
 
 jobs:
   run:
@@ -50,6 +52,7 @@ jobs:
       runs_on_map: ${{ steps.runner-map.outputs.runs_on_map }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
+      gpu_ci_enabled: ${{ steps.gpu-ci.outputs.enabled }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -70,6 +73,15 @@ jobs:
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
           fi
+
+      - name: Configure GPU CI
+        id: gpu-ci
+        run: |
+          # [Do Not Upstream] The TPU fork does not currently have access to
+          # upstream's self-hosted GPU runners. Keep GPU jobs skipped instead
+          # of leaving PR runs queued until the stage wait jobs time out.
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          echo "GPU CI disabled for this fork"
 
       - name: Detect file changes
         id: filter
@@ -212,4 +224,5 @@ jobs:
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
+            echo "| gpu_ci_enabled    | ${{ steps.gpu-ci.outputs.enabled }} |"
           } >> $GITHUB_STEP_SUMMARY
