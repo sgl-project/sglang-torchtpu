@@ -2639,7 +2639,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
             seq_lens_cpu=buffers.seq_lens_cpu,
-            next_token_logits_buffer=buffers.next_token_logits_buffer,
+            # TPU torch.compile lowers this buffer copy through a SparseCore path
+            # that can halt under high-concurrency serving.
+            next_token_logits_buffer=(
+                None if self.device == "tpu" else buffers.next_token_logits_buffer
+            ),
             orig_seq_lens=buffers.seq_lens,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
