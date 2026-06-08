@@ -6,7 +6,7 @@
 # Example — Qwen3-32B, default single run (bs=64, isl=1024, osl=1024):
 #   MODEL=Qwen/Qwen3-32B ./bench_serving.sh
 #
-# Example — exact 1k/1k random-id workload used for TPU compile/EP runs:
+# Example — 1k/1k workload used for TPU EP/RPA throughput runs:
 #   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 NUM_PROMPTS=640 ./bench_serving.sh
 #
 # Example — Qwen3-32B concurrency/shape sweep:
@@ -28,8 +28,8 @@
 #   MODEL=                          # REQUIRED — must match the served model
 #   BASE_URL=http://127.0.0.1:30000
 #   BACKEND=sglang
-#   DATASET_NAME=random-ids
-#   TOKENIZE_PROMPT=1              # send exact input_ids to native /generate
+#   DATASET_NAME=random
+#   TOKENIZE_PROMPT=0              # 1 sends exact input_ids; requires BACKEND=sglang
 #   ISL=1024                        # single-run input length
 #   OSL=1024                        # single-run output length
 #   BATCH_SIZE=64                   # single-run max-concurrency
@@ -65,8 +65,8 @@ MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' 
 
 BASE_URL=${BASE_URL:-http://127.0.0.1:30000}
 BACKEND=${BACKEND:-sglang}
-DATASET_NAME=${DATASET_NAME:-random-ids}
-TOKENIZE_PROMPT=${TOKENIZE_PROMPT:-1}
+DATASET_NAME=${DATASET_NAME:-random}
+TOKENIZE_PROMPT=${TOKENIZE_PROMPT:-0}
 ISL=${ISL:-1024}
 OSL=${OSL:-1024}
 BATCH_SIZE=${BATCH_SIZE:-64}
