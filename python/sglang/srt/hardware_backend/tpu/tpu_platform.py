@@ -68,14 +68,11 @@ class TpuSRTPlatform(SRTPlatform):
         if server_args.mem_fraction_static is None:
             server_args.mem_fraction_static = 0.40
 
-        # The TPU Pallas backends use a *paged* KV cache: ``page_size`` is the
-        # contiguous HBM<->VMEM DMA chunk and the second-major axis of the fused
-        # KV buffer (see ``TpuFusedMHATokenToKVPool``). SGLang's global default
-        # of ``page_size == 1`` (set later in ``_handle_page_size``) is correct
-        # for token-granular GPU paged kernels but pathological here: it
-        # collapses the page axis to length 1, turns ``page_indices`` into a
-        # per-token indirection table, which will cause a series of tiny-sized
-        # DMA during pallas RPA V3 kernel fetching KV cache from HBM to VMEM
+        # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
+        # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
+        # axis. SGLang's global page_size=1 default is valid for token-granular
+        # GPU kernels, but is inefficient here: it makes page_indices
+        # token-granular and turns KV fetches into many tiny DMAs.
         if server_args.page_size is None:
             server_args.page_size = 64
 
