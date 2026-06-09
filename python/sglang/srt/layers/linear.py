@@ -1118,13 +1118,25 @@ class QKVParallelLinear(ColumnParallelLinear):
         if _is_tpu and not getattr(param, "format_ue8m0", False):
             param_offset = 0
             loaded_block_offsets = [0]
-            for output_size in self.output_sizes[:-1]:
+            loaded_output_sizes = [
+                self.total_num_heads * self.head_size,
+                self.total_num_kv_heads * self.head_size,
+                self.total_num_kv_heads * self.v_head_size,
+            ]
+            for output_size in loaded_output_sizes[:-1]:
                 loaded_block_offsets.append(
                     loaded_block_offsets[-1] + (output_size + block_n - 1) // block_n
                 )
-            for shard_id, output_size in zip(("q", "k", "v"), self.output_sizes):
+            for shard_idx, (shard_id, output_size) in enumerate(
+                zip(("q", "k", "v"), self.output_sizes)
+            ):
                 local_size = output_size // self.tp_size
-                global_start = self.tp_rank * local_size
+                source_rank = (
+                    self.tp_rank
+                    if shard_id == "q"
+                    else self.tp_rank // self.num_kv_head_replicas
+                )
+                global_start = source_rank * local_size
                 block_start = global_start // block_n
                 block_end = (global_start + local_size + block_n - 1) // block_n
                 block_count = block_end - block_start
@@ -1133,7 +1145,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 )
                 loaded_weight_shard = loaded_weight.narrow(
                     param.output_dim,
-                    loaded_block_offsets[("q", "k", "v").index(shard_id)] + block_start,
+                    loaded_block_offsets[shard_idx] + block_start,
                     block_count,
                 )
                 assert param_data.shape == loaded_weight_shard.shape
@@ -1198,7 +1210,12 @@ class QKVParallelLinear(ColumnParallelLinear):
             if _is_tpu and not getattr(param, "format_ue8m0", False):
                 shard_idx = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
                 local_size = self.output_sizes[shard_idx] // self.tp_size
-                global_start = self.tp_rank * local_size
+                source_rank = (
+                    self.tp_rank
+                    if loaded_shard_id == "q"
+                    else self.tp_rank // self.num_kv_head_replicas
+                )
+                global_start = source_rank * local_size
                 param_offset = sum(
                     (
                         self.tp_rank * self.output_sizes[i] // self.tp_size
