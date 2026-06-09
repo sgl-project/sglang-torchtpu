@@ -105,9 +105,12 @@ class WeightsRef:
             w = pltpu.bitcast(w, packing_dtype)
         return w
 
-    def get_scale(self, b_id: int):
+    def get_scale(self, b_id: int, scale_block_n: int = 1, up_scale_start_n: int = 0):
+        del up_scale_start_n
         # Quantization subchannel scale per quant block
         s = self.scale[..., b_id, :, :]
+        if scale_block_n != 1:
+            s = jnp.repeat(s, scale_block_n, axis=-1)
         return s
 
     def get_bias(self):
@@ -145,10 +148,15 @@ class FusedWeightsRef:
 
         return w
 
-    def get_scale(self, b_id: int):
+    def get_scale(self, b_id: int, scale_block_n: int = 1, up_scale_start_n: int = 0):
         # Quantization subchannel scale per quant block
         s = self.gate.scale[..., b_id, :, :]
         s_up = self.up.scale[..., b_id, :, :]
+        if scale_block_n != 1:
+            s = jnp.repeat(s, scale_block_n, axis=-1)
+            s_up = jnp.repeat(s_up, scale_block_n, axis=-1)
+        if up_scale_start_n and s_up.shape[-1] > up_scale_start_n:
+            s_up = s_up[..., up_scale_start_n:]
         s = jnp.concatenate([s, s_up], axis=-1)
         return s
 
@@ -167,6 +175,41 @@ class TileSizes:
     tile_m: int
     tile_k: int
     tile_n: int
+
+
+def _largest_aligned_divisor_at_most(size: int, limit: int, alignment: int) -> int:
+    """Return the largest aligned divisor of ``size`` that is <= ``limit``."""
+
+    limit = min(size, limit)
+    for candidate in range(limit - (limit % alignment), 0, -alignment):
+        if size % candidate == 0:
+            return candidate
+    return size
+
+
+def _largest_compact_scale_tile_n_at_most(
+    size_n: int,
+    limit: int,
+    scale_block_n: int,
+    alignment: int,
+) -> int:
+    """Return a legal N tile for compact block scales.
+
+    The compact scale layout stores the scale blocks for each 512 output-column
+    tile in a 128-slot record. A single RHS scale BlockSpec load can therefore
+    cover at most one 512-column output tile.
+    """
+
+    compact_output_tile_n = 4 * scale_block_n
+    limit = min(limit, compact_output_tile_n)
+    limit = min(size_n, limit)
+    for candidate in range(limit - (limit % alignment), 0, -alignment):
+        if size_n % candidate != 0:
+            continue
+        scale_tile_n = pl.cdiv(candidate, scale_block_n)
+        if alignment % scale_tile_n == 0:
+            return candidate
+    return scale_block_n
 
 
 @dataclasses.dataclass(frozen=True)
@@ -188,6 +231,8 @@ class InputConfigs:
     has_scale: bool = False
     packing: int = 1
     num_quant_blocks: int = 1
+    scale_size_n: int = 0
+    scale_block_n: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -299,13 +344,24 @@ def create_rhs_spec(index_map: IndexMaps, cfgs: GmmConfigs) -> RhsRef:
             index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
+        if cfgs.rhs_cfgs.scale_block_n != 1 and cfgs.rhs_cfgs.scale_size_n >= 128:
+            scale_tile_n = 128
+        else:
+            scale_tile_n = pl.cdiv(cfgs.tiles.tile_n, cfgs.rhs_cfgs.scale_block_n)
         rhs_scale_spec = pl.BlockSpec(
-            (None, cfgs.num_quant_blocks_per_tile_k, 1, cfgs.tiles.tile_n),
+            (
+                None,
+                cfgs.num_quant_blocks_per_tile_k,
+                1,
+                scale_tile_n,
+            ),
             index_map.rhs_scale_index_map,
         )
 
     rhs_block_spec = WeightsRef(
-        weight=rhs_weight_spec, scale=rhs_scale_spec, bias=rhs_bias_spec
+        weight=rhs_weight_spec,
+        scale=rhs_scale_spec,
+        bias=rhs_bias_spec,
     )
     if cfgs.fuse_act is None:
         return rhs_block_spec
@@ -409,7 +465,9 @@ def inner_kernel(
                         preferred_element_type=jnp.float32,
                     )
                     if cfgs.rhs_cfgs.has_scale:
-                        tiled_rhs_scale = tiled_rhs_ref.get_scale(b_id)
+                        tiled_rhs_scale = tiled_rhs_ref.get_scale(
+                            b_id, cfgs.rhs_cfgs.scale_block_n, cfgs.dims.size_n
+                        )
                         scale = tiled_rhs_scale[..., start_n:end_n]
                         assert scale.shape[0] == 1
                         scale = jnp.tile(scale, (cfgs.tiles.tile_m, 1))
@@ -472,7 +530,9 @@ def inner_kernel(
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.has_scale:
                         b_id = start_k // cfgs.rhs_cfgs.quant_block_size
-                        rhs_scale_slice = tiled_rhs_ref.get_scale(b_id)
+                        rhs_scale_slice = tiled_rhs_ref.get_scale(
+                            b_id, cfgs.rhs_cfgs.scale_block_n, cfgs.dims.size_n
+                        )
                         block_acc *= rhs_scale_slice[..., start_n:end_n].astype(
                             acc_ref.dtype
                         )
@@ -859,7 +919,15 @@ def kernel_main(
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     if cfgs.fuse_act is not None:
         # Up half = sub-view of rhs_ref at column size_n.
-        rhs_up_ref = jax.tree.map(lambda x: x.at[..., cfgs.dims.size_n :], rhs_ref)
+        rhs_up_ref = WeightsRef(
+            weight=rhs_ref.weight.at[..., cfgs.dims.size_n :],
+            scale=rhs_ref.scale,
+            bias=(
+                rhs_ref.bias.at[..., cfgs.dims.size_n :]
+                if rhs_ref.bias is not None
+                else None
+            ),
+        )
         rhs_inner_ref = FusedWeightsRef(gate=rhs_ref, up=rhs_up_ref)
     else:
         rhs_inner_ref = rhs_ref
@@ -934,15 +1002,20 @@ def calculate_tiling(
         num_n_tiles += 1
         tile_n = align_to(dims.size_n, num_n_tiles * num_lanes) // num_n_tiles
 
+    rhs_tile_size_bytes = pl.cdiv(base_rhs_size_bytes, num_n_tiles)
+
     # If decreasing tile_n is no longer possible, we decrease tile_k instead.
     if tile_n < tile_n_limit:
         num_n_tiles -= 1
         tile_n = align_to(dims.size_n, num_n_tiles * num_lanes) // num_n_tiles
+        rhs_tile_size_bytes = pl.cdiv(base_rhs_size_bytes, num_n_tiles)
 
-        # Decrease tile_k until rhs fits in vmem target and tile_k is valid.
-        base_rhs_size_bytes = pl.cdiv(base_rhs_size_bytes, num_n_tiles)
+    # Decrease tile_k until rhs fits in vmem target and tile_k is valid.
+    # The tile_n loop can stop exactly at tile_n_limit while the RHS tile is
+    # still too large, so this cannot be nested only under tile_n < tile_n_limit.
+    if rhs_tile_size_bytes > rhs_vmem_target:
         while pl.cdiv(
-            base_rhs_size_bytes, num_k_tiles
+            rhs_tile_size_bytes, num_k_tiles
         ) > rhs_vmem_target or not _is_tile_k_quant_block_compatible(tile_k):
             num_k_tiles += 1
             tile_k = align_to(dims.size_k, num_k_tiles * num_lanes) // num_k_tiles
@@ -977,7 +1050,8 @@ def validate_inputs(
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
         num_quant_blocks = rhs_scale.shape[1]
-        assert rhs_scale.shape == (size_group, num_quant_blocks, 1, size_n)
+        assert rhs_scale.shape[:3] == (size_group, num_quant_blocks, 1)
+        assert size_n % rhs_scale.shape[3] == 0
         assert size_k % num_quant_blocks == 0
 
     assert group_offset.shape == (1,)
@@ -1077,7 +1151,12 @@ def make_gmm_configs(
         has_scale = True
         rhs_quant_dtype = rhs.dtype
         num_blocks = rhs_scale.shape[1]
+        scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
+        if rhs_scale.shape[3] != rhs.shape[2] and rhs_scale.shape[3] % 128 == 0:
+            scale_block_n = 128
+        else:
+            scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via
@@ -1087,7 +1166,9 @@ def make_gmm_configs(
         has_scale = False
         rhs_quant_dtype = None
         num_blocks = 1
+        scale_size_n = 0
         block_size = dims.size_k
+        scale_block_n = 1
         rhs_packing = 1
 
     rhs_cfgs = InputConfigs(
@@ -1098,6 +1179,8 @@ def make_gmm_configs(
         has_scale=has_scale,
         packing=rhs_packing,
         num_quant_blocks=num_blocks,
+        scale_size_n=scale_size_n,
+        scale_block_n=scale_block_n,
     )
 
     lhs_q_dtype = None
@@ -1113,13 +1196,17 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
+    lhs_quant_block_size = 512
+    if lhs_q_dtype is not None and num_blocks > 1:
+        lhs_quant_block_size = min(lhs_quant_block_size, block_size)
+
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
         # Input quantization involves reading all elements in a block to compute
         # scale value. Since this operation is very memory intensive, we use a
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
-        quant_block_size=512,
+        quant_block_size=lhs_quant_block_size,
         dtype=lhs.dtype,
     )
     # For block quantization (num_blocks > 1), rhs block size must be a
@@ -1150,6 +1237,25 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+    if dims.size_n % tiles.tile_n != 0:
+        # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
+        # partial final N tile would read/write past the RHS/output buffers, so
+        # constrain N tiling to cleanly divide the logical output width.
+        tiles = dataclasses.replace(
+            tiles,
+            tile_n=_largest_aligned_divisor_at_most(
+                dims.size_n, tiles.tile_n, pltpu.get_tpu_info().num_lanes
+            ),
+        )
+    if rhs_cfgs.has_scale and rhs_cfgs.scale_block_n != 1:
+        compact_tile_n = _largest_compact_scale_tile_n_at_most(
+            dims.size_n,
+            tiles.tile_n,
+            rhs_cfgs.scale_block_n,
+            pltpu.get_tpu_info().num_lanes,
+        )
+        if compact_tile_n != tiles.tile_n:
+            tiles = dataclasses.replace(tiles, tile_n=compact_tile_n)
 
     return GmmConfigs(
         dims=dims,
@@ -1319,7 +1425,11 @@ def gmm_v2(
 
     aligned_n = align_to(dims.size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
-    rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    rhs_weights = WeightsRef(
+        weight=rhs,
+        scale=rhs_scale,
+        bias=rhs_bias,
+    )
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
