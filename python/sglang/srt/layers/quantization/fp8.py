@@ -12,7 +12,11 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -121,25 +125,66 @@ def _requantize_tpu_fp8_block_linear_weight(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
+    logical_widths: Optional[List[int]] = None,
+    tp_rank: Optional[int] = None,
+    input_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert checkpoint block-FP8 dense weights to TPU per-channel layout."""
     block_n, block_k = weight_block_size
     out_size, in_size = weight.shape
-    if out_size % block_n != 0 or in_size % block_k != 0:
+    if logical_widths is None:
+        logical_widths = [out_size]
+    if sum(logical_widths) != out_size:
         raise ValueError(
-            "TPU FP8 block linear weights must be divisible by the checkpoint "
-            f"block size, got {tuple(weight.shape)=} and {weight_block_size=}."
+            "TPU FP8 block linear logical widths must cover the local output "
+            f"dimension, got {logical_widths=} and {out_size=}."
         )
+    if tp_rank is None:
+        try:
+            tp_rank = get_tensor_model_parallel_rank()
+        except AssertionError:
+            tp_rank = 0
 
     fp8_max = torch.finfo(fp8_dtype).max
     device = weight.device
     weight = weight.detach().cpu()
     weight_scale_inv = weight_scale_inv.detach().cpu().to(torch.float32)
-    weight = weight.to(torch.float32).reshape(
-        out_size // block_n, block_n, in_size // block_k, block_k
-    )
-    weight = weight * weight_scale_inv[:, None, :, None]
-    weight = weight.reshape(out_size, in_size)
+
+    dequantized_shards = []
+    weight_offset = 0
+    scale_offset = 0
+    first_k_block = input_offset // block_k
+    last_k_block = (input_offset + in_size + block_k - 1) // block_k
+    k_blocks = last_k_block - first_k_block
+    k_offset = input_offset - first_k_block * block_k
+    k_block_ids = (torch.arange(in_size) + k_offset) // block_k
+    for logical_width in logical_widths:
+        global_start = tp_rank * logical_width
+        first_block = global_start // block_n
+        last_block = (global_start + logical_width + block_n - 1) // block_n
+        num_blocks = last_block - first_block
+        row_offset = global_start - first_block * block_n
+
+        shard_weight = weight[weight_offset : weight_offset + logical_width]
+        shard_scale = weight_scale_inv[scale_offset : scale_offset + num_blocks]
+        if shard_scale.shape != (num_blocks, k_blocks):
+            raise ValueError(
+                "TPU FP8 block linear scale shard shape mismatch: "
+                f"got {tuple(shard_scale.shape)}, expected {(num_blocks, k_blocks)}."
+            )
+
+        n_block_ids = (torch.arange(logical_width) + row_offset) // block_n
+        expanded_scale = shard_scale[n_block_ids][:, k_block_ids].to(torch.float32)
+        dequantized_shards.append(shard_weight.to(torch.float32) * expanded_scale)
+        weight_offset += logical_width
+        scale_offset += num_blocks
+
+    if scale_offset != weight_scale_inv.shape[0]:
+        raise ValueError(
+            "TPU FP8 block linear scale rows were not fully consumed: "
+            f"used {scale_offset}, got {weight_scale_inv.shape[0]}."
+        )
+    weight = torch.cat(dequantized_shards, dim=0)
 
     weight_scale = weight.abs().amax(dim=1).clamp(min=1e-12) / fp8_max
     qweight = (
@@ -454,6 +499,16 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
+        if _is_tpu:
+            tp_rank = get_tensor_model_parallel_rank()
+            layer.tpu_fp8_output_tp_rank = (
+                tp_rank if output_size != output_size_per_partition else 0
+            )
+            layer.tpu_fp8_input_offset = (
+                tp_rank * input_size_per_partition
+                if input_size != input_size_per_partition
+                else 0
+            )
         layer.orig_dtype = params_dtype
         weight_loader = extra_weight_attrs.get("weight_loader")
 
@@ -465,7 +520,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_size,
                 output_size_per_partition,
                 output_partition_sizes,
-                skip_block_quant_check,
+                skip_block_quant_check or (_is_tpu and not self.use_mxfp8),
             )
 
         # Create the weight
@@ -497,10 +552,33 @@ class Fp8LinearMethod(LinearMethodBase):
                     )
                 scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
+                if _is_tpu and not self.use_mxfp8:
+                    tp_rank = get_tensor_model_parallel_rank()
+                    output_tp_rank = (
+                        tp_rank if output_size != output_size_per_partition else 0
+                    )
+                    scale_rows = sum(
+                        (output_tp_rank * partition_size + partition_size + block_n - 1)
+                        // block_n
+                        - (output_tp_rank * partition_size) // block_n
+                        for partition_size in output_partition_sizes
+                    )
+                    if input_size != input_size_per_partition:
+                        scale_cols = (
+                            tp_rank * input_size_per_partition
+                            + input_size_per_partition
+                            + block_k
+                            - 1
+                        ) // block_k - (tp_rank * input_size_per_partition) // block_k
+                    else:
+                        scale_cols = (input_size_per_partition + block_k - 1) // block_k
+                else:
+                    scale_rows = (output_size_per_partition + block_n - 1) // block_n
+                    scale_cols = (input_size_per_partition + block_k - 1) // block_k
                 scale = BlockQuantScaleParameter(
                     data=scale_init(
-                        (output_size_per_partition + block_n - 1) // block_n,
-                        (input_size_per_partition + block_k - 1) // block_k,
+                        scale_rows,
+                        scale_cols,
                         dtype=scale_dtype,
                     ),
                     input_dim=1,
@@ -541,10 +619,23 @@ class Fp8LinearMethod(LinearMethodBase):
         if _is_tpu and not self.use_mxfp8:
             old_weight = layer.weight.data
             old_weight_scale_inv = layer.weight_scale_inv.data
+            try:
+                tp_rank = get_tensor_model_parallel_rank()
+            except AssertionError:
+                tp_rank = 0
+            input_offset = (
+                tp_rank * old_weight.shape[1]
+                if getattr(layer, "input_size", old_weight.shape[1])
+                != old_weight.shape[1]
+                else 0
+            )
             weight, weight_scale = _requantize_tpu_fp8_block_linear_weight(
                 old_weight,
                 old_weight_scale_inv,
                 self.quant_config.weight_block_size,
+                logical_widths=getattr(layer, "logical_widths", None),
+                tp_rank=getattr(layer, "tpu_fp8_output_tp_rank", tp_rank),
+                input_offset=getattr(layer, "tpu_fp8_input_offset", input_offset),
             )
             copy_or_rebind_param(layer, "weight", weight)
             copy_or_rebind_param(layer, "weight_scale", weight_scale)

@@ -18,7 +18,8 @@ def _quantize_tensor(x: jax.Array, dtype: jnp.dtype, dim: int = -1):
     dtype_max = float(jnp.finfo(dtype).max)
     scale = jnp.maximum(amax / dtype_max, 1e-12)
     scale_inv = jnp.nan_to_num(1.0 / scale, dtype_max)
-    return (x * scale_inv).astype(dtype), scale.astype(jnp.float32)
+    x_q = jnp.clip(x * scale_inv, -dtype_max, dtype_max).astype(dtype)
+    return x_q, scale.astype(jnp.float32)
 
 
 def _fp8_linear_jax(
