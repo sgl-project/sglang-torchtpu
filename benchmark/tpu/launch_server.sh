@@ -172,14 +172,21 @@ if [[ "$ENABLE_COMPILE_CACHE" == "1" ]]; then
 fi
 
 # ===== XLA / libtpu init =====
-# XLA/libtpu tuning flags (latency-hiding scheduler + async collective fusion
-# keep collectives from serializing behind matmuls on TPU v7). Override the
-# whole string to retune. Changing it invalidates the compile cache (see above).
-export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=32768 \
+# XLA/libtpu tuning flags used for TP/EP TPU serving. Latency-hiding scheduler
+# and async collective fusion keep collectives from serializing behind matmuls;
+# post-SPMD collective-matmul modes and SparseCore collective offload disables
+# avoid TP=8 correctness issues seen with default collective lowering. Override
+# the whole string to retune. Changing it invalidates the compile cache.
+export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
 --xla_tpu_enable_async_collective_fusion=true \
 --xla_tpu_overlap_compute_collective_tc=true \
 --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
---xla_tpu_enable_latency_hiding_scheduler=true"}
+--xla_tpu_enable_latency_hiding_scheduler=true \
+--xla_latency_hiding_scheduler_rerun=10 \
+--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
 
 # ===== XLA HLO dump (opt-in) =====
 # Match on `tt_jit.*` — torch_tpu compiles are named `tt_jit_<op>`; a
