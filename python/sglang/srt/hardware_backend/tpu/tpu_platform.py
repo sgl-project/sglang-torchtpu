@@ -162,7 +162,9 @@ class TpuSRTPlatform(SRTPlatform):
         # defaults to materializing collective tensors by forcing graph breaks, which
         # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
         # disables that guardrail for SPMD TP graphs.
-        os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+        os.environ.setdefault(
+            "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
+        )
 
         import torch_tpu  # noqa: F401
 
