@@ -112,13 +112,6 @@ export SGLANG_PLATFORM=tpu
 # Per-phase scheduler/worker timing dumps every ~5 s (cheap).
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
 
-# Materialize collective tensors so the c10d_functional all_reduce in the
-# vocab-parallel embedding is traceable under torch.compile(fullgraph=True).
-# Without this, TP>1 + --enable-torch-compile crashes on the first prefill with
-# torch._dynamo.exc.Unsupported (the collective resolves to a raw pybind11
-# function Dynamo marks as skipped). Required for the compiled TP>1 path.
-export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-0}
-
 # HF cache. Defaults here are generic (standard HF cache, online download).
 # The team's TPU hosts keep weights on a GCS-FUSE mount and run fully offline;
 # export HF_HOME / HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE to match — see

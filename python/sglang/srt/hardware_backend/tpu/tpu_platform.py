@@ -6,6 +6,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -149,6 +150,12 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
+        # Keep c10d_functional collectives inside the compiled graph. torch_tpu
+        # defaults to materializing collective tensors by forcing graph breaks, which
+        # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
+        # disables that guardrail for SPMD TP graphs.
+        os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+
         import torch_tpu  # noqa: F401
 
         from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches
