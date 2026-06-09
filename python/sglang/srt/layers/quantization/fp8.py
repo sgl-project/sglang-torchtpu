@@ -91,6 +91,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -109,10 +110,47 @@ _is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+
+def _requantize_tpu_fp8_block_linear_weight(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert checkpoint block-FP8 dense weights to TPU per-channel layout."""
+    block_n, block_k = weight_block_size
+    out_size, in_size = weight.shape
+    if out_size % block_n != 0 or in_size % block_k != 0:
+        raise ValueError(
+            "TPU FP8 block linear weights must be divisible by the checkpoint "
+            f"block size, got {tuple(weight.shape)=} and {weight_block_size=}."
+        )
+
+    fp8_max = torch.finfo(fp8_dtype).max
+    device = weight.device
+    weight = weight.detach().cpu()
+    weight_scale_inv = weight_scale_inv.detach().cpu().to(torch.float32)
+    weight = weight.to(torch.float32).reshape(
+        out_size // block_n, block_n, in_size // block_k, block_k
+    )
+    weight = weight * weight_scale_inv[:, None, :, None]
+    weight = weight.reshape(out_size, in_size)
+
+    weight_scale = weight.abs().amax(dim=1).clamp(min=1e-12) / fp8_max
+    qweight = (
+        (weight / weight_scale[:, None]).clamp(min=-fp8_max, max=fp8_max).to(fp8_dtype)
+    )
+    return qweight.t().contiguous().to(device), weight_scale.to(device)
+
+
+def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
+    if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
+        old.untyped_storage().resize_(0)
 
 
 def _require_fp4_dtype():
@@ -353,6 +391,12 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+        if _is_tpu and not self.use_mxfp8:
+            from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                prebuild_tpu_fp8_linear_op,
+            )
+
+            prebuild_tpu_fp8_linear_op()
 
     def validate_block_quant_shapes(
         self,
@@ -494,6 +538,22 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if _is_tpu and not self.use_mxfp8:
+            old_weight = layer.weight.data
+            old_weight_scale_inv = layer.weight_scale_inv.data
+            weight, weight_scale = _requantize_tpu_fp8_block_linear_weight(
+                old_weight,
+                old_weight_scale_inv,
+                self.quant_config.weight_block_size,
+            )
+            copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            del layer._parameters["weight_scale_inv"]
+            _free_replaced_storage(old_weight, layer.weight.data)
+            _free_replaced_storage(old_weight_scale_inv, layer.weight_scale.data)
+            layer.input_scale = None
+            return
+
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -779,6 +839,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        if _is_tpu and self.block_quant and not self.use_mxfp8:
+            from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                apply_tpu_fp8_linear,
+            )
+
+            return apply_tpu_fp8_linear(
+                x=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+            )
+
         if self.block_quant:
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
@@ -807,6 +879,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 block_size=self.quant_config.weight_block_size,
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
+                bias=bias,
+            )
+
+        if _is_tpu and not self.block_quant and not self.use_mxfp8:
+            from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                apply_tpu_fp8_linear,
+            )
+
+            return apply_tpu_fp8_linear(
+                x=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
                 bias=bias,
             )
 
