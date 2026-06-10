@@ -888,10 +888,10 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     per layer after each scatter is materialised. The forward's
     ``get_key/value_buffer(L)`` blocks on that event before reading
     ``kv_cache[L]``, providing layer-level synchronisation without device
-    streams. ``host_stage`` is the D2H backup staging buffer (used by
-    ``backup_from_device_all_layer``); ``device_stage`` is reserved upfront
-    by ``_hicache_tpu_staging_reserve_bytes`` so it does not eat into the KV
-    cache allocation.
+    streams. ``device_stage_list`` holds one pre-allocated independent device
+    buffer per layer (used by ``load_to_device_layerwise``); ``host_stage``
+    is the D2H backup staging buffer (used by ``backup_from_device_all_layer``).
+    Both are sized upfront by ``_hicache_tpu_staging_reserve_bytes``.
     """
 
     device_pool: "TpuFusedMHATokenToKVPool"
@@ -924,16 +924,24 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         prewarm_offload_kernels(device_pool.kv_buffer, device_pool.device)
 
-        # Staging buffers for D2H backup (host_stage) and the legacy per-layer
-        # load path (device_stage). device_stage HBM is reserved upfront by
-        # _hicache_tpu_staging_reserve_bytes so it does not eat into the KV
-        # cache allocation; host_stage is used by backup_from_device_all_layer.
+        # Staging buffers allocated once at init to avoid per-reload allocation.
+        # stage_blocks = max pages per reload event; _hicache_tpu_staging_reserve_bytes
+        # accounts for this HBM upfront so it doesn't eat into the KV cache.
         self.stage_blocks = hicache_tpu_stage_blocks()
         block_shape = tuple(device_pool.kv_buffer[0].shape[1:])
+        layer_stage_shape = (self.stage_blocks,) + block_shape
+        # Per-layer INDEPENDENT device tensors (not slices of a shared base).
+        # A shared tensor with per-layer slices (the old device_stage approach)
+        # creates a patch-op dependency chain across layers in the XLA graph —
+        # each layer's copy_ triggers a read-modify-write on the whole base,
+        # serialising the scatters. Separate allocations have no shared base,
+        # so each layer's copy+scatter is an isolated XLA subgraph.
+        self.device_stage_list = [
+            torch.zeros(layer_stage_shape, dtype=self.dtype, device=device_pool.device)
+            for _ in range(self.layer_num)
+        ]
+        # host staging = D2H backup target (used by backup_from_device_all_layer).
         stage_shape = (self.layer_num, self.stage_blocks) + block_shape
-        self.device_stage = torch.zeros(
-            stage_shape, dtype=self.dtype, device=device_pool.device
-        )
         self.host_stage = torch.empty(stage_shape, dtype=self.dtype, device="cpu")
         self._stage_overflow_warned = False
 
@@ -997,9 +1005,9 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         Design (per the threaded paradigm):
           * _padded_ids is computed ONCE (no per-layer D2H sync).
-          * Each layer gets a FRESH standalone device staging tensor (not a slice
-            of the shared device_stage buffer), so the H2D copy_ has no XLA
-            dependency on any prior scatter or compute op.
+          * Each layer uses its own pre-allocated device staging tensor from
+            device_stage_list (independent buffers, no shared base), so the
+            H2D copy_ has no XLA dependency on any prior scatter or compute op.
           * After scatter, _tpu_sync([kv_cache[L]], wait=True) blocks until the
             scatter is materialised on the TPU device.
           * layer_event.complete(L + layer_offset) signals the main forward that
@@ -1037,13 +1045,9 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                 pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
                 host_g = torch.cat([host_g, pad], dim=0)
 
-            # Fresh standalone device tensor — independent of all prior XLA ops,
-            # so copy_ does not need to flush computation graphs for other layers.
-            dev_src = torch.empty(
-                (p,) + tuple(host_g.shape[1:]),
-                dtype=self.dtype,
-                device=device_pool.device,
-            )
+            # Use the pre-allocated per-layer staging buffer (independent of all
+            # other layers' buffers — no shared base tensor, no patch-op chain).
+            dev_src = self.device_stage_list[layer_id][:p]
             dev_src.copy_(host_g)  # PCIe H2D (blocking on this layer only)
 
             fused = device_pool.kv_buffer[layer_id]
@@ -1055,6 +1059,17 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
             # Signal the forward: kv_cache[layer_id] is ready.
             layer_event.complete(layer_id + layer_offset)
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        # The pallas_tpu path uses load_to_device_layerwise (threaded, all
+        # layers at once). This per-layer entry point is kept to satisfy the
+        # abstract base class; it is not called on this backend.
+        raise NotImplementedError(
+            "TpuFusedMHATokenToKVPoolHost uses load_to_device_layerwise; "
+            "load_to_device_per_layer is not supported on the pallas_tpu backend."
+        )
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
