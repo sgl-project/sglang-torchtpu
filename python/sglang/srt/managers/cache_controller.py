@@ -106,6 +106,110 @@ class LayerDoneCounter:
         self.consumer_index = -1
 
 
+# ---------------------------------------------------------------------------
+# TPU pallas_tpu per-layer load counter (Python-threading, no device streams)
+# ---------------------------------------------------------------------------
+
+
+class TpuLayerLoadingEvent:
+    """Python-threading equivalent of LayerLoadingEvent for the pallas_tpu path.
+
+    torch_tpu has no device streams or device events, so we track per-layer
+    completion of the copy+scatter producer thread with plain threading.Event
+    objects. The interface mirrors LayerLoadingEvent so that LayerDoneCounter's
+    wait_until() works unchanged, and kv_pool.get_key/value_buffer() needs no
+    modifications.
+
+    Lifecycle per reload batch:
+      1. Producer thread: for each layer N, calls complete(N) after the H2D
+         copy + Pallas scatter for layer N have been materialized on the TPU.
+      2. Consumer (forward): kv_pool.get_key_buffer(N) calls wait_until(N)
+         which calls wait(N) here, blocking until the producer has signalled.
+    """
+
+    def __init__(self, num_layers: int):
+        self._num_layers = num_layers
+        self._events = [threading.Event() for _ in range(num_layers)]
+        # _finish is set when the last layer is complete; used by update_producer
+        # to verify the previous round is fully done before reuse.
+        self._finish = threading.Event()
+        # Pre-set so the very first update_producer() sees the slot as available.
+        self._finish.set()
+
+    def complete(self, layer_index: int) -> None:
+        assert 0 <= layer_index < self._num_layers
+        self._events[layer_index].set()
+        if layer_index == self._num_layers - 1:
+            self._finish.set()
+
+    def wait(self, layer_index: int) -> None:
+        """Block the calling thread until layer_index's copy+scatter is done."""
+        self._events[layer_index].wait()
+
+    def reset(self) -> None:
+        for e in self._events:
+            e.clear()
+        self._finish.clear()
+
+    def query(self) -> bool:
+        """Return True if the last layer has been signalled (reuse-safe check)."""
+        return self._finish.is_set()
+
+    @property
+    def finish_event(self) -> "TpuLayerLoadingEvent":
+        # LayerDoneCounter.update_producer calls finish_event.query(); proxy self.
+        return self
+
+
+class TpuLayerDoneCounter:
+    """Drop-in replacement for LayerDoneCounter on the pallas_tpu path.
+
+    Uses TpuLayerLoadingEvent (Python threading.Event per layer) instead of
+    device stream events so that no torch.tpu streams are needed.
+
+    The interface is identical to LayerDoneCounter so that:
+      * cache_controller.start_loading can call update_producer() / set_consumer()
+      * kv_pool.get_key/value_buffer can call wait_until(layer_id) unchanged
+    """
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self.num_counters = 3
+        self.events = [
+            TpuLayerLoadingEvent(num_layers) for _ in range(self.num_counters)
+        ]
+        self.producer_index = -1
+        self.consumer_index = -1
+
+    def update_producer(self) -> int:
+        next_index = (self.producer_index + 1) % self.num_counters
+        # Wait for the slot we are about to reuse to be fully consumed.
+        # The GPU path (LayerDoneCounter) asserts query() == True because the
+        # previous round must have completed on the device stream before the
+        # scheduler issues a new load. On TPU the producer thread is async, so
+        # a prior round may still be in flight — block until it finishes.
+        slot = self.events[next_index]
+        if not slot.finish_event.query():
+            slot.finish_event.wait()  # type: ignore[union-attr]
+        slot.reset()
+        self.producer_index = next_index
+        return self.producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def wait_until(self, threshold: int) -> None:
+        """Called by kv_pool.get_key_buffer(layer_id). Blocks until the
+        producer thread has signalled layer `threshold` complete."""
+        if self.consumer_index < 0:
+            return
+        self.events[self.consumer_index].wait(threshold)
+
+    def reset(self) -> None:
+        self.producer_index = -1
+        self.consumer_index = -1
+
+
 class _SyncDoneEvent:
     """Always-complete sentinel satisfying the HiCacheAck event protocol.
 
@@ -334,7 +438,12 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        # Use the TPU-specific threading-based counter on pallas_tpu; for all
+        # other backends use the device-stream-based LayerDoneCounter.
+        if io_backend == "pallas_tpu":
+            self.layer_done_counter = TpuLayerDoneCounter(self.layer_num)
+        else:
+            self.layer_done_counter = LayerDoneCounter(self.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -837,38 +946,83 @@ class HiCacheController:
             return -1
 
         if self.io_backend == "pallas_tpu":
-            # No torch.tpu streams / per-layer events (unsupported). Issue the
-            # per-layer load scatters as plain lazy ops writing the live
-            # kv_cache. XLA schedules them by tensor-level dependency: the
-            # forward's read of kv_cache[L] waits on layer L's scatter, while
-            # the independent layer (L+1) load DMA overlaps layer L compute.
-            # No blocking sync; wait_until stays a no-op (return -1, no consumer).
+            # Threaded per-layer load: a dedicated producer thread does the
+            # H2D copy + Pallas scatter for each layer sequentially, signalling
+            # a TpuLayerLoadingEvent per layer as it completes. The forward's
+            # kv_pool.get_key/value_buffer(L) blocks on that event before reading
+            # kv_cache[L], giving layer-level synchronisation without device streams.
+            #
+            # While the producer thread materialises layer L, the main scheduler
+            # thread is free to run CPU-side work; if the forward executes compute
+            # for layer L-1 (lazy XLA ops) concurrently on the device, and the
+            # producer thread's copy for layer L targets an independent fresh staging
+            # buffer, the copy does not need to wait for layer L-1's compute.
+            #
+            # Implementation notes:
+            #   * _padded_ids (the D2H index read) is done ONCE by the producer
+            #     thread before the layer loop — avoids 48 per-layer syncs.
+            #   * Each layer gets a FRESH standalone staging tensor (not a slice of
+            #     a shared buffer) so the H2D copy has no XLA dependency on prior
+            #     scatters or compute.
+            #   * _tpu_sync([kv_cache[L]], wait=True) after each scatter confirms
+            #     the scatter is materialised before signalling the event.
             op = CacheOperation.merge_ops(self.load_queue)
             host_indices, device_indices = self.move_indices(
                 op.host_indices, op.device_indices
             )
             self.load_queue.clear()
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
+
+            producer_id = self.layer_done_counter.update_producer()
+            producer_event = self.layer_done_counter.events[producer_id]
+
+            mem_pool_host = self.mem_pool_host
+            mem_pool_device = self.mem_pool_device
+            io_backend = self.io_backend
+            has_draft = self.has_draft
+            mem_pool_host_draft = self.mem_pool_host_draft
+            mem_pool_device_draft = self.mem_pool_device_draft
+
+            def _producer():
+                try:
+                    mem_pool_host.load_to_device_layerwise(
+                        mem_pool_device,
                         host_indices,
                         device_indices,
-                        i,
-                        self.io_backend,
+                        io_backend,
+                        producer_event,
                     )
+                    if has_draft:
+                        # Draft layers use the same indices; complete their events
+                        # so the draft pool's wait_until also unblocks.
+                        mem_pool_host_draft.load_to_device_layerwise(
+                            mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            io_backend,
+                            producer_event,
+                            layer_offset=mem_pool_device.layer_num,
+                        )
+                except Exception as e:
+                    import logging as _log
+
+                    _log.getLogger(__name__).error(
+                        "[kv-offload] producer thread error: %s", e, exc_info=True
+                    )
+                    # Signal all remaining layers so the forward doesn't deadlock.
+                    for i in range(mem_pool_device.layer_num):
+                        try:
+                            producer_event.complete(i)
+                        except Exception:
+                            pass
+
+            t = threading.Thread(target=_producer, daemon=True, name="kv-offload-load")
+            t.start()
+
             done = _SyncDoneEvent()
             self.ack_load_queue.append(
                 HiCacheAck(start_event=done, finish_event=done, node_ids=op.node_ids)
             )
-            return -1
+            return producer_id
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)

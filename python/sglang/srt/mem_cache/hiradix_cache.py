@@ -929,7 +929,8 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: block moves from device to host.
+        # Device demotion: the KV is already on host (write-through backed it up
+        # at prefill time), so eviction is just a device-allocator free + bookkeeping.
         # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
         # The matching store(CPU) was emitted when write_backup() copied to host.
         self._record_remove_event(node, medium=StorageMedium.GPU)
