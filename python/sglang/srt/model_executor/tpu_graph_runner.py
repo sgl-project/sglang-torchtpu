@@ -63,10 +63,47 @@ def _wrap_with_tpu_compile(model, attr_name: str) -> bool:
     return True
 
 
-class TpuGraphRunner:
-    """Install ``torch.compile(backend='tpu')`` on the model backbone."""
+def _can_split_compile(model) -> bool:
+    """True if the model exposes the standard ``(model, logits_processor)``
+    split, allowing us to compile the transformer body and the LP as
+    separate regions instead of fusing them under one outer compile.
 
-    # Entry points wrapped with torch.compile. ``forward`` is hit by
+    The Qwen / Llama / GLM / Gemma families all match this shape via
+    sglang's ``XxxForCausalLM`` wrapper, where ``self.model`` is the
+    transformer backbone and ``self.logits_processor`` is the
+    :class:`~sglang.srt.layers.logits_processor.LogitsProcessor` epilogue.
+    """
+    body = getattr(model, "model", None)
+    lp = getattr(model, "logits_processor", None)
+    return (
+        body is not None
+        and lp is not None
+        and callable(getattr(body, "forward", None))
+        and callable(getattr(lp, "forward", None))
+    )
+
+
+class TpuGraphRunner:
+    """Install ``torch.compile(backend='tpu')`` on the model backbone.
+
+    Two compile shapes are supported, picked automatically:
+
+    * **Split-compile** (preferred). When the model exposes the standard
+      ``(model, logits_processor)`` split, the transformer body and the
+      :class:`LogitsProcessor` are compiled as separate regions; the
+      outer ``ForCausalLM.forward`` stays uncompiled and dispatches between
+      them. This isolates the LM-head matmul + TP all-gather in the LP's
+      own HLO, so XLA's SC-offload pass cannot fuse the all-gather into
+      the body graph — that fusion is the root cause of the
+      ``tt_jit_logits_processor`` UserFatal halt on Qwen3-32B TP=8.
+      Mirrors torchtpu-vllm's ``compute_selected_logits`` carve-out.
+
+    * **Single-compile fallback**. For models that do not expose the
+      split (no ``model.model`` / ``model.logits_processor``), wrap the
+      outer ``forward`` and ``forward_split_prefill`` as one region each.
+    """
+
+    # Single-compile fallback targets. ``forward`` is hit by
     # forward_decode / forward_extend / forward_idle.
     # ``forward_split_prefill`` is hit by the split-prefill path on
     # models that expose it (qwen2/qwen3 family, glm4, gemma); it is
@@ -124,36 +161,28 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
-        wrapped = [
-            name
-            for name in self._COMPILE_TARGETS
-            if _wrap_with_tpu_compile(self.model, name)
-        ]
-        if not wrapped:
-            logger.warning(
-                "enable_torch_compile=True but %s exposes none of %s; "
-                "nothing compiled.",
-                type(self.model).__name__,
-                self._COMPILE_TARGETS,
-            )
-            return
+        # Each install path returns ``(output_targets, compiled_fns)``:
+        #   output_targets : list of (owner, attr, fn) that need the
+        #                    output-slicing shim wrapped around them
+        #                    — exactly the frontier that emits
+        #                    ``LogitsProcessorOutput``.
+        #   compiled_fns   : dict[str, Callable] — informational, fed to
+        #                    ``CompilationManager`` for the
+        #                    ``forward_split_prefill`` warning.
+        if _can_split_compile(self.model):
+            output_targets, compiled_fns = self._install_split_compile()
+        else:
+            output_targets, compiled_fns = self._install_single_compile()
 
-        logger.info(
-            "Wrapped %s.{%s} with torch.compile(backend='tpu', "
-            "fullgraph=True, dynamic=False) inside torch.no_grad.",
-            type(self.model).__name__,
-            ", ".join(wrapped),
-        )
+        if not output_targets and not compiled_fns:
+            return
 
         from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
             TpuCompiledForwardShim,
         )
 
-        compiled_fns: dict[str, Callable] = {
-            name: getattr(self.model, name) for name in wrapped
-        }
         compiled_forward_shim = TpuCompiledForwardShim(
-            model_runner, compiled_fns=compiled_fns
+            model_runner, output_targets=output_targets
         ).install()
         model_runner.compiled_forward_shim = compiled_forward_shim
 
@@ -167,6 +196,95 @@ class TpuGraphRunner:
             t_bucketer=compiled_forward_shim.t_bucketer,
             b_bucketer=compiled_forward_shim.b_bucketer,
         ).precompile_all()
+
+    def _install_single_compile(
+        self,
+    ) -> tuple[list[tuple[object, str, Callable]], dict[str, Callable]]:
+        """Fallback path: compile ``model.forward`` (and optional
+        ``forward_split_prefill``) as one region each. Used when the model
+        does not expose the ``(model, logits_processor)`` split.
+
+        Both ``forward`` and ``forward_split_prefill`` can return
+        ``LogitsProcessorOutput`` (the latter on its final split), so
+        both go into ``output_targets`` for output slicing.
+        """
+        wrapped = [
+            name
+            for name in self._COMPILE_TARGETS
+            if _wrap_with_tpu_compile(self.model, name)
+        ]
+        if not wrapped:
+            logger.warning(
+                "enable_torch_compile=True but %s exposes none of %s; "
+                "nothing compiled.",
+                type(self.model).__name__,
+                self._COMPILE_TARGETS,
+            )
+            return [], {}
+
+        logger.info(
+            "Single-compile: wrapped %s.{%s} with torch.compile.",
+            type(self.model).__name__,
+            ", ".join(wrapped),
+        )
+        output_targets = [
+            (self.model, name, getattr(self.model, name)) for name in wrapped
+        ]
+        compiled_fns = {name: getattr(self.model, name) for name in wrapped}
+        return output_targets, compiled_fns
+
+    def _install_split_compile(
+        self,
+    ) -> tuple[list[tuple[object, str, Callable]], dict[str, Callable]]:
+        """Split-compile path: compile ``model.model.forward`` (body) and
+        ``model.logits_processor.forward`` (LP) as separate regions.
+
+        Leaves outer ``model.forward`` (the ``ForCausalLM`` wrapper)
+        uncompiled — it runs in eager and dispatches body→LP, so the
+        LM-head + TP all-gather end up in the LP's own HLO instead of
+        being fused into the body's.
+        """
+        output_targets: list[tuple[object, str, Callable]] = []
+        compiled_fns: dict[str, Callable] = {}
+
+        if not _wrap_with_tpu_compile(self.model.model, "forward"):
+            logger.warning(
+                "Split-compile expected %s.model.forward but it is missing; "
+                "falling back to single-compile.",
+                type(self.model).__name__,
+            )
+            return self._install_single_compile()
+        compiled_fns["model.forward"] = self.model.model.forward
+
+        lp = self.model.logits_processor
+        if not _wrap_with_tpu_compile(lp, "forward"):
+            logger.warning(
+                "Split-compile expected %s.logits_processor.forward but it "
+                "is missing; body compiled, LP left in eager.",
+                type(self.model).__name__,
+            )
+            return output_targets, compiled_fns
+        output_targets.append((lp, "forward", lp.forward))
+        compiled_fns["logits_processor.forward"] = lp.forward
+
+        # ``forward_split_prefill`` (when exposed) is compiled to populate
+        # the HLO cache but not added to ``output_targets`` — see
+        # docstring.
+        if _wrap_with_tpu_compile(self.model, "forward_split_prefill"):
+            compiled_fns["forward_split_prefill"] = self.model.forward_split_prefill
+
+        logger.info(
+            "Split-compile: wrapped %s.model.forward, "
+            "%s.logits_processor.forward%s with torch.compile.",
+            type(self.model).__name__,
+            type(self.model).__name__,
+            (
+                ", " + type(self.model).__name__ + ".forward_split_prefill"
+                if "forward_split_prefill" in compiled_fns
+                else ""
+            ),
+        )
+        return output_targets, compiled_fns
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

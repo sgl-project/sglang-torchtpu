@@ -43,21 +43,31 @@ _BS_CPU_LIST_FIELDS = (
     "extend_logprob_start_lens_cpu",
 )
 
-_REAL_Q_KEY = "_tpu_real_q"
+_REAL_T_KEY = "_tpu_real_t"
 _REAL_B_KEY = "_tpu_real_b"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
 
-def _static_default_kwargs(fn: Callable) -> dict:
-    signature = getattr(fn, "__signature__", None)
-    if signature is None:
-        return {}
+def _static_default_kwargs(signature: inspect.Signature) -> dict:
+    """Return parameter defaults that match Dynamo's "explicit-default ==
+    omitted" guard collapse — only None / bool / int / float / str defaults
+    are normalized (containers and custom defaults are kept as-is)."""
     return {
         name: param.default
         for name, param in signature.parameters.items()
         if param.default is not inspect.Parameter.empty
         and isinstance(param.default, _DEFAULT_KWARG_TYPES)
     }
+
+
+def _resolve_signature(compiled_fn: Callable) -> inspect.Signature:
+    """Return ``compiled_fn``'s signature, preferring an explicit
+    ``__signature__`` (set by :func:`_wrap_with_tpu_compile` on torch.compile
+    wrappers) over the inferred one."""
+    sig = getattr(compiled_fn, "__signature__", None)
+    if sig is not None:
+        return sig
+    return inspect.signature(compiled_fn)
 
 
 def _matches_default(value, default) -> bool:
@@ -85,10 +95,10 @@ def _pad_forward_batch_inputs(
         )
 
     is_decode = forward_batch.forward_mode.is_decode()
-    real_q = forward_batch.input_ids.shape[0]
+    real_t = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
 
-    pad_t = (b_bucketer if is_decode else t_bucketer).next_bucket(real_q)
+    pad_t = (b_bucketer if is_decode else t_bucketer).next_bucket(real_t)
     pad_b = b_bucketer.next_bucket(real_b)
 
     for field in _TOKEN_FIELDS:
@@ -108,21 +118,64 @@ def _pad_forward_batch_inputs(
 
     forward_batch.batch_size = pad_b
 
-    return real_q, real_b
+    return real_t, real_b
 
 
 class CompiledForwardShim:
-    """Adapt compiled forward calls and outputs for padded execution."""
+    """Adapt a compiled fn that returns ``LogitsProcessorOutput`` (or a
+    plain ``hidden_states`` tensor) for padded execution.
+
+    Used for both ``ForCausalLM.forward`` (single-compile) and
+    ``LogitsProcessor.forward`` (split-compile). The wrapped fn's
+    signature is introspected at init time to locate ``forward_batch``
+    by parameter name, so the same shim works for any call shape that
+    includes a ``forward_batch`` parameter — no hardcoded positional
+    indices, no per-signature subclass.
+
+    After the call, slices any ``next_token_logits`` and ``hidden_states``
+    fields on the output back to the real ``(b, t)`` recorded by
+    :func:`_pad_forward_batch_inputs`. Plain-tensor returns (the body's
+    ``hidden_states``) are passed through unchanged — the LP's
+    ``last_index`` indexing already selects only real positions, so the
+    body's output never needs explicit slicing.
+
+    ``functools.update_wrapper`` is required so Dynamo introspection
+    (``inspect.signature``, ``__wrapped__``) sees the real underlying
+    callable instead of the shim.
+    """
 
     def __init__(self, compiled_fn):
         self.fn = compiled_fn
-        signature = getattr(compiled_fn, "__signature__", None)
-        if signature is not None:
-            self.__signature__ = signature
-        self._default_kwargs = _static_default_kwargs(compiled_fn)
+        signature = _resolve_signature(compiled_fn)
+        self.__signature__ = signature
+        self._default_kwargs = _static_default_kwargs(signature)
+        # Cache the positional index of ``forward_batch`` for fast lookup
+        # in ``__call__``. ``None`` means "the wrapped fn doesn't take a
+        # ``forward_batch`` parameter by name"; the call-time fallback
+        # then scans ``args`` for an isinstance match.
+        params = list(signature.parameters)
+        self._fb_index = (
+            params.index("forward_batch") if "forward_batch" in params else None
+        )
         functools.update_wrapper(self, compiled_fn)
 
-    def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
+    def _find_forward_batch(self, args, kwargs):
+        fb = kwargs.get("forward_batch")
+        if fb is not None:
+            return fb
+        if self._fb_index is not None and self._fb_index < len(args):
+            return args[self._fb_index]
+        # Last-resort fallback: scan positional args for a ForwardBatch
+        # instance. Covers signatures that name the param differently
+        # (none in-tree today) and keeps the shim robust to renames.
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        for a in args:
+            if isinstance(a, ForwardBatch):
+                return a
+        return None
+
+    def __call__(self, *args, **kwargs):
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as
             # different call shapes; drop explicit default values.
@@ -134,11 +187,16 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
-        out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
 
-        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        out = self.fn(*args, **kwargs)
+
+        forward_batch = self._find_forward_batch(args, kwargs)
+        if forward_batch is None:
+            return out
+
+        real_t = getattr(forward_batch, _REAL_T_KEY, None)
         real_b = getattr(forward_batch, _REAL_B_KEY, None)
-        if real_q is None or real_b is None:
+        if real_t is None or real_b is None:
             return out
 
         next_token_logits = getattr(out, "next_token_logits", None)
@@ -146,8 +204,8 @@ class CompiledForwardShim:
             out.next_token_logits = next_token_logits[:real_b]
 
         hidden_states = getattr(out, "hidden_states", None)
-        if hidden_states is not None and real_q < hidden_states.shape[0]:
-            out.hidden_states = hidden_states[:real_q]
+        if hidden_states is not None and real_t < hidden_states.shape[0]:
+            out.hidden_states = hidden_states[:real_t]
 
         # Restore real batch_size so downstream consumers (sampler,
         # logprob, scheduler hooks) don't iterate over ghost slots.
@@ -195,12 +253,31 @@ def resolve_compile_caps(
 
 
 class TpuCompiledForwardShim:
-    """Installs bucket padding and compiled-forward adaptation."""
+    """Installs bucket padding and compiled-forward adaptation.
 
-    def __init__(self, model_runner, compiled_fns: dict[str, Callable]):
+    Responsibility split:
+
+    * Always patches ``model.prepare_forward_batch`` with the bucket-pad
+      step so attention metadata + the model's own forward see padded
+      inputs.
+    * For each ``(owner, attr, fn)`` triple in ``output_targets``, wraps
+      ``fn`` with :class:`CompiledForwardShim` and installs it as
+      ``owner.attr``. The caller (typically :class:`TpuGraphRunner`)
+      decides exactly which fns emit ``LogitsProcessorOutput`` and need
+      output slicing — letting different compile shapes
+      (single-compile vs. split-compile) pick different frontiers
+      without an extra opt-out flag.
+    """
+
+    def __init__(
+        self,
+        model_runner,
+        *,
+        output_targets: list[tuple[object, str, Callable]],
+    ):
         self.model_runner = model_runner
         self.model = model_runner.model
-        self._compiled_fns = compiled_fns
+        self._output_targets = list(output_targets)
 
         server_args = model_runner.server_args
         max_t, max_b = resolve_compile_caps(
@@ -227,22 +304,24 @@ class TpuCompiledForwardShim:
         def _prepare(forward_batch):
             if existing_prep is not None:
                 existing_prep(forward_batch)
-            real_q, real_b = _pad_forward_batch_inputs(
+            real_t, real_b = _pad_forward_batch_inputs(
                 forward_batch, t_bucketer, b_bucketer
             )
-            setattr(forward_batch, _REAL_Q_KEY, real_q)
+            setattr(forward_batch, _REAL_T_KEY, real_t)
             setattr(forward_batch, _REAL_B_KEY, real_b)
 
         self.model.prepare_forward_batch = _prepare
 
-        for attr, compiled_fn in self._compiled_fns.items():
-            setattr(self.model, attr, CompiledForwardShim(compiled_fn))
+        for owner, attr, compiled_fn in self._output_targets:
+            setattr(owner, attr, CompiledForwardShim(compiled_fn))
 
         logger.info(
-            "[compiled forward shim] Installed compiled-forward adaptation on %s.{%s} "
-            "(t-bucketer=%s, b-bucketer=%s).",
-            type(self.model).__name__,
-            ", ".join(self._compiled_fns),
+            "[compiled forward shim] Installed compiled-forward adaptation; "
+            "output shims on %s (t-bucketer=%s, b-bucketer=%s).",
+            [
+                f"{type(owner).__name__}.{attr}"
+                for owner, attr, _ in self._output_targets
+            ],
             self.t_bucketer.name,
             self.b_bucketer.name,
         )

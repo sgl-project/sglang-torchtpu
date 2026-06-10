@@ -42,6 +42,27 @@ class _ForwardModeMock:
         return self._mode == "decode"
 
 
+def _make_compiled(return_value, *, signature_of=None):
+    """Build a MagicMock whose ``__signature__`` matches a real model
+    method. The shim looks up ``forward_batch`` by parameter name, so
+    bare MagicMocks miss the fast path and fall back to ``isinstance``;
+    tests that exercise the slicing logic need a named ``forward_batch``
+    in the signature.
+
+    ``signature_of`` accepts a real callable (e.g. a stand-in
+    ``model.forward`` shape) and copies its signature onto the mock.
+    Defaults to the canonical body-forward signature.
+    """
+
+    def _default_body_forward(input_ids, positions, forward_batch):
+        pass
+
+    sig_source = signature_of if signature_of is not None else _default_body_forward
+    compiled = MagicMock(return_value=return_value)
+    compiled.__signature__ = inspect.signature(sig_source)
+    return compiled
+
+
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
     extend = mode == "extend"
@@ -83,12 +104,12 @@ class TestPadForwardBatchInputs(CustomTestCase):
     def test_extend_single_req(self):
         # tokens=4 -> bucket 8; bs=1 already a bucket.
         fb = _forward_batch(real_t=4, real_b=1, mode="extend")
-        real_q, real_b = _pad_forward_batch_inputs(
+        real_t, real_b = _pad_forward_batch_inputs(
             fb,
             t_bucketer=_bucketer("Token", [8, 64]),
             b_bucketer=_bucketer("Bs", [1, 4]),
         )
-        self.assertEqual((real_q, real_b), (4, 1))
+        self.assertEqual((real_t, real_b), (4, 1))
         self.assertEqual(fb.input_ids.shape[0], 8)
         self.assertEqual(fb.positions.shape[0], 8)
         self.assertEqual(fb.out_cache_loc.shape[0], 4)
@@ -98,12 +119,12 @@ class TestPadForwardBatchInputs(CustomTestCase):
     def test_extend_batched(self):
         # tokens=10 -> 16; bs=3 -> 4; ghost slots zero-filled.
         fb = _forward_batch(real_t=10, real_b=3, mode="extend")
-        real_q, real_b = _pad_forward_batch_inputs(
+        real_t, real_b = _pad_forward_batch_inputs(
             fb,
             t_bucketer=_bucketer("Token", [16, 64]),
             b_bucketer=_bucketer("Bs", [1, 4]),
         )
-        self.assertEqual((real_q, real_b), (10, 3))
+        self.assertEqual((real_t, real_b), (10, 3))
         self.assertEqual(fb.input_ids.shape[0], 16)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.req_pool_indices.shape[0], 4)
@@ -165,18 +186,24 @@ class TestPadForwardBatchInputs(CustomTestCase):
 
 class TestDefaultKwargHelpers(CustomTestCase):
     def test_static_default_kwargs_filters_to_simple_defaults(self):
+        # ``_static_default_kwargs`` now takes a ``Signature`` directly —
+        # the caller is responsible for resolving it. Containers and
+        # custom-class defaults are filtered out (only None / bool / int /
+        # float / str are considered "Dynamo-collapsible").
         def forward(a, b=None, c=False, d=3, e=1.5, f="x", g=torch.zeros(1)):
             pass
 
-        compiled = MagicMock()
-        compiled.__signature__ = inspect.signature(forward)
+        sig = inspect.signature(forward)
         self.assertEqual(
-            _static_default_kwargs(compiled),
+            _static_default_kwargs(sig),
             {"b": None, "c": False, "d": 3, "e": 1.5, "f": "x"},
         )
 
-    def test_static_default_kwargs_missing_signature_returns_empty(self):
-        self.assertEqual(_static_default_kwargs(MagicMock()), {})
+    def test_static_default_kwargs_no_defaults_returns_empty(self):
+        def forward(a, b, c):
+            pass
+
+        self.assertEqual(_static_default_kwargs(inspect.signature(forward)), {})
 
     def test_matches_default_is_type_strict(self):
         self.assertTrue(_matches_default(None, None))
@@ -191,14 +218,14 @@ class TestCompiledForwardShim(CustomTestCase):
     def test_slices_logits_and_hidden_states(self):
         padded_logits = torch.arange(4 * 10, dtype=torch.float32).reshape(4, 10)
         padded_hidden = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
-        compiled = MagicMock(
-            return_value=SimpleNamespace(
+        compiled = _make_compiled(
+            SimpleNamespace(
                 next_token_logits=padded_logits,
                 hidden_states=padded_hidden,
             )
         )
         shim = CompiledForwardShim(compiled)
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(_tpu_real_t=4, _tpu_real_b=2)
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -206,9 +233,9 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
 
     def test_passes_args_through(self):
-        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled = _make_compiled(SimpleNamespace())
         shim = CompiledForwardShim(compiled)
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(_tpu_real_t=4, _tpu_real_b=2)
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
 
@@ -228,7 +255,7 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled)
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(_tpu_real_t=4, _tpu_real_b=2)
         shim("ids", "pos", fb, pp_proxy_tensors=None)
         compiled.assert_called_once_with("ids", "pos", fb)
 
@@ -239,7 +266,7 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled)
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(_tpu_real_t=4, _tpu_real_b=2)
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
 
@@ -249,7 +276,7 @@ class TestCompiledForwardShim(CustomTestCase):
             next_token_logits=torch.zeros(4, 10),
             hidden_states=torch.zeros(8, 5),
         )
-        shim = CompiledForwardShim(MagicMock(return_value=out_obj))
+        shim = CompiledForwardShim(_make_compiled(out_obj))
         out = shim(None, None, SimpleNamespace())
         self.assertIs(out, out_obj)
 
@@ -259,8 +286,8 @@ class TestCompiledForwardShim(CustomTestCase):
             next_token_logits=torch.zeros(2, 10),
             hidden_states=torch.zeros(4, 5),
         )
-        shim = CompiledForwardShim(MagicMock(return_value=out_obj))
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        shim = CompiledForwardShim(_make_compiled(out_obj))
+        fb = SimpleNamespace(_tpu_real_t=4, _tpu_real_b=2)
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -269,11 +296,11 @@ class TestCompiledForwardShim(CustomTestCase):
         # Compiled-forward padding set batch_size to pad_b; the
         # shim must restore real_b so downstream consumers (sampler,
         # logprob, scheduler hooks) don't iterate over ghost slots.
-        compiled = MagicMock(
-            return_value=SimpleNamespace(next_token_logits=torch.zeros(4, 10))
+        compiled = _make_compiled(
+            SimpleNamespace(next_token_logits=torch.zeros(4, 10))
         )
         shim = CompiledForwardShim(compiled)
-        fb = SimpleNamespace(_tpu_real_q=8, _tpu_real_b=2, batch_size=4)
+        fb = SimpleNamespace(_tpu_real_t=8, _tpu_real_b=2, batch_size=4)
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 2)
 
@@ -281,7 +308,7 @@ class TestCompiledForwardShim(CustomTestCase):
         # forward_idle / split_prefill skip the pad hook, so the slicer
         # must not mutate batch_size in that case.
         fb = SimpleNamespace(batch_size=4)
-        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled = _make_compiled(SimpleNamespace())
         shim = CompiledForwardShim(compiled)
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 4)
@@ -426,7 +453,8 @@ class TestCompiledForwardShimInstall(CustomTestCase):
         runner = self._model_runner_with(model)
 
         TpuCompiledForwardShim(
-            runner, compiled_fns={"forward": original_forward}
+            runner,
+            output_targets=[(model, "forward", original_forward)],
         ).install()
 
         self.assertTrue(callable(getattr(model, "prepare_forward_batch", None)))
@@ -444,15 +472,121 @@ class TestCompiledForwardShimInstall(CustomTestCase):
         runner = self._model_runner_with(model)
 
         TpuCompiledForwardShim(
-            runner, compiled_fns={"forward": model.forward}
+            runner,
+            output_targets=[(model, "forward", model.forward)],
         ).install()
         self.assertIsNot(model.prepare_forward_batch, existing_prep)
 
         fb = _forward_batch(real_t=4, real_b=1, mode="extend")
         model.prepare_forward_batch(fb)
         existing_prep.assert_called_once_with(fb)
-        self.assertEqual(fb._tpu_real_q, 4)
+        self.assertEqual(fb._tpu_real_t, 4)
         self.assertEqual(fb._tpu_real_b, 1)
+
+    def test_install_wraps_multiple_targets_on_different_owners(self):
+        """Split-compile lands the shim on ``model.logits_processor.forward``;
+        verify multi-owner ``output_targets`` works (the case the dotted-attr
+        workaround used to fail on)."""
+
+        class _Body:
+            pass
+
+        class _LP:
+            pass
+
+        class _Outer:
+            pass
+
+        model = _Outer()
+        model.model = _Body()
+        model.logits_processor = _LP()
+
+        body_fn = MagicMock()
+        lp_fn = MagicMock()
+        model.model.forward = body_fn
+        model.logits_processor.forward = lp_fn
+        runner = self._model_runner_with(model)
+
+        TpuCompiledForwardShim(
+            runner,
+            output_targets=[
+                (model.model, "forward", body_fn),
+                (model.logits_processor, "forward", lp_fn),
+            ],
+        ).install()
+
+        self.assertIsInstance(model.model.forward, CompiledForwardShim)
+        self.assertIsInstance(model.logits_processor.forward, CompiledForwardShim)
+        self.assertIs(model.model.forward.fn, body_fn)
+        self.assertIs(model.logits_processor.forward.fn, lp_fn)
+        # Outer ``model.forward`` (uncompiled orchestrator) is untouched.
+        self.assertFalse(hasattr(model, "forward"))
+
+
+class TestCompiledForwardShimSignatureAware(CustomTestCase):
+    """The unified shim locates ``forward_batch`` via signature
+    introspection (one shim class for body / LP / split-prefill)."""
+
+    def test_lp_signature_slicing(self):
+        """LP signature is ``(input_ids, hidden_states, lm_head, forward_batch,
+        ...)``; the shim must still slice on a 4th-positional ``forward_batch``."""
+
+        def lp_forward(input_ids, hidden_states, lm_head, forward_batch,
+                       aux_hidden_states=None):
+            pass
+
+        padded_logits = torch.arange(8 * 10, dtype=torch.float32).reshape(8, 10)
+        compiled = _make_compiled(
+            SimpleNamespace(next_token_logits=padded_logits, hidden_states=None),
+            signature_of=lp_forward,
+        )
+        shim = CompiledForwardShim(compiled)
+
+        # _fb_index reflects the LP signature (4th positional = index 3).
+        self.assertEqual(shim._fb_index, 3)
+
+        fb = SimpleNamespace(_tpu_real_t=8, _tpu_real_b=2)
+        out = shim("ids", torch.zeros(8, 16), "lm_head", fb)
+        self.assertEqual(out.next_token_logits.shape, (2, 10))
+
+    def test_forward_batch_via_kwarg(self):
+        """``forward_batch=`` passed as a keyword still routes to the slicer."""
+        padded_logits = torch.zeros(4, 10)
+        compiled = _make_compiled(
+            SimpleNamespace(next_token_logits=padded_logits, hidden_states=None)
+        )
+        shim = CompiledForwardShim(compiled)
+        fb = SimpleNamespace(_tpu_real_t=4, _tpu_real_b=2)
+        out = shim("ids", "pos", forward_batch=fb)
+        self.assertEqual(out.next_token_logits.shape, (2, 10))
+
+    def test_isinstance_fallback_when_param_renamed(self):
+        """If the wrapped fn names the param differently (no in-tree fn does
+        today, but the shim should be robust), the call-time isinstance fallback
+        recovers it from positional args."""
+        # Import the real ForwardBatch and use a synthetic instance.
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+        def oddly_named(ids, hidden_states, lm_head, fb_state, **kwargs):
+            pass
+
+        compiled = _make_compiled(
+            SimpleNamespace(
+                next_token_logits=torch.zeros(4, 10), hidden_states=None
+            ),
+            signature_of=oddly_named,
+        )
+        shim = CompiledForwardShim(compiled)
+        # `forward_batch` is not in the signature → no fast-path index cached.
+        self.assertIsNone(shim._fb_index)
+
+        # Real ForwardBatch instance (sentinel only — we never inspect any of
+        # its real fields here, just isinstance).
+        fb = ForwardBatch.__new__(ForwardBatch)
+        fb._tpu_real_t = 4
+        fb._tpu_real_b = 2
+        out = shim("ids", torch.zeros(4, 8), "lm", fb)
+        self.assertEqual(out.next_token_logits.shape, (2, 10))
 
 
 if __name__ == "__main__":

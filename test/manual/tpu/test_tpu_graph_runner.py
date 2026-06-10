@@ -10,9 +10,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    CompiledForwardShim,
     TpuCompiledForwardShim,
 )
-from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
+from sglang.srt.model_executor.tpu_graph_runner import (
+    TpuGraphRunner,
+    _can_split_compile,
+)
 from sglang.test.test_utils import CustomTestCase
 
 PRECOMPILE_ALL = (
@@ -161,6 +165,132 @@ class TestTpuGraphRunner(CustomTestCase):
         # be False for every forward mode so the replay path stays off.
         runner = TpuGraphRunner(self._runner_for(_model_with(forward=MagicMock())))
         self.assertFalse(runner.can_run(MagicMock()))
+
+
+class TestCanSplitCompile(CustomTestCase):
+    """The probe that picks split-compile vs single-compile."""
+
+    def test_detects_forcausallm_shape(self):
+        model = _model_with(
+            forward=MagicMock(),
+            model=_model_with(forward=MagicMock()),
+            logits_processor=_model_with(forward=MagicMock()),
+        )
+        self.assertTrue(_can_split_compile(model))
+
+    def test_rejects_flat_model(self):
+        # No model / logits_processor sub-attrs.
+        self.assertFalse(_can_split_compile(_model_with(forward=MagicMock())))
+
+    def test_rejects_partial_shape(self):
+        # ``model.model`` present, ``model.logits_processor`` missing.
+        m = _model_with(forward=MagicMock(), model=_model_with(forward=MagicMock()))
+        self.assertFalse(_can_split_compile(m))
+
+
+class TestSplitCompileInstall(CustomTestCase):
+    """Split-compile wraps body + LP separately and leaves outer forward
+    uncompiled."""
+
+    def setUp(self):
+        # Reuse the same compile / register / precompile stubs as
+        # TestTpuGraphRunner — the assertion shape is what differs.
+        def _fake_compile(fn, **kwargs):
+            m = MagicMock(name="compiled")
+            m._wrapped_fn = fn
+            m._wrapped_kwargs = kwargs
+            return m
+
+        cp = patch(
+            "sglang.srt.model_executor.tpu_graph_runner.torch.compile",
+            side_effect=_fake_compile,
+        )
+        self.mock_compile = cp.start()
+        self.addCleanup(cp.stop)
+
+        rp = patch(
+            "sglang.srt.hardware_backend.tpu.patches._register_tpu_compile_backend"
+        )
+        rp.start()
+        self.addCleanup(rp.stop)
+
+        pp = patch(PRECOMPILE_ALL)
+        pp.start()
+        self.addCleanup(pp.stop)
+
+    def _runner_for(self, model):
+        return SimpleNamespace(
+            model=model,
+            model_config=SimpleNamespace(context_len=2048),
+            max_running_requests=1,
+            server_args=SimpleNamespace(
+                enable_torch_compile=True,
+                tpu_compile_tokens=None,
+                tpu_compile_bs=None,
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+            ),
+        )
+
+    def _build_forcausallm(self, with_split_prefill: bool = False):
+        """Build a fake ForCausalLM-shaped model with body + LP exposed."""
+
+        def body_forward(input_ids, positions, forward_batch, input_embeds=None):
+            pass
+
+        def lp_forward(
+            input_ids, hidden_states, lm_head, forward_batch, aux_hidden_states=None
+        ):
+            pass
+
+        outer = _model_with(
+            forward=MagicMock(),
+            model=_model_with(forward=body_forward),
+            logits_processor=_model_with(forward=lp_forward),
+        )
+        if with_split_prefill:
+
+            def fsp(input_ids, positions, forward_batch, split_interval, input_embeds=None):
+                pass
+
+            outer.forward_split_prefill = fsp
+        return outer
+
+    def test_wraps_body_and_lp_leaves_outer_uncompiled(self):
+        model = self._build_forcausallm()
+        original_outer_forward = model.forward
+        TpuGraphRunner(self._runner_for(model))
+
+        # Body wrapped with torch.compile only (no output shim — the LP
+        # downstream selects only real positions via last_index).
+        self.assertIsNot(model.model.forward, None)
+        self.assertNotIsInstance(model.model.forward, CompiledForwardShim)
+        # LP wrapped with CompiledForwardShim (the slicer wraps the
+        # torch.compile output here because LP returns
+        # LogitsProcessorOutput).
+        self.assertIsInstance(model.logits_processor.forward, CompiledForwardShim)
+        # Outer ForCausalLM.forward must stay uncompiled — that's the
+        # carve-out that keeps the LM-head all-gather out of the body
+        # graph.
+        self.assertIs(model.forward, original_outer_forward)
+
+    def test_compiles_split_prefill_without_output_shim(self):
+        model = self._build_forcausallm(with_split_prefill=True)
+        TpuGraphRunner(self._runner_for(model))
+
+        # forward_split_prefill is compiled (HLO cache) but NOT shim'd
+        # — the LP it calls on the final split is already shim'd, so an
+        # extra shim here would double-slice.
+        self.assertNotIsInstance(model.forward_split_prefill, CompiledForwardShim)
+        # Three compile calls: body, LP, and forward_split_prefill.
+        self.assertEqual(self.mock_compile.call_count, 3)
+
+    def test_skips_split_prefill_when_absent(self):
+        model = self._build_forcausallm(with_split_prefill=False)
+        TpuGraphRunner(self._runner_for(model))
+        # Two compile calls: body + LP. No forward_split_prefill.
+        self.assertEqual(self.mock_compile.call_count, 2)
+        self.assertFalse(hasattr(model, "forward_split_prefill"))
 
 
 if __name__ == "__main__":
