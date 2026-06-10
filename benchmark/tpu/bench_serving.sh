@@ -6,8 +6,8 @@
 # Example — Qwen3-32B, default single run (bs=64, isl=1024, osl=1024):
 #   MODEL=Qwen/Qwen3-32B ./bench_serving.sh
 #
-# Example — 1k/1k workload used for TPU EP/RPA throughput runs:
-#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 NUM_PROMPTS=640 ./bench_serving.sh
+# Example — 1k/1k workload used for TPU FP8 EP/RPA throughput runs:
+#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 NUM_PROMPTS=640 ./bench_serving.sh
 #
 # Example — exact 1k/1k c=64 for Qwen3-Coder-480B FP8:
 #   MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
