@@ -882,15 +882,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     de-interleave / un-pad (the gather/scatter kernels are layout-agnostic on
     dims >= 1).
 
-    OVERLAP MODEL: ``load_to_device_all_layers`` (used by the controller's
-    pallas_tpu path) does ONE bulk PCIe H2D of all layers' pages into a fresh
-    standalone device buffer, then issues the per-layer Pallas scatters into
-    the **live** ``kv_cache`` buffers **without a blocking sync**. The
-    forward's read of ``kv_cache[layer_id]`` is the data dependency XLA
-    schedules each scatter before. ``load_to_device_per_layer`` is kept for
-    interface compatibility but is pathological here — its per-layer
-    ``.cpu()`` sync and shared-staging slice writes serialize into a
-    ~1.5s/layer chain (see load_to_device_all_layers docstring).
+    OVERLAP MODEL: ``load_to_device_layerwise`` (called by the controller's
+    pallas_tpu path from a dedicated producer thread) does the H2D copy +
+    Pallas scatter one layer at a time, signalling a ``TpuLayerLoadingEvent``
+    per layer after each scatter is materialised. The forward's
+    ``get_key/value_buffer(L)`` blocks on that event before reading
+    ``kv_cache[L]``, providing layer-level synchronisation without device
+    streams. ``host_stage`` is the D2H backup staging buffer (used by
+    ``backup_from_device_all_layer``); ``device_stage`` is reserved upfront
+    by ``_hicache_tpu_staging_reserve_bytes`` so it does not eat into the KV
+    cache allocation.
     """
 
     device_pool: "TpuFusedMHATokenToKVPool"
@@ -923,21 +924,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         prewarm_offload_kernels(device_pool.kv_buffer, device_pool.device)
 
-        # Dedicated, per-layer-sliced staging buffers reused across transfers
-        # (avoids per-call torch.empty churn). Per-layer slices let consecutive
-        # layers stage into distinct memory, so the load scatters stay
-        # independent and XLA can overlap them. The device buffer's HBM is
-        # reserved up front by the KV-cache sizing path
-        # (model_runner_kv_cache_mixin._hicache_tpu_staging_reserve_bytes), so
-        # it does not eat into the KV cache proportion.
+        # Staging buffers for D2H backup (host_stage) and the legacy per-layer
+        # load path (device_stage). device_stage HBM is reserved upfront by
+        # _hicache_tpu_staging_reserve_bytes so it does not eat into the KV
+        # cache allocation; host_stage is used by backup_from_device_all_layer.
         self.stage_blocks = hicache_tpu_stage_blocks()
         block_shape = tuple(device_pool.kv_buffer[0].shape[1:])
         stage_shape = (self.layer_num, self.stage_blocks) + block_shape
-        # device staging = H2D load target / scatter source.
         self.device_stage = torch.zeros(
             stage_shape, dtype=self.dtype, device=device_pool.device
         )
-        # host staging = D2H backup target.
         self.host_stage = torch.empty(stage_shape, dtype=self.dtype, device="cpu")
         self._stage_overflow_warned = False
 
@@ -1059,90 +1055,6 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
             # Signal the forward: kv_cache[layer_id] is ready.
             layer_event.complete(layer_id + layer_offset)
-
-    def load_to_device_all_layers(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        """Bulk H2D load: ONE device sync + ONE PCIe transfer for ALL layers.
-
-        The per-layer path is pathological on this backend (measured 73.7s for
-        a 48-layer reload on Qwen3-30B, ~1.5s/layer of pure waiting):
-          * ``_padded_ids`` runs ``device_indices.cpu()`` — a hard torch_tpu
-            materialization sync — once PER LAYER with the same input;
-          * ``copy_`` into a *slice* of the shared ``device_stage`` lowers to a
-            functional patch op carrying the WHOLE staging buffer, so the 48
-            layer writes form a strict serial chain, and each layer's sync
-            forces the previous link to compile+run one at a time.
-
-        Here instead: pad/upload the ids once, gather all layers on host into
-        one contiguous ``[layer, p, ...]`` tensor, do ONE ``.to(device)`` (a
-        standalone materialized buffer — no patch op, no dependency on prior
-        device state), then queue the per-layer Pallas scatters lazily. Each
-        scatter depends only on the bulk buffer and its own kv_cache layer, so
-        XLA schedules them all with no intermediate syncs.
-        """
-        if io_backend != "pallas_tpu":
-            raise ValueError(
-                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
-                f"got {io_backend!r}"
-            )
-        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _scatter_fn
-
-        dst_ids, n, p = self._padded_ids(device_indices)  # ONE sync + ids upload
-        if n == 0:
-            return
-        host_pages = self._to_page_ids(host_indices).cpu()
-        # CPU gather of all layers at once: [n, layer, page, ...] (one copy).
-        host_g = self.kv_buffer[host_pages]
-        if p > n:
-            pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
-            host_g = torch.cat([host_g, pad], dim=0)
-        # [p, layer, ...] -> [layer, p, ...] so each layer's scatter source is
-        # a contiguous first-dim slice of the bulk device buffer.
-        host_g = host_g.transpose(0, 1).contiguous()
-        # ONE PCIe H2D into a fresh standalone device buffer (materialized on
-        # arrival; views of it are cheap and carry no patch-op dependencies).
-        dev_all = host_g.to(device_pool.device)
-        for layer_id in range(self.layer_num):
-            fused = device_pool.kv_buffer[layer_id]
-            # Lazy scatter into the LIVE kv_cache (unchanged semantics: the
-            # forward's read of kv_cache[layer_id] is the dependency XLA
-            # orders the scatter before).
-            fused[:] = _scatter_fn(fused, dev_all[layer_id], dst_ids)
-
-    def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        if io_backend != "pallas_tpu":
-            raise ValueError(
-                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
-                f"got {io_backend!r}"
-            )
-        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _scatter_fn
-
-        dst_ids, n, p = self._padded_ids(device_indices)
-        if n == 0:
-            return
-        host_pages = self._to_page_ids(host_indices).cpu()
-        host_g = self.kv_buffer[host_pages, layer_id]  # CPU gather [n, page, ...]
-        if p > n:
-            pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
-            host_g = torch.cat([host_g, pad], dim=0)
-        if p <= self.stage_blocks:
-            dev_src = self.device_stage[layer_id, :p]  # dedicated, per-layer slice
-        else:
-            self._warn_stage_overflow(p)
-            dev_src = torch.empty(
-                (p,) + tuple(host_g.shape[1:]),
-                dtype=self.dtype,
-                device=device_pool.device,
-            )
-        dev_src.copy_(host_g)  # PCIe H2D into the dedicated device staging buffer
-        fused = device_pool.kv_buffer[layer_id]
-        # Overlapped: scatter into the LIVE kv_cache; NO blocking sync. XLA
-        # orders the forward's read of this buffer after the scatter, and can
-        # overlap this layer's DMA with the earlier layers' compute.
-        fused[:] = _scatter_fn(fused, dev_src, dst_ids)
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
