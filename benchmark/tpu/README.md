@@ -58,6 +58,26 @@ NUM_PROMPTS=640 \
 ./bench_serving.sh
 ```
 
+TP8/EP8 480B FP8 1k/1k c=64 run:
+
+```bash
+MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=2048 \
+CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
+TORCH_COMPILE_MAX_BS=64 \
+TPU_COMPILE_TOKENS=1024 \
+TPU_COMPILE_BS="1 2 4 8 16 32 64" \
+NUM_CONTINUOUS_DECODE_STEPS=4 \
+./launch_server.sh
+
+MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+DATASET_NAME=random-ids TOKENIZE_PROMPT=1 \
+BATCH_SIZE=64 NUM_PROMPTS=64 ISL=1024 OSL=1024 \
+./bench_serving.sh
+```
+
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
 

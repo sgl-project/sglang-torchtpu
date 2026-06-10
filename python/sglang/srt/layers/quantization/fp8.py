@@ -329,6 +329,15 @@ def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
         old.untyped_storage().resize_(0)
 
 
+def _replace_tpu_param_from_cpu(param: Parameter, new_cpu: torch.Tensor) -> None:
+    device = param.data.device
+    dtype = param.data.dtype
+    old = param.data
+    param.data = torch.empty(0, dtype=dtype, device=device)
+    _free_replaced_storage(old, param.data)
+    param.data = new_cpu.to(device=device, dtype=dtype)
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -1994,10 +2003,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     "TPU FP8 MoE currently supports FP8 and block-FP8 experts only."
                 )
             for name in ("w13_weight", "w2_weight"):
-                old = getattr(layer, name).data
-                new = old.transpose(1, 2).contiguous()
-                copy_or_rebind_param(layer, name, new)
-                _free_replaced_storage(old, getattr(layer, name).data)
+                param = getattr(layer, name)
+                new_cpu = param.data.detach().cpu().transpose(1, 2).contiguous()
+                _replace_tpu_param_from_cpu(param, new_cpu)
+                del new_cpu
 
             if self.block_quant:
                 old_w13_scale = layer.w13_weight_scale_inv.data

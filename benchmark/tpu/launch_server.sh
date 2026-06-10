@@ -13,6 +13,15 @@
 #   TORCH_COMPILE_MAX_BS=64 SGLANG_TPU_DECODE_PROCESS_INTERVAL=8 \
 #   ./launch_server.sh
 #
+# Example — Qwen3-Coder-480B FP8 TP8/EP8, 1k/1k c=64:
+#   MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 TP_SIZE=8 EP_SIZE=8 \
+#   PAGE_SIZE=128 CONTEXT_LEN=2048 \
+#   CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+#   MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
+#   TORCH_COMPILE_MAX_BS=64 TPU_COMPILE_TOKENS=1024 \
+#   TPU_COMPILE_BS="1 2 4 8 16 32 64" NUM_CONTINUOUS_DECODE_STEPS=4 \
+#   ./launch_server.sh
+#
 # Example — a small model on a single chip (tp=1; auto-pins chiplet 0):
 #   MODEL=Qwen/Qwen3-0.6B TP_SIZE=1 PAGE_SIZE=32 ./launch_server.sh
 #
@@ -46,6 +55,7 @@
 #   TPU_COMPILE_TOKENS=            # optional token bucket override
 #   TPU_COMPILE_BS=                # optional bs bucket override
 #   TORCH_COMPILE_MAX_BS=$MAX_RUNNING
+#   NUM_CONTINUOUS_DECODE_STEPS=   # passed through if set
 #   SGLANG_TPU_DECODE_PROCESS_INTERVAL=
 #                                  # passed as env when set.
 #   MEM_FRACTION_STATIC=           # passed through if set (sglang default
@@ -220,6 +230,7 @@ TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 # unset to use the backend's derived powers-of-two buckets.
 TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
+NUM_CONTINUOUS_DECODE_STEPS=${NUM_CONTINUOUS_DECODE_STEPS:-}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
 DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-1}
@@ -243,6 +254,7 @@ echo "  max_prefill_tokens = ${MAX_PREFILL_TOKENS:-<unset>}"
 echo "  max_total_tokens   = ${MAX_TOTAL_TOKENS:-<unset>}"
 echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
+echo "  num_cont_decode    = ${NUM_CONTINUOUS_DECODE_STEPS:-<unset>}"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
@@ -274,6 +286,7 @@ args=(
 )
 [[ -n "$TPU_COMPILE_TOKENS" ]] && args+=(--tpu-compile-tokens $TPU_COMPILE_TOKENS)
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
+[[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")

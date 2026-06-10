@@ -2,9 +2,8 @@
 
 This backend wraps the JAX/Pallas v3 ragged_paged_attention kernel
 (``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``) and
-exposes it as a PyTorch custom op via ``torch_tpu._internal.pallas.jax_op``
-so it can be invoked from PyTorch and traced through ``torch.compile``
-with ``backend="tpu"``.
+exposes it as a PyTorch custom op so it can be invoked from PyTorch and
+traced through ``torch.compile`` with ``backend="tpu"``.
 
 Design notes
 ------------
@@ -144,11 +143,53 @@ def _build_pallas_kernel_op():
             v_scale=v_scale,
         )
 
-    # Donate ``kv_cache_fused`` (index 3) so XLA can reuse its storage for
-    # the updated cache output. Index 0 (queries) is *not* donated because
-    # SGLang's ``q`` is a fresh tensor allocated by the projection — donating
-    # it would invalidate the projection's output buffer.
-    custom_op = _torch_pallas.jax_op(op_name, _wrapped, donate_argnums=(3,))
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=(9, 10, 11, 12, 13),
+        donate_argnums=(3,),
+        input_output_aliases={3: 1},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        op_name,
+        mutates_args=("kv_cache_fused",),
+        device_types=["tpu"],
+    )
+    def custom_op(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        kv_cache_fused: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        cu_kv_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        sm_scale: float = 1.0,
+        sliding_window: Optional[int] = None,
+        soft_cap: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        output, _updated_kv = jax_kernel(
+            queries,
+            keys,
+            values,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            sm_scale,
+            sliding_window,
+            soft_cap,
+            k_scale,
+            v_scale,
+        )
+        return output
 
     def _fake_impl(
         queries: torch.Tensor,
@@ -158,12 +199,7 @@ def _build_pallas_kernel_op():
         *args,
         **kwargs,
     ):
-        # The kernel returns ``(output, updated_kv_cache_fused)`` with the
-        # same dtypes/shapes as ``queries`` and ``kv_cache_fused``. Returning
-        # ``empty_like`` here lets ``torch.compile`` handle dynamic token
-        # dimensions without invoking the (expensive, shape-specialised)
-        # JAX tracer.
-        return torch.empty_like(queries), torch.empty_like(kv_cache_fused)
+        return torch.empty_like(queries)
 
     custom_op.register_fake(_fake_impl)
 
@@ -183,8 +219,9 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     backend is active.
     """
 
-    # RPA-v3 writes updated KV pages back via copy_(), outside returned tensors.
-    requires_kv_sync_after_compile = True
+    # The torch custom op exposes KV updates as an in-place mutation, so syncing
+    # model outputs during TPU precompile is enough to execute the graph.
+    requires_kv_sync_after_compile = False
 
     def __init__(self, model_runner: "ModelRunner") -> None:
         super().__init__()
@@ -367,7 +404,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
-        out, updated_kv = op(
+        out = op(
             q,
             k,
             v,
@@ -383,14 +420,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             k_scale,
             v_scale,
         )
-        # ``donate_argnums=(3,)`` lets XLA alias the input KV cache with the
-        # output; in that common path the explicit ``copy_`` below is a
-        # storage-aliased no-op. When XLA chooses *not* to alias (e.g. on
-        # platforms / kernels where donation cannot be honoured) this copy
-        # is what propagates the updated cache back into the pool. It also
-        # gives dynamo a concrete in-place mutation edge between the kernel
-        # output and the long-lived KV buffer.
-        kv_cache.copy_(updated_kv)
 
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 

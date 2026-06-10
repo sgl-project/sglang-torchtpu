@@ -9,6 +9,12 @@
 # Example — 1k/1k workload used for TPU EP/RPA throughput runs:
 #   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 NUM_PROMPTS=640 ./bench_serving.sh
 #
+# Example — exact 1k/1k c=64 for Qwen3-Coder-480B FP8:
+#   MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+#   DATASET_NAME=random-ids TOKENIZE_PROMPT=1 \
+#   BATCH_SIZE=64 NUM_PROMPTS=64 ISL=1024 OSL=1024 \
+#   ./bench_serving.sh
+#
 # Example — Qwen3-32B concurrency/shape sweep:
 #   MODEL=Qwen/Qwen3-32B SWEEP="16:8192:512 64:8192:512" WARMUP_REQUESTS=auto ./bench_serving.sh
 # Each SWEEP token is "concurrency:isl:osl". The server's max-running-requests
