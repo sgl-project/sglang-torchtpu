@@ -6,6 +6,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -67,6 +68,14 @@ class TpuSRTPlatform(SRTPlatform):
 
         if server_args.mem_fraction_static is None:
             server_args.mem_fraction_static = 0.40
+
+        # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
+        # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
+        # axis. SGLang's global page_size=1 default is valid for token-granular
+        # GPU kernels, but is inefficient here: it makes page_indices
+        # token-granular and turns KV fetches into many tiny DMAs.
+        if server_args.page_size is None:
+            server_args.page_size = 64
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -149,6 +158,12 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
+        # Keep c10d_functional collectives inside the compiled graph. torch_tpu
+        # defaults to materializing collective tensors by forcing graph breaks, which
+        # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
+        # disables that guardrail for SPMD TP graphs.
+        os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
+
         import torch_tpu  # noqa: F401
 
         from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches

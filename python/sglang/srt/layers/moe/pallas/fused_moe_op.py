@@ -14,17 +14,18 @@ the op as an opaque tensor-in / tensor-out call.
 MoE math (single host, no shard_map)
 ------------------------------------
 For each token, top-``k`` experts are activated. We do the standard
-"permute / GMM1 / activation / GMM2 / un-permute / weighted-reduce"
+"permute / GMM1(+fused act) / GMM2 / un-permute / weighted-reduce"
 pipeline:
 
 1. Flatten ``topk_ids`` (``[m, topk]``) → ``[m * topk]``.
 2. ``argsort`` the flattened expert ids; rows of the LHS become
    contiguous blocks per expert. ``group_sizes[e] = #(topk_ids == e)``.
 3. Gather rows of ``hidden_states`` into the sorted order.
-4. GMM1: ``x_sorted @ w1[e] -> [m*topk, 2*intermediate]`` (gate || up).
-5. Apply gated activation (``silu(gate) * up`` for ``"silu"`` / SwiGLU).
-6. GMM2: ``act_out @ w2[e] -> [m*topk, hidden]``.
-7. Scatter back and reduce with ``topk_weights``.
+4. GMM1: ``x_sorted @ w1[e]`` with the gated activation fused in-kernel
+   (``fuse_act``): the [.., 2*intermediate] gate||up accumulator is reduced
+   to ``act(gate) * up -> [m*topk, intermediate]`` before write-out.
+5. GMM2: ``gmm1_out @ w2[e] -> [m*topk, hidden]``.
+6. Scatter back and reduce with ``topk_weights``.
 
 Weight layout
 -------------
@@ -38,8 +39,7 @@ Activation
 ----------
 Only ``"silu"`` (SwiGLU: ``silu(gate) * up``) is exercised today, which
 is what Qwen3-MoE uses. ``"gelu"`` is supported for parity with the
-mxfp4 path. ``"swiglu_oai"`` is plumbed through but raises at trace
-time until the GPT-OSS-specific clamping is wired up.
+mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here —
@@ -63,7 +63,7 @@ _PALLAS_MOE_OP = None
 
 # ---- JAX kernel body -------------------------------------------------------
 #
-# ``_fused_moe_jax`` (with ``_activation`` and ``_lookup_tile_info``) is the
+# ``_fused_moe_jax`` (with ``_fuse_act_name`` and ``_lookup_tile_info``) is the
 # function that ``torch_tpu._internal.pallas.jax_op`` exports and that all the
 # per-shape JAX traces specialise. It lives at module scope (not in the
 # ``_build_fused_moe_op`` closure) so unit tests can import and call it
@@ -116,30 +116,26 @@ def _lookup_tile_info(lhs, rhs, num_total_groups):
     return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
 
 
-def _activation(gmm1_out, activation_name):
-    """Apply the gated activation to a ``[m*topk, 2*n]`` GMM1 output.
+def _fuse_act_name(activation_name):
+    """Map SGLang's activation name to gmm_v2's ``fuse_act`` string.
 
-    Returns the ``[m*topk, n]`` post-activation tensor consumed by GMM2.
+    The gated activation now runs *in-kernel* in GMM1 (gmm_v2 splits the
+    ``2*n`` gate/up accumulator and applies ``act(gate) * up`` before writing
+    only ``n`` columns to HBM). ``gmm_v2.apply_act_fn`` accepts
+    ``silu`` / ``gelu`` / ``swigluoai``; SGLang spells the GPT-OSS one
+    ``swiglu_oai``.
     """
-    import jax
-
-    # TODO(Qinghan): case/switch
-    n = gmm1_out.shape[-1] // 2
-    gate, up = gmm1_out[:, :n], gmm1_out[:, n:]
-    if activation_name == "silu":
-        return jax.nn.silu(gate) * up
-    if activation_name == "gelu":
-        return jax.nn.gelu(gate) * up
-    if activation_name == "swiglu_oai":
+    mapping = {
+        "silu": "silu",
+        "gelu": "gelu",
+        "swiglu_oai": "swigluoai",
+    }
+    if activation_name not in mapping:
         raise NotImplementedError(
-            "swiglu_oai gating in the Pallas fused-MoE op is not wired "
-            "up yet; the GPT-OSS path still goes through the mxfp4 "
-            "specialised forward."
+            f"Unsupported activation '{activation_name}' for the Pallas "
+            "fused-MoE op. Supported: silu, gelu, swiglu_oai."
         )
-    raise NotImplementedError(
-        f"Unsupported activation '{activation_name}' for the Pallas "
-        "fused-MoE op. Supported: silu, gelu."
-    )
+    return mapping[activation_name]
 
 
 def _fused_moe_jax(
@@ -208,6 +204,12 @@ def _fused_moe_jax(
 
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
+    # GMM1: gate/up projection with the gated activation fused in-kernel.
+    # ``fuse_act`` makes gmm_v2 split the [.., 2*n] accumulator and write only
+    # [.., n] = act(gate) * up, avoiding a full materialize of the 2*n tensor
+    # to HBM plus a separate activation pass. The fused path uses gmm_v2's own
+    # fuse_act-aware tiling (``tile_n`` is per-projection when fused), so we do
+    # *not* pass the non-fused tuned tile_info here.
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
@@ -215,21 +217,18 @@ def _fused_moe_jax(
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
         preferred_element_type=out_dtype,
-        tile_info=_lookup_tile_info(x_sorted, w1, num_experts),
-    )  # [m*topk, 2 * n_intermediate]
-
-    # Gated activation.
-    act_out = _activation(gmm1_out, activation_name)
+        fuse_act=_fuse_act_name(activation_name),
+    )  # [m*topk, n_intermediate]
 
     # GMM2: project back to hidden size.
     gmm2_out = gmm_v2(
-        lhs=act_out,
+        lhs=gmm1_out,
         rhs=w2,
         group_sizes=group_sizes,
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
-        tile_info=_lookup_tile_info(act_out, w2, num_experts),
+        tile_info=_lookup_tile_info(gmm1_out, w2, num_experts),
     )  # [m*topk, k]
 
     # Un-permute back to token-major order and reduce across the top-k

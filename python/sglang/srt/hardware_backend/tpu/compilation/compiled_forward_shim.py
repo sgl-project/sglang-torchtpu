@@ -23,6 +23,8 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
 
 logger = get_logger(__name__)
 
+DEFAULT_TPU_COMPILE_MAX_BS = 64
+
 # Fields whose token dim gets padded to the token bucket.
 _TOKEN_FIELDS = ("input_ids", "positions")
 
@@ -88,8 +90,14 @@ def _pad_forward_batch_inputs(
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
 
-    pad_t = (b_bucketer if is_decode else t_bucketer).next_bucket(real_q)
-    pad_b = b_bucketer.next_bucket(real_b)
+    if is_decode:
+        pad_t = b_bucketer.next_bucket(real_q)
+        pad_b = b_bucketer.next_bucket(real_b)
+    else:
+        # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
+        # the full token_bucket x batch_bucket cross product.
+        pad_b = b_bucketer.max_val
+        pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
 
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
@@ -175,21 +183,24 @@ def resolve_compile_caps(
             "Cannot determine max_t for TPU compile bucketing: "
             "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
         )
-    # Use the compile knob for the batch grid; max_running_requests is a
-    # scheduler capacity and can be much larger than useful compile shapes.
-    max_b = torch_compile_max_bs or max_running_requests or 1
-    if (
-        torch_compile_max_bs
-        and max_running_requests
-        and torch_compile_max_bs < max_running_requests
-    ):
+    # TPU serving should compile the requested scheduler capacity by default for
+    # practical benchmark sizes (for example max_running_requests=64). Avoid
+    # blindly expanding to very large upstream defaults unless the user raises
+    # torch_compile_max_bs or pins --tpu-compile-bs.
+    max_running_compile_bs = (
+        min(max_running_requests, DEFAULT_TPU_COMPILE_MAX_BS)
+        if max_running_requests
+        else 1
+    )
+    max_b = max(torch_compile_max_bs or 1, max_running_compile_bs)
+    if max_running_requests and max_b < max_running_requests:
         logger.warning(
-            "[compiled forward shim] torch_compile_max_bs=%d < max_running_requests=%d; "
+            "[compiled forward shim] TPU compile bs cap=%d < max_running_requests=%d; "
             "batches above %d are outside the TPU compile grid. Raise "
             "--torch-compile-max-bs or pin --tpu-compile-bs to cover them.",
-            torch_compile_max_bs,
+            max_b,
             max_running_requests,
-            torch_compile_max_bs,
+            max_b,
         )
     return min(candidates), max_b
 

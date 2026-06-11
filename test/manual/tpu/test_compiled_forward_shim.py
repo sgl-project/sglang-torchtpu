@@ -81,7 +81,8 @@ class TestPadForwardBatchInputs(CustomTestCase):
     """Pads ForwardBatch fields to bucket size before init_forward_metadata."""
 
     def test_extend_single_req(self):
-        # tokens=4 -> bucket 8; bs=1 already a bucket.
+        # tokens=4 -> max(tokens, bs_cap=4) -> bucket 8.
+        # Extend bs pads to the fixed cap so precompile only needs one bs.
         fb = _forward_batch(real_t=4, real_b=1, mode="extend")
         real_q, real_b = _pad_forward_batch_inputs(
             fb,
@@ -92,8 +93,8 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.input_ids.shape[0], 8)
         self.assertEqual(fb.positions.shape[0], 8)
         self.assertEqual(fb.out_cache_loc.shape[0], 4)
-        self.assertEqual(fb.seq_lens.shape[0], 1)
-        self.assertEqual(fb.extend_seq_lens.shape[0], 1)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+        self.assertEqual(fb.extend_seq_lens.shape[0], 4)
 
     def test_extend_batched(self):
         # tokens=10 -> 16; bs=3 -> 4; ghost slots zero-filled.
@@ -131,13 +132,13 @@ class TestPadForwardBatchInputs(CustomTestCase):
 
     def test_no_op_when_at_bucket(self):
         # Shapes already at bucket: tensors unchanged (same identity).
-        fb = _forward_batch(real_t=4, real_b=1, mode="extend")
+        fb = _forward_batch(real_t=4, real_b=4, mode="extend")
         orig_input_ids = fb.input_ids
         orig_seq_lens = fb.seq_lens
         _pad_forward_batch_inputs(
             fb,
             t_bucketer=_bucketer("Token", [4]),
-            b_bucketer=_bucketer("Bs", [1]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
         )
         self.assertIs(fb.input_ids, orig_input_ids)
         self.assertIs(fb.seq_lens, orig_seq_lens)
@@ -386,7 +387,27 @@ class TestResolveCompileCaps(CustomTestCase):
             torch_compile_max_bs=32,
             max_running_requests=2048,
         )
-        self.assertEqual(max_b, 32)
+        self.assertEqual(max_b, 64)
+
+    def test_max_b_uses_sane_max_running_requests(self):
+        _, max_b = resolve_compile_caps(
+            chunked_prefill_size=2048,
+            max_prefill_tokens=2048,
+            context_len=32000,
+            torch_compile_max_bs=32,
+            max_running_requests=64,
+        )
+        self.assertEqual(max_b, 64)
+
+    def test_max_b_honors_larger_torch_compile_max_bs(self):
+        _, max_b = resolve_compile_caps(
+            chunked_prefill_size=2048,
+            max_prefill_tokens=2048,
+            context_len=32000,
+            torch_compile_max_bs=128,
+            max_running_requests=64,
+        )
+        self.assertEqual(max_b, 128)
 
     def test_raises_when_no_token_cap_set(self):
         with self.assertRaisesRegex(ValueError, "Cannot determine max_t"):

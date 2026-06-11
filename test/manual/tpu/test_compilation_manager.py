@@ -95,31 +95,33 @@ class TestMakeDummyForwardBatch(CustomTestCase):
 
 
 class TestPrecompileLoops(CustomTestCase):
-    """``precompile_all`` traverses the bucket grid and fires one forward
-    per variant: EXTEND covers every (token, bs) pair where t >= bs,
-    DECODE varies bs (tokens == bs)."""
+    """``precompile_all`` fires one forward per TPU precompile variant:
+    EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
+    (tokens == bs)."""
 
-    def test_extend_iterates_full_token_bs_grid(self):
+    def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
         mgr._precompile_extend()
-        # Every (t, b) pair where t >= b: at b=1 all 3 token buckets,
-        # at b=4 all 3 — total 6.
-        self.assertEqual(mr.model.forward.call_count, 6)
-        # Order: outer loop over bs_buckets, inner over token_buckets.
+        self.assertEqual(mr.model.forward.call_count, 3)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(8, 1), (64, 1), (256, 1), (8, 4), (64, 4), (256, 4)],
+            [(8, 4), (64, 4), (256, 4)],
         )
 
     def test_extend_skips_token_bucket_below_bs(self):
-        # A 4-token bucket can't hold an 8-req extend (kernel would
-        # crash on cu_q_lens); only (64, 1), (64, 8), (4, 1) clear.
+        # A 4-token bucket can't hold the fixed 8-req extend cap.
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(4, 64), bs_buckets=(1, 8))
         mgr._precompile_extend()
-        self.assertEqual(mr.model.forward.call_count, 3)
-        self.assertEqual(mr.attn_backend.calls, [(4, 1), (64, 1), (64, 8)])
+        self.assertEqual(mr.model.forward.call_count, 1)
+        self.assertEqual(mr.attn_backend.calls, [(64, 8)])
+
+    def test_extend_raises_when_no_token_bucket_can_hold_bs_cap(self):
+        mr = _model_runner()
+        mgr = _make_manager(mr, token_buckets=(4,), bs_buckets=(8,))
+        with self.assertRaisesRegex(ValueError, "No TPU extend compile shapes"):
+            mgr._precompile_extend()
 
     def test_decode_loop_iterates_bs(self):
         mr = _model_runner()
@@ -133,9 +135,8 @@ class TestPrecompileLoops(CustomTestCase):
         mr = _model_runner()
         mgr = _make_manager(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         mgr.precompile_all()
-        # EXTEND: (8,1), (64,1), (8,4), (64,4) = 4. DECODE: (1,1), (4,4)
-        # = 2. Total = 6.
-        self.assertEqual(mr.model.forward.call_count, 6)
+        # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
+        self.assertEqual(mr.model.forward.call_count, 4)
 
 
 class TestRunOneCallsCompiledForward(CustomTestCase):

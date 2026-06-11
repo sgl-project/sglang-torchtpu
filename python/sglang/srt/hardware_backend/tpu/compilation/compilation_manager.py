@@ -66,25 +66,26 @@ class CompilationManager:
         )
 
     def _precompile_extend(self) -> None:
-        """Compile every (token_bucket, bs_bucket) combination.
+        """Compile extend at each token bucket and the fixed batch cap.
 
-        Real extend batches can land at any bs bucket (the pad shim
-        rounds bs up to ``b_bucketer.next_bucket(real_b)``), and each
-        unique (token, bs) shape is a separate HLO cache entry. Skip
-        pairs where the token bucket can't hold ``bs`` one-token reqs
-        (the kernel would crash on a degenerate cu_q_lens layout)."""
-        valid_shapes = [
-            (t, b)
-            for b in self.b_bucketer.buckets
-            for t in self.t_bucketer.buckets
-            if t >= b
-        ]
+        The runtime pad shim pads extend batch metadata to
+        ``b_bucketer.max_val``. Keeping precompile on the same policy avoids
+        the full token_bucket x batch_bucket compile grid while still covering
+        the runtime extend shapes.
+        """
+        bs = self.b_bucketer.max_val
+        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        if not valid_shapes:
+            raise ValueError(
+                "No TPU extend compile shapes are valid: token buckets "
+                f"{list(self.t_bucketer.buckets)} are all smaller than the "
+                f"extend batch cap {bs}."
+            )
         n = len(valid_shapes)
         logger.info(
-            "[compilation manager] EXTEND: %d shapes (bs_buckets=%s, "
-            "token_buckets=%s)",
+            "[compilation manager] EXTEND: %d shapes (bs=%d, " "token_buckets=%s)",
             n,
-            list(self.b_bucketer.buckets),
+            bs,
             list(self.t_bucketer.buckets),
         )
         for idx, (num_tokens, bs) in enumerate(valid_shapes, start=1):
