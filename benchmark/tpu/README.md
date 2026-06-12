@@ -9,6 +9,7 @@ no per-model files. (For the separate sglang-jax engine, see
 launch_server.sh     # start the server
 bench_serving.sh     # run sglang.bench_serving (single run or sweep)
 run_eval.sh          # run sglang.test.run_eval (e.g. MMLU, GSM8K)
+run_lm_eval.sh       # run lm-eval against a live server and check baselines
 warmup.sh            # optional compile-bucket pre-warmup (stopgap)
 warmup_buckets.py    # request-sender used by warmup.sh
 ```
@@ -30,6 +31,20 @@ MODEL=Qwen/Qwen3-32B SWEEP="16:1024:1024 64:1024:1024" ./bench_serving.sh
 # 3. Eval — defaults to EVAL_NAME=mmlu, API=chat, NUM_THREADS=4
 MODEL=Qwen/Qwen3-4B ./run_eval.sh
 MODEL=Qwen/Qwen3-4B EVAL_NAME=gsm8k ./run_eval.sh
+```
+
+Qwen3-Coder-30B FP8 TP8/EP8 quality eval:
+
+```bash
+MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=8192 \
+CHUNKED_PREFILL_SIZE=4096 MAX_PREFILL_TOKENS=4096 \
+MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
+TORCH_COMPILE_MAX_BS=64 \
+./launch_server.sh
+
+./run_lm_eval.sh
 ```
 
 Single-chip smoke (tp=1 auto-pins chiplet 0):
