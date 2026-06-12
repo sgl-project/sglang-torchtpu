@@ -277,7 +277,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         ).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
-        num_active = torch.full((), bs, dtype=torch.int32, device=device)
+        # The TPU compile shim pads batch-shaped metadata up to the selected
+        # compile bucket. Keep the padded tensor shapes, but only mark the real
+        # request rows as active so the RPA kernel does not process ghost rows.
+        real_bs = int(getattr(forward_batch, "_tpu_real_b", bs))
+        num_active = torch.tensor(real_bs, dtype=torch.int32, device=device)
         if forward_batch.forward_mode.is_decode():
             distribution = num_active.repeat(3).to(torch.int32)
         else:
