@@ -1,0 +1,27 @@
+model_name: "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+backend: "local-chat-completions"
+api: "chat"
+tasks:
+- name: "mmlu_llama"
+  metrics:
+  - name: "exact_match,strict_match"
+    value: 0.8574  # torchtpu-vllm ref; sglang-TPU TP8/EP8 limit=100 measured 0.8635
+- name: "mmlu_pro"
+  metrics:
+  - name: "exact_match,custom-extract"
+    value: 0.7687  # torchtpu-vllm ref; sglang-TPU TP8/EP8 limit=100 measured 0.7650
+limit: 100
+num_concurrent: 32
+batch_size: "auto"
+apply_chat_template: true
+fewshot_as_multiturn: true
+gen_kwargs:
+  continue_final_message: true
+  add_generation_prompt: false
+  chat_template_kwargs:
+    enable_thinking: false
+  repetition_penalty: 1.0
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+atol: 0.015
+rtol: 0.0

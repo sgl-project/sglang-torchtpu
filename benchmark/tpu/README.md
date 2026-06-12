@@ -47,6 +47,40 @@ TORCH_COMPILE_MAX_BS=64 \
 ./run_lm_eval.sh
 ```
 
+Qwen3-Coder-480B FP8 TP8/EP8 quality eval (weights dominate HBM, so use a
+low mem-fraction and fewer running requests):
+
+```bash
+MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=8192 \
+CHUNKED_PREFILL_SIZE=4096 MAX_PREFILL_TOKENS=4096 \
+MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
+MAX_RUNNING=32 TORCH_COMPILE_MAX_BS=32 \
+./launch_server.sh
+
+EVAL_CONFIG=../../test/lm_eval_configs/Qwen3-Coder-480B-A35B-Instruct-FP8-TPU.yaml \
+./run_lm_eval.sh
+```
+
+Fast vs full: `run_lm_eval.sh` runs whatever tasks the `EVAL_CONFIG` lists, so
+each model has two configs:
+- `<Model>-TPU.yaml` — **full** quality eval (`mmlu_llama` + `mmlu_pro`); run for
+  release sign-off. Needs `CONTEXT_LEN=8192` for mmlu_pro's 2048-token CoT.
+- `<Model>-TPU-fast.yaml` — **fast** gate (`mmlu_llama` only, 10-token answers);
+  lighter (skips the heavy CoT) and runs at `CONTEXT_LEN=4096`. Use for per-PR gating.
+
+```bash
+# fast gate (mmlu_llama only) against the same server:
+EVAL_CONFIG=../../test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU-fast.yaml \
+./run_lm_eval.sh
+```
+
+(gsm8k would be the cheaper sglang-style gate, but it currently crashes the
+torch_tpu server on a serve-time recompile — `InductorError: KeyError 'tpu'` for
+request shapes outside the precompiled buckets — so the fast gate uses mmlu_llama
+for now.)
+
 Single-chip smoke (tp=1 auto-pins chiplet 0):
 
 ```bash

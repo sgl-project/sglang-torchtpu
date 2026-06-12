@@ -1,0 +1,31 @@
+# Fast correctness gate: mmlu_llama only (10-token answers, ctx 4096 is enough).
+# Skips the heavy mmlu_pro 2048-token CoT in the full config, so it's lighter and
+# needs no 8k context. Use for per-PR gating.
+#
+# NOTE: gsm8k would be the cheaper/standard sglang gate, but it currently CRASHES
+# the torch_tpu server at serve time (InductorError: KeyError 'tpu' on a recompile
+# for shapes outside the precompiled buckets). Until that recompile path is fixed,
+# stick to mmlu_llama, whose shapes match the precompiled buckets.
+model_name: "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+backend: "local-chat-completions"
+api: "chat"
+tasks:
+- name: "mmlu_llama"
+  metrics:
+  - name: "exact_match,strict_match"
+    value: 0.7991  # torchtpu-vllm ref (sglang-TPU measured 0.7879)
+limit: 100
+num_concurrent: 32
+batch_size: "auto"
+apply_chat_template: true
+fewshot_as_multiturn: true
+gen_kwargs:
+  continue_final_message: true
+  add_generation_prompt: false
+  chat_template_kwargs:
+    enable_thinking: false
+  repetition_penalty: 1.0
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+atol: 0.015
+rtol: 0.0
