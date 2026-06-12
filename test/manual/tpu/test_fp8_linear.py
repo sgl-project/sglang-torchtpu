@@ -6,7 +6,6 @@ import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_linear import (
     apply_tpu_fp8_linear,
-    prebuild_tpu_fp8_linear_op,
 )
 from sglang.srt.layers.quantization.fp8 import (
     Fp8LinearMethod,
@@ -23,8 +22,6 @@ class _FakeBlockFp8Config:
 
 class TestTpuFp8Linear(CustomTestCase):
     def test_fp8_linear_runs_eager_and_compiled(self):
-        prebuild_tpu_fp8_linear_op()
-
         device = torch.device("tpu")
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
         weight_fp32 = torch.randn(128, 32, dtype=torch.float32)
@@ -41,6 +38,15 @@ class TestTpuFp8Linear(CustomTestCase):
         weight_scale = weight_scale.to(device)
 
         eager_out = apply_tpu_fp8_linear(x, weight, weight_scale)
+        x_scale = torch.clamp(
+            x.abs().amax(dim=1, keepdim=True).float() / fp8_max, min=1e-12
+        )
+        x_q = torch.clamp(x.float() / x_scale, min=-fp8_max, max=fp8_max).to(
+            torch.float8_e4m3fn
+        )
+        ref_x = x_q.float() * x_scale
+        ref_weight = weight.float() * weight_scale.reshape(1, -1).float()
+        ref = (ref_x @ ref_weight).to(torch.bfloat16)
 
         def run_fp8_linear(x, weight, weight_scale):
             return apply_tpu_fp8_linear(x, weight, weight_scale)
@@ -55,11 +61,18 @@ class TestTpuFp8Linear(CustomTestCase):
 
         self.assertEqual(eager_out.shape, (4, 32))
         self.assertEqual(eager_out.dtype, torch.bfloat16)
+        torch.testing.assert_close(eager_out.cpu(), ref.cpu(), rtol=0.25, atol=0.25)
         torch.testing.assert_close(compiled_out.cpu(), eager_out.cpu())
 
-    def test_block_fp8_linear_requantizes_and_runs(self):
-        prebuild_tpu_fp8_linear_op()
+    def test_fp8_linear_rejects_unaligned_weight(self):
+        x = torch.randn(1, 15, dtype=torch.bfloat16)
+        weight = torch.empty(15, 16, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones(16, dtype=torch.float32)
 
+        with self.assertRaisesRegex(ValueError, "multiples of 16"):
+            apply_tpu_fp8_linear(x, weight, weight_scale)
+
+    def test_block_fp8_linear_requantizes_and_runs(self):
         device = torch.device("tpu")
         out_size = 256
         in_size = 256

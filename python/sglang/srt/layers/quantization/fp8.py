@@ -576,12 +576,6 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
-        if _is_tpu and not self.use_mxfp8:
-            from sglang.srt.hardware_backend.tpu.fp8_linear import (
-                prebuild_tpu_fp8_linear_op,
-            )
-
-            prebuild_tpu_fp8_linear_op()
 
     def validate_block_quant_shapes(
         self,
@@ -1075,6 +1069,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 apply_tpu_fp8_linear,
             )
 
+            # TODO(torch_tpu): add a true block-scaled dense matmul path.
+            # TPU block-FP8 dense checkpoints are currently requantized to
+            # per-output-channel scales during loading, so the dense scaled-mm
+            # fallback is the intended runtime path here.
             return apply_tpu_fp8_linear(
                 x=x,
                 weight=layer.weight,
