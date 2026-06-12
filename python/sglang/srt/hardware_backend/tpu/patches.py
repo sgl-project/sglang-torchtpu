@@ -617,6 +617,18 @@ def _prewarm_fused_moe() -> None:
         logger.warning("TPU: fused-MoE op prewarm skipped (%s)", e)
 
 
+def _prewarm_block_fp8_matmul() -> None:
+    """Register the block-FP8 Pallas custom op before torch.compile traces it."""
+    try:
+        from sglang.srt.hardware_backend.tpu.quantized_matmul import (
+            prebuild_tpu_block_fp8_matmul_op,
+        )
+
+        prebuild_tpu_block_fp8_matmul_op()
+    except Exception as e:  # noqa: BLE001 - prewarm is best-effort
+        logger.warning("TPU: block-FP8 matmul op prewarm skipped (%s)", e)
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -629,5 +641,6 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
     _prewarm_fused_moe()  # TODO(Qinghan): this will just be temporary
+    _prewarm_block_fp8_matmul()
     _register_aten_fallbacks()
     logger.info("TPU patches applied.")

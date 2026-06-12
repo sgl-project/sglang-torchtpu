@@ -6,11 +6,9 @@ import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_linear import (
     apply_tpu_fp8_linear,
+    tpu_w8a8_block_fp8_linear,
 )
-from sglang.srt.layers.quantization.fp8 import (
-    Fp8LinearMethod,
-    _requantize_tpu_fp8_block_linear_weight,
-)
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -72,7 +70,7 @@ class TestTpuFp8Linear(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "multiples of 16"):
             apply_tpu_fp8_linear(x, weight, weight_scale)
 
-    def test_block_fp8_linear_requantizes_and_runs(self):
+    def test_block_fp8_linear_uses_block_scales_at_runtime(self):
         device = torch.device("tpu")
         out_size = 256
         in_size = 256
@@ -104,121 +102,93 @@ class TestTpuFp8Linear(CustomTestCase):
         method = Fp8LinearMethod(_FakeBlockFp8Config())
         method.process_weights_after_loading(layer)
 
-        self.assertEqual(layer.weight.shape, (in_size, out_size))
-        self.assertEqual(layer.weight_scale.shape, (out_size,))
+        self.assertEqual(layer.weight.shape, (out_size, in_size))
+        self.assertEqual(layer.weight_scale_inv.shape, (2, 2))
 
         x = torch.randn(3, in_size, dtype=torch.bfloat16, device=device)
         out = method.apply(layer, x)
-        ref = x.cpu().float() @ weight_fp32.t()
+        ref = self._block_fp8_reference(
+            x.cpu(), weight_fp8.cpu(), block_scale, [block, block]
+        )
 
         self.assertEqual(out.shape, (3, out_size))
         torch.testing.assert_close(out.cpu().float(), ref, rtol=0.25, atol=0.25)
 
-    def test_partial_tp_block_fp8_linear_requantizes(self):
-        out_size = 12
-        in_size = 12
-        block = 4
-        tp_rank = 1
-        local_width = 6
-        local_input_width = 6
-        global_output_start = tp_rank * local_width
-        global_input_start = tp_rank * local_input_width
-        weight_fp32 = torch.randn(out_size, in_size, dtype=torch.float32) * 0.1
+    def test_tpu_block_fp8_dispatch_wrapper_runs(self):
+        device = torch.device("tpu")
+        x = torch.randn(2, 256, dtype=torch.bfloat16, device=device)
+        weight_fp32 = torch.randn(256, 256, dtype=torch.float32) * 0.1
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        block_scale = (
-            weight_fp32.reshape(out_size // block, block, in_size // block, block)
+        block = 128
+        weight_scale = (
+            weight_fp32.reshape(2, block, 2, block)
             .abs()
             .amax(dim=(1, 3))
             .clamp(min=1e-12)
             / fp8_max
         )
-        weight_fp8 = (
-            (
-                weight_fp32.reshape(out_size // block, block, in_size // block, block)
-                / block_scale[:, None, :, None]
-            )
+        weight = (
+            (weight_fp32.reshape(2, block, 2, block) / weight_scale[:, None, :, None])
             .clamp(min=-fp8_max, max=fp8_max)
-            .reshape(out_size, in_size)
+            .reshape(256, 256)
             .to(torch.float8_e4m3fn)
+            .to(device)
         )
 
-        local_weight = weight_fp8[
-            global_output_start : global_output_start + local_width,
-            global_input_start : global_input_start + local_input_width,
-        ]
-        n_scale_start = global_output_start // block
-        n_scale_end = (global_output_start + local_width + block - 1) // block
-        k_scale_start = global_input_start // block
-        k_scale_end = (global_input_start + local_input_width + block - 1) // block
-        local_scale = block_scale[n_scale_start:n_scale_end, k_scale_start:k_scale_end]
-
-        qweight, weight_scale = _requantize_tpu_fp8_block_linear_weight(
-            local_weight,
-            local_scale,
-            [block, block],
-            logical_widths=[local_width],
-            tp_rank=tp_rank,
-            input_offset=global_input_start,
+        out = tpu_w8a8_block_fp8_linear(
+            input=x,
+            weight=weight,
+            block_size=[128, 128],
+            weight_scale=weight_scale.to(device),
         )
-        dequant = qweight.t().float() * weight_scale[:, None]
-        ref = weight_fp32[
-            global_output_start : global_output_start + local_width,
-            global_input_start : global_input_start + local_input_width,
-        ]
 
-        self.assertEqual(qweight.shape, (local_input_width, local_width))
-        self.assertEqual(weight_scale.shape, (local_width,))
-        torch.testing.assert_close(dequant, ref, rtol=0.2, atol=0.2)
+        def run_block_fp8_linear(x, weight, weight_scale):
+            return tpu_w8a8_block_fp8_linear(
+                input=x,
+                weight=weight,
+                block_size=[128, 128],
+                weight_scale=weight_scale,
+            )
 
-    def test_row_parallel_block_fp8_linear_requantizes(self):
-        out_size = 12
-        in_size = 12
-        block = 4
-        tp_rank = 1
-        local_input_width = 6
-        global_input_start = tp_rank * local_input_width
-        weight_fp32 = torch.randn(out_size, in_size, dtype=torch.float32) * 0.1
+        compiled = torch.compile(
+            run_block_fp8_linear,
+            backend="tpu",
+            fullgraph=True,
+            dynamic=False,
+        )
+        compiled_out = compiled(x, weight, weight_scale.to(device))
+        ref = self._block_fp8_reference(x.cpu(), weight.cpu(), weight_scale, [128, 128])
+
+        self.assertEqual(out.shape, (2, 256))
+        torch.testing.assert_close(out.cpu().float(), ref, rtol=0.25, atol=0.25)
+        torch.testing.assert_close(compiled_out.cpu(), out.cpu())
+
+    @staticmethod
+    def _block_fp8_reference(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        block_size: list[int],
+    ) -> torch.Tensor:
+        block_n, block_k = block_size
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
-        block_scale = (
-            weight_fp32.reshape(out_size // block, block, in_size // block, block)
-            .abs()
-            .amax(dim=(1, 3))
-            .clamp(min=1e-12)
-            / fp8_max
-        )
-        weight_fp8 = (
-            (
-                weight_fp32.reshape(out_size // block, block, in_size // block, block)
-                / block_scale[:, None, :, None]
+        output = torch.zeros(x.shape[0], weight.shape[0], dtype=torch.float32)
+        for k_block_idx, k_start in enumerate(range(0, weight.shape[1], block_k)):
+            x_block = x[:, k_start : k_start + block_k]
+            x_scale = torch.clamp(
+                x_block.abs().amax(dim=1, keepdim=True).float() / fp8_max, min=1e-12
             )
-            .clamp(min=-fp8_max, max=fp8_max)
-            .reshape(out_size, in_size)
-            .to(torch.float8_e4m3fn)
-        )
-
-        local_weight = weight_fp8[
-            :, global_input_start : global_input_start + local_input_width
-        ]
-        k_scale_start = global_input_start // block
-        k_scale_end = (global_input_start + local_input_width + block - 1) // block
-        local_scale = block_scale[:, k_scale_start:k_scale_end]
-
-        qweight, weight_scale = _requantize_tpu_fp8_block_linear_weight(
-            local_weight,
-            local_scale,
-            [block, block],
-            logical_widths=[out_size],
-            tp_rank=0,
-            input_offset=global_input_start,
-        )
-        dequant = qweight.t().float() * weight_scale[:, None]
-        ref = weight_fp32[
-            :, global_input_start : global_input_start + local_input_width
-        ]
-
-        self.assertEqual(qweight.shape, (local_input_width, out_size))
-        self.assertEqual(weight_scale.shape, (out_size,))
-        torch.testing.assert_close(dequant, ref, rtol=0.2, atol=0.2)
+            x_q = torch.clamp(x_block.float() / x_scale, -fp8_max, fp8_max).to(
+                torch.float8_e4m3fn
+            )
+            raw = x_q.float() @ weight[:, k_start : k_start + block_k].float().t()
+            scale = (
+                weight_scale[:, k_block_idx]
+                .repeat_interleave(block_n)
+                .reshape(1, weight.shape[0])
+            )
+            output += raw * x_scale * scale.float()
+        return output
 
 
 if __name__ == "__main__":
