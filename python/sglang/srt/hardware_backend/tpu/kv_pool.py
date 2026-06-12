@@ -266,6 +266,16 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # ``get_fused_kv_buffer`` is the canonical accessor on TPU; the Pallas
     # backend uses it directly.
     def get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        # HiCache reload gate: don't read layer L before the producer thread's
+        # scatter for L has materialised. Runs per layer in eager. The reload
+        # scatters are issued at serving time, so they are NOT in the traced
+        # graph — the wait is skipped during tracing and the compiled path
+        # gates every layer before launch instead (CompiledForwardShim).
+        if (
+            self.layer_transfer_counter is not None
+            and not torch.compiler.is_dynamo_compiling()
+        ):
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.kv_buffer[layer_id - self.start_layer]
 
     def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
