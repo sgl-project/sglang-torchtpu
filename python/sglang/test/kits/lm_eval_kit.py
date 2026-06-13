@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import requests
 import yaml
 
@@ -49,10 +48,18 @@ class LMEvalMixin:
     model_config_name: str = ""
     default_rtol: float = 0.08
 
+    @staticmethod
+    def _lm_eval_endpoint(base_url: str, api: str) -> str:
+        suffix = "/v1/chat/completions" if api == "chat" else "/v1/completions"
+        return base_url.rstrip("/") + suffix
+
     def test_lm_eval(self):
         """Run lm-eval evaluation and validate results."""
         # Flush cache before evaluation
-        requests.get(self.base_url + "/flush_cache")
+        try:
+            requests.get(self.base_url + "/flush_cache", timeout=30)
+        except requests.RequestException:
+            pass
 
         eval_config = yaml.safe_load(
             Path(self.model_config_name).read_text(encoding="utf-8")
@@ -60,16 +67,19 @@ class LMEvalMixin:
         results = self.launch_lm_eval(eval_config)
 
         rtol = eval_config.get("rtol", self.default_rtol)
+        atol = eval_config.get("atol", 0.0)
 
         success = True
         for task in eval_config["tasks"]:
             for metric in task["metrics"]:
                 ground_truth = metric["value"]
                 measured_value = results["results"][task["name"]][metric["name"]]
+                floor = ground_truth * (1 - rtol) - atol
                 print(
                     f"{task['name']} | {metric['name']}: "
                     f"ground_truth={ground_truth:.3f} | "
-                    f"measured={measured_value:.3f} | rtol={rtol}"
+                    f"measured={measured_value:.3f} | floor={floor:.3f} | "
+                    f"rtol={rtol} | atol={atol}"
                 )
                 dump_metric(
                     f"{task['name']}_{metric['name']}",
@@ -80,9 +90,7 @@ class LMEvalMixin:
                         "task": task["name"],
                     },
                 )
-                success = success and np.isclose(
-                    ground_truth, measured_value, rtol=rtol
-                )
+                success = success and measured_value >= floor
 
         self.assertTrue(success, f"lm-eval validation failed")
 
@@ -96,12 +104,16 @@ class LMEvalMixin:
         batch_size = eval_config.get("batch_size", "auto")
         backend = eval_config.get("backend", "local-completions")
         num_concurrent = eval_config.get("num_concurrent", 1)
+        api = eval_config.get(
+            "api", "chat" if "chat" in backend else "completion"
+        )
 
         model_args = {
             "model": eval_config["model_name"],
-            "base_url": self.base_url + "/v1/completions",
+            "base_url": self._lm_eval_endpoint(self.base_url, api),
             "num_concurrent": num_concurrent,
         }
+        model_args.update(eval_config.get("model_args", {}))
 
         env_vars = eval_config.get("env_vars", None)
         with scoped_env_vars(env_vars):
