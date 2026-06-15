@@ -164,19 +164,16 @@ def _create_extend_after_decode_spec_info_torch(
     bonus_idx = (cumsum - 1).clamp(min=0)
     bonus_tokens.copy_(accept_tokens[bonus_idx].to(bonus_tokens.dtype))
 
-    # positions: per-request loop because requests write non-overlapping
-    # variable-length slices into the flat positions array. A batched
-    # scatter with clamp would cause index collisions across requests.
-    # TODO(pyc96): vectorize with a padded 2D scatter or torch_xla fori_loop
-    # to avoid per-request .item() host-device syncs on XLA.
-    offset = 0
-    for pid in range(batch_size):
-        al = int(accept_lens[pid].item())
-        sl = int(seq_lens[pid].item())
-        positions[offset : offset + al] = torch.arange(
-            sl - al, sl, device=positions.device, dtype=positions.dtype
-        )
-        offset += al
+    total = positions.numel()
+    if total == 0:
+        return
+    flat = torch.arange(total, device=positions.device, dtype=accept_lens.dtype)
+    req_id = (flat[:, None] >= cumsum[None, :]).sum(dim=1).clamp_(max=batch_size - 1)
+    start_excl = cumsum - accept_lens  # exclusive prefix offset per request
+    within = flat - start_excl[req_id]
+    positions.copy_(
+        (seq_lens[req_id] - accept_lens[req_id] + within).to(positions.dtype)
+    )
 
 
 def create_extend_after_decode_spec_info_func(
@@ -253,6 +250,9 @@ def _assign_req_to_token_pool_torch(
     """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
     if batch_size == 0:
         return
+    req_pool_indices = req_pool_indices[:batch_size]
+    start_offset = start_offset[:batch_size]
+    end_offset = end_offset[:batch_size]
     lengths = end_offset - start_offset
     # Use the KV pool width as a safe upper bound for max_len to avoid
     # a host-device sync from torch.max().item().
@@ -455,7 +455,10 @@ def _assign_draft_cache_locs_torch(
 
     device = req_to_token.device
     copy_len = topk * speculative_num_steps
-    # out_cache_loc is laid out as (batch_size, copy_len).
+
+    req_pool_indices = req_pool_indices[:batch_size]
+    seq_lens = seq_lens[:batch_size]
+    out_cache_loc = out_cache_loc[: batch_size * copy_len]
     # Out-of-bounds safety: cols stay within req_to_token.shape[1] because
     # the KV pool allocator guarantees seq_lens + copy_len <= pool width.
     offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
