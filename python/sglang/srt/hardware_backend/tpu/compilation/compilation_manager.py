@@ -49,6 +49,7 @@ class CompilationManager:
         self.compiled_fns = compiled_fns
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self._baseline_graph_count = -1
 
         # TODO(wyzhang): support ``forward_split_prefill`` on TPU. Its
         # signature includes a ``(split_index, next_split_index)`` tuple
@@ -73,6 +74,52 @@ class CompilationManager:
             "[compilation manager] precompile_all done in %.1fs.",
             time.perf_counter() - overall,
         )
+
+        # Snapshot the XLA graph count so serving-time recompilation can be
+        # detected. The scheduler calls check_recompilation() periodically.
+        self._baseline_graph_count = self._get_xla_graph_count()
+        logger.info(
+            "[compilation manager] XLA graph baseline: %d cached programs.",
+            self._baseline_graph_count,
+        )
+
+    @staticmethod
+    def _get_xla_graph_count() -> int:
+        """Return the number of compiled XLA programs in the cache."""
+        try:
+            stats = torch.tpu._get_cache_stats()
+            return len(stats.per_entry_stats)
+        except (AttributeError, RuntimeError):
+            return -1
+
+    def check_recompilation(self, context: str = "") -> int:
+        """Check if new XLA programs were compiled since precompilation.
+
+        Args:
+            context: human-readable description of the current forward
+                (e.g. "target LlamaForCausalLM mode=DECODE") for the warning.
+
+        Returns the number of new compilations (0 = no recompilation).
+        """
+        if self._baseline_graph_count < 0:
+            return 0  # cache stats unavailable
+        current = self._get_xla_graph_count()
+        if current < 0:
+            return 0
+        new_graphs = current - self._baseline_graph_count
+        if new_graphs > 0:
+            logger.warning(
+                "[compilation manager] %d new XLA program(s) compiled at "
+                "serving time [%s] (baseline=%d, current=%d). This causes "
+                "latency spikes.",
+                new_graphs,
+                context,
+                self._baseline_graph_count,
+                current,
+            )
+            # Update baseline so we don't warn repeatedly for the same graphs.
+            self._baseline_graph_count = current
+        return new_graphs
 
     def _precompile_extend(self) -> None:
         """Compile extend at each token bucket and the fixed batch cap.

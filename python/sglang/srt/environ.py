@@ -667,6 +667,9 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
+    # TPU
+    SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")

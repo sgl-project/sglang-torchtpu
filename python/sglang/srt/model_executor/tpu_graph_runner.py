@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 if TYPE_CHECKING:
@@ -161,12 +162,23 @@ class TpuGraphRunner:
             CompilationManager,
         )
 
-        CompilationManager(
+        manager = CompilationManager(
             model_runner=model_runner,
             compiled_fns=compiled_fns,
             t_bucketer=compiled_forward_shim.t_bucketer,
             b_bucketer=compiled_forward_shim.b_bucketer,
-        ).precompile_all()
+        )
+        manager.precompile_all()
+
+        # Wire the manager into the compiled forward shim for
+        # serving-time recompilation detection (opt-in via
+        # SGLANG_TPU_CHECK_RECOMPILATION=1).
+        if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+            return
+        model_name = type(model_runner.model).__name__
+        is_draft = getattr(model_runner, "is_draft_worker", False)
+        label = f"{'draft ' if is_draft else ''}{model_name}"
+        compiled_forward_shim.set_compilation_manager(manager, model_label=label)
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
