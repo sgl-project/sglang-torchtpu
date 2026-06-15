@@ -23,9 +23,7 @@ TPU_BENCH_DIR = REPO_ROOT / "benchmark" / "tpu"
 
 class TestQwen3CoderFP8TPULMEval(LMEvalMixin, CustomTestCase):
     model = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-    model_config_name = (
-        "test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml"
-    )
+    model_config_name = "test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml"
     base_url = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
     health_timeout = int(os.environ.get("HEALTH_TIMEOUT", "1800"))
     process = None
@@ -80,8 +78,7 @@ class TestQwen3CoderFP8TPULMEval(LMEvalMixin, CustomTestCase):
                 pass
             time.sleep(5)
         raise TimeoutError(
-            f"{cls.base_url}/health did not return 200 within "
-            f"{cls.health_timeout}s"
+            f"{cls.base_url}/health did not return 200 within " f"{cls.health_timeout}s"
         )
 
 

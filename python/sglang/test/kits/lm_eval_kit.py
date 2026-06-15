@@ -104,9 +104,7 @@ class LMEvalMixin:
         batch_size = eval_config.get("batch_size", "auto")
         backend = eval_config.get("backend", "local-completions")
         num_concurrent = eval_config.get("num_concurrent", 1)
-        api = eval_config.get(
-            "api", "chat" if "chat" in backend else "completion"
-        )
+        api = eval_config.get("api", "chat" if "chat" in backend else "completion")
 
         model_args = {
             "model": eval_config["model_name"],
