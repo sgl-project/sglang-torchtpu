@@ -89,8 +89,6 @@
 #   DIST_PORT=10011                # rendezvous port (NOT the HTTP PORT)
 #   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
 #   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
-#   KV_OFFLOAD=0                   # 1 → --enable-hierarchical-cache (+HICACHE_RATIO)
-#   HICACHE_RATIO=2.0              # host:device KV pool ratio when KV_OFFLOAD=1
 set -euo pipefail
 
 MODEL=${MODEL:-}
@@ -102,12 +100,6 @@ fi
 MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
 
 # ===== multihost (multi-node) coordination =====
-# Single-host by default. When the GKE TPU env injects TPU_WORKER_ID +
-# TPU_WORKER_HOSTNAMES (one pod per host of a slice) — or when NNODES>1 is set
-# manually — fan the server across hosts via sglang's --nnodes/--node-rank/
-# --dist-init-addr. These only drive sglang's torch.distributed rendezvous and
-# per-rank scheduler launch; the device mesh itself is still formed by
-# torch_tpu/PjRt (slicebuilder / TPU_PROCESS_*), NOT a Ray-style orchestrator.
 : "${DIST_PORT:=10011}"        # torch.distributed rendezvous port (NOT the HTTP PORT)
 : "${CHIPS_PER_HOST:=8}"       # tp-devices per host (v7x: 4 chips x 2 cores)
 if [[ -n "${TPU_WORKER_ID:-}" && -n "${TPU_WORKER_HOSTNAMES:-}" ]]; then
@@ -122,11 +114,6 @@ else
     ENABLE_MULTIHOST=0; NNODES=1; NODE_RANK=0
 fi
 if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
-    # Resolve the rendezvous address. If the caller already exported
-    # DIST_INIT_ADDR, honor it — multihost-scripts/k8s_launch.sh exports a BARE
-    # host (rank-0 → 0.0.0.0, peers → rank-0's pod IP), so we append DIST_PORT
-    # below when no :port is present. Otherwise build it: rank 0 binds all
-    # interfaces, other ranks dial rank-0's resolvable host.
     if [[ -z "${DIST_INIT_ADDR:-}" ]]; then
         if [[ "$NODE_RANK" == "0" ]]; then
             DIST_INIT_ADDR="0.0.0.0"

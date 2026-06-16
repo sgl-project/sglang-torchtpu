@@ -66,19 +66,6 @@ def _unwrap_dynamic_compile_fns() -> None:
 
 def _prepare_tpu_env(world_size: int = 1) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
-
-    Single-host: ported from torchtpu-vllm _prepare_singlehost_tpu_env() —
-    slicebuilder addresses are ``world_size`` localhost ports (one per TP
-    worker; detokenizer/tokenizer processes don't participate in PjRt
-    coordination), and the topology is sub-sliced from local PCI devices.
-
-    Multi-host (GKE TPU env injects TPU_WORKER_HOSTNAMES with >1 host): the
-    slice spans every host, so localhost addresses + ``get_tpu_topology()``
-    are both wrong — that helper only scans this host's PCI devices and
-    raises for a cross-host count. Instead mirror torch_tpu's
-    multihost_wrapper: address every host by name (8 devices/host from a base
-    port) and take the full slice topology straight from TPU_TOPOLOGY, which
-    libtpu already populated for the slice.
     """
     # Apply LIBTPU_INIT_ARGS overrides before the early return and before
     # any torch_tpu import; libtpu reads these flags at load time.
@@ -95,11 +82,7 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     hosts = [h for h in worker_hostnames.split(",") if h]
 
     if len(hosts) > 1:
-        # Multi-host: one slicebuilder endpoint per device across ALL hosts,
-        # ordered host-major so a process's global rank indexes its own host's
-        # block (ranks 0..7 -> host0, 8..15 -> host1, ...). 8 devices/host
-        # holds for every current TPU platform; base port matches torch_tpu's
-        # multihost_wrapper default.
+        # Multi-host: one slicebuilder endpoint per device across ALL hosts.
         base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
         devices_per_host = int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", 8))
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
@@ -107,20 +90,7 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
             for host in hosts
             for i in range(devices_per_host)
         )
-        # get_tpu_topology() can't describe a cross-host slice (it scans local
-        # PCI only). libtpu exports the slice's CHIP grid as TPU_TOPOLOGY
-        # (e.g. "2x2x2" = 8 chips), but torch_tpu's TORCH_TPU_TOPOLOGY is a
-        # *device* grid that also carries a trailing cores-per-chip dim (v7x
-        # packs 2 cores/chip, so single-host get_tpu_topology() reports e.g.
-        # "2,2,1,2"). libtpu's hard invariant is product(TORCH_TPU_TOPOLOGY) ==
-        # len(SLICEBUILDER_ADDRESSES); a bare chip grid violates it on v7x and
-        # libtpu aborts with "Expected 8 worker addresses, got 16". Derive
-        # cores-per-chip from the device counts we just used to build the
-        # address list (total devices / total chips), NOT from world_size: this
-        # runs in whichever _prepare_tpu_env call wins the once-only race (the
-        # SLICEBUILDER_ADDRESSES early-return above), and that caller's
-        # world_size may be the apply_tpu_patches() default of 1 rather than the
-        # tp_size passed from apply_server_args_defaults.
+        
         tpu_topology = os.environ.get("TPU_TOPOLOGY", "")
         if tpu_topology and "TORCH_TPU_TOPOLOGY" not in os.environ:
             chip_dims = [int(d) for d in tpu_topology.split("x") if d]
@@ -128,14 +98,16 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
             for d in chip_dims:
                 num_chips *= d
             num_devices = len(hosts) * devices_per_host
-            # Only platforms with >1 core/chip (v7x) need the extra dimension;
-            # v4/v5/v6 (1 core/chip) keep the bare 3-D chip grid. Guard on exact
-            # divisibility so an unexpected count falls back to the chip grid
-            # rather than emitting a topology whose product mismatches.
-            if num_chips and num_devices % num_chips == 0:
-                cores_per_chip = num_devices // num_chips
-                if cores_per_chip > 1:
-                    chip_dims.append(cores_per_chip)
+            # v7x (>1 core/chip) needs an extra topology dim; v4/v5/v6 keep the
+            # 3-D chip grid.
+            cores_per_chip, rem = divmod(num_devices, num_chips)
+            assert rem == 0, (
+                f"TPU device/chip mismatch: {num_devices} devices vs {num_chips} "
+                f"chips (TPU_TOPOLOGY={tpu_topology!r}, hosts={len(hosts)}, "
+                f"devices_per_host={devices_per_host})"
+            )
+            if cores_per_chip > 1:
+                chip_dims.append(cores_per_chip)
             os.environ["TORCH_TPU_TOPOLOGY"] = ",".join(str(d) for d in chip_dims)
     else:
         try:
