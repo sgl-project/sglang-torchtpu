@@ -200,6 +200,9 @@ fi
 # Per-phase scheduler/worker timing dumps every ~5 s (cheap).
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
 
+
+export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
+
 # HF cache. Defaults here are generic (standard HF cache, online download).
 # The team's TPU hosts keep weights on a GCS-FUSE mount and run fully offline;
 # export HF_HOME / HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE to match — see
@@ -319,6 +322,7 @@ echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
 echo "  disable_overlap_schedule = $DISABLE_OVERLAP_SCHEDULE"
 echo "  tpu_decode_process_interval = ${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-<unset>}"
 echo "  compile_cache        = $ENABLE_COMPILE_CACHE  (tier2=${TORCH_TPU_TIER2_NAME}, tier3=${TORCH_TPU_TIER3_ROOT})"
+echo "  materialize_collective_tensors = $TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"
 echo "  ENABLE_HLO_DUMP        = $ENABLE_HLO_DUMP  ($HLO_DUMP_DIR)"
 echo "  ENABLE_TORCH_COMPILE_DEBUG = $ENABLE_TORCH_COMPILE_DEBUG  ($TORCH_COMPILE_DEBUG_DIR)"
 echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"
