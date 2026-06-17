@@ -168,11 +168,22 @@ def _create_extend_after_decode_spec_info_torch(
     if total == 0:
         return
     flat = torch.arange(total, device=positions.device, dtype=accept_lens.dtype)
+    # Only the first sum(accept_lens) rows are real accepted tokens; the remaining rows
+    # are padding up to the compiled token bucket. Mirror the Triton kernel, which writes
+    # ONLY the real prefix: assign real positions there and leave padded (ghost) rows at a
+    # safe 0. Without this, ghost rows clamp to the last request and get ever-increasing
+    # positions that flow through embedding/rotary and can index past rotary/cache bounds
+    # near the context limit. `cumsum[-1] == sum(accept_lens)` is an on-device scalar, so
+    # no host sync is introduced.
+    real_mask = flat < cumsum[-1]
     req_id = (flat[:, None] >= cumsum[None, :]).sum(dim=1).clamp_(max=batch_size - 1)
     start_excl = cumsum - accept_lens  # exclusive prefix offset per request
     within = flat - start_excl[req_id]
+    real_positions = seq_lens[req_id] - accept_lens[req_id] + within
     positions.copy_(
-        (seq_lens[req_id] - accept_lens[req_id] + within).to(positions.dtype)
+        torch.where(real_mask, real_positions, torch.zeros_like(real_positions)).to(
+            positions.dtype
+        )
     )
 
 
