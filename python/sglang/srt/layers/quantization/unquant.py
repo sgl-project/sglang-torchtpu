@@ -180,13 +180,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
-        # Register the Pallas fused-MoE op at construction, before torch.compile
-        # traces the model, so the traced forward_tpu is a plain op lookup.
-        # Mirrors the RPA v3 attention backend.
-        if _is_tpu:
-            from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
-
-            _build_fused_moe_op()
 
     def create_weights(
         self,

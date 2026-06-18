@@ -1164,14 +1164,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
             ), "cutlass_fp8 MoE requires SM90, SM100, or SM120 GPUs"
 
-        # Register the Pallas fused-MoE op at construction, before torch.compile
-        # traces the model, so the traced forward_tpu is a plain op lookup.
-        # Mirrors the RPA v3 attention backend.
-        if _is_tpu:
-            from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
-
-            _build_fused_moe_op()
-
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
         """Check if MoE will actually use DeepGEMM runner for FP8."""
