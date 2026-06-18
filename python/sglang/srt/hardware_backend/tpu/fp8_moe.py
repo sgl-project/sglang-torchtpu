@@ -238,8 +238,9 @@ def prepare_tpu_fp8_moe_weights(
     if block_quant and _get_tpu_fp8_runtime() == "channelwise":
         print_warning_once(
             "TPU FP8 MoE is converting block-FP8 checkpoint weights to "
-            "channelwise runtime scales. Use --tpu-fp8-runtime=blockwise to "
-            "preserve blockwise runtime scales."
+            "channelwise runtime scales by default for performance. Use "
+            "--tpu-fp8-runtime=channelwise to make this explicit, or "
+            "--tpu-fp8-runtime=blockwise to preserve blockwise runtime scales."
         )
         _requantize_tpu_fp8_moe_block_to_channelwise(layer, weight_block_size)
         block_quant = False

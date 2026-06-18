@@ -745,9 +745,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 if _get_tpu_fp8_runtime() == "channelwise":
                     logger.warning_once(
                         "TPU dense FP8 linear is converting block-FP8 checkpoint "
-                        "weights to channelwise runtime scales. Use "
-                        "--tpu-fp8-runtime=blockwise to preserve blockwise runtime "
-                        "scales."
+                        "weights to channelwise runtime scales by default for "
+                        "performance. Use --tpu-fp8-runtime=channelwise to make "
+                        "this explicit, or --tpu-fp8-runtime=blockwise to preserve "
+                        "blockwise runtime scales."
                     )
                     self._requantize_tpu_block_fp8_to_channelwise(layer)
                 else:
