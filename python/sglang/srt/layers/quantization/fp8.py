@@ -59,6 +59,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.layers.quantization.fp8_utils import (
     _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
+    block_quant_dequant,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
@@ -119,6 +120,25 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+
+def _get_tpu_fp8_runtime() -> str:
+    from sglang.srt.server_args import get_global_server_args
+
+    return get_global_server_args().tpu_fp8_runtime
+
+
+def _clear_replaced_param(module: Module, name: str) -> None:
+    param = getattr(module, name, None)
+    if not isinstance(param, Parameter):
+        setattr(module, name, None)
+        return
+
+    old = param.data
+    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
+    if old.untyped_storage().data_ptr() != param.data.untyped_storage().data_ptr():
+        old.untyped_storage().resize_(0)
+    setattr(module, name, None)
 
 
 def _scaled_fp8_quant_tpu_weight(
@@ -693,9 +713,45 @@ class Fp8LinearMethod(LinearMethodBase):
         self._process_mxfp8_linear_weight_scale(layer)
         layer.input_scale = None
 
+    def _requantize_tpu_block_fp8_to_channelwise(self, layer: Module) -> None:
+        weight = layer.weight.data
+        weight_dequant = block_quant_dequant(
+            weight,
+            layer.weight_scale_inv.data,
+            self.quant_config.weight_block_size,
+            torch.float32,
+        )
+        dtype_max = torch.finfo(weight.dtype).max
+        weight_scale = torch.clamp(
+            weight_dequant.abs().amax(dim=1, keepdim=True) / dtype_max,
+            min=1e-12,
+        )
+        weight = torch.clamp(
+            weight_dequant / weight_scale,
+            min=-dtype_max,
+            max=dtype_max,
+        ).to(weight.dtype)
+
+        layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(weight_scale, requires_grad=False)
+        _clear_replaced_param(layer, "weight_scale_inv")
+        layer.weight_block_size = None
+        layer.input_scale = None
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+            if _is_tpu and not self.use_mxfp8:
+                if _get_tpu_fp8_runtime() == "channelwise":
+                    logger.warning_once(
+                        "TPU dense FP8 linear is converting block-FP8 checkpoint "
+                        "weights to channelwise runtime scales. Use "
+                        "--tpu-fp8-runtime=blockwise to preserve blockwise runtime "
+                        "scales."
+                    )
+                    self._requantize_tpu_block_fp8_to_channelwise(layer)
+                else:
+                    layer.weight_block_size = self.quant_config.weight_block_size
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -844,6 +900,18 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if _is_tpu and not self.use_mxfp8 and layer.weight_block_size is None:
+                from sglang.srt.hardware_backend.tpu.fp8_linear import (
+                    apply_tpu_fp8_linear,
+                )
+
+                return apply_tpu_fp8_linear(
+                    x=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                )
+
             if use_intel_amx_backend(layer):
                 return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
@@ -1766,6 +1834,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             prepare_tpu_fp8_moe_weights(
                 layer,
                 block_quant=self.block_quant,
+                weight_block_size=self.quant_config.weight_block_size,
                 use_mxfp8=self.use_mxfp8,
                 is_fp4_expert=self.is_fp4_expert,
             )

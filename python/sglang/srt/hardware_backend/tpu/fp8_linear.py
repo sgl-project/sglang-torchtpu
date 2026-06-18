@@ -36,6 +36,8 @@ def apply_tpu_fp8_linear(
     ``weight_scale`` may be scalar or per-output-channel ``[N]``.
     """
 
+    if weight_scale.ndim == 2 and weight_scale.shape[1] == 1:
+        weight_scale = weight_scale.reshape(-1)
     if weight_scale.ndim > 1:
         raise NotImplementedError(
             "TPU dense FP8 linear only supports per-tensor or per-output-channel "

@@ -15,13 +15,26 @@ from torch.nn.parameter import Parameter
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, print_warning_once
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
     if old.untyped_storage().data_ptr() != new.untyped_storage().data_ptr():
         old.untyped_storage().resize_(0)
+
+
+def _clear_replaced_param(module: torch.nn.Module, name: str) -> None:
+    param = getattr(module, name, None)
+    if not isinstance(param, Parameter):
+        setattr(module, name, None)
+        return
+
+    old = param.data
+    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
+    _free_replaced_storage(old, param.data)
+    setattr(module, name, None)
 
 
 def _replace_tpu_param_from_cpu(param: Parameter, new_cpu: torch.Tensor) -> None:
@@ -31,6 +44,57 @@ def _replace_tpu_param_from_cpu(param: Parameter, new_cpu: torch.Tensor) -> None
     param.data = torch.empty(0, dtype=dtype, device=device)
     _free_replaced_storage(old, param.data)
     param.data = new_cpu.to(device=device, dtype=dtype)
+
+
+def _get_tpu_fp8_runtime() -> str:
+    from sglang.srt.server_args import get_global_server_args
+
+    return get_global_server_args().tpu_fp8_runtime
+
+
+def _quantize_moe_weight_channelwise(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dtype = weight.dtype
+    dtype_max = torch.finfo(dtype).max
+    weight_scale = torch.clamp(
+        weight.abs().amax(dim=2, keepdim=True).float() / dtype_max,
+        min=1e-12,
+    )
+    weight_q = torch.clamp(
+        weight.float() / weight_scale,
+        min=-dtype_max,
+        max=dtype_max,
+    ).to(dtype)
+    return weight_q, weight_scale.squeeze(-1)
+
+
+def _requantize_tpu_fp8_moe_block_to_channelwise(
+    layer: torch.nn.Module,
+    block_size: list[int] | tuple[int, int],
+) -> None:
+    w13 = block_quant_dequant(
+        layer.w13_weight.data,
+        layer.w13_weight_scale_inv.data,
+        block_size,
+        torch.float32,
+    )
+    w2 = block_quant_dequant(
+        layer.w2_weight.data,
+        layer.w2_weight_scale_inv.data,
+        block_size,
+        torch.float32,
+    )
+    w13_q, w13_scale = _quantize_moe_weight_channelwise(w13)
+    w2_q, w2_scale = _quantize_moe_weight_channelwise(w2)
+
+    copy_or_rebind_param(layer, "w13_weight", w13_q)
+    copy_or_rebind_param(layer, "w2_weight", w2_q)
+    copy_or_rebind_param(layer, "w13_weight_scale", w13_scale)
+    copy_or_rebind_param(layer, "w2_weight_scale", w2_scale)
+    _clear_replaced_param(layer, "w13_weight_scale_inv")
+    _clear_replaced_param(layer, "w2_weight_scale_inv")
+    layer.weight_block_size = None
 
 
 def _to_tpu_fp8_moe_scale_layout(
@@ -157,6 +221,7 @@ def prepare_tpu_fp8_moe_weights(
     layer: torch.nn.Module,
     *,
     block_quant: bool,
+    weight_block_size: list[int] | tuple[int, int] | None,
     use_mxfp8: bool,
     is_fp4_expert: bool,
 ) -> None:
@@ -165,6 +230,19 @@ def prepare_tpu_fp8_moe_weights(
         raise NotImplementedError(
             "TPU FP8 MoE currently supports FP8 and block-FP8 experts only."
         )
+
+    layer.weight_block_size = weight_block_size if block_quant else None
+    if block_quant and weight_block_size is None:
+        raise ValueError("TPU block-FP8 MoE requires weight_block_size.")
+
+    if block_quant and _get_tpu_fp8_runtime() == "channelwise":
+        print_warning_once(
+            "TPU FP8 MoE is converting block-FP8 checkpoint weights to "
+            "channelwise runtime scales. Use --tpu-fp8-runtime=blockwise to "
+            "preserve blockwise runtime scales."
+        )
+        _requantize_tpu_fp8_moe_block_to_channelwise(layer, weight_block_size)
+        block_quant = False
 
     # gmm_v2 consumes RHS weights as [expert, K, N]. SGLang loads MoE weights
     # as [expert, N, K], so make the TPU runtime layout explicit at load time.
@@ -215,6 +293,7 @@ def apply_tpu_fp8_moe(
         raise NotImplementedError(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
+    block_quant = block_quant and getattr(layer, "weight_block_size", None) is not None
 
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output

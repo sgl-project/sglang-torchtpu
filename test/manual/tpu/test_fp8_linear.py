@@ -1,6 +1,7 @@
 """Manual TPU tests for dense FP8 linear."""
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -8,7 +9,12 @@ from sglang.srt.hardware_backend.tpu.fp8_linear import (
     apply_tpu_fp8_linear,
     tpu_w8a8_block_fp8_linear,
 )
+from sglang.srt.hardware_backend.tpu.fp8_moe import (
+    _requantize_tpu_fp8_moe_block_to_channelwise,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
+from sglang.srt.server_args import set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -19,6 +25,11 @@ class _FakeBlockFp8Config:
 
 
 class TestTpuFp8Linear(CustomTestCase):
+    def setUp(self):
+        set_global_server_args_for_scheduler(
+            SimpleNamespace(tpu_fp8_runtime="blockwise")
+        )
+
     def test_fp8_linear_runs_eager_and_compiled(self):
         device = torch.device("tpu")
         x = torch.randn(4, 128, dtype=torch.bfloat16, device=device)
@@ -189,6 +200,72 @@ class TestTpuFp8Linear(CustomTestCase):
                 weight_scale=weight_scale,
             )
 
+    def test_dense_block_to_channelwise_releases_block_scale(self):
+        out_size = 256
+        in_size = 256
+        block_size = [128, 128]
+        weight, weight_scale = self._make_block_fp8_weight(
+            (out_size, in_size), block_size
+        )
+        expected = block_quant_dequant(weight, weight_scale, block_size, torch.float32)
+
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+        layer.weight_scale_inv = torch.nn.Parameter(
+            weight_scale.clone(), requires_grad=False
+        )
+        layer.input_scale = None
+        stale_scale = layer.weight_scale_inv
+
+        method = Fp8LinearMethod(_FakeBlockFp8Config())
+        method._requantize_tpu_block_fp8_to_channelwise(layer)
+
+        self.assertIsNone(layer.weight_scale_inv)
+        self.assertEqual(stale_scale.data.numel(), 0)
+        self.assertEqual(layer.weight.shape, (in_size, out_size))
+        self.assertEqual(layer.weight_scale.shape, (out_size, 1))
+        recovered = (layer.weight.float() * layer.weight_scale.reshape(1, -1)).t()
+        torch.testing.assert_close(recovered, expected, rtol=0.1, atol=0.1)
+
+    def test_moe_block_to_channelwise_releases_block_scales(self):
+        num_experts = 2
+        out_size = 256
+        in_size = 256
+        block_size = [128, 128]
+        w13, w13_scale = self._make_block_fp8_weight(
+            (num_experts, out_size, in_size), block_size
+        )
+        w2, w2_scale = self._make_block_fp8_weight(
+            (num_experts, out_size, in_size), block_size
+        )
+        expected_w13 = block_quant_dequant(w13, w13_scale, block_size, torch.float32)
+        expected_w2 = block_quant_dequant(w2, w2_scale, block_size, torch.float32)
+
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w13_weight_scale_inv = torch.nn.Parameter(
+            w13_scale.clone(), requires_grad=False
+        )
+        layer.w2_weight_scale_inv = torch.nn.Parameter(
+            w2_scale.clone(), requires_grad=False
+        )
+        stale_w13_scale = layer.w13_weight_scale_inv
+        stale_w2_scale = layer.w2_weight_scale_inv
+
+        _requantize_tpu_fp8_moe_block_to_channelwise(layer, block_size)
+
+        self.assertIsNone(layer.w13_weight_scale_inv)
+        self.assertIsNone(layer.w2_weight_scale_inv)
+        self.assertEqual(stale_w13_scale.data.numel(), 0)
+        self.assertEqual(stale_w2_scale.data.numel(), 0)
+        self.assertEqual(layer.w13_weight_scale.shape, (num_experts, out_size))
+        self.assertEqual(layer.w2_weight_scale.shape, (num_experts, out_size))
+        recovered_w13 = layer.w13_weight.float() * layer.w13_weight_scale.unsqueeze(-1)
+        recovered_w2 = layer.w2_weight.float() * layer.w2_weight_scale.unsqueeze(-1)
+        torch.testing.assert_close(recovered_w13, expected_w13, rtol=0.1, atol=0.1)
+        torch.testing.assert_close(recovered_w2, expected_w2, rtol=0.1, atol=0.1)
+
     @staticmethod
     def _block_fp8_reference(
         x: torch.Tensor,
@@ -215,6 +292,27 @@ class TestTpuFp8Linear(CustomTestCase):
             )
             output += raw * x_scale * scale.float()
         return output
+
+    @staticmethod
+    def _make_block_fp8_weight(
+        shape: tuple[int, ...],
+        block_size: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        block_n, block_k = block_size
+        *prefix, n, k = shape
+        assert n % block_n == 0
+        assert k % block_k == 0
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        weight = torch.randn(shape, dtype=torch.float32) * 0.1
+        blocked = weight.reshape(*prefix, n // block_n, block_n, k // block_k, block_k)
+        scale = blocked.abs().amax(dim=(-3, -1)).clamp(min=1e-12) / fp8_max
+        weight_q = (
+            (blocked / scale[..., :, None, :, None])
+            .clamp(min=-fp8_max, max=fp8_max)
+            .reshape(shape)
+            .to(torch.float8_e4m3fn)
+        )
+        return weight_q, scale
 
 
 if __name__ == "__main__":

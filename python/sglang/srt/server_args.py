@@ -536,6 +536,7 @@ class ServerArgs:
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
+    tpu_fp8_runtime: Literal["channelwise", "blockwise"] = "blockwise"
     fp4_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
@@ -5383,6 +5384,15 @@ class ServerArgs:
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
             "'aiter' (ROCm only). ",
+        )
+        parser.add_argument(
+            "--tpu-fp8-runtime",
+            type=str,
+            choices=["channelwise", "blockwise"],
+            default=ServerArgs.tpu_fp8_runtime,
+            help="TPU runtime layout for FP8 linear/MoE layers loaded from block-FP8 checkpoints. "
+            "'channelwise' converts block scales to per-output-channel scales at load time. "
+            "'blockwise' (default) preserves true blockwise scales and uses the TPU block-FP8 Pallas kernel.",
         )
         parser.add_argument(
             "--fp4-gemm-backend",
