@@ -369,6 +369,16 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
+            if _is_tpu and self.block_quant:
+                # Register the Pallas block-FP8 op at construction, before
+                # torch.compile traces the model, so the traced forward is a
+                # plain op lookup. Mirrors the RPA v3 backend and the fused-MoE
+                # registration path.
+                from sglang.srt.hardware_backend.tpu.quantized_matmul import (
+                    register_tpu_block_fp8_matmul_op,
+                )
+
+                register_tpu_block_fp8_matmul_op()
         self.is_checkpoint_fp8_serialized = (
             self.quant_config.is_checkpoint_fp8_serialized
         )
@@ -607,17 +617,6 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
-
-        if _is_tpu and not self.use_mxfp8:
-            # Register the Pallas block-FP8 op at load time (before
-            # torch.compile traces the model) so the traced forward is a plain
-            # op lookup, not a graph-break-prone registration. Mirrors the RPA
-            # v3 backend and the fused-MoE registration path.
-            from sglang.srt.hardware_backend.tpu.quantized_matmul import (
-                register_tpu_block_fp8_matmul_op,
-            )
-
-            register_tpu_block_fp8_matmul_op()
 
         if (
             _use_aiter_bpreshuffle_gfx95
