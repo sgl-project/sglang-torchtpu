@@ -11,6 +11,9 @@ on:
   schedule:
     - cron: '0 11,23 * * *'  # Run 2x daily, 12h apart, off PR-push peaks
   pull_request:
+    # Ready PRs run automatically. `labeled` keeps `run-ci` available as an
+    # explicit draft opt-in or manual rerun trigger.
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
@@ -73,6 +76,9 @@ permissions:
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
+    # `labeled` is used only for the explicit `run-ci` path. Draft readiness
+    # is checked from live PR state in pr-gate.yml so label-then-rerun works.
+    if: github.event.action != 'labeled' || github.event.label.name == 'run-ci'
     uses: ./.github/workflows/_pr-test-check-changes.yml
     with:
       git_ref: ${{ inputs.git_ref || '' }}
@@ -170,6 +176,9 @@ jobs:
         needs.check-changes.outputs.multimodal_gen == 'true'
       )
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      # Readiness is the default CI opt-in. Drafts still require `run-ci`.
+      require-run-ci: false
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================

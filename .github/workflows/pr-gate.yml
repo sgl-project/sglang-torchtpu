@@ -49,16 +49,18 @@ jobs:
           echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
-      - name: Block draft PR
-        if: github.event_name == 'pull_request' && fromJson(steps.pr.outputs.draft)
+      - name: Block draft PR unless explicitly opted in
+        if: >-
+          github.event_name == 'pull_request' &&
+          fromJson(steps.pr.outputs.draft) &&
+          !contains(fromJson(steps.pr.outputs.labels), 'run-ci')
         run: |
-          echo "PR is draft. Blocking CI."
+          echo "PR is draft. Add the run-ci label to opt in before marking it ready."
           exit 1
 
       - name: Require run-ci label (optional)
         if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
         run: |
-          labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
             echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
             exit 1

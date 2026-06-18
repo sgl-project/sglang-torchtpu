@@ -13,7 +13,7 @@ name: PR Test (TPU)
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 
 concurrency:
   group: pr-test-tpu-${{ github.event.pull_request.number }}
@@ -21,6 +21,13 @@ concurrency:
 
 jobs:
   decide:
+    # For labeled events, only `tpu` and `run-ci` can affect this workflow.
+    # Readiness itself is fetched live below so label-then-rerun is not tied to
+    # the original event payload.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'tpu' ||
+      github.event.label.name == 'run-ci'
     runs-on: ubuntu-latest
     # dorny/paths-filter lists the PR's changed files via the GitHub API, which
     # needs pull-requests: read (the repo's default token is otherwise too narrow).
@@ -30,6 +37,19 @@ jobs:
     outputs:
       run: ${{ steps.gate.outputs.run }}
     steps:
+      - name: Fetch latest PR state
+        id: pr
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+            core.setOutput("draft", pr.data.draft);
+            core.setOutput("labels", JSON.stringify(pr.data.labels.map(l => l.name)));
+
       - name: Detect TPU-explicit path changes
         id: paths
         uses: dorny/paths-filter@v3
@@ -47,11 +67,15 @@ jobs:
               - '.github/workflows/_tpu-test.yml'
               - '.github/workflows/pr-test-tpu.yml'
               - '.github/workflows/nightly-test-tpu.yml'
-      - name: Gate on tpu-path change OR `tpu` label
+      - name: Gate on readiness and TPU relevance
         id: gate
         run: |
-          if [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
-                "${{ contains(github.event.pull_request.labels.*.name, 'tpu') }}" == "true" ]]; then
+          if [[ "${{ steps.pr.outputs.draft }}" == "true" && \
+                "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" != "true" ]]; then
+            echo "Draft PR without run-ci; skipping TPU CI"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
+                  "${{ contains(fromJson(steps.pr.outputs.labels), 'tpu') }}" == "true" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
