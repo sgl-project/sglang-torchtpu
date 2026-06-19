@@ -52,12 +52,14 @@ def _skip_if_no_tpu():
 def _count_prompt(n):
     # Wide greedy margin: counting continues deterministically, so cached
     # (partial-prefill) == recompute (full-prefill) exactly.
-    return "Continue this integer sequence, comma separated:\n" + ", ".join(
-        str(i) for i in range(1, n + 1)
-    ) + ","
+    return (
+        "Continue this integer sequence, comma separated:\n"
+        + ", ".join(str(i) for i in range(1, n + 1))
+        + ","
+    )
 
 
-COUNT_LONG = _count_prompt(120)   # ~300 tokens -> ~5 pages
+COUNT_LONG = _count_prompt(120)  # ~300 tokens -> ~5 pages
 SYSTEM = (
     "The following is reference material. The Sun is the star at the center of "
     "the solar system. Mercury, Venus, Earth, and Mars are the four terrestrial "
@@ -150,19 +152,23 @@ class TestTpuPrefixCache(unittest.TestCase):
             )
         second = [_gen(self.engine, SYSTEM + q) for q in QUESTIONS]
         self.assertEqual(
-            [t for t, _ in first], [t for t, _ in second], "warm re-run not deterministic"
+            [t for t, _ in first],
+            [t for t, _ in second],
+            "warm re-run not deterministic",
         )
 
     # (3) Primer-invariance: cached prefix must be independent of its writer. - #
     def test_3_primer_invariance(self):
         target = SYSTEM + QUESTIONS[-1]
-        _gen(self.engine, SYSTEM + QUESTIONS[0])   # primer A
+        _gen(self.engine, SYSTEM + QUESTIONS[0])  # primer A
         a, _ = _gen(self.engine, target)
         self.engine.flush_cache()
-        _gen(self.engine, SYSTEM + QUESTIONS[1])   # primer B
+        _gen(self.engine, SYSTEM + QUESTIONS[1])  # primer B
         c, cc = _gen(self.engine, target)
         self.assertGreaterEqual(cc, PAGE_SIZE, "target did not reuse the shared prefix")
-        self.assertEqual(a, c, "cached prefix KV depends on primer -> cross-request bug")
+        self.assertEqual(
+            a, c, "cached prefix KV depends on primer -> cross-request bug"
+        )
 
     # (4) Concurrent batch sharing the prefix: completes, hits, deterministic. #
     def test_4_concurrent_batch(self):
@@ -174,7 +180,9 @@ class TestTpuPrefixCache(unittest.TestCase):
             [t for t, _ in b1], [t for t, _ in b2], "concurrent batch not deterministic"
         )
         # b1 ran against an empty cache (setUp flushed); b2 is the warm rerun that hits.
-        self.assertGreater(sum(c for _, c in b2), 0, "no cache hits on warm batch rerun")
+        self.assertGreater(
+            sum(c for _, c in b2), 0, "no cache hits on warm batch rerun"
+        )
 
     # (5) Eviction: overflow the pool, prove the first prompt was evicted and  #
     #     recomputes correctly (no pool corruption).                           #
