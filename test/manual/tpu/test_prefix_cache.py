@@ -95,6 +95,21 @@ def _gen_batch(engine, prompts, n=MAX_NEW):
 class TestTpuPrefixCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        os.environ["SGLANG_PLATFORM"] = "tpu"
+        os.environ.setdefault("TPU_VISIBLE_CHIPS", "0")
+
+        from transformers import AutoTokenizer
+
+        tok = AutoTokenizer.from_pretrained(MODEL)
+        assert len(tok.encode(COUNT_LONG)) >= 3 * PAGE_SIZE, (
+            f"COUNT_LONG tokenizes to fewer than {3 * PAGE_SIZE} tokens; "
+            "test_1 and test_5 assertions will always fail"
+        )
+        assert len(tok.encode(SYSTEM)) >= PAGE_SIZE, (
+            f"SYSTEM tokenizes to fewer than {PAGE_SIZE} tokens; "
+            "test_2 and test_3 assertions will always fail"
+        )
+
         import sglang as sgl
 
         cls.engine = sgl.Engine(
@@ -144,7 +159,7 @@ class TestTpuPrefixCache(unittest.TestCase):
         _gen(self.engine, SYSTEM + QUESTIONS[0])   # primer A
         a, _ = _gen(self.engine, target)
         self.engine.flush_cache()
-        _gen(self.engine, SYSTEM + QUESTIONS[1])   # primer C
+        _gen(self.engine, SYSTEM + QUESTIONS[1])   # primer B
         c, cc = _gen(self.engine, target)
         self.assertGreaterEqual(cc, PAGE_SIZE, "target did not reuse the shared prefix")
         self.assertEqual(a, c, "cached prefix KV depends on primer -> cross-request bug")
@@ -158,7 +173,8 @@ class TestTpuPrefixCache(unittest.TestCase):
         self.assertEqual(
             [t for t, _ in b1], [t for t, _ in b2], "concurrent batch not deterministic"
         )
-        self.assertGreater(sum(c for _, c in b1), 0, "no cache hits within the batch")
+        # b1 ran against an empty cache (setUp flushed); b2 is the warm rerun that hits.
+        self.assertGreater(sum(c for _, c in b2), 0, "no cache hits on warm batch rerun")
 
     # (5) Eviction: overflow the pool, prove the first prompt was evicted and  #
     #     recomputes correctly (no pool corruption).                           #
@@ -177,6 +193,4 @@ class TestTpuPrefixCache(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("SGLANG_PLATFORM", "tpu")
-    os.environ.setdefault("TPU_VISIBLE_CHIPS", "0")
     unittest.main(verbosity=2)
