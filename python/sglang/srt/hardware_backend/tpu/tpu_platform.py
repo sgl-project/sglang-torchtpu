@@ -110,16 +110,18 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        if server_args.speculative_algorithm is not None:
-            # Speculative decoding currently requires page_size=1 on TPU:
-            # the verify eviction kernels (align_evict_mask_to_page_size,
-            # get_src_tgt_cache_loc) are Triton-only and have no PyTorch
-            # fallback yet.
-            # TODO(pyc96): add PyTorch eviction kernels and fused move_kv_cache
-            # to enable page_size > 1 with speculative decoding on TPU.
+        # Speculative decoding with topk==1 supports page_size>1 on TPU:
+        # the only page>1 verify kernel it hits, align_evict_mask_to_page_size,
+        # now has a torch fallback (spec_utils.align_evict_mask_to_page_size_func).
+        # topk>1 additionally needs the duplicate-partial-page kernels
+        # (get_src_tgt_cache_loc, get_target_cache_loc, move_kv_cache) which are
+        # still Triton-only with no TPU fallback, so it stays pinned to page_size=1.
+        # TODO(pyc96): add torch fallbacks for the topk>1 eviction/move kernels.
+        spec_topk = server_args.speculative_eagle_topk or 1
+        if server_args.speculative_algorithm is not None and spec_topk > 1:
             if server_args.page_size is not None and server_args.page_size != 1:
                 logger.warning(
-                    "Overriding page_size=%d to 1 for speculative decoding on TPU.",
+                    "Overriding page_size=%d to 1 for topk>1 speculative decoding on TPU.",
                     server_args.page_size,
                 )
             server_args.page_size = 1

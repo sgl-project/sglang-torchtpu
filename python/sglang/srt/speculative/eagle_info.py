@@ -35,7 +35,7 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     TREE_SPEC_KERNEL_AVAILABLE,
-    align_evict_mask_to_page_size,
+    align_evict_mask_to_page_size_func,
     assign_req_to_token_pool_func,
     create_extend_after_decode_spec_info_func,
     create_num_accept_tokens_filter,
@@ -496,12 +496,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
-                align_evict_mask_to_page_size[len(batch.seq_lens),](
+                align_evict_mask_to_page_size_func(
                     batch.seq_lens,
                     evict_mask,
                     page_size,
                     self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
                 )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
