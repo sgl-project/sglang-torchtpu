@@ -64,8 +64,91 @@ def _unwrap_dynamic_compile_fns() -> None:
             )
 
 
+def _set_torch_tpu_topology_env_multihost(
+    hosts: list[str],
+    base_port: int,
+    devices_per_host: int,
+    tpu_topology: str,
+) -> None:
+    """Set the slicebuilder + topology env for a multi-host slice.
+
+    One slicebuilder endpoint per device across ALL hosts; topology is the
+    ``TPU_TOPOLOGY`` chip grid with an extra dim appended on v7x (>1 core/chip).
+    """
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+        f"{host}:{base_port + i}"
+        for host in hosts
+        for i in range(devices_per_host)
+    )
+
+    if not tpu_topology:
+        return
+
+    chip_dims = [int(d) for d in tpu_topology.split("x") if d]
+    num_chips = 1
+    for d in chip_dims:
+        num_chips *= d
+    num_devices = len(hosts) * devices_per_host
+    # v7x (>1 core/chip) needs an extra topology dim; v4/v5/v6 keep the
+    # 3-D chip grid.
+    cores_per_chip, rem = divmod(num_devices, num_chips)
+    assert rem == 0, (
+        f"TPU device/chip mismatch: {num_devices} devices vs {num_chips} "
+        f"chips (TPU_TOPOLOGY={tpu_topology!r}, hosts={len(hosts)}, "
+        f"devices_per_host={devices_per_host})"
+    )
+    if cores_per_chip > 1:
+        chip_dims.append(cores_per_chip)
+    os.environ.setdefault("TORCH_TPU_TOPOLOGY", ",".join(str(d) for d in chip_dims))
+
+
+def _set_torch_tpu_topology_env_single(world_size: int) -> None:
+    """Set the slicebuilder + topology env for a single-host process group.
+
+    Picks ``world_size`` free localhost ports for the per-rank slicebuilder
+    endpoints; topology is ``1,1,1`` for ``world_size == 1``, else the
+    torch_tpu-derived grid when one is available.
+    """
+    try:
+        import portpicker
+
+        sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
+    except ImportError:
+        import socket
+
+        # Hold sockets open until env var is written so OS doesn't reassign.
+        _held = [
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            for _ in range(world_size)
+        ]
+        for s in _held:
+            s.bind(("", 0))
+        sb_ports = [s.getsockname()[1] for s in _held]
+        for s in _held:
+            s.close()
+
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+        f"localhost:{p}" for p in sb_ports
+    )
+
+    if world_size == 1:
+        os.environ.setdefault("TORCH_TPU_TOPOLOGY", "1,1,1")
+    else:
+        try:
+            from torch_tpu._internal.utils import hardware
+
+            topo = hardware.get_tpu_topology(world_size)
+            if topo:
+                os.environ.setdefault("TORCH_TPU_TOPOLOGY", topo)
+        except Exception:
+            pass
+
+
 def _prepare_tpu_env(world_size: int = 1) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
+
+    Applies LIBTPU_INIT_ARGS overrides, then dispatches to the multi-host or
+    single-host helper, which write the slicebuilder + topology env directly.
     """
     # Apply LIBTPU_INIT_ARGS overrides before the early return and before
     # any torch_tpu import; libtpu reads these flags at load time.
@@ -82,67 +165,14 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     hosts = [h for h in worker_hostnames.split(",") if h]
 
     if len(hosts) > 1:
-        # Multi-host: one slicebuilder endpoint per device across ALL hosts.
-        base_port = int(os.environ.get("TORCH_TPU_BASE_PORT", 8070))
-        devices_per_host = int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", 8))
-        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-            f"{host}:{base_port + i}"
-            for host in hosts
-            for i in range(devices_per_host)
+        _set_torch_tpu_topology_env_multihost(
+            hosts,
+            base_port=int(os.environ.get("TORCH_TPU_BASE_PORT", 8070)),
+            devices_per_host=int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", 8)),
+            tpu_topology=os.environ.get("TPU_TOPOLOGY", ""),
         )
-        
-        tpu_topology = os.environ.get("TPU_TOPOLOGY", "")
-        if tpu_topology and "TORCH_TPU_TOPOLOGY" not in os.environ:
-            chip_dims = [int(d) for d in tpu_topology.split("x") if d]
-            num_chips = 1
-            for d in chip_dims:
-                num_chips *= d
-            num_devices = len(hosts) * devices_per_host
-            # v7x (>1 core/chip) needs an extra topology dim; v4/v5/v6 keep the
-            # 3-D chip grid.
-            cores_per_chip, rem = divmod(num_devices, num_chips)
-            assert rem == 0, (
-                f"TPU device/chip mismatch: {num_devices} devices vs {num_chips} "
-                f"chips (TPU_TOPOLOGY={tpu_topology!r}, hosts={len(hosts)}, "
-                f"devices_per_host={devices_per_host})"
-            )
-            if cores_per_chip > 1:
-                chip_dims.append(cores_per_chip)
-            os.environ["TORCH_TPU_TOPOLOGY"] = ",".join(str(d) for d in chip_dims)
     else:
-        try:
-            import portpicker
-
-            sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
-        except ImportError:
-            import socket
-
-            # Hold sockets open until env var is written so OS doesn't reassign.
-            _held = [
-                socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                for _ in range(world_size)
-            ]
-            for s in _held:
-                s.bind(("", 0))
-            sb_ports = [s.getsockname()[1] for s in _held]
-            for s in _held:
-                s.close()
-
-        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-            f"localhost:{p}" for p in sb_ports
-        )
-
-        if world_size == 1:
-            os.environ.setdefault("TORCH_TPU_TOPOLOGY", "1,1,1")
-        else:
-            try:
-                from torch_tpu._internal.utils import hardware
-
-                topo = hardware.get_tpu_topology(world_size)
-                if topo:
-                    os.environ.setdefault("TORCH_TPU_TOPOLOGY", topo)
-            except Exception:
-                pass
+        _set_torch_tpu_topology_env_single(world_size)
 
     logger.info(
         "TPU env: TORCH_TPU_SLICEBUILDER_ADDRESSES=%s, TORCH_TPU_TOPOLOGY=%s",
