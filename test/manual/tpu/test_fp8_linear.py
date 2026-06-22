@@ -163,6 +163,32 @@ class TestTpuFp8Linear(CustomTestCase):
         torch.testing.assert_close(out.cpu().float(), ref, rtol=0.25, atol=0.25)
         torch.testing.assert_close(compiled_out.cpu(), out.cpu())
 
+    def test_block_fp8_linear_rejects_non_block_aligned_k(self):
+        x = torch.randn(2, 192, dtype=torch.bfloat16)
+        weight = torch.empty(256, 192, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones(2, 2, dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "divisible by block_size"):
+            tpu_w8a8_block_fp8_linear(
+                input=x,
+                weight=weight,
+                block_size=[128, 128],
+                weight_scale=weight_scale,
+            )
+
+    def test_block_fp8_linear_rejects_mismatched_scale_shape(self):
+        x = torch.randn(2, 256, dtype=torch.bfloat16)
+        weight = torch.empty(256, 256, dtype=torch.float8_e4m3fn)
+        weight_scale = torch.ones(2, 1, dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "weight_scale shape mismatch"):
+            tpu_w8a8_block_fp8_linear(
+                input=x,
+                weight=weight,
+                block_size=[128, 128],
+                weight_scale=weight_scale,
+            )
+
     @staticmethod
     def _block_fp8_reference(
         x: torch.Tensor,
