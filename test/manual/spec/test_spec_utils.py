@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import copy_all_layer_kv_cache_tiled
 from sglang.srt.speculative.spec_utils import (
+    _align_evict_mask_to_page_size_torch,
     _assign_draft_cache_locs_torch,
     _assign_req_to_token_pool_torch,
     _create_extend_after_decode_spec_info_torch,
@@ -596,6 +597,170 @@ class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
         )
         assert positions.numel() == 0
         assert bonus.numel() == 0
+
+
+class TestAlignEvictMaskToPageSize(unittest.TestCase):
+    """Verify _align_evict_mask_to_page_size_torch against a naive reference.
+
+    The reference mirrors the triton kernel ``align_evict_mask_to_page_size``:
+    for each request, the page that contains the boundary between accepted and
+    evicted draft tokens must be preserved (its draft slots are forced to
+    ``False`` in ``evict_mask``) so that the last partial KV page is not freed.
+    """
+
+    @staticmethod
+    def _ref(seq_lens, evict_mask, page_size, num_draft_tokens):
+        bs = seq_lens.shape[0]
+        mask2d = evict_mask.view(bs, num_draft_tokens)
+        for bid in range(bs):
+            seq_len = int(seq_lens[bid].item())
+            row = mask2d[bid]
+            num_trues = int(row.sum().item())
+            num_false = num_draft_tokens - num_trues
+            start = (seq_len + num_false - 1) // page_size * page_size - seq_len
+            lo = max(start, 0)
+            hi = min(start + page_size, num_draft_tokens)
+            for i in range(lo, hi):
+                row[i] = False
+
+    def _run_case(self, seq_vals, evict_rows, page_size):
+        device = "cpu"
+        bs = len(seq_vals)
+        num_draft_tokens = len(evict_rows[0])
+        for r in evict_rows:
+            assert len(r) == num_draft_tokens
+        seq_lens = torch.tensor(seq_vals, dtype=torch.int32, device=device)
+        mask_flat = torch.tensor(
+            [v for row in evict_rows for v in row], dtype=torch.bool, device=device
+        )
+
+        ref = mask_flat.clone()
+        self._ref(seq_lens, ref, page_size, num_draft_tokens)
+
+        got = mask_flat.clone()
+        _align_evict_mask_to_page_size_torch(seq_lens, got, page_size, num_draft_tokens)
+
+        torch.testing.assert_close(got, ref)
+        return got.view(bs, num_draft_tokens)
+
+    def test_page_size_1_matches_reference(self):
+        """page_size=1 still clears the single slot covering the boundary."""
+        # At page_size=1, start = num_false - 1, so the boundary slot
+        # (the one immediately following the last accepted draft) is forced
+        # to False. Verified against the naive reference.
+        evict_rows = [
+            [True, False, True, True, False],
+            [False, False, True, False, True],
+            [True, True, True, True, True],
+        ]
+        self._run_case(seq_vals=[7, 12, 33], evict_rows=evict_rows, page_size=1)
+
+    def test_partial_page_preserves_boundary(self):
+        """Boundary page lies inside the draft slice and is cleared."""
+        # bs=1, seq_len=7, page_size=4, num_draft_tokens=5
+        # mask = [F, T, T, T, T] -> num_false=1, num_trues=4
+        # start = (7 + 1 - 1)//4*4 - 7 = 4 - 7 = -3
+        # lo=0, hi=min(1, 5)=1 -> clear index 0 only (already False -> no change)
+        # That's a degenerate case; pick a more informative one:
+        # seq_len=6, page_size=4, num_draft_tokens=5, mask=[F,F,T,T,T]
+        # num_false=2 -> start = (6+2-1)//4*4 - 6 = 4 - 6 = -2
+        # lo=0, hi=min(2,5)=2 -> clear indices [0,1] (already False)
+        # Try where eviction actually happens:
+        # seq_len=5, page_size=4, num_draft_tokens=5, mask=[T,F,F,T,T]
+        # num_false=2 -> start = (5+2-1)//4*4 - 5 = 4 - 5 = -1
+        # lo=0, hi=min(3,5)=3 -> clear [0,1,2]: mask becomes [F,F,F,T,T]
+        got = self._run_case(
+            seq_vals=[5],
+            evict_rows=[[True, False, False, True, True]],
+            page_size=4,
+        )
+        expected = torch.tensor([[False, False, False, True, True]], dtype=torch.bool)
+        torch.testing.assert_close(got, expected)
+
+    def test_boundary_inside_draft_slice(self):
+        """seq_len aligned: start lands at first kept draft slot."""
+        # seq_len=8, page_size=4, num_draft_tokens=5, mask=[T,T,F,F,F]
+        # num_false=3 -> start = (8+3-1)//4*4 - 8 = 8 - 8 = 0
+        # lo=0, hi=4 -> clear [0,1,2,3]: -> [F,F,F,F,F]
+        got = self._run_case(
+            seq_vals=[8],
+            evict_rows=[[True, True, False, False, False]],
+            page_size=4,
+        )
+        expected = torch.tensor([[False, False, False, False, False]], dtype=torch.bool)
+        torch.testing.assert_close(got, expected)
+
+    def test_boundary_beyond_draft_slice(self):
+        """Boundary page is entirely past the draft slice: no-op."""
+        # seq_len=4, page_size=4, num_draft_tokens=5, mask=[T,T,T,T,T]
+        # num_false=0 -> start = (4-1)//4*4 - 4 = 0 - 4 = -4
+        # lo=0, hi=min(0,5)=0 -> nothing cleared
+        got = self._run_case(
+            seq_vals=[4],
+            evict_rows=[[True, True, True, True, True]],
+            page_size=4,
+        )
+        expected = torch.tensor([[True, True, True, True, True]], dtype=torch.bool)
+        torch.testing.assert_close(got, expected)
+
+    def test_all_accepted(self):
+        """No evictions: nothing to align."""
+        # seq_len=7, page_size=4, mask all False
+        # num_false=5 -> start = (7+5-1)//4*4 - 7 = 8 - 7 = 1
+        # lo=1, hi=5 -> clear [1..5) but values are already False
+        got = self._run_case(
+            seq_vals=[7],
+            evict_rows=[[False, False, False, False, False]],
+            page_size=4,
+        )
+        expected = torch.zeros(1, 5, dtype=torch.bool)
+        torch.testing.assert_close(got, expected)
+
+    def test_page_size_larger_than_num_draft(self):
+        """page_size > num_draft_tokens: clears at most num_draft_tokens slots."""
+        # seq_len=10, page_size=16, num_draft_tokens=5, mask=[T,F,T,F,T]
+        # num_false=2 -> start = (10+2-1)//16*16 - 10 = 0 - 10 = -10
+        # lo=0, hi=min(6, 5)=5 -> clear all
+        got = self._run_case(
+            seq_vals=[10],
+            evict_rows=[[True, False, True, False, True]],
+            page_size=16,
+        )
+        expected = torch.zeros(1, 5, dtype=torch.bool)
+        torch.testing.assert_close(got, expected)
+
+    def test_batch_varying(self):
+        """Batch with different seq_lens and accept patterns."""
+        seq_vals = [5, 8, 4, 7, 10]
+        evict_rows = [
+            [True, False, False, True, True],
+            [True, True, False, False, False],
+            [True, True, True, True, True],
+            [False, False, False, False, False],
+            [True, False, True, False, True],
+        ]
+        self._run_case(seq_vals=seq_vals, evict_rows=evict_rows, page_size=4)
+
+    def test_batch_page_size_64(self):
+        """Realistic config: page_size=64, num_draft_tokens=4."""
+        seq_vals = [61, 64, 65, 127, 128]
+        evict_rows = [
+            [True, True, True, True],
+            [True, False, True, False],
+            [False, True, False, True],
+            [True, True, False, False],
+            [False, False, True, True],
+        ]
+        self._run_case(seq_vals=seq_vals, evict_rows=evict_rows, page_size=64)
+
+    def test_empty_batch(self):
+        device = "cpu"
+        seq_lens = torch.zeros(0, dtype=torch.int32, device=device)
+        evict_mask = torch.zeros(0, dtype=torch.bool, device=device)
+        _align_evict_mask_to_page_size_torch(
+            seq_lens, evict_mask, page_size=4, num_draft_tokens=5
+        )
+        assert evict_mask.numel() == 0
 
 
 if __name__ == "__main__":

@@ -634,14 +634,7 @@ def _align_evict_mask_to_page_size_torch(
     page_size: int,
     num_draft_tokens: int,
 ):
-    """Vectorized torch equivalent of ``align_evict_mask_to_page_size``.
-
-    ``evict_mask`` is a flat ``[bs * num_draft_tokens]`` bool tensor (True =
-    evict). For each request, keep (un-mask) the tokens that fall in the
-    trailing partial KV page so a partial page is never freed -- matching the
-    triton kernel's per-row ``start = (seq_len + num_false - 1) // page_size *
-    page_size - seq_len`` window. Mutates ``evict_mask`` in place.
-    """
+    """Vectorized torch equivalent of ``align_evict_mask_to_page_size``."""
     bs = seq_lens.shape[0]
     device = evict_mask.device
     mask2d = evict_mask.view(bs, num_draft_tokens)
