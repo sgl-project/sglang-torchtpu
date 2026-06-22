@@ -158,6 +158,11 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
 
     apply_tpu_env_overrides()
 
+    # Speculative decoding enables KV-cache moves. The generic fast path is a
+    # Triton kernel, which has no active driver on TPU; use the existing native
+    # torch implementation instead.
+    os.environ.setdefault("SGLANG_NATIVE_MOVE_KV_CACHE", "1")
+
     if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
         return
 

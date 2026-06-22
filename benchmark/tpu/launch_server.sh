@@ -49,7 +49,11 @@
 #   HOST=127.0.0.1
 #   PORT=30000
 #   TP_SIZE=8                      # tensor-parallel ranks (= chiplets)
-#   EP_SIZE=                       # expert-parallel ranks; passed only when set
+#   EP_SIZE=                       # expert-parallel ranks; passed only when set.
+#                                  # Default off (sglang ep_size=1: experts run
+#                                  # tensor-parallel within the TP group). For a
+#                                  # MoE model set EP to a divisor of TP_SIZE and
+#                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
 #   MAX_RUNNING=64                 # in-flight request cap (>= bench concurrency)
 #   PAGE_SIZE=128
 #   CONTEXT_LEN=                  # passed through if set
