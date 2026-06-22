@@ -54,11 +54,12 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_xpu, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_tpu, is_xpu, make_layers
 from sglang.utils import get_exception_traceback
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
+_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
@@ -437,7 +438,7 @@ class LlamaModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -769,6 +770,9 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
+        elif _is_tpu:
+            # XLA reclaims memory for del'd tensors at the next mark_step().
+            pass
         else:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -788,6 +792,8 @@ class LlamaForCausalLM(nn.Module):
         if _is_xpu:
             torch.xpu.empty_cache()
             torch.xpu.synchronize()
+        elif _is_tpu:
+            pass
         else:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()

@@ -16,9 +16,10 @@ Design notes
   is built once per forward pass in :meth:`init_forward_metadata` and reused
   by every layer.
 * Only Qwen3-dense-style models are exercised today (causal, GQA, no
-  speculative decoding, no SWA). The kernel itself supports more, so
-  enabling extra features is a matter of plumbing flags through the
-  ``_KernelHandle`` cache key.
+  SWA). The kernel itself supports more, so enabling extra features is
+  a matter of plumbing flags through the ``_KernelHandle`` cache key.
+* EAGLE speculative decoding is supported: TARGET_VERIFY, DRAFT_EXTEND,
+  and multi-step draft decode with ``speculative_step_id``.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here.
@@ -223,9 +224,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
 
-    def __init__(self, model_runner: "ModelRunner") -> None:
+    def __init__(
+        self, model_runner: "ModelRunner", speculative_step_id: int = 0
+    ) -> None:
         super().__init__()
         self.device = model_runner.device
+        self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
@@ -279,16 +283,43 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-
-        if forward_batch.forward_mode.is_extend():
+        # -------------------------------------------------------------- #
+        # Speculative decoding: adjust seq_lens / extend metadata
+        # -------------------------------------------------------------- #
+        if forward_batch.forward_mode.is_target_verify():
+            # TARGET_VERIFY: the target model verifies draft_token_num
+            # tokens per request.  The KV cache already includes the
+            # draft tokens, so bump seq_lens accordingly.
+            assert forward_batch.spec_info is not None
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            seq_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+            extend_seq_lens = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device=device
+            )
+        elif forward_batch.forward_mode.is_draft_extend():
+            # DRAFT_EXTEND: batch.prefix_lens may be stale from the
+            # initial prefill; seq_lens and extend_seq_lens are current.
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            assert forward_batch.extend_seq_lens is not None
+            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        elif forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
                 "extend_seq_lens is required for the Pallas attention backend in "
                 "extend mode."
             )
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
         else:
-            # Decode: q_len == 1 per sequence.
+            # Decode (including draft decode).
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is not None
+            ):
+                # Multi-step draft decode: each step's backend has a
+                # different speculative_step_id.  Bump seq_lens so the
+                # kernel sees KV entries from prior draft steps.
+                seq_lens = seq_lens + self.speculative_step_id + 1
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
@@ -436,3 +467,39 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return 0
+
+
+class TpuPallasRpaV3MultiStepDraftBackend:
+    """Wrap one RPA-v3 backend per EAGLE draft decode step.
+
+    Each step's backend carries a different ``speculative_step_id`` so
+    ``_build_metadata`` bumps ``seq_lens`` by the right offset,
+    mirroring ``TpuPallasMultiStepDraftBackend`` for the flash backend.
+    """
+
+    def __init__(
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = [
+            TpuPallasRpaV3AttnBackend(model_runner, speculative_step_id=i)
+            for i in range(self.speculative_num_steps - 1)
+        ]
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        assert forward_batch.spec_info is not None
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        pass
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        self.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_replay_cuda_graph(self, forward_batch: ForwardBatch, bs):
+        self.init_forward_metadata(forward_batch)

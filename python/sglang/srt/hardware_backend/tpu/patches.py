@@ -658,29 +658,6 @@ def _patch_mha_kv_pool_for_rpa_v3() -> None:
     )
 
 
-def _prewarm_fused_moe() -> None:
-    """Register the Pallas fused-MoE custom op before torch.compile traces it.
-
-    The op is exposed to PyTorch via ``torch_tpu._internal.pallas.jax_op``,
-    whose registration (``inspect.signature`` + JAX export) cannot run inside
-    a dynamo trace (gb0088). Building it once here -- at TPU backend init,
-    before any model is built or compiled -- guarantees the trace-time
-    ``fused_moe_call`` is a plain op lookup. Mirrors the RPA v3 attention
-    backend, which registers its kernel op eagerly in ``__init__``.
-
-    Best-effort: a dense (non-MoE) model never invokes the op, and an env
-    without the Pallas-MoE deps simply skips it; only a MoE model under
-    ``--enable-torch-compile`` actually needs it (that path would otherwise
-    gb0088), so a failure here is logged rather than fatal.
-    """
-    try:
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
-
-        _build_fused_moe_op()
-    except Exception as e:  # noqa: BLE001 - prewarm is best-effort
-        logger.warning("TPU: fused-MoE op prewarm skipped (%s)", e)
-
-
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -692,6 +669,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
-    _prewarm_fused_moe()  # TODO(Qinghan): this will just be temporary
     _register_aten_fallbacks()
     logger.info("TPU patches applied.")
