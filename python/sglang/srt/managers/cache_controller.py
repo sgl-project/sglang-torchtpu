@@ -112,52 +112,53 @@ class LayerDoneCounter:
 
 
 class TpuLayerLoadingEvent:
-    """Python-threading equivalent of LayerLoadingEvent for the pallas_tpu path.
+    """Round-completion signal for the pallas_tpu reload producer.
 
-    torch_tpu has no device streams or device events, so we track per-layer
-    completion of the copy+scatter producer thread with plain threading.Event
-    objects. The interface mirrors LayerLoadingEvent so that LayerDoneCounter's
-    wait_until() works unchanged, and kv_pool.get_key/value_buffer() needs no
-    modifications.
+    torch_tpu has no device streams/events, so a reload round's copy+scatter
+    completion is tracked with a single threading.Event. The GPU LayerLoadingEvent
+    is per-layer (it gates each layer independently for layerwise overlap); TPU
+    gates the whole monolithic compiled forward at once (CompiledForwardShim), so
+    one round-done flag is enough. Method names mirror LayerLoadingEvent so
+    LayerDoneCounter / cache_controller are unchanged.
 
-    Lifecycle per reload batch:
-      1. Producer thread: for each layer N, calls complete(N) after the H2D
-         copy + Pallas scatter for layer N have been materialized on the TPU.
-      2. Consumer (forward): kv_pool.get_key_buffer(N) calls wait_until(N)
-         which calls wait(N) here, blocking until the producer has signalled.
+    Lifecycle per reload round:
+      1. Producer thread: calls complete(L) per layer; the last layer flips the
+         flag (the producer signals in order, so last layer == whole round done).
+      2. Consumer (forward): CompiledForwardShim waits via the counter before
+         launch; update_producer waits before reusing a ring slot.
     """
 
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
-        self._events = [threading.Event() for _ in range(num_layers)]
-        # _finish is set when the last layer is complete; used by update_producer
-        # to verify the previous round is fully done before reuse.
-        self._finish = threading.Event()
+        self._done = threading.Event()
         # Pre-set so the very first update_producer() sees the slot as available.
-        self._finish.set()
+        self._done.set()
 
     def complete(self, layer_index: int) -> None:
         assert 0 <= layer_index < self._num_layers
-        self._events[layer_index].set()
+        # Producer signals layers in order; the last one means the whole round's
+        # copy+scatter has materialized on the TPU.
         if layer_index == self._num_layers - 1:
-            self._finish.set()
+            self._done.set()
 
-    def wait(self, layer_index: int) -> None:
-        """Block the calling thread until layer_index's copy+scatter is done."""
-        self._events[layer_index].wait()
+    def wait(self, layer_index: int | None = None) -> None:
+        """Block until the round's copy+scatter is done (whole-forward gate).
+
+        ``layer_index`` is accepted for LayerLoadingEvent interface compatibility
+        but ignored — TPU gates the whole round, not individual layers.
+        """
+        self._done.wait()
 
     def reset(self) -> None:
-        for e in self._events:
-            e.clear()
-        self._finish.clear()
+        self._done.clear()
 
     def query(self) -> bool:
-        """Return True if the last layer has been signalled (reuse-safe check)."""
-        return self._finish.is_set()
+        """Return True once the round (last layer) has been signalled."""
+        return self._done.is_set()
 
     @property
     def finish_event(self) -> "TpuLayerLoadingEvent":
-        # LayerDoneCounter.update_producer calls finish_event.query(); proxy self.
+        # LayerDoneCounter.update_producer calls finish_event.query()/.wait().
         return self
 
 
