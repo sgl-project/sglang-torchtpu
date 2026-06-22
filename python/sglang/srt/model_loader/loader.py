@@ -2991,7 +2991,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             )
 
         assert device_config.device_type in ("cuda", "cpu", "tpu"), (
-            f"Runai Model Streamer only supports CUDA and CPU, "
+            f"Runai Model Streamer only supports CUDA, CPU, and TPU, "
             f"got {device_config.device_type}"
         )
 
