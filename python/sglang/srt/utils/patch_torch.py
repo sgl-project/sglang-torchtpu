@@ -128,16 +128,6 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
 
     import os
 
-    # sglang's tp_size is the GLOBAL tensor-parallel world (spanning every node)
-    # and tp_rank is ALREADY a global rank — get_tp_rank_range() hands node N the
-    # range [N*tp_size/nnodes, (N+1)*tp_size/nnodes). torch_tpu's PJRT
-    # slicebuilder indexes TORCH_TPU_SLICEBUILDER_ADDRESSES by this global RANK,
-    # so RANK must be tp_rank verbatim. Adding node_rank*tp_size (which only
-    # makes sense if tp_rank were node-local) overshoots the address list on
-    # node_rank>0 — e.g. "RANK 25 is out of bounds ... (size 16)". Likewise the
-    # world is tp_size, not tp_size*nnodes. LOCAL_RANK/LOCAL_WORLD_SIZE are the
-    # per-host slice (tp_size//nnodes for the pp_size==1 serving case). Node 0
-    # happened to work before only because its node_rank*tp_size offset is 0.
     world_size = server_args.tp_size
     local_world_size = max(world_size // server_args.nnodes, 1)
     os.environ["RANK"] = str(tp_rank)
