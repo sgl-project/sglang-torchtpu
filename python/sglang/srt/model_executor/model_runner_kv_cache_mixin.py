@@ -76,11 +76,10 @@ class ModelRunnerKVCacheMixin:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _hicache_tpu_staging_reserve_bytes(self: ModelRunner) -> int:
-        """HBM to reserve for the TPU HiCache dedicated device staging buffer.
+        """HBM to reserve for the TPU HiCache device staging buffer.
 
-        Subtracted from available memory before the KV-cache token budget is
-        computed, so the staging buffer (layer_num * stage_blocks * fused_block)
-        does not eat into the KV-cache proportion. Mirrors the actual
+        Subtracted from available memory before sizing the KV cache so the
+        staging buffer does not eat into the KV-cache proportion. Mirrors the
         ``TpuFusedMHATokenToKVPoolHost.device_stage`` allocation. Returns 0
         unless hierarchical cache + the ``pallas_tpu`` io backend are active.
         """
@@ -932,8 +931,7 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        # Carve out the TPU HiCache device staging buffer before sizing the KV
-        # cache, so the staging HBM is excluded from the KV-cache proportion.
+        # Carve out the TPU HiCache device staging buffer before sizing the KV cache.
         available_bytes = max(
             0, available_bytes - self._hicache_tpu_staging_reserve_bytes()
         )

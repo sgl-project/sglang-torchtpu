@@ -13,22 +13,18 @@
 # limitations under the License.
 """Pallas DMA gather/scatter kernels for TPU HiCache KV offload.
 
-Kernel bodies ported verbatim from torchtpu-vllm
-``tpu_inference/offload/pallas_kv_{gather,scatter}.py``.
-
-* gather (D2H): read scattered source pages ``src_cache[block_ids[i]]`` into
-  ``N`` contiguous output rows -> one bulk HBM staging buffer before a single
-  ``copy_`` to host.
-* scatter (H2D): write ``src_blocks[i]`` into scattered ``dest_cache[block_ids[i]]``
-  in place (``input_output_aliases``).
+* gather (D2H): ``src_cache[block_ids[i]]`` -> contiguous output rows, a bulk
+  HBM staging buffer for a single ``copy_`` to host.
+* scatter (H2D): ``src_blocks[i]`` -> ``dest_cache[block_ids[i]]`` in place
+  (``input_output_aliases``).
 
 Both are HBM<->HBM only; the host<->HBM PCIe leg is a torch ``copy_`` in the
 host pool. Block ids are scalar-prefetched (no recompile on id change) and the
 last dim is padded to 128 for TPU DMA alignment.
 
-Overlapped (layer-wise) usage: the H2D scatter writes the live ``kv_cache``
-buffer and is issued WITHOUT a blocking sync, so XLA schedules the DMA and the
-forward's read of the same ``kv_cache`` tensor is the dependency it waits on.
+Overlapped (layer-wise) usage: the H2D scatter writes the live ``kv_cache`` and
+is issued WITHOUT a blocking sync, so the forward's read of that same tensor is
+the dependency XLA schedules the DMA against.
 """
 
 from __future__ import annotations
@@ -191,7 +187,9 @@ def pallas_kv_scatter(
             grid=(1,),
             in_specs=[
                 pl.BlockSpec(memory_space=pltpu.HBM),  # src_blocks
-                pl.BlockSpec(memory_space=pltpu.HBM),  # dest_cache (aliased)
+                pl.BlockSpec(
+                    memory_space=pltpu.HBM
+                ),  # dest_cache (aliased, written in place)
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=[pltpu.SemaphoreType.DMA],
@@ -221,9 +219,8 @@ _scatter_fn = tpu_pallas.custom_jax_kernel(pallas_kv_scatter)
 def pad_to_pow2(ids: np.ndarray) -> tuple[np.ndarray, int]:
     """Return ``(padded_ids, original_len)`` padded to the next power of two.
 
-    The repeated final element fills padding so scattered writes stay
-    idempotent (padding rewrites the last real block). Callers trim with
-    ``original_len``.
+    Padding repeats the last real id so scattered writes stay idempotent (they
+    just rewrite the last real block). Callers trim with ``original_len``.
     """
     n = len(ids)
     if n == 0:
@@ -255,9 +252,9 @@ def prewarm_offload_kernels(
 ) -> None:
     """Pre-compile the gather/scatter HLOs for power-of-2 block counts.
 
-    ``custom_jax_kernel`` JIT-traces on first call holding the GIL; tracing
-    mid-serving would stall the scheduler. One layer's buffer suffices (HLO is
-    shape-keyed). Scatter prewarm writes the dummy (loc==0) page only.
+    First-call JIT tracing holds the GIL and would stall the scheduler mid-serving.
+    HLO is shape-keyed, so one layer's buffer suffices; scatter prewarm only
+    touches the dummy (loc==0) page.
     """
     if not kv_buffer_list:
         return

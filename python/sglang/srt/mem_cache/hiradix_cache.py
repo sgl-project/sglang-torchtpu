@@ -75,7 +75,7 @@ class HiRadixCache(RadixCache):
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             # The TPU fused pool subclasses MHATokenToKVPool but stores a fused
-            # 5D layout; route it to the fused host pool. Guarded import keeps
+            # 5D layout, so route it to the fused host pool. Guarded import keeps
             # non-TPU builds unaffected.
             host_pool_cls = MHATokenToKVPoolHost
             try:
@@ -929,8 +929,8 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # Device demotion: the KV is already on host (write-through backed it up
-        # at prefill time), so eviction is just a device-allocator free + bookkeeping.
+        # Device demotion: KV is already on host (write-through), so eviction is
+        # just a device-allocator free + bookkeeping.
         # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
         # The matching store(CPU) was emitted when write_backup() copied to host.
         self._record_remove_event(node, medium=StorageMedium.GPU)

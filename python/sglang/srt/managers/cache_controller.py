@@ -114,18 +114,12 @@ class LayerDoneCounter:
 class TpuLayerLoadingEvent:
     """Round-completion signal for the pallas_tpu reload producer.
 
-    torch_tpu has no device streams/events, so a reload round's copy+scatter
-    completion is tracked with a single threading.Event. The GPU LayerLoadingEvent
-    is per-layer (it gates each layer independently for layerwise overlap); TPU
-    gates the whole monolithic compiled forward at once (CompiledForwardShim), so
-    one round-done flag is enough. Method names mirror LayerLoadingEvent so
-    LayerDoneCounter / cache_controller are unchanged.
-
-    Lifecycle per reload round:
-      1. Producer thread: calls complete(L) per layer; the last layer flips the
-         flag (the producer signals in order, so last layer == whole round done).
-      2. Consumer (forward): CompiledForwardShim waits via the counter before
-         launch; update_producer waits before reusing a ring slot.
+    torch_tpu has no device streams/events, so a reload round's completion is a
+    single threading.Event. (The GPU LayerLoadingEvent is per-layer for layerwise
+    overlap; TPU gates the whole compiled forward at once, so one flag suffices.)
+    complete(L) flips it on the last layer — the producer signals in order, so
+    last-layer-done == round-done. Names mirror LayerLoadingEvent so
+    LayerDoneCounter / cache_controller stay unchanged.
     """
 
     def __init__(self, num_layers: int):
@@ -163,14 +157,9 @@ class TpuLayerLoadingEvent:
 
 
 class TpuLayerDoneCounter:
-    """Drop-in replacement for LayerDoneCounter on the pallas_tpu path.
-
-    Uses TpuLayerLoadingEvent (Python threading.Event per layer) instead of
-    device stream events so that no torch.tpu streams are needed.
-
-    The interface is identical to LayerDoneCounter so that:
-      * cache_controller.start_loading can call update_producer() / set_consumer()
-      * kv_pool.get_key/value_buffer can call wait_until(layer_id) unchanged
+    """Drop-in LayerDoneCounter for the pallas_tpu path: a ring of
+    TpuLayerLoadingEvents (threading-based, no torch.tpu streams). Same interface
+    (update_producer / set_consumer / wait_until) so cache_controller is unchanged.
     """
 
     def __init__(self, num_layers: int):
@@ -184,11 +173,9 @@ class TpuLayerDoneCounter:
 
     def update_producer(self) -> int:
         next_index = (self.producer_index + 1) % self.num_counters
-        # Wait for the slot we are about to reuse to be fully consumed.
-        # The GPU path (LayerDoneCounter) asserts query() == True because the
-        # previous round must have completed on the device stream before the
-        # scheduler issues a new load. On TPU the producer thread is async, so
-        # a prior round may still be in flight — block until it finishes.
+        # Block until the slot we're about to reuse is done. The GPU path can
+        # assert it (device stream guarantees it); the TPU producer is async, so
+        # a prior round may still be in flight — wait it out.
         slot = self.events[next_index]
         if not slot.finish_event.query():
             slot.finish_event.wait()  # type: ignore[union-attr]
@@ -200,8 +187,7 @@ class TpuLayerDoneCounter:
         self.consumer_index = index
 
     def wait_until(self, threshold: int) -> None:
-        """Called by kv_pool.get_key_buffer(layer_id). Blocks until the
-        producer thread has signalled layer `threshold` complete."""
+        """Block until the consumer slot's round is done (called by the shim)."""
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
@@ -212,15 +198,10 @@ class TpuLayerDoneCounter:
 
 
 class _SyncDoneEvent:
-    """Always-complete sentinel satisfying the HiCacheAck event protocol.
-
-    The TPU (``pallas_tpu``) path uses NO torch.tpu streams or device events
-    (unsupported); the load/backup are issued as plain lazy ops and XLA orders
-    them by tensor-level data dependency. Completion bookkeeping
-    (``writing_check`` / ``loading_check``) only needs ``query()`` -> True /
-    ``synchronize()`` -> no-op, since the lazy transfer has materialized by the
-    time those run (a forward step, which reads the loaded ``kv_cache``,
-    executes in between).
+    """Always-complete sentinel for the HiCacheAck protocol on the pallas_tpu
+    path: load/backup are lazy ops ordered by data dependency, so completion
+    bookkeeping (writing_check / loading_check) only needs query()->True /
+    synchronize()->no-op — a forward reading the loaded KV runs in between.
     """
 
     def query(self) -> bool:
@@ -947,26 +928,10 @@ class HiCacheController:
             return -1
 
         if self.io_backend == "pallas_tpu":
-            # Threaded per-layer load: a dedicated producer thread does the
-            # H2D copy + Pallas scatter for each layer sequentially, signalling
-            # a TpuLayerLoadingEvent per layer as it completes. The forward's
-            # kv_pool.get_key/value_buffer(L) blocks on that event before reading
-            # kv_cache[L], giving layer-level synchronisation without device streams.
-            #
-            # While the producer thread materialises layer L, the main scheduler
-            # thread is free to run CPU-side work; if the forward executes compute
-            # for layer L-1 (lazy XLA ops) concurrently on the device, and the
-            # producer thread's copy for layer L targets an independent fresh staging
-            # buffer, the copy does not need to wait for layer L-1's compute.
-            #
-            # Implementation notes:
-            #   * _padded_ids (the D2H index read) is done ONCE by the producer
-            #     thread before the layer loop — avoids 48 per-layer syncs.
-            #   * Each layer gets a FRESH standalone staging tensor (not a slice of
-            #     a shared buffer) so the H2D copy has no XLA dependency on prior
-            #     scatters or compute.
-            #   * _tpu_sync([kv_cache[L]], wait=True) after each scatter confirms
-            #     the scatter is materialised before signalling the event.
+            # A dedicated producer thread does the H2D copy + Pallas scatter for
+            # all layers, then signals the round done; CompiledForwardShim gates
+            # the forward on it (no per-layer device events on torch_tpu).
+
             op = CacheOperation.merge_ops(self.load_queue)
             host_indices, device_indices = self.move_indices(
                 op.host_indices, op.device_indices
@@ -984,37 +949,23 @@ class HiCacheController:
             mem_pool_device_draft = self.mem_pool_device_draft
 
             def _producer():
-                try:
-                    mem_pool_host.load_to_device_layerwise(
-                        mem_pool_device,
+                mem_pool_host.load_to_device_layerwise(
+                    mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    io_backend,
+                    producer_event,
+                )
+                if has_draft:
+                    # Draft layers share these indices, offset past the main layers.
+                    mem_pool_host_draft.load_to_device_layerwise(
+                        mem_pool_device_draft,
                         host_indices,
                         device_indices,
                         io_backend,
                         producer_event,
+                        layer_offset=mem_pool_device.layer_num,
                     )
-                    if has_draft:
-                        # Draft layers use the same indices; complete their events
-                        # so the draft pool's wait_until also unblocks.
-                        mem_pool_host_draft.load_to_device_layerwise(
-                            mem_pool_device_draft,
-                            host_indices,
-                            device_indices,
-                            io_backend,
-                            producer_event,
-                            layer_offset=mem_pool_device.layer_num,
-                        )
-                except Exception as e:
-                    import logging as _log
-
-                    _log.getLogger(__name__).error(
-                        "[kv-offload] producer thread error: %s", e, exc_info=True
-                    )
-                    # Signal all remaining layers so the forward doesn't deadlock.
-                    for i in range(mem_pool_device.layer_num):
-                        try:
-                            producer_event.complete(i)
-                        except Exception:
-                            pass
 
             t = threading.Thread(target=_producer, daemon=True, name="kv-offload-load")
             t.start()

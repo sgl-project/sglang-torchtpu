@@ -106,12 +106,10 @@ pass() {
     bash "$HERE/bench_serving.sh"
 }
 
-# Pass 1: populate the cache (cold prompts -> recompute + write-through to host,
-# device LRU-evicts the overflow). Not a measurement.
+# Populate the cache + device LRU-evicts the overflow to host. Not measured.
 pass populate "$SEED"
 
-# Measured reload passes. Because WS > device, every subsequent same-seed pass
-# re-evicts and re-reloads, so each pass is a genuine reload.
+# WS > device => every same-seed pass re-evicts and re-reloads (genuine reload).
 for k in $(seq 1 "$SAMPLES"); do
     if [[ "$AB" == "1" ]]; then
         rm -f "$SERIAL_FLAG";  pass "reload-async-$k"  "$SEED"

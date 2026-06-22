@@ -1,23 +1,10 @@
 """Unit tests for the TPU HiCache KV-offload data plane (layer-wise overlapped).
 
-Mirrors the other ``test/manual/tpu`` suites: ``CustomTestCase`` classes guarded
-by ``@unittest.skipUnless(_has_tpu_via_jax(), ...)`` so they no-op cleanly off
-TPU. Requires torch_tpu + JAX with a TPU backend visible to ``jax.devices()``
-(the Pallas gather/scatter kernels JIT-export at first call).
-
-Coverage:
-  * Pallas scatter -> gather round-trip (layout + kernel + 128-align + pow2 pad).
-  * D2H -> host -> H2D round-trip incl. the PCIe ``copy_`` legs.
-  * Real ``TpuFusedMHATokenToKVPool`` + ``TpuFusedMHATokenToKVPoolHost``
-    backup -> evict -> async-load round-trip (the overlapped load issues the
-    scatter without a blocking sync; the ``.cpu()`` readback forces
-    materialization, so this asserts correctness of the overlapped path).
-  * The HBM staging reserve estimate equals the actual ``device_stage`` buffer
-    (guards drift between ``fused_block_nbytes`` and the real allocation that
-    the KV-cache sizing path relies on).
-
-Whether the overlapped load DMA actually *overlaps* compute is an
-integration/profiler question, not asserted here.
+Requires torch_tpu + JAX with a TPU backend visible to ``jax.devices()``; classes
+skip cleanly off TPU. The overlapped load issues the scatter without a blocking
+sync, so the ``.cpu()`` readbacks force materialization to assert correctness.
+Whether the load DMA actually *overlaps* compute is a profiler question, not
+asserted here.
 """
 
 import unittest
@@ -64,12 +51,8 @@ def _pad_src(src, p):
 
 
 def _make_pools(size=256, layer_num=2, head_num=2, head_dim=64, stage_blocks=None):
-    """Build a (device_pool, host_pool) pair on TPU.
-
-    If ``stage_blocks`` is given, override ``SGLANG_HICACHE_TPU_STAGE_BLOCKS``
-    for that pool's dedicated staging buffers (used to exercise the
-    overflow/fallback path with a small cap).
-    """
+    """Build a (device_pool, host_pool) pair on TPU. ``stage_blocks`` caps the
+    staging buffers to exercise the overflow/fallback path."""
     import os
     from unittest.mock import patch
 
@@ -120,7 +103,7 @@ def _assert_backup_load_roundtrip(
         dev.kv_buffer[layer][dev_page_ids] = r
         orig[layer] = r.cpu().clone()
 
-    # device_indices = concat of per-page token ranges, preserving page order.
+    # Per-page token ranges concatenated in page order.
     device_indices = torch.cat(
         [
             torch.arange(pid * page_size, (pid + 1) * page_size, device=DEV)
@@ -134,7 +117,6 @@ def _assert_backup_load_roundtrip(
     host.backup_from_device_all_layer(dev, host_indices, device_indices, "pallas_tpu")
     for layer in range(dev.layer_num):
         dev.kv_buffer[layer][dev_page_ids] = 0
-    # Real load path: pipelined per-layer copy+scatter, single barrier, signal.
     from sglang.srt.managers.cache_controller import TpuLayerLoadingEvent
 
     layer_event = TpuLayerLoadingEvent(dev.layer_num)
@@ -240,9 +222,8 @@ class TestTpuKvOffloadKernels(CustomTestCase):
         self._kernel_roundtrip([0, 1, 2, 3, 4, 5, 6, 7])
 
     def test_unaligned_last_dim(self):
-        # last dim 64 is NOT a multiple of 128 -> exercises the kernel's internal
-        # pad-to-128 + strip path (needs_pad=True), unused by the fused layout
-        # but part of the ported kernel contract.
+        # last dim 64 is not a multiple of 128 -> exercises the kernel's internal
+        # pad-to-128 + strip path (needs_pad=True), unused by the fused layout.
         self._kernel_roundtrip([2, 6, 1], block=(PAGE_SIZE, 2, 2, 64))
 
     def test_padding_does_not_corrupt_other_pages(self):
@@ -264,7 +245,7 @@ class TestTpuKvOffloadKernels(CustomTestCase):
         self.sync([g], wait=True)
         self.assertTrue(torch.equal(g[:n].cpu(), src.cpu()))
 
-        # Pages never named in block_ids must remain zero.
+        # Pages outside block_ids must remain zero.
         untouched = torch.tensor([0, 2, 4, 5, 8], dtype=torch.int32, device=DEV)
         gu = self.gather(cache, untouched)
         self.sync([gu], wait=True)
@@ -336,7 +317,6 @@ class TestTpuFusedHostPool(CustomTestCase):
             self.assertEqual(
                 dev.kv_buffer[layer][dev_pages].cpu().abs().sum().item(), 0.0
             )
-        # async layer-wise load: pipelined copies + single barrier, then signal
         from sglang.srt.managers.cache_controller import TpuLayerLoadingEvent
 
         layer_event = TpuLayerLoadingEvent(self.LAYER_NUM)

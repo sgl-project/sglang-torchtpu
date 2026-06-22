@@ -882,16 +882,12 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
     de-interleave / un-pad (the gather/scatter kernels are layout-agnostic on
     dims >= 1).
 
-    OVERLAP MODEL: ``load_to_device_layerwise`` (called by the controller's
-    pallas_tpu path from a dedicated producer thread) does the H2D copy +
-    Pallas scatter one layer at a time, signalling a ``TpuLayerLoadingEvent``
-    per layer after each scatter is materialised. The forward's
-    ``get_key/value_buffer(L)`` blocks on that event before reading
-    ``kv_cache[L]``, providing layer-level synchronisation without device
-    streams. ``device_stage_list`` holds one pre-allocated independent device
-    buffer per layer (used by ``load_to_device_layerwise``); ``host_stage``
-    is the D2H backup staging buffer (used by ``backup_from_device_all_layer``).
-    Both are sized upfront by ``_hicache_tpu_staging_reserve_bytes``.
+    OVERLAP MODEL: ``load_to_device_layerwise`` runs on the controller's
+    producer thread (pallas_tpu path), doing the H2D copy + Pallas scatter so
+    the copies overlap the prior batch's forward; CompiledForwardShim gates the
+    whole forward on the round before launch. ``device_stage_list`` holds one
+    per-layer device staging buffer (reload), ``host_stage`` the D2H backup
+    buffer; both sized upfront by ``_hicache_tpu_staging_reserve_bytes``.
     """
 
     device_pool: "TpuFusedMHATokenToKVPool"
@@ -924,18 +920,15 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         prewarm_offload_kernels(device_pool.kv_buffer, device_pool.device)
 
-        # Staging buffers allocated once at init to avoid per-reload allocation.
-        # stage_blocks = max pages per reload event; _hicache_tpu_staging_reserve_bytes
-        # accounts for this HBM upfront so it doesn't eat into the KV cache.
+        # Staging allocated once, sized upfront by the reserve so it doesn't eat
+        # the KV cache. stage_blocks = max pages per reload event.
         self.stage_blocks = hicache_tpu_stage_blocks()
         block_shape = tuple(device_pool.kv_buffer[0].shape[1:])
         layer_stage_shape = (self.stage_blocks,) + block_shape
-        # Per-layer INDEPENDENT device tensors (not slices of a shared base).
-        # A shared tensor with per-layer slices (the old device_stage approach)
-        # creates a patch-op dependency chain across layers in the XLA graph —
-        # each layer's copy_ triggers a read-modify-write on the whole base,
-        # serialising the scatters. Separate allocations have no shared base,
-        # so each layer's copy+scatter is an isolated XLA subgraph.
+        # Per-layer INDEPENDENT tensors, not slices of a shared base: a shared
+        # base chains the per-layer copy_ ops (read-modify-write on the whole
+        # tensor) and serialises the scatters; separate buffers keep each layer's
+        # copy+scatter an isolated XLA subgraph.
         self.device_stage_list = [
             torch.zeros(layer_stage_shape, dtype=self.dtype, device=device_pool.device)
             for _ in range(self.layer_num)
@@ -1001,40 +994,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         layer_event,
         layer_offset: int = 0,
     ):
-        """Producer-thread entry point: pipelined H2D copy + scatter, one barrier, signal.
+        """Reload on the HiCache producer thread: dispatch all layers' H2D copy +
+        Pallas scatter without per-layer syncs, then one barrier, then signal.
 
-        Runs on the HiCache producer thread. Under overlap scheduling this thread
-        is kicked while the *previous* batch's forward is still executing on the
-        TPU, so the goal is forward-level overlap: the expensive host->HBM copies
-        run on the DMA/transfer engine concurrently with that forward's compute.
-
-        Design (vs. the per-layer blocking variant this replaces):
-          * _padded_ids is computed ONCE (single D2H sync, before the loop).
-          * Each layer's H2D copy_ + Pallas scatter are *dispatched* without a
-            per-layer _tpu_sync. Each layer writes its own independent staging
-            buffer (device_stage_list[L]) and its own kv_cache[L], so the copies
-            pipeline on the DMA engine and the scatters pipeline on the compute
-            queue rather than serialising one layer at a time. (Per-layer
-            copy->scatter ordering is still guaranteed: the scatter reads the same
-            staging buffer the copy writes, so the runtime orders them via that
-            buffer's definition event — no explicit sync needed for that edge.)
-          * A SINGLE _tpu_sync over all layers' kv_cache buffers materialises the
-            whole batch before any layer is signalled. This is the no-stale
-            barrier: the forward (gated on these events) must never read kv_cache
-            before its scatter has executed. Batching the barrier (instead of one
-            sync per layer) is what frees the per-layer DMAs to overlap each other
-            and the concurrent forward.
-
-        The no-stale guarantee is identical to the per-layer-sync variant (nothing
-        is signalled until the single barrier returns); only the overlap improves.
-        For the copies to actually fit under the prior forward they must run at DMA
-        speed — set TPU_PREMAPPED_BUFFER_SIZE (see TpuPlatform.init_backend), else
-        copy_ falls back to slow per-call pinning and dominates the step.
-
-        Args:
-            layer_event: TpuLayerLoadingEvent — one threading.Event per layer.
-            layer_offset: non-zero when this call handles draft layers that share
-                the same event object as the main model layers.
+        Runs while the prior batch's forward executes, so the host->HBM copies
+        overlap that compute. Each layer uses its own staging buffer + kv_cache[L]
+        so the copies/scatters pipeline; the single barrier over all kv_cache
+        buffers materialises the batch before any layer is signalled (no-stale).
+        Copies only overlap at DMA speed — needs TPU_PREMAPPED_BUFFER_SIZE set
+        (TpuPlatform.init_backend). layer_offset is non-zero for draft layers
+        sharing the same event.
         """
         if io_backend != "pallas_tpu":
             raise ValueError(
@@ -1056,11 +1025,9 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         host_pages = self._to_page_ids(host_indices).cpu()
 
-        # A/B baseline (benchmark only): if the flag file /cache/kvoffload_serial
-        # exists, use the old per-layer copy -> scatter -> BLOCKING _tpu_sync ->
-        # signal path (serialises the producer, no overlap with the prior forward).
-        # File-based (read per call) so async vs serial can be A/B'd against one
-        # running server without recompiling. Default (no file) = async overlap.
+        # Benchmark-only A/B toggle (REMOVE before merge): with the flag file
+        # present, use the old per-layer copy->scatter->blocking-sync path so
+        # async vs serial can be compared against one running server.
         import os as _os
 
         if _os.path.exists("/cache/kvoffload_serial"):
@@ -1085,12 +1052,9 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                 layer_event.complete(layer_id + layer_offset)
             return
 
-        # Phase 1: dispatch every layer's H2D copy + scatter WITHOUT syncing, so
-        # the per-layer DMAs pipeline (and overlap the concurrent forward) instead
-        # of serialising. We keep references to the gathered host buffers and the
-        # live kv_cache buffers: the host buffers must stay alive until their
-        # async H2D transfer completes (kImmutableUntilTransferCompletes), and the
-        # kv_cache buffers are what the single barrier below waits on.
+        # Phase 1: dispatch all layers' copy + scatter, no per-layer sync. Keep
+        # host buffers alive until the barrier (async H2D in flight); fused_buffers
+        # is what the barrier waits on.
         host_srcs = []
         dev_srcs = []  # keep staging buffers alive until the barrier
         fused_buffers = []
@@ -1102,10 +1066,8 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                 host_g = torch.cat([host_g, pad], dim=0)
             host_srcs.append(host_g)  # keep alive until the barrier (DMA in flight)
 
-            # Per-layer independent staging buffer (no shared base -> no patch-op
-            # chain), so this copy has no XLA dependency on other layers. If the
-            # transfer exceeds the dedicated staging buffer, fall back to a per-call
-            # device allocation (mirrors backup_from_device_all_layer's overflow).
+            # Per-layer independent staging (no shared base -> no XLA dep across
+            # layers); oversized transfers fall back to a per-call allocation.
             if p <= self.stage_blocks:
                 dev_src = self.device_stage_list[layer_id][:p]
             else:
@@ -1122,9 +1084,8 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             fused[:] = _scatter_fn(fused, dev_src, dst_ids)  # async scatter dispatch
             fused_buffers.append(fused)
 
-        # Phase 2: single barrier — materialise ALL scatters before signalling any
-        # layer (the no-stale guarantee). The per-layer copies/scatters above were
-        # free to overlap each other and the prior batch's forward.
+        # Phase 2: single barrier materialises all scatters before any layer is
+        # signalled (no-stale).
         _tpu_sync(fused_buffers, wait=True)
         del host_srcs, dev_srcs  # transfers done; release staging buffers
 

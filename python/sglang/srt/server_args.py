@@ -3479,9 +3479,8 @@ class ServerArgs:
 
     def _resolve_layout_io_compatibility(self):
         if self.hicache_io_backend == "pallas_tpu":
-            # The TPU fused host pool stores the device's fused 5D row verbatim
-            # and only supports the "page_first_fused" layout; force it so users
-            # need only pass --hicache-io-backend pallas_tpu.
+            # The TPU fused host pool only supports the "page_first_fused"
+            # layout; force it so users need only pass the io backend.
             if self.hicache_mem_layout != "page_first_fused":
                 logger.warning(
                     "pallas_tpu io backend requires the page_first_fused layout, "
