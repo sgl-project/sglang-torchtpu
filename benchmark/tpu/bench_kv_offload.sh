@@ -1,27 +1,17 @@
 #!/usr/bin/env bash
-# KV-offload (HiCache --hicache-io-backend pallas_tpu) reload benchmark, built on
-# top of ./bench_serving.sh. It reuses bench_serving's metrics/JSONL and just
-# orchestrates the workload so that a real host->HBM reload is exercised.
+# KV-offload (HiCache --hicache-io-backend pallas_tpu) reload benchmark on top of
+# ./bench_serving.sh (reuses its metrics/JSONL).
 #
-# WHY A WRAPPER: a plain bench_serving run with --dataset-name random sends fresh
-# prompts -> no prefix reuse -> no cache hit -> that's the *recompute* (offload
-# OFF) case, never a reload. A reload only fires when a prompt was seen before,
-# written through to the host pool, evicted from the device pool, and then
-# re-requested. Two facts make that reproducible on top of bench_serving:
-#   * bench_serving re-seeds RNGs at startup, so --dataset-name random-ids
-#     --seed S yields the SAME prompts on every invocation;
-#   * random-ids (--tokenize-prompt) sends exact input_ids -> guaranteed radix
-#     match across runs.
-# So we run the same seed twice: pass 1 populates + evicts to host, pass 2 is the
-# measured reload. A different seed = fresh prompts = recompute (offload OFF).
+# Same-seed double-run forces a real host->HBM reload (bench_serving re-seeds at
+# startup, so `--dataset-name random-ids --seed S` sends identical input_ids each
+# run): pass 1 populates + evicts to host, pass 2 (same seed) is the measured
+# reload, a different seed = fresh prompts = recompute (offload OFF).
 #
-# THE SIZING (the whole game): the working set must straddle the two pools ::
-#       device pool ( --max-total-tokens )  <  NUM_PROMPTS*ISL  <  host pool
-#                                                              ( hicache-ratio * device )
-#   below the band -> everything fits device -> device hit, no reload
-#   above the band -> host pool thrashes too -> recompute, no reload
-#   inside it      -> device evicts, host keeps -> reload on the re-run
-# This script aims the working set at ~1.9x the device pool by default.
+# Sizing (the knob): keep the working set between the pools so it evicts from
+# device but stays on host --
+#   device (--max-total-tokens) < NUM_PROMPTS*ISL < host (hicache-ratio * device)
+# below -> device hit (no reload); above -> host thrash -> recompute (no reload).
+# Default targets ~1.9x the device pool.
 #
 # PREREQ: a server up at $BASE_URL with offload enabled, e.g.
 #   TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false \

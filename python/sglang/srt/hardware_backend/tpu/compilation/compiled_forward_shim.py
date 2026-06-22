@@ -131,14 +131,10 @@ class CompiledForwardShim:
         functools.update_wrapper(self, compiled_fn)
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
-        # HiCache reload no-stale gate. Reload scatters are issued at serving
-        # time by the producer thread, so they are NOT in the traced graph — the
-        # compiled program cannot depend on them and would otherwise read stale
-        # KV (and race the RPA kernel's buffer donation). The program reads every
-        # layer's buffer at launch, so wait for the producer to signal each layer
-        # ready before launching. (This is the whole-forward gate; the per-layer
-        # getter is a plain read. A future split/piecewise forward regains
-        # overlap by gating each segment's launch the same way.)
+        # HiCache reload no-stale gate: the producer's reload scatters aren't in
+        # the traced graph, so wait until they've landed before launching. The
+        # forward reads all layers at once and the producer signals in order
+        # (last layer last), so one wait on the final layer covers the batch.
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         counter = getattr(pool, "layer_transfer_counter", None)
         if counter is not None:
