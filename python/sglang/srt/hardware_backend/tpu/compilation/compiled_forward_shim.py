@@ -131,18 +131,18 @@ class CompiledForwardShim:
         functools.update_wrapper(self, compiled_fn)
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
-        # HiCache reload gate: reload scatters are issued at serving time by
-        # the producer thread, so they are NOT in the traced graph — the
-        # compiled program cannot depend on them and would read stale KV
-        # (and race the RPA kernel's buffer donation). Since the program
-        # reads every layer's buffer at launch, apply the same layerwise
-        # gate eager uses (get_fused_kv_buffer) to each layer here, before
-        # launch. A future split/piecewise forward regains overlap by gating
-        # each segment's launch the same way.
+        # HiCache reload no-stale gate. Reload scatters are issued at serving
+        # time by the producer thread, so they are NOT in the traced graph — the
+        # compiled program cannot depend on them and would otherwise read stale
+        # KV (and race the RPA kernel's buffer donation). The program reads every
+        # layer's buffer at launch, so wait for the producer to signal each layer
+        # ready before launching. (This is the whole-forward gate; the per-layer
+        # getter is a plain read. A future split/piecewise forward regains
+        # overlap by gating each segment's launch the same way.)
         pool = getattr(forward_batch, "token_to_kv_pool", None)
-        if getattr(pool, "layer_transfer_counter", None) is not None:
-            for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
-                pool.get_fused_kv_buffer(layer_id)
+        counter = getattr(pool, "layer_transfer_counter", None)
+        if counter is not None:
+            counter.wait_until(pool.layer_num - 1)
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as
