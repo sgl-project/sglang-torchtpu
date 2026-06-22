@@ -179,6 +179,15 @@ class TpuSRTPlatform(SRTPlatform):
             "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false"
         )
 
+        # Size libtpu's premapped (pinned, DMA-mapped) host staging pool. This is
+        # read by libtpu at init, so it MUST be set before `import torch_tpu`.
+        # Without it, host<->HBM copy_ falls back to slow per-call pinning (~1
+        # GB/s); with it, copies run at DMA speed (several GB/s) — which the
+        # HiCache (pallas_tpu) layer-wise reload relies on to fit the host->HBM
+        # copy under the prior forward's compute. setdefault: the launch env /
+        # configmap can override (raise it for heavy KV-offload workloads).
+        os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(4 * 1024 * 1024 * 1024))
+
         import torch_tpu  # noqa: F401
 
         from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches

@@ -134,10 +134,14 @@ def _assert_backup_load_roundtrip(
     host.backup_from_device_all_layer(dev, host_indices, device_indices, "pallas_tpu")
     for layer in range(dev.layer_num):
         dev.kv_buffer[layer][dev_page_ids] = 0
-    for layer in range(dev.layer_num):
-        host.load_to_device_per_layer(
-            dev, host_indices, device_indices, layer, "pallas_tpu"
-        )
+    # Real load path: pipelined per-layer copy+scatter, single barrier, signal.
+    from sglang.srt.managers.cache_controller import TpuLayerLoadingEvent
+
+    layer_event = TpuLayerLoadingEvent(dev.layer_num)
+    host.load_to_device_layerwise(
+        dev, host_indices, device_indices, "pallas_tpu", layer_event
+    )
+    test.assertTrue(layer_event.query())  # all layers signalled after the barrier
     for layer in range(dev.layer_num):
         test.assertTrue(
             torch.equal(dev.kv_buffer[layer][dev_page_ids].cpu(), orig[layer])
@@ -332,10 +336,14 @@ class TestTpuFusedHostPool(CustomTestCase):
             self.assertEqual(
                 dev.kv_buffer[layer][dev_pages].cpu().abs().sum().item(), 0.0
             )
-        for layer in range(self.LAYER_NUM):  # async load (no blocking sync)
-            host.load_to_device_per_layer(
-                dev, host_indices, device_indices, layer, "pallas_tpu"
-            )
+        # async layer-wise load: pipelined copies + single barrier, then signal
+        from sglang.srt.managers.cache_controller import TpuLayerLoadingEvent
+
+        layer_event = TpuLayerLoadingEvent(self.LAYER_NUM)
+        host.load_to_device_layerwise(
+            dev, host_indices, device_indices, "pallas_tpu", layer_event
+        )
+        self.assertTrue(layer_event.query())
         for layer in range(self.LAYER_NUM):  # .cpu() forces materialization
             self.assertTrue(
                 torch.equal(dev.kv_buffer[layer][dev_pages].cpu(), orig[layer])
@@ -351,9 +359,8 @@ class TestTpuFusedHostPool(CustomTestCase):
                 self.HEAD_NUM, self.HEAD_DIM, torch.bfloat16, self.PAGE_SIZE
             )
         )
-        actual = (
-            self.host_pool.device_stage.numel()
-            * self.host_pool.device_stage.element_size()
+        actual = sum(
+            t.numel() * t.element_size() for t in self.host_pool.device_stage_list
         )
         self.assertEqual(reserve, actual)
 
@@ -370,7 +377,11 @@ class TestTpuFusedHostPool(CustomTestCase):
         ]
         empty = torch.empty((0,), dtype=torch.int64, device=DEV)
         host.backup_from_device_all_layer(dev, empty.cpu(), empty, "pallas_tpu")
-        host.load_to_device_per_layer(dev, empty.cpu(), empty, 0, "pallas_tpu")
+        from sglang.srt.managers.cache_controller import TpuLayerLoadingEvent
+
+        host.load_to_device_layerwise(
+            dev, empty.cpu(), empty, "pallas_tpu", TpuLayerLoadingEvent(dev.layer_num)
+        )
         for layer in range(self.LAYER_NUM):
             self.assertTrue(torch.equal(dev.kv_buffer[layer].cpu(), snapshot[layer]))
 
