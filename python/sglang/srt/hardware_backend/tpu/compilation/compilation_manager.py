@@ -8,10 +8,12 @@ Iterates over shape buckets to compile:
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
+import tqdm
 
+from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -24,6 +26,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = get_logger(__name__)
+
+# Pure-text progress format (no animated bar) so log files and
+# multi-process wrappers don't garble the output.
+_COMPILE_BAR_FORMAT = (
+    "{desc}: {percentage:3.0f}% Completed | "
+    "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+)
 
 
 class CompilationManager:
@@ -83,22 +92,30 @@ class CompilationManager:
             )
         n = len(valid_shapes)
         logger.info(
-            "[compilation manager] EXTEND: %d shapes (bs=%d, " "token_buckets=%s)",
+            "[compilation manager] EXTEND: %d shapes (bs=%d, token_buckets=%s)",
             n,
             bs,
             list(self.t_bucketer.buckets),
         )
-        for idx, (num_tokens, bs) in enumerate(valid_shapes, start=1):
+        compile_range = (
+            tqdm.tqdm(
+                valid_shapes, desc="Compiling EXTEND", bar_format=_COMPILE_BAR_FORMAT
+            )
+            if get_tensor_model_parallel_rank() == 0
+            else valid_shapes
+        )
+        for num_tokens, bs in compile_range:
+            hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(num_tokens=num_tokens, bs=bs, mode=ForwardMode.EXTEND)
-            logger.info(
-                "[compilation manager] EXTEND [%d/%d] (tokens=%d, bs=%d) in %.1fs",
-                idx,
-                n,
-                num_tokens,
-                bs,
-                time.perf_counter() - start,
-            )
+            if get_tensor_model_parallel_rank() == 0:
+                elapsed = time.perf_counter() - start
+                hbm_after = _get_hbm_usage_mb()
+                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                compile_range.set_description(
+                    f"Compiled EXTEND (tokens={num_tokens}, bs={bs})"
+                    f" in {elapsed:.1f}s{hbm_str}"
+                )
 
     def _precompile_decode(self) -> None:
         """Compile decode mode: vary batch size (where tokens == batch_size)."""
@@ -109,16 +126,24 @@ class CompilationManager:
             n,
             bs_buckets,
         )
-        for idx, bs in enumerate(bs_buckets, start=1):
+        compile_range = (
+            tqdm.tqdm(
+                bs_buckets, desc="Compiling DECODE", bar_format=_COMPILE_BAR_FORMAT
+            )
+            if get_tensor_model_parallel_rank() == 0
+            else bs_buckets
+        )
+        for bs in compile_range:
+            hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(num_tokens=bs, bs=bs, mode=ForwardMode.DECODE)
-            logger.info(
-                "[compilation manager] DECODE [%d/%d] (bs=%d) in %.1fs",
-                idx,
-                n,
-                bs,
-                time.perf_counter() - start,
-            )
+            if get_tensor_model_parallel_rank() == 0:
+                elapsed = time.perf_counter() - start
+                hbm_after = _get_hbm_usage_mb()
+                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                compile_range.set_description(
+                    f"Compiled DECODE (bs={bs}) in {elapsed:.1f}s{hbm_str}"
+                )
 
     def _run_one(self, num_tokens: int, bs: int, mode: ForwardMode) -> None:
         """Build and execute one dummy forward pass for compilation."""
@@ -217,3 +242,26 @@ def _materialize_out(out, forward_batch) -> None:
     from torch_tpu._internal.sync.sync import synchronize as tpu_sync
 
     tpu_sync(tensors, wait=True)
+
+
+def _get_hbm_usage_mb() -> Optional[tuple[float, float]]:
+    """Return (used_mb, total_mb) for the current TPU device, or None."""
+    try:
+        info = torch.accelerator.get_memory_info(torch.device("tpu"))
+        free = info["free"] if isinstance(info, dict) else info[0]
+        total = info["total"] if isinstance(info, dict) else info[1]
+        used = total - free
+        return (used / 1024 / 1024, total / 1024 / 1024)
+    except Exception:
+        return None
+
+
+def _hbm_delta_str(
+    before: Optional[tuple[float, float]],
+    after: Optional[tuple[float, float]],
+) -> str:
+    """Format HBM delta + total as a suffix string, or empty if unavailable."""
+    if before is None or after is None:
+        return " HBM: N/A"
+    delta = after[0] - before[0]
+    return f" HBM: +{delta:.0f} MB ({after[0]:.0f}/{after[1]:.0f} MB)"

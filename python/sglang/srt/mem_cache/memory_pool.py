@@ -837,7 +837,7 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
-        if enable_kv_cache_copy:
+        if enable_kv_cache_copy and not envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None

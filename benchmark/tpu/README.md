@@ -8,6 +8,8 @@ no per-model files. (For the separate sglang-jax engine, see
 ```
 launch_server.sh     # start the server
 bench_serving.sh     # run sglang.bench_serving (single run or sweep)
+run_eval.sh          # run sglang.test.run_eval (e.g. MMLU, GSM8K)
+run_lm_eval.sh       # run lm-eval against a live server and check baselines
 warmup.sh            # optional compile-bucket pre-warmup (stopgap)
 warmup_buckets.py    # request-sender used by warmup.sh
 ```
@@ -25,7 +27,59 @@ MODEL=Qwen/Qwen3-32B ./bench_serving.sh
 
 # Concurrency/shape sweep ("concurrency:isl:osl" per leg)
 MODEL=Qwen/Qwen3-32B SWEEP="16:1024:1024 64:1024:1024" ./bench_serving.sh
+
+# 3. Eval — defaults to EVAL_NAME=mmlu, API=chat, NUM_THREADS=4
+MODEL=Qwen/Qwen3-4B ./run_eval.sh
+MODEL=Qwen/Qwen3-4B EVAL_NAME=gsm8k ./run_eval.sh
 ```
+
+Qwen3-Coder-30B FP8 TP8/EP8 quality eval:
+
+```bash
+MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=8192 \
+CHUNKED_PREFILL_SIZE=4096 MAX_PREFILL_TOKENS=4096 \
+MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
+TORCH_COMPILE_MAX_BS=64 \
+./launch_server.sh
+
+./run_lm_eval.sh
+```
+
+Qwen3-Coder-480B FP8 TP8/EP8 quality eval (weights dominate HBM, so use a
+low mem-fraction and fewer running requests):
+
+```bash
+MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=8192 \
+CHUNKED_PREFILL_SIZE=4096 MAX_PREFILL_TOKENS=4096 \
+MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
+MAX_RUNNING=32 TORCH_COMPILE_MAX_BS=32 \
+./launch_server.sh
+
+EVAL_CONFIG=../../test/lm_eval_configs/Qwen3-Coder-480B-A35B-Instruct-FP8-TPU.yaml \
+./run_lm_eval.sh
+```
+
+Fast vs full: `run_lm_eval.sh` runs whatever tasks the `EVAL_CONFIG` lists, so
+each model has two configs:
+- `<Model>-TPU.yaml` — **full** quality eval (`mmlu_llama` + `mmlu_pro`); run for
+  release sign-off. Needs `CONTEXT_LEN=8192` for mmlu_pro's 2048-token CoT.
+- `<Model>-TPU-fast.yaml` — **fast** gate (`mmlu_llama` only, 10-token answers);
+  lighter (skips the heavy CoT) and runs at `CONTEXT_LEN=4096`. Use for per-PR gating.
+
+```bash
+# fast gate (mmlu_llama only) against the same server:
+EVAL_CONFIG=../../test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU-fast.yaml \
+./run_lm_eval.sh
+```
+
+(gsm8k would be the cheaper sglang-style gate, but it currently crashes the
+torch_tpu server on a serve-time recompile — `InductorError: KeyError 'tpu'` for
+request shapes outside the precompiled buckets — so the fast gate uses mmlu_llama
+for now.)
 
 Single-chip smoke (tp=1 auto-pins chiplet 0):
 
@@ -37,19 +91,35 @@ MODEL=Qwen/Qwen3-0.6B TP_SIZE=1 ./bench_serving.sh
 TP8/EP8 MoE throughput run:
 
 ```bash
-MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 \
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
 TP_SIZE=8 EP_SIZE=8 \
 PAGE_SIZE=128 CONTEXT_LEN=2048 \
 CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
 MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
 TORCH_COMPILE_MAX_BS=64 \
-TPU_COMPILE_TOKENS="64 128 256 512 1024" \
-TPU_COMPILE_BS="1 2 4 8 16 32 64" \
-SGLANG_TPU_DECODE_PROCESS_INTERVAL=8 \
+NUM_CONTINUOUS_DECODE_STEPS=8 \
 ./launch_server.sh
 
-MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 \
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
 NUM_PROMPTS=640 \
+./bench_serving.sh
+```
+
+TP8/EP8 480B FP8 1k/1k c=64 run:
+
+```bash
+MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+TP_SIZE=8 EP_SIZE=8 \
+PAGE_SIZE=128 CONTEXT_LEN=2048 \
+CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
+TORCH_COMPILE_MAX_BS=64 \
+NUM_CONTINUOUS_DECODE_STEPS=4 \
+./launch_server.sh
+
+MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
+DATASET_NAME=random-ids TOKENIZE_PROMPT=1 \
+BATCH_SIZE=64 NUM_PROMPTS=64 ISL=1024 OSL=1024 \
 ./bench_serving.sh
 ```
 

@@ -41,7 +41,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    is_tpu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -50,6 +57,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _disable_hip_linear_quant = _is_hip and get_bool_env_var(
     "SGLANG_ROCM_DISABLE_LINEARQUANT"
 )
@@ -783,6 +791,32 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         block_n, _ = weight_block_size[0], weight_block_size[1]
         block_n = 1 if getattr(param, "format_ue8m0", False) else block_n
 
+        if _is_tpu and not getattr(param, "format_ue8m0", False):
+            param_offset = 0
+            loaded_block_offsets = [0]
+            for output_size in self.output_sizes[:-1]:
+                loaded_block_offsets.append(
+                    loaded_block_offsets[-1] + (output_size + block_n - 1) // block_n
+                )
+            for shard_id, output_size in enumerate(self.output_sizes):
+                local_size = output_size // self.tp_size
+                global_start = self.tp_rank * local_size
+                block_start = global_start // block_n
+                block_end = (global_start + local_size + block_n - 1) // block_n
+                block_count = block_end - block_start
+                param_data = param.data.narrow(
+                    param.output_dim, param_offset, block_count
+                )
+                loaded_weight_shard = loaded_weight.narrow(
+                    param.output_dim,
+                    loaded_block_offsets[shard_id] + block_start,
+                    block_count,
+                )
+                assert param_data.shape == loaded_weight_shard.shape
+                param_data.copy_(loaded_weight_shard)
+                param_offset += block_count
+            return
+
         # Calculate block sizes for each shard
         shard_block_sizes = []
         shard_block_offsets = []
@@ -868,14 +902,41 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
-            shard_offset = (
-                (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
-            ) // self.tp_size
-            shard_size = (
-                (self.output_sizes[loaded_shard_id] + block_n - 1)
-                // block_n
-                // self.tp_size
-            )
+            if _is_tpu and not getattr(param, "format_ue8m0", False):
+                local_size = self.output_sizes[loaded_shard_id] // self.tp_size
+                global_start = self.tp_rank * local_size
+                shard_offset = sum(
+                    (
+                        self.tp_rank * self.output_sizes[i] // self.tp_size
+                        + self.output_sizes[i] // self.tp_size
+                        + block_n
+                        - 1
+                    )
+                    // block_n
+                    - (self.tp_rank * self.output_sizes[i] // self.tp_size) // block_n
+                    for i in range(loaded_shard_id)
+                )
+                shard_size = (
+                    global_start + local_size + block_n - 1
+                ) // block_n - global_start // block_n
+                loaded_weight = loaded_weight.narrow(
+                    param.output_dim, global_start // block_n, shard_size
+                )
+                param_data = param.data.narrow(
+                    param.output_dim, shard_offset, shard_size
+                )
+                assert param_data.shape == loaded_weight.shape
+                param_data.copy_(loaded_weight)
+                return
+            else:
+                shard_offset = (
+                    (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
+                ) // self.tp_size
+                shard_size = (
+                    (self.output_sizes[loaded_shard_id] + block_n - 1)
+                    // block_n
+                    // self.tp_size
+                )
         else:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
             shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
@@ -1053,6 +1114,45 @@ class QKVParallelLinear(ColumnParallelLinear):
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
         block_n, _ = self.quant_method.quant_config.weight_block_size
+
+        if _is_tpu and not getattr(param, "format_ue8m0", False):
+            param_offset = 0
+            loaded_block_offsets = [0]
+            loaded_output_sizes = [
+                self.total_num_heads * self.head_size,
+                self.total_num_kv_heads * self.head_size,
+                self.total_num_kv_heads * self.v_head_size,
+            ]
+            for output_size in loaded_output_sizes[:-1]:
+                loaded_block_offsets.append(
+                    loaded_block_offsets[-1] + (output_size + block_n - 1) // block_n
+                )
+            for shard_idx, (shard_id, output_size) in enumerate(
+                zip(("q", "k", "v"), self.output_sizes)
+            ):
+                local_size = output_size // self.tp_size
+                source_rank = (
+                    self.tp_rank
+                    if shard_id == "q"
+                    else self.tp_rank // self.num_kv_head_replicas
+                )
+                global_start = source_rank * local_size
+                block_start = global_start // block_n
+                block_end = (global_start + local_size + block_n - 1) // block_n
+                block_count = block_end - block_start
+                param_data = param.data.narrow(
+                    param.output_dim, param_offset, block_count
+                )
+                loaded_weight_shard = loaded_weight.narrow(
+                    param.output_dim,
+                    loaded_block_offsets[shard_idx] + block_start,
+                    block_count,
+                )
+                assert param_data.shape == loaded_weight_shard.shape
+                param_data.copy_(loaded_weight_shard)
+                param_offset += block_count
+            return
+
         q_size = self.total_num_heads * self.head_size // block_n
         k_size = self.total_num_kv_heads * self.head_size // block_n
         v_size = self.total_num_kv_heads * self.v_head_size // block_n
@@ -1107,8 +1207,41 @@ class QKVParallelLinear(ColumnParallelLinear):
             weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
-            shard_offset = (shard_offset + block_n - 1) // block_n
-            shard_size = (shard_size + block_n - 1) // block_n
+            if _is_tpu and not getattr(param, "format_ue8m0", False):
+                shard_idx = {"q": 0, "k": 1, "v": 2}[loaded_shard_id]
+                local_size = self.output_sizes[shard_idx] // self.tp_size
+                source_rank = (
+                    self.tp_rank
+                    if loaded_shard_id == "q"
+                    else self.tp_rank // self.num_kv_head_replicas
+                )
+                global_start = source_rank * local_size
+                param_offset = sum(
+                    (
+                        self.tp_rank * self.output_sizes[i] // self.tp_size
+                        + self.output_sizes[i] // self.tp_size
+                        + block_n
+                        - 1
+                    )
+                    // block_n
+                    - (self.tp_rank * self.output_sizes[i] // self.tp_size) // block_n
+                    for i in range(shard_idx)
+                )
+                shard_size = (
+                    global_start + local_size + block_n - 1
+                ) // block_n - global_start // block_n
+                loaded_weight = loaded_weight.narrow(
+                    param.output_dim, global_start // block_n, shard_size
+                )
+                param_data = param.data.narrow(
+                    param.output_dim, param_offset, shard_size
+                )
+                assert param_data.shape == loaded_weight.shape
+                param_data.copy_(loaded_weight)
+                return
+            else:
+                shard_offset = (shard_offset + block_n - 1) // block_n
+                shard_size = (shard_size + block_n - 1) // block_n
 
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
@@ -1495,6 +1628,25 @@ class RowParallelLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
+        if (
+            isinstance(param, BlockQuantScaleParameter)
+            and _is_tpu
+            and not getattr(param, "format_ue8m0", False)
+        ):
+            _, block_k = self.quant_method.quant_config.weight_block_size
+            global_start = self.tp_rank * self.input_size_per_partition
+            block_start = global_start // block_k
+            block_end = (
+                global_start + self.input_size_per_partition + block_k - 1
+            ) // block_k
+            block_count = block_end - block_start
+            loaded_weight = loaded_weight.narrow(
+                param.input_dim, block_start, block_count
+            )
+            assert param.data.shape == loaded_weight.shape
+            param.data.copy_(loaded_weight)
+            return
+
         if isinstance(param, RowvLLMParameter):
             # This `BasevLLMParameter` is defined in sglang/srt/layers/parameter.py,
             # It supports additional parameters like tp_rank and use_presharded_weights.
@@ -1528,9 +1680,21 @@ class RowParallelLinear(LinearBase):
 
         # Matrix multiply.
         assert self.quant_method is not None
-        # Only fuse bias add into GEMM for rank 0 (this ensures that
-        # bias will not get added more than once in TP>1 case)
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        # On TPU, defer the bias only when this call performs the TP all-reduce;
+        # that keeps all ranks' compiled graphs structurally identical without
+        # changing the rank-0-only bias semantics of unreduced paths.
+        defer_tpu_bias = (
+            _is_tpu
+            and self.reduce_results
+            and self.tp_size > 1
+            and not skip_all_reduce
+            and not self.skip_bias_add
+            and self.bias is not None
+        )
+        if defer_tpu_bias:
+            bias_ = None
+        else:
+            bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         if self.use_dp_attention_reduce:
             symm_ctx = use_symmetric_memory(get_attention_tp_group())
         else:
@@ -1558,6 +1722,9 @@ class RowParallelLinear(LinearBase):
                     output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
+
+        if defer_tpu_bias:
+            output = output + self.bias
 
         output_bias = self.bias if self.skip_bias_add else None
 

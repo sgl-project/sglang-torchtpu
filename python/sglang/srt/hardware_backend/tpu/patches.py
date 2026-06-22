@@ -17,6 +17,7 @@ logger = get_logger(__name__)
 
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("sglang.srt.layers.vocab_parallel_embedding", "get_masked_input_and_mask"),
+    ("sglang.srt.layers.rotary_embedding.utils", "apply_rotary_pos_emb_native"),
 ]
 
 _dynamic_compile_unwrapped = False
@@ -34,6 +35,12 @@ def _register_tpu_compile_backend() -> None:
     # torch._dynamo so that `torch.compile(backend="tpu", ...)` works. Must run
     # before any code applies that decorator (e.g. on imports of layers/models).
     import torch_tpu._internal.compile  # noqa: F401
+
+    # Upgrade the just-registered TPU Dynamo backend to a serializable backend
+    # so PyTorch's bundled AOTAutogradCache can persist compile artifacts.
+    from sglang.srt.hardware_backend.tpu.compilation import aot_autograd_cache
+
+    aot_autograd_cache.install()
 
 
 def _unwrap_dynamic_compile_fns() -> None:
@@ -57,17 +64,51 @@ def _unwrap_dynamic_compile_fns() -> None:
             )
 
 
-def _prepare_tpu_env(world_size: int = 1) -> None:
-    """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
+def _set_torch_tpu_topology_env_multihost(
+    hosts: list[str],
+    base_port: int,
+    devices_per_host: int,
+    tpu_topology: str,
+) -> None:
+    """Set the slicebuilder + topology env for a multi-host slice.
 
-    Ported from torchtpu-vllm: _prepare_singlehost_tpu_env().
-    Slicebuilder addresses must match exactly the number of TP workers
-    (world_size), not the total process count — detokenizer and tokenizer
-    processes do not participate in PjRt coordination.
+    One slicebuilder endpoint per device across ALL hosts; topology is the
+    ``TPU_TOPOLOGY`` chip grid with an extra dim appended on v7x (>1 core/chip).
     """
-    if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+        f"{host}:{base_port + i}"
+        for host in hosts
+        for i in range(devices_per_host)
+    )
+
+    if not tpu_topology:
         return
 
+    chip_dims = [int(d) for d in tpu_topology.split("x") if d]
+    num_chips = 1
+    for d in chip_dims:
+        num_chips *= d
+    num_devices = len(hosts) * devices_per_host
+    # v7x (>1 core/chip) needs an extra topology dim; v4/v5/v6 keep the
+    # 3-D chip grid.
+    cores_per_chip, rem = divmod(num_devices, num_chips)
+    assert rem == 0, (
+        f"TPU device/chip mismatch: {num_devices} devices vs {num_chips} "
+        f"chips (TPU_TOPOLOGY={tpu_topology!r}, hosts={len(hosts)}, "
+        f"devices_per_host={devices_per_host})"
+    )
+    if cores_per_chip > 1:
+        chip_dims.append(cores_per_chip)
+    os.environ.setdefault("TORCH_TPU_TOPOLOGY", ",".join(str(d) for d in chip_dims))
+
+
+def _set_torch_tpu_topology_env_single(world_size: int) -> None:
+    """Set the slicebuilder + topology env for a single-host process group.
+
+    Picks ``world_size`` free localhost ports for the per-rank slicebuilder
+    endpoints; topology is ``1,1,1`` for ``world_size == 1``, else the
+    torch_tpu-derived grid when one is available.
+    """
     try:
         import portpicker
 
@@ -77,7 +118,8 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
 
         # Hold sockets open until env var is written so OS doesn't reassign.
         _held = [
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            for _ in range(world_size)
         ]
         for s in _held:
             s.bind(("", 0))
@@ -100,6 +142,42 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
                 os.environ.setdefault("TORCH_TPU_TOPOLOGY", topo)
         except Exception:
             pass
+
+
+def _prepare_tpu_env(world_size: int = 1) -> None:
+    """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
+
+    Applies LIBTPU_INIT_ARGS overrides, then dispatches to the multi-host or
+    single-host helper, which write the slicebuilder + topology env directly.
+    """
+    # Apply LIBTPU_INIT_ARGS overrides before the early return and before
+    # any torch_tpu import; libtpu reads these flags at load time.
+    from sglang.srt.hardware_backend.tpu.env_override import (
+        apply_tpu_env_overrides,
+    )
+
+    apply_tpu_env_overrides()
+
+    # Speculative decoding enables KV-cache moves. The generic fast path is a
+    # Triton kernel, which has no active driver on TPU; use the existing native
+    # torch implementation instead.
+    os.environ.setdefault("SGLANG_NATIVE_MOVE_KV_CACHE", "1")
+
+    if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
+        return
+
+    worker_hostnames = os.environ.get("TPU_WORKER_HOSTNAMES", "")
+    hosts = [h for h in worker_hostnames.split(",") if h]
+
+    if len(hosts) > 1:
+        _set_torch_tpu_topology_env_multihost(
+            hosts,
+            base_port=int(os.environ.get("TORCH_TPU_BASE_PORT", 8070)),
+            devices_per_host=int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", 8)),
+            tpu_topology=os.environ.get("TPU_TOPOLOGY", ""),
+        )
+    else:
+        _set_torch_tpu_topology_env_single(world_size)
 
     logger.info(
         "TPU env: TORCH_TPU_SLICEBUILDER_ADDRESSES=%s, TORCH_TPU_TOPOLOGY=%s",
@@ -580,29 +658,6 @@ def _patch_mha_kv_pool_for_rpa_v3() -> None:
     )
 
 
-def _prewarm_fused_moe() -> None:
-    """Register the Pallas fused-MoE custom op before torch.compile traces it.
-
-    The op is exposed to PyTorch via ``torch_tpu._internal.pallas.jax_op``,
-    whose registration (``inspect.signature`` + JAX export) cannot run inside
-    a dynamo trace (gb0088). Building it once here -- at TPU backend init,
-    before any model is built or compiled -- guarantees the trace-time
-    ``fused_moe_call`` is a plain op lookup. Mirrors the RPA v3 attention
-    backend, which registers its kernel op eagerly in ``__init__``.
-
-    Best-effort: a dense (non-MoE) model never invokes the op, and an env
-    without the Pallas-MoE deps simply skips it; only a MoE model under
-    ``--enable-torch-compile`` actually needs it (that path would otherwise
-    gb0088), so a failure here is logged rather than fatal.
-    """
-    try:
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
-
-        _build_fused_moe_op()
-    except Exception as e:  # noqa: BLE001 - prewarm is best-effort
-        logger.warning("TPU: fused-MoE op prewarm skipped (%s)", e)
-
-
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -614,6 +669,5 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _patch_mha_kv_pool_for_rpa_v3()
-    _prewarm_fused_moe()  # TODO(Qinghan): this will just be temporary
     _register_aten_fallbacks()
     logger.info("TPU patches applied.")

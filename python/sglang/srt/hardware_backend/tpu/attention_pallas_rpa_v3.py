@@ -2,9 +2,8 @@
 
 This backend wraps the JAX/Pallas v3 ragged_paged_attention kernel
 (``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``) and
-exposes it as a PyTorch custom op via ``torch_tpu._internal.pallas.jax_op``
-so it can be invoked from PyTorch and traced through ``torch.compile``
-with ``backend="tpu"``.
+exposes it as a PyTorch custom op so it can be invoked from PyTorch and
+traced through ``torch.compile`` with ``backend="tpu"``.
 
 Design notes
 ------------
@@ -17,9 +16,10 @@ Design notes
   is built once per forward pass in :meth:`init_forward_metadata` and reused
   by every layer.
 * Only Qwen3-dense-style models are exercised today (causal, GQA, no
-  speculative decoding, no SWA). The kernel itself supports more, so
-  enabling extra features is a matter of plumbing flags through the
-  ``_KernelHandle`` cache key.
+  SWA). The kernel itself supports more, so enabling extra features is
+  a matter of plumbing flags through the ``_KernelHandle`` cache key.
+* EAGLE speculative decoding is supported: TARGET_VERIFY, DRAFT_EXTEND,
+  and multi-step draft decode with ``speculative_step_id``.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here.
@@ -144,11 +144,53 @@ def _build_pallas_kernel_op():
             v_scale=v_scale,
         )
 
-    # Donate ``kv_cache_fused`` (index 3) so XLA can reuse its storage for
-    # the updated cache output. Index 0 (queries) is *not* donated because
-    # SGLang's ``q`` is a fresh tensor allocated by the projection — donating
-    # it would invalidate the projection's output buffer.
-    custom_op = _torch_pallas.jax_op(op_name, _wrapped, donate_argnums=(3,))
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        static_argnums=(9, 10, 11, 12, 13),
+        donate_argnums=(3,),
+        input_output_aliases={3: 1},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        op_name,
+        mutates_args=("kv_cache_fused",),
+        device_types=["tpu"],
+    )
+    def custom_op(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        kv_cache_fused: torch.Tensor,
+        kv_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        cu_kv_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        sm_scale: float = 1.0,
+        sliding_window: Optional[int] = None,
+        soft_cap: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        output, _updated_kv = jax_kernel(
+            queries,
+            keys,
+            values,
+            kv_cache_fused,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            sm_scale,
+            sliding_window,
+            soft_cap,
+            k_scale,
+            v_scale,
+        )
+        return output
 
     def _fake_impl(
         queries: torch.Tensor,
@@ -158,12 +200,7 @@ def _build_pallas_kernel_op():
         *args,
         **kwargs,
     ):
-        # The kernel returns ``(output, updated_kv_cache_fused)`` with the
-        # same dtypes/shapes as ``queries`` and ``kv_cache_fused``. Returning
-        # ``empty_like`` here lets ``torch.compile`` handle dynamic token
-        # dimensions without invoking the (expensive, shape-specialised)
-        # JAX tracer.
-        return torch.empty_like(queries), torch.empty_like(kv_cache_fused)
+        return torch.empty_like(queries)
 
     custom_op.register_fake(_fake_impl)
 
@@ -183,12 +220,16 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     backend is active.
     """
 
-    # RPA-v3 writes updated KV pages back via copy_(), outside returned tensors.
-    requires_kv_sync_after_compile = True
+    # The torch custom op exposes KV updates as an in-place mutation, so syncing
+    # model outputs during TPU precompile is enough to execute the graph.
+    requires_kv_sync_after_compile = False
 
-    def __init__(self, model_runner: "ModelRunner") -> None:
+    def __init__(
+        self, model_runner: "ModelRunner", speculative_step_id: int = 0
+    ) -> None:
         super().__init__()
         self.device = model_runner.device
+        self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
@@ -242,16 +283,43 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
-        seq_lens = forward_batch.seq_lens.to(torch.int32)
-
-        if forward_batch.forward_mode.is_extend():
+        # -------------------------------------------------------------- #
+        # Speculative decoding: adjust seq_lens / extend metadata
+        # -------------------------------------------------------------- #
+        if forward_batch.forward_mode.is_target_verify():
+            # TARGET_VERIFY: the target model verifies draft_token_num
+            # tokens per request.  The KV cache already includes the
+            # draft tokens, so bump seq_lens accordingly.
+            assert forward_batch.spec_info is not None
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            seq_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+            extend_seq_lens = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device=device
+            )
+        elif forward_batch.forward_mode.is_draft_extend():
+            # DRAFT_EXTEND: batch.prefix_lens may be stale from the
+            # initial prefill; seq_lens and extend_seq_lens are current.
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            assert forward_batch.extend_seq_lens is not None
+            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        elif forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
                 "extend_seq_lens is required for the Pallas attention backend in "
                 "extend mode."
             )
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
         else:
-            # Decode: q_len == 1 per sequence.
+            # Decode (including draft decode).
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is not None
+            ):
+                # Multi-step draft decode: each step's backend has a
+                # different speculative_step_id.  Bump seq_lens so the
+                # kernel sees KV entries from prior draft steps.
+                seq_lens = seq_lens + self.speculative_step_id + 1
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
@@ -277,7 +345,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         ).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
-        num_active = torch.full((), bs, dtype=torch.int32, device=device)
+        # The TPU compile shim pads batch-shaped metadata up to the selected
+        # compile bucket. Keep the padded tensor shapes, but only mark the real
+        # request rows as active so the RPA kernel does not process ghost rows.
+        real_bs = int(getattr(forward_batch, "_tpu_real_b", bs))
+        num_active = torch.tensor(real_bs, dtype=torch.int32, device=device)
         if forward_batch.forward_mode.is_decode():
             distribution = num_active.repeat(3).to(torch.int32)
         else:
@@ -367,7 +439,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
-        out, updated_kv = op(
+        out = op(
             q,
             k,
             v,
@@ -383,14 +455,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             k_scale,
             v_scale,
         )
-        # ``donate_argnums=(3,)`` lets XLA alias the input KV cache with the
-        # output; in that common path the explicit ``copy_`` below is a
-        # storage-aliased no-op. When XLA chooses *not* to alias (e.g. on
-        # platforms / kernels where donation cannot be honoured) this copy
-        # is what propagates the updated cache back into the pool. It also
-        # gives dynamo a concrete in-place mutation edge between the kernel
-        # output and the long-lived KV buffer.
-        kv_cache.copy_(updated_kv)
 
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -403,3 +467,39 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         return 0
+
+
+class TpuPallasRpaV3MultiStepDraftBackend:
+    """Wrap one RPA-v3 backend per EAGLE draft decode step.
+
+    Each step's backend carries a different ``speculative_step_id`` so
+    ``_build_metadata`` bumps ``seq_lens`` by the right offset,
+    mirroring ``TpuPallasMultiStepDraftBackend`` for the flash backend.
+    """
+
+    def __init__(
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = [
+            TpuPallasRpaV3AttnBackend(model_runner, speculative_step_id=i)
+            for i in range(self.speculative_num_steps - 1)
+        ]
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        assert forward_batch.spec_info is not None
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        pass
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        self.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_replay_cuda_graph(self, forward_batch: ForwardBatch, bs):
+        self.init_forward_metadata(forward_batch)

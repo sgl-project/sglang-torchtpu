@@ -6,15 +6,30 @@
 # Example — Qwen3-32B on all 8 chiplets (tp=8):
 #   MODEL=Qwen/Qwen3-32B TP_SIZE=8 ./launch_server.sh
 #
-# Example — Qwen3 MoE EP throughput run (tp=8, ep=8):
-#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507 TP_SIZE=8 EP_SIZE=8 \
-#   PAGE_SIZE=128 CHUNKED_PREFILL_SIZE=2048 MAX_PREFILL_TOKENS=2048 \
+# Example — Qwen3 MoE FP8 EP throughput run (tp=8, ep=8):
+#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 TP_SIZE=8 EP_SIZE=8 \
+#   PAGE_SIZE=128 CONTEXT_LEN=2048 CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
 #   MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
-#   TORCH_COMPILE_MAX_BS=64 SGLANG_TPU_DECODE_PROCESS_INTERVAL=8 \
+#   TORCH_COMPILE_MAX_BS=64 NUM_CONTINUOUS_DECODE_STEPS=8 \
+#   ./launch_server.sh
+#
+# Example — Qwen3-Coder-480B FP8 TP8/EP8, 1k/1k c=64:
+#   MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 TP_SIZE=8 EP_SIZE=8 \
+#   PAGE_SIZE=128 CONTEXT_LEN=2048 \
+#   CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+#   MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
+#   TORCH_COMPILE_MAX_BS=64 NUM_CONTINUOUS_DECODE_STEPS=4 \
 #   ./launch_server.sh
 #
 # Example — a small model on a single chip (tp=1; auto-pins chiplet 0):
 #   MODEL=Qwen/Qwen3-0.6B TP_SIZE=1 PAGE_SIZE=32 ./launch_server.sh
+#
+# Example — multihost MoE across a 2x2x2 v7x slice (2 hosts → tp=16, ep=8).
+# Launch this SAME command on every host (one pod per host); node rank and the
+# peer list are auto-detected from the GKE TPU env (TPU_WORKER_ID /
+# TPU_WORKER_HOSTNAMES), and TP_SIZE auto-derives to NNODES*CHIPS_PER_HOST:
+#   MODEL=Qwen/Qwen3-30B-A3B EP_SIZE=8 MEM_FRACTION_STATIC=0.30 ./launch_server.sh
+# See the "multihost (multi-node) coordination" section below for manual control.
 #
 # Chiplet visibility is derived from TP_SIZE: tp=1 pins to chiplet 0 (torch_tpu
 # needs exactly one addressable PjRt device at process-group init), tp>1 leaves
@@ -34,7 +49,11 @@
 #   HOST=127.0.0.1
 #   PORT=30000
 #   TP_SIZE=8                      # tensor-parallel ranks (= chiplets)
-#   EP_SIZE=                       # expert-parallel ranks; passed only when set
+#   EP_SIZE=                       # expert-parallel ranks; passed only when set.
+#                                  # Default off (sglang ep_size=1: experts run
+#                                  # tensor-parallel within the TP group). For a
+#                                  # MoE model set EP to a divisor of TP_SIZE and
+#                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
 #   MAX_RUNNING=64                 # in-flight request cap (>= bench concurrency)
 #   PAGE_SIZE=128
 #   CONTEXT_LEN=                  # passed through if set
@@ -46,6 +65,7 @@
 #   TPU_COMPILE_TOKENS=            # optional token bucket override
 #   TPU_COMPILE_BS=                # optional bs bucket override
 #   TORCH_COMPILE_MAX_BS=$MAX_RUNNING
+#   NUM_CONTINUOUS_DECODE_STEPS=   # passed through if set
 #   SGLANG_TPU_DECODE_PROCESS_INTERVAL=
 #                                  # passed as env when set.
 #   MEM_FRACTION_STATIC=           # passed through if set (sglang default
@@ -66,6 +86,13 @@
 #   TORCH_TPU_TIER2_NAME=torchtpu_<model-slug>   # per-model compile cache name
 #   PYTHON=python3                 # interpreter with torch_tpu + sglang installed
 #   JAX_BAZEL=                     # opt-in; only for a Bazel-built torch_tpu (see below)
+#   --- multihost (multi-node serving; auto-enabled by the GKE TPU env) ---
+#   NNODES=                        # # hosts; auto from TPU_WORKER_HOSTNAMES
+#   NODE_RANK=                     # this host's rank; auto from TPU_WORKER_ID
+#   DIST_INIT_ADDR=                # torch.distributed rendezvous addr; auto-built
+#   DIST_PORT=10011                # rendezvous port (NOT the HTTP PORT)
+#   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
+#   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
 set -euo pipefail
 
 MODEL=${MODEL:-}
@@ -76,7 +103,36 @@ fi
 # Slug for per-model cache / artifact dir names: lowercase, non-alnum → '_'.
 MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
 
-TP_SIZE=${TP_SIZE:-8}
+# ===== multihost (multi-node) coordination =====
+: "${DIST_PORT:=10011}"        # torch.distributed rendezvous port (NOT the HTTP PORT)
+: "${CHIPS_PER_HOST:=8}"       # tp-devices per host (v7x: 4 chips x 2 cores)
+if [[ -n "${TPU_WORKER_ID:-}" && -n "${TPU_WORKER_HOSTNAMES:-}" ]]; then
+    ENABLE_MULTIHOST=1
+    NODE_RANK=${NODE_RANK:-$TPU_WORKER_ID}
+    NNODES=${NNODES:-$(awk -F, '{print NF}' <<< "$TPU_WORKER_HOSTNAMES")}
+    RANK0_HOST=${RANK0_HOST:-$(cut -d, -f1 <<< "$TPU_WORKER_HOSTNAMES")}
+elif [[ "${NNODES:-1}" -gt 1 ]]; then
+    ENABLE_MULTIHOST=1             # manual: caller sets NNODES / NODE_RANK / RANK0_HOST
+    NODE_RANK=${NODE_RANK:-0}
+else
+    ENABLE_MULTIHOST=0; NNODES=1; NODE_RANK=0
+fi
+if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
+    if [[ -z "${DIST_INIT_ADDR:-}" ]]; then
+        if [[ "$NODE_RANK" == "0" ]]; then
+            DIST_INIT_ADDR="0.0.0.0"
+        else
+            DIST_INIT_ADDR="${RANK0_HOST:?set RANK0_HOST or DIST_INIT_ADDR for node_rank>0}"
+        fi
+    fi
+    [[ "$DIST_INIT_ADDR" == *:* ]] || DIST_INIT_ADDR="$DIST_INIT_ADDR:$DIST_PORT"
+    # tp counts DEVICES across the whole slice: NNODES * CHIPS_PER_HOST.
+    DEFAULT_TP=$((NNODES * CHIPS_PER_HOST))
+else
+    DEFAULT_TP=8
+fi
+
+TP_SIZE=${TP_SIZE:-$DEFAULT_TP}
 EP_SIZE=${EP_SIZE:-}
 
 TS=$(date +%Y%m%d_%H%M%S)
@@ -135,6 +191,9 @@ fi
 # Per-phase scheduler/worker timing dumps every ~5 s (cheap).
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
 
+
+export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
+
 # HF cache. Defaults here are generic (standard HF cache, online download).
 # The team's TPU hosts keep weights on a GCS-FUSE mount and run fully offline;
 # export HF_HOME / HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE to match — see
@@ -172,14 +231,21 @@ if [[ "$ENABLE_COMPILE_CACHE" == "1" ]]; then
 fi
 
 # ===== XLA / libtpu init =====
-# XLA/libtpu tuning flags (latency-hiding scheduler + async collective fusion
-# keep collectives from serializing behind matmuls on TPU v7). Override the
-# whole string to retune. Changing it invalidates the compile cache (see above).
-export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=32768 \
+# XLA/libtpu tuning flags used for TP/EP TPU serving. Latency-hiding scheduler
+# and async collective fusion keep collectives from serializing behind matmuls;
+# post-SPMD collective-matmul modes and SparseCore collective offload disables
+# avoid TP=8 correctness issues seen with default collective lowering. Override
+# the whole string to retune. Changing it invalidates the compile cache.
+export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
 --xla_tpu_enable_async_collective_fusion=true \
 --xla_tpu_overlap_compute_collective_tc=true \
 --xla_tpu_enable_async_collective_fusion_multiple_steps=true \
---xla_tpu_enable_latency_hiding_scheduler=true"}
+--xla_tpu_enable_latency_hiding_scheduler=true \
+--xla_latency_hiding_scheduler_rerun=10 \
+--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
 
 # ===== XLA HLO dump (opt-in) =====
 # Match on `tt_jit.*` — torch_tpu compiles are named `tt_jit_<op>`; a
@@ -213,6 +279,7 @@ TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 # unset to use the backend's derived powers-of-two buckets.
 TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
+NUM_CONTINUOUS_DECODE_STEPS=${NUM_CONTINUOUS_DECODE_STEPS:-}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
 DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-1}
@@ -225,6 +292,8 @@ echo "==== launch config ===="
 echo "  model              = $MODEL"
 echo "  model_slug         = $MODEL_SLUG"
 echo "  tp_size            = $TP_SIZE"
+[[ "$ENABLE_MULTIHOST" == "1" ]] && \
+  echo "  multihost          = nnodes=$NNODES node_rank=$NODE_RANK dist=$DIST_INIT_ADDR (chips/host=$CHIPS_PER_HOST)"
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
 echo "  host:port          = $HOST:$PORT"
 echo "  max_running        = $MAX_RUNNING"
@@ -236,6 +305,7 @@ echo "  max_prefill_tokens = ${MAX_PREFILL_TOKENS:-<unset>}"
 echo "  max_total_tokens   = ${MAX_TOTAL_TOKENS:-<unset>}"
 echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
+echo "  num_cont_decode    = ${NUM_CONTINUOUS_DECODE_STEPS:-<unset>}"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
@@ -243,6 +313,7 @@ echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
 echo "  disable_overlap_schedule = $DISABLE_OVERLAP_SCHEDULE"
 echo "  tpu_decode_process_interval = ${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-<unset>}"
 echo "  compile_cache        = $ENABLE_COMPILE_CACHE  (tier2=${TORCH_TPU_TIER2_NAME}, tier3=${TORCH_TPU_TIER3_ROOT})"
+echo "  materialize_collective_tensors = $TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"
 echo "  ENABLE_HLO_DUMP        = $ENABLE_HLO_DUMP  ($HLO_DUMP_DIR)"
 echo "  ENABLE_TORCH_COMPILE_DEBUG = $ENABLE_TORCH_COMPILE_DEBUG  ($TORCH_COMPILE_DEBUG_DIR)"
 echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"
@@ -267,6 +338,7 @@ args=(
 )
 [[ -n "$TPU_COMPILE_TOKENS" ]] && args+=(--tpu-compile-tokens $TPU_COMPILE_TOKENS)
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
+[[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
@@ -276,6 +348,10 @@ args=(
 [[ -n "$MAX_TOTAL_TOKENS" ]] && args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
 [[ "$DISABLE_RADIX_CACHE" == "1" ]] && args+=(--disable-radix-cache)
 [[ "$DISABLE_OVERLAP_SCHEDULE" == "1" ]] && args+=(--disable-overlap-schedule)
+# Multinode: pass sglang's rendezvous flags only when fanned across hosts.
+[[ "$ENABLE_MULTIHOST" == "1" ]] && args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
+# KV offloading to host RAM (hierarchical cache); orthogonal to multihost.
+[[ "${KV_OFFLOAD:-0}" == "1" ]] && args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO:-2.0}")
 
 # Escape hatch for any launch_server flag not surfaced above, e.g.
 #   EXTRA_ARGS="--weight-loader-disable-mmap" MODEL=... ./launch_server.sh

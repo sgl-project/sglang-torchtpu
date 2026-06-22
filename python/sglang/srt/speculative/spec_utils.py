@@ -20,12 +20,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_tpu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
+_use_torch_native = _is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -138,6 +140,73 @@ def create_extend_after_decode_spec_info(
     tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
+def _create_extend_after_decode_spec_info_torch(
+    accept_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    positions: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+):
+    """Pure-PyTorch implementation of create_extend_after_decode_spec_info.
+
+    For each request *pid*, compute:
+      - positions[start:start+accept_len] = seq_len - accept_len .. seq_len - 1
+      - bonus_tokens[pid] = accept_tokens[start + accept_len - 1]
+    where start = sum(accept_lens[:pid]).
+    """
+    batch_size = seq_lens.numel()
+    if batch_size == 0:
+        return
+
+    cumsum = torch.cumsum(accept_lens, dim=0)
+
+    # bonus_tokens: last accepted token per request (vectorised, no collisions)
+    bonus_idx = (cumsum - 1).clamp(min=0)
+    bonus_tokens.copy_(accept_tokens[bonus_idx].to(bonus_tokens.dtype))
+
+    # positions: per-request loop because requests write non-overlapping
+    # variable-length slices into the flat positions array. A batched
+    # scatter with clamp would cause index collisions across requests.
+    # TODO(pyc96): vectorize with a padded 2D scatter or torch_xla fori_loop
+    # to avoid per-request .item() host-device syncs on XLA.
+    offset = 0
+    for pid in range(batch_size):
+        al = int(accept_lens[pid].item())
+        sl = int(seq_lens[pid].item())
+        positions[offset : offset + al] = torch.arange(
+            sl - al, sl, device=positions.device, dtype=positions.dtype
+        )
+        offset += al
+
+
+def create_extend_after_decode_spec_info_func(
+    accept_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    positions: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    speculative_num_steps: int,
+):
+    if _use_torch_native:
+        _create_extend_after_decode_spec_info_torch(
+            accept_tokens,
+            seq_lens,
+            accept_lens,
+            positions,
+            bonus_tokens,
+        )
+        return
+
+    create_extend_after_decode_spec_info[(len(seq_lens),)](
+        accept_tokens,
+        seq_lens,
+        accept_lens,
+        positions,
+        bonus_tokens,
+        next_power_of_2(max(speculative_num_steps + 1, len(seq_lens))),
+    )
+
+
 @triton.jit
 def assign_req_to_token_pool(
     req_pool_indices,
@@ -173,6 +242,47 @@ def assign_req_to_token_pool(
         load_offset += BLOCK_SIZE
 
 
+def _assign_req_to_token_pool_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+):
+    """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
+    if batch_size == 0:
+        return
+    lengths = end_offset - start_offset
+    # Use the KV pool width as a safe upper bound for max_len to avoid
+    # a host-device sync from torch.max().item().
+    max_len = min(
+        int(req_to_token.shape[1]),
+        int(out_cache_loc.numel()) if out_cache_loc.numel() > 0 else 0,
+    )
+    if max_len == 0:
+        return
+    offsets = torch.arange(
+        max_len, device=req_to_token.device, dtype=start_offset.dtype
+    )
+    mask = offsets[None, :] < lengths[:, None]  # (batch_size, max_len)
+    src_starts = torch.cumsum(lengths, dim=0) - lengths
+    src_index = (src_starts[:, None] + offsets[None, :]).clamp(
+        max=out_cache_loc.numel() - 1
+    )
+    dst_index = start_offset[:, None] + offsets[None, :]
+    row_index = req_pool_indices[:, None].expand(batch_size, max_len)
+    # Redirect masked-out positions to the padding row (row 0, col 0).
+    dst_index = torch.where(mask, dst_index, torch.zeros_like(dst_index))
+    row_index = torch.where(mask, row_index, torch.zeros_like(row_index))
+    vals = torch.where(
+        mask,
+        out_cache_loc[src_index].to(req_to_token.dtype),
+        req_to_token[row_index, dst_index],
+    )
+    req_to_token[row_index, dst_index] = vals
+
+
 def assign_req_to_token_pool_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -181,6 +291,17 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    if _use_torch_native:
+        _assign_req_to_token_pool_torch(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            batch_size,
+        )
+        return
+
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,
@@ -300,6 +421,105 @@ def assign_draft_cache_locs(
                 indices,
                 mask=combined_mask,
             )
+
+
+def _assign_draft_cache_locs_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    num_new_pages_per_topk: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    source_cache_loc: torch.Tensor,
+    target_cache_loc: torch.Tensor,
+    last_page_lens_cumsum: torch.Tensor,
+    duplicate_cache_len: int,
+    pool_len: int,
+    topk: int,
+    speculative_num_steps: int,
+    page_size: int,
+    batch_size: int,
+):
+    """Pure-PyTorch implementation of assign_draft_cache_locs for TPU/XLA.
+
+    Currently supports only page_size=1 or topk=1.
+    """
+    if batch_size == 0:
+        return
+
+    if page_size != 1 and topk != 1:
+        raise NotImplementedError(
+            "TPU assign_draft_cache_locs currently supports only "
+            f"page_size=1 or topk=1, got {page_size=} {topk=}."
+        )
+
+    device = req_to_token.device
+    copy_len = topk * speculative_num_steps
+    # out_cache_loc is laid out as (batch_size, copy_len).
+    # Out-of-bounds safety: cols stay within req_to_token.shape[1] because
+    # the KV pool allocator guarantees seq_lens + copy_len <= pool width.
+    offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
+    rows = req_pool_indices[:, None]  # (bs, 1)
+    cols = seq_lens[:, None] + offsets[None, :]  # (bs, copy_len)
+    src = out_cache_loc.view(batch_size, copy_len).to(req_to_token.dtype)
+    req_to_token[rows, cols] = src
+
+
+def assign_draft_cache_locs_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: torch.Tensor,
+    num_new_pages_per_topk: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    source_cache_loc: torch.Tensor,
+    target_cache_loc: torch.Tensor,
+    last_page_lens_cumsum: torch.Tensor,
+    duplicate_cache_len: int,
+    pool_len: int,
+    topk: int,
+    speculative_num_steps: int,
+    page_size: int,
+    batch_size: int,
+):
+    if _use_torch_native:
+        _assign_draft_cache_locs_torch(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            extend_lens,
+            num_new_pages_per_topk,
+            out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            duplicate_cache_len,
+            pool_len,
+            topk,
+            speculative_num_steps,
+            page_size,
+            batch_size,
+        )
+        return
+
+    assign_draft_cache_locs[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        extend_lens,
+        num_new_pages_per_topk,
+        out_cache_loc,
+        source_cache_loc,
+        target_cache_loc,
+        last_page_lens_cumsum,
+        duplicate_cache_len,
+        pool_len,
+        topk,
+        speculative_num_steps,
+        page_size,
+        next_power_of_2(batch_size),
+        next_power_of_2(speculative_num_steps + page_size),
+    )
 
 
 @triton.jit
@@ -454,7 +674,7 @@ def get_target_cache_loc(
     )
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_tpu))
 def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -506,7 +726,7 @@ def filter_finished_cache_loc_kernel(
     )
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_tpu))
 def create_num_accept_tokens_filter(
     num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
@@ -540,7 +760,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_tpu))
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,

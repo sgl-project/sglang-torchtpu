@@ -23,6 +23,7 @@ from sglang.srt.utils import (
     envs,
     is_cpu,
     is_npu,
+    is_tpu,
     is_xpu,
     load_audio,
     load_image,
@@ -38,6 +39,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
@@ -435,6 +437,10 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
+            elif _is_tpu:
+                # transformers image processors don't support TPU as a device.
+                # Preprocess on CPU; the model runner will move tensors to TPU.
+                kwargs["device"] = "cpu"
             elif not _is_npu:
                 kwargs["device"] = "cuda"
             elif processor.__class__.__name__ not in {

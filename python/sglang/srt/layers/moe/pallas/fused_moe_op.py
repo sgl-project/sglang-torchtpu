@@ -76,7 +76,7 @@ _PALLAS_MOE_OP = None
 # TPU pre-warm hook).
 
 
-def _lookup_tile_info(lhs, rhs, num_total_groups):
+def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups):
     """Pick a ``TileSizes`` for this gmm_v2 call.
 
     ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
@@ -100,9 +100,7 @@ def _lookup_tile_info(lhs, rhs, num_total_groups):
     m, k = lhs.shape
     _g, _k, n = rhs.shape
     assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
-    # Quantization is per-channel (kernel asserts rhs_scale.shape[1] == 1),
-    # so quant_block_size == k whenever scales are provided.
-    quant_block_size = k
+    quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
     tm, tk, tn = get_tuned_block_sizes(
         m=int(m),
         k=int(k),
@@ -161,7 +159,12 @@ def _fused_moe_jax(
     import jax
     import jax.numpy as jnp
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
+    from sglang.srt.layers.moe.pallas.gmm_v2 import (
+        TileSizes,
+        apply_act_fn,
+        calculate_tiling,
+        gmm_v2,
+    )
 
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
@@ -204,12 +207,20 @@ def _fused_moe_jax(
 
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
-    # GMM1: gate/up projection with the gated activation fused in-kernel.
-    # ``fuse_act`` makes gmm_v2 split the [.., 2*n] accumulator and write only
-    # [.., n] = act(gate) * up, avoiding a full materialize of the 2*n tensor
-    # to HBM plus a separate activation pass. The fused path uses gmm_v2's own
-    # fuse_act-aware tiling (``tile_n`` is per-projection when fused), so we do
-    # *not* pass the non-fused tuned tile_info here.
+    # GMM1: gate/up projection. For per-column/per-tensor scales, the gated
+    # activation can be fused in-kernel. Compact block-FP8 scales need different
+    # scale offsets for the gate and up halves, so run an unfused GMM1 and apply
+    # the activation in JAX for correctness.
+    compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
+    gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
+    gmm1_tile_info = None
+    if compact_block_scales:
+        gmm1_tile_info = TileSizes(
+            tile_m=min(128, int(x_sorted.shape[0])),
+            tile_k=int(w1.shape[1]),
+            tile_n=min(896, int(w1.shape[2])),
+        )
+
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
@@ -217,8 +228,14 @@ def _fused_moe_jax(
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
         preferred_element_type=out_dtype,
-        fuse_act=_fuse_act_name(activation_name),
-    )  # [m*topk, n_intermediate]
+        tile_info=gmm1_tile_info or calculate_tiling,
+        fuse_act=gmm1_fuse_act,
+    )
+    if compact_block_scales:
+        gmm1_out = apply_act_fn(
+            gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
+        )
+    # gmm1_out: [m*topk, n_intermediate]
 
     # GMM2: project back to hidden size.
     gmm2_out = gmm_v2(
@@ -228,7 +245,7 @@ def _fused_moe_jax(
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
-        tile_info=_lookup_tile_info(gmm1_out, w2, num_experts),
+        tile_info=_lookup_tile_info(gmm1_out, w2, w2_scale, num_experts),
     )  # [m*topk, k]
 
     # Un-permute back to token-major order and reduce across the top-k

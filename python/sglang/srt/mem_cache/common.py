@@ -156,7 +156,11 @@ def get_last_loc(
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
     attn_backend = get_global_server_args().attention_backend
-    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+    uses_triton_dispatch = attn_backend not in (
+        "ascend",
+        "torch_native",
+        "pallas_tpu_rpa_v3",
+    )
 
     if _is_hip and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
