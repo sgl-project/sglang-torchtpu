@@ -222,7 +222,7 @@ def alloc_tpu_host(
     TPU host<->device staging goes through libtpu's premapped pool
     (TPU_PREMAPPED_BUFFER_SIZE); self-pinning hundreds of GB here would starve
     that region, so we always allocate plain unpinned host memory regardless of
-    ``pin_memory`` (matches the torchtpu-vllm reference cpu_tpu.py choice).
+    ``pin_memory``
     """
     return torch.empty(dims, dtype=dtype, device="cpu")
 

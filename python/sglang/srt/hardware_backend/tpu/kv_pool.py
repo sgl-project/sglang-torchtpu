@@ -263,6 +263,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # base-class accounting; the buffers are fused so we split evenly.
         return size_bytes // 2, size_bytes // 2
 
+    # ``get_fused_kv_buffer`` is the canonical accessor on TPU; the Pallas
+    # backend uses it directly.
     def get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
         return self.kv_buffer[layer_id - self.start_layer]
 
@@ -277,11 +279,15 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         return buf.view(n_blocks * page_size, packed * packing, hd)
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         view = self._logical_kv_view(layer_id)
         # K heads are the even indices of the interleaved KV axis.
         return view[:, 0 : 2 * self.head_num : 2, : self.head_dim]
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         view = self._logical_kv_view(layer_id)
         return view[:, 1 : 2 * self.head_num : 2, : self.head_dim]
 
