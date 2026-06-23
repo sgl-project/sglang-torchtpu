@@ -1104,32 +1104,60 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             "load_to_device_per_layer is not supported on the pallas_tpu backend."
         )
 
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        if io_backend != "pallas_tpu":
-            raise ValueError(
-                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
-                f"got {io_backend!r}"
-            )
+    def backup_gather(self, device_pool, device_indices):
+        """Pallas-gather the evicted pages into independent HBM tensors and force
+        them, so they're read before the next forward donates the KV buffer.
+        Returns the staged outputs for backup_copy_d2h(), or None if nothing to
+        back up.
+        """
+        from torch_tpu._internal.sync import synchronize as _tpu_sync
+
         from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _gather_fn
 
         src_ids, n, p = self._padded_ids(device_indices)
         if n == 0:
-            return
+            return None
+        gathered = [
+            _gather_fn(device_pool.kv_buffer[layer_id], src_ids)  # HBM->HBM
+            for layer_id in range(self.layer_num)
+        ]
+        _tpu_sync(gathered, wait=True)  # read KV before the next forward donates it
+        return gathered, n, p
+
+    def backup_copy_d2h(self, staged, host_indices):
+        """Copy the staged (already-gathered, donation-safe) HBM tensors
+        host-ward and scatter into the host pool. This D2H is the only part that
+        overlaps the running forward.
+        """
+        gathered, n, p = staged
         host_pages = self._to_page_ids(host_indices).cpu()
-        for layer_id in range(self.layer_num):
-            fused = device_pool.kv_buffer[layer_id]
-            gathered = _gather_fn(fused, src_ids)  # HBM->HBM [p, page, ...]
+        for layer_id, layer_gathered in enumerate(gathered):
             if p <= self.stage_blocks:
                 hstage = self.host_stage[layer_id, :p]  # dedicated host buffer
             else:
                 self._warn_stage_overflow(p)
                 hstage = torch.empty(
-                    (p,) + tuple(gathered.shape[1:]), dtype=self.dtype, device="cpu"
+                    (p,) + tuple(layer_gathered.shape[1:]),
+                    dtype=self.dtype,
+                    device="cpu",
                 )
-            hstage.copy_(gathered)  # PCIe D2H into the dedicated host staging buffer
+            hstage.copy_(layer_gathered)  # PCIe D2H into the host staging buffer
             self.kv_buffer[host_pages, layer_id] = hstage[:n]
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        # Synchronous gather+drain (tests / non-overlapped path); the controller
+        # calls the two phases directly to run the D2H async.
+        if io_backend != "pallas_tpu":
+            raise ValueError(
+                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
+                f"got {io_backend!r}"
+            )
+        staged = self.backup_gather(device_pool, device_indices)
+        if staged is None:
+            return
+        self.backup_copy_d2h(staged, host_indices)
 
     def _warn_stage_overflow(self, p: int) -> None:
         if not self._stage_overflow_warned:
