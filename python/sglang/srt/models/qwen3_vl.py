@@ -77,11 +77,13 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_npu,
+    is_tpu,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -89,6 +91,14 @@ if _is_npu:
     )
 
     graph_runners_dict["npu"] = ViTNpuGraphRunner
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+        VisionTpuCompilePolicy,
+        ViTTpuCompileRunner,
+    )
+
+    graph_runners_dict["tpu"] = ViTTpuCompileRunner
 
 
 logger = logging.getLogger(__name__)
@@ -229,6 +239,7 @@ class Qwen3_VisionBlock(nn.Module):
         output_ws: Optional[torch.Tensor] = None,
         max_seqlen: Optional[torch.Tensor] = None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.norm1(x)
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
@@ -240,6 +251,7 @@ class Qwen3_VisionBlock(nn.Module):
             output_ws=output_ws,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            segment_ids=segment_ids,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
         x += attn
@@ -887,6 +899,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
+        if _is_tpu:
+            return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
@@ -1023,7 +1037,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_cos,
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
-        if not isinstance(cu_seqlens, torch.Tensor):
+        if _is_tpu:
+            # Segment IDs are built on the host by ViTTpuCompileRunner. Keep the
+            # cumulative lengths on CPU to avoid a per-request TPU-to-host sync.
+            cu_seqlens = torch.as_tensor(cu_seqlens, dtype=torch.int32, device="cpu")
+        elif not isinstance(cu_seqlens, torch.Tensor):
             cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
         else:
             cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
@@ -1098,6 +1116,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
         return x, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+
+
+if _is_tpu:
+    support_torch_compile(
+        Qwen3VLMoeVisionModel,
+        policy=VisionTpuCompilePolicy,
+    )
 
 
 cached_get_processor = lru_cache(get_processor)
