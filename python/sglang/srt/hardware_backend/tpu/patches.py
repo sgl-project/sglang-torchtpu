@@ -36,12 +36,6 @@ def _register_tpu_compile_backend() -> None:
     # before any code applies that decorator (e.g. on imports of layers/models).
     import torch_tpu._internal.compile  # noqa: F401
 
-    # Upgrade the just-registered TPU Dynamo backend to a serializable backend
-    # so PyTorch's bundled AOTAutogradCache can persist compile artifacts.
-    from sglang.srt.hardware_backend.tpu.compilation import aot_autograd_cache
-
-    aot_autograd_cache.install()
-
 
 def _unwrap_dynamic_compile_fns() -> None:
     global _dynamic_compile_unwrapped
