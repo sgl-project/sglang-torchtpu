@@ -221,6 +221,12 @@ class PrefillBootstrapQueue:
                     kv_pool.v_buffer,
                     kv_pool.page_size,
                 )
+        # Raiden needs the per-layer device KV tensors (it indexes their major
+        # dim as pages). The TPU fused KV pool exposes them via kv_buffer.
+        if hasattr(kv_manager, "set_kv_caches"):
+            from sglang.srt.disaggregation.raiden.conn import get_raiden_kv_caches
+
+            kv_manager.set_kv_caches(get_raiden_kv_caches(self.token_to_kv_pool))
         return kv_manager
 
     def add(self, req: Req, num_kv_heads: int) -> None:
