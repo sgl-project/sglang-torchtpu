@@ -7,6 +7,7 @@ on Google Cloud TPUs via the torch_tpu (PyTorch privateuse1) backend.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -19,6 +20,39 @@ if TYPE_CHECKING:
     pass
 
 logger = get_logger(__name__)
+
+# Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,
+# so it materializes in chunks rather than all at once, which may cause HBM OOMs.
+_LOAD_WEIGHT_SYNC_BYTES = 2 << 30  # 2 GiB
+_LOAD_WEIGHT_SYNC_TENSORS = 64
+
+
+def _sync_weight_stream(weights):
+    """Yield weights and periodically drain torch_tpu pending work.
+
+    ``torch.tpu.synchronize()`` blocks until async device work and deferred
+    operations on the TPU have completed, which lets transient buffers be freed.
+    This bounds HBM peak usage only when the loader copies parameters while
+    iterating.
+
+    Warning: when ``weights`` is a one-pass iterator/generator, some loaders call
+    ``list(weights)`` before loading parameters. That consumes the entire stream
+    before any real parameter copy happens, so the periodic syncs cannot bound the
+    HBM peak.
+    """
+    pending_bytes = 0
+    pending_tensors = 0
+    for name, tensor in weights:
+        yield name, tensor
+        pending_tensors += 1
+        pending_bytes += tensor.numel() * tensor.element_size()
+        if (
+            pending_bytes >= _LOAD_WEIGHT_SYNC_BYTES
+            or pending_tensors >= _LOAD_WEIGHT_SYNC_TENSORS
+        ):
+            torch.tpu.synchronize()
+            pending_bytes = 0
+            pending_tensors = 0
 
 
 class TpuSRTPlatform(SRTPlatform):
@@ -228,6 +262,13 @@ class TpuSRTPlatform(SRTPlatform):
 
     def synchronize(self) -> None:
         torch.tpu.synchronize()
+
+    @contextmanager
+    def weight_loading_context(self, weights):
+        try:
+            yield _sync_weight_stream(weights)
+        finally:
+            torch.tpu.synchronize()
 
     def empty_cache(self) -> None:
         pass
