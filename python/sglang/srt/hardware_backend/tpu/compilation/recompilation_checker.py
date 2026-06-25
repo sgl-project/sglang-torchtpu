@@ -7,11 +7,8 @@ each) and are hard to diagnose without monitoring.
 Opt in via ``SGLANG_TPU_CHECK_RECOMPILATION=1``.
 """
 
-from __future__ import annotations
-
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 logger = get_logger(__name__)
@@ -61,16 +58,15 @@ class RecompilationChecker:
             return 0
         new_graphs = current - self._baseline_graph_count
         if new_graphs > 0:
-            if get_tensor_model_parallel_rank() == 0:
-                logger.warning(
-                    "[recompilation checker] %d new XLA program(s) compiled at "
-                    "serving time [%s] (baseline=%d, current=%d). This causes "
-                    "latency spikes.",
-                    new_graphs,
-                    context,
-                    self._baseline_graph_count,
-                    current,
-                )
+            logger.warning(
+                "[recompilation checker] %d new XLA program(s) compiled at "
+                "serving time [%s] (baseline=%d, current=%d). This causes "
+                "latency spikes.",
+                new_graphs,
+                context,
+                self._baseline_graph_count,
+                current,
+            )
             # Update baseline so we don't warn repeatedly for the same graphs.
             self._baseline_graph_count = current
         return new_graphs

@@ -162,13 +162,12 @@ class TpuGraphRunner:
             CompilationManager,
         )
 
-        manager = CompilationManager(
+        CompilationManager(
             model_runner=model_runner,
             compiled_fns=compiled_fns,
             t_bucketer=compiled_forward_shim.t_bucketer,
             b_bucketer=compiled_forward_shim.b_bucketer,
-        )
-        manager.precompile_all()
+        ).precompile_all()
 
         # Wire serving-time recompilation detection into the compiled
         # forward shim (opt-in via SGLANG_TPU_CHECK_RECOMPILATION=1).
