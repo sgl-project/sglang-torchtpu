@@ -170,15 +170,21 @@ class TpuGraphRunner:
         )
         manager.precompile_all()
 
-        # Wire the manager into the compiled forward shim for
-        # serving-time recompilation detection (opt-in via
-        # SGLANG_TPU_CHECK_RECOMPILATION=1).
+        # Wire serving-time recompilation detection into the compiled
+        # forward shim (opt-in via SGLANG_TPU_CHECK_RECOMPILATION=1).
         if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
             return
+
+        from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+            RecompilationChecker,
+        )
+
+        checker = RecompilationChecker()
+        checker.snapshot_baseline()
         model_name = type(model_runner.model).__name__
         is_draft = getattr(model_runner, "is_draft_worker", False)
         label = f"{'draft ' if is_draft else ''}{model_name}"
-        compiled_forward_shim.set_compilation_manager(manager, model_label=label)
+        compiled_forward_shim.set_recompilation_checker(checker, model_label=label)
 
     def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

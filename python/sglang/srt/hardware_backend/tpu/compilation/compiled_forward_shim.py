@@ -124,22 +124,22 @@ class CompiledForwardShim:
 
     def __init__(self, compiled_fn):
         self.fn = compiled_fn
-        self._compilation_manager = None
+        self._recompilation_checker = None
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
 
-    def set_compilation_manager(self, manager, model_label: str = "") -> None:
-        """Set the compilation manager for serving-time recompilation checks.
+    def set_recompilation_checker(self, checker, model_label: str = "") -> None:
+        """Set the recompilation checker for serving-time detection.
 
         Args:
-            manager: CompilationManager instance.
+            checker: RecompilationChecker instance.
             model_label: human-readable model identifier for log context
                 (e.g. "LlamaForCausalLM").
         """
-        self._compilation_manager = manager
+        self._recompilation_checker = checker
         self._model_label = model_label
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
@@ -175,9 +175,9 @@ class CompiledForwardShim:
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
-        if self._compilation_manager is not None:
+        if self._recompilation_checker is not None:
             fm = getattr(forward_batch, "forward_mode", "N/A")
-            self._compilation_manager.check_recompilation(
+            self._recompilation_checker.check(
                 f"{self._model_label} {fm.name if hasattr(fm, 'name') else fm}"
             )
 
@@ -279,12 +279,12 @@ class TpuCompiledForwardShim:
         )
         return self
 
-    def set_compilation_manager(self, manager, model_label: str = "") -> None:
-        """Propagate the compilation manager to all installed forward shims."""
+    def set_recompilation_checker(self, checker, model_label: str = "") -> None:
+        """Propagate the recompilation checker to all installed forward shims."""
         for attr in self._compiled_fns:
             shim = getattr(self.model, attr, None)
             if isinstance(shim, CompiledForwardShim):
-                shim.set_compilation_manager(manager, model_label=model_label)
+                shim.set_recompilation_checker(checker, model_label=model_label)
 
 
 def build_bucketers(server_args, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:
