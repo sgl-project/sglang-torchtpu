@@ -19,13 +19,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.profile_merger import ProfileMerger
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 if _is_npu:
     import torch_npu
 
@@ -76,6 +77,9 @@ class SchedulerProfilerManager:
         # For ROCM
         self.rpd_profiler = None
 
+        # For TPU
+        self.tpu_profiler = None
+
     def _init_profile(
         self,
         output_dir: Optional[str],
@@ -111,14 +115,22 @@ class SchedulerProfilerManager:
                 message="Profiling is already in progress. Call /stop_profile first.",
             )
 
-        self.profile_by_stage = profile_by_stage
-        self.merge_profiles = merge_profiles
-
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
         if activities is None:
             activities = ["CPU", "GPU"]
+            # On TPU the device activity is xprof ("TPU"), not CUDA.
+            if _is_tpu:
+                activities = ["CPU", "TPU"]
 
+        if merge_profiles and _is_tpu:
+            return ProfileReqOutput(
+                success=False,
+                message="merge_profiles is not supported for TPU profiling.",
+            )
+
+        self.profile_by_stage = profile_by_stage
+        self.merge_profiles = merge_profiles
         self.torch_profiler_output_dir = Path(output_dir).expanduser()
         self.torch_profiler_with_stack = with_stack
         self.torch_profiler_record_shapes = record_shapes
@@ -172,7 +184,31 @@ class SchedulerProfilerManager:
             activity_map[a] for a in activities if a in activity_map
         ]
 
-        if "RPD" in activities:  # for ROCM
+        if "TPU" in activities:
+            # TorchTPU xprof: capture TPU device activity (and host CPU only if
+            # "CPU" was also requested).
+            if _is_tpu and self._is_global_primary_rank():
+                from torch_tpu._internal.profiler import profiler_api
+
+                subdir_parts = [self.profile_prefix or "profile"]
+                if self.profile_id:
+                    subdir_parts.append(str(self.profile_id))
+                if stage is not None:
+                    subdir_parts.append(stage.name)
+                out_dir = self.torch_profiler_output_dir / "-".join(subdir_parts)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                handler = profiler_api.xprof_trace_handler(dir_name=str(out_dir))
+                # "TPU" -> TPU-only; "TPU"+"CPU" -> CPU and TPU.
+                xprof_activities = [profiler_api.ProfilerActivity.TPU]
+                if "CPU" in activities:
+                    xprof_activities.append(profiler_api.ProfilerActivity.CPU)
+                self.tpu_profiler = profiler_api.profile(
+                    activities=xprof_activities,
+                    on_trace_ready=handler,
+                )
+                self.tpu_profiler.__enter__()
+            self.profile_in_progress = True
+        elif "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
 
             rpdTracerControl.skipCreate()
@@ -227,6 +263,17 @@ class SchedulerProfilerManager:
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _is_global_primary_rank(self) -> bool:
+        if self.ps.tp_rank != 0:
+            return False
+        if self.ps.dp_size > 1 and self.ps.dp_rank != 0:
+            return False
+        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
+            return False
+        if self.ps.moe_ep_size > 1 and self.ps.moe_ep_rank != 0:
+            return False
+        return True
 
     def _merge_profile_traces(self) -> str:
         if not self.merge_profiles:
@@ -320,6 +367,11 @@ class SchedulerProfilerManager:
             self.rpd_profiler = None
             self.rpd_profile_path = None
 
+        if self.tpu_profiler is not None:
+            # Exiting the context stops the xprof session.
+            self.tpu_profiler.__exit__(None, None, None)
+            self.tpu_profiler = None
+
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
@@ -405,7 +457,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_stages,
                 )
             else:
-                self._init_profile(
+                result = self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -417,6 +469,9 @@ class SchedulerProfilerManager:
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
                 )
+                # Don't start if init failed.
+                if result is not None and not result.success:
+                    return result
                 return self._start_profile()
         else:
             return self._stop_profile()

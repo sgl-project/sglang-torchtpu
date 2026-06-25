@@ -129,6 +129,13 @@ if __name__ == "__main__":
         help="Whether to use ROCM rpd profiler (https://github.com/ROCm/rocmProfileData)",
     )
     parser.add_argument(
+        "--tpu",
+        action=argparse.BooleanOptionalAction,
+        type=bool,
+        default=False,
+        help="Whether to use the TPU xprof collector.",
+    )
+    parser.add_argument(
         "--merge-profiles",
         action=argparse.BooleanOptionalAction,
         type=bool,
@@ -146,6 +153,8 @@ if __name__ == "__main__":
         activities.append("MEM")
     if args.rpd:
         activities.append("RPD")
+    if args.tpu:
+        activities.append("TPU")
 
     run_profile(
         url=args.url,
