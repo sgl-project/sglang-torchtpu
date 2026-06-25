@@ -258,6 +258,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.forward_metadata = self._build_metadata(forward_batch)
+        # Block until the metadata is committed on device before the compiled
+        # forward reads it; the discarded .tolist() is the device sync. Without
+        # it, with KV-cache donation under transfer/compute overlap the RPA
+        # decode kernel can read an uncommitted `distribution` as [0, 0, 0],
+        # take the empty get_range -> pl.loop(0, 0), and trip the Mosaic
+        # semaphore-balance assertion -> E0200 TensorCore halt.
+        self.forward_metadata.distribution.tolist()
+        self.forward_metadata.kv_lens.tolist()
 
     def _build_metadata(self, forward_batch: ForwardBatch) -> PallasForwardMetadata:
         """Build per-forward-pass metadata for the Pallas kernel.
