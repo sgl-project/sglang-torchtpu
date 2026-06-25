@@ -36,6 +36,25 @@ else:
     _resolve_future_token_ids = _resolve_future_token_ids_native
 
 
+# Device types whose backend bakes a Python-int index as a compile-time constant
+# (e.g. torch_tpu / XLA), so indexing a buffer with a slice or int recompiles the
+# graph per distinct value. On these the FutureMap keeps its circular-buffer write
+# offset as a device tensor and writes with index_copy_; other backends index
+# eagerly, where the cheaper slice assignment is fine.
+_DYNAMIC_INDEX_DEVICE_TYPES = ("tpu",)
+
+
+def _device_use_dynamic_index(device: torch.device) -> bool:
+    """Whether ``device``'s backend bakes Python-int indices as graph constants.
+
+    True for the backends in ``_DYNAMIC_INDEX_DEVICE_TYPES`` (which would otherwise
+    recompile a slice/int-indexed write per value); those keep the future-map
+    offsets dynamic (device tensor + ``index_copy_``) instead.
+    """
+    dev_type = device.type if hasattr(device, "type") else str(device).split(":")[0]
+    return any(dev_type == known for known in _DYNAMIC_INDEX_DEVICE_TYPES)
+
+
 @dataclass
 class FutureIndices:
     indices: torch.Tensor
@@ -68,6 +87,14 @@ class FutureMap:
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device
         self.spec_algo = spec_algo
+
+        # On backends that bake Python-int indices as HLO constants (e.g. TPU),
+        # keep the circular-buffer write head on-device (`future_ct_dev`, mirrors
+        # `future_ct`) so future-map indices stay DATA rather than baked constants
+        # that recompile the store every step. See `alloc_future_indices` / `_store`.
+        self._use_dynamic_index = _device_use_dynamic_index(device)
+        if self._use_dynamic_index:
+            self.future_ct_dev = torch.zeros((), dtype=torch.int64, device=device)
 
         if self.spec_algo.is_none():
             # For non-speculative decoding, we only need to store the token ids.
@@ -124,7 +151,17 @@ class FutureMap:
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
-        indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
+        if self._use_dynamic_index:
+            # base is a device scalar (== start) carried on-device, so the offset
+            # is a runtime operand: `arange(bs)` bakes only the bucketed bs, not
+            # the position. future_ct_dev mirrors future_ct (same update below).
+            base = self.future_ct_dev + 1
+            indices = base + torch.arange(bs, dtype=torch.int64, device=self.device)
+            self.future_ct_dev = torch.remainder(
+                self.future_ct_dev + bs, self.future_limit
+            )
+        else:
+            indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, batch: ScheduleBatch):
@@ -157,33 +194,50 @@ class FutureMap:
         else:
             return start <= stop
 
+    def _store(self, buf: torch.Tensor, fi: FutureIndices, values: torch.Tensor):
+        """Write ``values`` into circular buffer ``buf`` at future indices ``fi``.
+
+        On backends that avoid static indices (``_use_dynamic_index``) use a
+        tensor-indexed ``index_copy_`` so the write offset stays DATA: a
+        Python-slice assign (``buf[fi.interval] = values``) bakes the buffer
+        position as an HLO compile-time constant, recompiling the future-map store
+        every overlap step. ``fi.indices`` is the on-device equivalent of the
+        ``fi.interval`` slice (see ``alloc_future_indices``). Elsewhere keep the
+        cheaper slice assign.
+        """
+        if self._use_dynamic_index:
+            buf.index_copy_(0, fi.indices, values)
+        else:
+            buf[fi.interval] = values
+
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
         if self.spec_algo.is_none():
-            intv = future_indices.interval
-            if self.is_empty_slice(intv):
-                # idle indices in dp attention do not need store info
+            # idle indices in dp attention do not need store info
+            if self.is_empty_slice(future_indices.interval):
                 return
-            self.token_ids_buf[intv] = batch_result.next_token_ids
+            self._store(
+                self.token_ids_buf, future_indices, batch_result.next_token_ids
+            )
         else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
+            self.store_to_map_for_new_batch(
+                future_indices, batch_result.next_draft_input
+            )
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ):
-        intv = future_indices.interval
-        if self.is_empty_slice(intv):
-            # idle indices in dp attention do not need store info
+        # idle indices in dp attention do not need store info
+        if self.is_empty_slice(future_indices.interval):
             return
-
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
-
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
-        self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        self._store(self.topk_p_buf, future_indices, draft_input.topk_p)
+        self._store(self.topk_index_buf, future_indices, draft_input.topk_index)
+        self._store(self.bonus_tokens_buf, future_indices, draft_input.bonus_tokens)
+        self._store(self.new_seq_lens_buf, future_indices, draft_input.new_seq_lens)
         if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
+            self._store(
+                self.hidden_states_buf, future_indices, draft_input.hidden_states
+            )

@@ -88,12 +88,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
-    def merge_and_sort_free(self):
+    def merge_and_sort_free(self, device: torch.device | None = None):
         if len(self.release_pages) > 0:
             self.free_pages = torch.cat((self.free_pages, self.release_pages))
             self.free_pages, _ = torch.sort(self.free_pages)
+            # ``release_pages`` is ``cat``'d with ``free_pages`` on the next
+            # ``free()``, so it must live on the same device. Default to that;
+            # ``device`` lets a subclass with host-resident pools (e.g. the
+            # TPU allocator) keep them off the accelerator.
             self.release_pages = torch.empty(
-                (0,), dtype=self.release_pages.dtype, device=self.device
+                (0,),
+                dtype=self.release_pages.dtype,
+                device=device if device is not None else self.device,
             )
 
     def get_cpu_copy(self, indices, mamba_indices=None):

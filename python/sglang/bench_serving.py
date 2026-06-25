@@ -2180,8 +2180,8 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         default=["CPU", "GPU"],
-        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM"],
-        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM "
+        choices=["CPU", "GPU", "CUDA_PROFILER", "XPU", "MEM", "TPU"],
+        help="Profiler activities to capture: CPU, GPU, XPU, CUDA_PROFILER, MEM, TPU "
         "(MEM dumps a torch.cuda.memory snapshot, viewable at https://pytorch.org/memory_viz).",
     )
     parser.add_argument(

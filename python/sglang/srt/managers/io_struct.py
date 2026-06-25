@@ -1710,7 +1710,8 @@ class ProfileReqInput(BaseReq):
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
     num_steps: Optional[int] = None
-    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
+    # The activities to record. The choices are
+    # ["CPU", "GPU", "XPU", "MEM", "CUDA_PROFILER", "RPD", "TPU"].
     activities: Optional[List[str]] = None
     # Whether profile by stages (e.g., prefill and decode) separately
     profile_by_stage: bool = False

@@ -1,4 +1,29 @@
-"""TPU paged memory allocator using pure PyTorch ops (no triton)."""
+"""TPU paged memory allocator.
+
+CPU-resident free-page bookkeeping.
+
+Why CPU bookkeeping on TPU
+--------------------------
+PJRT compiles a fresh HLO graph for every unique tensor shape it sees.
+The upstream allocator keeps ``self.free_pages`` as a device tensor
+that shrinks by one entry every page-boundary allocation
+(``self.free_pages = self.free_pages[num_new_pages:]``). The gather
+``self.free_pages[start_new_pages]`` inside ``alloc_decode`` therefore
+sees a different input shape every ``page_size`` decode tokens, which
+triggers a ~25 ms TPU recompile per page boundary (~25% of long-decode
+wall time at page_size=32).
+
+This subclass keeps the free/release pools as host-resident **CPU torch
+tensors** (torchtpu-vllm's style). ``alloc_decode`` precomputes the
+assigned page-IDs on CPU and ships a fixed-shape ``(bs,)`` tensor to the
+device-side formula with a direct ``cpu_tensor.to(device)`` — no
+``from_numpy`` round-trip. The compiled HLO graph has constant input
+shapes regardless of how many pages have been consumed, so PJRT reuses
+its cache.
+
+The fix only affects the TPU subclass; the parent
+:class:`PagedTokenToKVPoolAllocator` is unchanged for other backends.
+"""
 
 from __future__ import annotations
 
@@ -18,17 +43,37 @@ if TYPE_CHECKING:
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: "KVCache",
-        need_sort: bool,
-    ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
-        self.roundup = page_size - 1
+    def clear(self) -> None:
+        # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
+        self.free_pages = torch.arange(
+            1, self.num_pages + 1, dtype=torch.int32, device="cpu"
+        )
+        self.release_pages = torch.empty((0,), dtype=torch.int32, device="cpu")
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+    def alloc(self, need_size: int):
+        # Page-aligned bulk allocation, returns contiguous device indices.
+        assert (
+            need_size % self.page_size == 0
+        ), "The allocation size should be page-aligned"
+        num_pages = need_size // self.page_size
+        if self.need_sort and num_pages > len(self.free_pages):
+            # Pools are host-resident; keep release_pages on CPU (the parent
+            # defaults to self.device, which is the accelerator here).
+            self.merge_and_sort_free(device="cpu")
+        if num_pages > len(self.free_pages):
+            return None
+
+        out_pages = self.free_pages[:num_pages]
+        self.free_pages = self.free_pages[num_pages:]
+
+        # Expand to per-token indices on CPU, then one async H2D.
+        out_indices = (
+            out_pages[:, None] * self.page_size
+            + torch.arange(self.page_size, dtype=torch.int32)
+        ).reshape(-1)
+        return out_indices.to(self.device, non_blocking=True)
 
     def alloc_extend(
         self,
@@ -46,34 +91,52 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         if num_new_pages is None:
-            num_new_pages_tensor = (
-                (seq_lens + self.roundup) // self.page_size
-                - (prefix_lens + self.roundup) // self.page_size
-            ).sum()
-            num_new_pages_item = num_new_pages_tensor.item()
+            num_new_pages_item = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
         else:
             num_new_pages_item = num_new_pages
 
         if self.need_sort and num_new_pages_item > len(self.free_pages):
-            self.merge_and_sort_free()
+            # Pools are host-resident; keep release_pages on CPU (the parent
+            # defaults to self.device, which is the accelerator here).
+            self.merge_and_sort_free(device="cpu")
 
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        out_indices = torch.empty(
+        # Compute the per-token page indices entirely on host, then do a
+        # single H2D copy. The shared ``alloc_extend_naive`` iterates over
+        # ``range(len(prefix_lens))`` and reads scalar elements off its
+        # tensor inputs each iteration — if those tensors live on the TPU,
+        # the XLA backend lowers each scalar ``//`` to its own one-element
+        # HLO module per iteration (~64 tiny compiles per extend) and every
+        # scalar read forces a device→host sync. Running the loop on CPU
+        # avoids both. ``prefix_lens_cpu`` / ``seq_lens_cpu`` are already
+        # mirrors of the device tensors, so the only extra D2H is the tiny
+        # ``last_loc`` vector (one int32 per sequence).
+        if num_new_pages_item > 0:
+            free_pages_cpu = self.free_pages[:num_new_pages_item]
+        else:
+            free_pages_cpu = torch.empty((0,), dtype=torch.int32, device="cpu")
+
+        out_indices_cpu = torch.empty(
             (extend_num_tokens,),
             dtype=torch.int32,
-            device=self.device,
+            device="cpu",
         )
         alloc_extend_naive(
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
+            prefix_lens_cpu,
+            seq_lens_cpu,
+            last_loc.cpu(),
+            free_pages_cpu,
+            out_indices_cpu,
             self.page_size,
-            self.device,
+            "cpu",
         )
+        out_indices = out_indices_cpu.to(self.device, non_blocking=True)
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -92,47 +155,69 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
 
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
+        # Everything below is computed on CPU torch tensors; we never
+        # index into ``self.free_pages`` from a device kernel, so its
+        # size doesn't affect any HLO.
+        need_new_pages = (seq_lens_cpu % self.page_size == 1).to(torch.int32)
+        num_new_pages = int(need_new_pages.sum())
 
         if num_new_pages > len(self.free_pages):
-            self.merge_and_sort_free()
-
+            # Pools are host-resident; keep release_pages on CPU (the parent
+            # defaults to self.device, which is the accelerator here).
+            self.merge_and_sort_free(device="cpu")
         if num_new_pages > len(self.free_pages):
             return None
 
-        need_new_pages = (seq_lens % self.page_size == 1).int()
-        end_new_pages = torch.cumsum(need_new_pages, 0)
-        start_new_pages = end_new_pages - need_new_pages
-        if num_new_pages == 0:
-            out_indices = last_loc + 1
-        else:
-            out_indices = (last_loc + 1) * (1 - need_new_pages) + self.free_pages[
-                start_new_pages
-            ] * self.page_size * need_new_pages
+        bs = int(seq_lens.shape[0])
+        # ``per_req_new_page[i]`` = page-ID assigned to req i if it
+        # needs a fresh page, else 0 (multiplied by 0 in the formula
+        # below — the sentinel is harmless).
+        per_req_new_page = torch.zeros(bs, dtype=torch.int32, device="cpu")
+        if num_new_pages > 0:
+            new_page_ids = self.free_pages[:num_new_pages]
+            start_new_pages = torch.cumsum(need_new_pages, 0) - need_new_pages
+            mask = need_new_pages.to(torch.bool)
+            per_req_new_page[mask] = new_page_ids[start_new_pages[mask].long()]
+            self.free_pages = self.free_pages[num_new_pages:]
+
+        # Two fixed-shape ``(bs,)`` async H2D copies, straight off the CPU
+        # torch tensors (no from_numpy round-trip). bs is bucketed by the
+        # attention backend, so PJRT sees a stable input shape and reuses
+        # its compiled graph for the device formula below regardless of
+        # context length / number of pages consumed so far.
+        per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)
+        need_new_pages_dev = need_new_pages.to(self.device, non_blocking=True)
+
+        # Stable-shape device formula:
+        #   need_new_pages[i] == 1  →  out_indices[i] = new_page * page_size
+        #   need_new_pages[i] == 0  →  out_indices[i] = last_loc + 1
+        out_indices = (last_loc + 1) * (1 - need_new_pages_dev) + (
+            per_req_new_page_dev * self.page_size * need_new_pages_dev
+        )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
-        self.free_pages = self.free_pages[num_new_pages:]
         return out_indices.int()
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor) -> None:
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            device = free_index.device
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size)
-            free_page_indices = free_page_indices.to(device)
+            # D2H copy of the freed token indices, then everything
+            # stays on host until merge_and_sort_free flushes them
+            # back into self.free_pages.
+            free_page_indices = torch.unique(free_index.cpu() // self.page_size).to(
+                torch.int32
+            )
             if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
+                self.release_pages = torch.cat([free_page_indices, self.release_pages])
             else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+                self.free_pages = torch.cat([free_page_indices, self.free_pages])
         else:
+            # Aggregated frees still come in as device tensors; flush
+            # at free_group_end -> free.
             self.free_group.append(free_index)
 
         if self.debug_mode:
