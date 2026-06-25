@@ -43,20 +43,6 @@ if TYPE_CHECKING:
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        device: str,
-        kvcache: "KVCache",
-        need_sort: bool,
-    ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
-        # Parent's __init__ called clear(); replace its device-tensor
-        # pools with host CPU-tensor versions.
-        self.clear()
-
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
         self.free_pages = torch.arange(
