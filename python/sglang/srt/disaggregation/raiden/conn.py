@@ -19,8 +19,7 @@ import logging
 import math
 import os
 import threading
-import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -40,7 +39,6 @@ from sglang.srt.disaggregation.raiden.serde import (
     unpack_blocks,
     write_aux_blob,
 )
-from sglang.srt.disaggregation.raiden.transfer_engine import RaidenTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 
@@ -74,7 +72,7 @@ class RaidenKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
-        self._engine: Optional[RaidenTransferEngine] = None
+        self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
         # Deterministic control port per attn-tp rank (data port is +1). Matches
@@ -83,21 +81,6 @@ class RaidenKVManager(CommonKVManager):
         base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", "30000"))
         self._control_port = base_port + 2 * self.attn_tp_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
-        # Block per-room until the H2D completes before the decode forward, so
-        # raiden's KV write never overlaps the RPA kernel (TPU E0200 halt).
-        # Pair with --disable-overlap-schedule. Trades overlap for correctness.
-        self._sync_transfer = os.environ.get("SGLANG_RAIDEN_SYNC_TRANSFER", "0") == "1"
-        # raiden completes the H2D on its own PJRT client; torch_tpu's RPA
-        # kernel reads the KV on a different client with no cross-client
-        # ordering, so the donated decode kernel can read a page before
-        # raiden's DMA is visible -> E0200 TensorCore halt. A device
-        # synchronize on the consuming client, fired once when a transfer just
-        # completed, makes torch_tpu observe the committed DMA before the read
-        # while leaving steady-state decode (no new transfer) free to overlap.
-        self._sync_on_recv = os.environ.get("SGLANG_RAIDEN_SYNC_ON_RECV", "1") == "1"
-        # Diagnostic: admit decode requests without the actual H2D KV write, to
-        # test whether the concurrent cross-client DMA is the E0200 trigger.
-        self._skip_h2d = os.environ.get("SGLANG_RAIDEN_SKIP_H2D", "0") == "1"
 
         # Completion sets, drained from raiden and keyed by str(room). Persist
         # until clear() so repeated poll() calls before the framework advances
@@ -141,10 +124,16 @@ class RaidenKVManager(CommonKVManager):
     def _build_engine(self) -> None:
         if self._engine is not None or self._kv_caches is None:
             return
+        # TPU-only import, deferred so the disaggregation module imports cleanly
+        # on hosts without tpu_raiden. Raiden owns the transport, host staging,
+        # D2H/H2D DMA, and completion tracking; it indexes each KV tensor's major
+        # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
+        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+
         max_blocks = self._max_request_blocks()
         num_slots = self._num_slots()
         self.raiden_endpoint = f"{self.local_ip}:{self._control_port}"
-        self._engine = RaidenTransferEngine(
+        self._engine = KVCacheManager(
             kv_caches=self._kv_caches,
             node_id=self.attn_tp_rank,
             local_control_port=self._control_port,
@@ -173,7 +162,7 @@ class RaidenKVManager(CommonKVManager):
     def _num_slots(self) -> int:
         return max(1, int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "16")))
 
-    def _ensure_engine(self) -> RaidenTransferEngine:
+    def _ensure_engine(self) -> Any:
         if self._engine is None:
             with self._engine_lock:
                 self._build_engine()
@@ -187,33 +176,16 @@ class RaidenKVManager(CommonKVManager):
     def _drain_engine(self) -> None:
         if self._engine is None:
             return
-        done_send, done_recv, failed = self._engine.poll_finished()
+        done_send, done_recv, failed = self._engine.poll_stats()
         if done_send or done_recv or failed:
             with self._state_lock:
                 self._completed_send.update(done_send)
                 self._completed_recv.update(done_recv)
                 self._failed.update(failed)
-            if done_recv and self._sync_on_recv:
-                self._sync_device_after_recv()
             if failed:
                 logger.error(
                     "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
                 )
-
-    def _sync_device_after_recv(self) -> None:
-        """Order raiden's just-committed H2D against torch_tpu's KV reads.
-
-        Without this, the donated RPA decode kernel can read a freshly
-        transferred page before raiden's cross-client DMA is visible to
-        torch_tpu, halting the TensorCore (E0200). Fired only on new receive
-        completions, so it does not serialize transfer-free decode steps.
-        """
-        try:
-            import torch
-
-            torch.tpu.synchronize()
-        except Exception as e:  # noqa: BLE001
-            logger.warning("RaidenKVManager device sync after recv failed: %s", e)
 
     def register_to_bootstrap(self):
         # Topology/handshake registration is backend-agnostic; raiden adds no
@@ -281,7 +253,7 @@ class RaidenKVManager(CommonKVManager):
                     self.kv_args.aux_item_lens,
                     aux_index,
                 )
-        engine.register_send(str(room), room, blocks)
+        engine.register_read(str(room), room, blocks)
         self._maybe_reply(room)
 
     def _maybe_reply(self, room: int) -> None:
@@ -357,30 +329,8 @@ class RaidenKVManager(CommonKVManager):
             remote = []
         elif len(remote) > len(local):
             remote = remote[-len(local) :]
-        if self._skip_h2d:
-            # Diagnostic: admit the request WITHOUT performing the cross-client
-            # H2D KV write. Keeps donation + scheduler + overlap + concurrency
-            # identical, but removes the actual concurrent device write. If the
-            # E0200 halt persists here, the concurrent DMA is NOT the trigger.
-            with self._state_lock:
-                self._completed_recv.add(str(room))
-            return True
         engine = self._ensure_engine()
-        engine.submit_load(str(room), room, endpoint, remote, local)
-        if self._sync_transfer:
-            # Sync-inline: block (poll-only, never Await) until THIS room's H2D
-            # completes before its decode forward runs. With --disable-overlap-
-            # schedule (synchronous forward), this keeps raiden's KV H2D from
-            # overlapping the RPA attention kernel that reads the same KV buffer
-            # (the E0200 TensorCore halt). Trades transfer/compute overlap for
-            # correctness on TPU.
-            rid = str(room)
-            deadline = time.monotonic() + self._timeout_s
-            while rid not in self._completed_recv and rid not in self._failed:
-                self._drain_engine()
-                if time.monotonic() > deadline:
-                    break
-                time.sleep(0.0005)
+        engine.start_read(str(room), room, endpoint, remote, local)
         return True
 
     # ----- completion queries (drained by poll()) ---------------------------
