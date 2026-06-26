@@ -291,6 +291,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
+        # Move inputs to CPU for metadata calculation to avoid TPU compilation churn
+        seq_lens_cpu = forward_batch.seq_lens.to("cpu")
+        req_pool_indices_cpu = forward_batch.req_pool_indices.to("cpu").to(torch.int64)
+        req_to_token_cpu = req_to_token.to("cpu")
+
         # -------------------------------------------------------------- #
         # Speculative decoding: adjust seq_lens / extend metadata
         # -------------------------------------------------------------- #
@@ -300,26 +305,26 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             # draft tokens, so bump seq_lens accordingly.
             assert forward_batch.spec_info is not None
             draft_token_num = forward_batch.spec_info.draft_token_num
-            seq_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
-            extend_seq_lens = torch.full(
-                (bs,), draft_token_num, dtype=torch.int32, device=device
+            seq_lens_cpu = (seq_lens_cpu + draft_token_num).to(torch.int32)
+            extend_seq_lens_cpu = torch.full(
+                (bs,), draft_token_num, dtype=torch.int32, device="cpu"
             )
         elif forward_batch.forward_mode.is_draft_extend():
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
-            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            seq_lens_cpu = seq_lens_cpu.to(torch.int32)
             assert forward_batch.extend_seq_lens is not None
-            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens.to("cpu").to(torch.int32)
         elif forward_batch.forward_mode.is_extend():
             assert forward_batch.extend_seq_lens is not None, (
                 "extend_seq_lens is required for the Pallas attention backend in "
                 "extend mode."
             )
-            seq_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            seq_lens_cpu = seq_lens_cpu.to(torch.int32)
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens.to("cpu").to(torch.int32)
         else:
             # Decode (including draft decode).
-            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            seq_lens_cpu = seq_lens_cpu.to(torch.int32)
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
@@ -327,49 +332,47 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 # Multi-step draft decode: each step's backend has a
                 # different speculative_step_id.  Bump seq_lens so the
                 # kernel sees KV entries from prior draft steps.
-                seq_lens = seq_lens + self.speculative_step_id + 1
-            extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+                seq_lens_cpu = seq_lens_cpu + self.speculative_step_id + 1
+            extend_seq_lens_cpu = torch.ones(bs, dtype=torch.int32, device="cpu")
 
-        req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
-
-        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32, device=device)
-        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        cu_q_lens_cpu = torch.zeros(bs + 1, dtype=torch.int32, device="cpu")
+        cu_q_lens_cpu[1:] = torch.cumsum(extend_seq_lens_cpu, dim=0, dtype=torch.int32)
 
         # cu_kv_lens[i] = i * pages_per_seq * page_size so the kernel addresses
         # ``page_indices[i * pages_per_seq + j]`` for token j of seq i.
-        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32, device=device) * (
+        cu_kv_lens_cpu = torch.arange(bs + 1, dtype=torch.int32, device="cpu") * (
             pages_per_seq * page_size
         )
 
-        per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
+        per_seq_cpu = req_to_token_cpu[req_pool_indices_cpu]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of
         # ``page_size`` (SGLang adds extra slack tokens), in which case
         # ``per_seq[:, ::page_size]`` would emit one extra trailing column.
         # Trim to exactly ``pages_per_seq`` entries per row so the flat
         # ``page_indices`` shape matches the rectangular layout the kernel
         # expects.
-        page_indices = (
-            per_seq[:, : pages_per_seq * page_size : page_size] // page_size
+        page_indices_cpu = (
+            per_seq_cpu[:, : pages_per_seq * page_size : page_size] // page_size
         ).to(torch.int32)
-        page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+        page_indices_cpu = page_indices_cpu.reshape(bs * pages_per_seq).contiguous()
 
         # The TPU compile shim pads batch-shaped metadata up to the selected
         # compile bucket. Keep the padded tensor shapes, but only mark the real
         # request rows as active so the RPA kernel does not process ghost rows.
         real_bs = int(getattr(forward_batch, "_tpu_real_b", bs))
-        num_active = torch.tensor(real_bs, dtype=torch.int32, device=device)
+        num_active_cpu = torch.tensor(real_bs, dtype=torch.int32, device="cpu")
         if forward_batch.forward_mode.is_decode():
-            distribution = num_active.repeat(3).to(torch.int32)
+            distribution_cpu = num_active_cpu.repeat(3).to(torch.int32)
         else:
-            zero = torch.zeros((), dtype=torch.int32, device=device)
-            distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
+            zero_cpu = torch.zeros((), dtype=torch.int32, device="cpu")
+            distribution_cpu = torch.stack([zero_cpu, num_active_cpu, num_active_cpu]).to(torch.int32)
 
         return PallasForwardMetadata(
-            kv_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            cu_kv_lens=cu_kv_lens,
-            page_indices=page_indices,
-            distribution=distribution,
+            kv_lens=seq_lens_cpu.to(device),
+            cu_q_lens=cu_q_lens_cpu.to(device),
+            cu_kv_lens=cu_kv_lens_cpu.to(device),
+            page_indices=page_indices_cpu.to(device),
+            distribution=distribution_cpu.to(device),
         )
 
     # ------------------------------------------------------------------ #
