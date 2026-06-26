@@ -13,13 +13,15 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
-    TpuCompiledForwardShim,
     _matches_default,
     _pad_forward_batch_inputs,
     _static_default_kwargs,
     _zero_pad_1d,
     build_bucketers,
     resolve_compile_caps,
+)
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -198,7 +200,7 @@ class TestCompiledForwardShim(CustomTestCase):
                 hidden_states=padded_hidden,
             )
         )
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
@@ -208,7 +210,7 @@ class TestCompiledForwardShim(CustomTestCase):
 
     def test_passes_args_through(self):
         compiled = MagicMock(return_value=SimpleNamespace())
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
@@ -219,7 +221,7 @@ class TestCompiledForwardShim(CustomTestCase):
 
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         self.assertIn("pp_proxy_tensors", inspect.signature(shim).parameters)
 
     def test_drops_default_kwargs_before_compiled_call(self):
@@ -228,7 +230,7 @@ class TestCompiledForwardShim(CustomTestCase):
 
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, pp_proxy_tensors=None)
         compiled.assert_called_once_with("ids", "pos", fb)
@@ -239,7 +241,7 @@ class TestCompiledForwardShim(CustomTestCase):
 
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
@@ -250,7 +252,9 @@ class TestCompiledForwardShim(CustomTestCase):
             next_token_logits=torch.zeros(4, 10),
             hidden_states=torch.zeros(8, 5),
         )
-        shim = CompiledForwardShim(MagicMock(return_value=out_obj))
+        shim = CompiledForwardShim(
+            MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
+        )
         out = shim(None, None, SimpleNamespace())
         self.assertIs(out, out_obj)
 
@@ -260,7 +264,9 @@ class TestCompiledForwardShim(CustomTestCase):
             next_token_logits=torch.zeros(2, 10),
             hidden_states=torch.zeros(4, 5),
         )
-        shim = CompiledForwardShim(MagicMock(return_value=out_obj))
+        shim = CompiledForwardShim(
+            MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
+        )
         fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
@@ -273,7 +279,7 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(
             return_value=SimpleNamespace(next_token_logits=torch.zeros(4, 10))
         )
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = SimpleNamespace(_tpu_real_q=8, _tpu_real_b=2, batch_size=4)
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 2)
@@ -283,7 +289,7 @@ class TestCompiledForwardShim(CustomTestCase):
         # must not mutate batch_size in that case.
         fb = SimpleNamespace(batch_size=4)
         compiled = MagicMock(return_value=SimpleNamespace())
-        shim = CompiledForwardShim(compiled)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 4)
 
@@ -418,62 +424,6 @@ class TestResolveCompileCaps(CustomTestCase):
                 torch_compile_max_bs=4,
                 max_running_requests=4,
             )
-
-
-class TestCompiledForwardShimInstall(CustomTestCase):
-    """Verify TpuCompiledForwardShim installs the runtime wrappers."""
-
-    @staticmethod
-    def _model_runner_with(model):
-        return SimpleNamespace(
-            model=model,
-            model_config=SimpleNamespace(context_len=128),
-            max_running_requests=1,
-            server_args=SimpleNamespace(
-                tpu_compile_tokens=None,
-                tpu_compile_bs=None,
-                chunked_prefill_size=None,
-                max_prefill_tokens=128,
-            ),
-        )
-
-    def test_installs_prepare_and_compiled_forward(self):
-        class _M:
-            pass
-
-        model = _M()
-        original_forward = MagicMock()
-        model.forward = original_forward
-        runner = self._model_runner_with(model)
-
-        TpuCompiledForwardShim(
-            runner, compiled_fns={"forward": original_forward}
-        ).install()
-
-        self.assertTrue(callable(getattr(model, "prepare_forward_batch", None)))
-        self.assertIsInstance(model.forward, CompiledForwardShim)
-        self.assertIs(model.forward.fn, original_forward)
-
-    def test_chains_existing_prepare_forward_batch(self):
-        class _M:
-            pass
-
-        model = _M()
-        existing_prep = MagicMock()
-        model.prepare_forward_batch = existing_prep
-        model.forward = MagicMock()
-        runner = self._model_runner_with(model)
-
-        TpuCompiledForwardShim(
-            runner, compiled_fns={"forward": model.forward}
-        ).install()
-        self.assertIsNot(model.prepare_forward_batch, existing_prep)
-
-        fb = _forward_batch(real_t=4, real_b=1, mode="extend")
-        model.prepare_forward_batch(fb)
-        existing_prep.assert_called_once_with(fb)
-        self.assertEqual(fb._tpu_real_q, 4)
-        self.assertEqual(fb._tpu_real_b, 1)
 
 
 if __name__ == "__main__":

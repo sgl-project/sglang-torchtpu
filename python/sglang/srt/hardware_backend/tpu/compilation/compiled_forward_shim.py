@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU compiled-forward adaptation for bucketized static shapes.
 
-This module pads ForwardBatch tensors and Python-list metadata to
-configured token/batch buckets before attention metadata is built. It
-wraps compiled model forwards to normalize default kwargs at the Dynamo
-boundary and slices padded outputs back to real request shapes.
+This module pads ForwardBatch tensors and Python-list metadata to configured
+token/batch buckets before attention metadata is built. It wraps compiled
+model forwards to normalize default kwargs at the Dynamo boundary and slices
+padded decoder outputs back to real request shapes.
 """
 
 from __future__ import annotations
@@ -12,11 +12,12 @@ from __future__ import annotations
 import functools
 import inspect
 import time
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
@@ -56,7 +57,7 @@ _REAL_B_KEY = "_tpu_real_b"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
 
-def _static_default_kwargs(fn: Callable) -> dict:
+def _static_default_kwargs(fn: Callable[..., Any]) -> dict[str, Any]:
     signature = getattr(fn, "__signature__", None)
     if signature is None:
         return {}
@@ -68,7 +69,7 @@ def _static_default_kwargs(fn: Callable) -> dict:
     }
 
 
-def _matches_default(value, default) -> bool:
+def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
     return type(value) is type(default) and value == default
@@ -82,7 +83,7 @@ def _zero_pad_1d(t: torch.Tensor, target_size: int) -> torch.Tensor:
 
 
 def _pad_forward_batch_inputs(
-    forward_batch,
+    forward_batch: Any,
     t_bucketer: Bucketer,
     b_bucketer: Bucketer,
 ) -> tuple[int, int]:
@@ -110,6 +111,13 @@ def _pad_forward_batch_inputs(
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
             setattr(forward_batch, field, _zero_pad_1d(val, pad_t))
 
+    # MROPE positions are (3, num_tokens); pad along the token dim.
+    mrope_pos = getattr(forward_batch, "mrope_positions", None)
+    if isinstance(mrope_pos, torch.Tensor) and mrope_pos.shape[-1] < pad_t:
+        forward_batch.mrope_positions = F.pad(
+            mrope_pos, (0, pad_t - mrope_pos.shape[-1])
+        )
+
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
@@ -119,6 +127,12 @@ def _pad_forward_batch_inputs(
         val = getattr(forward_batch, field, None)
         if isinstance(val, list) and len(val) < pad_b:
             setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
+
+    # mm_inputs is per request. Keep it aligned with padded extend_* CPU lists
+    # so eager multimodal embedding code can index by batch position.
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+        forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
     forward_batch.batch_size = pad_b
 
@@ -183,27 +197,34 @@ def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
 class CompiledForwardShim:
     """Adapt compiled forward calls and outputs for padded execution."""
 
-    def __init__(self, compiled_fn):
+    def __init__(
+        self,
+        compiled_fn: Callable[..., Any],
+        policy: CompilePolicy,
+    ) -> None:
         self.fn = compiled_fn
+        self.policy = policy
         self._recompilation_checker = None
+        self._model_label = ""
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
 
-    def set_recompilation_checker(self, checker, model_label: str = "") -> None:
-        """Set the recompilation checker for serving-time detection.
-
-        Args:
-            checker: RecompilationChecker instance.
-            model_label: human-readable model identifier for log context
-                (e.g. "LlamaForCausalLM").
-        """
+    def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
+        """Set the serving-time recompilation checker."""
         self._recompilation_checker = checker
         self._model_label = model_label
 
-    def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
+    def __call__(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
         # TODO: rename layer_transfer_counter to transfer_counter or similar after integrating to upstream as it represents different things on tpu and other hardware backends.
         pool = getattr(forward_batch, "token_to_kv_pool", None)
@@ -212,8 +233,8 @@ class CompiledForwardShim:
             counter.wait()
 
         if self._default_kwargs and kwargs:
-            # Dynamo treats omitted kwargs and explicit defaults as
-            # different call shapes; drop explicit default values.
+            # Dynamo treats omitted kwargs and explicit defaults as different
+            # call shapes; drop explicit default values.
             kwargs = {
                 k: v
                 for k, v in kwargs.items()
@@ -223,23 +244,7 @@ class CompiledForwardShim:
                 )
             }
         out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
-
-        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-        real_b = getattr(forward_batch, _REAL_B_KEY, None)
-        if real_q is None or real_b is None:
-            return out
-
-        next_token_logits = getattr(out, "next_token_logits", None)
-        if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            out.next_token_logits = next_token_logits[:real_b]
-
-        hidden_states = getattr(out, "hidden_states", None)
-        if hidden_states is not None and real_q < hidden_states.shape[0]:
-            out.hidden_states = hidden_states[:real_q]
-
-        # Restore real batch_size so downstream consumers (sampler,
-        # logprob, scheduler hooks) don't iterate over ghost slots.
-        forward_batch.batch_size = real_b
+        out = self.policy.unpad_outputs(out, forward_batch)
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
@@ -293,69 +298,7 @@ def resolve_compile_caps(
     return min(candidates), max_b
 
 
-class TpuCompiledForwardShim:
-    """Installs bucket padding and compiled-forward adaptation."""
-
-    def __init__(self, model_runner, compiled_fns: dict[str, Callable]):
-        self.model_runner = model_runner
-        self.model = model_runner.model
-        self._compiled_fns = compiled_fns
-
-        server_args = model_runner.server_args
-        max_t, max_b = resolve_compile_caps(
-            chunked_prefill_size=server_args.chunked_prefill_size,
-            max_prefill_tokens=server_args.max_prefill_tokens,
-            context_len=model_runner.model_config.context_len,
-            torch_compile_max_bs=getattr(server_args, "torch_compile_max_bs", None),
-            max_running_requests=model_runner.max_running_requests,
-        )
-
-        self.t_bucketer, self.b_bucketer = build_bucketers(
-            server_args, max_t=max_t, max_b=max_b
-        )
-
-    def install(self) -> TpuCompiledForwardShim:
-        # TODO(wyzhang): Speculative decoding bypasses prepare_forward_batch via
-        # skip_attn_backend_init=True. Speculative decoding is not yet supported
-        # on TPU; when added, either integrate padding into the batch builder
-        # or ensure speculative runners invoke prepare_forward_batch.
-        existing_prep = getattr(self.model, "prepare_forward_batch", None)
-        t_bucketer = self.t_bucketer
-        b_bucketer = self.b_bucketer
-
-        def _prepare(forward_batch):
-            if existing_prep is not None:
-                existing_prep(forward_batch)
-            real_q, real_b = _pad_forward_batch_inputs(
-                forward_batch, t_bucketer, b_bucketer
-            )
-            setattr(forward_batch, _REAL_Q_KEY, real_q)
-            setattr(forward_batch, _REAL_B_KEY, real_b)
-
-        self.model.prepare_forward_batch = _prepare
-
-        for attr, compiled_fn in self._compiled_fns.items():
-            setattr(self.model, attr, CompiledForwardShim(compiled_fn))
-
-        logger.info(
-            "[compiled forward shim] Installed compiled-forward adaptation on %s.{%s} "
-            "(t-bucketer=%s, b-bucketer=%s).",
-            type(self.model).__name__,
-            ", ".join(self._compiled_fns),
-            self.t_bucketer.name,
-            self.b_bucketer.name,
-        )
-        return self
-
-    def set_recompilation_checker(self, checker, model_label: str = "") -> None:
-        """Propagate the recompilation checker to all installed forward shims."""
-        for attr in self._compiled_fns:
-            shim = getattr(self.model, attr, None)
-            if isinstance(shim, CompiledForwardShim):
-                shim.set_recompilation_checker(checker, model_label=model_label)
-
-
-def build_bucketers(server_args, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:
+def build_bucketers(server_args: Any, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:
     """Build token and batch size bucketers."""
     token_paddings = server_args.tpu_compile_tokens
     if token_paddings:

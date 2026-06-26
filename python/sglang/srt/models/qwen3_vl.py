@@ -26,6 +26,7 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
 
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
@@ -77,11 +78,13 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_npu,
+    is_tpu,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -1065,6 +1068,17 @@ class Qwen3LLMModel(Qwen3Model):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+    support_torch_compile(
+        Qwen3LLMModel,
+        policy=Qwen3VLDecoderTpuCompilePolicy,
+    )
 
 
 class Qwen3VLForConditionalGeneration(nn.Module):

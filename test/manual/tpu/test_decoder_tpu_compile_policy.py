@@ -1,4 +1,4 @@
-"""Unit tests for the in-process TPU CompilationManager."""
+"""Unit tests for decoder TPU compile policy warmup."""
 
 import unittest
 from types import SimpleNamespace
@@ -7,8 +7,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
-from sglang.srt.hardware_backend.tpu.compilation.compilation_manager import (
-    CompilationManager,
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
     _materialize_out,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -32,7 +32,7 @@ def _model_runner(device="cpu"):
 
     ``prepare_forward_batch`` is included because ``_run_one`` calls it
     before ``init_forward_metadata`` (mirrors the runtime chain installed
-    by ``TpuCompiledForwardShim.install()``)."""
+    by ``DecoderTpuCompilePolicy.install()``)."""
     return SimpleNamespace(
         device=device,
         model=SimpleNamespace(
@@ -45,15 +45,33 @@ def _model_runner(device="cpu"):
     )
 
 
-def _make_manager(model_runner=None, token_buckets=(64, 256), bs_buckets=(1, 4)):
+def _make_policy(model_runner=None, token_buckets=(64, 256), bs_buckets=(1, 4)):
     if model_runner is None:
         model_runner = _model_runner()
-    return CompilationManager(
+    t_bucketer = Bucketer(name="Token", buckets=list(token_buckets))
+    b_bucketer = Bucketer(name="Bs", buckets=list(bs_buckets))
+    return DecoderTpuCompilePolicy(
         model_runner=model_runner,
-        compiled_fns={"forward": model_runner.model.forward},
-        t_bucketer=Bucketer(name="Token", buckets=list(token_buckets)),
-        b_bucketer=Bucketer(name="Bs", buckets=list(bs_buckets)),
+        t_bucketer=t_bucketer,
+        b_bucketer=b_bucketer,
+        owner=model_runner.model,
     )
+
+
+def _target_and_padding(policy):
+    return policy.owner, policy
+
+
+def _run_cases(policy, mode):
+    with patch(
+        "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+        "get_tensor_model_parallel_rank",
+        return_value=1,
+    ):
+        if mode == ForwardMode.EXTEND:
+            policy._precompile_extend()
+        else:
+            policy._precompile_decode()
 
 
 class TestMakeDummyForwardBatch(CustomTestCase):
@@ -61,8 +79,11 @@ class TestMakeDummyForwardBatch(CustomTestCase):
 
     def test_extend_shapes_and_ghost_tokens(self):
         mr = _model_runner()
-        mgr = _make_manager(mr)
-        fb = mgr._make_dummy_forward_batch(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
+        policy = _make_policy(mr)
+        _, padding = _target_and_padding(policy)
+        fb = padding._make_dummy_forward_batch(
+            num_tokens=64, bs=4, mode=ForwardMode.EXTEND
+        )
         # Token-axis tensors padded to num_tokens; bs=4 valid + 60 ghost.
         self.assertEqual(fb.input_ids.shape[0], 64)
         self.assertEqual(fb.positions.shape[0], 64)
@@ -82,8 +103,11 @@ class TestMakeDummyForwardBatch(CustomTestCase):
 
     def test_decode_has_no_extend_fields(self):
         mr = _model_runner()
-        mgr = _make_manager(mr)
-        fb = mgr._make_dummy_forward_batch(num_tokens=8, bs=8, mode=ForwardMode.DECODE)
+        policy = _make_policy(mr)
+        _, padding = _target_and_padding(policy)
+        fb = padding._make_dummy_forward_batch(
+            num_tokens=8, bs=8, mode=ForwardMode.DECODE
+        )
         # Decode: one query token per running seq.
         self.assertEqual(fb.input_ids.shape[0], 8)
         self.assertEqual(fb.seq_lens.shape[0], 8)
@@ -95,14 +119,14 @@ class TestMakeDummyForwardBatch(CustomTestCase):
 
 
 class TestPrecompileLoops(CustomTestCase):
-    """``precompile_all`` fires one forward per TPU precompile variant:
+    """``precompile`` fires one forward per TPU precompile variant:
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
 
     def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
-        mgr = _make_manager(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
-        mgr._precompile_extend()
+        policy = _make_policy(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
+        _run_cases(policy, ForwardMode.EXTEND)
         self.assertEqual(mr.model.forward.call_count, 3)
         self.assertEqual(
             mr.attn_backend.calls,
@@ -112,29 +136,34 @@ class TestPrecompileLoops(CustomTestCase):
     def test_extend_skips_token_bucket_below_bs(self):
         # A 4-token bucket can't hold the fixed 8-req extend cap.
         mr = _model_runner()
-        mgr = _make_manager(mr, token_buckets=(4, 64), bs_buckets=(1, 8))
-        mgr._precompile_extend()
+        policy = _make_policy(mr, token_buckets=(4, 64), bs_buckets=(1, 8))
+        _run_cases(policy, ForwardMode.EXTEND)
         self.assertEqual(mr.model.forward.call_count, 1)
         self.assertEqual(mr.attn_backend.calls, [(64, 8)])
 
     def test_extend_raises_when_no_token_bucket_can_hold_bs_cap(self):
         mr = _model_runner()
-        mgr = _make_manager(mr, token_buckets=(4,), bs_buckets=(8,))
+        policy = _make_policy(mr, token_buckets=(4,), bs_buckets=(8,))
         with self.assertRaisesRegex(ValueError, "No TPU extend compile shapes"):
-            mgr._precompile_extend()
+            _run_cases(policy, ForwardMode.EXTEND)
 
     def test_decode_loop_iterates_bs(self):
         mr = _model_runner()
-        mgr = _make_manager(mr, token_buckets=(64,), bs_buckets=(1, 4, 8))
-        mgr._precompile_decode()
+        policy = _make_policy(mr, token_buckets=(64,), bs_buckets=(1, 4, 8))
+        _run_cases(policy, ForwardMode.DECODE)
         self.assertEqual(mr.model.forward.call_count, 3)
         # Decode: tokens == bs for each call.
         self.assertEqual(mr.attn_backend.calls, [(1, 1), (4, 4), (8, 8)])
 
-    def test_precompile_all_combines_extend_and_decode(self):
+    def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
-        mgr = _make_manager(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
-        mgr.precompile_all()
+        policy = _make_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
 
@@ -146,8 +175,8 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
 
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
-        mgr = _make_manager(mr)
-        mgr._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
+        policy = _make_policy(mr)
+        policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         # prepare_forward_batch runs first so model-specific prep hooks
         # (Moss-VL etc.) see precompile too.
         mr.model.prepare_forward_batch.assert_called_once()
@@ -161,16 +190,17 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
 
     def test_run_one_uses_no_grad_not_inference_mode(self):
         mr = _model_runner()
-        mgr = _make_manager(mr)
+        policy = _make_policy(mr)
         cm = MagicMock()
         with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.compilation_manager.torch.no_grad",
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy.torch.no_grad",
             return_value=cm,
         ) as no_grad, patch(
-            "sglang.srt.hardware_backend.tpu.compilation.compilation_manager.torch.inference_mode",
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "decoder_compile_policy.torch.inference_mode",
             side_effect=AssertionError("inference_mode should not be used"),
         ):
-            mgr._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
+            policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
 

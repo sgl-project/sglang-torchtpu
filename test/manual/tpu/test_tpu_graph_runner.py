@@ -7,21 +7,26 @@ tests run on any machine without TPU hardware.
 import inspect
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    TpuCompiledForwardShim,
+from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
+    support_torch_compile,
+)
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
 )
 from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
 from sglang.test.test_utils import CustomTestCase
 
-PRECOMPILE_ALL = (
+DECODER_POLICY_PRECOMPILE = (
     "sglang.srt.hardware_backend.tpu.compilation."
-    "compilation_manager.CompilationManager.precompile_all"
+    "decoder_compile_policy.DecoderTpuCompilePolicy.precompile"
 )
 
 
-def _model_with(**attrs):
+def _model_with(**attrs: Any) -> Any:
     """Return a bare object with the given attributes.
 
     A bare object is preferable here over MagicMock because MagicMock
@@ -40,21 +45,22 @@ def _model_with(**attrs):
 
 
 class TestTpuGraphRunner(CustomTestCase):
-    """TpuGraphRunner wraps model methods with torch.compile correctly."""
+    """TpuGraphRunner orchestrates annotated compile policies."""
 
     def setUp(self):
         # Stub torch.compile so the test doesn't need the tpu dynamo backend.
         # Return a MagicMock that records the wrapped fn/kwargs and lets
         # tpu_graph_runner assign ``__signature__`` on the result (a tuple
         # would raise AttributeError on attribute set).
-        def _fake_compile(fn, **kwargs):
+        def _fake_compile(fn: Any, **kwargs: Any) -> MagicMock:
             m = MagicMock(name="compiled")
             m._wrapped_fn = fn
             m._wrapped_kwargs = kwargs
             return m
 
         compile_patcher = patch(
-            "sglang.srt.model_executor.tpu_graph_runner.torch.compile",
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "decoder_compile_policy.torch.compile",
             side_effect=_fake_compile,
         )
         self.mock_compile = compile_patcher.start()
@@ -66,13 +72,15 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_register = register_patcher.start()
         self.addCleanup(register_patcher.stop)
         # Stub the in-process precompile so the test doesn't need a real
-        # attn_backend / model_runner.device — CompilationManager
-        # behavior is covered separately in test_compilation_manager.py.
-        precompile_patcher = patch(PRECOMPILE_ALL)
+        # attn_backend / model_runner.device. Decoder policy warmup behavior
+        # is covered separately in test_decoder_tpu_compile_policy.py.
+        precompile_patcher = patch(DECODER_POLICY_PRECOMPILE)
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
 
-    def _runner_for(self, model, enable_torch_compile=True):
+    def _runner_for(
+        self, model: Any, enable_torch_compile: bool = True
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             model=model,
             model_config=SimpleNamespace(context_len=2048),
@@ -86,16 +94,37 @@ class TestTpuGraphRunner(CustomTestCase):
             ),
         )
 
-    def test_wraps_forward_when_enabled(self):
-        def original(input_ids, positions, forward_batch, input_embeds=None):
+    def _annotate(
+        self,
+        model: Any,
+        *,
+        precompile: bool = False,
+    ) -> Any:
+        policy = type(
+            "_TestDecoderTpuCompilePolicy",
+            (DecoderTpuCompilePolicy,),
+            {"should_precompile": precompile},
+        )
+        return support_torch_compile(
+            model,
+            policy=policy,
+        )
+
+    def test_wraps_annotated_forward_when_enabled(self):
+        def original(
+            input_ids: Any,
+            positions: Any,
+            forward_batch: Any,
+            input_embeds: Any | None = None,
+        ) -> None:
             pass
 
-        model = _model_with(forward=original)
+        model = self._annotate(_model_with(forward=original))
         runner = self._runner_for(model)
         TpuGraphRunner(runner)
         self.assertIsNot(model.forward, original)
         self.assertIn("input_embeds", inspect.signature(model.forward).parameters)
-        self.assertIsInstance(runner.compiled_forward_shim, TpuCompiledForwardShim)
+        self.assertIsInstance(runner.compiled_forward_shim, DecoderTpuCompilePolicy)
         self.mock_compile.assert_called_once()
         _, kwargs = self.mock_compile.call_args
         # Pinned compile kwargs — these are correctness-critical for the
@@ -107,23 +136,17 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertFalse(kwargs["dynamic"])
         self.mock_register.assert_called_once()
 
-    def test_wraps_both_entry_points_when_present(self):
-        # ``forward_split_prefill`` is wrapped so first invocation
-        # populates the HLO cache, even though CompilationManager only
-        # precompiles ``forward`` today (a warning is logged for the
-        # gap — see TODO in CompilationManager.__init__).
-        model = _model_with(
-            forward=MagicMock(),
-            forward_split_prefill=MagicMock(),
+    def test_module_annotation_wraps_forward_only(self):
+        model = self._annotate(
+            _model_with(
+                forward=MagicMock(),
+                forward_split_prefill=MagicMock(),
+            ),
         )
-        TpuGraphRunner(self._runner_for(model))
-        self.assertEqual(self.mock_compile.call_count, 2)
-
-    def test_skips_missing_split_prefill_silently(self):
-        # Only `forward` exists — no warning, no error.
-        model = _model_with(forward=MagicMock())
+        original_split = model.forward_split_prefill
         TpuGraphRunner(self._runner_for(model))
         self.assertEqual(self.mock_compile.call_count, 1)
+        self.assertIs(model.forward_split_prefill, original_split)
 
     def test_respects_can_torch_compile_false(self):
         original = MagicMock()
@@ -139,27 +162,73 @@ class TestTpuGraphRunner(CustomTestCase):
         # to specialize over compile-only buckets.
         self.assertFalse(runner.server_args.enable_torch_compile)
 
-    def test_can_torch_compile_true_default(self):
-        # Models that don't set _can_torch_compile should still be wrapped.
-        model = _model_with(forward=MagicMock())
+    def test_annotation_drives_compile_when_can_torch_compile_default(self):
+        # Models that don't set _can_torch_compile should compile only when
+        # they declare a boundary.
+        model = self._annotate(_model_with(forward=MagicMock()))
         TpuGraphRunner(self._runner_for(model))
         self.mock_compile.assert_called_once()
 
-    def test_warns_when_no_targets_present(self):
-        # Model exposes neither forward nor forward_split_prefill:
-        # nothing to wrap. We log a warning and return without raising.
-        model = _model_with()  # empty
-        TpuGraphRunner(self._runner_for(model))
-        self.mock_compile.assert_not_called()
+    def test_no_annotation_falls_back_to_decoder_policy(self):
+        # Most text decoder models should not need an explicit annotation.
+        # If no annotated boundary is installed, TPU compile falls back to
+        # the generic decoder policy on the model forward.
+        model = _model_with(forward=MagicMock())
+        runner = self._runner_for(model)
+        TpuGraphRunner(runner)
+        self.mock_compile.assert_called_once()
+        self.assertIsInstance(runner.compiled_forward_shim, DecoderTpuCompilePolicy)
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_precompile_called_for_precompile_enabled_policy(self):
+        model = self._annotate(_model_with(forward=MagicMock()), precompile=True)
+        TpuGraphRunner(self._runner_for(model))
+        self.mock_precompile.assert_called_once()
+
+    def test_discovers_annotated_module(self):
+        class _VisionPolicy(CompilePolicy):
+            backend = "tpu"
+            should_precompile = True
+
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+
+            def install(self) -> bool:
+                self.owner.installed = True
+                return True
+
+            def precompile(self) -> None:
+                self.owner.precompiled = True
+
+            def unpad_outputs(self, out: Any, context: Any) -> Any:
+                return out
+
+        class _VisionModule:
+            def forward(self):
+                pass
+
+        support_torch_compile(
+            _VisionModule,
+            policy=_VisionPolicy,
+        )
+        vision_module = _VisionModule()
+        model = _model_with()
+        model.modules = lambda: (model, vision_module)
+
+        TpuGraphRunner(self._runner_for(model))
+
+        self.assertTrue(vision_module.installed)
+        self.assertTrue(vision_module.precompiled)
+        self.mock_compile.assert_not_called()
 
     def test_can_run_is_always_false(self):
         # ModelRunner.forward branches on `graph_runner.can_run(...)`
         # to decide whether to replay a captured graph. TPU has no
         # captured graph (PJRT caches HLO internally), so this must
         # be False for every forward mode so the replay path stays off.
-        runner = TpuGraphRunner(self._runner_for(_model_with(forward=MagicMock())))
+        model = self._annotate(_model_with(forward=MagicMock()))
+        runner = TpuGraphRunner(self._runner_for(model))
         self.assertFalse(runner.can_run(MagicMock()))
 
 
