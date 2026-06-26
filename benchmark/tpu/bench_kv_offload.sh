@@ -41,9 +41,6 @@
 #   WS_TOKENS=                 # default: 1.9 * DEVICE_TOKENS
 #   SAMPLES=3                  # measured reload passes (per mode)
 #   SEED=1234
-#   AB=0                       # 1 -> A/B async vs serial reload (needs the dev
-#                              #      /cache/kvoffload_serial toggle in
-#                              #      load_to_device_layerwise)
 #   PROFILE=0                  # forwarded to bench_serving.sh
 #   OUTPUT_DIR=./results/kvoffload-<model-slug>-<ts>
 #   PYTHON=python3
@@ -63,9 +60,7 @@ OSL=${OSL:-8}
 CONCURRENCY=${CONCURRENCY:-12}
 SAMPLES=${SAMPLES:-3}
 SEED=${SEED:-1234}
-AB=${AB:-0}
 PROFILE=${PROFILE:-0}
-SERIAL_FLAG=/cache/kvoffload_serial
 
 HOST_TOKENS=$(( DEVICE_TOKENS * HOST_RATIO ))
 WS_TOKENS=${WS_TOKENS:-$(( DEVICE_TOKENS * 19 / 10 ))}
@@ -89,7 +84,7 @@ fi
 if (( WS >= HOST_TOKENS )); then
     echo "  !! WARNING: working set >= host pool => host thrash => recompute, NO reload. Lower NUM_PROMPTS or raise hicache-ratio." >&2
 fi
-echo "  concurrency   = $CONCURRENCY   isl/osl = $ISL/$OSL   samples = $SAMPLES   ab = $AB"
+echo "  concurrency   = $CONCURRENCY   isl/osl = $ISL/$OSL   samples = $SAMPLES"
 echo "  output_dir    = $OUT_BASE"
 echo "====================================="
 
@@ -111,13 +106,7 @@ pass populate "$SEED"
 
 # WS > device => every same-seed pass re-evicts and re-reloads (genuine reload).
 for k in $(seq 1 "$SAMPLES"); do
-    if [[ "$AB" == "1" ]]; then
-        rm -f "$SERIAL_FLAG";  pass "reload-async-$k"  "$SEED"
-        touch "$SERIAL_FLAG";  pass "reload-serial-$k" "$SEED"
-        rm -f "$SERIAL_FLAG"
-    else
-        pass "reload-$k" "$SEED"
-    fi
+    pass "reload-$k" "$SEED"
 done
 
 # Recompute baseline (offload OFF): fresh seed => never-seen prompts => full prefill.
