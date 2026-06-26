@@ -321,14 +321,21 @@ class RaidenKVManager(CommonKVManager):
             local = list(self._local_blocks.get(room, []))
             remote = list(self._remote_blocks[room])
             endpoint = self._remote_endpoint[room]
-        # decode_prefix_len: decode already holds the first len(remote)-len(local)
-        # pages, so pull only the tail that maps onto the freshly allocated pages.
-        # (Empty local => full prefix hit; pull nothing. Avoid remote[-0:], which
-        # would select the whole list.)
+        # Pull the prefill KV pages that map onto decode's freshly allocated
+        # local pages; raiden requires remote/local to be equal length.
+        #   - empty local => full prefix-cache hit; pull nothing (avoid
+        #     remote[-0:], which would select the whole list).
+        #   - len(remote) > len(local) => decode already holds the head prefix;
+        #     pull only the tail len(local) prefill pages.
+        #   - len(remote) < len(local) => decode allocated a trailing page for
+        #     the first generated token that prefill produced no KV for; fill the
+        #     head len(remote) local pages and leave that page out of the pull.
         if not local:
             remote = []
         elif len(remote) > len(local):
             remote = remote[-len(local) :]
+        elif len(remote) < len(local):
+            local = local[: len(remote)]
         engine = self._ensure_engine()
         engine.start_read(str(room), room, endpoint, remote, local)
         return True
