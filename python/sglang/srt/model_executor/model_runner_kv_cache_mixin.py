@@ -75,46 +75,6 @@ class ModelRunnerKVCacheMixin:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
-    def _hicache_tpu_staging_reserve_bytes(self: ModelRunner) -> int:
-        """HBM to reserve for the TPU HiCache device staging buffer.
-
-        Subtracted from available memory before sizing the KV cache so the
-        staging buffer does not eat into the KV-cache proportion. Mirrors the
-        ``TpuFusedMHATokenToKVPoolHost.device_stage`` allocation. Returns 0
-        unless hierarchical cache + the ``pallas_tpu`` io backend are active.
-        """
-        sa = self.server_args
-        if not (
-            getattr(sa, "enable_hierarchical_cache", False)
-            and getattr(sa, "hicache_io_backend", None) == "pallas_tpu"
-        ):
-            return 0
-        try:
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
-                fused_block_nbytes,
-                hicache_tpu_stage_blocks,
-            )
-
-            mc = self.model_config
-            head_num = mc.get_num_kv_heads(get_attention_tp_size())
-            stage_blocks = hicache_tpu_stage_blocks()
-            block_bytes = fused_block_nbytes(
-                head_num, mc.head_dim, self.kv_cache_dtype, sa.page_size
-            )
-            reserve = self.num_effective_layers * stage_blocks * block_bytes
-            logger.info(
-                "[hicache-tpu] reserving %.3f GB HBM for the device staging "
-                "buffer (layers=%d, stage_blocks=%d, block=%d B)",
-                reserve / (1 << 30),
-                self.num_effective_layers,
-                stage_blocks,
-                block_bytes,
-            )
-            return int(reserve)
-        except Exception as e:  # a mis-estimate must never crash startup
-            logger.warning("[hicache-tpu] staging reserve estimate failed: %s", e)
-            return 0
-
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
@@ -931,10 +891,6 @@ class ModelRunnerKVCacheMixin:
         )
 
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
-        # Carve out the TPU HiCache device staging buffer before sizing the KV cache.
-        available_bytes = max(
-            0, available_bytes - self._hicache_tpu_staging_reserve_bytes()
-        )
         page_size = self.server_args.page_size
 
         configurator = create_memory_pool_configurator(self)

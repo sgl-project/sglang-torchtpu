@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# KV-offload (HiCache --hicache-io-backend pallas_tpu) reload benchmark on top of
+# KV-offload (HiCache --hicache-io-backend torch_tpu) reload benchmark on top of
 # ./bench_serving.sh (reuses its metrics/JSONL).
 #
 # Same-seed double-run forces a real host->HBM reload (bench_serving re-seeds at
@@ -18,7 +18,7 @@
 #   python -m sglang.launch_server --model-path Qwen/Qwen3-30B-A3B --device tpu \
 #     --tp-size 8 --ep-size 8 --enable-torch-compile --page-size 128 \
 #     --attention-backend pallas_tpu_rpa_v3 --mem-fraction-static 0.30 \
-#     --enable-hierarchical-cache --hicache-io-backend pallas_tpu --hicache-ratio 3 \
+#     --enable-hierarchical-cache --hicache-io-backend torch_tpu --hicache-ratio 3 \
 #     --max-total-tokens 16384 --enable-cache-report --port 30033
 #
 #   # then (DEVICE_TOKENS/HOST_RATIO must match the launch flags):

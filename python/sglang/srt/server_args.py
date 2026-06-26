@@ -3478,12 +3478,12 @@ class ServerArgs:
             self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
-        if self.hicache_io_backend == "pallas_tpu":
+        if self.hicache_io_backend == "torch_tpu":
             # The TPU fused host pool only supports the "page_first_fused"
             # layout; force it so users need only pass the io backend.
             if self.hicache_mem_layout != "page_first_fused":
                 logger.warning(
-                    "pallas_tpu io backend requires the page_first_fused layout, "
+                    "torch_tpu io backend requires the page_first_fused layout, "
                     f"switching from {self.hicache_mem_layout} to page_first_fused"
                 )
                 self.hicache_mem_layout = "page_first_fused"
@@ -5896,7 +5896,7 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend", "pallas_tpu"],
+            choices=["direct", "kernel", "kernel_ascend", "torch_tpu"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
         )

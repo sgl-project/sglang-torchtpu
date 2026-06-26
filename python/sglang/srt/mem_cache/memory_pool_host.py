@@ -70,6 +70,10 @@ logger = logging.getLogger(__name__)
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
+# Largest pow2 page-count to pre-compile native scatter/gather XLA programs for
+# (TPU HiCache offload). Buckets above this compile on first use.
+_NATIVE_PREWARM_MAX_BLOCKS: int = 2048
+
 
 def synchronized(func):
     @wraps(func)
@@ -871,7 +875,7 @@ class MHATokenToKVPoolHost(HostKVCache):
 
 
 class TpuFusedMHATokenToKVPoolHost(HostKVCache):
-    """Host (L2) pool for the TPU fused MHA device pool (rpa_v3), layer-wise overlapped.
+    """Host (L2) pool for the TPU fused MHA device pool (rpa_v3).
 
     Stores the device's fused 5D row VERBATIM, page-major (``page_first_fused``)::
 
@@ -879,15 +883,18 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                   kv_packing, padded_head_dim]
 
     so a page's all-layer KV round-trips as a contiguous per-page copy with no
-    de-interleave / un-pad (the gather/scatter kernels are layout-agnostic on
-    dims >= 1).
+    de-interleave / un-pad.
 
-    OVERLAP MODEL: ``load_to_device_layerwise`` runs on the controller's
-    producer thread (pallas_tpu path), doing the H2D copy + Pallas scatter so
-    the copies overlap the prior batch's forward; CompiledForwardShim gates the
-    whole forward on the round before launch. ``device_stage_list`` holds one
-    per-layer device staging buffer (reload), ``host_stage`` the D2H backup
-    buffer; both sized upfront by ``_hicache_tpu_staging_reserve_bytes``.
+    DATA PLANE: plain torch indexing -- no Pallas kernels and no pre-allocated
+    staging buffer. Reload (``load_to_device_all``) runs on the
+    controller's producer thread: one bulk CPU gather of all layers, one H2D,
+    then a native in-place ``index_put`` scatter into each live per-layer device
+    buffer (the device pool is a per-layer list, so the write is the only
+    per-layer step). One barrier materialises every scatter before the round is
+    signalled (no-stale); CompiledForwardShim gates the whole forward on it. The
+    H2D overlaps the prior batch's forward (needs TPU_PREMAPPED_BUFFER_SIZE).
+    Backup mirrors it: per-layer gather stacked on device, then one D2H + one
+    host scatter. pow2 padding keeps the scatter/gather HLOs shape-bucketed.
     """
 
     device_pool: "TpuFusedMHATokenToKVPool"
@@ -913,30 +920,32 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             device=device,
             allocator_type=allocator_type,
         )
-        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import (
-            prewarm_offload_kernels,
-        )
-        from sglang.srt.hardware_backend.tpu.kv_pool import hicache_tpu_stage_blocks
+        # Native data plane: no Pallas kernels, no pre-allocated staging. Just
+        # pre-compile the scatter/gather XLA programs for the pow2 block buckets
+        # so the first reload/backup of each size doesn't compile mid-serving.
+        self._prewarm_native(device_pool)
 
-        prewarm_offload_kernels(device_pool.kv_buffer, device_pool.device)
+    def _prewarm_native(self, device_pool) -> None:
+        """Pre-compile the native scatter/gather XLA programs for pow2 block
+        counts so the first reload/backup of each bucket doesn't compile
+        mid-serving. Shape-keyed, so layer 0 + the harmless dummy page 0
+        (``loc == 0`` is the padded-token slot) suffice. Doubles as a startup
+        smoke test of the in-place ``index_put`` path.
+        """
+        from torch_tpu._internal.sync import synchronize as _tpu_sync
 
-        # Staging allocated once, sized upfront by the reserve so it doesn't eat
-        # the KV cache. stage_blocks = max pages per reload event.
-        self.stage_blocks = hicache_tpu_stage_blocks()
-        block_shape = tuple(device_pool.kv_buffer[0].shape[1:])
-        layer_stage_shape = (self.stage_blocks,) + block_shape
-        # Per-layer INDEPENDENT tensors, not slices of a shared base: a shared
-        # base chains the per-layer copy_ ops (read-modify-write on the whole
-        # tensor) and serialises the scatters; separate buffers keep each layer's
-        # copy+scatter an isolated XLA subgraph.
-        self.device_stage_list = [
-            torch.zeros(layer_stage_shape, dtype=self.dtype, device=device_pool.device)
-            for _ in range(self.layer_num)
-        ]
-        # host staging = D2H backup target (used by backup_from_device_all_layer).
-        stage_shape = (self.layer_num, self.stage_blocks) + block_shape
-        self.host_stage = torch.empty(stage_shape, dtype=self.dtype, device="cpu")
-        self._stage_overflow_warned = False
+        kv0 = device_pool.kv_buffer[0]
+        block_shape = tuple(kv0.shape[1:])
+        max_blocks = min(kv0.shape[0], _NATIVE_PREWARM_MAX_BLOCKS)
+        p = 1
+        while p <= max_blocks:
+            ids = torch.zeros(p, dtype=torch.long, device=kv0.device)
+            src = torch.zeros((p,) + block_shape, dtype=self.dtype, device=kv0.device)
+            kv0[ids] = src  # scatter (index_put) HLO for this bucket
+            gathered = kv0[ids]  # gather HLO for this bucket
+            _tpu_sync([kv0, gathered], wait=True)
+            del ids, src, gathered
+            p <<= 1
 
     def get_size_per_token(self):
         dp = self.device_pool
@@ -992,218 +1001,123 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             pages = torch.cat([pages, pages[n - 1 : n].expand(p - n)], dim=0)
         return pages, n, p
 
-    def load_to_device_layerwise(
+    def load_to_device_all(
         self,
         device_pool,
         host_indices,
         device_indices,
         io_backend,
-        layer_event,
-        layer_offset: int = 0,
     ):
-        """Reload on the HiCache producer thread: dispatch all layers' H2D copy +
-        Pallas scatter without per-layer syncs, then one barrier, then signal.
+        """Reload evicted KV host->device in ONE bulk pass, on the HiCache
+        producer thread.
 
-        Runs while the prior batch's forward executes, so the host->HBM copies
-        overlap that compute. Each layer uses its own staging buffer + kv_cache[L]
-        so the copies/scatters pipeline; the single barrier over all kv_cache
-        buffers materialises the batch before any layer is signalled (no-stale).
-        Copies only overlap at DMA speed — needs TPU_PREMAPPED_BUFFER_SIZE set
-        (TpuPlatform.init_backend). layer_offset is non-zero for draft layers
-        sharing the same event.
+        One CPU gather of all layers, one H2D, then a native in-place
+        ``index_put`` scatter into each live per-layer device buffer (the device
+        pool is a per-layer list, so the write is the only per-layer step -- no
+        Pallas kernel, no staging). One barrier materialises every scatter
+        before the round is signalled (no-stale); CompiledForwardShim gates the
+        whole forward on it. Runs while the prior batch's forward executes, so
+        the H2D overlaps that compute (needs TPU_PREMAPPED_BUFFER_SIZE set).
+        pow2 padding keeps the scatter HLO shape-bucketed (no per-page-count
+        recompile).
         """
-        if io_backend != "pallas_tpu":
+        if io_backend != "torch_tpu":
             raise ValueError(
-                "TpuFusedMHATokenToKVPoolHost.load_to_device_layerwise only "
-                f"supports io_backend='pallas_tpu', got {io_backend!r}"
+                "TpuFusedMHATokenToKVPoolHost.load_to_device_all only "
+                f"supports io_backend='torch_tpu', got {io_backend!r}"
             )
         from torch_tpu._internal.sync import synchronize as _tpu_sync
 
-        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _scatter_fn
-
-        dst_ids, n, p = self._padded_ids(
-            device_indices
-        )  # one D2H sync, before the loop
+        dst_ids, n, p = self._padded_ids(device_indices)
         if n == 0:
-            # Signal all layers immediately so the forward doesn't deadlock.
-            for i in range(self.layer_num):
-                layer_event.complete(i + layer_offset)
             return
 
+        # host_indices is host-born (move_indices keeps it on CPU); index the
+        # CPU host buffer directly. ``.cpu()`` is a no-op here (no sync).
         host_pages = self._to_page_ids(host_indices).cpu()
 
-        # Benchmark-only A/B toggle (REMOVE before merge): with the flag file
-        # present, use the old per-layer copy->scatter->blocking-sync path so
-        # async vs serial can be compared against one running server.
-        import os as _os
+        # One bulk gather of ALL layers from the host pool + one H2D. The padded
+        # tail repeats the last page so the scatter rewrites it idempotently.
+        host_all = self.kv_buffer[host_pages]  # [n, layer_num, page, ...]
+        if p > n:
+            pad = host_all[-1:].expand((p - n,) + tuple(host_all.shape[1:]))
+            host_all = torch.cat([host_all, pad], dim=0)  # [p, layer_num, ...]
+        # Single async H2D (DMA engine, overlaps the prior forward). host_all /
+        # src_all stay alive until the barrier below (DMA in flight).
+        src_all = host_all.to(device_pool.kv_buffer[0].device, non_blocking=True)
 
-        if _os.path.exists("/cache/kvoffload_serial"):
-            import time as _time
-
-            _t_gather = _t_copy = _t_scatter = 0.0
-            for layer_id in range(self.layer_num):
-                _a = _time.perf_counter()
-                host_g = self.kv_buffer[host_pages, layer_id]
-                if p > n:
-                    pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
-                    host_g = torch.cat([host_g, pad], dim=0)
-                if p <= self.stage_blocks:
-                    dev_src = self.device_stage_list[layer_id][:p]
-                else:
-                    self._warn_stage_overflow(p)
-                    dev_src = torch.empty(
-                        (p,) + tuple(self.device_stage_list[layer_id].shape[1:]),
-                        dtype=self.dtype,
-                        device=device_pool.kv_buffer[layer_id].device,
-                    )
-                _b = _time.perf_counter()
-                dev_src.copy_(host_g)  # blocking H2D (non_blocking=False)
-                _c = _time.perf_counter()
-                fused = device_pool.kv_buffer[layer_id]
-                fused[:] = _scatter_fn(fused, dev_src, dst_ids)
-                _tpu_sync([fused], wait=True)  # per-layer blocking barrier (no overlap)
-                _d = _time.perf_counter()
-                _t_gather += _b - _a
-                _t_copy += _c - _b
-                _t_scatter += _d - _c
-                layer_event.complete(layer_id + layer_offset)
-            logger.info(
-                "[reload-timing serial] n=%d p=%d layers=%d | gather=%.1fms "
-                "copy_H2D=%.1fms scatter+sync=%.1fms total=%.1fms (copy share=%.0f%%)",
-                n,
-                p,
-                self.layer_num,
-                _t_gather * 1e3,
-                _t_copy * 1e3,
-                _t_scatter * 1e3,
-                (_t_gather + _t_copy + _t_scatter) * 1e3,
-                100.0 * _t_copy / max(_t_gather + _t_copy + _t_scatter, 1e-9),
-            )
-            return
-
-        # Phase 1: dispatch all layers' copy + scatter, no per-layer sync. Keep
-        # host buffers alive until the barrier (async H2D in flight); fused_buffers
-        # is what the barrier waits on.
-        host_srcs = []
-        dev_srcs = []  # keep staging buffers alive until the barrier
+        # Native in-place scatter into each live per-layer buffer -- src_all[:, L]
+        # is the source for layer L. No Pallas, no staging.
+        dst_ids = dst_ids.long()
         fused_buffers = []
         for layer_id in range(self.layer_num):
-            # CPU gather for this layer only.
-            host_g = self.kv_buffer[host_pages, layer_id]  # [n, page, ...]
-            if p > n:
-                pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
-                host_g = torch.cat([host_g, pad], dim=0)
-            host_srcs.append(host_g)  # keep alive until the barrier (DMA in flight)
-
-            # Per-layer independent staging (no shared base -> no XLA dep across
-            # layers); oversized transfers fall back to a per-call allocation.
-            if p <= self.stage_blocks:
-                dev_src = self.device_stage_list[layer_id][:p]
-            else:
-                self._warn_stage_overflow(p)
-                dev_src = torch.empty(
-                    (p,) + tuple(self.device_stage_list[layer_id].shape[1:]),
-                    dtype=self.dtype,
-                    device=device_pool.kv_buffer[layer_id].device,
-                )
-            # Truly async H2D: non_blocking=True routes through torch_tpu's
-            # MarkStreamActive path (no future.Await), so the per-layer copies
-            # pipeline on the DMA engine and overlap compute instead of the
-            # producer thread serializing 48 blocking transfers. Safe because
-            # host_g stays alive in host_srcs until the barrier below.
-            dev_src.copy_(host_g, non_blocking=True)  # async H2D (DMA engine)
-            dev_srcs.append(dev_src)
-
             fused = device_pool.kv_buffer[layer_id]
-            fused[:] = _scatter_fn(fused, dev_src, dst_ids)  # async scatter dispatch
+            fused[dst_ids] = src_all[:, layer_id]
             fused_buffers.append(fused)
 
-        # Phase 2: single barrier materialises all scatters before any layer is
-        # signalled (no-stale).
+        # One barrier: every scatter (and the H2D feeding it) lands before the
+        # worker signals this batch's done-event (no-stale).
         _tpu_sync(fused_buffers, wait=True)
-        del host_srcs, dev_srcs  # transfers done; release staging buffers
-
-        # Phase 3: release the forward for every layer.
-        for layer_id in range(self.layer_num):
-            layer_event.complete(layer_id + layer_offset)
+        del host_all, src_all
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        # The pallas_tpu path uses load_to_device_layerwise (threaded, all
+        # The torch_tpu path uses load_to_device_all (threaded, all
         # layers at once). This per-layer entry point is kept to satisfy the
         # abstract base class; it is not called on this backend.
         raise NotImplementedError(
-            "TpuFusedMHATokenToKVPoolHost uses load_to_device_layerwise; "
-            "load_to_device_per_layer is not supported on the pallas_tpu backend."
+            "TpuFusedMHATokenToKVPoolHost uses load_to_device_all; "
+            "load_to_device_per_layer is not supported on the torch_tpu backend."
         )
 
     def backup_gather(self, device_pool, device_indices):
-        """Pallas-gather the evicted pages into independent HBM tensors and force
-        them, so they're read before the next forward donates the KV buffer.
-        Returns the staged outputs for backup_copy_d2h(), or None if nothing to
-        back up.
+        """Gather the evicted pages off-device into ONE ``[p, layer_num, ...]``
+        HBM tensor and force the read, so it completes before the next forward
+        donates the KV buffer. Returns the staged tensor for backup_copy_d2h(),
+        or None if nothing to back up.
         """
         from torch_tpu._internal.sync import synchronize as _tpu_sync
-
-        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import _gather_fn
 
         src_ids, n, p = self._padded_ids(device_indices)
         if n == 0:
             return None
-        gathered = [
-            _gather_fn(device_pool.kv_buffer[layer_id], src_ids)  # HBM->HBM
-            for layer_id in range(self.layer_num)
-        ]
-        _tpu_sync(gathered, wait=True)  # read KV before the next forward donates it
+        src_ids = src_ids.long()
+        # Native gather per layer, stacked into one tensor matching the host
+        # layout. The stack is the donation-safe HBM copy.
+        gathered = torch.stack(
+            [
+                device_pool.kv_buffer[layer_id][src_ids]
+                for layer_id in range(self.layer_num)
+            ],
+            dim=1,
+        )
+        _tpu_sync([gathered], wait=True)  # read KV before the next forward donates it
         return gathered, n, p
 
     def backup_copy_d2h(self, staged, host_indices):
-        """Copy the staged (already-gathered, donation-safe) HBM tensors
-        host-ward and scatter into the host pool. This D2H is the only part that
-        overlaps the running forward.
+        """Copy the staged (donation-safe) HBM tensor host-ward in ONE D2H and
+        scatter it into the host pool. This D2H overlaps the running forward.
         """
-        gathered, n, p = staged
+        gathered, n, p = staged  # [p, layer_num, ...] on device
         host_pages = self._to_page_ids(host_indices).cpu()
-        for layer_id, layer_gathered in enumerate(gathered):
-            if p <= self.stage_blocks:
-                hstage = self.host_stage[layer_id, :p]  # dedicated host buffer
-            else:
-                self._warn_stage_overflow(p)
-                hstage = torch.empty(
-                    (p,) + tuple(layer_gathered.shape[1:]),
-                    dtype=self.dtype,
-                    device="cpu",
-                )
-            hstage.copy_(layer_gathered)  # PCIe D2H into the host staging buffer
-            self.kv_buffer[host_pages, layer_id] = hstage[:n]
+        host_all = gathered[:n].to("cpu")  # single D2H, [n, layer_num, ...]
+        self.kv_buffer[host_pages] = host_all
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         # Synchronous gather+drain (tests / non-overlapped path); the controller
         # calls the two phases directly to run the D2H async.
-        if io_backend != "pallas_tpu":
+        if io_backend != "torch_tpu":
             raise ValueError(
-                "TpuFusedMHATokenToKVPoolHost supports io_backend='pallas_tpu', "
+                "TpuFusedMHATokenToKVPoolHost supports io_backend='torch_tpu', "
                 f"got {io_backend!r}"
             )
         staged = self.backup_gather(device_pool, device_indices)
         if staged is None:
             return
         self.backup_copy_d2h(staged, host_indices)
-
-    def _warn_stage_overflow(self, p: int) -> None:
-        if not self._stage_overflow_warned:
-            logger.warning(
-                "[hicache-tpu] transfer of %d padded blocks exceeds the "
-                "dedicated staging buffer (stage_blocks=%d); falling back to a "
-                "per-call allocation. Raise SGLANG_HICACHE_TPU_STAGE_BLOCKS to "
-                "cover it (costs layer_num * stage_blocks * block HBM).",
-                p,
-                self.stage_blocks,
-            )
-            self._stage_overflow_warned = True
 
     # -- L3 storage hooks (not supported in the 2-tier TPU phase) -------- #
 

@@ -3,7 +3,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 # One TPU server launch + torch.compile warmup.
 register_tpu_ci(est_time=600, suite="tpu-hicache")
 
-"""E2E correctness for the TPU pallas_tpu KV-offload backend.
+"""E2E correctness for the TPU torch_tpu KV-offload backend.
 
 A prefix served via HOST RELOAD must produce byte-identical greedy output to the
 same prefix served from the DEVICE cache. Using one server, the prefix's KV is
@@ -55,7 +55,7 @@ _OFFLOAD_ARGS = [
     str(OFFLOAD_POOL),
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
-    "pallas_tpu",
+    "torch_tpu",
     "--hicache-ratio",
     str(HICACHE_RATIO),
     "--enable-cache-report",
