@@ -71,10 +71,7 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args) -> None:
-        from sglang.srt.hardware_backend.tpu.patches import (
-            _prepare_tpu_env,
-            set_active_attention_backend,
-        )
+        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         _prepare_tpu_env(server_args.tp_size)
 
@@ -83,11 +80,6 @@ class TpuSRTPlatform(SRTPlatform):
 
         if server_args.attention_backend is None:
             server_args.attention_backend = self.get_default_attention_backend()
-
-        # Record for ``_patch_mha_kv_pool_for_rpa_v3``: the pool swap runs at
-        # model_runner module import (well after this point) and needs to
-        # know which TPU Pallas variant the server resolved to.
-        set_active_attention_backend(server_args.attention_backend)
 
         server_args.disable_cuda_graph = True
         server_args.disable_piecewise_cuda_graph = True
@@ -153,9 +145,11 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.hardware_backend.tpu.kv_pool import (
+            TpuFusedMHATokenToKVPool,
+        )
 
-        return MHATokenToKVPool
+        return TpuFusedMHATokenToKVPool
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool

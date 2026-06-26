@@ -2018,6 +2018,8 @@ class ServerArgs:
                 "ascend",
                 "intel_xpu",
                 "aiter",
+                # TPU
+                "pallas_tpu_rpa_v3",
             ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (

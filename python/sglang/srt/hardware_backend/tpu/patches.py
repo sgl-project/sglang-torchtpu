@@ -607,53 +607,31 @@ _mha_kv_pool_patched = False
 
 
 def _patch_mha_kv_pool_for_rpa_v3() -> None:
-    """Swap ``MHATokenToKVPool`` for the fused TPU pool when the active
-    attention backend is ``pallas_tpu_rpa_v3``.
-
-    The RPA v3 kernel reads/writes a single fused 5D KV buffer
-    (``[blocks, page_size, num_kv_heads*2 // packing, packing, head_dim]``)
-    that the stock :class:`MHATokenToKVPool` does not produce. Rather than
-    edit ``model_runner_kv_cache_mixin._init_pools`` (upstream code), we
-    rebind the ``MHATokenToKVPool`` symbol *in that module's namespace* to
-    :class:`TpuFusedMHATokenToKVPool` — the existing ``pool_cls = ...
-    MHATokenToKVPool`` lookup will resolve to the fused variant. This
-    matches the rest of this file's "patch around upstream" convention.
-
-    When the active backend is the flash variant (``pallas_tpu_flash``,
-    PR #5's design), the upstream pool is the correct one and no swap is
-    performed. The flash backend reads K and V via the standard
-    ``get_key_buffer`` / ``get_value_buffer`` accessors against that layout
-    and would silently mis-read the fused buffer if we swapped it in.
-
-    Ordering: depends on ``set_active_attention_backend`` having been
-    called first. ``apply_tpu_patches`` is invoked from
-    ``TpuSRTPlatform.init_backend`` (model_runner.py:237, module-import
-    time), which runs *after* ``apply_server_args_defaults`` has resolved
-    the backend name, so the flag is reliably populated by then.
+    """Rebind ``MHATokenToKVPool`` to ``TpuFusedMHATokenToKVPool`` in every
+    module that constructs an MHA KV pool, so RPA v3's fused 5D KV layout
+    is used end-to-end including the hybrid-SWA sub-pools.
     """
     global _mha_kv_pool_patched
     if _mha_kv_pool_patched:
         return
-
-    if _active_attention_backend != "pallas_tpu_rpa_v3":
-        # No swap needed for flash or torch_native. Leave the patched flag
-        # false so a later re-run (e.g. spawned worker that resolves a
-        # different backend) can still apply the swap if it lands on RPA v3.
-        return
-
     _mha_kv_pool_patched = True
 
+    import sglang.srt.mem_cache.memory_pool as mem_pool_mod
     import sglang.srt.model_executor.model_runner_kv_cache_mixin as mix
     from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-    if mix.MHATokenToKVPool is TpuFusedMHATokenToKVPool:
-        return
-
-    mix.MHATokenToKVPool = TpuFusedMHATokenToKVPool
-    logger.info(
-        "TPU: swapped MHATokenToKVPool -> TpuFusedMHATokenToKVPool for the "
-        "pallas_tpu_rpa_v3 attention backend (fused 5D KV layout)."
-    )
+    if mix.MHATokenToKVPool is not TpuFusedMHATokenToKVPool:
+        mix.MHATokenToKVPool = TpuFusedMHATokenToKVPool
+    # SWAKVPool.__init__ captured ``MHATokenToKVPool`` as a default argument
+    # value at module-import time; rebinding the module attribute alone
+    # would not change the default. Rewrite the tuple in place.
+    init_fn = SWAKVPool.__init__
+    if init_fn.__defaults__ is not None:
+        init_fn.__defaults__ = tuple(
+            TpuFusedMHATokenToKVPool if d is mem_pool_mod.MHATokenToKVPool else d
+            for d in init_fn.__defaults__
+        )
 
 
 def apply_tpu_patches(world_size: int = 1) -> None:

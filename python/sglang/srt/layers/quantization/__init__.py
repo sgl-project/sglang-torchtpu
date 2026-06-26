@@ -53,6 +53,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     is_npu,
+    is_tpu,
     mxfp_supported,
 )
 
@@ -91,7 +92,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cuda() or (_is_mxfp_supported and is_hip()) or is_tpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

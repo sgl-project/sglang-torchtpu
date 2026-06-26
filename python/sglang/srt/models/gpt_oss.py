@@ -85,12 +85,14 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_npu,
     is_sm90_supported,
+    is_tpu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_tpu = is_tpu()
 _is_tinygemm_supported = (
     _is_cuda
     and is_flashinfer_available()
@@ -572,6 +574,8 @@ class GptOssModel(nn.Module):
 
         if _is_npu:
             config.hidden_act = "npu_swiglu_oai"
+        elif _is_tpu:
+            config.hidden_act = "swigluoai"
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -880,8 +884,11 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
+        # Use the model's existing parameter device (handles TPU as well as CUDA).
+        target_device = next(self.parameters()).device
+
         for name, weight in weights:
-            weight = weight.cuda()
+            weight = weight.to(target_device)
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1253,8 +1260,12 @@ def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
 
     original_device = w_blocks.device
 
-    w_blocks = w_blocks.cuda()
-    w_scales = w_scales.cuda()
+    # Stage on the device that's actually available (handles TPU + CPU paths;
+    # ``dequant_mxfp4`` is hardware-agnostic but the original upstream version
+    # assumed CUDA. Keep CUDA when present, fall through otherwise.)
+    if torch.cuda.is_available():
+        w_blocks = w_blocks.cuda()
+        w_scales = w_scales.cuda()
 
     w_bf16 = dequant_mxfp4(w_block=w_blocks, w_scale=w_scales, out_dtype=torch.bfloat16)
     w_bf16 = w_bf16.transpose(-2, -1).contiguous()

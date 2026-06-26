@@ -59,6 +59,8 @@ class PallasForwardMetadata:
     page_indices: torch.Tensor
     # i32[3]  (decode_end, prefill_end, mixed_end) sequence-index ranges
     distribution: torch.Tensor
+    # i32[max_num_seqs * pages_per_seq]  page indices
+    swa_page_indices: Optional[torch.Tensor] = None
 
 
 _PALLAS_RPA_OP = None
@@ -113,6 +115,7 @@ def _build_pallas_kernel_op():
         cu_q_lens: jax.Array,
         cu_kv_lens: jax.Array,
         distribution: jax.Array,
+        attention_sink: Optional[jax.Array] = None,
         sm_scale: float = 1.0,
         sliding_window: Optional[int] = None,
         soft_cap: Optional[float] = None,
@@ -130,7 +133,7 @@ def _build_pallas_kernel_op():
             cu_kv_lens,
             distribution,
             None,  # custom_mask
-            None,  # attention_sink
+            attention_sink,
             causal=1,
             sm_scale=sm_scale,
             sliding_window=sliding_window,
@@ -147,7 +150,7 @@ def _build_pallas_kernel_op():
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(9, 10, 11, 12, 13),
+        static_argnums=(10, 11, 12, 13, 14),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -168,6 +171,7 @@ def _build_pallas_kernel_op():
         cu_q_lens: torch.Tensor,
         cu_kv_lens: torch.Tensor,
         distribution: torch.Tensor,
+        attention_sink: Optional[torch.Tensor] = None,
         sm_scale: float = 1.0,
         sliding_window: Optional[int] = None,
         soft_cap: Optional[float] = None,
@@ -184,6 +188,7 @@ def _build_pallas_kernel_op():
             cu_q_lens,
             cu_kv_lens,
             distribution,
+            attention_sink,
             sm_scale,
             sliding_window,
             soft_cap,
@@ -232,6 +237,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
+
+        # Hybrid-SWA models (e.g. GPT-OSS) keep two KV sub-pools and need a
+        # second page_indices tensor with indices translated into the SWA
+        # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
+        self._is_hybrid_swa = bool(getattr(model_runner, "is_hybrid_swa", False))
+        self._token_to_kv_pool = model_runner.token_to_kv_pool
 
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
@@ -381,12 +392,33 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             zero = torch.zeros((), dtype=torch.int32, device=device)
             distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
 
+        swa_page_indices: Optional[torch.Tensor] = None
+        if self._is_hybrid_swa:
+            # ``page_indices`` are page-level indices into the full pool. To get
+            # the SWA-pool variant, look up the full→swa token mapping at the
+            # first token of each page and divide by page_size again.
+            # ``full_to_swa_index_mapping`` is registered by
+            # ``SWATokenToKVPoolAllocator`` at init time.
+            full_to_swa = self._token_to_kv_pool.full_to_swa_index_mapping
+            assert full_to_swa is not None, (
+                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+                "has not been registered yet — did the allocator finish init?"
+            )
+            full_tokens = page_indices.to(torch.int64) * page_size
+            # full_to_swa may be host-resident (CPU) on TPU; gather on its device
+            # and bring the result back to the metadata's device.
+            swa_tokens = full_to_swa[full_tokens.to(full_to_swa.device)].to(
+                full_tokens.device
+            )
+            swa_page_indices = (swa_tokens // page_size).to(torch.int32)
+
         return PallasForwardMetadata(
             kv_lens=seq_lens,
             cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,
             distribution=distribution,
+            swa_page_indices=swa_page_indices,
         )
 
     def _build_metadata_host(
@@ -436,6 +468,25 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         else:
             distribution = num_active.repeat(3).to(torch.int32)
 
+        # Hybrid-SWA: translate full-pool pages to SWA-pool pages. The host path
+        # gates regardless of SWA (see _host_ok), so this must mirror the device
+        # path (lines ~395-409) or SWA layers would address the full pool.
+        # full_to_swa_index_mapping is host-resident (CPU) on TPU, so do the
+        # lookup here on the CPU page_indices and H2D the result once — keeping
+        # this builder free of on-device gathers.
+        swa_page_indices: Optional[torch.Tensor] = None
+        if self._is_hybrid_swa:
+            full_to_swa = self._token_to_kv_pool.full_to_swa_index_mapping
+            assert full_to_swa is not None, (
+                "Hybrid-SWA model is configured but full_to_swa_index_mapping "
+                "has not been registered yet — did the allocator finish init?"
+            )
+            full_tokens = page_indices.to(torch.int64) * page_size
+            swa_tokens = full_to_swa[full_tokens.to(full_to_swa.device)]
+            swa_page_indices = (
+                (swa_tokens // page_size).to(torch.int32).to(device, non_blocking=True)
+            )
+
         # Single H2D of the host-built metadata; kv_lens already on device.
         return PallasForwardMetadata(
             kv_lens=forward_batch.seq_lens.to(torch.int32),
@@ -443,6 +494,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution.to(device, non_blocking=True),
+            swa_page_indices=swa_page_indices,
         )
 
     # ------------------------------------------------------------------ #
@@ -459,7 +511,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        return self._forward(q, k, v, layer, forward_batch)
+        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def forward_decode(
         self,
@@ -475,7 +527,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # the view below matches the kernel's expected layout. This mirrors
         # TorchNativeAttnBackend.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        return self._forward(q, k, v, layer, forward_batch)
+        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def _forward(
         self,
@@ -484,6 +536,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: ForwardBatch,
+        sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.forward_metadata is not None, (
             "Pallas attention backend was not initialised for this forward pass; "
@@ -502,6 +555,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         sliding_window = getattr(layer, "sliding_window_size", None)
         if sliding_window is not None and sliding_window <= 0:
             sliding_window = None
+
+        # For hybrid-SWA models, SWA layers index into the SWA sub-pool;
+        # full-attention layers (or non-hybrid models) use the full-pool indices.
+        is_swa_layer = sliding_window is not None
+        if is_swa_layer and self.forward_metadata.swa_page_indices is not None:
+            page_indices = self.forward_metadata.swa_page_indices
+        else:
+            page_indices = self.forward_metadata.page_indices
 
         soft_cap = layer.logit_cap if getattr(layer, "logit_cap", 0) else None
 
@@ -526,10 +587,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             v,
             kv_cache,
             self.forward_metadata.kv_lens,
-            self.forward_metadata.page_indices,
+            page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            sinks,
             float(layer.scaling),
             sliding_window,
             soft_cap,

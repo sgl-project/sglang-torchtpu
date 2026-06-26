@@ -5,7 +5,7 @@ This module wraps the JAX/Pallas ``gmm_v2`` grouped-matmul kernel
 single-host fused-MoE op exposed to PyTorch via
 ``torch_tpu._internal.pallas.jax_op``. It mirrors the pattern used by the
 ragged-paged-attention v3 backend in
-``sglang.srt.layers.attention.pallas_backend``: register one custom
+``sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3``: register one custom
 ``torch.library`` op whose implementation is a ``jax.jit``-traced JAX
 function. Per-shape / per-(topk, activation) specialisation happens
 inside the JAX trace cache maintained by ``JaxCallable``; dynamo sees
@@ -127,6 +127,7 @@ def _fuse_act_name(activation_name):
         "silu": "silu",
         "gelu": "gelu",
         "swiglu_oai": "swigluoai",
+        "swigluoai": "swigluoai",
     }
     if activation_name not in mapping:
         raise NotImplementedError(
@@ -136,10 +137,38 @@ def _fuse_act_name(activation_name):
     return mapping[activation_name]
 
 
+def _align_n(rhs, rhs_scale, rhs_bias, align=128):
+    """Zero-pad the gmm_v2 output dim N up to a multiple of ``align`` (the TPU
+    sublane = 128), returning the padded tensors and the original N to slice
+    back.
+
+    gmm_v2 tiles the output N and requires ``tile_n`` to divide ``size_n``
+    (fixed-size BlockSpecs, bounds checks disabled). When ``size_n`` is not a
+    multiple of 128 (GPT-OSS hidden = 2880) NO 128-aligned tile divides it, so
+    the kernel raises ``Block size must divide tiling``.
+    """
+    import jax.numpy as jnp
+
+    n = rhs.shape[2]
+    pad = (-n) % align
+    if pad == 0:
+        return rhs, rhs_scale, rhs_bias, n
+    rhs = jnp.pad(rhs, ((0, 0), (0, 0), (0, pad)))
+    if rhs_scale is not None:
+        # [g, num_blocks, 1, n] — N is the last axis; pad with 1.0 (finite; the
+        # padded weights are 0 so the column contributes 0 regardless).
+        rhs_scale = jnp.pad(
+            rhs_scale, ((0, 0), (0, 0), (0, 0), (0, pad)), constant_values=1.0
+        )
+    if rhs_bias is not None:
+        rhs_bias = jnp.pad(rhs_bias, ((0, 0), (0, 0), (0, pad)))  # [g, 1, n]
+    return rhs, rhs_scale, rhs_bias, n
+
+
 def _fused_moe_jax(
     hidden_states,  # [m, k]
-    w1,  # [g, k, 2 * n_intermediate]
-    w2,  # [g, n_intermediate, k]
+    w1,  # [g, k, 2 * n_intermediate]  bf16, OR [g, k/2, 2*n] uint8 (packed FP4)
+    w2,  # [g, n_intermediate, k]      bf16, OR [g, n/2, k]    uint8 (packed FP4)
     topk_weights,  # [m, topk]
     topk_ids,  # i32[m, topk]
     w1_scale,  # Optional[g, 1, 1, 2 * n_intermediate] f32
@@ -207,12 +236,16 @@ def _fused_moe_jax(
 
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
 
-    # GMM1: gate/up projection. For per-column/per-tensor scales, the gated
-    # activation can be fused in-kernel. Compact block-FP8 scales need different
-    # scale offsets for the gate and up halves, so run an unfused GMM1 and apply
-    # the activation in JAX for correctness.
+    # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
+    # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
+    # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
+    # full materialize of the 2*n tensor to HBM plus a separate activation pass.
+    # Compact block-FP8 scales need different scale offsets for the gate and up
+    # halves, so run an unfused GMM1 and apply the activation in JAX for
+    # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
     gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
+
     gmm1_tile_info = None
     if compact_block_scales:
         gmm1_tile_info = TileSizes(
@@ -228,6 +261,8 @@ def _fused_moe_jax(
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
         preferred_element_type=out_dtype,
+        # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
+        # when fused); compact FP8 pins an unfused tile.
         tile_info=gmm1_tile_info or calculate_tiling,
         fuse_act=gmm1_fuse_act,
     )
@@ -237,7 +272,11 @@ def _fused_moe_jax(
         )
     # gmm1_out: [m*topk, n_intermediate]
 
-    # GMM2: project back to hidden size.
+    # GMM2: project back to hidden size. Align the output N (= hidden) to a
+    # 128-multiple: gmm_v2 needs tile_n | size_n and no 128-aligned tile divides
+    # a non-128 N like 2880 (see _align_n). Sliced back to hidden after the call.
+    # (The contraction K needs no alignment — the kernel masks the partial K-tile.)
+    w2, w2_scale, w2_bias, n_hidden = _align_n(w2, w2_scale, w2_bias)
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -246,7 +285,9 @@ def _fused_moe_jax(
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
         tile_info=_lookup_tile_info(gmm1_out, w2, w2_scale, num_experts),
-    )  # [m*topk, k]
+    )[
+        :, :n_hidden
+    ]  # [m*topk, k]
 
     # Un-permute back to token-major order and reduce across the top-k
     # experts with the routing weights.
@@ -262,7 +303,7 @@ def _fused_moe_jax(
 def _build_fused_moe_op():
     """Lazily register the fused-MoE kernel as a torch custom op.
 
-    Mirrors ``_build_pallas_kernel_op`` in pallas_backend.py — registration
+    Mirrors ``_build_pallas_kernel_op`` in attention_pallas_rpa_v3.py — registration
     is heavy (``inspect.signature`` on a JAX function + JAX export) and
     cannot run inside a dynamo trace, so we call this eagerly from the
     TPU pre-warm hook and just look the op up from the model code path.

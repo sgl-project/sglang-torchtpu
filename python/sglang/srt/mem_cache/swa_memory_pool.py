@@ -165,6 +165,21 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_fused_kv_buffer(self, layer_id: int):
+        """TPU-only proxy: route to the sub-pool's fused 5D buffer.
+
+        ``TpuFusedMHATokenToKVPool`` exposes the Pallas-kernel-shaped
+        ``[num_blocks, page_size, num_kv_heads_x2, kv_packing, head_dim]``
+        buffer via this method; SWA layers need to read from ``swa_kv_pool``
+        and full layers from ``full_kv_pool``. The layer-id remap is the
+        same one ``get_kv_buffer`` uses.
+        """
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
+            return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
+        else:
+            return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
+
     def set_swa_loc(self, loc: torch.Tensor):
         self.swa_loc = loc
 
@@ -173,7 +188,14 @@ class SWAKVPool(BaseSWAKVPool):
 
         # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
         # since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        # On TPU kv_indices is host-resident (host-side req_to_token / alloc_extend
+        # index math, see #29/#107) while full_to_swa_index_mapping lives on the
+        # accelerator. Gather on the mapping's device, then return on kv_indices'
+        # original device so swa_last_loc matches the full last_loc device downstream.
+        mapping = self.full_to_swa_index_mapping
+        return (
+            mapping[kv_indices.to(mapping.device)].to(torch.int32).to(kv_indices.device)
+        )
 
     def set_kv_buffer(
         self,
@@ -255,7 +277,8 @@ class SWAKVPool(BaseSWAKVPool):
 
         swa_mask = None
         if self.full_to_swa_index_mapping is not None:
-            swa_indices = self.full_to_swa_index_mapping[indices]
+            mapping = self.full_to_swa_index_mapping
+            swa_indices = mapping[indices.to(mapping.device)]
             # Slot 0 is reserved as a dummy slot. Tail-only SWA allocations leave
             # the out-of-window full KV indices unmapped, so only copy mapped SWA
             # tokens and keep their positions for load_cpu_copy().
@@ -281,7 +304,8 @@ class SWAKVPool(BaseSWAKVPool):
 
         # Load SWA KV cache if it exists
         if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
-            swa_indices = self.full_to_swa_index_mapping[indices]
+            mapping = self.full_to_swa_index_mapping
+            swa_indices = mapping[indices.to(mapping.device)]
             new_swa_mask = swa_indices > 0
             old_swa_mask = kv_cache_cpu.get("swa_mask")
             if old_swa_mask is not None:
@@ -363,14 +387,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
         # is -1, and we need to map it to swa_last_loc -1 as well.
+        # On TPU the index bookkeeping that drives this mapping (last_loc and
+        # free_index) is host-resident (#29), so keep the mapping on CPU too: the
+        # hot translate / free_swa / attention-metadata-host paths then gather
+        # without a device round-trip. Alloc writes carry device indices and align
+        # to mapping.device explicitly. NPU/CUDA keep it on the accelerator.
+        mapping_device = "cpu" if _is_tpu else device
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
                     size + self.page_size,
                     dtype=torch.int64,
-                    device=device,
+                    device=mapping_device,
                 ),
-                torch.tensor([-1], dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=mapping_device),
             ]
         )
 
@@ -435,9 +465,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
+        if _is_npu or _is_tpu:
+            # TODO (Qinghan): int64 is not native on TPU; further optimization needed
+            mapping = self.full_to_swa_index_mapping
+            mapping[alloc_full_indices.to(mapping.device, torch.int64)] = (
+                alloc_swa_indices.to(mapping.device, torch.int64)
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
@@ -485,9 +517,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
+        if _is_npu or _is_tpu:
+            mapping = self.full_to_swa_index_mapping
+            mapping[alloc_full_indices.to(mapping.device, torch.int64)] = (
+                alloc_swa_indices.to(mapping.device, torch.int64)
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
@@ -554,8 +587,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
-            alloc_swa_indices
+        mapping = self.full_to_swa_index_mapping
+        mapping[alloc_full_indices[-swa_tail_len:].to(mapping.device)] = (
+            alloc_swa_indices.to(mapping.device)
         )
         return alloc_full_indices
 
@@ -578,9 +612,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
+        if _is_npu or _is_tpu:
+            mapping = self.full_to_swa_index_mapping
+            mapping[alloc_full_indices.to(mapping.device, torch.int64)] = (
+                alloc_swa_indices.to(mapping.device, torch.int64)
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
@@ -612,12 +647,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if full_indices.numel() == 0:
             return
         assert full_indices.numel() == swa_indices.numel()
-        if _is_npu:
-            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
-                swa_indices.to(torch.int64)
+        mapping = self.full_to_swa_index_mapping
+        if _is_npu or _is_tpu:
+            mapping[full_indices.to(mapping.device, torch.int64)] = swa_indices.to(
+                mapping.device, torch.int64
             )
         else:
-            self.full_to_swa_index_mapping[full_indices] = swa_indices
+            mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]

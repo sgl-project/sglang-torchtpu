@@ -765,8 +765,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            topk_weights=topk_weights.to(x.dtype),
+            topk_ids=topk_ids.to(torch.int32),
             topk=int(topk_ids.shape[-1]),
             activation=moe_runner_config.activation,
         )

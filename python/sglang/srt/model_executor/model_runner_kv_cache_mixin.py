@@ -408,6 +408,26 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+            elif self.is_hybrid_swa:
+                # Hybrid SWA on TPU (e.g. GPT-OSS): two TpuFusedMHATokenToKVPool
+                # sub-pools managed by SWAKVPool. The pallas attention backend
+                # picks the right sub-pool per layer via ``layers_mapping``.
+                PoolCls = current_platform.get_mha_kv_pool_cls()
+                self.token_to_kv_pool = SWAKVPool(
+                    size=self.full_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                    token_to_kv_pool_class=PoolCls,
+                )
             else:
                 PoolCls = current_platform.get_mha_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
@@ -676,18 +696,33 @@ class ModelRunnerKVCacheMixin:
                     need_sort=need_sort,
                 )
             elif current_platform.is_tpu():
-                from sglang.srt.hardware_backend.tpu.allocator_tpu import (
-                    TpuPagedTokenToKVPoolAllocator,
-                )
+                if self.is_hybrid_swa:
+                    # Hybrid SWA on TPU shares the same generic allocator used
+                    # by GPU/NPU SWA paths — the sub-pools are TPU-fused but the
+                    # allocator just bookkeeps token slots and the full↔swa
+                    # mapping (queried by pallas_backend in _build_metadata).
+                    self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        self.full_max_total_num_tokens,
+                        self.swa_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                else:
+                    from sglang.srt.hardware_backend.tpu.allocator_tpu import (
+                        TpuPagedTokenToKVPoolAllocator,
+                    )
 
-                self.token_to_kv_pool_allocator = TpuPagedTokenToKVPoolAllocator(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                    need_sort=need_sort,
-                )
+                    self.token_to_kv_pool_allocator = TpuPagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
             elif _is_npu and (
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
@@ -858,6 +893,27 @@ class ModelRunnerKVCacheMixin:
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+
+            # On TPU the hybrid-SWA two-pool KV cache miscompiles under
+            # torch.compile unless the SWA sub-pool's allocatable page count is
+            # a multiple of the sublane tiling factor (8). The pool size is
+            # derived from leftover HBM (swa = floor(full * swa_full_tokens_ratio)
+            # page-aligned), which lands on arbitrary page counts (e.g.
+            # gpt-oss-20b tp=8 → 819 pages); at a non-8-aligned count the
+            # compiled decode read of the SWA pool returns wrong K/V. Round the
+            # SWA pool down to an 8-page-aligned size (costs at most 7 pages and
+            # keeps the window-ring HBM savings).
+            if self.device == "tpu":
+                align_tokens = self.page_size * 8
+                aligned = (self.swa_max_total_num_tokens // align_tokens) * align_tokens
+                if aligned != self.swa_max_total_num_tokens and aligned > 0:
+                    logger.info(
+                        "[hybrid-SWA] aligning swa_max_total_num_tokens "
+                        f"{self.swa_max_total_num_tokens} -> {aligned} "
+                        "(SWA page count must be a multiple of 8 for correct "
+                        "torch.compile decode on TPU)"
+                    )
+                    self.swa_max_total_num_tokens = aligned
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
