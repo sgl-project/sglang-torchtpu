@@ -7,18 +7,15 @@
 #   MODEL=Qwen/Qwen3-32B TP_SIZE=8 ./launch_server.sh
 #
 # Example — Qwen3 MoE FP8 EP throughput run (tp=8, ep=8):
-#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 TP_SIZE=8 EP_SIZE=8 \
-#   PAGE_SIZE=128 CONTEXT_LEN=2048 CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 EP_SIZE=8 \
+#   CONTEXT_LEN=2048 CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
 #   MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
-#   TORCH_COMPILE_MAX_BS=64 NUM_CONTINUOUS_DECODE_STEPS=8 \
 #   ./launch_server.sh
 #
 # Example — Qwen3-Coder-480B FP8 TP8/EP8, 1k/1k c=64:
 #   MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 TP_SIZE=8 EP_SIZE=8 \
-#   PAGE_SIZE=128 CONTEXT_LEN=2048 \
-#   CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+#   CONTEXT_LEN=2048 CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
 #   MAX_TOTAL_TOKENS=131072 MEM_FRACTION_STATIC=0.05 \
-#   TORCH_COMPILE_MAX_BS=64 NUM_CONTINUOUS_DECODE_STEPS=4 \
 #   ./launch_server.sh
 #
 # Example — a small model on a single chip (tp=1; auto-pins chiplet 0):
@@ -61,7 +58,7 @@
 #   MAX_PREFILL_TOKENS=            # passed through if set
 #   MAX_TOTAL_TOKENS=              # passed through if set
 #   ATTENTION_BACKEND=pallas_tpu_rpa_v3
-#   DISABLE_OVERLAP_SCHEDULE=1
+#   DISABLE_OVERLAP_SCHEDULE=     # 1 passes --disable-overlap-schedule
 #   TPU_COMPILE_TOKENS=            # optional token bucket override
 #   TPU_COMPILE_BS=                # optional bs bucket override
 #   TORCH_COMPILE_MAX_BS=$MAX_RUNNING
@@ -282,7 +279,6 @@ TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
 NUM_CONTINUOUS_DECODE_STEPS=${NUM_CONTINUOUS_DECODE_STEPS:-}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
-DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-1}
 # 1 → pass --disable-radix-cache to sglang. Useful when validating warmup
 # scripts: with radix on, repeated synthetic prompts share a long prefix
 # and sglang short-circuits the prefill, hiding the larger-bucket compiles.
@@ -310,7 +306,7 @@ echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
 echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
-echo "  disable_overlap_schedule = $DISABLE_OVERLAP_SCHEDULE"
+echo "  disable_overlap_schedule = ${DISABLE_OVERLAP_SCHEDULE:-<platform default>}"
 echo "  tpu_decode_process_interval = ${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-<unset>}"
 echo "  compile_cache        = $ENABLE_COMPILE_CACHE  (tier2=${TORCH_TPU_TIER2_NAME}, tier3=${TORCH_TPU_TIER3_ROOT})"
 echo "  materialize_collective_tensors = $TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"
@@ -347,7 +343,7 @@ args=(
 [[ -n "$MAX_PREFILL_TOKENS" ]] && args+=(--max-prefill-tokens "$MAX_PREFILL_TOKENS")
 [[ -n "$MAX_TOTAL_TOKENS" ]] && args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
 [[ "$DISABLE_RADIX_CACHE" == "1" ]] && args+=(--disable-radix-cache)
-[[ "$DISABLE_OVERLAP_SCHEDULE" == "1" ]] && args+=(--disable-overlap-schedule)
+[[ "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]] && args+=(--disable-overlap-schedule)
 # Multinode: pass sglang's rendezvous flags only when fanned across hosts.
 [[ "$ENABLE_MULTIHOST" == "1" ]] && args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
 # KV offloading to host RAM (hierarchical cache); orthogonal to multihost.
