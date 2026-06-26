@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -156,13 +157,33 @@ class ReqToTokenPool:
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
+        # Host-resident req_to_token: keep the page table on CPU so the index
+        # write and attention-metadata build run on host, avoiding the on-device
+        # gather/scatter recompiles. Default on for TPU (TPU_HOST_R2T=0 opts
+        # out); self.device stays the real (tpu) device.
+        self.host_resident = (
+            os.environ.get("TPU_HOST_R2T", "1") == "1" and str(device).startswith("tpu")
+        )
+        r2t_device = "cpu" if self.host_resident else device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=r2t_device,
             )
         self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
+        # Host-resident pool: move device index/value tensors to host scatter.
+        if self.req_to_token.device.type == "cpu":
+            if isinstance(indices, tuple):
+                indices = tuple(
+                    i.cpu() if torch.is_tensor(i) else i for i in indices
+                )
+            elif torch.is_tensor(indices):
+                indices = indices.cpu()
+            if torch.is_tensor(values):
+                values = values.cpu()
         self.req_to_token[indices] = values
 
     def available_size(self):

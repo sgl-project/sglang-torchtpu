@@ -223,6 +223,12 @@ def write_cache_indices(
             prefix_tensors,
         )
     else:
+        # Host-resident pool: the CPU scatter below needs host-side values.
+        if (
+            req_to_token_pool.req_to_token.device.type == "cpu"
+            and out_cache_loc.device.type != "cpu"
+        ):
+            out_cache_loc = out_cache_loc.cpu()
         pt = 0
         for i in range(req_pool_indices_cpu.shape[0]):
             req_idx = req_pool_indices_cpu[i].item()
@@ -280,6 +286,11 @@ def get_last_loc_torch(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
+    # Host-resident pool: index with host tensors (torch.where evaluates the
+    # gather branch even when prefix_lens==0, so a device index would error).
+    if req_to_token.device.type == "cpu":
+        req_pool_indices_tensor = req_pool_indices_tensor.cpu()
+        prefix_lens_tensor = prefix_lens_tensor.cpu()
     return torch.where(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
@@ -554,9 +565,11 @@ def alloc_for_extend(
     if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
-        # Paged allocation - build last_loc
+        # Paged allocation - build last_loc. The empty-prefix sentinel must
+        # match the prefix slices' device so torch.cat stays single-device.
+        _last_loc_dev = batch.req_to_token_pool.req_to_token.device
         last_loc = [
-            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
+            (t[-1:] if len(t) > 0 else torch.tensor([-1], device=_last_loc_dev))
             for t in prefix_tensors
         ]
         out_cache_loc = alloc_paged_token_slots_extend(
@@ -633,9 +646,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
         # Paged allocation
-        last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
-        ]
+        _r2t = batch.req_to_token_pool.req_to_token
+        if _r2t.device.type == "cpu":
+            # Host-resident pool: gather last_loc on host (alloc_decode runs
+            # its formula on host).
+            last_loc = _r2t[batch.req_pool_indices.cpu(), batch.seq_lens_cpu - 1]
+        else:
+            last_loc = _r2t[batch.req_pool_indices, batch.seq_lens - 1]
         seq_lens_next = batch.seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,

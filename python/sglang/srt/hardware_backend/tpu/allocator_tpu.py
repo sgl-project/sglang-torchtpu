@@ -180,20 +180,22 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             per_req_new_page[mask] = new_page_ids[start_new_pages[mask].long()]
             self.free_pages = self.free_pages[num_new_pages:]
 
-        # Two fixed-shape ``(bs,)`` async H2D copies, straight off the CPU
-        # torch tensors (no from_numpy round-trip). bs is bucketed by the
-        # attention backend, so PJRT sees a stable input shape and reuses
-        # its compiled graph for the device formula below regardless of
-        # context length / number of pages consumed so far.
-        per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)
-        need_new_pages_dev = need_new_pages.to(self.device, non_blocking=True)
-
-        # Stable-shape device formula:
         #   need_new_pages[i] == 1  →  out_indices[i] = new_page * page_size
         #   need_new_pages[i] == 0  →  out_indices[i] = last_loc + 1
-        out_indices = (last_loc + 1) * (1 - need_new_pages_dev) + (
-            per_req_new_page_dev * self.page_size * need_new_pages_dev
-        )
+        if last_loc.device.type == "cpu":
+            # Host-resident: last_loc is host, so run the formula on CPU and
+            # H2D once (no per-bucket device compile of the allocator formula).
+            out_indices_cpu = (last_loc + 1) * (1 - need_new_pages) + (
+                per_req_new_page * self.page_size * need_new_pages
+            )
+            out_indices = out_indices_cpu.to(self.device, non_blocking=True)
+        else:
+            # Device formula on fixed-shape (bs,) inputs (bs is bucketed).
+            per_req_new_page_dev = per_req_new_page.to(self.device, non_blocking=True)
+            need_new_pages_dev = need_new_pages.to(self.device, non_blocking=True)
+            out_indices = (last_loc + 1) * (1 - need_new_pages_dev) + (
+                per_req_new_page_dev * self.page_size * need_new_pages_dev
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
