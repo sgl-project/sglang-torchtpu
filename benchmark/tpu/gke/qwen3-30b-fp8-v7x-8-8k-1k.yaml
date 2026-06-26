@@ -1,0 +1,338 @@
+# JobSet: Qwen3-30B-A3B FP8 (MoE, EP=8) on a single v7x 2x2x1 host, 8k-1k bench.
+#
+# GKE-SPECIFIC (Google Kubernetes Engine), not portable vanilla Kubernetes:
+#   - nodeSelector cloud.google.com/gke-tpu-{topology,accelerator} (GKE TPU nodes)
+#   - gke-gcsfuse/volumes annotation + gcsfuse.csi.storage.gke.io CSI driver
+#   - google.com/tpu device resource
+#   - gs:// model/result buckets (GCS) + `gcloud storage cp` (Cloud SDK)
+#   - us-central1-docker.pkg.dev image (Google Artifact Registry)
+# Only the JobSet API and the NFS mounts are cluster-agnostic.
+#
+# This is the direct-`python -m sglang.launch_server` equivalent of:
+#
+#   MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 EP_SIZE=8 \
+#   CONTEXT_LEN=9216 CHUNKED_PREFILL_SIZE=1024 MAX_PREFILL_TOKENS=1024 \
+#   MAX_TOTAL_TOKENS=262144 MEM_FRACTION_STATIC=0.30 \
+#   benchmark/tpu/launch_server.sh
+#
+# Instead of shelling out to launch_server.sh, the server container builds the
+# exact arg list that script would emit (see launch_server.sh:319-361) and sets
+# the env it exports (SGLANG_PLATFORM, the TP=8 LIBTPU_INIT_ARGS tuning string,
+# collective-tensor materialize off, tier2/tier3 compile cache, profiler dir,
+# +recompiles logging). Keep this manifest in sync with that script when its
+# arg/env contract changes.
+#
+# NOTE: the FP8 weights are assumed to live at
+#   gs://junyanxu-benchmark-models/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+# Adjust MODEL / the bench --tokenizer if your bucket layout differs.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: sglang-torchtpu-qwen3-30b-fp8-v7x-8-8k-1k
+spec:
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - benchmark
+  network:
+    enableDNSHostnames: true
+  replicatedJobs:
+  - name: ray-node
+    replicas: 1
+    template:
+      spec:
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+            labels:
+              app: sglang-torchtpu-qwen3-30b-fp8-v7x-8-8k-1k
+          spec:
+            containers:
+            - name: sglang-node
+              image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/junyanxu-vllm-tpu/sglang-torchtpu:latest
+              imagePullPolicy: Always
+              env:
+              - name: RECIPE_NAME
+                value: "sglang-torchtpu-qwen3-30b-fp8-v7x-8-8k-1k"
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              - name: JOBSET_JOB_INDEX
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/job-index']
+              - name: POD_NAMESPACE
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.namespace
+              - name: RAY_ADDRESS
+                value: "127.0.0.1:6379"
+              - name: PJRT_DEVICE
+                value: "TPU"
+              - name: TPU_WORKER_HOSTNAMES
+                value: "$(JS_NAME)-ray-node-0-0.$(JS_NAME).$(POD_NAMESPACE).svc.cluster.local"
+              - name: TPU_NODE_ID
+                value: "$(JOBSET_JOB_INDEX)"
+              - name: TPU_WORKER_ID
+                value: "$(JOBSET_JOB_INDEX)"
+              - name: RAY_DEDUP_LOGS
+                value: "0"
+              # ---- libtpu pin (downloaded over the image default at startup) ----
+              - name: CUSTOM_LIBTPU_GCS_PATH
+                value: "gs://cloud-devkit/libs/libtpu/20260526/libtpu.so"
+              - name: TPU_LIBRARY_PATH
+                value: "/root/cloud-devkit/base/bin/libtpu.so"
+              - name: TPU_VMODULE
+                value: "tpu_pjrt_client=1,pjrt_stream_executor_client=1,tpu_pjrt_compiler_utils=1"
+              - name: TPU_STDERR_LOG_LEVEL
+                value: "0"
+              # ---- explicitly disable megascale (single host) ----
+              - name: MEGASCALE_NUM_SLICES
+                value: ""
+              - name: MEGASCALE_SLICE_ID
+                value: ""
+              - name: MEGASCALE_PORT
+                value: ""
+              - name: MEGASCALE_COORDINATOR_ADDRESS
+                value: ""
+              # ---- sglang server config (consumed by the inline python command) ----
+              - name: MODEL
+                value: "gs://junyanxu-benchmark-models/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+              - name: HOST
+                value: "0.0.0.0"
+              - name: PORT
+                value: "47903"
+              - name: TP_SIZE
+                value: "8"
+              - name: EP_SIZE
+                value: "8"
+              - name: MAX_RUNNING
+                value: "64"
+              - name: PAGE_SIZE
+                value: "128"
+              - name: CONTEXT_LEN
+                value: "9216"
+              - name: CHUNKED_PREFILL_SIZE
+                value: "1024"
+              - name: MAX_PREFILL_TOKENS
+                value: "1024"
+              - name: MAX_TOTAL_TOKENS
+                value: "262144"
+              - name: MEM_FRACTION_STATIC
+                value: "0.30"
+              - name: TORCH_COMPILE_MAX_BS
+                value: "64"
+              - name: ATTENTION_BACKEND
+                value: "pallas_tpu_rpa_v3"
+              # ---- runtime env that launch_server.sh exports (replicated here) ----
+              - name: SGLANG_PLATFORM
+                value: "tpu"
+              - name: SGLANG_TPU_DECODE_PROCESS_INTERVAL
+                value: "8"
+              - name: SGLANG_TPU_OVERLAP_PROFILE
+                value: "1"
+              - name: SGLANG_WARMUP_TIMEOUT
+                value: "3600"
+              - name: TORCH_LOGS
+                value: "+recompiles"
+              - name: TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS
+                value: "false"
+              # torch_tpu compile cache: tier2 in /dev/shm, tier3 on local disk.
+              - name: TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE
+                value: "torchtpu_qwen3_30b_a3b_instruct_2507_fp8"
+              - name: TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT
+                value: "/root/.cache/torch_tpu_compile_cache"
+              - name: TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK
+                value: "1"
+              # XLA/libtpu tuning for TP/EP serving (verbatim from launch_server.sh).
+              # Latency-hiding scheduler + async collective fusion; post-SPMD
+              # collective-matmul and SparseCore-offload disables avoid TP=8
+              # correctness issues. Changing this string invalidates the cache.
+              - name: LIBTPU_INIT_ARGS
+                value: >-
+                  --xla_tpu_scoped_vmem_limit_kib=65536
+                  --xla_tpu_enable_async_collective_fusion=true
+                  --xla_tpu_overlap_compute_collective_tc=true
+                  --xla_tpu_enable_async_collective_fusion_multiple_steps=true
+                  --xla_tpu_enable_latency_hiding_scheduler=true
+                  --xla_latency_hiding_scheduler_rerun=10
+                  --xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative
+                  --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative
+                  --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false
+                  --xla_tpu_enable_sparse_core_collective_offload_all_gather=false
+              - name: HF_HUB_OFFLINE
+                value: "0"
+              - name: TRANSFORMERS_OFFLINE
+                value: "0"
+              - name: GET_HOST_METRICS
+                value: "0"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "JOBSET_JOB_INDEX=$JOBSET_JOB_INDEX"
+
+                  # Pull the pinned libtpu over the image default.
+                  if [ -n "$TPU_LIBRARY_PATH" ]; then
+                    gcloud storage cp -v "$CUSTOM_LIBTPU_GCS_PATH" "$TPU_LIBRARY_PATH"
+                  fi
+
+                  RUN_DIR="/mnt/results/${RECIPE_NAME}/${JS_NAME}"
+                  export SGLANG_TORCH_PROFILER_DIR="${RUN_DIR}/profiler"
+                  mkdir -p "${SGLANG_TORCH_PROFILER_DIR}" "${RUN_DIR}/benchmark" "${RUN_DIR}/xprof"
+                  mkdir -p "$TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT"
+                  mkdir -p "/dev/shm/torch_tpu_cache/$TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE" || true
+
+                  cd /workspace/sglang || cd /sgl-workspace/sglang
+
+                  echo "Starting SGLang serve (direct python -m sglang.launch_server)..."
+                  # Mirrors the arg list benchmark/tpu/launch_server.sh builds for
+                  # the Qwen3 MoE FP8 EP recipe (tp=8, ep=8). TP>1 leaves all
+                  # chiplets visible; the TPU backend lays out one PjRt rank per
+                  # chiplet (4 chips x 2 cores = 8 on v7x).
+                  python3 -u -m sglang.launch_server \
+                    --model-path "$MODEL" \
+                    --dtype bfloat16 \
+                    --device tpu \
+                    --attention-backend "$ATTENTION_BACKEND" \
+                    --tp-size "$TP_SIZE" \
+                    --ep-size "$EP_SIZE" \
+                    --grammar-backend none \
+                    --enable-torch-compile \
+                    --host "$HOST" \
+                    --port "$PORT" \
+                    --max-running-requests "$MAX_RUNNING" \
+                    --page-size "$PAGE_SIZE" \
+                    --chunked-prefill-size "$CHUNKED_PREFILL_SIZE" \
+                    --max-prefill-tokens "$MAX_PREFILL_TOKENS" \
+                    --max-total-tokens "$MAX_TOTAL_TOKENS" \
+                    --context-length "$CONTEXT_LEN" \
+                    --mem-fraction-static "$MEM_FRACTION_STATIC" \
+                    --torch-compile-max-bs "$TORCH_COMPILE_MAX_BS" \
+                    --trust-remote-code \
+                    --watchdog-timeout 3600 \
+                    --dist-timeout 3600 \
+                    2>&1 | tee /workspace/tmp/sglang_node_${JOBSET_JOB_INDEX}.log
+              volumeMounts:
+              - name: datasets-volume
+                mountPath: /datasets
+              - name: dshm
+                mountPath: /dev/shm
+              - name: results-volume
+                mountPath: /mnt/results
+              - name: sglang-nfs-code
+                mountPath: /workspace/sglang
+              - name: sglang-nfs-tmp
+                mountPath: /workspace/tmp
+              resources:
+                limits:
+                  memory: 900Gi
+                  cpu: "32"
+                  google.com/tpu: 4
+                requests:
+                  memory: 900Gi
+                  cpu: "32"
+                  google.com/tpu: 4
+            volumes:
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: results-volume
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: junyanxu-benchmark-results
+                  mountOptions: "implicit-dirs"
+            - name: datasets-volume
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: junyanxu-benchmark-datasets
+                  mountOptions: "implicit-dirs"
+            - name: sglang-nfs-code
+              nfs:
+                server: 10.199.241.162
+                path: /vol1/code/sglang-torchtpu
+            - name: sglang-nfs-tmp
+              nfs:
+                server: 10.199.241.162
+                path: /vol1/code/tmp
+            restartPolicy: Never
+            nodeSelector:
+              cloud.google.com/gke-tpu-topology: "2x2x1"
+              cloud.google.com/gke-tpu-accelerator: "tpu7x"
+
+  - name: benchmark
+    replicas: 1
+    template:
+      spec:
+        parallelism: 1
+        completions: 1
+        backoffLimit: 0
+        template:
+          metadata:
+            annotations:
+              gke-gcsfuse/volumes: "true"
+          spec:
+            containers:
+            - name: sidecar-bench
+              image: us-central1-docker.pkg.dev/cloud-tpu-inference-test/junyanxu-vllm-tpu/sglang-torchtpu:latest
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  HEAD_DNS="${JS_NAME}-ray-node-0-0.${JS_NAME}"
+
+                  echo "Waiting for SGLang server up"
+                  until curl -s http://$HEAD_DNS:47903/health > /dev/null; do
+                    sleep 5
+                  done
+
+                  run_bench() {
+                    local name=$1
+                    echo "trace-start-event: name=${name} ts=$(date +'%s.%N') pid=bench tid=bench"
+                    echo "Server is up! Starting benchmark ${name}..."
+                    PYTHONPATH=/workspace/sglang/python python3 /workspace/sglang/python/sglang/bench_serving.py \
+                      --backend=sglang \
+                      --model=gs://junyanxu-benchmark-models/Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+                      --tokenizer=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+                      --host=$HEAD_DNS \
+                      --port=47903 \
+                      --dataset-name=random \
+                      --random-input-len=8192 \
+                      --random-output-len=1024 \
+                      --num-prompts=640 \
+                      --max-concurrency=64 \
+                      --request-rate=inf \
+                      --output-file=/mnt/results/${RECIPE_NAME}/${JS_NAME}/benchmark/results.jsonl
+                    echo "trace-end-event: name=${name} ts=$(date +'%s.%N') pid=bench tid=bench"
+                  }
+
+                  # First pass absorbs warmup/compilation; second is steady-state.
+                  run_bench benchmark
+                  run_bench benchmark_2
+              env:
+              - name: RECIPE_NAME
+                value: "sglang-torchtpu-qwen3-30b-fp8-v7x-8-8k-1k"
+              - name: JS_NAME
+                valueFrom:
+                  fieldRef:
+                    fieldPath: metadata.labels['jobset.sigs.k8s.io/jobset-name']
+              volumeMounts:
+              - name: results-volume
+                mountPath: /mnt/results
+              - name: sglang-nfs-code
+                mountPath: /workspace/sglang
+            volumes:
+            - name: results-volume
+              csi:
+                driver: gcsfuse.csi.storage.gke.io
+                volumeAttributes:
+                  bucketName: junyanxu-benchmark-results
+                  mountOptions: "implicit-dirs"
+            - name: sglang-nfs-code
+              nfs:
+                server: 10.199.241.162
+                path: /vol1/code/sglang-torchtpu
+            restartPolicy: Never
