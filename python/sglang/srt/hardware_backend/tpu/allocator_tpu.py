@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.utils import get_num_new_pages
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    pass
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):

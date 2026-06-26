@@ -145,15 +145,16 @@ def _write_req_to_token_vectorized(
         ) - torch.repeat_interleave(seg_token_starts, seg_lens, output_size=num_tokens)
         if seg_col_starts is not None:
             col_per_token = (
-                torch.repeat_interleave(seg_col_starts, seg_lens, output_size=num_tokens)
+                torch.repeat_interleave(
+                    seg_col_starts, seg_lens, output_size=num_tokens
+                )
                 + col_within_seg
             )
         else:
             col_per_token = col_within_seg
-        flat_indices = (
-            row_per_token.to(index_dtype) * max_context_len
-            + col_per_token.to(index_dtype)
-        )
+        flat_indices = row_per_token.to(
+            index_dtype
+        ) * max_context_len + col_per_token.to(index_dtype)
         flat_table.index_put_((flat_indices,), values.to(flat_table.dtype))
 
     # extend: out_cache_loc -> req_to_token[req_idx, prefix_len:seq_len]

@@ -217,9 +217,7 @@ class FutureMap:
             # idle indices in dp attention do not need store info
             if self.is_empty_slice(future_indices.interval):
                 return
-            self._store(
-                self.token_ids_buf, future_indices, batch_result.next_token_ids
-            )
+            self._store(self.token_ids_buf, future_indices, batch_result.next_token_ids)
         else:
             self.store_to_map_for_new_batch(
                 future_indices, batch_result.next_draft_input

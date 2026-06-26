@@ -161,9 +161,9 @@ class ReqToTokenPool:
         # write and attention-metadata build run on host, avoiding the on-device
         # gather/scatter recompiles. Default on for TPU (TPU_HOST_R2T=0 opts
         # out); self.device stays the real (tpu) device.
-        self.host_resident = (
-            os.environ.get("TPU_HOST_R2T", "1") == "1" and str(device).startswith("tpu")
-        )
+        self.host_resident = os.environ.get("TPU_HOST_R2T", "1") == "1" and str(
+            device
+        ).startswith("tpu")
         r2t_device = "cpu" if self.host_resident else device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
@@ -177,9 +177,7 @@ class ReqToTokenPool:
         # Host-resident pool: move device index/value tensors to host scatter.
         if self.req_to_token.device.type == "cpu":
             if isinstance(indices, tuple):
-                indices = tuple(
-                    i.cpu() if torch.is_tensor(i) else i for i in indices
-                )
+                indices = tuple(i.cpu() if torch.is_tensor(i) else i for i in indices)
             elif torch.is_tensor(indices):
                 indices = indices.cpu()
             if torch.is_tensor(values):
