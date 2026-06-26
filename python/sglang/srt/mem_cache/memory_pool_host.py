@@ -975,15 +975,22 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         return token_indices[:: self.page_size] // self.page_size
 
     def _padded_ids(self, device_indices: torch.Tensor):
-        from sglang.srt.hardware_backend.tpu.kernels.kv_offload import pad_to_pow2
-
-        dev_pages = self._to_page_ids(device_indices).cpu().numpy()
-        n = len(dev_pages)
+        # Page-id prep with NO device->host round-trip. device_indices is
+        # host-born allocator output that was pushed to the device; pulling it
+        # back with .cpu() forced a hard sync (single in-order PJRT queue must
+        # flush behind the running forward) -- the #1 scheduler stall on the
+        # offload path. n/p are shape quantities (no sync); the ids and the
+        # pow2 pad stay on device. Pad by repeating the last id so the padded
+        # scatter/gather rewrite the last real block idempotently (the kernel
+        # processes all p blocks, not just the first n).
+        pages = (device_indices[:: self.page_size] // self.page_size).to(torch.int32)
+        n = pages.shape[0]
         if n == 0:
             return None, 0, 0
-        padded_np, _ = pad_to_pow2(dev_pages.astype(np.int64))
-        ids = torch.from_numpy(padded_np.astype(np.int32)).to(self.device_pool.device)
-        return ids, n, len(padded_np)
+        p = 1 << (n - 1).bit_length()  # next power of two (== n when n is pow2)
+        if p > n:
+            pages = torch.cat([pages, pages[n - 1 : n].expand(p - n)], dim=0)
+        return pages, n, p
 
     def load_to_device_layerwise(
         self,
@@ -1031,7 +1038,11 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         import os as _os
 
         if _os.path.exists("/cache/kvoffload_serial"):
+            import time as _time
+
+            _t_gather = _t_copy = _t_scatter = 0.0
             for layer_id in range(self.layer_num):
+                _a = _time.perf_counter()
                 host_g = self.kv_buffer[host_pages, layer_id]
                 if p > n:
                     pad = host_g[-1:].expand((p - n,) + tuple(host_g.shape[1:]))
@@ -1045,11 +1056,29 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                         dtype=self.dtype,
                         device=device_pool.kv_buffer[layer_id].device,
                     )
-                dev_src.copy_(host_g)
+                _b = _time.perf_counter()
+                dev_src.copy_(host_g)  # blocking H2D (non_blocking=False)
+                _c = _time.perf_counter()
                 fused = device_pool.kv_buffer[layer_id]
                 fused[:] = _scatter_fn(fused, dev_src, dst_ids)
                 _tpu_sync([fused], wait=True)  # per-layer blocking barrier (no overlap)
+                _d = _time.perf_counter()
+                _t_gather += _b - _a
+                _t_copy += _c - _b
+                _t_scatter += _d - _c
                 layer_event.complete(layer_id + layer_offset)
+            logger.info(
+                "[reload-timing serial] n=%d p=%d layers=%d | gather=%.1fms "
+                "copy_H2D=%.1fms scatter+sync=%.1fms total=%.1fms (copy share=%.0f%%)",
+                n,
+                p,
+                self.layer_num,
+                _t_gather * 1e3,
+                _t_copy * 1e3,
+                _t_scatter * 1e3,
+                (_t_gather + _t_copy + _t_scatter) * 1e3,
+                100.0 * _t_copy / max(_t_gather + _t_copy + _t_scatter, 1e-9),
+            )
             return
 
         # Phase 1: dispatch all layers' copy + scatter, no per-layer sync. Keep
@@ -1077,7 +1106,12 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                     dtype=self.dtype,
                     device=device_pool.kv_buffer[layer_id].device,
                 )
-            dev_src.copy_(host_g)  # async H2D dispatch (DMA/transfer engine)
+            # Truly async H2D: non_blocking=True routes through torch_tpu's
+            # MarkStreamActive path (no future.Await), so the per-layer copies
+            # pipeline on the DMA engine and overlap compute instead of the
+            # producer thread serializing 48 blocking transfers. Safe because
+            # host_g stays alive in host_srcs until the barrier below.
+            dev_src.copy_(host_g, non_blocking=True)  # async H2D (DMA engine)
             dev_srcs.append(dev_src)
 
             fused = device_pool.kv_buffer[layer_id]
