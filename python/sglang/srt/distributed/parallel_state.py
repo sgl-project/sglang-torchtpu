@@ -585,11 +585,10 @@ class GroupCoordinator:
             return input_
 
         if _is_tpu:
-            # sglang's registered custom op (inplace_all_reduce) is CUDA-only.
-            # Route to _all_reduce_in_place which falls through to
-            # torch.distributed.all_reduce with the tpu_dist backend (native
-            # StableHLO all-reduce via ProcessGroupTpu).
-            self._all_reduce_in_place(input_)
+            # Raw torch.distributed.all_reduce lowers to
+            # _c10d_functional.all_reduce, which Dynamo cannot trace under
+            # torch.compile at tp>1; the registered custom op is traceable.
+            inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
@@ -763,9 +762,11 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_tpu:
+        if _is_npu:
             self._reduce_scatter_tensor(output, input)
         else:
+            # TPU routes through the custom op: the raw reduce_scatter lowers to
+            # _c10d_functional, untraceable by Dynamo under torch.compile at tp>1.
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
     def reduce_scatter(
@@ -826,9 +827,11 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu or _is_tpu:
+        if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
         else:
+            # TPU routes through the custom op: the raw all_gather lowers to
+            # _c10d_functional, untraceable by Dynamo under torch.compile at tp>1.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
     def cp_all_gather_into_tensor_async(

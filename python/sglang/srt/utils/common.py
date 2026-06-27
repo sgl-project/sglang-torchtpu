@@ -2167,7 +2167,9 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or is_tpu():
+            # TPU and NPU both dispatch under PrivateUse1; register the custom
+            # op there so torch.compile can trace it (CUDA impl is unreachable).
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
