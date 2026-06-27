@@ -56,6 +56,9 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
         self.req_to_token_pool = types.SimpleNamespace(req_to_token=req_to_token)
         self.forward_metadata = None
         self._op = None
+        self._distribution_cache = {}
+        # Non-SWA: skips the hybrid-SWA page remap in _build_metadata(_host).
+        self._is_hybrid_swa = False
 
 
 def _make_forward_batch(
@@ -75,6 +78,7 @@ def _make_forward_batch(
         req_pool_indices=req_pool_indices,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
+        spec_info=None,
     )
 
 
@@ -91,6 +95,14 @@ def _build_req_to_token(
         + torch.arange(num_reqs).unsqueeze(1) * max_context_len
         + torch.arange(max_context_len).unsqueeze(0)
     ).to(torch.int32)
+
+
+def _build_meta(backend, fb) -> PallasForwardMetadata:
+    """Mirror ``init_forward_metadata``."""
+    distribution = backend._get_cached_rpa_distribution(
+        fb.forward_mode.is_decode(), backend._real_batch_size(fb), fb.seq_lens.device
+    )
+    return backend._build_metadata(fb, distribution)
 
 
 class TestPallasRpaV3MetadataDecode(CustomTestCase):
@@ -115,7 +127,7 @@ class TestPallasRpaV3MetadataDecode(CustomTestCase):
         )
 
     def _build(self) -> PallasForwardMetadata:
-        return self.backend._build_metadata(self.fb)
+        return _build_meta(self.backend, self.fb)
 
     def test_returns_pallas_forward_metadata(self):
         meta = self._build()
@@ -204,7 +216,7 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
         )
 
     def _build(self) -> PallasForwardMetadata:
-        return self.backend._build_metadata(self.fb)
+        return _build_meta(self.backend, self.fb)
 
     def test_cu_q_lens_is_cumsum_of_extend_seq_lens(self):
         meta = self._build()
@@ -228,7 +240,7 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
             extend_seq_lens=None,
         )
         with self.assertRaises(AssertionError):
-            self.backend._build_metadata(fb_bad)
+            _build_meta(self.backend, fb_bad)
 
 
 class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
@@ -250,7 +262,7 @@ class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
         )
 
-        meta = backend._build_metadata(fb)
+        meta = _build_meta(backend, fb)
 
         expected_pages_per_seq = max_ctx_raw // page_size  # 4
         self.assertEqual(tuple(meta.page_indices.shape), (bs * expected_pages_per_seq,))
@@ -259,6 +271,24 @@ class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
         stride = expected_pages_per_seq * page_size
         expected_cu_kv = (torch.arange(bs + 1) * stride).to(torch.int32)
         self.assertTrue(torch.equal(meta.cu_kv_lens, expected_cu_kv))
+
+
+class TestRpaDistribution(CustomTestCase):
+    """The cached ``distribution`` values that ``_build_metadata`` depends on:
+    ``[bs]*3`` for decode, ``[0, bs, bs]`` otherwise; int32.
+    """
+
+    def test_get_cached_rpa_distribution_values_and_cache_hit(self):
+        backend = _BackendUnderTest(
+            16, _build_req_to_token(num_reqs=1, max_context_len=16)
+        )
+        device = torch.device("cpu")
+        dec = backend._get_cached_rpa_distribution(True, 3, device)
+        self.assertTrue(torch.equal(dec, torch.tensor([3, 3, 3], dtype=torch.int32)))
+        ext = backend._get_cached_rpa_distribution(False, 3, device)
+        self.assertTrue(torch.equal(ext, torch.tensor([0, 3, 3], dtype=torch.int32)))
+        # Repeat call for the same key is a cache hit -> same tensor object.
+        self.assertIs(backend._get_cached_rpa_distribution(True, 3, device), dec)
 
 
 if __name__ == "__main__":

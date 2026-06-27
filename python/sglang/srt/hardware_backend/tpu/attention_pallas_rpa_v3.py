@@ -264,6 +264,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         )
 
         self.forward_metadata: Optional[PallasForwardMetadata] = None
+        # Cached ``distribution`` tensors on TPU, keyed by
+        # (is_decode, real_batch, device) -- it depends only on those, so a
+        # cached buffer is reused every step (see init_forward_metadata).
+        self._distribution_cache: dict[tuple[bool, int, torch.device], torch.Tensor] = (
+            {}
+        )
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
@@ -275,17 +281,47 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # ------------------------------------------------------------------ #
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        self.forward_metadata = self._build_metadata(forward_batch)
-        # Block until the metadata is committed on device before the compiled
-        # forward reads it; the discarded .tolist() is the device sync. Without
-        # it, with KV-cache donation under transfer/compute overlap the RPA
-        # decode kernel can read an uncommitted `distribution` as [0, 0, 0],
-        # take the empty get_range -> pl.loop(0, 0), and trip the Mosaic
-        # semaphore-balance assertion -> E0200 TensorCore halt.
-        self.forward_metadata.distribution.tolist()
-        self.forward_metadata.kv_lens.tolist()
+        # Look up the cached RPA ``distribution`` on TPU, so we don't build it,
+        # don't H2D it per step, and don't need the barrier that ensured the RPA
+        # kernel launched only after that H2D finished.
+        device = forward_batch.seq_lens.device
+        real_bs = self._real_batch_size(forward_batch)
+        is_decode = forward_batch.forward_mode.is_decode()
+        distribution = self._get_cached_rpa_distribution(is_decode, real_bs, device)
+        self.forward_metadata = self._build_metadata(forward_batch, distribution)
 
-    def _build_metadata(self, forward_batch: ForwardBatch) -> PallasForwardMetadata:
+    @staticmethod
+    def _real_batch_size(forward_batch: ForwardBatch) -> int:
+        return int(
+            getattr(forward_batch, "_tpu_real_b", forward_batch.seq_lens.shape[0])
+        )
+
+    def _get_cached_rpa_distribution(
+        self, is_decode: bool, real_bs: int, device
+    ) -> torch.Tensor:
+        """Cached RPA ``distribution`` on TPU for (is_decode, real_bs, device)."""
+        device = torch.device(device)
+        key = (is_decode, real_bs, device)
+        cached = self._distribution_cache.get(key)
+        if cached is not None:
+            return cached
+
+        dist = self._make_rpa_distribution_cpu(is_decode, real_bs).to(device)
+        dist.tolist()  # one-time blocking sync: wait until the H2D completes
+        self._distribution_cache[key] = dist
+        return dist
+
+    @staticmethod
+    def _make_rpa_distribution_cpu(is_decode: bool, real_bs: int) -> torch.Tensor:
+        num_active = torch.tensor(real_bs, dtype=torch.int32)
+        if is_decode:
+            return num_active.repeat(3)
+        zero = torch.zeros((), dtype=torch.int32)
+        return torch.stack([zero, num_active, num_active])
+
+    def _build_metadata(
+        self, forward_batch: ForwardBatch, distribution: torch.Tensor
+    ) -> PallasForwardMetadata:
         """Build per-forward-pass metadata for the Pallas kernel.
 
         Layout choice
@@ -323,7 +359,13 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         )
         if _host_ok:
             return self._build_metadata_host(
-                forward_batch, page_size, device, bs, req_to_token, pages_per_seq
+                forward_batch,
+                page_size,
+                device,
+                bs,
+                req_to_token,
+                pages_per_seq,
+                distribution,
             )
 
         # -------------------------------------------------------------- #
@@ -388,17 +430,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         ).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
-        # The TPU compile shim pads batch-shaped metadata up to the selected
-        # compile bucket. Keep the padded tensor shapes, but only mark the real
-        # request rows as active so the RPA kernel does not process ghost rows.
-        real_bs = int(getattr(forward_batch, "_tpu_real_b", bs))
-        num_active = torch.tensor(real_bs, dtype=torch.int32, device=device)
-        if forward_batch.forward_mode.is_decode():
-            distribution = num_active.repeat(3).to(torch.int32)
-        else:
-            zero = torch.zeros((), dtype=torch.int32, device=device)
-            distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
-
         swa_page_indices: Optional[torch.Tensor] = None
         if self._is_hybrid_swa:
             # ``page_indices`` are page-level indices into the full pool. To get
@@ -431,13 +462,20 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         )
 
     def _build_metadata_host(
-        self, forward_batch, page_size, device, bs, req_to_token, pages_per_seq
+        self,
+        forward_batch,
+        page_size,
+        device,
+        bs,
+        req_to_token,
+        pages_per_seq,
+        distribution: torch.Tensor,
     ) -> PallasForwardMetadata:
         """Host-resident metadata build (gated in ``_build_metadata``).
 
-        req_to_token is on CPU, so page_indices / cu-lens / distribution are
-        built with torch-CPU ops (never traced -> no per-shape recompile) and
-        H2D'd once. kv_lens stays on device.
+        req_to_token is on CPU, so page_indices / cu-lens are built with
+        torch-CPU ops (never traced -> no per-shape recompile) and H2D'd once.
+        kv_lens stays on device; ``distribution`` is the caller's cached buffer.
         """
         is_extend = forward_batch.forward_mode.is_extend()
 
@@ -468,15 +506,6 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         page_indices = (per_seq // page_size).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
-        # Mark only the real (unpadded) rows active; padded rows are masked.
-        real_bs = int(getattr(forward_batch, "_tpu_real_b", bs))
-        num_active = torch.tensor(real_bs, dtype=torch.int32)
-        if is_extend:
-            zero = torch.zeros((), dtype=torch.int32)
-            distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
-        else:
-            distribution = num_active.repeat(3).to(torch.int32)
-
         # Hybrid-SWA: translate full-pool pages to SWA-pool pages. The host path
         # gates regardless of SWA (see _host_ok), so this must mirror the device
         # path (lines ~395-409) or SWA layers would address the full pool.
@@ -500,13 +529,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 .to(device, non_blocking=True)
             )
 
-        # Single H2D of the host-built metadata; kv_lens already on device.
+        # H2D for host-built cu-lens / page_indices; kv_lens already on device,
+        # distribution is the caller's cached buffer.
         return PallasForwardMetadata(
             kv_lens=forward_batch.seq_lens.to(torch.int32),
             cu_q_lens=cu_q_lens.to(device, non_blocking=True),
             cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
             page_indices=page_indices.to(device, non_blocking=True),
-            distribution=distribution.to(device, non_blocking=True),
+            distribution=distribution,
             swa_page_indices=swa_page_indices,
         )
 
