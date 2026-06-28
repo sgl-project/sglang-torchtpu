@@ -988,7 +988,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         # host-born allocator output that was pushed to the device; pulling it
         # back with .cpu() forced a hard sync (single in-order PJRT queue must
         # flush behind the running forward)
-        pages = (device_indices[:: self.page_size] // self.page_size).to(torch.int32)
+        pages = device_indices[:: self.page_size] // self.page_size
         num_pages = pages.shape[0]
         if num_pages == 0:
             return None, 0, 0
@@ -1053,7 +1053,6 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         # Native in-place scatter into each live per-layer buffer -- src_all[:, L]
         # is the source for layer L. No Pallas, no staging.
-        dst_ids = dst_ids.long()
         fused_buffers = []
         for layer_id in range(self.layer_num):
             fused = device_pool.kv_buffer[layer_id]
@@ -1085,7 +1084,6 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         src_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
         if num_pages == 0:
             return None
-        src_ids = src_ids.long()
         # Native gather per layer, stacked into one tensor matching the host
         # layout. The stack is the donation-safe HBM copy.
         gathered = torch.stack(
