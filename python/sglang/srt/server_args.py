@@ -3480,14 +3480,12 @@ class ServerArgs:
     def _resolve_layout_io_compatibility(self):
         if self.hicache_io_backend == "torch_tpu":
             # The TPU fused host pool only supports the "page_first_fused"
-            # layout; force it so users need only pass the io backend.
             if self.hicache_mem_layout != "page_first_fused":
-                logger.warning(
-                    "torch_tpu io backend requires the page_first_fused layout, "
-                    f"switching from {self.hicache_mem_layout} to page_first_fused"
+                raise ValueError(
+                    "torch_tpu io backend requires --hicache-mem-layout "
+                    f"page_first_fused, but got {self.hicache_mem_layout!r}. "
+                    "Re-run with --hicache-mem-layout page_first_fused."
                 )
-                self.hicache_mem_layout = "page_first_fused"
-            return
 
         if (
             self.hicache_mem_layout == "page_first_direct"

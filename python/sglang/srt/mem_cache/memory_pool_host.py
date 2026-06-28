@@ -932,20 +932,20 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         (``loc == 0`` is the padded-token slot) suffice. Doubles as a startup
         smoke test of the in-place ``index_put`` path.
         """
-        from torch_tpu._internal.sync import synchronize as _tpu_sync
-
         kv0 = device_pool.kv_buffer[0]
         block_shape = tuple(kv0.shape[1:])
         max_blocks = min(kv0.shape[0], _NATIVE_PREWARM_MAX_BLOCKS)
-        p = 1
-        while p <= max_blocks:
-            ids = torch.zeros(p, dtype=torch.long, device=kv0.device)
-            src = torch.zeros((p,) + block_shape, dtype=self.dtype, device=kv0.device)
+        num_blocks = 1
+        while num_blocks <= max_blocks:
+            ids = torch.zeros(num_blocks, dtype=torch.long, device=kv0.device)
+            src = torch.zeros(
+                (num_blocks,) + block_shape, dtype=self.dtype, device=kv0.device
+            )
             kv0[ids] = src  # scatter (index_put) HLO for this bucket
             gathered = kv0[ids]  # gather HLO for this bucket
-            _tpu_sync([kv0, gathered], wait=True)
+            torch.tpu.synchronize()
             del ids, src, gathered
-            p <<= 1
+            num_blocks <<= 1
 
     def get_size_per_token(self):
         dp = self.device_pool
@@ -987,19 +987,23 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         # Page-id prep with NO device->host round-trip. device_indices is
         # host-born allocator output that was pushed to the device; pulling it
         # back with .cpu() forced a hard sync (single in-order PJRT queue must
-        # flush behind the running forward) -- the #1 scheduler stall on the
-        # offload path. n/p are shape quantities (no sync); the ids and the
-        # pow2 pad stay on device. Pad by repeating the last id so the padded
-        # scatter/gather rewrite the last real block idempotently (the kernel
-        # processes all p blocks, not just the first n).
+        # flush behind the running forward)
         pages = (device_indices[:: self.page_size] // self.page_size).to(torch.int32)
-        n = pages.shape[0]
-        if n == 0:
+        num_pages = pages.shape[0]
+        if num_pages == 0:
             return None, 0, 0
-        p = 1 << (n - 1).bit_length()  # next power of two (== n when n is pow2)
-        if p > n:
-            pages = torch.cat([pages, pages[n - 1 : n].expand(p - n)], dim=0)
-        return pages, n, p
+        num_padded_pages = 1 << (num_pages - 1).bit_length()  # next power of two
+        if num_padded_pages > num_pages:
+            pages = torch.cat(
+                [
+                    pages,
+                    pages[num_pages - 1 : num_pages].expand(
+                        num_padded_pages - num_pages
+                    ),
+                ],
+                dim=0,
+            )
+        return pages, num_pages, num_padded_pages
 
     def load_to_device_all(
         self,
@@ -1026,10 +1030,9 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                 "TpuFusedMHATokenToKVPoolHost.load_to_device_all only "
                 f"supports io_backend='torch_tpu', got {io_backend!r}"
             )
-        from torch_tpu._internal.sync import synchronize as _tpu_sync
 
-        dst_ids, n, p = self._padded_ids(device_indices)
-        if n == 0:
+        dst_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
+        if num_pages == 0:
             return
 
         # host_indices is host-born (move_indices keeps it on CPU); index the
@@ -1038,10 +1041,12 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         # One bulk gather of ALL layers from the host pool + one H2D. The padded
         # tail repeats the last page so the scatter rewrites it idempotently.
-        host_all = self.kv_buffer[host_pages]  # [n, layer_num, page, ...]
-        if p > n:
-            pad = host_all[-1:].expand((p - n,) + tuple(host_all.shape[1:]))
-            host_all = torch.cat([host_all, pad], dim=0)  # [p, layer_num, ...]
+        host_all = self.kv_buffer[host_pages]  # [num_pages, layer_num, page, ...]
+        if num_padded_pages > num_pages:
+            pad = host_all[-1:].expand(
+                (num_padded_pages - num_pages,) + tuple(host_all.shape[1:])
+            )
+            host_all = torch.cat([host_all, pad], dim=0)  # [num_padded_pages, ...]
         # Single async H2D (DMA engine, overlaps the prior forward). host_all /
         # src_all stay alive until the barrier below (DMA in flight).
         src_all = host_all.to(device_pool.kv_buffer[0].device, non_blocking=True)
@@ -1057,7 +1062,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         # One barrier: every scatter (and the H2D feeding it) lands before the
         # worker signals this batch's done-event (no-stale).
-        _tpu_sync(fused_buffers, wait=True)
+        torch.tpu.synchronize()
         del host_all, src_all
 
     def load_to_device_per_layer(
@@ -1072,15 +1077,13 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         )
 
     def backup_gather(self, device_pool, device_indices):
-        """Gather the evicted pages off-device into ONE ``[p, layer_num, ...]``
-        HBM tensor and force the read, so it completes before the next forward
-        donates the KV buffer. Returns the staged tensor for backup_copy_d2h(),
-        or None if nothing to back up.
+        """Gather the evicted pages off-device into ONE
+        ``[num_padded_pages, layer_num, ...]`` HBM tensor and force the read, so
+        it completes before the next forward donates the KV buffer. Returns the
+        staged tensor for backup_copy_d2h(), or None if nothing to back up.
         """
-        from torch_tpu._internal.sync import synchronize as _tpu_sync
-
-        src_ids, n, p = self._padded_ids(device_indices)
-        if n == 0:
+        src_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
+        if num_pages == 0:
             return None
         src_ids = src_ids.long()
         # Native gather per layer, stacked into one tensor matching the host
@@ -1092,16 +1095,17 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             ],
             dim=1,
         )
-        _tpu_sync([gathered], wait=True)  # read KV before the next forward donates it
-        return gathered, n, p
+        # read KV before the next forward donates it
+        torch.tpu.synchronize()
+        return gathered, num_pages, num_padded_pages
 
     def backup_copy_d2h(self, staged, host_indices):
         """Copy the staged (donation-safe) HBM tensor host-ward in ONE D2H and
         scatter it into the host pool. This D2H overlaps the running forward.
         """
-        gathered, n, p = staged  # [p, layer_num, ...] on device
+        gathered, num_pages, num_padded_pages = staged  # [num_padded_pages, ...]
         host_pages = self._to_page_ids(host_indices).cpu()
-        host_all = gathered[:n].to("cpu")  # single D2H, [n, layer_num, ...]
+        host_all = gathered[:num_pages].to("cpu")  # single D2H, [num_pages, ...]
         self.kv_buffer[host_pages] = host_all
 
     def backup_from_device_all_layer(

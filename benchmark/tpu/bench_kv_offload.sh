@@ -18,7 +18,8 @@
 #   python -m sglang.launch_server --model-path Qwen/Qwen3-30B-A3B --device tpu \
 #     --tp-size 8 --ep-size 8 --enable-torch-compile --page-size 128 \
 #     --attention-backend pallas_tpu_rpa_v3 --mem-fraction-static 0.30 \
-#     --enable-hierarchical-cache --hicache-io-backend torch_tpu --hicache-ratio 3 \
+#     --enable-hierarchical-cache --hicache-io-backend torch_tpu \
+#     --hicache-mem-layout page_first_fused --hicache-ratio 3 \
 #     --max-total-tokens 16384 --enable-cache-report --port 30033
 #
 #   # then (DEVICE_TOKENS/HOST_RATIO must match the launch flags):
