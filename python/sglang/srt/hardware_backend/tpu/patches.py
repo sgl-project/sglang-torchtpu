@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import os
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 logger = get_logger(__name__)
@@ -23,17 +24,15 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 _dynamic_compile_unwrapped = False
 
 
-# Default torch_tpu eager execution mode. DEFER_NEVER materializes each op as its
-# own small, shape-stable graph that the compile cache reuses across steps, so
-# per-step recompiles are cheap and overlap execution. DEFER_AND_FUSE instead
-# fuses a *variable-size* batch of pending ops into one graph per materialization;
-_DEFAULT_EAGER_MODE = "DEFER_NEVER"
-
-
 def _configure_eager_mode() -> None:
+    # torch_tpu eager mode (default DEFER_NEVER). DEFER_NEVER materializes each op
+    # as its own small, shape-stable graph that the compile cache reuses across
+    # steps, so per-step recompiles are cheap and overlap execution. DEFER_AND_FUSE
+    # instead fuses a variable-size batch of pending ops into one graph per
+    # materialization.
     from torch_tpu._internal import execution_mode
 
-    mode_name = os.environ.get("TPU_EAGER_MODE", _DEFAULT_EAGER_MODE)
+    mode_name = envs.SGLANG_TPU_EAGER_MODE.get()
     execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_name)
     logger.info("TorchTPU eager mode set to %s.", mode_name)
 

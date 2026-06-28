@@ -12,12 +12,13 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.utils import get_bool_env_var, print_warning_once
+from sglang.srt.utils import print_warning_once
 
 
 def _free_replaced_storage(old: torch.Tensor, new: torch.Tensor) -> None:
@@ -165,16 +166,13 @@ def _to_tpu_fp8_moe_block_scale_layout(
             f"{tuple(scale.shape)} for {out_size=}"
         )
     block_n = out_size // scale.shape[2]
+    compact = envs.SGLANG_TPU_FP8_MOE_COMPACT_SCALES.get()
+    compact_w1 = envs.SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES.get()
+    compact_w2 = envs.SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES.get()
     use_compact_scales = (
-        get_bool_env_var("SGLANG_TPU_FP8_MOE_COMPACT_SCALES")
-        or (
-            get_bool_env_var("SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES")
-            and out_size == 5120
-        )
-        or (
-            get_bool_env_var("SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES")
-            and out_size == 6144
-        )
+        compact
+        or (compact_w1 and out_size == 5120)
+        or (compact_w2 and out_size == 6144)
     )
     if not use_compact_scales:
         return scale.repeat_interleave(block_n, dim=2)[:, :, None, :].contiguous()

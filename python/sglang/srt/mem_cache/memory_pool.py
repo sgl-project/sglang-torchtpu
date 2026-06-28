@@ -27,7 +27,6 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
-import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -159,11 +158,11 @@ class ReqToTokenPool:
         self.device = device
         # Host-resident req_to_token: keep the page table on CPU so the index
         # write and attention-metadata build run on host, avoiding the on-device
-        # gather/scatter recompiles. Default on for TPU (TPU_HOST_R2T=0 opts
-        # out); self.device stays the real (tpu) device.
-        self.host_resident = os.environ.get("TPU_HOST_R2T", "1") == "1" and str(
-            device
-        ).startswith("tpu")
+        # gather/scatter recompiles. Default on for TPU
+        # (SGLANG_TPU_HOST_R2T=0 opts out); self.device stays the real (tpu) device.
+        self.host_resident = (
+            str(device).startswith("tpu") and envs.SGLANG_TPU_HOST_R2T.get()
+        )
         r2t_device = "cpu" if self.host_resident else device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
