@@ -906,13 +906,15 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        assert layout == "page_first_fused", layout
+        assert not pin_memory
         super().__init__(
             device_pool,
             host_to_device_ratio,
             host_size,
             page_size,
-            "page_first_fused",
-            pin_memory=False,
+            layout,
+            pin_memory=pin_memory,
             device=device,
             allocator_type=allocator_type,
         )
@@ -927,11 +929,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         return self.fused_row_elems * self.layer_num * self.dtype.itemsize
 
     def init_kv_buffer(self):
-        if self.layout != "page_first_fused":
-            raise ValueError(
-                "TpuFusedMHATokenToKVPoolHost only supports 'page_first_fused', "
-                f"got {self.layout!r}"
-            )
+        # layout is asserted page_first_fused in __init__, so no re-check here.
         dims = (
             self.page_num,
             self.layer_num,
