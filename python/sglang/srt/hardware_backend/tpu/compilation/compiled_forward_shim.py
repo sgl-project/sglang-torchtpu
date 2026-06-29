@@ -131,14 +131,11 @@ class CompiledForwardShim:
         functools.update_wrapper(self, compiled_fn)
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
-        # HiCache reload no-stale gate: the producer's reload scatters aren't in
-        # the traced graph, so wait until they've landed before launching. The
-        # forward reads all layers at once and the producer signals in order
-        # (last layer last), so one wait on the final layer covers the batch.
+        # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         counter = getattr(pool, "layer_transfer_counter", None)
         if counter is not None:
-            counter.wait_until(pool.layer_num - 1)
+            counter.wait_until()
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as
