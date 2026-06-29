@@ -591,6 +591,17 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         k = k.view(num_tokens, layer.tp_k_head_num, layer.qk_head_dim)
         v = v.view(num_tokens, layer.tp_v_head_num, layer.v_head_dim)
 
+        # Asymmetric K/V head dims (e.g. MiMo / DeepSeek-style qk=192, v=128):
+        # the fused KV buffer stores one shared head_dim, and the Pallas kernel
+        # reads K and V from it at the same width. Pad V up to the qk head_dim
+        # with zeros so it occupies the qk-width slot; the padded value columns
+        # contribute 0 to the attention output, which is sliced back to
+        # v_head_dim after the kernel. ``F.pad`` is a no-op when qk == v.
+        if layer.v_head_dim < layer.qk_head_dim:
+            v = torch.nn.functional.pad(
+                v, (0, layer.qk_head_dim - layer.v_head_dim)
+            )
+
         kv_cache = forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
         op = self._op
@@ -642,6 +653,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             v_scale,
         )
 
+        # The kernel emits output at the (padded) qk head_dim. For asymmetric
+        # K/V the trailing (qk - v) columns come from the zero-padded V slots and
+        # are dropped here so o_proj receives exactly tp_q_head_num * v_head_dim.
+        # When qk == v this view+slice is a no-op reshape.
+        out = out.reshape(num_tokens, layer.tp_q_head_num, -1)[..., : layer.v_head_dim]
         return out.reshape(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
 
     # ------------------------------------------------------------------ #

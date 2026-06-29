@@ -185,6 +185,14 @@ benchmark/tpu/**/hlo_dump/
 tmp*.txt
 /tmp/
 
+# HLO / XLA dumps (--xla_dump_to --xla_dump_hlo_as_text/--xla_dump_hlo_as_proto):
+# dump dirs land as hlo_dump/ or xla_dump_*/ next to cwd; each holds per-module
+# HLO text (module_*.txt) and proto (module_*.pb) files.
+hlo_dump/
+**/xla_dump*/
+module_*.txt
+module_*.pb
+
 # Torch Compile logs
 tl_out/
 

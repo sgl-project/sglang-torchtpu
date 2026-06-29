@@ -117,11 +117,17 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
             if swa_v_head_dim is not None
             else v_head_dim if v_head_dim is not None else head_dim
         )
-        if self.head_dim != self.v_head_dim:
+        # Asymmetric K/V head dims (e.g. MiMo / DeepSeek-style qk=192, v=128):
+        # the fused KV buffer stores a single shared head_dim, so V is padded up
+        # to head_dim before the kernel writes it (see
+        # ``attention_pallas_rpa_v3._forward``) and the attention output is
+        # sliced back to v_head_dim. Only v_head_dim <= head_dim is
+        # representable; a wider V cannot fit the qk-width slot.
+        if self.v_head_dim > self.head_dim:
             raise NotImplementedError(
-                "TpuFusedMHATokenToKVPool requires head_dim == v_head_dim "
-                f"(got {self.head_dim} vs {self.v_head_dim}). Asymmetric K/V "
-                "head dims are not supported by the Pallas kernel."
+                "TpuFusedMHATokenToKVPool supports v_head_dim <= head_dim "
+                f"(got v_head_dim={self.v_head_dim} > head_dim={self.head_dim}); "
+                "the fused KV buffer stores V padded to the qk head_dim."
             )
 
         self.padded_head_dim = (

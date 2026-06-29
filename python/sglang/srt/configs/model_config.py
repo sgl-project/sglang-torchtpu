@@ -230,14 +230,15 @@ class ModelConfig:
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
             elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
-                hasattr(self.hf_config, "vision_config")
-                and hasattr(self.hf_config, "audio_config")
+                getattr(self.hf_config, "vision_config", None) is not None
+                and getattr(self.hf_config, "audio_config", None) is not None
             ):
                 enable_multimodal = False
                 logger.info(
                     "Multimodal is disabled for this MiMoV2 checkpoint: "
-                    "vision_config/audio_config not found in the model config "
-                    "(likely a text-only MiMoV2 variant)."
+                    "vision_config/audio_config not present in the model config "
+                    "(text-only MiMoV2 variant, or nulled via "
+                    "--json-model-override-args)."
                 )
             else:
                 enable_multimodal = True

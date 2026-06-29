@@ -656,10 +656,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        swa_indices = self.full_to_swa_index_mapping[free_index]
+        # TPU stages free indices on CPU while the mapping lives on device:
+        # gather/scatter on the mapping's device, but free() (like
+        # full_attn_allocator.free above) expects the caller's device. `.to` is
+        # a no-op when devices already match (CUDA/CPU unaffected).
+        mapping = self.full_to_swa_index_mapping
+        src_device = free_index.device
+        idx = free_index.to(mapping.device)
+        swa_indices = mapping[idx]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        self.swa_attn_allocator.free(swa_indices.to(src_device))
+        mapping[idx] = 0
 
     def backup_state(self):
         return [

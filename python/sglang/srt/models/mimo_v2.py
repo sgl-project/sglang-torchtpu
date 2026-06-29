@@ -1500,8 +1500,11 @@ class MiMoV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # Guard CUDA-only calls so EAGLE/MTP weight tying works on non-CUDA
+        # backends (e.g. TPU); torch.cuda.synchronize() raises without a driver.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:

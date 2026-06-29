@@ -112,9 +112,32 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
+    is_tpu,
     rank0_log,
     set_weight_attrs,
 )
+
+_is_tpu = is_tpu()
+
+
+def _drain_device_transients_after_module_load() -> None:
+    """Flush any deferred device copy/free work after a module's
+    ``process_weights_after_loading``.
+
+    Some accelerator backends execute device copies and frees lazily, so the
+    transient buffers created during weight post-processing -- e.g. the FP8
+    block->channelwise float32 dequant in ``prepare_tpu_fp8_moe_weights`` and
+    the dense FP8 linear conversion -- otherwise accumulate across modules and
+    can spike device memory to OOM. Synchronizing per module frees each
+    module's transients before the next.
+
+    Only backends with this deferred-execution behavior need it (currently
+    torch_tpu; no-op elsewhere). Mirrors the load-stream drain in #105, which
+    does not cover this post-load loop.
+    """
+    if _is_tpu:
+        current_platform.synchronize()
+
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -746,6 +769,7 @@ class DefaultModelLoader(BaseModelLoader):
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                _drain_device_transients_after_module_load()
 
 
 class LayeredModelLoader(DefaultModelLoader):
@@ -2503,6 +2527,7 @@ def load_model_with_cpu_quantization(
                 # parameters onto device for processing and back off after.
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
+                _drain_device_transients_after_module_load()
 
         model.to(target_device)
 

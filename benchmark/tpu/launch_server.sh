@@ -283,6 +283,9 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
 # scripts: with radix on, repeated synthetic prompts share a long prefix
 # and sglang short-circuits the prefill, hiding the larger-bucket compiles.
 DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
+# 1 (default) → pass --enable-torch-compile. Set 0 to run eager (debugging:
+# isolate compile bugs and allow .item() probes without graph breaks).
+ENABLE_TORCH_COMPILE=${ENABLE_TORCH_COMPILE:-1}
 
 echo "==== launch config ===="
 echo "  model              = $MODEL"
@@ -325,7 +328,6 @@ args=(
     --attention-backend "$ATTENTION_BACKEND"
     --tp-size "$TP_SIZE"
     --grammar-backend none
-    --enable-torch-compile
     --host "$HOST"
     --port "$PORT"
     --max-running-requests "$MAX_RUNNING"
@@ -343,6 +345,8 @@ args=(
 [[ -n "$MAX_PREFILL_TOKENS" ]] && args+=(--max-prefill-tokens "$MAX_PREFILL_TOKENS")
 [[ -n "$MAX_TOTAL_TOKENS" ]] && args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
 [[ "$DISABLE_RADIX_CACHE" == "1" ]] && args+=(--disable-radix-cache)
+[[ "$ENABLE_TORCH_COMPILE" == "1" ]] && args+=(--enable-torch-compile)
+[[ -n "${JSON_MODEL_OVERRIDE:-}" ]] && args+=(--json-model-override-args "$JSON_MODEL_OVERRIDE")
 [[ "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]] && args+=(--disable-overlap-schedule)
 # Multinode: pass sglang's rendezvous flags only when fanned across hosts.
 [[ "$ENABLE_MULTIHOST" == "1" ]] && args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
