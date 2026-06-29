@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import functools
 import inspect
-from typing import Callable
+import time
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +21,9 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
 
 logger = get_logger(__name__)
 
@@ -117,6 +121,50 @@ def _pad_forward_batch_inputs(
     forward_batch.batch_size = pad_b
 
     return real_q, real_b
+
+
+# Largest block (page) bucket to warm for KV offload. Buckets are pow2
+# (1, 2, 4, ...) up to this value, clamped to the device pool's page capacity.
+_KV_OFFLOAD_WARMUP_MAX_BLOCKS: int = 2048
+
+
+def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
+    """Dummy-run the real reload/backup transfer methods across pow2 block
+    buckets to pre-compile their XLA programs.
+    """
+    device_pool = host_pool.device_pool
+    page_size = host_pool.page_size
+    device = device_pool.kv_buffer[0].device
+    max_blocks = min(device_pool.kv_buffer[0].shape[0], _KV_OFFLOAD_WARMUP_MAX_BLOCKS)
+
+    start = time.perf_counter()
+    num_buckets = 0
+    n = 1
+    while n <= max_blocks:
+        num_tokens = n * page_size
+        # Page-aligned indices into page 0. Host indices are host-born (CPU),
+        # device indices live on-device -- matching what move_indices() yields.
+        host_indices = torch.zeros(num_tokens, dtype=torch.long)
+        device_indices = torch.zeros(num_tokens, dtype=torch.long, device=device)
+
+        # Run the ACTUAL transfer methods so the warmed HLOs == the served HLOs.
+        host_pool.load_to_device_all(
+            device_pool, host_indices, device_indices, "torch_tpu"
+        )
+        staged = host_pool.backup_gather(device_pool, device_indices)
+        if staged is not None:
+            host_pool.backup_copy_d2h(staged, host_indices)
+
+        num_buckets += 1
+        n <<= 1
+
+    logger.info(
+        "[kv-offload warmup] pre-compiled reload/backup HLOs for %d pow2 block "
+        "buckets (<= %d blocks) in %.1fs.",
+        num_buckets,
+        max_blocks,
+        time.perf_counter() - start,
+    )
 
 
 class CompiledForwardShim:

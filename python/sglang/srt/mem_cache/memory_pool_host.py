@@ -70,10 +70,6 @@ logger = logging.getLogger(__name__)
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
-# Largest pow2 page-count to pre-compile native scatter/gather XLA programs for
-# (TPU HiCache offload). Buckets above this compile on first use.
-_NATIVE_PREWARM_MAX_BLOCKS: int = 2048
-
 
 def synchronized(func):
     @wraps(func)
@@ -920,32 +916,6 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             device=device,
             allocator_type=allocator_type,
         )
-        # Native data plane: no Pallas kernels, no pre-allocated staging. Just
-        # pre-compile the scatter/gather XLA programs for the pow2 block buckets
-        # so the first reload/backup of each size doesn't compile mid-serving.
-        self._prewarm_native(device_pool)
-
-    def _prewarm_native(self, device_pool) -> None:
-        """Pre-compile the native scatter/gather XLA programs for pow2 block
-        counts so the first reload/backup of each bucket doesn't compile
-        mid-serving. Shape-keyed, so layer 0 + the harmless dummy page 0
-        (``loc == 0`` is the padded-token slot) suffice. Doubles as a startup
-        smoke test of the in-place ``index_put`` path.
-        """
-        kv0 = device_pool.kv_buffer[0]
-        block_shape = tuple(kv0.shape[1:])
-        max_blocks = min(kv0.shape[0], _NATIVE_PREWARM_MAX_BLOCKS)
-        num_blocks = 1
-        while num_blocks <= max_blocks:
-            ids = torch.zeros(num_blocks, dtype=torch.long, device=kv0.device)
-            src = torch.zeros(
-                (num_blocks,) + block_shape, dtype=self.dtype, device=kv0.device
-            )
-            kv0[ids] = src  # scatter (index_put) HLO for this bucket
-            gathered = kv0[ids]  # gather HLO for this bucket
-            torch.tpu.synchronize()
-            del ids, src, gathered
-            num_blocks <<= 1
 
     def get_size_per_token(self):
         dp = self.device_pool

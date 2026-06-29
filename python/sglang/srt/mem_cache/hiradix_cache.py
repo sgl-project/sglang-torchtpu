@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    TpuFusedMHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -84,10 +85,6 @@ class HiRadixCache(RadixCache):
                 )
 
                 if isinstance(self.kv_cache, TpuFusedMHATokenToKVPool):
-                    from sglang.srt.mem_cache.memory_pool_host import (
-                        TpuFusedMHATokenToKVPoolHost,
-                    )
-
                     host_pool_cls = TpuFusedMHATokenToKVPoolHost
             except ImportError:
                 pass
@@ -99,6 +96,13 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+            if host_pool_cls is TpuFusedMHATokenToKVPoolHost:
+                # TPU fused host: pre-compile the native reload/backup XLA
+                from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+                    precompile_kv_offload,
+                )
+
+                precompile_kv_offload(self.token_to_kv_pool_host)
         elif isinstance(self.kv_cache, NSATokenToKVPool):
             # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
