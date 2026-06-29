@@ -107,17 +107,19 @@ class LayerDoneCounter:
 
 
 # ---------------------------------------------------------------------------
-# TPU reload-done counter (Python-threading, no device streams). Whole-round
-# gate -- torch_tpu has no layer-wise overlap.
+# Batch-granular reload-done counter (Python-threading, no device streams).
+# Whole-batch gate. Used on the torch_tpu path (which has no layer-wise
+# overlap), but the mechanism is backend-agnostic -- hence named for what it
+# does (batch gate), not for TPU.
 # ---------------------------------------------------------------------------
 
 
-class TpuDoneCounter:
-    """Drop-in for LayerDoneCounter on torch_tpu.
+class BatchDoneCounter:
+    """Batch-granular counterpart to LayerDoneCounter.
 
-    TPU gates the whole forward at once (no layer-wise overlap), so each ring
-    slot just holds the reload's TpuKvCopyWorker completion event; the forward
-    waits on its batch's slot. Same interface as LayerDoneCounter (the per-batch
+    Gates the whole forward at once (no layer-wise overlap), so each ring slot
+    just holds the reload's TpuKvCopyWorker completion event; the forward waits
+    on its batch's slot. Same interface as LayerDoneCounter (the per-batch
     handle is an int slot index), so the shim / cache_controller are unchanged.
     """
 
@@ -154,26 +156,6 @@ class TpuDoneCounter:
     def reset(self) -> None:
         self.producer_index = -1
         self.consumer_index = -1
-
-
-class _SyncDoneEvent:
-    """Always-complete sentinel for the HiCacheAck protocol on the torch_tpu
-    path: load/backup are lazy ops ordered by data dependency, so completion
-    bookkeeping (writing_check / loading_check) only needs query()->True /
-    synchronize()->no-op — a forward reading the loaded KV runs in between.
-    """
-
-    def query(self) -> bool:
-        return True
-
-    def synchronize(self) -> None:
-        pass
-
-    def record(self, *args, **kwargs) -> None:
-        pass
-
-    def wait(self, *args, **kwargs) -> None:
-        pass
 
 
 class CacheOperation:
@@ -386,7 +368,7 @@ class HiCacheController:
                 TpuKvCopyWorker,
             )
 
-            self.layer_done_counter = TpuDoneCounter()
+            self.layer_done_counter = BatchDoneCounter()
             # One copy worker per direction; they must not share a thread (a
             # slow D2H must not head-of-line block an H2D, and vice versa).
             self._load_worker = TpuKvCopyWorker("kv-offload-h2d")
@@ -928,7 +910,12 @@ class HiCacheController:
                 producer_id, self._load_worker.submit(_producer)
             )
 
-            done = _SyncDoneEvent()
+            from sglang.srt.hardware_backend.tpu.kv_copy_worker import (
+                _ThreadDoneEvent,
+            )
+
+            done = _ThreadDoneEvent()
+            done.set()
             self.ack_load_queue.append(
                 HiCacheAck(start_event=done, finish_event=done, node_ids=op.node_ids)
             )
