@@ -123,9 +123,9 @@ def _pad_forward_batch_inputs(
     return real_q, real_b
 
 
-# Largest block (page) bucket to warm for KV offload. Buckets are pow2
-# (1, 2, 4, ...) up to this value, clamped to the device pool's page capacity.
-_KV_OFFLOAD_WARMUP_MAX_BLOCKS: int = 2048
+# Warming above this many pow2 blocks is correct but means warmup runs a
+# (near-)full-pool transfer, so we surface it rather than silently clamp.
+_KV_OFFLOAD_WARMUP_WARN_BLOCKS: int = 2048
 
 
 def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
@@ -135,7 +135,18 @@ def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
     device_pool = host_pool.device_pool
     page_size = host_pool.page_size
     device = device_pool.kv_buffer[0].device
-    max_blocks = min(device_pool.kv_buffer[0].shape[0], _KV_OFFLOAD_WARMUP_MAX_BLOCKS)
+
+    # Serving pads page counts UP to the next pow2
+    device_blocks = device_pool.kv_buffer[0].shape[0]
+    max_blocks = 1 << (device_blocks - 1).bit_length()  # next pow2 >= capacity
+    if max_blocks > _KV_OFFLOAD_WARMUP_WARN_BLOCKS:
+        logger.warning(
+            "[kv-offload warmup] device pool has %d blocks; warming pow2 "
+            "buckets up to %d (a near-full-pool transfer). Startup will be "
+            "longer, but this avoids a mid-serve JIT recompile.",
+            device_blocks,
+            max_blocks,
+        )
 
     start = time.perf_counter()
     num_buckets = 0
