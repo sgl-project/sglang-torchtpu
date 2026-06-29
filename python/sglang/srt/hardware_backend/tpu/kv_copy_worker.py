@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 from queue import SimpleQueue
-from typing import Callable
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,28 +34,48 @@ class _ThreadDoneEvent:
     The transfer runs on a worker thread and ends with a blocking device sync,
     so ``query`` / ``synchronize`` reflect real on-device completion -- a plain
     always-done sentinel here would let ``writing_check`` unlock a node before
-    its host write landed (corruption). ``record`` / ``wait`` are no-ops:
-    torch_tpu has no device streams, and the ack drain logic only ever calls
-    ``query`` / ``synchronize`` on the finish event.
+    its host write landed (corruption). ``record`` is a no-op (torch_tpu has no
+    device streams).
+
+    Failure surfacing: if the transfer raises (OOM mid-stage, shape mismatch,
+    ...), the device KV is left half-scattered with no rollback -- continuing
+    would feed the forward stale/garbage KV. So the worker records the exception
+    here and ``query`` / ``synchronize`` / ``wait`` re-raise it on the observing
+    (scheduler) thread, which is uncaught and trips the scheduler's top-level
+    SIGQUIT handler -> coordinated process-tree shutdown -> restart with a fresh
+    KV cache. Crash, don't limp: the data plane has no recovery path.
     """
 
     def __init__(self) -> None:
         self._e = threading.Event()
+        self._exc: Optional[BaseException] = None
 
     def set(self) -> None:
         self._e.set()
 
+    def set_exception(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def _raise_if_failed(self) -> None:
+        if self._exc is not None:
+            raise self._exc
+
     def query(self) -> bool:
-        return self._e.is_set()
+        if not self._e.is_set():
+            return False
+        self._raise_if_failed()
+        return True
 
     def synchronize(self) -> None:
         self._e.wait()
+        self._raise_if_failed()
 
     def record(self, *args, **kwargs) -> None:
         pass
 
     def wait(self, *args, **kwargs) -> None:
         self._e.wait()
+        self._raise_if_failed()
 
 
 class TpuKvCopyWorker:
@@ -87,8 +107,9 @@ class TpuKvCopyWorker:
             fn, args, done = item
             try:
                 fn(*args)
-            except Exception:
+            except Exception as e:
                 logger.exception("[kv-offload] copy worker task failed")
+                done.set_exception(e)
             finally:
                 done.set()
 
