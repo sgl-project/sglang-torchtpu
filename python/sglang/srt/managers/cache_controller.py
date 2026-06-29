@@ -144,8 +144,8 @@ class BatchDoneCounter:
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
-    def wait_until(self, threshold: int = -1) -> None:
-        # threshold (layer) ignored: TPU gates the whole round.
+    def wait(self) -> None:
+        # Whole-batch gate: block until this batch's reload has landed.
         if self.consumer_index < 0:
             return
         ev = self.events[self.consumer_index]
@@ -1239,6 +1239,9 @@ class TpuHiCacheController(HiCacheController):
     per-direction TpuKvCopyWorker threads (torch_tpu has no per-layer device
     streams, and gates the whole forward at once). Only __init__ and the
     load/backup dispatch differ; everything else is inherited.
+
+    TODO: speculative decoding is not supported yet on this path. Will support as
+    followup
     """
 
     def __init__(self, *args, **kwargs):
@@ -1255,6 +1258,17 @@ class TpuHiCacheController(HiCacheController):
         # Depth-1 async write-back (see start_writing).
         self._backup_worker = TpuKvCopyWorker("kv-offload-d2h")
         self._backup_inflight = None  # _ThreadDoneEvent | None
+
+    def reset(self):
+        if self._backup_inflight is not None:
+            self._backup_inflight.synchronize()
+            self._backup_inflight = None
+        # FIFO workers: a submitted sentinel completes only after every prior
+        # transfer task, so synchronizing on it drains the queue.
+        self._load_worker.submit(lambda: None).synchronize()
+        self._backup_worker.submit(lambda: None).synchronize()
+        self.layer_done_counter.reset()
+        super().reset()
 
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:

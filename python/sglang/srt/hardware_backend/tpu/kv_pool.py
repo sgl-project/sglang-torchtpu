@@ -238,14 +238,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait()
         view = self._logical_kv_view(layer_id)
         # K heads are the even indices of the interleaved KV axis.
         return view[:, 0 : 2 * self.head_num : 2, : self.head_dim]
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            self.layer_transfer_counter.wait()
         view = self._logical_kv_view(layer_id)
         return view[:, 1 : 2 * self.head_num : 2, : self.head_dim]
 

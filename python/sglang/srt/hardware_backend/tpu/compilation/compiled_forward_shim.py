@@ -195,7 +195,7 @@ class CompiledForwardShim:
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         counter = getattr(pool, "layer_transfer_counter", None)
         if counter is not None:
-            counter.wait_until()
+            counter.wait()
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as
