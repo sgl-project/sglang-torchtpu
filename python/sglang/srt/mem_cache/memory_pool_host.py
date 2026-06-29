@@ -1045,15 +1045,20 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
     def backup_gather(self, device_pool, device_indices):
         """Gather the evicted pages off-device into ONE
-        ``[num_padded_pages, layer_num, ...]`` HBM tensor and force the read, so
-        it completes before the next forward donates the KV buffer. Returns the
-        staged tensor for backup_copy_d2h(), or None if nothing to back up.
+        ``[num_padded_pages, layer_num, ...]`` donation-safe HBM tensor and
+        return it for backup_copy_d2h(), or None if nothing to back up.
+
+        Runs INLINE on the scheduler thread (start_writing), so it must not
+        block: the donation-safety is provided by PJRT queue ordering, not a
+        host sync (see below).
         """
         src_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
         if num_pages == 0:
             return None
         # Native gather per layer, stacked into one tensor matching the host
-        # layout. The stack is the donation-safe HBM copy.
+        # layout. The stack is the donation-safe HBM copy -- a fresh HBM buffer
+        # (advanced-index + stack both copy), decoupled from kv_buffer, so a
+        # later forward overwriting those KV slots can't touch it.
         gathered = torch.stack(
             [
                 device_pool.kv_buffer[layer_id][src_ids]
@@ -1061,8 +1066,6 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
             ],
             dim=1,
         )
-        # read KV before the next forward donates it
-        torch.tpu.synchronize()
         return gathered, num_pages, num_padded_pages
 
     def backup_copy_d2h(self, staged, host_indices):
