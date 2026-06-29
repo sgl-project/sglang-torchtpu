@@ -152,7 +152,7 @@ class HiRadixCache(RadixCache):
                 attn_tp_group=self.attn_tp_group,
             )
         else:
-            self.cache_controller = HiCacheController(
+            self.cache_controller = HiCacheController.create_for_backend(
                 params.token_to_kv_pool_allocator,
                 self.token_to_kv_pool_host,
                 self.page_size,

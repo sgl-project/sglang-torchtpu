@@ -89,7 +89,7 @@ class DecodeKVCacheOffloadManager:
                     f"Invalid hicache storage backend extra config JSON: {e}"
                 )
 
-        self.cache_controller = HiCacheController(
+        self.cache_controller = HiCacheController.create_for_backend(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             mem_pool_host=self.decode_host_mem_pool,
             page_size=self.page_size,
