@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
@@ -138,7 +139,7 @@ def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
 
     # Serving pads page counts UP to the next pow2
     device_blocks = device_pool.kv_buffer[0].shape[0]
-    max_blocks = 1 << (device_blocks - 1).bit_length()  # next pow2 >= capacity
+    max_blocks = next_power_of_2(device_blocks)  # next pow2 >= capacity
     if max_blocks > _KV_OFFLOAD_WARMUP_WARN_BLOCKS:
         logger.warning(
             "[kv-offload warmup] device pool has %d blocks; warming pow2 "
@@ -162,9 +163,9 @@ def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
         host_pool.load_to_device_all(
             device_pool, host_indices, device_indices, "torch_tpu"
         )
-        staged = host_pool.backup_gather(device_pool, device_indices)
-        if staged is not None:
-            host_pool.backup_copy_d2h(staged, host_indices)
+        host_pool.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, "torch_tpu"
+        )
 
         num_buckets += 1
         n <<= 1

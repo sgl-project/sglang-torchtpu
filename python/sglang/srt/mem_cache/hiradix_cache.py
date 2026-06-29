@@ -44,7 +44,6 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     TpuFusedMHATokenToKVPoolHost,
 )
@@ -58,6 +57,7 @@ from sglang.srt.mem_cache.utils import (
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -75,19 +75,10 @@ class HiRadixCache(RadixCache):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
-            # The TPU fused pool subclasses MHATokenToKVPool but stores a fused
-            # 5D layout, so route it to the fused host pool. Guarded import keeps
-            # non-TPU builds unaffected.
-            host_pool_cls = MHATokenToKVPoolHost
-            try:
-                from sglang.srt.hardware_backend.tpu.kv_pool import (
-                    TpuFusedMHATokenToKVPool,
-                )
-
-                if isinstance(self.kv_cache, TpuFusedMHATokenToKVPool):
-                    host_pool_cls = TpuFusedMHATokenToKVPoolHost
-            except ImportError:
-                pass
+            # The host pool must mirror the device pool's layout (e.g. the TPU
+            # fused 5D pool needs the fused host pool); the platform hook returns
+            # the matching host class for the active device pool.
+            host_pool_cls = current_platform.get_mha_kv_pool_host_cls(self.kv_cache)
             self.token_to_kv_pool_host = host_pool_cls(
                 self.kv_cache,
                 server_args.hicache_ratio,

@@ -57,6 +57,12 @@ class SRTPlatform(DeviceMixin):
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
 
+    def get_mha_kv_pool_host_cls(self, device_pool) -> type:
+        """Return the host (L2) MHA KV pool class matching ``device_pool``."""
+        from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+
+        return MHATokenToKVPoolHost
+
     def get_mla_kv_pool_cls(self) -> type:
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError

@@ -38,7 +38,15 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_tpu, is_xpu
+from sglang.srt.utils import (
+    is_cuda,
+    is_hip,
+    is_mps,
+    is_npu,
+    is_tpu,
+    is_xpu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -960,7 +968,7 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
         num_pages = pages.shape[0]
         if num_pages == 0:
             return None, 0, 0
-        num_padded_pages = 1 << (num_pages - 1).bit_length()  # next power of two
+        num_padded_pages = next_power_of_2(num_pages)
         if num_padded_pages > num_pages:
             pages = torch.cat(
                 [
@@ -1021,11 +1029,8 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
 
         # Native in-place scatter into each live per-layer buffer -- src_all[:, L]
         # is the source for layer L. No Pallas, no staging.
-        fused_buffers = []
         for layer_id in range(self.layer_num):
-            fused = device_pool.kv_buffer[layer_id]
-            fused[dst_ids] = src_all[:, layer_id]
-            fused_buffers.append(fused)
+            device_pool.kv_buffer[layer_id][dst_ids] = src_all[:, layer_id]
 
         # One barrier: every scatter (and the H2D feeding it) lands before the
         # worker signals this batch's done-event (no-stale).
