@@ -1323,20 +1323,15 @@ class TpuHiCacheController(HiCacheController):
                 mem_pool_device, host_indices, device_indices, io_backend
             )
 
-        # Worker done-event (set after the reload barrier) = batch ready; stash
-        # it in the slot the shim waits on.
-        self.layer_done_counter.set_event(
-            producer_id, self._load_worker.submit(_producer)
-        )
-
-        # Always-complete sentinel: the real load gate is the counter slot's
-        # worker event + the forward shim, so this ack only needs query()->True
-        # / synchronize()->no-op. A pre-set worker event is exactly that.
-        from sglang.srt.hardware_backend.tpu.kv_copy_worker import _ThreadDoneEvent
-
-        done = _ThreadDoneEvent()
-        done.set()
+        # The worker event is set only after the reload barrier (load_to_device_all
+        # reads the source host pages, runs the H2D, and syncs).
+        worker_done = self._load_worker.submit(_producer)
+        self.layer_done_counter.set_event(producer_id, worker_done)
         self.ack_load_queue.append(
-            HiCacheAck(start_event=done, finish_event=done, node_ids=op.node_ids)
+            HiCacheAck(
+                start_event=worker_done,
+                finish_event=worker_done,
+                node_ids=op.node_ids,
+            )
         )
         return producer_id
