@@ -192,6 +192,7 @@ class CompiledForwardShim:
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
         # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
+        # TODO: rename layer_transfer_counter to transfer_counter or similar after integrating to upstream as it represents different things on tpu and other hardware backends.
         pool = getattr(forward_batch, "token_to_kv_pool", None)
         counter = getattr(pool, "layer_transfer_counter", None)
         if counter is not None:
