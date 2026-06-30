@@ -408,26 +408,6 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-            elif self.is_hybrid_swa:
-                # Hybrid SWA on TPU (e.g. GPT-OSS): two TpuFusedMHATokenToKVPool
-                # sub-pools managed by SWAKVPool. The pallas attention backend
-                # picks the right sub-pool per layer via ``layers_mapping``.
-                PoolCls = current_platform.get_mha_kv_pool_cls()
-                self.token_to_kv_pool = SWAKVPool(
-                    size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                    token_to_kv_pool_class=PoolCls,
-                )
             else:
                 PoolCls = current_platform.get_mha_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
