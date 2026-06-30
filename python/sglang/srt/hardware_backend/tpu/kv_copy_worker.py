@@ -16,6 +16,8 @@ must not be able to head-of-line block an H2D (and vice versa), so each
 direction gets its own ``TpuKvCopyWorker``.
 """
 
+# TODO: might want to use threadpool with futures instead
+
 from __future__ import annotations
 
 import logging
@@ -34,16 +36,9 @@ class _ThreadDoneEvent:
     The transfer runs on a worker thread and ends with a blocking device sync,
     so ``query`` / ``synchronize`` reflect real on-device completion -- a plain
     always-done sentinel here would let ``writing_check`` unlock a node before
-    its host write landed (corruption). ``record`` is a no-op (torch_tpu has no
-    device streams).
-
-    Failure surfacing: if the transfer raises (OOM mid-stage, shape mismatch,
-    ...), the device KV is left half-scattered with no rollback -- continuing
-    would feed the forward stale/garbage KV. So the worker records the exception
-    here and ``query`` / ``synchronize`` / ``wait`` re-raise it on the observing
-    (scheduler) thread, which is uncaught and trips the scheduler's top-level
-    SIGQUIT handler -> coordinated process-tree shutdown -> restart with a fresh
-    KV cache. Crash, don't limp: the data plane has no recovery path.
+    its host write landed (corruption). ``record`` / ``wait`` are no-ops:
+    torch_tpu has no device streams, and the ack drain logic only ever calls
+    ``query`` / ``synchronize`` on the finish event.
     """
 
     def __init__(self) -> None:
