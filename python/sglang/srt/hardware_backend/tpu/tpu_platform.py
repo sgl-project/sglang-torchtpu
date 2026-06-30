@@ -238,7 +238,10 @@ class TpuSRTPlatform(SRTPlatform):
         return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
-        return 0.0
+        if device is None:
+            device = self.get_device(0)
+        free, total = torch.accelerator.get_memory_info(device)
+        return float(total - free)
 
     def get_device(self, local_rank: int) -> torch.device:
         return torch.device("tpu", local_rank)
