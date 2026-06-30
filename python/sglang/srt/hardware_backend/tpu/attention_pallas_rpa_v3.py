@@ -404,13 +404,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
             )
-            full_tokens = page_indices.to(torch.int64) * page_size
+            # First token index of each full-pool page (page_indices * page_size).
+            full_token_starts = page_indices.to(torch.int64) * page_size
             # full_to_swa may be host-resident (CPU) on TPU; gather on its device
             # and bring the result back to the metadata's device.
-            swa_tokens = full_to_swa[full_tokens.to(full_to_swa.device)].to(
-                full_tokens.device
+            swa_token_starts = full_to_swa[full_token_starts.to(full_to_swa.device)].to(
+                full_token_starts.device
             )
-            swa_page_indices = (swa_tokens // page_size).to(torch.int32)
+            swa_page_indices = (swa_token_starts // page_size).to(torch.int32)
 
         return PallasForwardMetadata(
             kv_lens=seq_lens,
@@ -481,10 +482,13 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
             )
-            full_tokens = page_indices.to(torch.int64) * page_size
-            swa_tokens = full_to_swa[full_tokens.to(full_to_swa.device)]
+            # First token index of each full-pool page (page_indices * page_size).
+            full_token_starts = page_indices.to(torch.int64) * page_size
+            swa_token_starts = full_to_swa[full_token_starts.to(full_to_swa.device)]
             swa_page_indices = (
-                (swa_tokens // page_size).to(torch.int32).to(device, non_blocking=True)
+                (swa_token_starts // page_size)
+                .to(torch.int32)
+                .to(device, non_blocking=True)
             )
 
         # Single H2D of the host-built metadata; kv_lens already on device.
