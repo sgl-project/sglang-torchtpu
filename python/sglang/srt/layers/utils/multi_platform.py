@@ -57,7 +57,7 @@ class MultiPlatformOp(nn.Module):
         # The performance of torch.compile on this layer is not always good when bs > 1,
         # so we decide to only use torch.compile when bs=1
         if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
+            if num_tokens == 1 and not _is_tpu:
                 from sglang.srt.layers.moe.fused_moe_native import (
                     fused_moe_forward_native,
                 )

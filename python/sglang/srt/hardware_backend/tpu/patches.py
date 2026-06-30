@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import os
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
 logger = get_logger(__name__)
@@ -24,16 +25,16 @@ _dynamic_compile_unwrapped = False
 
 
 def _configure_eager_mode() -> None:
+    # torch_tpu eager mode (default DEFER_NEVER). DEFER_NEVER materializes each op
+    # as its own small, shape-stable graph that the compile cache reuses across
+    # steps, so per-step recompiles are cheap and overlap execution. DEFER_AND_FUSE
+    # instead fuses a variable-size batch of pending ops into one graph per
+    # materialization.
     from torch_tpu._internal import execution_mode
 
-    # Select DEFER_AND_FUSE (matches torchtpu-vllm). NOTE: set_eager_mode() is a
-    # @contextmanager — calling it bare (without a `with` block) only builds the
-    # context manager and never runs _push_eager_mode, so it was a silent no-op
-    # and the mode stayed at torch_tpu's DEFER_NEVER default (the log line above
-    # notwithstanding). Assign the module's `eager_mode` property instead, whose
-    # setter calls _set_eager_mode(...) and sticks process-wide.
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
-    logger.info("TorchTPU eager mode set to DEFER_AND_FUSE.")
+    mode_name = envs.SGLANG_TPU_EAGER_MODE.get()
+    execution_mode.eager_mode = getattr(execution_mode.EagerMode, mode_name)
+    logger.info("TorchTPU eager mode set to %s.", mode_name)
 
 
 def _register_tpu_compile_backend() -> None:

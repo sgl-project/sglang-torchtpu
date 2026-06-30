@@ -667,6 +667,14 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
+    # TPU
+    SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
+    SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
+    SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
+    SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
+    SGLANG_TPU_HOST_R2T = EnvBool(True)
+    SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")

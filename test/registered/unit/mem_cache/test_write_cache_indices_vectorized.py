@@ -61,9 +61,13 @@ def _reference_write(
 
 class TestWriteReqToTokenVectorized(CustomTestCase):
     def _assert_matches_reference(self, rows, prefix_lens, extend_lens):
-        out_cache_loc, req_pool_indices, prefix_lens_t, extend_lens_t, prefix_tensors = (
-            _build_inputs(rows, prefix_lens, extend_lens)
-        )
+        (
+            out_cache_loc,
+            req_pool_indices,
+            prefix_lens_t,
+            extend_lens_t,
+            prefix_tensors,
+        ) = _build_inputs(rows, prefix_lens, extend_lens)
         n_rows = max(rows) + 1
         vec = torch.full((n_rows, _WIDTH), _FILL, dtype=torch.int32)
         ref = torch.full((n_rows, _WIDTH), _FILL, dtype=torch.int32)
@@ -114,9 +118,7 @@ class TestWriteReqToTokenVectorized(CustomTestCase):
     def test_written_values_and_untouched_cells(self):
         # Spot-check the actual contents: extend slots land at the right columns and
         # untouched cells keep the sentinel.
-        vec = self._assert_matches_reference(
-            rows=[0], prefix_lens=[2], extend_lens=[3]
-        )
+        vec = self._assert_matches_reference(rows=[0], prefix_lens=[2], extend_lens=[3])
         # row 0: cols [0,2) = prefix ids (1,2); cols [2,5) = out_cache_loc (1000..1002)
         self.assertEqual(vec[0, 0].item(), 1)
         self.assertEqual(vec[0, 1].item(), 2)

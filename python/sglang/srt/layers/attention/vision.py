@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
     print_info_once,
 )
@@ -36,7 +37,11 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.attention_pallas import _get_vision_flash_op
 
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
@@ -730,6 +735,55 @@ class VisionAscendAttention(nn.Module):
         return output
 
 
+class VisionTpuAttention(nn.Module):
+    _BLOCK_SIZE = 128
+    supports_segment_ids = True
+
+    def __init__(
+        self,
+        head_dim,
+        num_heads,
+        num_kv_heads,
+        dropout=0.0,
+        flatten_batch=False,
+        softmax_in_single_precision=False,
+        softmax_scale=None,
+        **kwargs,
+    ):
+        super().__init__()
+        if not _is_tpu:
+            raise RuntimeError("VisionTpuAttention requires the TPU platform.")
+        self.head_size = head_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.flatten_batch = flatten_batch
+        self.scale = (
+            softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
+        )
+        self._flash_op = _get_vision_flash_op(float(self.scale))
+
+    def forward(self, q, k, v, bsz, segment_ids=None, **kwargs):
+        if self.flatten_batch:
+            assert bsz == 1
+        assert segment_ids is not None, "VisionTpuAttention requires segment_ids"
+        s = q.shape[0] // bsz
+        q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
+        pad = (-s) % self._BLOCK_SIZE
+        if pad > 0:
+            q = F.pad(q, (0, 0, 0, pad))
+            k = F.pad(k, (0, 0, 0, pad))
+            v = F.pad(v, (0, 0, 0, pad))
+            num_segs = segment_ids.max() + 1
+            pad_ids = num_segs.expand(bsz, pad)
+            segment_ids = torch.cat([segment_ids, pad_ids], dim=1)
+        output = self._flash_op(q, k, v, segment_ids)
+        if pad > 0:
+            output = output[:, :, :s, :]
+        output = output.contiguous()
+        output = rearrange(output, "b h s d -> (b s) h d")
+        return output
+
+
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
@@ -738,6 +792,7 @@ QKV_BACKEND_IMPL = {
     "flashinfer_cudnn": VisionFlashInferAttention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
+    "tpu": VisionTpuAttention,
 }
 
 
@@ -1030,6 +1085,7 @@ class VisionAttention(nn.Module):
         rotary_pos_emb_cos: Optional[torch.Tensor] = None,
         rotary_pos_emb_sin: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
         full_attn: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -1178,6 +1234,7 @@ class VisionAttention(nn.Module):
             seq_len=s,
             cu_seqlens=cu_seqlens,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
             sequence_lengths=sequence_lengths,
             max_seqlen=max_seqlen,
             output_ws=attn_output_ws,

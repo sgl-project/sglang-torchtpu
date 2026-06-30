@@ -291,6 +291,23 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
 
+        # Host-resident fast path: when req_to_token is on CPU, build the
+        # metadata on host (one H2D) instead of the on-device gather/reshape
+        # that recompiles per shape. Only non-spec decode/extend; other modes
+        # use the device path below.
+        _host_ok = (
+            req_to_token.device.type == "cpu"
+            and forward_batch.spec_info is None
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_extend()
+            )
+        )
+        if _host_ok:
+            return self._build_metadata_host(
+                forward_batch, page_size, device, bs, req_to_token, pages_per_seq
+            )
+
         # -------------------------------------------------------------- #
         # Speculative decoding: adjust seq_lens / extend metadata
         # -------------------------------------------------------------- #
@@ -370,6 +387,62 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,
             distribution=distribution,
+        )
+
+    def _build_metadata_host(
+        self, forward_batch, page_size, device, bs, req_to_token, pages_per_seq
+    ) -> PallasForwardMetadata:
+        """Host-resident metadata build (gated in ``_build_metadata``).
+
+        req_to_token is on CPU, so page_indices / cu-lens / distribution are
+        built with torch-CPU ops (never traced -> no per-shape recompile) and
+        H2D'd once. kv_lens stays on device.
+        """
+        is_extend = forward_batch.forward_mode.is_extend()
+
+        # Small per-batch tensors -> host.
+        req_pool_indices = forward_batch.req_pool_indices.to("cpu", torch.int64)
+        if is_extend:
+            assert forward_batch.extend_seq_lens is not None
+            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+        else:
+            extend_seq_lens = torch.ones(bs, dtype=torch.int32)
+
+        cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
+        cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
+        cu_kv_lens = torch.arange(bs + 1, dtype=torch.int32) * (
+            pages_per_seq * page_size
+        )
+
+        # Gather only the strided page-slot columns [bs, pages_per_seq] (one
+        # slot per page), not the full [bs, max_ctx] row. page_cols is constant,
+        # so cache it.
+        page_cols = getattr(self, "_host_page_cols", None)
+        if page_cols is None or page_cols.numel() != pages_per_seq:
+            page_cols = torch.arange(
+                0, pages_per_seq * page_size, page_size, dtype=torch.long
+            )
+            self._host_page_cols = page_cols
+        per_seq = req_to_token[req_pool_indices[:, None], page_cols[None, :]]
+        page_indices = (per_seq // page_size).to(torch.int32)
+        page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
+
+        # Mark only the real (unpadded) rows active; padded rows are masked.
+        real_bs = int(getattr(forward_batch, "_tpu_real_b", bs))
+        num_active = torch.tensor(real_bs, dtype=torch.int32)
+        if is_extend:
+            zero = torch.zeros((), dtype=torch.int32)
+            distribution = torch.stack([zero, num_active, num_active]).to(torch.int32)
+        else:
+            distribution = num_active.repeat(3).to(torch.int32)
+
+        # Single H2D of the host-built metadata; kv_lens already on device.
+        return PallasForwardMetadata(
+            kv_lens=forward_batch.seq_lens.to(torch.int32),
+            cu_q_lens=cu_q_lens.to(device, non_blocking=True),
+            cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
+            page_indices=page_indices.to(device, non_blocking=True),
+            distribution=distribution.to(device, non_blocking=True),
         )
 
     # ------------------------------------------------------------------ #

@@ -156,13 +156,31 @@ class ReqToTokenPool:
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
+        # Host-resident req_to_token: keep the page table on CPU so the index
+        # write and attention-metadata build run on host, avoiding the on-device
+        # gather/scatter recompiles. Default on for TPU
+        # (SGLANG_TPU_HOST_R2T=0 opts out); self.device stays the real (tpu) device.
+        self.host_resident = (
+            str(device).startswith("tpu") and envs.SGLANG_TPU_HOST_R2T.get()
+        )
+        r2t_device = "cpu" if self.host_resident else device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, max_context_len),
+                dtype=torch.int32,
+                device=r2t_device,
             )
         self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
+        # Host-resident pool: move device index/value tensors to host scatter.
+        if self.req_to_token.device.type == "cpu":
+            if isinstance(indices, tuple):
+                indices = tuple(i.cpu() if torch.is_tensor(i) else i for i in indices)
+            elif torch.is_tensor(indices):
+                indices = indices.cpu()
+            if torch.is_tensor(values):
+                values = values.cpu()
         self.req_to_token[indices] = values
 
     def available_size(self):

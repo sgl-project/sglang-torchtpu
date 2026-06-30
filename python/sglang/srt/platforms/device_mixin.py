@@ -27,6 +27,7 @@ Method status annotations:
 
 import enum
 import random
+from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
 import numpy as np
@@ -163,6 +164,16 @@ class DeviceMixin:
     ) -> float:
         """[Active] Get current peak memory usage in bytes."""
         raise NotImplementedError
+
+    @contextmanager
+    def weight_loading_context(self, weights):
+        """[Active] Wrap the weight iterator consumed by ``model.load_weights``.
+
+        Default: pass the stream through unchanged. Platforms may override to
+        stage the load (e.g. TPU flushes torch_tpu's lazy host->device copy
+        graph to bound its materialization peak).
+        """
+        yield weights
 
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded

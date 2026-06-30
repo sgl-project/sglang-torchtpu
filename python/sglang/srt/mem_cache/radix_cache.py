@@ -291,6 +291,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        # Host-resident req_to_token: keep the tree on CPU too (node values are
+        # slices of req_to_token), so match/concat stay host with no copy.
+        if (
+            self.req_to_token_pool is not None
+            and self.req_to_token_pool.req_to_token.device.type == "cpu"
+        ):
+            self.device = torch.device("cpu")
+
         if self.eviction_policy == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
         elif self.eviction_policy == "lfu":

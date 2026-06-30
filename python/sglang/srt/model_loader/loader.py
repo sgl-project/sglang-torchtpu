@@ -731,7 +731,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        # Give the active platform a hook around weight loading
+        # (e.g. flush deferred device copies for torch_tpu). Default is no-op.
+        with current_platform.weight_loading_context(weights) as weights:
+            model.load_weights(weights)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)

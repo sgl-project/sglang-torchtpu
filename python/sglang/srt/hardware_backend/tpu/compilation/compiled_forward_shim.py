@@ -184,11 +184,23 @@ class CompiledForwardShim:
 
     def __init__(self, compiled_fn):
         self.fn = compiled_fn
+        self._recompilation_checker = None
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
+
+    def set_recompilation_checker(self, checker, model_label: str = "") -> None:
+        """Set the recompilation checker for serving-time detection.
+
+        Args:
+            checker: RecompilationChecker instance.
+            model_label: human-readable model identifier for log context
+                (e.g. "LlamaForCausalLM").
+        """
+        self._recompilation_checker = checker
+        self._model_label = model_label
 
     def __call__(self, input_ids, positions, forward_batch, *args, **kwargs):
         # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
@@ -227,6 +239,14 @@ class CompiledForwardShim:
         # Restore real batch_size so downstream consumers (sampler,
         # logprob, scheduler hooks) don't iterate over ghost slots.
         forward_batch.batch_size = real_b
+
+        # Check for serving-time XLA recompilation (once per forward call).
+        # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
+        if self._recompilation_checker is not None:
+            fm = getattr(forward_batch, "forward_mode", "N/A")
+            self._recompilation_checker.check(
+                f"{self._model_label} {fm.name if hasattr(fm, 'name') else fm}"
+            )
 
         return out
 
@@ -325,6 +345,13 @@ class TpuCompiledForwardShim:
             self.b_bucketer.name,
         )
         return self
+
+    def set_recompilation_checker(self, checker, model_label: str = "") -> None:
+        """Propagate the recompilation checker to all installed forward shims."""
+        for attr in self._compiled_fns:
+            shim = getattr(self.model, attr, None)
+            if isinstance(shim, CompiledForwardShim):
+                shim.set_recompilation_checker(checker, model_label=model_label)
 
 
 def build_bucketers(server_args, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:

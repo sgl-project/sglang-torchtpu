@@ -26,6 +26,7 @@ from jax.experimental.pallas.ops.tpu.paged_attention.paged_attention_kernel impo
 )
 
 from sglang.srt.hardware_backend.tpu.kernels.flash_attention import (
+    SegmentIds,
     flash_attention,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -456,3 +457,48 @@ class TpuPallasAttnBackend(AttentionBackend):
 
     def support_triton(self):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder: non-causal flash attention with segment_ids
+# ---------------------------------------------------------------------------
+_VISION_FLASH_OPS: dict[float, object] = {}
+
+
+def _get_vision_flash_op(sm_scale: float):
+    """Return a cached pallas op for non-causal flash attention with segment IDs."""
+    key = float(sm_scale)
+    op = _VISION_FLASH_OPS.get(key)
+    if op is not None:
+        return op
+
+    from torch_tpu._internal import pallas
+
+    def _jax_vision_flash(q, k, v, seg_ids):
+        return flash_attention(
+            q,
+            k,
+            v,
+            segment_ids=SegmentIds(q=seg_ids, kv=seg_ids),
+            causal=False,
+            sm_scale=sm_scale,
+            vmem_limit_bytes=None,
+        )
+
+    _jax_vision_flash.__annotations__ = {
+        "q": jax.Array,
+        "k": jax.Array,
+        "v": jax.Array,
+        "seg_ids": jax.Array,
+        "return": jax.Array,
+    }
+
+    op_name = f"sglang_tpu::vision_flash_s{key!r}".replace(".", "_").replace("-", "m")
+    op = pallas.jax_op(op_name, _jax_vision_flash)
+
+    def _fake_vision_flash(q, k, v, seg_ids):
+        return torch.empty_like(q)
+
+    op.register_fake(_fake_vision_flash)
+    _VISION_FLASH_OPS[key] = op
+    return op

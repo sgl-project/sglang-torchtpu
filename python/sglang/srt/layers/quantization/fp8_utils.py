@@ -46,6 +46,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     offloader,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -59,6 +60,7 @@ _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
+_is_tpu = is_tpu()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -355,6 +357,13 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
+    if _is_tpu:
+        from sglang.srt.hardware_backend.tpu.fp8_linear import (
+            tpu_w8a8_block_fp8_linear,
+        )
+
+        return tpu_w8a8_block_fp8_linear
+
     backend = get_fp8_gemm_runner_backend()
 
     # Handle explicit backend selection via --fp8-gemm-backend
