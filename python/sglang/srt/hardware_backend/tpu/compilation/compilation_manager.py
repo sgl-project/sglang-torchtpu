@@ -67,6 +67,12 @@ class CompilationManager:
 
     def precompile_all(self) -> None:
         """Run precompilation for all valid extend and decode bucket shapes."""
+        if getattr(self.model_runner.server_args, "enable_dp_attention", False):
+            logger.warning(
+                "[compilation manager] dp-attention: skipping static precompile; "
+                "the compiled forward compiles lazily on the first real forward."
+            )
+            return
         overall = time.perf_counter()
         self._precompile_extend()
         self._precompile_decode()
