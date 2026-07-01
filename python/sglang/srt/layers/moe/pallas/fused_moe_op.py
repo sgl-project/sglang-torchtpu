@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from https://github.com/sgl-project/sglang-jax/blob/main/python/sgl_jax/srt/kernels/gmm/megablox_gmm_backend.py
 """Pallas fused-MoE bridge for the TPU torch_tpu platform.
 
 This module wraps the JAX/Pallas ``gmm_v2`` grouped-matmul kernel

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/layers/vllm/quantization/fp8.py
+# Copyright 2025 Google LLC
 """TPU FP8 MoE helpers.
 
 TPU MoE follows the same backend-dispatch shape as upstream SGLang MoE:

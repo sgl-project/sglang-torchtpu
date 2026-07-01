@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """In-process TPU precompilation to warm up the PJRT/HLO compilation cache.
 
 Iterates over shape buckets to compile:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU paged memory allocator.
 
 CPU-resident free-page bookkeeping.
@@ -14,7 +15,9 @@ triggers a ~25 ms TPU recompile per page boundary (~25% of long-decode
 wall time at page_size=32).
 
 This subclass keeps the free/release pools as host-resident **CPU torch
-tensors** (torchtpu-vllm's style). ``alloc_decode`` precomputes the
+tensors** (adapted from the numpy-based CPU-resident allocator in
+``sglang-jax``; ported to torch tensors for the torch_tpu backend).
+``alloc_decode`` precomputes the
 assigned page-IDs on CPU and ships a fixed-shape ``(bs,)`` tensor to the
 device-side formula with a direct ``cpu_tensor.to(device)`` — no
 ``from_numpy`` round-trip. The compiled HLO graph has constant input

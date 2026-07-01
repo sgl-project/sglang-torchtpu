@@ -1,4 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
 """Pallas ragged-paged-attention backend for the TPU torch_tpu platform.
+
+Implements the Ragged Paged Attention (RPA) algorithm
+(https://arxiv.org/abs/2604.15464), adapted from vllm/tpu-inference
+(https://github.com/vllm-project/tpu-inference/tree/main/tpu_inference/kernels/).
 
 This backend wraps the JAX/Pallas v3 ragged_paged_attention kernel
 (``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``) and
@@ -70,8 +75,10 @@ def _quantize_kv_to_fp8(
     """Static per-tensor quantization of K or V into ``fp8_dtype``.
 
     Mirrors the GPU path's ``set_kv_buffer`` quantization (``cache_k.div_(scale)
-    .to(fp8)``) and torchtpu-vllm's ``quantize_kv``: divide by the per-tensor
-    scale, clamp to the fp8 representable range, then cast. The kernel undoes
+    .to(fp8)``) and vllm/tpu-inference's ``quantize_kv``
+    (https://github.com/vllm-project/tpu-inference/tree/main/tpu_inference/kernels/):
+    divide by the per-tensor scale, clamp to the
+    fp8 representable range, then cast. The kernel undoes
     this by multiplying the attention scores / output by the same scale.
     """
     finfo = torch.finfo(fp8_dtype)
