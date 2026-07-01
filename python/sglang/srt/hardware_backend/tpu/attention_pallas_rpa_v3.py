@@ -405,13 +405,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 "has not been registered yet — did the allocator finish init?"
             )
             # First token index of each full-pool page (page_indices * page_size).
+            # full_to_swa is host-resident (CPU) on TPU: gather on CPU (where the
+            # table lives), then move the small int32 result to the batch device.
             full_token_starts = page_indices.to(torch.int64) * page_size
-            # full_to_swa may be host-resident (CPU) on TPU; gather on its device
-            # and bring the result back to the metadata's device.
-            swa_token_starts = full_to_swa[full_token_starts.to(full_to_swa.device)].to(
-                full_token_starts.device
+            swa_page_indices = (
+                (full_to_swa[full_token_starts.cpu()] // page_size)
+                .to(torch.int32)
+                .to(device)
             )
-            swa_page_indices = (swa_token_starts // page_size).to(torch.int32)
 
         return PallasForwardMetadata(
             kv_lens=seq_lens,
@@ -483,10 +484,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
                 "has not been registered yet — did the allocator finish init?"
             )
             # First token index of each full-pool page (page_indices * page_size).
+            # page_indices and full_to_swa are both CPU here, so gather on CPU and
+            # H2D the small int32 result once.
             full_token_starts = page_indices.to(torch.int64) * page_size
-            swa_token_starts = full_to_swa[full_token_starts.to(full_to_swa.device)]
             swa_page_indices = (
-                (swa_token_starts // page_size)
+                (full_to_swa[full_token_starts] // page_size)
                 .to(torch.int32)
                 .to(device, non_blocking=True)
             )

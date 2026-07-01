@@ -147,7 +147,7 @@ def _pad_last_axis(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
     )
 
 
-def process_gpt_oss_mxfp4_weights_bf16(
+def process_mxfp4_moe_weights_bf16(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
     w13_bias: torch.Tensor,
@@ -155,6 +155,7 @@ def process_gpt_oss_mxfp4_weights_bf16(
     w2_scale: torch.Tensor,
     w2_bias: torch.Tensor,
     *,
+    w13_interleaved: bool,
     align_to: int = 128,
 ) -> tuple[
     torch.Tensor,  # w13_weight  (E, hidden, 2*N_int_padded)  bfloat16
@@ -164,7 +165,7 @@ def process_gpt_oss_mxfp4_weights_bf16(
 ]:
     """Dequantize HF GPT-OSS MXFP4 weights to **bf16** in gmm_v2's (g, k, n)
     layout (the torchtpu-vllm "dequant at load" approach). Same layout as
-    :func:`process_gpt_oss_mxfp4_weights_native`
+    :func:`process_mxfp4_moe_weights_native`
     """
     E_w13, two_N_int, K_packed_w13 = w13_packed.shape
     N_int = two_N_int // 2
@@ -172,22 +173,25 @@ def process_gpt_oss_mxfp4_weights_bf16(
     pad_n = (align_to - N_int % align_to) % align_to
 
     # w13: dequant (along K=hidden) → deinterleave gate/up → pad N → transpose.
-    # Deinterleave is unconditional: this is the GPT-OSS path and GPT-OSS uses
-    # SWIGLUOAI, whose HF checkpoint stores w13 interleaved as
-    # [gate_0, up_0, gate_1, up_1, ...]. (tpu-inference gates the equivalent on
-    # ``layer.activation == SWIGLUOAI`` because its path is generic; this one is
-    # gpt-oss-only, so the interleaved layout always holds.)
+    # ``w13_interleaved`` follows the checkpoint's gate/up layout: SWIGLUOAI
+    # (GPT-OSS) stores w13 interleaved as [gate_0, up_0, gate_1, up_1, ...] and
+    # must be deinterleaved into [gate.., up..] halves; a non-interleaved
+    # checkpoint is already in that layout and skips this step. Mirrors
+    # tpu-inference's ``w13_interleave = layer.activation == SWIGLUOAI``.
     w13 = MXFP4QuantizeUtil.dequantize(
         quantized_data=w13_packed,
         scale=w13_scale,
         dtype=torch.bfloat16,
         block_sizes=[MXFP4_BLOCK_SIZE],
     )  # (E, 2N, hidden) bf16
-    w13 = _deinterleave_axis1(w13)
+    if w13_interleaved:
+        w13 = _deinterleave_axis1(w13)
     w13 = _pad_gate_up_halves_axis1(w13, N_int, pad_n)  # (E, 2*N_padded, hidden)
     w13 = w13.permute(0, 2, 1).contiguous()  # (E, hidden, 2*N_padded) bf16
 
-    w13_b = _deinterleave_axis1(w13_bias.unsqueeze(-1)).squeeze(-1)
+    w13_b = w13_bias
+    if w13_interleaved:
+        w13_b = _deinterleave_axis1(w13_b.unsqueeze(-1)).squeeze(-1)
     w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(-1)
     w13_b = w13_b.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, 2*N_padded)
 
@@ -210,7 +214,7 @@ def process_gpt_oss_mxfp4_weights_bf16(
 # ---------------------------------------------------------------------------
 
 
-def process_gpt_oss_mxfp4_weights_native(
+def process_mxfp4_moe_weights_native(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
     w13_bias: torch.Tensor,
@@ -218,6 +222,7 @@ def process_gpt_oss_mxfp4_weights_native(
     w2_scale: torch.Tensor,
     w2_bias: torch.Tensor,
     *,
+    w13_interleaved: bool,
     align_to: int = 128,
 ) -> tuple[
     torch.Tensor,  # w13_weight  (E, K_packed = hidden/2, 2*N_int_padded) uint8
@@ -259,7 +264,8 @@ def process_gpt_oss_mxfp4_weights_native(
 
     # --- Weights ---
     # Step 1: deinterleave the 2N axis → first half gate, second half up
-    w13_w = _deinterleave_axis1(w13_packed)
+    #         (interleaved checkpoints only; see process_mxfp4_moe_weights_bf16)
+    w13_w = _deinterleave_axis1(w13_packed) if w13_interleaved else w13_packed
     # Step 3: pad gate and up halves of N with zeros
     w13_w = _pad_gate_up_halves_axis1(w13_w, N_int, pad_n)  # (E, 2*N_padded, K_packed)
     # Step 4: transpose to gmm_v2 (E, K_packed, N) layout
@@ -269,7 +275,9 @@ def process_gpt_oss_mxfp4_weights_native(
     # --- Scales (e8m0 → fp32) ---
     # HF layout: (E, 2N, num_blocks) uint8.
     # Deinterleave first (same gate/up axis as weights).
-    w13_s = _deinterleave_axis1(w13_scale)  # (E, 2N, num_blocks)
+    w13_s = (
+        _deinterleave_axis1(w13_scale) if w13_interleaved else w13_scale
+    )  # (E, 2N, num_blocks)
     # Pad N with zeros (corresponding fp4 weights are zero → no contribution).
     w13_s = _pad_gate_up_halves_axis1(
         w13_s, N_int, pad_n
@@ -284,7 +292,11 @@ def process_gpt_oss_mxfp4_weights_native(
 
     # --- Bias (bf16 → fp32) ---
     # Deinterleave needs at least one trailing dim; use a temporary unsqueeze.
-    w13_b = _deinterleave_axis1(w13_bias.unsqueeze(-1)).squeeze(-1)  # (E, 2N)
+    w13_b = (
+        _deinterleave_axis1(w13_bias.unsqueeze(-1)).squeeze(-1)
+        if w13_interleaved
+        else w13_bias
+    )  # (E, 2N)
     w13_b = _pad_gate_up_halves_axis1(w13_b.unsqueeze(-1), N_int, pad_n).squeeze(
         -1
     )  # (E, 2*N_padded)
@@ -346,17 +358,23 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     simpler kernel path and no shared-kernel scale handling.
 
     The lossless packed-FP4 alternative
-    (:func:`process_gpt_oss_mxfp4_weights_native`) feeds the same gmm_v2
+    (:func:`process_mxfp4_moe_weights_native`) feeds the same gmm_v2
     block-scale path FP8 uses; it is not wired yet — switching to it is a
     numerics-affecting change tracked separately from the FP8 redesign merge.
     """
-    w13, w13_bias, w2, w2_bias = process_gpt_oss_mxfp4_weights_bf16(
+    # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...]; a
+    # non-interleaved MXFP4 MoE checkpoint would not. Mirrors tpu-inference's
+    # ``w13_interleave = layer.activation == MoEActivation.SWIGLUOAI`` — sglang
+    # carries the activation as a string on the MoE runner config.
+    w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
+    w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
         layer.w13_weight.data,
         layer.w13_weight_scale.data,
         layer.w13_weight_bias.data,
         layer.w2_weight.data,
         layer.w2_weight_scale.data,
         layer.w2_weight_bias.data,
+        w13_interleaved=w13_interleaved,
     )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = None
