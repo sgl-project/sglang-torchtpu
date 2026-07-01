@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import threading
-from typing import Callable
+from typing import Callable, Optional
 
 import ray
-from ray.util.placement_group import PlacementGroup
+from ray.util.placement_group import (
+    PlacementGroup,
+    placement_group as create_placement_group,
+    remove_placement_group,
+)
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from sglang.srt.entrypoints.engine import (
@@ -34,6 +39,107 @@ from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _accelerator_resource_name(server_args: ServerArgs) -> str:
+    """Ray resource name for the server's accelerator.
+
+    Ray auto-detects NVIDIA GPUs as the built-in ``GPU`` resource, but a TPU
+    cluster advertises ``TPU`` instead (and reports 0 GPU). The placement group
+    and scheduler actors must request the resource that actually exists on the
+    nodes -- otherwise the bundles are never schedulable and the Engine hangs
+    forever at ``pg.ready()``.
+    """
+    return "TPU" if server_args.device == "tpu" else "GPU"
+
+
+def _accelerator_actor_options(server_args: ServerArgs, count: int = 1) -> dict:
+    """Ray ``.options()`` kwargs reserving ``count`` accelerators per actor.
+
+    Ray only special-cases ``num_gpus`` (which also drives CUDA_VISIBLE_DEVICES);
+    there is no ``num_tpus`` -- TPUs are a custom resource, so they go through the
+    generic ``resources`` dict. This keeps one scheduler actor pinned per chip
+    without touching the GPU machinery.
+    """
+    if server_args.device == "tpu":
+        return {"num_gpus": 0, "resources": {"TPU": count}}
+    return {"num_gpus": count}
+
+
+def _detect_tpu_nnodes() -> int:
+    """Count alive Ray nodes that advertise the ``TPU`` resource.
+
+    Used to auto-derive ``nnodes`` for TPU ray runs so the operator doesn't have
+    to pass ``--nnodes`` -- the placement group and rank math then follow the live
+    cluster. Returns 0 if nothing is detectable (caller keeps server_args.nnodes).
+    """
+    try:
+        return sum(
+            1
+            for node in ray.nodes()
+            if node.get("Alive") and float(node.get("Resources", {}).get("TPU", 0)) > 0
+        )
+    except Exception as e:  # pragma: no cover - defensive; fall back to server_args
+        logger.warning("Failed to count TPU nodes from Ray: %s", e)
+        return 0
+
+
+@ray.remote(num_cpus=0, num_gpus=0)
+def _get_worker_id_and_address():
+    """Ray task: return this node's ``(TPU_WORKER_ID, ip)`` for slice ordering."""
+    return os.environ.get("TPU_WORKER_ID"), ray.util.get_node_ip_address()
+
+
+def _discover_tpu_worker_hostnames(nnodes: int) -> Optional[str]:
+    """Discover the physically-ordered TPU host list from the live Ray cluster.
+
+    The torch_tpu slicebuilder (``_prepare_tpu_env``) needs hosts ordered by
+    physical slice position (``TPU_WORKER_ID``). We always discover this from Ray
+    (ignoring any pre-set ``TPU_WORKER_HOSTNAMES`` in the environment) by probing
+    every node for its ``TPU_WORKER_ID`` and IP, then sorting by ``TPU_WORKER_ID``
+    -- never by the arbitrary ``ray.nodes()`` order. Returns None if it can't be
+    discovered, in which case each actor falls back to its own pod env.
+    """
+    if nnodes <= 1:
+        return None
+
+    # One probe per node via a SPREAD placement group so each lands on a distinct
+    # host; sort by TPU_WORKER_ID afterwards to recover physical order.
+    pg = None
+    try:
+        pg = create_placement_group([{"CPU": 1}] * nnodes, strategy="SPREAD")
+        ray.get(pg.ready())
+        probes = ray.get(
+            [
+                _get_worker_id_and_address.options(
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg, placement_group_bundle_index=i
+                    )
+                ).remote()
+                for i in range(nnodes)
+            ]
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Ray discovery: failed to probe TPU worker hostnames: %s", e)
+        return None
+    finally:
+        if pg is not None:
+            remove_placement_group(pg)
+
+    if any(worker_id is None for worker_id, _ in probes):
+        logger.warning(
+            "Ray discovery: TPU_WORKER_ID missing on some nodes; cannot order "
+            "hosts. Actors will fall back to their own pod env."
+        )
+        return None
+
+    ordered = sorted(probes, key=lambda p: int(p[0]))
+    hostnames = ",".join(ip for _, ip in ordered)
+    logger.info(
+        "Ray discovery: TPU_WORKER_HOSTNAMES=%s (ordered by TPU_WORKER_ID)",
+        hostnames,
+    )
+    return hostnames
 
 
 @dataclasses.dataclass
@@ -101,12 +207,46 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
+        # TPU + Ray: auto-detect the cluster shape from the live Ray cluster so
+        # the operator doesn't have to pass --nnodes or a pre-ordered host list.
+        tpu_worker_hostnames = None
+        if server_args.use_ray and server_args.device == "tpu":
+            # _detect_tpu_nnodes() below calls ray.nodes() -- the Ray *state API*,
+            # which (unlike the placement-group / actor APIs) does NOT auto-connect
+            # via RAY_ADDRESS. Connect explicitly first so auto-detection sees the
+            # live cluster; otherwise it fails with "Ray has not been started yet",
+            # falls back to nnodes=1, and builds a single tp_size-wide bundle that
+            # no host can satisfy (STRICT_PACK), hanging forever at pg.ready().
+            if not ray.is_initialized():
+                ray.init(address="auto", ignore_reinit_error=True)
+            detected = _detect_tpu_nnodes()
+            if detected > server_args.nnodes:
+                logger.info(
+                    "Ray discovery: detected %d TPU node(s); overriding "
+                    "nnodes=%d -> %d",
+                    detected,
+                    server_args.nnodes,
+                    detected,
+                )
+                server_args = dataclasses.replace(server_args, nnodes=detected)
+            tpu_worker_hostnames = _discover_tpu_worker_hostnames(server_args.nnodes)
+
+            if server_args.nnodes <= 1:
+                # Single-host Ray: no multihost host list to rebuild from, so
+                # seed the (localhost) slicebuilder env once here in the driver.
+                # Same-node actors inherit this identical port list via Ray's
+                # env propagation, keeping their PJRT slicebuilder consistent.
+                # Multihost actors rebuild deterministically from the discovered
+                # node IPs (see _prepare_tpu_env), so seeding is skipped there --
+                # keeping the orchestrator's logs free of the localhost line.
+                from sglang.srt.hardware_backend.tpu.patches import (
+                    _prepare_tpu_env,
+                )
+
+                _prepare_tpu_env(server_args.tp_size)
+
         pg = ray.util.get_current_placement_group()
         if pg is None:
-            from ray.util.placement_group import (
-                placement_group as create_placement_group,
-            )
-
             if server_args.enable_dp_attention:
                 total_gpus = server_args.tp_size * server_args.pp_size
             else:
@@ -117,15 +257,16 @@ class RayEngine(Engine):
             nnodes = server_args.nnodes
             gpus_per_node = total_gpus // nnodes
             strategy = "STRICT_PACK" if nnodes == 1 else "SPREAD"
+            accel = _accelerator_resource_name(server_args)
 
             logger.info(
                 "No placement group detected. Auto-creating one with "
-                f"{nnodes} bundle(s), {gpus_per_node} GPU(s)/bundle, "
+                f"{nnodes} bundle(s), {gpus_per_node} {accel}(s)/bundle, "
                 "placement group explicitly and schedule the Engine onto it."
             )
 
             pg = create_placement_group(
-                [{"CPU": 1, "GPU": gpus_per_node}] * nnodes,
+                [{"CPU": 1, accel: gpus_per_node}] * nnodes,
                 strategy=strategy,
             )
             ray.get(pg.ready())
@@ -146,7 +287,8 @@ class RayEngine(Engine):
 
             logger.info(
                 f"Ray cluster: {nnodes} nodes, "
-                f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
+                f"Use {gpus_per_node} {_accelerator_resource_name(server_args)}/node, "
+                f"world_size={world_size}"
             )
 
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
@@ -174,7 +316,7 @@ class RayEngine(Engine):
 
                         actor = SchedulerActor.options(
                             num_cpus=0,
-                            num_gpus=1,
+                            **_accelerator_actor_options(server_args),
                             name=f"sglang_scheduler_node{rank0_node_ip}_pp{pp_rank}_tp{tp_rank}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}",
                             scheduling_strategy=PlacementGroupSchedulingStrategy(
                                 placement_group=pg,
@@ -191,6 +333,7 @@ class RayEngine(Engine):
                             pp_rank=pp_rank,
                             dp_rank=0,
                             dist_init_addr=dist_init_addr,
+                            tpu_worker_hostnames=tpu_worker_hostnames,
                         )
                         scheduler_actors.append(actor)
 
@@ -228,7 +371,12 @@ class RayEngine(Engine):
             # Launch the data parallel controller
             return (
                 cls._launch_dp_scheduler_processes(
-                    server_args, port_args, pg, bundle_for_node, rank0_node_ip
+                    server_args,
+                    port_args,
+                    pg,
+                    bundle_for_node,
+                    rank0_node_ip,
+                    tpu_worker_hostnames,
                 ),
                 None,
             )
@@ -241,6 +389,7 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: list,
         rank0_node_ip: str,
+        tpu_worker_hostnames: Optional[str] = None,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
@@ -255,7 +404,8 @@ class RayEngine(Engine):
         gpus_per_node = total_gpus // server_args.nnodes
         logger.info(
             f"Ray DP cluster: {server_args.nnodes} nodes, "
-            f"{gpus_per_node} GPUs/node, dp_size={server_args.dp_size}, "
+            f"{gpus_per_node} {_accelerator_resource_name(server_args)}/node, "
+            f"dp_size={server_args.dp_size}, "
             f"tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, "
             f"enable_dp_attention={server_args.enable_dp_attention}"
         )
@@ -270,7 +420,12 @@ class RayEngine(Engine):
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(
-            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip
+            dp_server_args,
+            port_args,
+            pg,
+            bundle_for_node,
+            rank0_node_ip,
+            tpu_worker_hostnames,
         )
 
         # Start the DP controller's event loop in a daemon thread.

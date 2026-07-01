@@ -22,9 +22,17 @@
 #   MODEL=Qwen/Qwen3-0.6B TP_SIZE=1 PAGE_SIZE=32 ./launch_server.sh
 #
 # Example — multihost MoE across a 2x2x2 v7x slice (2 hosts → tp=16, ep=8).
-# Launch this SAME command on every host (one pod per host); node rank and the
-# peer list are auto-detected from the GKE TPU env (TPU_WORKER_ID /
-# TPU_WORKER_HOSTNAMES), and TP_SIZE auto-derives to NNODES*CHIPS_PER_HOST:
+# Preferred: Ray mode. Bring up a Ray cluster (head + workers), then run this
+# ONLY on the head. The head Engine discovers the peer hostnames + slice
+# topology from the live Ray cluster, so you supply only NNODES — no
+# TPU_WORKER_HOSTNAMES, node rank, or dist addr. TP_SIZE auto-derives to
+# NNODES*CHIPS_PER_HOST:
+#   SGLANG_USE_RAY=1 NNODES=2 MODEL=Qwen/Qwen3-30B-A3B EP_SIZE=8 \
+#   MEM_FRACTION_STATIC=0.30 ./launch_server.sh
+#
+# Alternative — no Ray: launch this SAME command on every host (one pod per
+# host); node rank and the peer list are auto-detected from the GKE TPU env
+# (TPU_WORKER_ID / TPU_WORKER_HOSTNAMES):
 #   MODEL=Qwen/Qwen3-30B-A3B EP_SIZE=8 MEM_FRACTION_STATIC=0.30 ./launch_server.sh
 # See the "multihost (multi-node) coordination" section below for manual control.
 #
@@ -83,10 +91,16 @@
 #   TORCH_TPU_TIER2_NAME=torchtpu_<model-slug>   # per-model compile cache name
 #   PYTHON=python3                 # interpreter with torch_tpu + sglang installed
 #   JAX_BAZEL=                     # opt-in; only for a Bazel-built torch_tpu (see below)
-#   --- multihost (multi-node serving; auto-enabled by the GKE TPU env) ---
-#   NNODES=                        # # hosts; auto from TPU_WORKER_HOSTNAMES
-#   NODE_RANK=                     # this host's rank; auto from TPU_WORKER_ID
-#   DIST_INIT_ADDR=                # torch.distributed rendezvous addr; auto-built
+#   --- multihost (multi-node serving) ---
+#   SGLANG_USE_RAY=                # 1 → Ray mode: run only on the head; nnodes +
+#                                  #   peer hostnames auto-discovered from the Ray
+#                                  #   cluster. Supply only NNODES.
+#   NNODES=                        # # hosts. Ray mode: user-supplied (may be
+#                                  #   overridden by the discovered cluster).
+#                                  #   Non-Ray: auto from TPU_WORKER_HOSTNAMES.
+#   NODE_RANK=                     # non-Ray this host's rank; auto from TPU_WORKER_ID
+#   DIST_INIT_ADDR=                # non-Ray torch.distributed rendezvous addr;
+#                                  #   auto-built (Ray computes it at runtime)
 #   DIST_PORT=10011                # rendezvous port (NOT the HTTP PORT)
 #   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
 #   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
@@ -103,7 +117,18 @@ MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' 
 # ===== multihost (multi-node) coordination =====
 : "${DIST_PORT:=10011}"        # torch.distributed rendezvous port (NOT the HTTP PORT)
 : "${CHIPS_PER_HOST:=8}"       # tp-devices per host (v7x: 4 chips x 2 cores)
-if [[ -n "${TPU_WORKER_ID:-}" && -n "${TPU_WORKER_HOSTNAMES:-}" ]]; then
+USE_RAY=${SGLANG_USE_RAY:-0}
+if [[ "$USE_RAY" == "1" ]]; then
+    # Ray mode: only the HEAD runs this script. The head Engine discovers the
+    # peer hostnames + slice topology straight from the live Ray cluster
+    # (ray.nodes() + a SPREAD placement group that probes every node's
+    # TPU_WORKER_ID / IP, then sorts by TPU_WORKER_ID for physical order).
+    # So TPU_WORKER_HOSTNAMES / NODE_RANK / RANK0_HOST / DIST_INIT_ADDR are all
+    # discovered at runtime and NOT needed here — the user supplies only NNODES.
+    NNODES=${NNODES:-1}
+    NODE_RANK=0
+    [[ "$NNODES" -gt 1 ]] && ENABLE_MULTIHOST=1 || ENABLE_MULTIHOST=0
+elif [[ -n "${TPU_WORKER_ID:-}" && -n "${TPU_WORKER_HOSTNAMES:-}" ]]; then
     ENABLE_MULTIHOST=1
     NODE_RANK=${NODE_RANK:-$TPU_WORKER_ID}
     NNODES=${NNODES:-$(awk -F, '{print NF}' <<< "$TPU_WORKER_HOSTNAMES")}
@@ -115,16 +140,22 @@ else
     ENABLE_MULTIHOST=0; NNODES=1; NODE_RANK=0
 fi
 if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
-    if [[ -z "${DIST_INIT_ADDR:-}" ]]; then
-        if [[ "$NODE_RANK" == "0" ]]; then
-            DIST_INIT_ADDR="0.0.0.0"
-        else
-            DIST_INIT_ADDR="${RANK0_HOST:?set RANK0_HOST or DIST_INIT_ADDR for node_rank>0}"
-        fi
-    fi
-    [[ "$DIST_INIT_ADDR" == *:* ]] || DIST_INIT_ADDR="$DIST_INIT_ADDR:$DIST_PORT"
-    # tp counts DEVICES across the whole slice: NNODES * CHIPS_PER_HOST.
+    # tp counts DEVICES across the whole slice: NNODES * CHIPS_PER_HOST. In Ray
+    # mode the user sets only NNODES; this gives a correct slice-wide default tp
+    # (an explicit TP_SIZE=... still overrides below).
     DEFAULT_TP=$((NNODES * CHIPS_PER_HOST))
+    if [[ "$USE_RAY" != "1" ]]; then
+        # Non-Ray multihost: build the torch.distributed rendezvous addr here
+        # (Ray computes it from the discovered rank-0 node IP instead).
+        if [[ -z "${DIST_INIT_ADDR:-}" ]]; then
+            if [[ "$NODE_RANK" == "0" ]]; then
+                DIST_INIT_ADDR="0.0.0.0"
+            else
+                DIST_INIT_ADDR="${RANK0_HOST:?set RANK0_HOST or DIST_INIT_ADDR for node_rank>0}"
+            fi
+        fi
+        [[ "$DIST_INIT_ADDR" == *:* ]] || DIST_INIT_ADDR="$DIST_INIT_ADDR:$DIST_PORT"
+    fi
 else
     DEFAULT_TP=8
 fi
@@ -295,8 +326,13 @@ echo "==== launch config ===="
 echo "  model              = $MODEL"
 echo "  model_slug         = $MODEL_SLUG"
 echo "  tp_size            = $TP_SIZE"
-[[ "$ENABLE_MULTIHOST" == "1" ]] && \
-  echo "  multihost          = nnodes=$NNODES node_rank=$NODE_RANK dist=$DIST_INIT_ADDR (chips/host=$CHIPS_PER_HOST)"
+if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
+  if [[ "$USE_RAY" == "1" ]]; then
+    echo "  multihost          = ray-discovered (nnodes hint=$NNODES, chips/host=$CHIPS_PER_HOST)"
+  else
+    echo "  multihost          = nnodes=$NNODES node_rank=$NODE_RANK dist=$DIST_INIT_ADDR (chips/host=$CHIPS_PER_HOST)"
+  fi
+fi
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
 echo "  host:port          = $HOST:$PORT"
 echo "  max_running        = $MAX_RUNNING"
@@ -352,10 +388,24 @@ args=(
 [[ "$ENABLE_TORCH_COMPILE" == "1" ]] && args+=(--enable-torch-compile)
 [[ -n "${JSON_MODEL_OVERRIDE:-}" ]] && args+=(--json-model-override-args "$JSON_MODEL_OVERRIDE")
 [[ "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]] && args+=(--disable-overlap-schedule)
-# Multinode: pass sglang's rendezvous flags only when fanned across hosts.
-[[ "$ENABLE_MULTIHOST" == "1" ]] && args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
+# Multinode rendezvous flags, only when fanned across hosts.
+if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
+    if [[ "$USE_RAY" == "1" ]]; then
+        # Ray assigns node ranks and the rendezvous addr from the discovered
+        # cluster; only hint nnodes (the head may still override it from
+        # ray.nodes()). No --node-rank / --dist-init-addr here.
+        args+=(--nnodes "$NNODES")
+    else
+        args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
+    fi
+fi
 # KV offloading to host RAM (hierarchical cache); orthogonal to multihost.
 [[ "${KV_OFFLOAD:-0}" == "1" ]] && args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO:-2.0}")
+# Ray scheduler mode: the head Engine launches scheduler actors on every node via
+# Ray, auto-detecting nnodes + slice topology (peer hostnames) from the live
+# cluster — so only the head runs this script and no TPU_WORKER_HOSTNAMES is
+# needed. Enabled purely by env; the user supplies only NNODES.
+[[ "$USE_RAY" == "1" ]] && args+=(--use-ray)
 
 # Escape hatch for any launch_server flag not surfaced above, e.g.
 #   EXTRA_ARGS="--weight-loader-disable-mmap" MODEL=... ./launch_server.sh

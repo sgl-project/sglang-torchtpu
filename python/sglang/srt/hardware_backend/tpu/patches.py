@@ -143,11 +143,18 @@ def _set_torch_tpu_topology_env_single(world_size: int) -> None:
             pass
 
 
-def _prepare_tpu_env(world_size: int = 1) -> None:
+def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
 
     Applies LIBTPU_INIT_ARGS overrides, then dispatches to the multi-host or
     single-host helper, which write the slicebuilder + topology env directly.
+
+    ``setup_slicebuilder=False`` applies only the libtpu/env overrides and
+    returns without touching the slicebuilder/topology (or logging it). Used by
+    the Ray orchestrator: the overrides must be set early (actors inherit them
+    before ``import torch_tpu``), but the slicebuilder is built per-rank after
+    node discovery, so building it here would emit a bogus single-host
+    (localhost) env that never applies to the real ranks.
     """
     # Apply LIBTPU_INIT_ARGS overrides before the early return and before
     # any torch_tpu import; libtpu reads these flags at load time.
@@ -162,20 +169,33 @@ def _prepare_tpu_env(world_size: int = 1) -> None:
     # torch implementation instead.
     os.environ.setdefault("SGLANG_NATIVE_MOVE_KV_CACHE", "1")
 
-    if "TORCH_TPU_SLICEBUILDER_ADDRESSES" in os.environ:
+    if not setup_slicebuilder:
         return
 
     worker_hostnames = os.environ.get("TPU_WORKER_HOSTNAMES", "")
     hosts = [h for h in worker_hostnames.split(",") if h]
 
     if len(hosts) > 1:
+        # Multihost slicebuilder endpoints are deterministic
+        # (``host:base_port+i`` over the Ray-discovered node IPs), so rebuild
+        # them unconditionally. Ray propagates the driver's env to every actor,
+        # so an actor can inherit the driver's stale *single-host* values
+        # (``localhost:*`` addresses + a single-box topology). Those are always
+        # wrong for a multi-host slice and, left in place, strand each host
+        # trying to bind the whole slice on localhost -> PJRT device binding
+        # aborts. Drop any inherited copies so the helper recomputes from the
+        # real node IPs; recompute is idempotent.
+        os.environ.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
+        os.environ.pop("TORCH_TPU_TOPOLOGY", None)
         _set_torch_tpu_topology_env_multihost(
             hosts,
             base_port=int(os.environ.get("TORCH_TPU_BASE_PORT", 8070)),
             devices_per_host=int(os.environ.get("TORCH_TPU_DEVICES_PER_HOST", 8)),
             tpu_topology=os.environ.get("TPU_TOPOLOGY", ""),
         )
-    else:
+    elif "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ:
+        # Single-host picks random free ports, so it must be computed once and
+        # inherited by child ranks -- don't clobber an already-set value.
         _set_torch_tpu_topology_env_single(world_size)
 
     logger.info(

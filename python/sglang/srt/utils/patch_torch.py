@@ -125,7 +125,17 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     os.environ["LOCAL_RANK"] = str(tp_rank % local_world_size)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+
+    # Multihost: every rank must rendezvous at rank-0's node. TPU_WORKER_HOSTNAMES
+    # is ordered by TPU_WORKER_ID (physical slice order), so hosts[0] is where
+    # RANK 0 lives. Set it authoritatively -- under Ray the inherited value is
+    # the driver's loopback, which would leave each host rendezvousing with
+    # itself. Single-host stays on loopback.
+    hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
+    if len(hosts) > 1:
+        os.environ["MASTER_ADDR"] = hosts[0]
+    else:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
 
 
