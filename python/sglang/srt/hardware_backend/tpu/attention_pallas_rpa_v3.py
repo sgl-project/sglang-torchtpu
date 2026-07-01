@@ -220,9 +220,9 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     wraps the Pallas flash + paged-attention kernels. Selected via
     ``--attention-backend pallas_tpu_rpa_v3`` (the TPU platform default).
     Requires the fused KV layout supplied by
-    :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`;
-    :func:`patches._patch_mha_kv_pool_for_rpa_v3` swaps that pool in when this
-    backend is active.
+    :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`,
+    which ``TpuSRTPlatform.get_mha_kv_pool_cls`` returns for this backend and
+    the model_runner passes as ``token_to_kv_pool_class``.
     """
 
     # The torch custom op exposes KV updates as an in-place mutation, so syncing

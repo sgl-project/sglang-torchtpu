@@ -107,19 +107,10 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     """TPU-only per-child-process startup work, called from
     ``run_scheduler_process`` before ``Scheduler`` is constructed.
 
-    Two responsibilities:
-
-    1. Set torchrun-style env vars for torch_tpu's PJRT slicebuilder
-       (RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT). PJRT
-       lazy-init in each worker reads these to coordinate; sglang's
-       mp.Process spawn path doesn't otherwise set them.
-
-    2. Re-arm the TPU pool swap in the child. ``apply_tpu_patches`` runs at
-       model_runner module-import time — before the child has any view of
-       ``server_args`` — so the swap of ``MHATokenToKVPool`` →
-       ``TpuFusedMHATokenToKVPool`` is silently skipped on the child side.
-       Replaying it here (before ``ModelRunner._init_pools`` runs) puts
-       the fused pool in place for the ``pallas_tpu_rpa_v3`` backend.
+    Sets torchrun-style env vars for torch_tpu's PJRT slicebuilder
+    (RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT). PJRT lazy-init
+    in each worker reads these to coordinate; sglang's mp.Process spawn path
+    doesn't otherwise set them.
 
     No-op for non-TPU runs.
     """
@@ -136,14 +127,6 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
-
-    from sglang.srt.hardware_backend.tpu.patches import (
-        _patch_mha_kv_pool_for_rpa_v3,
-        set_active_attention_backend,
-    )
-
-    set_active_attention_backend(server_args.attention_backend)
-    _patch_mha_kv_pool_for_rpa_v3()
 
 
 def monkey_patch_torch_compile():

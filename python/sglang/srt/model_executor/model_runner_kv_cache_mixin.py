@@ -499,6 +499,48 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
+        elif (
+            current_platform.is_tpu()
+            and not self.use_mla_backend
+            and not self.mambaish_config
+        ):
+            # TPU MHA pools (mirrors the NPU/ascend branch above).
+            # get_mha_kv_pool_cls() returns the fused (RPA v3) or flat
+            # (torch_native / pallas_tpu_flash) pool per the resolved backend.
+            # TPU MLA models fall through to the shared MLA branch below — their
+            # pool is the generic MLATokenToKVPool, so no TPU-specific class.
+            PoolCls = current_platform.get_mha_kv_pool_cls()
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool = SWAKVPool(
+                    size=self.full_max_total_num_tokens,
+                    size_swa=self.swa_max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+                    enable_kvcache_transpose=False,
+                    device=self.device,
+                    token_to_kv_pool_class=PoolCls,
+                )
+            else:
+                self.token_to_kv_pool = PoolCls(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
         elif self.use_mla_backend and is_nsa_model:
             PoolCls = (
                 HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool

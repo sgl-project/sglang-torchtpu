@@ -145,11 +145,22 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
-        from sglang.srt.hardware_backend.tpu.kv_pool import (
-            TpuFusedMHATokenToKVPool,
-        )
+        # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
+        # read the flat MHATokenToKVPool. Pick per the resolved attention backend
+        # — it's on the (scheduler-child) global server args by pool-creation
+        # time (set in ModelRunner.__init__, before _init_pools).
+        from sglang.srt.server_args import get_global_server_args
 
-        return TpuFusedMHATokenToKVPool
+        if get_global_server_args().attention_backend == "pallas_tpu_rpa_v3":
+            from sglang.srt.hardware_backend.tpu.kv_pool import (
+                TpuFusedMHATokenToKVPool,
+            )
+
+            return TpuFusedMHATokenToKVPool
+
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        return MHATokenToKVPool
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool

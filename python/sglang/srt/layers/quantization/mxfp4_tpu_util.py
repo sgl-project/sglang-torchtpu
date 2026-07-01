@@ -63,11 +63,11 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
 # block size is always 32 for MXFP4
 MXFP4_BLOCK_SIZE = 32
 PACKING = 2  # two FP4 codes per uint8 byte
-# FP4 (e2m1) code → magnitude lookup (sign is the top bit).
-E2M1_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
 # ---------------------------------------------------------------------------
@@ -147,41 +147,6 @@ def _pad_last_axis(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
     )
 
 
-def _dequant_mxfp4_to_float(
-    packed_blocks: torch.Tensor,
-    scales_e8m0: torch.Tensor,
-    dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Dequantize HF MXFP4 packed blocks + e8m0 scales to a float dtype, along
-    the LAST axis. ``packed_blocks`` ``(*leading, K/2)`` uint8, ``scales_e8m0``
-    ``(*leading, K/32)`` uint8 → ``(*leading, K)`` ``dtype``.
-
-    Unpacks 2 FP4 codes per byte (low nibble = even index, high = odd, HF
-    order), decodes sign+magnitude via :data:`E2M1_VALUES`, and applies the
-    per-32-element e8m0 scale (``2**(scale-127)``).
-    """
-    assert packed_blocks.dtype == torch.uint8 and scales_e8m0.dtype == torch.uint8
-    *leading, k_packed = packed_blocks.shape
-    num_blocks = scales_e8m0.shape[-1]
-    block_size = (k_packed * PACKING) // num_blocks
-    assert block_size == MXFP4_BLOCK_SIZE, f"block_size={block_size}"
-    blocks = packed_blocks.reshape(*leading, num_blocks, block_size // PACKING)
-    low = blocks & 0x0F
-    high = (blocks >> 4) & 0x0F
-    codes = torch.zeros(
-        *leading, num_blocks, block_size, dtype=torch.uint8, device=packed_blocks.device
-    )
-    codes[..., 0::2] = low
-    codes[..., 1::2] = high
-    sign = 1.0 - 2.0 * ((codes & 0b1000) >> 3).to(torch.float32)
-    magnitude = (codes & 0b0111).to(torch.long)
-    vals = E2M1_VALUES.to(packed_blocks.device)
-    abs_vals = vals[magnitude.reshape(-1)].reshape(magnitude.shape)
-    scale = _e8m0_to_fp32(scales_e8m0).unsqueeze(-1)  # (*leading, num_blocks, 1)
-    dequant = (sign * abs_vals) * scale
-    return dequant.reshape(*leading, num_blocks * block_size).to(dtype)
-
-
 def process_gpt_oss_mxfp4_weights_bf16(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -212,7 +177,12 @@ def process_gpt_oss_mxfp4_weights_bf16(
     # [gate_0, up_0, gate_1, up_1, ...]. (tpu-inference gates the equivalent on
     # ``layer.activation == SWIGLUOAI`` because its path is generic; this one is
     # gpt-oss-only, so the interleaved layout always holds.)
-    w13 = _dequant_mxfp4_to_float(w13_packed, w13_scale)  # (E, 2N, hidden) bf16
+    w13 = MXFP4QuantizeUtil.dequantize(
+        quantized_data=w13_packed,
+        scale=w13_scale,
+        dtype=torch.bfloat16,
+        block_sizes=[MXFP4_BLOCK_SIZE],
+    )  # (E, 2N, hidden) bf16
     w13 = _deinterleave_axis1(w13)
     w13 = _pad_gate_up_halves_axis1(w13, N_int, pad_n)  # (E, 2*N_padded, hidden)
     w13 = w13.permute(0, 2, 1).contiguous()  # (E, hidden, 2*N_padded) bf16
@@ -222,7 +192,12 @@ def process_gpt_oss_mxfp4_weights_bf16(
     w13_b = w13_b.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, 2*N_padded)
 
     # w2: dequant (along K=intermediate) → pad K to match N_padded → transpose.
-    w2 = _dequant_mxfp4_to_float(w2_packed, w2_scale)  # (E, hidden, inter) bf16
+    w2 = MXFP4QuantizeUtil.dequantize(
+        quantized_data=w2_packed,
+        scale=w2_scale,
+        dtype=torch.bfloat16,
+        block_sizes=[MXFP4_BLOCK_SIZE],
+    )  # (E, hidden, inter) bf16
     w2 = _pad_last_axis(w2, pad_n)  # (E, hidden, N_padded)
     w2 = w2.permute(0, 2, 1).contiguous()  # (E, N_padded, hidden) bf16
     w2_b = w2_bias.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, hidden)
