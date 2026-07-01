@@ -12,19 +12,15 @@ fused device KV buffer and raiden's DMA-pinned host pool, returning a pollable
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, List
+
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 
 logger = logging.getLogger(__name__)
-
-# Deadline for the blocking flush poll. A raiden DMA that never completes
-# (internal error, hang) raises past this instead of spinning the scheduler
-# thread forever. Override with RAIDEN_DMA_TIMEOUT_S.
-_DMA_TIMEOUT_S = float(os.environ.get("RAIDEN_DMA_TIMEOUT_S", "60"))
 
 
 class RaidenFutureEvent:
@@ -59,12 +55,11 @@ class RaidenFutureEvent:
         """
         if self._future is None:
             return
-        deadline = time.monotonic() + _DMA_TIMEOUT_S
+        timeout_s = envs.SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S.get()
+        deadline = time.monotonic() + timeout_s
         while not self._future.is_ready():
             if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"raiden DMA did not complete within {_DMA_TIMEOUT_S}s"
-                )
+                raise TimeoutError(f"raiden DMA did not complete within {timeout_s}s")
             time.sleep(self._POLL_INTERVAL_S)
 
     def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op

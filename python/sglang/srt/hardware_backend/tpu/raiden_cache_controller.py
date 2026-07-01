@@ -14,8 +14,7 @@ fallback, for a raiden build that does not release the GIL on H2d.
 
 from __future__ import annotations
 
-import os
-
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.raiden_transfer import NOOP_EVENT
 from sglang.srt.managers.cache_controller import (
     BatchDoneCounter,
@@ -40,9 +39,9 @@ class TpuRaidenHiCacheController(HiCacheController):
         # Run the blocking H2d load-back on a worker thread so it overlaps the
         # forward: raiden's H2d releases the GIL while it blocks, and the
         # BatchDoneCounter gates the consuming forward on the worker's completion.
-        # RAIDEN_ASYNC_H2D=0 selects the inline poll-to-complete path (for a
-        # raiden build that does not release the GIL on H2d).
-        self._async_h2d = os.environ.get("RAIDEN_ASYNC_H2D", "1") == "1"
+        # SGLANG_TPU_RAIDEN_ASYNC_H2D=0 selects the inline poll-to-complete path
+        # (for a raiden build that does not release the GIL on H2d).
+        self._async_h2d = envs.SGLANG_TPU_RAIDEN_ASYNC_H2D.get()
         self._load_worker = None
         if self._async_h2d:
             from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
@@ -50,6 +49,11 @@ class TpuRaidenHiCacheController(HiCacheController):
             self._load_worker = TpuKvCopyWorker("raiden-h2d")
 
     def reset(self):
+        # Drain outstanding D2H write-backs before the base clears the ack queue
+        # and HiRadixCache.reset() frees host pages: a page raiden is still
+        # writing must not return to the free list mid-DMA (silent corruption).
+        for ack in list(self.ack_write_queue):
+            ack.finish_event.synchronize()
         if self._load_worker is not None:
             self._load_worker.submit(lambda: None).synchronize()
         self.layer_done_counter.reset()
@@ -134,6 +138,11 @@ class TpuRaidenHiCacheController(HiCacheController):
                 ).synchronize()
 
             worker_done = self._load_worker.submit(_load)
+            # BatchDoneCounter has 2 slots, so round N reuses round N-2's slot and
+            # update_producer() synchronizes on it. Safe only because the single
+            # FIFO worker cannot dequeue round N's _load until round N-2's has
+            # returned, so round N-2's event is already complete. Parallelizing the
+            # worker or growing num_counters would break this invariant.
             self.layer_done_counter.set_event(producer_id, worker_done)
             self.ack_load_queue.append(
                 HiCacheAck(
