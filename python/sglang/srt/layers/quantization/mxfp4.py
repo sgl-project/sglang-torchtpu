@@ -480,7 +480,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
             )
-        else:
+        elif is_tpu():
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, mxfp4_block
             )

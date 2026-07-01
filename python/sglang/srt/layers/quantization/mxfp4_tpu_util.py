@@ -63,7 +63,8 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
-MXFP4_BLOCK_SIZE = 32  # HF MXFP4 spec; format-fixed
+# block size is always 32 for MXFP4
+MXFP4_BLOCK_SIZE = 32
 PACKING = 2  # two FP4 codes per uint8 byte
 # FP4 (e2m1) code → magnitude lookup (sign is the top bit).
 E2M1_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -206,6 +207,11 @@ def process_gpt_oss_mxfp4_weights_bf16(
     pad_n = (align_to - N_int % align_to) % align_to
 
     # w13: dequant (along K=hidden) → deinterleave gate/up → pad N → transpose.
+    # Deinterleave is unconditional: this is the GPT-OSS path and GPT-OSS uses
+    # SWIGLUOAI, whose HF checkpoint stores w13 interleaved as
+    # [gate_0, up_0, gate_1, up_1, ...]. (tpu-inference gates the equivalent on
+    # ``layer.activation == SWIGLUOAI`` because its path is generic; this one is
+    # gpt-oss-only, so the interleaved layout always holds.)
     w13 = _dequant_mxfp4_to_float(w13_packed, w13_scale)  # (E, 2N, hidden) bf16
     w13 = _deinterleave_axis1(w13)
     w13 = _pad_gate_up_halves_axis1(w13, N_int, pad_n)  # (E, 2*N_padded, hidden)
