@@ -181,16 +181,6 @@ class TileSizes:
     tile_n: int
 
 
-def _largest_aligned_divisor_at_most(size: int, limit: int, alignment: int) -> int:
-    """Return the largest aligned divisor of ``size`` that is <= ``limit``."""
-
-    limit = min(size, limit)
-    for candidate in range(limit - (limit % alignment), 0, -alignment):
-        if size % candidate == 0:
-            return candidate
-    return size
-
-
 def _largest_compact_scale_tile_n_at_most(
     size_n: int,
     limit: int,
@@ -1241,16 +1231,11 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-    if dims.size_n % tiles.tile_n != 0:
-        # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
-        # partial final N tile would read/write past the RHS/output buffers, so
-        # constrain N tiling to cleanly divide the logical output width.
-        tiles = dataclasses.replace(
-            tiles,
-            tile_n=_largest_aligned_divisor_at_most(
-                dims.size_n, tiles.tile_n, pltpu.get_tpu_info().num_lanes
-            ),
-        )
+    # A non-128-multiple N (e.g. GPT-OSS hidden = 2880) needs no caller padding:
+    # the output is over-allocated to a 128-aligned width and sliced back (see
+    # ``aligned_n`` below), and the partial final N tile's out-of-bounds RHS read
+    # is discarded because bounds checks are disabled — matching the tpu-inference
+    # kernel.
     if rhs_cfgs.has_scale and rhs_cfgs.scale_block_n != 1:
         compact_tile_n = _largest_compact_scale_tile_n_at_most(
             dims.size_n,

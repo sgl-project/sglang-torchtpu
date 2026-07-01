@@ -137,34 +137,6 @@ def _fuse_act_name(activation_name):
     return mapping[activation_name]
 
 
-def _align_n(rhs, rhs_scale, rhs_bias, align=128):
-    """Zero-pad the gmm_v2 output dim N up to a multiple of ``align`` (the TPU
-    sublane = 128), returning the padded tensors and the original N to slice
-    back.
-
-    gmm_v2 tiles the output N and requires ``tile_n`` to divide ``size_n``
-    (fixed-size BlockSpecs, bounds checks disabled). When ``size_n`` is not a
-    multiple of 128 (GPT-OSS hidden = 2880) NO 128-aligned tile divides it, so
-    the kernel raises ``Block size must divide tiling``.
-    """
-    import jax.numpy as jnp
-
-    n = rhs.shape[2]
-    pad = (-n) % align
-    if pad == 0:
-        return rhs, rhs_scale, rhs_bias, n
-    rhs = jnp.pad(rhs, ((0, 0), (0, 0), (0, pad)))
-    if rhs_scale is not None:
-        # [g, num_blocks, 1, n] — N is the last axis; pad with 1.0 (finite; the
-        # padded weights are 0 so the column contributes 0 regardless).
-        rhs_scale = jnp.pad(
-            rhs_scale, ((0, 0), (0, 0), (0, 0), (0, pad)), constant_values=1.0
-        )
-    if rhs_bias is not None:
-        rhs_bias = jnp.pad(rhs_bias, ((0, 0), (0, 0), (0, pad)))  # [g, 1, n]
-    return rhs, rhs_scale, rhs_bias, n
-
-
 def _fused_moe_jax(
     hidden_states,  # [m, k]
     w1,  # [g, k, 2 * n_intermediate]  bf16, OR [g, k/2, 2*n] uint8 (packed FP4)
@@ -272,11 +244,9 @@ def _fused_moe_jax(
         )
     # gmm1_out: [m*topk, n_intermediate]
 
-    # GMM2: project back to hidden size. Align the output N (= hidden) to a
-    # 128-multiple: gmm_v2 needs tile_n | size_n and no 128-aligned tile divides
-    # a non-128 N like 2880 (see _align_n). Sliced back to hidden after the call.
-    # (The contraction K needs no alignment — the kernel masks the partial K-tile.)
-    w2, w2_scale, w2_bias, n_hidden = _align_n(w2, w2_scale, w2_bias)
+    # GMM2: project back to hidden size. gmm_v2 handles a non-128-multiple N
+    # (GPT-OSS hidden = 2880) itself: it over-allocates the output to a
+    # 128-aligned width and slices back, so no caller-side padding is needed.
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -285,9 +255,7 @@ def _fused_moe_jax(
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
         tile_info=_lookup_tile_info(gmm1_out, w2, w2_scale, num_experts),
-    )[
-        :, :n_hidden
-    ]  # [m*topk, k]
+    )  # [m*topk, k]
 
     # Un-permute back to token-major order and reduce across the top-k
     # experts with the routing weights.
