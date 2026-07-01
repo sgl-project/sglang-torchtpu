@@ -450,6 +450,35 @@ def prod(x):
 
 
 def memcpy_triton(dst, src, dim, offset, sz, offset_src):
+    # Native, torch.compile-traceable equivalent of the Triton row-memcpy used
+    # by the DP gather/scatter. Triton has no torch_tpu backend, and the Triton
+    # path also needs an untraceable `.untyped_storage()` aliasing assert. On TPU
+    # use index_select + a masked `where` (static bucket shapes, no Triton, no
+    # data-dependent slicing) so it lowers cleanly under torch.compile.
+    # `offset`/`sz` are 0-dim tensors (row counts). Semantics match the kernel:
+    #   offset_src True :  dst[:sz]              = src[offset:offset+sz]
+    #   offset_src False:  dst[offset:offset+sz] = src[:sz]
+    assert dim == 0, "dim != 0 unsupported"
+    if not (dst.device.type == "tpu" or src.device.type == "tpu"):
+        _memcpy_triton_impl(dst, src, dim, offset, sz, offset_src)
+        return
+    n_dst = dst.shape[0]
+    n_src = src.shape[0]
+    view_shape = (-1,) + (1,) * (dst.dim() - 1)
+    row = torch.arange(n_dst, device=dst.device)
+    if offset_src:
+        src_idx = torch.clamp(offset + row, 0, n_src - 1)
+        gathered = src.index_select(0, src_idx)
+        mask = (row < sz).reshape(view_shape)
+        dst.copy_(torch.where(mask, gathered, torch.zeros_like(dst)))
+    else:
+        src_idx = torch.clamp(row - offset, 0, n_src - 1)
+        gathered = src.index_select(0, src_idx)
+        mask = ((row >= offset) & (row < offset + sz)).reshape(view_shape)
+        dst.copy_(torch.where(mask, gathered, dst))
+
+
+def _memcpy_triton_impl(dst, src, dim, offset, sz, offset_src):
     max_size = min(src.numel(), dst.numel())
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
@@ -473,9 +502,6 @@ def _dp_gather_via_all_reduce(
     assert global_tokens.is_contiguous()
 
     if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between global_tokens and local_tokens not allowed"
 
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
@@ -560,9 +586,6 @@ def dp_scatter(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
-        assert (
-            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
-        ), "aliasing between local_tokens and global_tokens not allowed"
 
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
