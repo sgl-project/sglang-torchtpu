@@ -1,4 +1,6 @@
 # Adapted from https://github.com/sgl-project/sglang-jax/blob/febb350c/python/sgl_jax/srt/kernels/ragged_paged_attention/ragged_paged_attention_v3.py
+# which was adapted from https://github.com/vllm-project/tpu-inference/releases/tag/v0.11.1
+# Copyright 2025 The tpu-inference Authors. All rights reserved.
 # Copyright 2025 The SGLang Team. All rights reserved.
 """TPU-Friendly Ragged Paged Attention kernel (v3).
 

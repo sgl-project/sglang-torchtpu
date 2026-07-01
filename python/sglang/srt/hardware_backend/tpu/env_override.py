@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU env-var overrides.
 
 Call ``apply_tpu_env_overrides()`` from TPU setup before ``torch_tpu`` is

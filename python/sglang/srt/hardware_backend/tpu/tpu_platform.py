@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU platform backend for SGLang SRT using torch_tpu.
 
 Implements the SRTPlatform interface so that SGLang can run inference

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU shape bucketing utilities for input compilation."""
 
 from __future__ import annotations

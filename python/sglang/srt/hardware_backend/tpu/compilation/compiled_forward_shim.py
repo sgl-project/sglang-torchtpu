@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU compiled-forward adaptation for bucketized static shapes.
 
 This module pads ForwardBatch tensors and Python-list metadata to

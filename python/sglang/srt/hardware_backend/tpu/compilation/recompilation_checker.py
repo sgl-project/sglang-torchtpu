@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Serving-time XLA recompilation detector for TPU.
 
 Detects new XLA program compilations after the precompilation phase is
