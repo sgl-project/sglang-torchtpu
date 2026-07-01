@@ -18,7 +18,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import require_mlp_tp_gather
+from sglang.srt.utils.common import is_tpu, require_mlp_tp_gather
+
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -180,10 +182,15 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
-        disable_overlap_schedule
-        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    if _is_tpu or (
+        len(offload_tags) == 0
+        and (
+            disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
     ):
+        # TPU (tpu_dist) has no CPU collective backend, so the MLP-sync
+        # all_gather must run on the device group regardless of overlap mode.
         group = tp_group.device_group
         device = tp_group.device
     else:
