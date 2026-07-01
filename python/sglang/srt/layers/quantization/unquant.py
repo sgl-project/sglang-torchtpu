@@ -758,13 +758,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_ids = topk_ids.to(torch.int32)
         topk_weights, topk_ids = mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
 
-        # Weights are already in gmm_v2's (num_experts, k, n) layout —
-        # the swap from SGLang's (num_experts, n, k) happens once in
-        # process_weights_after_loading above.
+        # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
+        # from SGLang's (num_experts, n, k) happens once in
+        # process_weights_after_loading above. Per-expert biases are optional:
+        # present for GPT-OSS (MXFP4 dequantized to bf16, which reuses this
+        # forward) and absent for plain-bf16 models like Qwen3, so read them via
+        # getattr (mirrors the XPU path).
         output = fused_moe_call(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
+            w1_bias=getattr(layer, "w13_weight_bias", None),
+            w2_bias=getattr(layer, "w2_weight_bias", None),
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             topk=int(topk_ids.shape[-1]),

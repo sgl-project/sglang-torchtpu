@@ -238,7 +238,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
-        # Hybrid-SWA models (e.g. GPT-OSS) keep two KV sub-pools and need a
+        # Hybrid-SWA models keep two KV sub-pools and need a
         # second page_indices tensor with indices translated into the SWA
         # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
         self._is_hybrid_swa = bool(getattr(model_runner, "is_hybrid_swa", False))

@@ -1120,14 +1120,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
         # config flag instead of unconditionally taking the BF16 triage path.
         if is_tpu():
-            from sglang.srt.hardware_backend.tpu.mxfp4_moe import apply_tpu_mxfp4_moe
-
-            return apply_tpu_mxfp4_moe(
-                layer=layer,
-                dispatch_output=dispatch_output,
-                activation=self.moe_runner_config.activation,
-                apply_router_weight_on_input=self.moe_runner_config.apply_router_weight_on_input,
+            # TODO(qinghan): support native packed-MXFP4 here
+            from sglang.srt.layers.quantization.unquant import (
+                UnquantizedFusedMoEMethod,
             )
+
+            return UnquantizedFusedMoEMethod.forward_tpu(self, layer, dispatch_output)
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
