@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/layers/common/quantization.py
 # Copyright 2025 Google LLC
-"""TPU FP8 dense linear helpers.
-
-"""
+"""TPU FP8 dense linear helpers."""
 
 import torch
 
