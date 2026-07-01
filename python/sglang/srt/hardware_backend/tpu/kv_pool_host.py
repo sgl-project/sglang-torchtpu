@@ -155,11 +155,11 @@ class TpuRaidenHostKVCache(HostKVCache):
 
     def _to_page_ids(self, token_indices: torch.Tensor) -> List[int]:
         """Whole-page token runs -> page ids, one per page, order preserved."""
-        ids = token_indices.cpu().numpy()
-        # Take the first token of each page-sized run; the runs are page-aligned
-        # and contiguous within a page by construction (see ``alloc``).
-        page_first = ids[:: self.page_size]
-        return (page_first // self.page_size).astype(np.int64).tolist()
+        # Indices are host-resident (raiden runs with SGLANG_TPU_HOST_R2T=1), so
+        # this is a pure host slice+divide. Take the first token of each
+        # page-sized run; the runs are page-aligned and contiguous within a page
+        # by construction (see ``alloc``).
+        return (token_indices[:: self.page_size] // self.page_size).tolist()
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend

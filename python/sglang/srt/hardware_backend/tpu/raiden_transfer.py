@@ -12,6 +12,7 @@ fused device KV buffer and raiden's DMA-pinned host pool, returning a pollable
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List
 
@@ -20,16 +21,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-def raiden_available() -> bool:
-    """True iff the raiden torch extension can be imported in this process.
-
-    Lazy: importing ``tpu_raiden`` pulls in torch_tpu's shared libraries, so it
-    must never run on a non-TPU host.
-    """
-    import importlib.util
-
-    return importlib.util.find_spec("tpu_raiden") is not None
+# Deadline for the blocking flush poll. A raiden DMA that never completes
+# (internal error, hang) raises past this instead of spinning the scheduler
+# thread forever. Override with RAIDEN_DMA_TIMEOUT_S.
+_DMA_TIMEOUT_S = float(os.environ.get("RAIDEN_DMA_TIMEOUT_S", "60"))
 
 
 class RaidenFutureEvent:
@@ -42,8 +37,7 @@ class RaidenFutureEvent:
     ``HiRadixCache.writing_check`` / ``loading_check``.
     """
 
-    # Poll interval for the blocking flush path. Matches the vLLM raiden
-    # handler's wait() cadence.
+    # Poll interval for the blocking flush path.
     _POLL_INTERVAL_S = 0.0005
 
     def __init__(self, future):
@@ -60,11 +54,17 @@ class RaidenFutureEvent:
 
         ``RaidenFuture.Await`` (``PJRT_Event_Await`` / ``xla::Future``
         ``BlockUntilReady``) can deadlock against the live model, so the flush
-        primitive spins like the vLLM disagg / offload poll path does.
+        primitive polls ``is_ready`` instead of awaiting. A DMA that never lands
+        raises ``TimeoutError`` past the deadline rather than spinning forever.
         """
         if self._future is None:
             return
+        deadline = time.monotonic() + _DMA_TIMEOUT_S
         while not self._future.is_ready():
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"raiden DMA did not complete within {_DMA_TIMEOUT_S}s"
+                )
             time.sleep(self._POLL_INTERVAL_S)
 
     def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
@@ -93,7 +93,7 @@ class RaidenKVTransfer:
         device_pool: "TpuFusedMHATokenToKVPool",
         num_host_pages: int,
     ):
-        from tpu_raiden.api.torch import kv_cache_manager as _kcm
+        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
 
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
@@ -105,8 +105,10 @@ class RaidenKVTransfer:
             [device_pool.get_fused_kv_buffer(device_pool.start_layer + i)]
             for i in range(self.layer_num)
         ]
-        self._mgr = _kcm._impl.KVCacheManager(
+        # Local offload has no control plane; port 0 opens no control listener.
+        self._mgr = KVCacheManager(
             self._device_tensors,
+            local_control_port=0,
             host_blocks_to_allocate=num_host_pages,
             unsafe_skip_buffer_lock=True,
         )
@@ -128,13 +130,12 @@ class RaidenKVTransfer:
         committed radix node, and the scheduler reads that batch's sampled
         tokens (``next_token_ids.tolist()``, fed by the whole forward graph)
         before triggering write-back, so the node's in-place KV writes are in
-        HBM by the time this runs. (vLLM's connector can store concurrently with
-        the forward, hence its ``D2h(wait_ready=True)``; sglang's write-back
-        cannot, so the order is already fixed.)
+        HBM by the time this runs. Write-back never runs concurrently with the
+        forward, so no explicit wait-ready on the DMA source is needed.
         """
         n = len(device_page_ids)
         assert n == len(host_page_ids)
-        fut = self._mgr.D2h(device_page_ids, host_page_ids, [1] * n)
+        fut = self._mgr.d2h(device_page_ids, host_page_ids, [1] * n)
         return RaidenFutureEvent(fut)
 
     def load(
@@ -143,5 +144,5 @@ class RaidenKVTransfer:
         """Host->device (H2D): load host pages back into the fused KV buffer."""
         n = len(host_page_ids)
         assert n == len(device_page_ids)
-        fut = self._mgr.H2d(host_page_ids, device_page_ids, [1] * n)
+        fut = self._mgr.h2d(host_page_ids, device_page_ids, [1] * n)
         return RaidenFutureEvent(fut)

@@ -3491,6 +3491,17 @@ class ServerArgs:
                 )
 
         if (
+            self.hicache_io_backend == "raiden"
+            and self.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "raiden io backend supports only L2 (TPU<->host) offload and has "
+                "no L3 storage path. Remove --hicache-storage-backend "
+                f"({self.hicache_storage_backend!r}) or choose a different "
+                "--hicache-io-backend."
+            )
+
+        if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
         ):
