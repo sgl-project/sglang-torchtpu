@@ -174,6 +174,9 @@ def _bare_manager(mode, pool, aux_tensors):
         m.transfer_infos = {}
         m.req_to_decode_prefix_len = {}
         m._push_pool = ThreadPoolExecutor(max_workers=2)
+        # Per-room push completion tracking (out-of-order-drain safe Success).
+        m._push_progress = {}
+        m._push_progress_lock = threading.Lock()
     else:
         m.decode_states = {}
         m.decode_states_lock = threading.Lock()
@@ -278,6 +281,67 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
         self.assertTrue(torch.equal(daux[0][2], paux[0][5]))
         self.assertEqual(decode.request_status[room], KVPoll.Success)
+
+    def test_out_of_order_chunks_wait_for_all(self):
+        """Regression: chunks are pushed by a pool of workers over parallel
+        channels, so the ``is_last`` chunk can arrive/scatter *before* an
+        earlier one. The decode must not conclude Success off ``is_last`` alone
+        — it waits until every page has landed. Here we deliver the last chunk
+        first and assert the room stays un-concluded until the first arrives."""
+        prefill, decode, ppool, dpool, paux, daux = self._make_pair()
+        room = 4040
+        src_pages = np.array([1, 2, 3, 8], dtype=np.int64)
+        dst_pages = np.array([10, 0, 6, 2], dtype=np.int64)
+        decode.register_decode_state(room, dst_pages, aux_index=2)
+        ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
+        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 4)}
+
+        # Push chunk 1 (pages [2:4], IS last, carries aux) FIRST, deliver + scatter.
+        prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
+        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+        # is_last scattered, but pages [0:2] have not arrived -> NOT Success yet.
+        self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
+
+        # Now the earlier chunk 0 (pages [0:2], not last) arrives.
+        prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
+        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+
+        self.assertEqual(decode.request_status[room], KVPoll.Success)
+        self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
+        self.assertTrue(torch.equal(daux[0][2], paux[0][5]))
+
+    def test_prefill_success_waits_for_all_pushes(self):
+        """Prefill counterpart: pushes run on ``_push_pool`` and can drain out of
+        order. The sender concludes Success only once the drained page count
+        reaches the room total, not when any single (e.g. last) push finishes."""
+        prefill, *_ = self._make_pair()
+        room = 5050
+        # Room total is 4 pages, delivered as two 2-page chunks.
+        prefill._note_push_submitted(room, total_pages=4)
+        prefill._note_push_submitted(room, total_pages=4)  # idempotent
+        # One chunk's push drains -> only 2/4 pages -> not complete yet.
+        prefill._note_push_done(room, n_pages=2)
+        self.assertNotEqual(prefill.request_status.get(room), KVPoll.Success)
+        # The other chunk's push drains -> 4/4 -> complete.
+        prefill._note_push_done(room, n_pages=2)
+        self.assertEqual(prefill.request_status[room], KVPoll.Success)
+
+    def test_prefill_failure_suppresses_late_success(self):
+        """If one chunk's push fails, a sibling push draining afterwards must
+        not overwrite the recorded failure with Success."""
+        prefill, *_ = self._make_pair()
+        room = 6060
+        prefill.request_status[room] = KVPoll.WaitingForInput
+        prefill._note_push_submitted(room, total_pages=4)
+        # A chunk fails (drops the progress entry + records Failed).
+        prefill._note_push_failed(room)
+        prefill.update_status(room, KVPoll.Failed)
+        # A sibling push drains afterwards: must be a no-op (entry gone), not
+        # resurrect the room as Success.
+        prefill._note_push_done(room, n_pages=2)
+        self.assertEqual(prefill.request_status[room], KVPoll.Failed)
 
     def test_parallel_channels_roundtrip(self):
         """#3: with N>1 channels the prefill shards layers across N parallel
@@ -527,6 +591,112 @@ class TestTpuTransferOnDevice(CustomTestCase):
                 self.assertTrue(torch.equal(a, b), f"prestaged layer {li} {sp}->{dp}")
         # scatter_stage_from_host released the pre-staged buffers back to the pool.
         self.assertTrue(pool._free[prestaged[0].nbytes])
+
+
+# --------------------------------------------------------------------------
+# 4. Manager staging path end-to-end on device (requires a TPU)
+#
+# The CPU protocol tests above always take the bytes fallback: their fake pool
+# is CPU, so gather_and_push / _recv_layers / process_decode_pending skip the
+# pooled-staging branch (guarded on ``device.type != "cpu"``). These tests drive
+# the *default production* data path through the manager on real device tensors:
+# pooled pinned staging + zero-copy send + one-copy recv + H2D scatter, plus the
+# async D2H gather (conn.py:280-284, gather_pages_to_stage_async) and the
+# parallel-channel zero-copy send — none of which were previously exercised.
+# --------------------------------------------------------------------------
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "Requires torch_tpu / a TPU device")
+class TestTpuKVManagerStagingOnDevice(CustomTestCase):
+    # 4 blocks (size/page_size), 4 layers so 2 channels shard 2 layers each.
+    POOL_KWARGS = dict(
+        size=128,
+        page_size=32,
+        dtype=torch.bfloat16,
+        head_num=2,
+        head_dim=128,
+        layer_num=4,
+        device="tpu",
+        enable_memory_saver=False,
+    )
+
+    def _make_device_pair(self, async_d2h, n_channels):
+        from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        src = TpuFusedMHATokenToKVPool(**self.POOL_KWARGS)
+        dst = TpuFusedMHATokenToKVPool(**self.POOL_KWARGS)
+        for buf in src.kv_buffer:
+            buf.copy_(
+                torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu")
+            )
+        # aux buffers stay on host (like MetadataBuffers); ctypes codec is CPU.
+        paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
+        daux = [torch.zeros(8, 16, dtype=torch.int32)]
+
+        prefill = _bare_manager(DisaggregationMode.PREFILL, src, paux)
+        decode = _bare_manager(DisaggregationMode.DECODE, dst, daux)
+        # Turn on the pooled-staging data path on both sides (what _init_prefill
+        # / _init_decode set in production; _bare_manager omits them).
+        prefill._stage_pool = PinnedHostPool()
+        prefill._async_d2h = async_d2h
+        prefill._n_channels = n_channels
+        prefill._chan_socks = {}
+        prefill._chan_socks_lock = threading.Lock()
+        decode._stage_pool = PinnedHostPool()
+        decode._chan_reasm = {}
+        decode._chan_reasm_lock = threading.Lock()
+        return prefill, decode, src, dst, paux, daux
+
+    def _recv_and_scatter(self, decode, n_channels, room):
+        if n_channels > 1:
+            for _ in range(n_channels):
+                decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        else:
+            decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+
+    def _run(self, async_d2h, n_channels):
+        prefill, decode, src, dst, paux, daux = self._make_device_pair(
+            async_d2h, n_channels
+        )
+        room = 700 + n_channels * 2 + int(async_d2h)
+        src_pages = np.array([0, 1, 2], dtype=np.int64)
+        dst_pages = np.array([2, 0, 1], dtype=np.int64)  # deliberately remapped
+        decode.register_decode_state(room, dst_pages, aux_index=3)
+        ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
+        n_pages = len(src_pages)
+        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, n_pages)}
+
+        prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        self._recv_and_scatter(decode, n_channels, room)
+
+        for li in range(len(src.kv_buffer)):
+            for sp, dp in zip(src_pages, dst_pages):
+                a = src.kv_buffer[li][sp].to("cpu").float()
+                b = dst.kv_buffer[li][dp].to("cpu").float()
+                self.assertTrue(torch.equal(a, b), f"layer {li} page {sp}->{dp}")
+        self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
+        self.assertEqual(decode.request_status[room], KVPoll.Success)
+        # Prove the pooled-staging branch actually ran (not the bytes fallback):
+        # scatter acquired + released StageBufs, so the pool holds free buffers.
+        self.assertTrue(
+            any(decode._stage_pool._free.values()),
+            "decode never used the staging pool -> took the bytes fallback",
+        )
+
+    def test_manager_staging_sync(self):
+        """Pooled staging + zero-copy send, synchronous D2H, single channel."""
+        self._run(async_d2h=False, n_channels=1)
+
+    def test_manager_staging_async(self):
+        """Async D2H gather (gather_pages_to_stage_async + conn.py:280 branch)."""
+        self._run(async_d2h=True, n_channels=1)
+
+    def test_manager_staging_async_channels(self):
+        """The full default production config: async D2H + 2 zero-copy channels
+        + pooled staging, reassembled across channels into the decode pages."""
+        self._run(async_d2h=True, n_channels=2)
 
 
 if __name__ == "__main__":

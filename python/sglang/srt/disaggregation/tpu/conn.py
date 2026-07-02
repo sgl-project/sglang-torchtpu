@@ -146,14 +146,26 @@ class _KvStats:
 
 class _DecodeTransferState:
     """Decode-side per-request bookkeeping (kept locally; never sent to
-    prefill). ``dst_page_indices`` are *this* process's block ids."""
+    prefill). ``dst_page_indices`` are *this* process's block ids; their count
+    (``num_pages``) is the full transfer size — the decode allocated exactly the
+    pages the prefill will send (the delta beyond any cached prefix) and handed
+    that count to the prefill in the bootstrap handshake, so both sides agree on
+    it up front.
 
-    __slots__ = ("dst_page_indices", "aux_index", "num_pages")
+    ``scattered_pages`` accumulates across chunks so we mark the room Success
+    only once *every* page has landed. Chunks are pushed by a pool of prefill
+    worker threads (``_PUSH_POOL_WORKERS``) over parallel channels and so can
+    arrive out of order; completion is a page count reaching ``num_pages``, not
+    an ``is_last`` marker (which could conclude early on a short last chunk).
+    See ``_note_push_*`` for the prefill-side completion counterpart."""
+
+    __slots__ = ("dst_page_indices", "aux_index", "num_pages", "scattered_pages")
 
     def __init__(self, dst_page_indices: np.ndarray, aux_index: Optional[int]):
         self.dst_page_indices = dst_page_indices
         self.aux_index = aux_index
         self.num_pages = len(dst_page_indices)
+        self.scattered_pages = 0
 
 
 class _PendingChunk:
@@ -163,12 +175,11 @@ class _PendingChunk:
     pinned staging by the recv thread — see ``_recv_layers``) or raw ``bytes``
     on the CPU fallback path. ``aux_blobs`` are always small ``bytes`` rows."""
 
-    __slots__ = ("index_start", "num_pages", "is_last", "layer_blobs", "aux_blobs")
+    __slots__ = ("index_start", "num_pages", "layer_blobs", "aux_blobs")
 
-    def __init__(self, index_start, num_pages, is_last, layer_blobs, aux_blobs):
+    def __init__(self, index_start, num_pages, layer_blobs, aux_blobs):
         self.index_start = index_start
         self.num_pages = num_pages
-        self.is_last = is_last
         self.layer_blobs = layer_blobs
         self.aux_blobs = aux_blobs
 
@@ -212,6 +223,12 @@ class TpuKVManager(TpuKVManagerBase):
         # Per-(endpoint, channel) PUSH sockets for the parallel path (#3).
         self._chan_socks: Dict[str, List] = {}
         self._chan_socks_lock = threading.Lock()
+        # Per-room push progress: {room: {"drained": int, "total": int}}.
+        # Chunk pushes run on a pool (_PUSH_POOL_WORKERS) and can drain out of
+        # order, so conclude Success by drained page count reaching the room
+        # total (not by an is_last push), mirroring the decode. See _note_push_*.
+        self._push_progress: Dict[int, dict] = {}
+        self._push_progress_lock = threading.Lock()
         self._start_prefill_thread()
 
     def _init_decode(self) -> None:
@@ -240,11 +257,42 @@ class TpuKVManager(TpuKVManagerBase):
     # ---- prefill side ---------------------------------------------------
 
     def _start_prefill_thread(self):
-        self._serve(TAG_TRSFR, self._handle_trsfr)
+        self._serve(TAG_TRSFR, self._handle_transfer)
 
     def _record_decode_endpoint(self, room: int, endpoint: str, num_pages: int):
         # Stash a full record so gather_and_push can read ``.decode_endpoint``.
         return _PrefillTransferInfo(room, endpoint, num_pages)
+
+    def _note_push_submitted(self, room: int, total_pages: int) -> None:
+        """Main thread: register the room's push-progress entry (with the total
+        page count agreed in the bootstrap handshake) before any push is
+        submitted, so a failing sibling can invalidate it and a worker can't
+        recreate a fresh one behind a recorded failure."""
+        with self._push_progress_lock:
+            if room not in self._push_progress:
+                self._push_progress[room] = {"drained": 0, "total": total_pages}
+
+    def _note_push_done(self, room: int, n_pages: int) -> None:
+        """Worker thread: a chunk push of ``n_pages`` pages drained. Conclude
+        Success once the drained page count reaches the room total — the same
+        known-total accounting as the decode's scatter side, so completion needs
+        no ``is_last`` marker and is immune to pushes draining out of order."""
+        with self._push_progress_lock:
+            ent = self._push_progress.get(room)
+            if ent is None:
+                return  # already failed/cleared
+            ent["drained"] += n_pages
+            done = ent["drained"] >= ent["total"]
+            if done:
+                self._push_progress.pop(room, None)
+        if done:
+            self.update_status(room, KVPoll.Success)
+
+    def _note_push_failed(self, room: int) -> None:
+        """A chunk push failed: drop the progress entry so a later-draining
+        sibling push can't then conclude Success over the recorded failure."""
+        with self._push_progress_lock:
+            self._push_progress.pop(room, None)
 
     def gather_and_push(
         self,
@@ -302,6 +350,10 @@ class TpuKVManager(TpuKVManagerBase):
                 aux_blobs = tpu_transfer.read_aux_row(self.kv_args, aux_index)
 
             endpoints = [info.decode_endpoint for info in bucket.values()]
+            # Register the room's total (from the handshake) before submitting,
+            # so a worker draining fast can't race the entry's creation.
+            total_pages = next(iter(bucket.values())).num_pages
+            self._note_push_submitted(room, total_pages)
             n_ch = getattr(self, "_n_channels", 1)
             if n_ch > 1:
                 # Parallel path (#3): shard the layers across N streams.
@@ -311,7 +363,6 @@ class TpuKVManager(TpuKVManagerBase):
                     endpoints,
                     index_start,
                     len(page_indices),
-                    is_last_chunk,
                     aux_blobs,
                     layer_frames,
                     stages,
@@ -324,7 +375,6 @@ class TpuKVManager(TpuKVManagerBase):
                     str(room).encode(),
                     str(index_start).encode(),
                     str(len(page_indices)).encode(),
-                    b"1" if is_last_chunk else b"0",
                     str(len(aux_blobs)).encode(),
                 ] + aux_blobs + layer_frames
                 self._push_pool.submit(
@@ -332,12 +382,13 @@ class TpuKVManager(TpuKVManagerBase):
                     room,
                     endpoints,
                     payload,
-                    is_last_chunk,
+                    len(page_indices),
                     stages,
                     d2h_future,
                 )
         except Exception as e:
             logger.exception("KV gather failed for room %s", room)
+            self._note_push_failed(room)
             self.record_failure(room, f"TPU KV gather failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
@@ -346,7 +397,7 @@ class TpuKVManager(TpuKVManagerBase):
         room: int,
         endpoints: List[str],
         payload: List,
-        is_last: bool,
+        n_pages: int,
         stages=None,
         d2h_future=None,
     ):
@@ -376,12 +427,14 @@ class TpuKVManager(TpuKVManagerBase):
             if stages is not None:
                 for st in stages:
                     st.release()
-            if is_last:
-                self.update_status(room, KVPoll.Success)
+            # Count this chunk's pages toward the room total; Success fires once
+            # every page has drained, regardless of push completion order.
+            self._note_push_done(room, n_pages)
         except Exception as e:
             # On failure don't recycle the buffers: zmq (copy=False) may still
             # hold them until its send drains — let GC reclaim them instead.
             logger.exception("KV push failed for room %s", room)
+            self._note_push_failed(room)
             self.record_failure(room, f"TPU KV push failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
@@ -402,7 +455,6 @@ class TpuKVManager(TpuKVManagerBase):
         endpoints: List[str],
         index_start: int,
         num_pages: int,
-        is_last: bool,
         aux_blobs: List[bytes],
         layer_frames: List,
         stages,
@@ -412,7 +464,7 @@ class TpuKVManager(TpuKVManagerBase):
         """Background thread (#3): send the chunk as ``n_ch`` messages over
         ``n_ch`` parallel sockets, each carrying a contiguous layer slice. Aux
         rides channel 0. Frame: ``[TAG_KVDATA_CH, room, index_start, num_pages,
-        is_last, ch, n_ch, layer_lo, num_layers, num_aux] + aux + layer_slice``."""
+        ch, n_ch, layer_lo, num_layers, num_aux] + aux + layer_slice``."""
         try:
             if d2h_future is not None:
                 d2h_future.wait()
@@ -430,7 +482,6 @@ class TpuKVManager(TpuKVManagerBase):
                         str(room).encode(),
                         str(index_start).encode(),
                         str(num_pages).encode(),
-                        b"1" if is_last else b"0",
                         str(ch).encode(),
                         str(n_ch).encode(),
                         str(lo).encode(),
@@ -450,10 +501,11 @@ class TpuKVManager(TpuKVManagerBase):
             if stages is not None:
                 for st in stages:
                     st.release()
-            if is_last:
-                self.update_status(room, KVPoll.Success)
+            # See _push: count this chunk's pages toward the room total.
+            self._note_push_done(room, num_pages)
         except Exception as e:
             logger.exception("KV channel push failed for room %s", room)
+            self._note_push_failed(room)
             self.record_failure(room, f"TPU KV channel push failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
@@ -522,15 +574,14 @@ class TpuKVManager(TpuKVManagerBase):
         bytes are copied once, straight into pinned staging (``_recv_layers``);
         NO device ops here — the H2D scatter happens on the main thread in
         process_decode_pending(). ``msg`` items are ``zmq.Frame``s (copy=False)."""
-        # [TAG, room, index_start, num_pages, is_last, num_aux] + aux + layers
+        # [TAG, room, index_start, num_pages, num_aux] + aux + layers
         room = int(bytes(msg[1]).decode())
         index_start = int(bytes(msg[2]).decode())
         num_pages = int(bytes(msg[3]).decode())
-        is_last = bytes(msg[4]) == b"1"
-        num_aux = int(bytes(msg[5]).decode())
-        aux_blobs = [bytes(f) for f in msg[6 : 6 + num_aux]]
-        layer_blobs = self._recv_layers(msg[6 + num_aux :])
-        chunk = _PendingChunk(index_start, num_pages, is_last, layer_blobs, aux_blobs)
+        num_aux = int(bytes(msg[4]).decode())
+        aux_blobs = [bytes(f) for f in msg[5 : 5 + num_aux]]
+        layer_blobs = self._recv_layers(msg[5 + num_aux :])
+        chunk = _PendingChunk(index_start, num_pages, layer_blobs, aux_blobs)
         with self.decode_pending_lock:
             self.decode_pending[room].append(chunk)
 
@@ -540,19 +591,18 @@ class TpuKVManager(TpuKVManagerBase):
         the complete chunk for the main-thread scatter (same as _handle_kvdata).
         Each channel's layer frames are copied once, straight into pinned staging
         (``_recv_layers``)."""
-        # [TAG, room, index_start, num_pages, is_last, ch, n_ch, lo, n_layers, num_aux]
+        # [TAG, room, index_start, num_pages, ch, n_ch, lo, n_layers, num_aux]
         room = int(bytes(msg[1]).decode())
         index_start = int(bytes(msg[2]).decode())
         num_pages = int(bytes(msg[3]).decode())
-        is_last = bytes(msg[4]) == b"1"
-        ch = int(bytes(msg[5]).decode())
-        n_ch = int(bytes(msg[6]).decode())
-        lo = int(bytes(msg[7]).decode())
-        n_layers = int(bytes(msg[8]).decode())
-        num_aux = int(bytes(msg[9]).decode())
-        aux_blobs = [bytes(f) for f in msg[10 : 10 + num_aux]]
+        ch = int(bytes(msg[4]).decode())
+        n_ch = int(bytes(msg[5]).decode())
+        lo = int(bytes(msg[6]).decode())
+        n_layers = int(bytes(msg[7]).decode())
+        num_aux = int(bytes(msg[8]).decode())
+        aux_blobs = [bytes(f) for f in msg[9 : 9 + num_aux]]
         # One copy: wire -> pinned staging (or bytes on the CPU fallback path).
-        staged = self._recv_layers(msg[10 + num_aux :])
+        staged = self._recv_layers(msg[9 + num_aux :])
 
         key = (room, index_start)
         complete = None
@@ -563,7 +613,6 @@ class TpuKVManager(TpuKVManagerBase):
                     "layers": [None] * n_layers,
                     "got": set(),
                     "aux": [],
-                    "is_last": is_last,
                     "num_pages": num_pages,
                 }
                 self._chan_reasm[key] = ent
@@ -580,7 +629,6 @@ class TpuKVManager(TpuKVManagerBase):
             chunk = _PendingChunk(
                 index_start,
                 complete["num_pages"],
-                complete["is_last"],
                 complete["layers"],
                 complete["aux"],
             )
@@ -590,7 +638,7 @@ class TpuKVManager(TpuKVManagerBase):
     def process_decode_pending(self, room: int) -> None:
         """Runs on the scheduler MAIN thread (from TpuKVReceiver.poll): drain
         any received chunks for ``room`` and scatter them H2D into the decode
-        KV pool. Marks the room Success once the last chunk lands. The device
+        KV pool. Marks the room Success once every page has landed. The device
         touch (index_copy_) is serialised with the forward loop."""
         with self.decode_pending_lock:
             pending = self.decode_pending.get(room)
@@ -650,11 +698,18 @@ class TpuKVManager(TpuKVManagerBase):
                         for b in chunk.layer_blobs
                     ),
                 )
-            if chunk.is_last:
-                if chunk.aux_blobs and state.aux_index is not None:
-                    tpu_transfer.write_aux_row(
-                        self.kv_args, state.aux_index, chunk.aux_blobs
-                    )
+            state.scattered_pages += chunk.num_pages
+            # Aux rides the prefill's last chunk only, so its presence — not an
+            # is_last flag — is the signal to write it.
+            if chunk.aux_blobs and state.aux_index is not None:
+                tpu_transfer.write_aux_row(
+                    self.kv_args, state.aux_index, chunk.aux_blobs
+                )
+            # Conclude only once every page has landed. The full count is known
+            # up front (the decode allocated exactly these pages and handshaked
+            # the count to the prefill), so completion doesn't depend on chunk
+            # ordering or an is_last marker.
+            if state.scattered_pages >= state.num_pages:
                 self.update_status(room, KVPoll.Success)
 
 
