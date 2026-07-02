@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Adapted from https://github.com/sgl-project/sglang-jax/blob/main/python/sgl_jax/srt/mem_cache/memory_pool.py
 """TPU fused KV cache pool used by the Pallas ragged-paged-attention backend.
 
 The Pallas v3 kernel expects KV cache laid out as a single 5D buffer per

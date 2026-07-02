@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Background KV-copy worker for the TPU HiCache offload data plane.
 
 A single-direction FIFO worker thread -- **one instance per transfer

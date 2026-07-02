@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU platform backend for SGLang SRT using torch_tpu.
 
 Implements the SRTPlatform interface so that SGLang can run inference
@@ -97,6 +98,19 @@ class TpuSRTPlatform(SRTPlatform):
         if server_args.mem_fraction_static is None:
             server_args.mem_fraction_static = 0.40
 
+        # raiden's load-back keeps the reloaded prefix's slot indices on CPU
+        # (TpuRaidenHiCacheController.load), so req_to_token must stay
+        # host-resident: a device-resident req_to_token would put the other
+        # nodes' prefix indices on device and mix devices in the prefix cat. Pin
+        # SGLANG_TPU_HOST_R2T=1 for raiden.
+        if server_args.hicache_io_backend == "raiden":
+            if os.environ.get("SGLANG_TPU_HOST_R2T") == "0":
+                logger.warning(
+                    "Overriding SGLANG_TPU_HOST_R2T=0 -> 1: the raiden KV-offload "
+                    "backend requires host-resident req_to_token."
+                )
+            os.environ["SGLANG_TPU_HOST_R2T"] = "1"
+
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
         # axis. SGLang's global page_size=1 default is valid for token-granular
@@ -168,6 +182,16 @@ class TpuSRTPlatform(SRTPlatform):
             MHATokenToKVPoolHost,
             TpuFusedMHATokenToKVPoolHost,
         )
+        from sglang.srt.server_args import get_global_server_args
+
+        # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the
+        # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
+        if get_global_server_args().hicache_io_backend == "raiden":
+            from sglang.srt.hardware_backend.tpu.kv_pool_host import (
+                TpuRaidenHostKVCache,
+            )
+
+            return TpuRaidenHostKVCache
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):
             return TpuFusedMHATokenToKVPoolHost
@@ -270,7 +294,10 @@ class TpuSRTPlatform(SRTPlatform):
         return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
-        return 0.0
+        if device is None:
+            device = self.get_device(0)
+        free, total = torch.accelerator.get_memory_info(device)
+        return float(total - free)
 
     def get_device(self, local_rank: int) -> torch.device:
         return torch.device("tpu", local_rank)

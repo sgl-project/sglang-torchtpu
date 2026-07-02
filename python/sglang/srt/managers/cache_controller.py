@@ -404,6 +404,12 @@ class HiCacheController:
         copy-worker threads instead of device streams)."""
         if kwargs.get("io_backend") == "torch_tpu":
             return TpuHiCacheController(*args, **kwargs)
+        if kwargs.get("io_backend") == "raiden":
+            from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
+                TpuRaidenHiCacheController,
+            )
+
+            return TpuRaidenHiCacheController(*args, **kwargs)
         return cls(*args, **kwargs)
 
     def get_attn_cp_rank_and_size(self) -> tuple[int, int]:

@@ -674,6 +674,9 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_HOST_R2T = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # raiden KV-offload backend
+    SGLANG_TPU_RAIDEN_ASYNC_H2D = EnvBool(True)
+    SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

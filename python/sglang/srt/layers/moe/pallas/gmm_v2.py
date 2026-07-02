@@ -1,14 +1,10 @@
-# Adapted from vllm-project/tpu-inference, the gmm_v2 kernel
-#   (tpu_inference/kernels/megablox/gmm_v2.py):
-#   https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/megablox/gmm_v2.py
-#
-# SGLang adaptations:
-#   - In-kernel fused activation (``fuse_act``: silu / gelu / swigluoai) added
-#     over the prior sglang-jax vendor; the Pallas fused-MoE bridge
-#     (``fused_moe_op.py``) passes ``fuse_act`` so the GMM1 gated activation
-#     runs in-kernel instead of as a separate JAX pass.
-#   - ``swigluoai`` activation support required for GPT-OSS.
-#   - Fused gate+up weight layout support.
+# Uses the latest torchtpu-vllm gmm_v2 kernel
+#   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
+# This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
+# swigluoai) and fused gate+up weight support over the prior sglang-jax vendor.
+# The Pallas fused-MoE bridge (``fused_moe_op.py``) passes ``fuse_act`` so the
+# GMM1 gated activation runs in-kernel instead of as a separate JAX pass.
+# The ``swigluoai`` activation in particular is required for GPT-OSS.
 #
 # Copyright 2026 Google LLC
 #

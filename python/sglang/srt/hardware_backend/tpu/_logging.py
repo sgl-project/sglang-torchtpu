@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """TPU logger factory.
 
 * Prefixes all logs with ``[TPU]`` for easy filtering.

@@ -3481,14 +3481,37 @@ class ServerArgs:
             self._resolve_layout_io_compatibility()
 
     def _resolve_layout_io_compatibility(self):
-        if self.hicache_io_backend == "torch_tpu":
-            # The TPU fused host pool only supports the "page_first_fused"
+        if self.hicache_io_backend in ("torch_tpu", "raiden"):
+            # The TPU fused host pool (torch_tpu) and raiden both mirror the fused
+            # device pool, which only supports the "page_first_fused" layout.
             if self.hicache_mem_layout != "page_first_fused":
                 raise ValueError(
-                    "torch_tpu io backend requires --hicache-mem-layout "
-                    f"page_first_fused, but got {self.hicache_mem_layout!r}. "
+                    f"{self.hicache_io_backend} io backend requires "
+                    "--hicache-mem-layout page_first_fused, but got "
+                    f"{self.hicache_mem_layout!r}. "
                     "Re-run with --hicache-mem-layout page_first_fused."
                 )
+
+        if (
+            self.hicache_io_backend == "raiden"
+            and self.hicache_storage_backend is not None
+        ):
+            raise ValueError(
+                "raiden io backend supports only L2 (TPU<->host) offload and has "
+                "no L3 storage path. Remove --hicache-storage-backend "
+                f"({self.hicache_storage_backend!r}) or choose a different "
+                "--hicache-io-backend."
+            )
+
+        if (
+            self.hicache_io_backend == "raiden"
+            and self.speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "raiden io backend does not support speculative decoding (draft "
+                "KV offload). Disable --speculative-algorithm or choose a "
+                "different --hicache-io-backend."
+            )
 
         if (
             self.hicache_mem_layout == "page_first_direct"
@@ -5906,9 +5929,10 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-io-backend",
             type=str,
-            choices=["direct", "kernel", "kernel_ascend", "torch_tpu"],
+            choices=["direct", "kernel", "kernel_ascend", "torch_tpu", "raiden"],
             default=ServerArgs.hicache_io_backend,
-            help="The IO backend for KV cache transfer between CPU and GPU",
+            help="The IO backend for KV cache transfer between CPU and GPU "
+            "('raiden' offloads TPU<->host via the raiden DMA engine)",
         )
         parser.add_argument(
             "--hicache-mem-layout",

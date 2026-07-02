@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Utility functions for ragged paged attention."""
 
 import jax
