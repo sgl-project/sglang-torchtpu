@@ -116,6 +116,32 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups):
     return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
 
 
+def _dividing_tile_k(base_tile_info):
+    """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
+    ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent).
+    """
+    import dataclasses
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import (
+        TileSizes,
+        _largest_aligned_divisor_at_most,
+    )
+
+    def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
+        if isinstance(base_tile_info, TileSizes):
+            tiles = base_tile_info
+        else:
+            tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+        if dims.size_k % tiles.tile_k != 0:
+            tiles = dataclasses.replace(
+                tiles,
+                tile_k=_largest_aligned_divisor_at_most(dims.size_k, tiles.tile_k, 128),
+            )
+        return tiles
+
+    return wrapped
+
+
 def _fuse_act_name(activation_name):
     """Map SGLang's activation name to gmm_v2's ``fuse_act`` string.
 
@@ -209,7 +235,6 @@ def _fused_moe_jax(
     )
 
     x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
-
     # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
     # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
     # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
@@ -228,6 +253,24 @@ def _fused_moe_jax(
             tile_n=min(896, int(w1.shape[2])),
         )
 
+    # Weights arrive lane-aligned from the loader (bf16: pad activations to
+    # match; quantized: unpadded-at-load dims are unsupported)
+    gmm1_tiling = _dividing_tile_k(gmm1_tile_info or calculate_tiling)
+    if w1_scale is None:
+        assert w1.shape[1] % 128 == 0, (
+            f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight "
+            "at load time (see mxfp4_tpu_util._k_pad_amount)"
+        )
+        if w1.shape[1] != hidden_size:
+            # activations are born at model width; zero-pad K to the
+            # load-padded weight's width (0 * w = 0, exact)
+            x_sorted = jnp.pad(x_sorted, ((0, 0), (0, w1.shape[1] - hidden_size)))
+    elif hidden_size % 128 != 0:
+        raise NotImplementedError(
+            f"Quantized MoE with non-lane-aligned hidden dim ({hidden_size}) "
+            "is unsupported: pad weights AND scales jointly at load time."
+        )
+
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
@@ -237,7 +280,7 @@ def _fused_moe_jax(
         preferred_element_type=out_dtype,
         # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
         # when fused); compact FP8 pins an unfused tile.
-        tile_info=gmm1_tile_info or calculate_tiling,
+        tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
     )
     if compact_block_scales:
@@ -246,9 +289,18 @@ def _fused_moe_jax(
         )
     # gmm1_out: [m*topk, n_intermediate]
 
-    # GMM2: project back to hidden size. gmm_v2 handles a non-128-multiple N
-    # (GPT-OSS hidden = 2880) itself: it over-allocates the output to a
-    # 128-aligned width and slices back, so no caller-side padding is needed.
+    # same padding
+    if w2_scale is not None and (
+        gmm1_out.shape[1] % 128 != 0 or hidden_size % 128 != 0
+    ):
+        raise NotImplementedError(
+            f"Quantized MoE with non-lane-aligned dims (intermediate "
+            f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
+            "pad weights AND scales jointly at load time."
+        )
+    gmm2_tiling = _dividing_tile_k(
+        _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts)
+    )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -256,8 +308,11 @@ def _fused_moe_jax(
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
         preferred_element_type=out_dtype,
-        tile_info=_lookup_tile_info(gmm1_out, w2, w2_scale, num_experts),
-    )  # [m*topk, k]
+        tile_info=gmm2_tiling,
+    )[
+        :,
+        :hidden_size,
+    ]  # [m*topk, k]
 
     # Un-permute back to token-major order and reduce across the top-k
     # experts with the routing weights.

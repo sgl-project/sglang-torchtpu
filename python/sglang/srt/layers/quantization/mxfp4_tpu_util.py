@@ -147,6 +147,28 @@ def _pad_last_axis(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
     )
 
 
+def _pad_axis1(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
+    """Append ``pad_amount`` zeros along axis 1 of a 3-D tensor."""
+    if pad_amount == 0:
+        return t
+    E, _, rest = t.shape
+    return torch.cat(
+        [t, torch.zeros((E, pad_amount, rest), dtype=t.dtype, device=t.device)],
+        dim=1,
+    )
+
+
+def _k_pad_amount(k: int, align: int = 128, pad_unit: int = 1024) -> int:
+    """Zero-pad amount for a gmm_v2 contraction dim.
+
+    gmm_v2 requires the contraction dim K to be a multiple of the TPU lane width (128).
+    """
+    if k % align == 0:
+        return 0
+    unit = pad_unit if k >= pad_unit else align
+    return (-k) % unit
+
+
 def process_mxfp4_moe_weights_bf16(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -158,10 +180,10 @@ def process_mxfp4_moe_weights_bf16(
     w13_interleaved: bool,
     align_to: int = 128,
 ) -> tuple[
-    torch.Tensor,  # w13_weight  (E, hidden, 2*N_int_padded)  bfloat16
-    torch.Tensor,  # w13_bias    (E, 1, 2*N_int_padded)       fp32
-    torch.Tensor,  # w2_weight   (E, N_int_padded, hidden)    bfloat16
-    torch.Tensor,  # w2_bias     (E, 1, hidden)               fp32
+    torch.Tensor,  # w13_weight  (E, hidden_K_padded, 2*N_int_padded)  bfloat16
+    torch.Tensor,  # w13_bias    (E, 1, 2*N_int_padded)                fp32
+    torch.Tensor,  # w2_weight   (E, N_int_padded, hidden_N_padded)    bfloat16
+    torch.Tensor,  # w2_bias     (E, 1, hidden_N_padded)               fp32
 ]:
     """Dequantize HF GPT-OSS MXFP4 weights to **bf16** in gmm_v2's (g, k, n)
     layout (the torchtpu-vllm "dequant at load" approach). Same layout as
@@ -189,6 +211,9 @@ def process_mxfp4_moe_weights_bf16(
     w13 = _pad_gate_up_halves_axis1(w13, N_int, pad_n)  # (E, 2*N_padded, hidden)
     w13 = w13.permute(0, 2, 1).contiguous()  # (E, hidden, 2*N_padded) bf16
 
+    # pad for irregular shape
+    w13 = _pad_axis1(w13, _k_pad_amount(hidden))  # (E, hidden_padded, 2*N_padded)
+
     w13_b = w13_bias
     if w13_interleaved:
         w13_b = _deinterleave_axis1(w13_b.unsqueeze(-1)).squeeze(-1)
@@ -204,7 +229,12 @@ def process_mxfp4_moe_weights_bf16(
     )  # (E, hidden, inter) bf16
     w2 = _pad_last_axis(w2, pad_n)  # (E, hidden, N_padded)
     w2 = w2.permute(0, 2, 1).contiguous()  # (E, N_padded, hidden) bf16
+
+    # pad for irregular shape
+    pad_n_out = (-hidden) % 128
+    w2 = _pad_last_axis(w2, pad_n_out)  # (E, N_padded, hidden_padded_out)
     w2_b = w2_bias.to(torch.float32).unsqueeze(1).contiguous()  # (E, 1, hidden)
+    w2_b = _pad_last_axis(w2_b, pad_n_out)  # (E, 1, hidden_padded_out)
 
     return w13, w13_b, w2, w2_b
 
