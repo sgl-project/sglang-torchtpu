@@ -82,6 +82,142 @@ def _zero_pad_1d(t: torch.Tensor, target_size: int) -> torch.Tensor:
     return F.pad(t, (0, target_size - t.shape[0]))
 
 
+def _dp_attn_select_bucket_shape(
+    forward_batch,
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    max_tokens_per_rank: int,
+    real_q: int,
+    real_b: int,
+) -> tuple[int, int]:
+    """Pick the padded (pad_t, pad_b) bucket every DP rank agrees on."""
+
+    is_decode = forward_batch.forward_mode.is_decode()
+    is_idle = forward_batch.forward_mode.is_idle()
+
+    group_is_decode = is_decode or (
+        is_idle and not getattr(forward_batch, "is_extend_in_batch", False)
+    )
+    if group_is_decode:
+        # Decode runs one query token per sequence, so the token axis equals
+        # the batch axis and both pad with the bs bucketer (decode graphs are
+        # precompiled at (bs, bs) shapes). pad_b also uses max_tokens_per_rank
+        # so the decode BATCH bucket is identical across ranks.
+        pad_t = b_bucketer.next_bucket(max(real_q, max_tokens_per_rank))
+        pad_b = b_bucketer.next_bucket(max(real_b, max_tokens_per_rank))
+    else:
+        # Extend always pads to the max batch bucket. Precompile mirrors this in
+        # DecoderTpuCompilePolicy._precompile_extend (which compiles extend only
+        # at b_bucketer.max_val), so the two must change together.
+        # TODO(wyzhang): Support multiple batch size buckets for extend/prefill.
+        pad_b = b_bucketer.max_val
+        pad_t = t_bucketer.next_bucket(max(real_q, max_tokens_per_rank, pad_b))
+    return pad_t, pad_b
+
+
+def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> None:
+    """Update the DP-attention state on forward_batch for the chosen bucket."""
+    from sglang.srt.layers.dp_attention import set_dp_buffer_len
+
+    dp_size = len(forward_batch.global_num_tokens_cpu)
+    device = forward_batch.input_ids.device
+
+    forward_batch.global_num_tokens_cpu = [pad_t] * dp_size
+    forward_batch.global_num_tokens_gpu = torch.full(
+        (dp_size,), pad_t, dtype=torch.int64, device=device
+    )
+    if forward_batch.global_num_tokens_for_logprob_cpu is not None:
+        forward_batch.global_num_tokens_for_logprob_cpu = [pad_b] * dp_size
+        forward_batch.global_num_tokens_for_logprob_gpu = torch.full(
+            (dp_size,), pad_b, dtype=torch.int64, device=device
+        )
+    # Clear cached local offsets so they recompute from the padded counts.
+    forward_batch.dp_local_start_pos = None
+    forward_batch.dp_local_num_tokens = None
+    forward_batch.global_dp_buffer_len = pad_t * dp_size
+    set_dp_buffer_len(pad_t * dp_size, pad_t, True, [pad_t] * dp_size)
+
+    # Pin is_prefill_only. An idle batch computes it as True (all() over zero
+    # requests) while real batches are False. The compiled forward reads this
+    # value, so it must be identical across all batches to avoid a serve-time
+    # recompile. Pinning False is safe because the flag only enables logprob
+    # capture and pooling, and TPU supports neither.
+    forward_batch.is_prefill_only = False
+
+
+def _dp_attn_compute_padding(
+    forward_batch,
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    real_q: int,
+    real_b: int,
+) -> tuple[int, int, int, int, int]:
+    """Compute the DP-attention padding (no side effects).
+
+    Every rank must run the same shape, so the bucket is chosen by taking the
+    max per-rank token count and padding up to the next bucket size. Returns
+    (pad_t, pad_b, real_q_out, real_b_out).
+    """
+    # TPU only supports the MAX_LEN layout: equal-length per-rank blocks.
+    # SUM_LEN is ragged and not supported on TPU.
+    if not forward_batch.dp_padding_mode.is_max_len():
+        raise NotImplementedError(
+            "TPU DP Attention supports DpPaddingMode.MAX_LEN only, but got "
+            f"{forward_batch.dp_padding_mode}."
+        )
+
+    from sglang.srt.layers.dp_attention import get_attention_dp_rank
+
+    dp_rank = get_attention_dp_rank()
+    # This rank's real live token count (used below for decode/idle real_q/b).
+    # global_num_tokens_cpu is padded.
+    # original_global_num_tokens_cpu is the pre-padding counts.
+    # Explicit None check (not `or`): a malformed empty list must fail at the
+    # bounds check below, not silently fall back to the padded counts.
+    real_counts = getattr(forward_batch, "original_global_num_tokens_cpu", None)
+    if real_counts is None:
+        real_counts = forward_batch.global_num_tokens_cpu
+    if not 0 <= dp_rank < len(real_counts):
+        raise RuntimeError(
+            f"DP rank {dp_rank} out of range for per-rank token counts "
+            f"(len {len(real_counts)})."
+        )
+    real_local_tokens = int(real_counts[dp_rank])
+
+    max_tokens_per_rank = max(forward_batch.global_num_tokens_cpu)
+    pad_t, pad_b = _dp_attn_select_bucket_shape(
+        forward_batch, t_bucketer, b_bucketer, max_tokens_per_rank, real_q, real_b
+    )
+
+    if forward_batch.forward_mode.is_decode() or forward_batch.forward_mode.is_idle():
+        # ForwardBatch.prepare_mlp_sync_batch (upstream, before this shim) already
+        # padded decode/idle shapes up to the cross-rank max.
+        real_q_out = real_b_out = real_local_tokens
+    else:
+        real_q_out, real_b_out = real_q, real_b
+
+    return pad_t, pad_b, real_q_out, real_b_out
+
+
+def _dp_attn_prepare_padding(
+    forward_batch,
+    t_bucketer: Bucketer,
+    b_bucketer: Bucketer,
+    real_q: int,
+    real_b: int,
+) -> tuple[int, int, int, int]:
+    """Compute the DP-attention padding and apply the DP-specific batch state.
+
+    Returns (pad_t, pad_b, real_q_out, real_b_out). the caller pads tensors to
+    the bucket sizes.
+    """
+    pad_t, pad_b, real_q_out, real_b_out = _dp_attn_compute_padding(
+        forward_batch, t_bucketer, b_bucketer, real_q, real_b
+    )
+    _dp_attn_apply_bucket_metadata(forward_batch, pad_t, pad_b)
+    return pad_t, pad_b, real_q_out, real_b_out
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -97,14 +233,23 @@ def _pad_forward_batch_inputs(
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
 
-    if is_decode:
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    if is_dp_attention_enabled():
+        # DP Attention needs all ranks to pad to the same bucket.
+        pad_t, pad_b, real_q_out, real_b_out = _dp_attn_prepare_padding(
+            forward_batch, t_bucketer, b_bucketer, real_q, real_b
+        )
+    elif is_decode:
         pad_t = b_bucketer.next_bucket(real_q)
         pad_b = b_bucketer.next_bucket(real_b)
+        real_q_out, real_b_out = real_q, real_b
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
         pad_b = b_bucketer.max_val
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
+        real_q_out, real_b_out = real_q, real_b
 
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
@@ -123,10 +268,21 @@ def _pad_forward_batch_inputs(
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
             setattr(forward_batch, field, _zero_pad_1d(val, pad_b))
 
+    # Normalize tensor/None values to padded lists so every extend batch
+    # presents the same type to the compiled graph (the precompile dummy uses
+    # lists, and DP attention derives tensors when converting decode batches
+    # to extend). Non-extend batches keep the upstream None.
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
-        if isinstance(val, list) and len(val) < pad_b:
-            setattr(forward_batch, field, val + [0] * (pad_b - len(val)))
+        if val is None:
+            if not forward_batch.forward_mode.is_extend():
+                continue
+            val = []
+        elif isinstance(val, torch.Tensor):
+            val = val.tolist()
+        if len(val) < pad_b:
+            val = val + [0] * (pad_b - len(val))
+        setattr(forward_batch, field, val)
 
     # mm_inputs is per request. Keep it aligned with padded extend_* CPU lists
     # so eager multimodal embedding code can index by batch position.
@@ -136,7 +292,7 @@ def _pad_forward_batch_inputs(
 
     forward_batch.batch_size = pad_b
 
-    return real_q, real_b
+    return real_q_out, real_b_out
 
 
 # Warming above this many pow2 blocks is correct but means warmup runs a
@@ -298,7 +454,9 @@ def resolve_compile_caps(
     return min(candidates), max_b
 
 
-def build_bucketers(server_args: Any, max_t: int, max_b: int) -> tuple[Bucketer, Bucketer]:
+def build_bucketers(
+    server_args: Any, max_t: int, max_b: int
+) -> tuple[Bucketer, Bucketer]:
     """Build token and batch size bucketers."""
     token_paddings = server_args.tpu_compile_tokens
     if token_paddings:

@@ -14,13 +14,14 @@ from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
-    CompiledForwardShim,
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    CompiledForwardShim,
     _pad_forward_batch_inputs,
     build_bucketers,
     resolve_compile_caps,
 )
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -134,11 +135,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
-        if (
-            self.model_runner is None
-            or self.owner is None
-            or self.method_name is None
-        ):
+        if self.model_runner is None or self.owner is None or self.method_name is None:
             logger.warning(
                 "[decoder compile policy] missing model_runner/owner/method; "
                 "cannot install."
@@ -197,6 +194,9 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
         self.model_runner.compiled_forward_shim = self
 
+        if is_dp_attention_enabled():
+            self._install_dp_idle_as_decode()
+
         logger.info(
             "[decoder compile policy] Installed %s on %s.%s "
             "(t-bucketer=%s, b-bucketer=%s).",
@@ -207,6 +207,30 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def _install_dp_idle_as_decode(self) -> None:
+        """Run idle DP batches as DECODE.
+
+        An idle rank may take a different code path than decode, but with DP
+        attention all ranks must run the same code. Relabel idle as DECODE.
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        model_runner = self.model_runner
+        # Idempotent: a re-install (tests, warmups) must not nest a second
+        # wrapper around an already-wrapped forward_idle.
+        if getattr(model_runner.forward_idle, "_tpu_idle_as_decode", False):
+            return
+        orig_forward_idle = model_runner.forward_idle
+
+        def forward_idle(forward_batch, pp_proxy_tensors=None):
+            if forward_batch.batch_size > 0 and is_dp_attention_enabled():
+                forward_batch.forward_mode = ForwardMode.DECODE
+                model_runner.model.prepare_forward_batch(forward_batch)
+            return orig_forward_idle(forward_batch, pp_proxy_tensors)
+
+        forward_idle._tpu_idle_as_decode = True
+        model_runner.forward_idle = forward_idle
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Forward serving-time recompilation checks to the installed shim."""
@@ -326,6 +350,11 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         forward_batch = args[2]
 
         model = self.model_runner.model
+        # Set the DP metadata before the pad shim runs, just like serving does,
+        # so precompile traces the same DP graph serving uses. Without it,
+        # precompile traces a different graph.
+        if is_dp_attention_enabled():
+            self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
@@ -337,6 +366,33 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
     def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
         return _unpad_decoder_outputs(out, forward_batch)
+
+    def _set_dp_attention_metadata(
+        self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
+    ) -> None:
+        """Set the DP metadata in the same way as serving.
+
+        Serving fills in the DP padding mode and global per-rank token counts
+        before the shim runs. Precompile must set the same values so the shim
+        traces the identical DP graph. All ranks compile the same bucket in
+        lockstep.
+        """
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+
+        dp_size = self.model_runner.server_args.dp_size
+        device = self.model_runner.device
+        global_num_tokens = [num_tokens] * dp_size
+        forward_batch.dp_padding_mode = DpPaddingMode.MAX_LEN
+        forward_batch.is_extend_in_batch = mode == ForwardMode.EXTEND
+        forward_batch.global_num_tokens_cpu = list(global_num_tokens)
+        forward_batch.original_global_num_tokens_cpu = list(global_num_tokens)
+        forward_batch.global_num_tokens_gpu = torch.tensor(
+            global_num_tokens, dtype=torch.int64, device=device
+        )
+        forward_batch.global_num_tokens_for_logprob_cpu = [bs] * dp_size
+        forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
+            [bs] * dp_size, dtype=torch.int64, device=device
+        )
 
     def _make_dummy_forward_batch(
         self, num_tokens: int, bs: int, mode: ForwardMode
@@ -422,9 +478,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
         outer = getattr(self.model_runner, "model", None)
         is_multimodal = hasattr(outer, "get_image_feature")
-        return is_multimodal and callable(
-            getattr(target, "get_input_embeddings", None)
-        )
+        return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
     def _precompile_extend(self) -> None:
         if not self._uses_input_embeds(self.owner):
@@ -552,11 +606,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         call_kwargs: dict[str, Any] = {}
         num_deepstack = self._num_deepstack
-        if (
-            variant == "deepstack"
-            and mode == ForwardMode.EXTEND
-            and num_deepstack > 0
-        ):
+        if variant == "deepstack" and mode == ForwardMode.EXTEND and num_deepstack > 0:
             call_kwargs["input_deepstack_embeds"] = torch.zeros(
                 input_embeds.shape[0],
                 input_embeds.shape[1] * num_deepstack,
@@ -574,9 +624,11 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 "input_ids=None, input_embeds=%s, input_deepstack_embeds=%s",
                 logged_variant,
                 tuple(input_embeds.shape),
-                tuple(call_kwargs["input_deepstack_embeds"].shape)
-                if "input_deepstack_embeds" in call_kwargs
-                else None,
+                (
+                    tuple(call_kwargs["input_deepstack_embeds"].shape)
+                    if "input_deepstack_embeds" in call_kwargs
+                    else None
+                ),
             )
 
         call_kwargs["input_embeds"] = input_embeds

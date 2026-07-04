@@ -954,8 +954,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
-                self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
-                self.extend_prefix_lens = self.seq_lens - 1
+                self.extend_seq_lens = torch.full_like(
+                    self.seq_lens, 1, dtype=torch.int32
+                )
+                self.extend_prefix_lens = (self.seq_lens - 1).to(torch.int32)
                 self.extend_start_loc = torch.arange(
                     bs, dtype=torch.int32, device=self.seq_lens.device
                 )

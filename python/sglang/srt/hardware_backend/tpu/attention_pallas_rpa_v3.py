@@ -355,6 +355,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             and (
                 forward_batch.forward_mode.is_decode()
                 or forward_batch.forward_mode.is_extend()
+                # IDLE batches can occur for DP-attention ranks with no requests.
+                # They must still run a dummy forward to stay in lockstep, join
+                # the cross-rank collectives, and take the same host metadata
+                # path as active decode/extend forwards.
+                or forward_batch.forward_mode.is_idle()
             )
         )
         if _host_ok:

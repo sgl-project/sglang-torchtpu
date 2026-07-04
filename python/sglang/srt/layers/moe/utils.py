@@ -14,9 +14,10 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -410,6 +411,10 @@ def should_use_dp_reduce_scatterv():
     with EP, replacing the default all-reduce + dp_scatter path.
     Only changes the combine (post-kernel) communication; dispatch is unchanged.
     """
+    if _is_tpu:
+        # TPU requires equal-sized per-rank distribution and does not support
+        # variable-length reduce_scatter.
+        return False
     return (
         not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()

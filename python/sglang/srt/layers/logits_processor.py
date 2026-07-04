@@ -56,11 +56,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_npu, is_tpu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @dataclasses.dataclass
@@ -200,7 +201,11 @@ class LogitsMetadata:
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.SUM_LEN,
+            # TPU requires equal-sized blocks and does not support variable
+            # length, so use MAX_LEN. GPU defaults to SUM_LEN.
+            dp_padding_mode=(
+                DpPaddingMode.MAX_LEN if _is_tpu else DpPaddingMode.SUM_LEN
+            ),
             mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
@@ -223,8 +228,13 @@ class LogitsMetadata:
         device = get_dp_device()
 
         if self.global_num_tokens_for_logprob_cpu is not None:
-            # create a smaller buffer to reduce peak memory usage
-            self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
+            if self.dp_padding_mode == DpPaddingMode.MAX_LEN:
+                dp_size = len(self.global_num_tokens_for_logprob_cpu)
+                self.global_dp_buffer_len = (
+                    max(self.global_num_tokens_for_logprob_cpu) * dp_size
+                )
+            else:
+                self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
 

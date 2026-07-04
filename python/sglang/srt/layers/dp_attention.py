@@ -29,7 +29,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip, is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -47,6 +47,7 @@ _LOCAL_ATTN_DP_RANK: Optional[int] = None
 _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
 
 
@@ -67,6 +68,11 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
+        # TPU requires static shapes and equal-length per-rank blocks. Only
+        # MAX_LEN is compatible with that.
+        if _is_tpu:
+            return DpPaddingMode.MAX_LEN
+
         dp_size = get_attention_dp_size()
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
@@ -552,6 +558,19 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
 ):
+    if _is_tpu:
+        # TPU supports MAX_LEN only (SUM_LEN is ragged and not supported by TPU)
+        assert forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN, (
+            "TPU DP scatter requires DpPaddingMode.MAX_LEN, got "
+            f"{forward_batch.dp_padding_mode}"
+        )
+        n = local_tokens.shape[0]
+        if n > 0:
+            rows = torch.arange(n, dtype=torch.int64, device=global_tokens.device)
+            idx = rows + get_attention_dp_rank() * n
+            local_tokens.copy_(global_tokens.index_select(0, idx))
+        return
+
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)

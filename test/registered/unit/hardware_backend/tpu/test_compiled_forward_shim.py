@@ -13,6 +13,8 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
+    _dp_attn_apply_bucket_metadata,
+    _dp_attn_select_bucket_shape,
     _matches_default,
     _pad_forward_batch_inputs,
     _static_default_kwargs,
@@ -23,7 +25,12 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+# Pure-logic tests: CPU tensors only, and the shim's import chain is
+# torch_tpu-free, so this runs on the CPU CI runner (no TPU required).
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _t(*vals, dtype=torch.int32):
@@ -42,6 +49,12 @@ class _ForwardModeMock:
 
     def is_decode(self):
         return self._mode == "decode"
+
+    def is_idle(self):
+        return self._mode == "idle"
+
+    def is_extend(self):
+        return self._mode == "extend"
 
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
@@ -65,6 +78,8 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         extend_logprob_start_lens_cpu=([0] * real_b if extend else None),
         forward_mode=_ForwardModeMock(mode),
         return_logprob=return_logprob,
+        dp_padding_mode=None,
+        global_num_tokens_cpu=None,
     )
 
 
@@ -144,6 +159,23 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertIs(fb.input_ids, orig_input_ids)
         self.assertIs(fb.seq_lens, orig_seq_lens)
+
+    def test_decode_cpu_list_fields_stay_none(self):
+        # Non-extend batches keep the upstream None for the extend_*_cpu
+        # lists. Consumers gate on forward_mode.is_extend(), and the decode
+        # precompile dummy also carries None.
+        fb = _forward_batch(real_t=2, real_b=2, mode="decode")
+        fb.extend_seq_lens_cpu = None
+        fb.extend_prefix_lens_cpu = None
+        fb.extend_logprob_start_lens_cpu = None
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertIsNone(fb.extend_seq_lens_cpu)
+        self.assertIsNone(fb.extend_prefix_lens_cpu)
+        self.assertIsNone(fb.extend_logprob_start_lens_cpu)
 
     def test_optional_fields_left_alone_when_none(self):
         # extend_* are None in DECODE; padder must not crash.
@@ -424,6 +456,97 @@ class TestResolveCompileCaps(CustomTestCase):
                 torch_compile_max_bs=4,
                 max_running_requests=4,
             )
+
+
+class TestDpAttnSelectBucketShape(CustomTestCase):
+    """Every DP rank must agree on the same (pad_t, pad_b) bucket."""
+
+    def _fb(self, mode, is_extend_in_batch=False):
+        return SimpleNamespace(
+            forward_mode=_ForwardModeMock(mode),
+            is_extend_in_batch=is_extend_in_batch,
+        )
+
+    def test_decode_uses_bs_bucketer_for_both_axes(self):
+        # decode BATCH bucket must be identical across ranks -> both axes use the
+        # bs bucketer seeded with the cross-rank max_tokens_per_rank.
+        t_b = _bucketer("Token", [16, 64])
+        b_b = _bucketer("Bs", [4, 8, 16])
+        pad_t, pad_b = _dp_attn_select_bucket_shape(
+            self._fb("decode"), t_b, b_b, max_tokens_per_rank=8, real_q=3, real_b=3
+        )
+        self.assertEqual((pad_t, pad_b), (8, 8))
+
+    def test_extend_pads_to_max_bs_bucket(self):
+        t_b = _bucketer("Token", [16, 64])
+        b_b = _bucketer("Bs", [4, 8, 16])
+        pad_t, pad_b = _dp_attn_select_bucket_shape(
+            self._fb("extend", is_extend_in_batch=True),
+            t_b,
+            b_b,
+            max_tokens_per_rank=8,
+            real_q=10,
+            real_b=3,
+        )
+        # pad_b is forced to the max bs bucket. pad_t is the next token bucket
+        # covering max(real_q, max_tokens_per_rank, pad_b).
+        self.assertEqual(pad_b, 16)
+        self.assertEqual(pad_t, 16)
+
+    def test_idle_without_extend_in_batch_is_decode_group(self):
+        t_b = _bucketer("Token", [16, 64])
+        b_b = _bucketer("Bs", [4, 8, 16])
+        pad_t, pad_b = _dp_attn_select_bucket_shape(
+            self._fb("idle", is_extend_in_batch=False),
+            t_b,
+            b_b,
+            max_tokens_per_rank=8,
+            real_q=1,
+            real_b=1,
+        )
+        # Treated as decode: both axes from the bs bucketer.
+        self.assertEqual((pad_t, pad_b), (8, 8))
+
+
+class TestDpAttnApplyBucketMetadata(CustomTestCase):
+    def _fb(self, dp_size=2):
+        return SimpleNamespace(
+            input_ids=torch.zeros(4, dtype=torch.int32),  # CPU -> device for gpu counts
+            global_num_tokens_cpu=[3] * dp_size,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_cpu=[3] * dp_size,
+            global_num_tokens_for_logprob_gpu=None,
+            dp_local_start_pos=torch.tensor([1]),
+            dp_local_num_tokens=torch.tensor([2]),
+            global_dp_buffer_len=0,
+            is_prefill_only=True,
+        )
+
+    def test_sets_uniform_padded_global_counts(self):
+        fb = self._fb(dp_size=2)
+        _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=16)
+        self.assertEqual(fb.global_num_tokens_cpu, [8, 8])
+        self.assertEqual(fb.global_num_tokens_gpu.tolist(), [8, 8])
+        self.assertEqual(fb.global_num_tokens_gpu.dtype, torch.int64)
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [16, 16])
+
+    def test_pins_is_prefill_only_false(self):
+        # An idle batch computes is_prefill_only=True. Pinning False keeps the
+        # guarded flag stable so the compiled logits processor never recompiles.
+        fb = self._fb()
+        _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
+        self.assertIs(fb.is_prefill_only, False)
+
+    def test_clears_cached_local_offsets(self):
+        fb = self._fb()
+        _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
+        self.assertIsNone(fb.dp_local_start_pos)
+        self.assertIsNone(fb.dp_local_num_tokens)
+
+    def test_global_buffer_len_is_pad_t_times_dp_size(self):
+        fb = self._fb(dp_size=4)
+        _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
+        self.assertEqual(fb.global_dp_buffer_len, 8 * 4)
 
 
 if __name__ == "__main__":
