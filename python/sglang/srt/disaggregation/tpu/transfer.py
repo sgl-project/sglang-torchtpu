@@ -222,8 +222,7 @@ def scatter_stage_from_host(layer_buffers, page_indices, layer_blobs, specs, poo
             st.copy_bytes(blob)
     try:
         host_srcs = [
-            st.view(dtype, (n_pages, *tail))
-            for st, (dtype, tail) in zip(stages, specs)
+            st.view(dtype, (n_pages, *tail)) for st, (dtype, tail) in zip(stages, specs)
         ]
         dev_shards = [
             torch.empty((n_pages, *tail), dtype=dtype, device=device)
@@ -323,9 +322,7 @@ def read_aux_row(kv_args, aux_index: int) -> List[bytes]:
 
 def write_aux_row(kv_args, aux_index: int, blobs: Sequence[bytes]) -> None:
     """Write aux buffer row ``aux_index`` into the decode MetadataBuffers."""
-    for ptr, item_len, blob in zip(
-        kv_args.aux_data_ptrs, kv_args.aux_item_lens, blobs
-    ):
+    for ptr, item_len, blob in zip(kv_args.aux_data_ptrs, kv_args.aux_item_lens, blobs):
         # Tolerate length drift defensively; both sides build MetadataBuffers
         # identically so this should always be an exact fit.
         n = min(item_len, len(blob))

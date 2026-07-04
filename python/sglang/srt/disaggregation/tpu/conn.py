@@ -52,11 +52,6 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
-from sglang.srt.disaggregation.tpu.host_staging import (
-    PinnedHostPool,
-    StageBuf,
-    default_pool_max_bytes,
-)
 
 # Re-exported from base so existing imports (and a future raiden backend)
 # keep resolving ``from ...tpu.conn import KVTransferError, _tcp_endpoint``.
@@ -68,6 +63,11 @@ from sglang.srt.disaggregation.tpu.base import (  # noqa: F401
     TpuKVReceiverBase,
     TpuKVSenderBase,
     _tcp_endpoint,
+)
+from sglang.srt.disaggregation.tpu.host_staging import (
+    PinnedHostPool,
+    StageBuf,
+    default_pool_max_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,7 @@ TAG_KVDATA_CH = b"KVDATAC"
 # to SGLANG_TPU_KV_CHANNELS (parallel streams *within* one transfer); the
 # effective stream count is this x channels. See _push / _push_channels.
 _PUSH_POOL_WORKERS = 4
+
 
 def _kv_stats_every() -> int:
     """How many transfers between logged latency summaries (0 disables).
@@ -370,13 +371,17 @@ class TpuKVManager(TpuKVManagerBase):
                     n_ch,
                 )
             else:
-                payload = [
-                    TAG_KVDATA,
-                    str(room).encode(),
-                    str(index_start).encode(),
-                    str(len(page_indices)).encode(),
-                    str(len(aux_blobs)).encode(),
-                ] + aux_blobs + layer_frames
+                payload = (
+                    [
+                        TAG_KVDATA,
+                        str(room).encode(),
+                        str(index_start).encode(),
+                        str(len(page_indices)).encode(),
+                        str(len(aux_blobs)).encode(),
+                    ]
+                    + aux_blobs
+                    + layer_frames
+                )
                 self._push_pool.submit(
                     self._push,
                     room,
@@ -477,17 +482,21 @@ class TpuKVManager(TpuKVManagerBase):
                 for ch in range(n_ch):
                     lo, hi = bounds[ch], bounds[ch + 1]
                     aux = aux_blobs if ch == 0 else []
-                    msg = [
-                        TAG_KVDATA_CH,
-                        str(room).encode(),
-                        str(index_start).encode(),
-                        str(num_pages).encode(),
-                        str(ch).encode(),
-                        str(n_ch).encode(),
-                        str(lo).encode(),
-                        str(n_layers).encode(),
-                        str(len(aux)).encode(),
-                    ] + aux + layer_frames[lo:hi]
+                    msg = (
+                        [
+                            TAG_KVDATA_CH,
+                            str(room).encode(),
+                            str(index_start).encode(),
+                            str(num_pages).encode(),
+                            str(ch).encode(),
+                            str(n_ch).encode(),
+                            str(lo).encode(),
+                            str(n_layers).encode(),
+                            str(len(aux)).encode(),
+                        ]
+                        + aux
+                        + layer_frames[lo:hi]
+                    )
                     sock = socks[ch]
                     with self._endpoint_locks[(endpoint, ch)]:
                         if copy_false:

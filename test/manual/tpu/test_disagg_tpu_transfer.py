@@ -378,7 +378,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # rooms by design).
         decode.request_status[room] = KVPoll.WaitingForInput
         # decode only has 2 dst pages but prefill will send 3
-        decode.register_decode_state(room, np.array([0, 1], dtype=np.int64), aux_index=0)
+        decode.register_decode_state(
+            room, np.array([0, 1], dtype=np.int64), aux_index=0
+        )
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
         prefill.gather_and_push(room, np.array([2, 5, 9], dtype=np.int64), 0, True, 1)
@@ -487,7 +489,9 @@ class TestTpuTransferOnDevice(CustomTestCase):
         src = TpuFusedMHATokenToKVPool(**kwargs)
         dst = TpuFusedMHATokenToKVPool(**kwargs)
         for buf in src.kv_buffer:
-            buf.copy_(torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu"))
+            buf.copy_(
+                torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu")
+            )
 
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
@@ -523,7 +527,9 @@ class TestTpuTransferOnDevice(CustomTestCase):
         src = TpuFusedMHATokenToKVPool(**kwargs)
         dst = TpuFusedMHATokenToKVPool(**kwargs)
         for buf in src.kv_buffer:
-            buf.copy_(torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu"))
+            buf.copy_(
+                torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu")
+            )
 
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
@@ -566,7 +572,9 @@ class TestTpuTransferOnDevice(CustomTestCase):
         src = TpuFusedMHATokenToKVPool(**kwargs)
         dst = TpuFusedMHATokenToKVPool(**kwargs)
         for buf in src.kv_buffer:
-            buf.copy_(torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu"))
+            buf.copy_(
+                torch.randn(buf.shape, dtype=torch.float32).to(buf.dtype).to("tpu")
+            )
 
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
@@ -575,7 +583,9 @@ class TestTpuTransferOnDevice(CustomTestCase):
         dst_pages = np.array([1, 0], dtype=np.int64)
 
         pool = PinnedHostPool()
-        blobs = [bytes(st.mv()) for st in T.gather_pages_to_stage(sbufs, src_pages, pool)]
+        blobs = [
+            bytes(st.mv()) for st in T.gather_pages_to_stage(sbufs, src_pages, pool)
+        ]
         # Mirror _recv_layers: copy each wire blob once into a pooled StageBuf.
         prestaged = [pool.acquire(len(b)) for b in blobs]
         for st, b in zip(prestaged, blobs):

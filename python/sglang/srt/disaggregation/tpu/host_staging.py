@@ -118,7 +118,9 @@ class PinnedHostPool:
     def __init__(self, max_bytes: Optional[int] = None):
         self._free: Dict[int, List[StageBuf]] = defaultdict(list)
         self._lock = threading.Lock()
-        self._max_bytes = max_bytes if max_bytes is not None else default_pool_max_bytes()
+        self._max_bytes = (
+            max_bytes if max_bytes is not None else default_pool_max_bytes()
+        )
         self._pooled_bytes = 0
         logger.debug(
             "PinnedHostPool: retention budget %.1f MiB (mlock=%s)",
@@ -131,7 +133,9 @@ class PinnedHostPool:
     def _mlock(self, buf: StageBuf) -> None:
         if _LIBC is None or buf._locked:
             return
-        rc = _LIBC.mlock(ctypes.c_void_p(buf._t.data_ptr()), ctypes.c_size_t(buf.nbytes))
+        rc = _LIBC.mlock(
+            ctypes.c_void_p(buf._t.data_ptr()), ctypes.c_size_t(buf.nbytes)
+        )
         buf._locked = rc == 0
 
     def _munlock(self, buf: StageBuf) -> None:
