@@ -201,11 +201,8 @@ class TestTpuPrefixCache(unittest.TestCase):
         self.assertEqual(out1, out2, "output changed after eviction (pool corruption)")
 
 
-# Extension of COUNT_LONG: same instruction + numbers, continued to 150 —
-# COUNT_LONG is a strict string prefix, so radix can match ~all of it.
 COUNT_EXT = _count_prompt(150)
-# Sub-window shared prefix (~97 gpt-oss tokens, comfortably < the 128-token
-# sliding window): on reuse, the *entire* cached prefix is inside the SWA window.
+
 SHORT_PREFIX = _count_prompt(30)
 SUF_A = " What single number comes next? Answer:"
 SUF_B = " List the next three numbers. Answer:"
@@ -217,14 +214,7 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
 
     Runs every scenario of :class:`TestTpuPrefixCache` against ``SWARadixCache``
     + the two-pool ``SWAKVPool`` (alternating sliding/full layers), then adds
-    window-boundary scenarios. This is the SWA + prefix-caching coverage
-    deferred from PR #15 review — gpt-oss serving has so far run with
-    ``--disable-radix-cache``, so this suite gates enabling radix there.
-
-    SWA-critical paths exercised: ``match_prefix`` window validity,
-    ``alloc_extend`` with a nonzero cached prefix (``last_loc`` →
-    ``translate_loc_from_full_to_swa`` with the host-resident mapping), and
-    tail-only SWA reuse when the cached prefix exceeds the window.
+    window-boundary scenarios.
 
     Usage (single class):
         SGLANG_PLATFORM=tpu TPU_VISIBLE_CHIPS=0 \
