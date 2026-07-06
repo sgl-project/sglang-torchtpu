@@ -147,28 +147,6 @@ def _pad_last_axis(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
     )
 
 
-def _pad_axis1(t: torch.Tensor, pad_amount: int) -> torch.Tensor:
-    """Append ``pad_amount`` zeros along axis 1 of a 3-D tensor."""
-    if pad_amount == 0:
-        return t
-    E, _, rest = t.shape
-    return torch.cat(
-        [t, torch.zeros((E, pad_amount, rest), dtype=t.dtype, device=t.device)],
-        dim=1,
-    )
-
-
-def _k_pad_amount(k: int, align: int = 128, pad_unit: int = 1024) -> int:
-    """Zero-pad amount for a gmm_v2 contraction dim.
-
-    gmm_v2 requires the contraction dim K to be a multiple of the TPU lane width (128).
-    """
-    if k % align == 0:
-        return 0
-    unit = pad_unit if k >= pad_unit else align
-    return (-k) % unit
-
-
 def process_mxfp4_moe_weights_bf16(
     w13_packed: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -211,8 +189,10 @@ def process_mxfp4_moe_weights_bf16(
     w13 = _pad_gate_up_halves_axis1(w13, N_int, pad_n)  # (E, 2*N_padded, hidden)
     w13 = w13.permute(0, 2, 1).contiguous()  # (E, hidden, 2*N_padded) bf16
 
-    # pad for irregular shape
-    w13 = _pad_axis1(w13, _k_pad_amount(hidden))  # (E, hidden_padded, 2*N_padded)
+    # requires K % 128 == 0 for gmm_v2 (the TPU lane width)
+    w13 = torch.nn.functional.pad(
+        w13, (0, 0, 0, (-hidden) % 128)
+    )  # pad K (axis 1) → (E, hidden_padded, 2*N_padded)
 
     w13_b = w13_bias
     if w13_interleaved:

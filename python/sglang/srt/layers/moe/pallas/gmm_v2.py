@@ -184,7 +184,10 @@ def _largest_aligned_divisor_at_most(size: int, limit: int, alignment: int) -> i
     for candidate in range(limit - (limit % alignment), 0, -alignment):
         if size % candidate == 0:
             return candidate
-    return size
+    raise ValueError(
+        f"no {alignment}-aligned divisor of {size} is <= {limit}; pad the dim "
+        "to an aligned, divisor-rich width at load time"
+    )
 
 
 def _largest_compact_scale_tile_n_at_most(

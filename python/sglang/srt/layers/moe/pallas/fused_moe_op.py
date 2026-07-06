@@ -258,8 +258,8 @@ def _fused_moe_jax(
     gmm1_tiling = _dividing_tile_k(gmm1_tile_info or calculate_tiling)
     if w1_scale is None:
         assert w1.shape[1] % 128 == 0, (
-            f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight "
-            "at load time (see mxfp4_tpu_util._k_pad_amount)"
+            f"gmm_v2 w1 K={w1.shape[1]} is not lane-aligned; pad the weight K "
+            "to a multiple of 128 at load time"
         )
         if w1.shape[1] != hidden_size:
             # activations are born at model width; zero-pad K to the
