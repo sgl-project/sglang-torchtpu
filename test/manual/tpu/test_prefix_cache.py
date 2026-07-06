@@ -34,7 +34,6 @@ Usage:
 import os
 import unittest
 
-MODEL = "Qwen/Qwen3-0.6B"
 PAGE_SIZE = 64
 MAX_NEW = 12
 POOL = 4096  # small KV pool so the same engine can be driven into eviction
@@ -95,6 +94,8 @@ def _gen_batch(engine, prompts, n=MAX_NEW):
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuPrefixCache(unittest.TestCase):
+    MODEL = "Qwen/Qwen3-0.6B"
+
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_PLATFORM"] = "tpu"
@@ -102,7 +103,7 @@ class TestTpuPrefixCache(unittest.TestCase):
 
         from transformers import AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(MODEL)
+        tok = AutoTokenizer.from_pretrained(cls.MODEL)
         assert len(tok.encode(COUNT_LONG)) >= 3 * PAGE_SIZE, (
             f"COUNT_LONG tokenizes to fewer than {3 * PAGE_SIZE} tokens; "
             "test_1 and test_5 assertions will always fail"
@@ -115,7 +116,7 @@ class TestTpuPrefixCache(unittest.TestCase):
         import sglang as sgl
 
         cls.engine = sgl.Engine(
-            model_path=MODEL,
+            model_path=cls.MODEL,
             device="tpu",
             tp_size=1,
             dtype="bfloat16",
@@ -198,6 +199,81 @@ class TestTpuPrefixCache(unittest.TestCase):
         out2, c2 = _gen(self.engine, COUNT_LONG)
         self.assertLess(c2, PAGE_SIZE, "expected COUNT_LONG to be evicted (cache miss)")
         self.assertEqual(out1, out2, "output changed after eviction (pool corruption)")
+
+
+# Extension of COUNT_LONG: same instruction + numbers, continued to 150 —
+# COUNT_LONG is a strict string prefix, so radix can match ~all of it.
+COUNT_EXT = _count_prompt(150)
+# Sub-window shared prefix (~97 gpt-oss tokens, comfortably < the 128-token
+# sliding window): on reuse, the *entire* cached prefix is inside the SWA window.
+SHORT_PREFIX = _count_prompt(30)
+SUF_A = " What single number comes next? Answer:"
+SUF_B = " List the next three numbers. Answer:"
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
+class TestTpuSwaPrefixCache(TestTpuPrefixCache):
+    """Prefix-cache correctness on a hybrid-SWA model (gpt-oss-20b, window=128).
+
+    Runs every scenario of :class:`TestTpuPrefixCache` against ``SWARadixCache``
+    + the two-pool ``SWAKVPool`` (alternating sliding/full layers), then adds
+    window-boundary scenarios. This is the SWA + prefix-caching coverage
+    deferred from PR #15 review — gpt-oss serving has so far run with
+    ``--disable-radix-cache``, so this suite gates enabling radix there.
+
+    SWA-critical paths exercised: ``match_prefix`` window validity,
+    ``alloc_extend`` with a nonzero cached prefix (``last_loc`` →
+    ``translate_loc_from_full_to_swa`` with the host-resident mapping), and
+    tail-only SWA reuse when the cached prefix exceeds the window.
+
+    Usage (single class):
+        SGLANG_PLATFORM=tpu TPU_VISIBLE_CHIPS=0 \
+            python test/manual/tpu/test_prefix_cache.py TestTpuSwaPrefixCache
+    """
+
+    MODEL = "openai/gpt-oss-20b"
+
+    @classmethod
+    def setUpClass(cls):
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(cls.MODEL)
+        cls.window = getattr(cfg, "sliding_window", None)
+        assert cls.window and cls.window >= 2 * PAGE_SIZE, (
+            f"expected a sliding window of >= 2 pages, got {cls.window}; "
+            "the window-boundary assertions below assume it"
+        )
+        super().setUpClass()
+
+    # (6) Extend from a cached prefix that exceeds the SWA window: the reused --
+    #     prefix's SWA KV is only valid for the tail window, and the extension
+    #     allocates with prefix_lens > 0 (full->swa last_loc translation).
+    def test_6_swa_extend_from_cached_prefix(self):
+        cold_ext, c0 = _gen(self.engine, COUNT_EXT)
+        self.assertEqual(c0, 0, "cold run after flush must not hit cache")
+        self.engine.flush_cache()
+        _gen(self.engine, COUNT_LONG)  # prime: caches a prefix > window
+        warm_ext, c1 = _gen(self.engine, COUNT_EXT)
+        self.assertGreaterEqual(
+            c1, self.window, "extension did not reuse a beyond-window prefix"
+        )
+        self.assertEqual(
+            warm_ext, cold_ext, "extending from a cached SWA prefix changed output"
+        )
+
+    # (7) Shared prefix shorter than the window: all of its SWA KV must be ----
+    #     in-window on reuse, and the result must not depend on the primer.
+    def test_7_swa_subwindow_shared_prefix(self):
+        target = SHORT_PREFIX + SUF_B
+        cold, c0 = _gen(self.engine, target)
+        self.assertEqual(c0, 0, "cold run after flush must not hit cache")
+        self.engine.flush_cache()
+        _gen(self.engine, SHORT_PREFIX + SUF_A)  # primer writes the prefix
+        warm, c1 = _gen(self.engine, target)
+        self.assertGreaterEqual(
+            c1, PAGE_SIZE, "target did not reuse the sub-window shared prefix"
+        )
+        self.assertEqual(warm, cold, "sub-window cached prefix KV depends on primer")
 
 
 if __name__ == "__main__":

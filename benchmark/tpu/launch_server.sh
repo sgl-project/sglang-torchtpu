@@ -325,7 +325,7 @@ args=(
     --attention-backend "$ATTENTION_BACKEND"
     --tp-size "$TP_SIZE"
     --grammar-backend none
-    --enable-torch-compile
+    $( [[ "${ENABLE_TORCH_COMPILE:-1}" == "1" ]] && echo --enable-torch-compile || true )
     --host "$HOST"
     --port "$PORT"
     --max-running-requests "$MAX_RUNNING"
