@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import print_warning_once
 
 
@@ -89,7 +90,15 @@ def _requantize_tpu_fp8_moe_block_to_channelwise(
     # stack is ~2GB at tp8/ep8 and OOMs the thin post-load HBM headroom. It's
     # exact because the channelwise scale is per-(expert, out-channel), so each
     # expert converts independently of the rest.
-    target_transient_bytes = 256 * 1024 * 1024  # ~256 MB float32 scratch / chunk
+    #
+    # Size the per-chunk scratch to a fraction of free HBM: headroom-rich setups
+    # get bigger chunks (fewer syncs -> faster load), tight ones stay small.
+    # Clamp to [256 MiB, 2 GiB] -- below 256 MiB the per-chunk sync overhead
+    # dominates; above 2 GiB risks the thin post-load headroom.
+    free_bytes = current_platform.get_available_memory()[0]
+    target_transient_bytes = int(
+        min(2 * 1024**3, max(256 * 1024**2, free_bytes // 4))
+    )
     for w_name, scale_inv_name in (
         ("w13_weight", "w13_weight_scale_inv"),
         ("w2_weight", "w2_weight_scale_inv"),
@@ -299,13 +308,10 @@ def prepare_tpu_fp8_moe_weights(
         _free_replaced_storage(old_w13_scale, layer.w13_weight_scale.data)
         _free_replaced_storage(old_w2_scale, layer.w2_weight_scale.data)
 
-    # Drain torch_tpu's deferred copy/dequant/free graph for this layer before
-    # returning. process_weights_after_loading runs this per MoE layer; without
-    # a per-layer sync the lazy transients (notably the float32 block->channelwise
-    # dequant buffers above) accumulate across all layers and spike HBM to OOM.
-    # This mirrors the load_weights-stream drain added in #105, which does not
-    # cover this post-load conversion path.
-    torch.tpu.synchronize()
+    # No per-layer drain here: the requantize loop above already syncs per
+    # expert-chunk (bounding the float32 dequant transient), and the loader
+    # drains once more via _drain_device_transients_after_module_load() right
+    # after this layer's process_weights_after_loading returns.
 
 
 def apply_tpu_fp8_moe(

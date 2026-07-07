@@ -137,7 +137,14 @@ RUN_DIR=${RUN_DIR:-./profile/${MODEL_SLUG}-tpu/$TS}
 
 ENABLE_HLO_DUMP=${ENABLE_HLO_DUMP:-0}
 ENABLE_TORCH_COMPILE_DEBUG=${ENABLE_TORCH_COMPILE_DEBUG:-0}
+# 1 (default) → pass --enable-torch-compile. Set 0 to run eager (debugging:
+# isolate compile bugs and allow .item() probes without graph breaks).
+ENABLE_TORCH_COMPILE=${ENABLE_TORCH_COMPILE:-1}
 ENABLE_PROFILER_ENDPOINT=${ENABLE_PROFILER_ENDPOINT:-1}
+# Optional JSON merged into the HF config via --json-model-override-args, e.g.
+# '{"vision_config":null,"audio_config":null}' to serve a multimodal checkpoint
+# text-only. Passed as one quoted argv element (see the args+= block below).
+JSON_MODEL_OVERRIDE=${JSON_MODEL_OVERRIDE:-}
 
 PROFILER_DIR=${PROFILER_DIR:-$RUN_DIR}
 HLO_DUMP_DIR=${HLO_DUMP_DIR:-./hlo_dump/${MODEL_SLUG}-tpu/$TS}
@@ -283,9 +290,6 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
 # scripts: with radix on, repeated synthetic prompts share a long prefix
 # and sglang short-circuits the prefill, hiding the larger-bucket compiles.
 DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
-# 1 (default) → pass --enable-torch-compile. Set 0 to run eager (debugging:
-# isolate compile bugs and allow .item() probes without graph breaks).
-ENABLE_TORCH_COMPILE=${ENABLE_TORCH_COMPILE:-1}
 
 echo "==== launch config ===="
 echo "  model              = $MODEL"

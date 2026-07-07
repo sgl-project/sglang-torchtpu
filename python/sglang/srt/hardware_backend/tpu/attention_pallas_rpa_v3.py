@@ -597,6 +597,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # with zeros so it occupies the qk-width slot; the padded value columns
         # contribute 0 to the attention output, which is sliced back to
         # v_head_dim after the kernel. ``F.pad`` is a no-op when qk == v.
+        #
+        # This is a correctness stopgap, not the end goal: it wastes
+        # (qk - v)/qk of the V cache and kernel V-bandwidth on zero columns. The
+        # goal is a kernel that reads V at its native v_head_dim so no padding
+        # (or output slicing) is needed; until then this keeps K==V width.
         if layer.v_head_dim < layer.qk_head_dim:
             v = torch.nn.functional.pad(v, (0, layer.qk_head_dim - layer.v_head_dim))
 

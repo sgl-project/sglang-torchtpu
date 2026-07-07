@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.platforms import current_platform
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -1500,11 +1501,11 @@ class MiMoV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        # Guard CUDA-only calls so EAGLE/MTP weight tying works on non-CUDA
-        # backends (e.g. TPU); torch.cuda.synchronize() raises without a driver.
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        # Settle device memory after weight tying via the platform abstraction
+        # (empty_cache + synchronize) so it works on any backend -- the raw
+        # torch.cuda.* calls raise on non-CUDA backends (e.g. TPU).
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is not None:

@@ -511,6 +511,21 @@ class ModelRunnerKVCacheMixin:
             # pool is the generic MLATokenToKVPool, so no TPU-specific class.
             PoolCls = current_platform.get_mha_kv_pool_cls()
             if self.is_hybrid_swa:
+                # ``head_num`` sizes the FULL-attention sub-pool. When the SWA
+                # layers have a different KV-head count (e.g. MiMo:
+                # num_key_value_heads=4 full vs swa_num_key_value_heads=8), the
+                # SWA sub-pool must be sized to the SWA count -- otherwise the
+                # Pallas kernel DMAs the SWA layer's K/V (swa heads) into a
+                # full-head-sized buffer and fails verification. Pass
+                # swa_head_num so the SWA sub-pool uses the SWA count. (Do NOT
+                # pass v_head_dim here: the fused KV buffer stores V padded to
+                # head_dim and the kernel DMAs at that width.) When the counts
+                # match (e.g. GPT-OSS) this is a no-op.
+                swa_head_num = max(
+                    1,
+                    self.model_config.hf_text_config.swa_num_key_value_heads
+                    // get_attention_tp_size(),
+                )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -520,6 +535,7 @@ class ModelRunnerKVCacheMixin:
                         get_attention_tp_size()
                     ),
                     head_dim=self.model_config.head_dim,
+                    swa_head_num=swa_head_num,
                     swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,

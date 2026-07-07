@@ -20,6 +20,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
+from sglang.srt.platforms import current_platform
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
@@ -387,11 +388,11 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        # Guard CUDA-only calls so EAGLE/MTP weight tying works on non-CUDA
-        # backends (e.g. TPU); torch.cuda.synchronize() raises without a driver.
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        # Settle device memory after weight tying via the platform abstraction
+        # (empty_cache + synchronize) so it works on any backend -- the raw
+        # torch.cuda.* calls raise on non-CUDA backends (e.g. TPU).
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = MiMoV2MTP
