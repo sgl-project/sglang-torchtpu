@@ -95,6 +95,7 @@ def _gen_batch(engine, prompts, n=MAX_NEW):
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuPrefixCache(unittest.TestCase):
     MODEL = "Qwen/Qwen3-0.6B"
+    EXTRA_ENGINE_KWARGS = {}
 
     @classmethod
     def setUpClass(cls):
@@ -125,6 +126,7 @@ class TestTpuPrefixCache(unittest.TestCase):
             mem_fraction_static=0.4,
             max_total_tokens=POOL,
             skip_server_warmup=True,
+            **cls.EXTRA_ENGINE_KWARGS,
         )
 
     @classmethod
@@ -207,6 +209,11 @@ SHORT_PREFIX = _count_prompt(30)
 SUF_A = " What single number comes next? Answer:"
 SUF_B = " List the next three numbers. Answer:"
 
+SWA_RATIO = 0.5  # swa pool = POOL * ratio; makes SWA the binding pool (test_10)
+# ~1924 tokens: overflows the 2048-token SWA pool (after COUNT_LONG is cached)
+# while the 4096-token full pool stays ~50% used -> SWA-only eviction pressure.
+BIG_DOC = "Article 99. " + ", ".join(str(90000 + j) for j in range(480)) + "."
+
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSwaPrefixCache(TestTpuPrefixCache):
@@ -214,7 +221,9 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
 
     Runs every scenario of :class:`TestTpuPrefixCache` against ``SWARadixCache``
     + the two-pool ``SWAKVPool`` (alternating sliding/full layers), then adds
-    window-boundary scenarios.
+    window-boundary, window-slide (tombstone), and SWA-pool-eviction scenarios.
+    Runs with ``swa_full_tokens_ratio=0.5`` so the SWA pool (2048 tok) is the
+    binding constraint, as in production.
 
     Usage (single class):
         SGLANG_PLATFORM=tpu TPU_VISIBLE_CHIPS=0 \
@@ -222,16 +231,32 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     """
 
     MODEL = "openai/gpt-oss-20b"
+    EXTRA_ENGINE_KWARGS = {"swa_full_tokens_ratio": SWA_RATIO}
 
     @classmethod
     def setUpClass(cls):
-        from transformers import AutoConfig
+        from transformers import AutoConfig, AutoTokenizer
 
         cfg = AutoConfig.from_pretrained(cls.MODEL)
         cls.window = getattr(cfg, "sliding_window", None)
         assert cls.window and cls.window >= 2 * PAGE_SIZE, (
             f"expected a sliding window of >= 2 pages, got {cls.window}; "
             "the window-boundary assertions below assume it"
+        )
+        # Decode length that provably slides the window past any prompt:
+        # decode-time eviction fires every `interval` (= window) tokens with a
+        # window+page margin, so LONG_NEW >= interval + window + 2*page suffices.
+        cls.LONG_NEW = 3 * cls.window + PAGE_SIZE
+
+        # BIG_DOC must overflow the SWA pool even after decode-time
+        # self-eviction, yet fit in it alone (with room to decode).
+        swa_pool = int(POOL * SWA_RATIO)
+        n_big = len(AutoTokenizer.from_pretrained(cls.MODEL).encode(BIG_DOC))
+        assert (
+            swa_pool - cls.window - PAGE_SIZE < n_big <= swa_pool - PAGE_SIZE - MAX_NEW
+        ), (
+            f"BIG_DOC tokenizes to {n_big}; test_10 needs it in "
+            f"({swa_pool - cls.window - PAGE_SIZE}, {swa_pool - PAGE_SIZE - MAX_NEW}]"
         )
         super().setUpClass()
 
@@ -264,6 +289,42 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
             c1, PAGE_SIZE, "target did not reuse the sub-window shared prefix"
         )
         self.assertEqual(warm, cold, "sub-window cached prefix KV depends on primer")
+
+    # (8) Decode past the window: the prompt's SWA KV is tombstoned mid-decode.
+    #     A re-query must NOT reuse the tombstoned prefix (match-past-tombstone
+    #     gate) and must recompute bit-identically (no corruption from free_swa).
+    def test_8_swa_window_slide_long_decode(self):
+        out1, _ = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        self.assertTrue(out1, "long decode returned empty")
+        out2, c2 = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        self.assertLess(c2, PAGE_SIZE, "reused a tombstoned (window-slid) prefix")
+        self.assertEqual(out2, out1, "recompute after window slide changed output")
+
+    # (9) Match past a tombstone: the cached sequence is tombstoned-head +
+    #     live tail >= window, so extending it MAY reuse across the tombstone
+    #     and must equal a cold full recompute.
+    def test_9_swa_match_past_tombstone(self):
+        out1, _ = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        ext = COUNT_LONG + out1
+        warm, cw = _gen(self.engine, ext)
+        self.engine.flush_cache()
+        cold, c0 = _gen(self.engine, ext)
+        self.assertEqual(c0, 0, "cold run after flush must not hit cache")
+        self.assertGreaterEqual(
+            cw, self.window, "extension did not reuse across the tombstone"
+        )
+        self.assertEqual(warm, cold, "reuse across a tombstone changed output")
+
+    # (10) SWA-pool-bound eviction: BIG_DOC overflows only the SWA pool, so ---
+    #      swa-LRU eviction (not full-pool eviction) must reclaim COUNT_LONG;
+    #      the requery must miss and recompute identically.
+    def test_10_swa_pool_bound_eviction(self):
+        out1, _ = _gen(self.engine, COUNT_LONG)
+        txt, _ = _gen(self.engine, BIG_DOC)
+        self.assertTrue(txt, "SWA-pool-overflow request returned empty")
+        out2, c2 = _gen(self.engine, COUNT_LONG)
+        self.assertLess(c2, PAGE_SIZE, "expected SWA-pool eviction of COUNT_LONG")
+        self.assertEqual(out2, out1, "output changed after SWA-pool eviction")
 
 
 if __name__ == "__main__":
