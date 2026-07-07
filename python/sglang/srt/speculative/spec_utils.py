@@ -257,9 +257,11 @@ def _assign_req_to_token_pool_torch(
     """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
     if batch_size == 0:
         return
-    req_pool_indices = req_pool_indices[:batch_size]
-    start_offset = start_offset[:batch_size]
-    end_offset = end_offset[:batch_size]
+    device = req_to_token.device
+    req_pool_indices = req_pool_indices[:batch_size].to(device)
+    start_offset = start_offset[:batch_size].to(device)
+    end_offset = end_offset[:batch_size].to(device)
+    out_cache_loc = out_cache_loc.to(device)
     lengths = end_offset - start_offset
     # Use the KV pool width as a safe upper bound for max_len to avoid
     # a host-device sync from torch.max().item().
@@ -469,9 +471,9 @@ def _assign_draft_cache_locs_torch(
     # Out-of-bounds safety: cols stay within req_to_token.shape[1] because
     # the KV pool allocator guarantees seq_lens + copy_len <= pool width.
     offsets = torch.arange(copy_len, device=device, dtype=seq_lens.dtype)
-    rows = req_pool_indices[:, None]  # (bs, 1)
-    cols = seq_lens[:, None] + offsets[None, :]  # (bs, copy_len)
-    src = out_cache_loc.view(batch_size, copy_len).to(req_to_token.dtype)
+    rows = req_pool_indices.to(device)[:, None]  # (bs, 1)
+    cols = seq_lens.to(device)[:, None] + offsets[None, :]  # (bs, copy_len)
+    src = out_cache_loc.view(batch_size, copy_len).to(device).to(req_to_token.dtype)
     req_to_token[rows, cols] = src
 
 

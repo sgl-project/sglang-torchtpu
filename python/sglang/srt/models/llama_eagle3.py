@@ -270,8 +270,14 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 layer.self_attn.attn.sliding_window_size = self._draft_window_size
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
+        #
+        # A reduced-vocab EAGLE3 draft must NOT tie lm_head to embed_tokens.
+        has_reduced_draft_vocab = (
+            config.draft_vocab_size is not None
+            and config.draft_vocab_size != config.vocab_size
+        )
         self.load_lm_head_from_target = False
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings and not has_reduced_draft_vocab:
             self.lm_head = self.model.embed_tokens
         else:
             if config.draft_vocab_size is None:

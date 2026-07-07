@@ -79,7 +79,7 @@ def main(args):
     rets = answer_mt_bench.run_batch(
         arguments,
         temperature=0,
-        max_new_tokens=2048,
+        max_new_tokens=args.max_new_tokens,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -140,5 +140,6 @@ if __name__ == "__main__":
     parser.add_argument("--question-file", type=str, default="question.jsonl")
     parser.add_argument("--answer-file", type=str, default=None)
     parser.add_argument("--num-questions", type=int, default=80)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     args = add_common_sglang_args_and_parse(parser)
     main(args)

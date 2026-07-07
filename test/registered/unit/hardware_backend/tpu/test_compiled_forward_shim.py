@@ -56,6 +56,9 @@ class _ForwardModeMock:
     def is_extend(self):
         return self._mode == "extend"
 
+    def is_target_verify(self):
+        return self._mode == "target_verify"
+
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
@@ -80,6 +83,8 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         return_logprob=return_logprob,
         dp_padding_mode=None,
         global_num_tokens_cpu=None,
+        # Real ForwardBatch always carries spec_info (None when not spec).
+        spec_info=None,
     )
 
 
@@ -132,6 +137,23 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [3, 3, 3, 0])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
+        self.assertEqual(fb.batch_size, 4)
+
+    def test_target_verify_pins_token_dim_to_draft_token_num(self):
+        # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:
+        # the extend branch would over-pad it up to the nearest token bucket.
+        fb = _forward_batch(real_t=8, real_b=2, mode="target_verify")  # bs=2, dtn=4
+        fb.spec_info = SimpleNamespace(draft_token_num=4)
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64, 128]),  # must NOT be used for verify
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (8, 2))
+        # pad_b = max_val = 4; pad_t = 4 * draft_token_num(4) = 16, not 64.
+        self.assertEqual(fb.input_ids.shape[0], 16)
+        self.assertEqual(fb.positions.shape[0], 16)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.batch_size, 4)
 
     def test_decode_uses_bs_bucketer_for_tokens(self):
@@ -355,6 +377,18 @@ class TestBuildBucketers(CustomTestCase):
         t_b, b_b = build_bucketers(sa, max_t=2048, max_b=16)
         self.assertEqual(t_b.buckets, [64, 512])
         self.assertEqual(b_b.buckets, [1, 2])
+
+    def test_token_buckets_above_max_t_dropped(self):
+        # Token buckets feed only the EXTEND path, which never exceeds max_t
+        # (chunked-prefill / context cap), so buckets above it are dropped --
+        # they would compile dead shapes serving can't reach.
+        sa = self._server_args(tpu_compile_tokens=[64, 512, 2048, 4096])
+        t_b, _ = build_bucketers(sa, max_t=2048, max_b=8)
+        self.assertEqual(t_b.buckets, [64, 512, 2048])  # 4096 dropped
+        # If every user bucket is above the cap, fall back to max_t itself.
+        sa2 = self._server_args(tpu_compile_tokens=[4096])
+        t_b2, _ = build_bucketers(sa2, max_t=2048, max_b=8)
+        self.assertEqual(t_b2.buckets, [2048])
 
     def test_falls_back_to_power_bucketer_when_unset(self):
         # min_val hardcoded: 64 (T), 1 (B).

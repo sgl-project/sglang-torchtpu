@@ -768,15 +768,18 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
+            # Multi-step draft decode: shape the batch for the compiled forward
+            # before building attention metadata (no-op off compile).
             if (
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
             ):
-                # Skip attention backend init for idle mode or 1-step draft
+                self.draft_model_runner.pad_spec_draft_decode(forward_batch)
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-            # Run forward steps
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens = (
+                self.draft_model_runner.unpad_spec_draft_outputs(
+                    self.draft_forward(forward_batch), forward_batch
+                )
             )
 
         if batch.forward_mode.is_idle():

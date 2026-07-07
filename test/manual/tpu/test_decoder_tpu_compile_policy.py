@@ -11,7 +11,13 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _materialize_out,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    SpecDecoderTpuCompilePolicy,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -225,6 +231,191 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
+
+
+def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
+    """ModelRunner stand-in with the spec config SpecDecoderTpuCompilePolicy reads."""
+    return SimpleNamespace(
+        device=device,
+        model=SimpleNamespace(
+            forward=MagicMock(),
+            prepare_forward_batch=MagicMock(),
+        ),
+        attn_backend=_FakeAttnBackend(),
+        # _run_one seeds req_to_token row 1; needs a real indexable tensor.
+        req_to_token_pool=SimpleNamespace(
+            req_to_token=torch.zeros(4, 4096, dtype=torch.int64)
+        ),
+        token_to_kv_pool=SimpleNamespace(),
+        model_config=SimpleNamespace(hidden_size=16),
+        is_draft_worker=is_draft_worker,
+        server_args=SimpleNamespace(
+            speculative_num_steps=num_steps,
+            # topk=1 chain: verify width == num_steps + 1.
+            speculative_num_draft_tokens=num_steps + 1,
+            speculative_algorithm="EAGLE3",
+            speculative_eagle_topk=1,
+        ),
+    )
+
+
+def _make_spec_policy(
+    model_runner=None, token_buckets=(8, 64), bs_buckets=(1, 4), **mr_kwargs
+):
+    if model_runner is None:
+        model_runner = _spec_model_runner(**mr_kwargs)
+    return SpecDecoderTpuCompilePolicy(
+        model_runner=model_runner,
+        t_bucketer=Bucketer(name="Token", buckets=list(token_buckets)),
+        b_bucketer=Bucketer(name="Bs", buckets=list(bs_buckets)),
+        owner=model_runner.model,
+    )
+
+
+class TestSpecPrecompileLoops(CustomTestCase):
+    """Target spec precompile fires EXTEND + DECODE + TARGET_VERIFY +
+    EXTEND(FULL); the draft worker skips precompile entirely."""
+
+    def test_target_precompiles_all_spec_modes(self):
+        mr = _spec_model_runner(num_steps=3)  # draft_token_num = 4
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
+        # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
+        # in spec_decode_compile_policy. Patch the rank helper in both.
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy.precompile()
+        # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
+        # TARGET_VERIFY buckets bs: (4,1),(16,4)=2  EXTEND(FULL) 2
+        self.assertEqual(mr.model.forward.call_count, 8)
+        self.assertIn((16, 4), mr.attn_backend.calls)
+        self.assertIn((4, 1), mr.attn_backend.calls)
+
+    def test_draft_worker_skips_precompile(self):
+        mr = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(mr)
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy.precompile()
+        self.assertEqual(mr.model.forward.call_count, 0)
+        self.assertEqual(mr.attn_backend.calls, [])
+
+    def test_non_eagle3_algorithm_raises(self):
+        # The spec policy enforces the supported algorithm at construction (only
+        # EAGLE3 today); an unsupported algorithm fails loudly rather than
+        # silently degrading to a non-spec policy.
+        mr = _spec_model_runner()
+        mr.server_args.speculative_algorithm = "NGRAM"
+        with self.assertRaisesRegex(ValueError, "only supports EAGLE3"):
+            _make_spec_policy(mr)
+
+
+class TestSpecDummyForwardBatch(CustomTestCase):
+    """Spec dummy batches carry spec_info + slot-1 KV seeding, and TARGET_VERIFY
+    sizes extend metadata to draft_token_num tokens per request."""
+
+    def test_target_verify_batch_shapes_and_capture_mode(self):
+        policy = _make_spec_policy(num_steps=3)  # draft_token_num = 4
+        spec_info = policy._make_verify_spec_info()
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=16,
+            bs=4,
+            mode=ForwardMode.TARGET_VERIFY,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            spec_info=spec_info,
+        )
+        self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertIsNotNone(fb.spec_info)
+        # draft_token_num (=4) tokens per request.
+        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4, 4, 4])
+        self.assertEqual(fb.extend_num_tokens, 16)
+        # Slot-1 KV seeding (avoids draft/target pool conflicts): not slot 0.
+        self.assertEqual(fb.out_cache_loc.tolist(), [1] * 16)
+        self.assertEqual(fb.req_pool_indices.tolist(), [1, 1, 1, 1])
+        # Text-only mm_inputs is [None]*bs, not None (Dynamo guard parity).
+        self.assertEqual(fb.mm_inputs, [None] * 4)
+
+    def test_plain_extend_carries_idle_spec_stub(self):
+        # With spec enabled, non-verify modes still get a non-None spec stub so
+        # Dynamo traces both branches of ``if spec_info is not None``.
+        policy = _make_spec_policy()
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=64,
+            bs=4,
+            mode=ForwardMode.EXTEND,
+            spec_info=policy._make_null_spec_info(),
+        )
+        self.assertIsNotNone(fb.spec_info)
+
+
+class TestSpecUnpadOutputs(CustomTestCase):
+    """Spec output slicing: TARGET_VERIFY logits use real_q; capture-LAST hidden
+    uses real_b; everything else matches the base decoder policy."""
+
+    def _out_and_batch(self, forward_mode, capture, real_q, real_b, rows):
+        out = SimpleNamespace(
+            next_token_logits=torch.zeros(rows, 8),
+            hidden_states=torch.zeros(rows, 8),
+        )
+        fb = SimpleNamespace(
+            forward_mode=forward_mode,
+            capture_hidden_mode=capture,
+            batch_size=rows,
+            _tpu_real_q=real_q,
+            _tpu_real_b=real_b,
+        )
+        return out, fb
+
+    def test_target_verify_slices_logits_to_real_q(self):
+        policy = _make_spec_policy()
+        out, fb = self._out_and_batch(
+            ForwardMode.TARGET_VERIFY,
+            CaptureHiddenMode.FULL,
+            real_q=16,
+            real_b=4,
+            rows=32,
+        )
+        policy.unpad_outputs(out, fb)
+        # Verify emits one logit per draft token -> real_q, not real_b.
+        self.assertEqual(out.next_token_logits.shape[0], 16)
+        self.assertEqual(out.hidden_states.shape[0], 16)  # FULL -> real_q
+        self.assertEqual(fb.batch_size, 4)
+
+    def test_capture_last_slices_hidden_to_real_b(self):
+        policy = _make_spec_policy()
+        out, fb = self._out_and_batch(
+            ForwardMode.DRAFT_EXTEND,
+            CaptureHiddenMode.LAST,
+            real_q=8,
+            real_b=4,
+            rows=16,
+        )
+        policy.unpad_outputs(out, fb)
+        self.assertEqual(out.next_token_logits.shape[0], 4)  # not verify -> real_b
+        self.assertEqual(out.hidden_states.shape[0], 4)  # LAST -> real_b
+
+    def test_decode_default_slicing(self):
+        policy = _make_spec_policy()
+        out, fb = self._out_and_batch(
+            ForwardMode.DECODE,
+            CaptureHiddenMode.NULL,
+            real_q=4,
+            real_b=4,
+            rows=8,
+        )
+        policy.unpad_outputs(out, fb)
+        self.assertEqual(out.next_token_logits.shape[0], 4)
+        self.assertEqual(out.hidden_states.shape[0], 4)
 
 
 if __name__ == "__main__":

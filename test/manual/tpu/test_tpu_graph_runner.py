@@ -17,7 +17,14 @@ from sglang.srt.compilation.support_torch_compile import (
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
-from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    SpecDecodeCompilePolicyMixin,
+)
+from sglang.srt.model_executor.tpu_graph_runner import (
+    TpuGraphRunner,
+    _augment_spec_policy,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 DECODER_POLICY_PRECOMPILE = (
@@ -85,6 +92,7 @@ class TestTpuGraphRunner(CustomTestCase):
             model=model,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
             server_args=SimpleNamespace(
                 enable_torch_compile=enable_torch_compile,
                 tpu_compile_tokens=None,
@@ -124,7 +132,7 @@ class TestTpuGraphRunner(CustomTestCase):
         TpuGraphRunner(runner)
         self.assertIsNot(model.forward, original)
         self.assertIn("input_embeds", inspect.signature(model.forward).parameters)
-        self.assertIsInstance(runner.compiled_forward_shim, DecoderTpuCompilePolicy)
+        self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
         self.mock_compile.assert_called_once()
         _, kwargs = self.mock_compile.call_args
         # Pinned compile kwargs — these are correctness-critical for the
@@ -177,9 +185,52 @@ class TestTpuGraphRunner(CustomTestCase):
         runner = self._runner_for(model)
         TpuGraphRunner(runner)
         self.mock_compile.assert_called_once()
-        self.assertIsInstance(runner.compiled_forward_shim, DecoderTpuCompilePolicy)
+        self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
+        # EAGLE3 spec composes the spec mixin over the resolved policy (both the
+        # fallback and a model's own annotated policy go through this).
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="EAGLE3"
+            ),
+        )
+        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, SpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
+        # Idempotent: a policy that already implements spec is left untouched.
+        self.assertIs(_augment_spec_policy(cls, mr), cls)
+
+    def test_augment_spec_policy_noop_without_spec(self):
+        # No speculative decoding -> plain (unmixed) policy.
+        no_spec = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NONE, server_args=SimpleNamespace()
+        )
+        self.assertIs(
+            _augment_spec_policy(DecoderTpuCompilePolicy, no_spec),
+            DecoderTpuCompilePolicy,
+        )
+
+    def test_augment_spec_policy_is_algorithm_agnostic(self):
+        # Any spec run gets the spec mixin regardless of algorithm; the mixin
+        # enforces the supported algorithm at construction (non-EAGLE3 raises,
+        # covered in test_decoder_tpu_compile_policy), rather than silently
+        # falling back to a non-spec policy here.
+        ngram = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.NGRAM,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="NGRAM"
+            ),
+        )
+        self.assertTrue(
+            issubclass(
+                _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
+                SpecDecodeCompilePolicyMixin,
+            )
+        )
 
     def test_precompile_called_for_precompile_enabled_policy(self):
         model = self._annotate(_model_with(forward=MagicMock()), precompile=True)

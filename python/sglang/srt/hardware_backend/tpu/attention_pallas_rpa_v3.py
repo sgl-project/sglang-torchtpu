@@ -245,6 +245,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.req_to_token_pool = model_runner.req_to_token_pool
 
+        ctx_len = int(model_runner.model_config.context_len)
+        eff_draft = (
+            model_runner.server_args.effective_max_speculative_num_draft_tokens()
+        )
+        self._max_kv_len = ctx_len + int(eff_draft) if eff_draft is not None else None
+
         # Hybrid-SWA models keep two KV sub-pools and need a
         # second page_indices tensor with indices translated into the SWA
         # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
@@ -344,6 +350,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         req_to_token = self.req_to_token_pool.req_to_token
         max_context_len = req_to_token.shape[1]
         pages_per_seq = max_context_len // page_size
+        # Cap to the tight per-sequence KV budget to avoid prefetching the
+        # pow2-rounded pool slack into SMEM.
+        if self._max_kv_len is not None:
+            tight_pages = (self._max_kv_len + page_size - 1) // page_size
+            pages_per_seq = min(pages_per_seq, tight_pages)
 
         # Host-resident fast path: when req_to_token is on CPU, build the
         # metadata on host (one H2D) instead of the on-device gather/reshape
@@ -423,7 +434,14 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             pages_per_seq * page_size
         )
 
-        per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
+        # req_to_token is host-resident (#107) here only for spec modes -- the
+        # non-spec host-resident path is peeled off above into
+        # _build_metadata_host. Index on CPU then move to device so the gather
+        # doesn't mix devices; the else branch is the on-device req_to_token case.
+        if req_to_token.device.type == "cpu":
+            per_seq = req_to_token[req_pool_indices.cpu()].to(device)  # [bs, max_ctx]
+        else:
+            per_seq = req_to_token[req_pool_indices]  # [bs, max_ctx]
         # ``req_to_token.shape[1]`` may not be an exact multiple of
         # ``page_size`` (SGLang adds extra slack tokens), in which case
         # ``per_seq[:, ::page_size]`` would emit one extra trailing column.

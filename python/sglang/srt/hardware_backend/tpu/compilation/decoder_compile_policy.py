@@ -192,7 +192,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         self.compiled_forward_shim = CompiledForwardShim(compiled, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
-        self.model_runner.compiled_forward_shim = self
+        self.model_runner.compile_policy = self
 
         if is_dp_attention_enabled():
             self._install_dp_idle_as_decode()
