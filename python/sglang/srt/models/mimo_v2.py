@@ -20,7 +20,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
-from sglang.srt.platforms import current_platform
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -81,6 +80,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import MiMoAudioEncoder, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,

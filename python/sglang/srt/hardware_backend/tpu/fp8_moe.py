@@ -96,9 +96,7 @@ def _requantize_tpu_fp8_moe_block_to_channelwise(
     # Clamp to [256 MiB, 2 GiB] -- below 256 MiB the per-chunk sync overhead
     # dominates; above 2 GiB risks the thin post-load headroom.
     free_bytes = current_platform.get_available_memory()[0]
-    target_transient_bytes = int(
-        min(2 * 1024**3, max(256 * 1024**2, free_bytes // 4))
-    )
+    target_transient_bytes = int(min(2 * 1024**3, max(256 * 1024**2, free_bytes // 4)))
     for w_name, scale_inv_name in (
         ("w13_weight", "w13_weight_scale_inv"),
         ("w2_weight", "w2_weight_scale_inv"),

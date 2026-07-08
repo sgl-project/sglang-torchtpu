@@ -20,7 +20,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
-from sglang.srt.platforms import current_platform
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.communicator import (
@@ -47,6 +46,7 @@ from sglang.srt.models.mimo_v2 import (
     MiMoV2MLP,
     load_mimo_v2_qkv_proj_weight,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 

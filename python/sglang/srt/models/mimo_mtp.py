@@ -9,7 +9,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.platforms import current_platform
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -20,6 +19,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
+from sglang.srt.platforms import current_platform
 
 
 class MiMoMultiTokenPredictorLayer(nn.Module):
