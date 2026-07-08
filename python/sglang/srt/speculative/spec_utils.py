@@ -171,7 +171,7 @@ def _create_extend_after_decode_spec_info_torch(
     # Only the first sum(accept_lens) rows are real accepted tokens; the remaining rows
     # are padding up to the compiled token bucket.
     real_mask = flat < cumsum[-1]
-    req_id = (flat[:, None] >= cumsum[None, :]).sum(dim=1).clamp_(max=batch_size - 1)
+    req_id = (flat[:, None] >= cumsum[None, :]).sum(dim=1).clamp(max=batch_size - 1)
     start_excl = cumsum - accept_lens  # exclusive prefix offset per request
     within = flat - start_excl[req_id]
     real_positions = seq_lens[req_id] - accept_lens[req_id] + within

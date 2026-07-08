@@ -732,21 +732,26 @@ class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
             bonus_tokens[pid] = accept_tokens[offset + accept_len - 1]
             offset += accept_len
 
-    def _run_case(self, seq_vals, accept_vals):
+    def _run_case(self, seq_vals, accept_vals, pad_to=None):
         device = "cpu"
         bs = len(seq_vals)
         seq_lens = torch.tensor(seq_vals, dtype=torch.int32, device=device)
         accept_lens = torch.tensor(accept_vals, dtype=torch.int32, device=device)
         total_tokens = sum(accept_vals)
+        # ``pad_to`` mimics serving padding positions up to the compiled token
+        # bucket: rows beyond sum(accept_lens) are padding (real_mask is False)
+        # and must be left at 0.
+        n_pos = total_tokens if pad_to is None else pad_to
+        self.assertGreaterEqual(n_pos, total_tokens)
         accept_tokens = torch.arange(
             100, 100 + total_tokens, dtype=torch.int32, device=device
         )
 
-        ref_pos = torch.zeros(total_tokens, dtype=torch.long, device=device)
+        ref_pos = torch.zeros(n_pos, dtype=torch.long, device=device)
         ref_bonus = torch.zeros(bs, dtype=torch.int32, device=device)
         self._ref(accept_tokens, seq_lens, accept_lens, ref_pos, ref_bonus)
 
-        got_pos = torch.zeros(total_tokens, dtype=torch.long, device=device)
+        got_pos = torch.zeros(n_pos, dtype=torch.long, device=device)
         got_bonus = torch.zeros(bs, dtype=torch.int32, device=device)
         _create_extend_after_decode_spec_info_torch(
             accept_tokens,
@@ -774,6 +779,13 @@ class TestCreateExtendAfterDecodeSpecInfo(unittest.TestCase):
     def test_batch_varying(self):
         """3 requests with different accept counts."""
         self._run_case(seq_vals=[10, 20, 30], accept_vals=[1, 4, 2])
+
+    def test_padded_positions_leave_padding_rows_zero(self):
+        """positions padded past sum(accept_lens): real_mask has False rows
+        (serving pads to the compiled token bucket). Those padding rows must
+        stay 0 and not pick up out-of-range req_id garbage."""
+        # 7 real tokens (1+4+2); pad the positions buffer to 12.
+        self._run_case(seq_vals=[10, 20, 30], accept_vals=[1, 4, 2], pad_to=12)
 
     def test_empty_batch(self):
         device = "cpu"
