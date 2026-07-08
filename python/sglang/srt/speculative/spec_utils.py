@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import time
@@ -628,6 +629,12 @@ def align_evict_mask_to_page_size(
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
 
 
+@functools.lru_cache(maxsize=None)
+def _draft_token_cols(num_draft_tokens: int, device: torch.device) -> torch.Tensor:
+    """Cached ``[1, num_draft_tokens]`` arange (num_draft_tokens is static per run)."""
+    return torch.arange(num_draft_tokens, device=device).unsqueeze(0)
+
+
 def _align_evict_mask_to_page_size_torch(
     seq_lens: torch.Tensor,
     evict_mask: torch.Tensor,
@@ -646,7 +653,7 @@ def _align_evict_mask_to_page_size_torch(
     )
     lo = torch.clamp(start, min=0)
     hi = torch.clamp(start + page_size, max=num_draft_tokens)
-    cols = torch.arange(num_draft_tokens, device=device).unsqueeze(0)
+    cols = _draft_token_cols(num_draft_tokens, device)
     keep = (cols >= lo.unsqueeze(1)) & (cols < hi.unsqueeze(1))
     mask2d &= ~keep
 

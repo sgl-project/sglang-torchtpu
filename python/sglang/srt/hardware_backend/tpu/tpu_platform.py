@@ -110,10 +110,21 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        spec_topk = server_args.speculative_eagle_topk or 1
-        if server_args.speculative_algorithm is not None and spec_topk > 1:
-            raise NotImplementedError("topk > 1 is not supported on TPU yet")
-        elif server_args.page_size is None:
+        # Only EAGLE3 spec decoding is supported on TPU, and only with topk == 1
+        spec_algo = server_args.speculative_algorithm
+        if spec_algo is not None:
+            if spec_algo == "EAGLE3":
+                if (server_args.speculative_eagle_topk or 1) > 1:
+                    raise NotImplementedError(
+                        "EAGLE3 topk > 1 is not supported on TPU yet."
+                    )
+            else:
+                raise NotImplementedError(
+                    f"Speculative algorithm {spec_algo!r} is not supported on TPU "
+                    "yet (only EAGLE3)."
+                )
+
+        if server_args.page_size is None:
             server_args.page_size = 64
 
     # ------------------------------------------------------------------
