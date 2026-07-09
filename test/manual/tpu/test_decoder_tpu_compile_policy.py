@@ -248,6 +248,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
         ),
         token_to_kv_pool=SimpleNamespace(),
         model_config=SimpleNamespace(hidden_size=16),
+        dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
         server_args=SimpleNamespace(
             speculative_num_steps=num_steps,

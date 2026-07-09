@@ -195,7 +195,7 @@ class SpecDecodeCompilePolicyMixin:
         return EagleDraftInput.create_idle_input(
             device=self.model_runner.device,
             hidden_size=self.eagle_hidden_size or 1,
-            dtype=torch.bfloat16,
+            dtype=self.model_runner.dtype,
             topk=self.speculative_eagle_topk,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
