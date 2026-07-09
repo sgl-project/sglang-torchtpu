@@ -88,7 +88,11 @@ def _gen(engine, prompt, n=MAX_NEW):
 
 
 def _gen_batch(engine, prompts, n=MAX_NEW):
-    outs = engine.generate(prompts, {"temperature": 0.0, "max_new_tokens": n})
+    # n: shared decode length, or a per-prompt list for heterogeneous batches.
+    ns = n if isinstance(n, list) else [n] * len(prompts)
+    outs = engine.generate(
+        prompts, [{"temperature": 0.0, "max_new_tokens": m} for m in ns]
+    )
     return [(o["text"], o["meta_info"].get("cached_tokens", 0)) for o in outs]
 
 
@@ -221,7 +225,8 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
 
     Runs every scenario of :class:`TestTpuPrefixCache` against ``SWARadixCache``
     + the two-pool ``SWAKVPool`` (alternating sliding/full layers), then adds
-    window-boundary, window-slide (tombstone), and SWA-pool-eviction scenarios.
+    window-boundary, window-slide (tombstone), SWA-pool-eviction, and a
+    concurrent slide/evict-while-locked scenario.
     Runs with ``swa_full_tokens_ratio=0.5`` so the SWA pool (2048 tok) is the
     binding constraint, as in production.
 
@@ -325,6 +330,33 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
         out2, c2 = _gen(self.engine, COUNT_LONG)
         self.assertLess(c2, PAGE_SIZE, "expected SWA-pool eviction of COUNT_LONG")
         self.assertEqual(out2, out1, "output changed after SWA-pool eviction")
+
+    # (11) Concurrency: three sharers of the primed prefix decode past the ----
+    #      window in ONE in-flight batch
+    def test_11_swa_concurrent_slide_evict_locked_prefix(self):
+        extend = _count_prompt(180)  # shares COUNT_LONG's prefix, longer tail
+        prompts = [COUNT_LONG, COUNT_EXT, extend] + CHURN[:3]
+        news = [self.LONG_NEW] * 3 + [MAX_NEW] * 3
+
+        refs = []
+        for p, n in zip(prompts, news):
+            self.engine.flush_cache()
+            refs.append(_gen(self.engine, p, n=n)[0])
+
+        self.engine.flush_cache()
+        _gen(self.engine, COUNT_LONG)  # prime the shared prefix into the tree
+        outs = _gen_batch(self.engine, prompts, n=news)
+        texts = [t for t, _ in outs]
+        cached = [c for _, c in outs]
+
+        self.assertTrue(all(texts), "a concurrent request returned empty")
+        for i in range(3):
+            self.assertGreaterEqual(
+                cached[i], self.window, f"sharer {i} did not reuse the primed prefix"
+            )
+        self.assertEqual(
+            texts, refs, "concurrent window-slide/eviction changed request outputs"
+        )
 
 
 if __name__ == "__main__":
