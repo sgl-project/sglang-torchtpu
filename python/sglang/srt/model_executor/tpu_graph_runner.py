@@ -116,7 +116,15 @@ class TpuGraphRunner:
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
         # Fail loudly on compile-limit hits to expose latency cliffs early.
-        if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
+        # NOTE: fail_on_recompile_limit_hit and suppress_errors are mutually
+        # exclusive (torch._dynamo asserts). flashinfer_backend sets
+        # suppress_errors=True at import when SGLANG_ENABLE_TORCH_COMPILE is set,
+        # so only enable the fail-loud flag when suppress_errors is off. The
+        # recompile ceiling is already raised to 1024 above, so the limit is not
+        # hit in practice.
+        if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit") and not getattr(
+            torch._dynamo.config, "suppress_errors", False
+        ):
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
