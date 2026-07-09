@@ -541,8 +541,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
+            # TPU: kv_indices may live on CPU while new_indices is on device; align before cat.
             req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
+                [new_indices, kv_indices[len(new_indices) :].to(new_indices.device)]
             )
         else:
             req.prefix_indices = new_indices
