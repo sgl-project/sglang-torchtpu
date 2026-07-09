@@ -114,7 +114,7 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual((real_q, real_b), (4, 1))
         self.assertEqual(fb.input_ids.shape[0], 8)
         self.assertEqual(fb.positions.shape[0], 8)
-        self.assertEqual(fb.out_cache_loc.shape[0], 4)
+        self.assertEqual(fb.out_cache_loc.shape[0], 8)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.extend_seq_lens.shape[0], 4)
 
