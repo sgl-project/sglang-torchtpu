@@ -19,11 +19,9 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _get_hbm_usage_mb,
     _hbm_delta_str,
-    _materialize_out,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -177,6 +175,7 @@ class SpecDecodeCompilePolicyMixin:
                 bs=bs,
                 mode=ForwardMode.EXTEND,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
+                spec_info=self._make_null_spec_info(),
             )
             if get_tensor_model_parallel_rank() == 0:
                 elapsed = time.perf_counter() - start
@@ -210,128 +209,35 @@ class SpecDecodeCompilePolicyMixin:
             device=self.model_runner.device,
         )
 
-    def _run_one(
-        self,
-        *,
-        num_tokens: int,
-        bs: int,
-        mode: ForwardMode,
-        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-        spec_info: Any | None = None,
-        variant: str = "plain",
-    ) -> None:
-        """Build and execute one dummy spec forward pass for compilation."""
-        if spec_info is None:
-            spec_info = self._make_null_spec_info()
-        forward_batch = self._make_dummy_forward_batch(
-            num_tokens=num_tokens,
-            bs=bs,
-            mode=mode,
-            capture_hidden_mode=capture_hidden_mode,
-            spec_info=spec_info,
-        )
-        # Seed req_to_token row 1 with valid page indices for this model's KV
-        # pool. The dummy batch uses req_pool_indices=1 and out_cache_loc=1 to
-        # avoid conflicts with row/slot 0 (which may hold stale state from
-        # another model's precompilation, e.g. a smaller draft KV pool).
+    def _dummy_kv_slot(self) -> int:
+        # Row 0 of the req_to_token pool is the reserved padding row: free_slots
+        # start at 1, so it is never allocated to a real request and its
+        # contents persist for the whole run. Padded/ghost batch entries default
+        # req_pool_indices to 0 and read row 0, expecting page 0. Spec precompile
+        # must seed a *live* page index (see _seed_dummy_req_to_token), so it
+        # keeps that off row 0 -- otherwise every padded read would permanently
+        # point at a real KV page. Slot 1 is allocatable, so the seed is
+        # transient (overwritten by the first real request).
+        return 1
+
+    def _dummy_tokens_per_req(self, mode: ForwardMode, spec_info: Any | None) -> int:
+        # TARGET_VERIFY verifies draft_token_num tokens per request;
+        # DRAFT_EXTEND extends by the same width. Other extend modes use 1.
+        if mode.is_target_verify() and spec_info is not None:
+            return spec_info.draft_token_num
+        if mode.is_draft_extend() and self.draft_token_num:
+            return self.draft_token_num
+        return 1
+
+    def _dummy_mm_inputs(self, bs: int) -> Any:
+        # Text-only spec requests produce mm_inputs=[None]*bs at runtime.
+        return [None] * bs
+
+    def _seed_dummy_req_to_token(self, num_tokens: int) -> None:
+        # Spec verify/extend precompile needs the page table to hold a valid,
+        # in-range page mapping.
         req_to_token = self.model_runner.req_to_token_pool.req_to_token
         req_to_token[1, :num_tokens] = 1
-
-        model = self.model_runner.model
-        model.prepare_forward_batch(forward_batch)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-
-        with torch.no_grad():
-            out = self.owner.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
-            _materialize_out(out, forward_batch)
-
-    def _make_dummy_forward_batch(
-        self,
-        num_tokens: int,
-        bs: int,
-        mode: ForwardMode,
-        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-        spec_info: Any | None = None,
-    ) -> ForwardBatch:
-        """Construct a dummy spec ForwardBatch at the target bucket shape."""
-        device = self.model_runner.device
-        # TARGET_VERIFY is extend-like (is_extend() returns True) so it needs
-        # the extend metadata fields populated.
-        is_extend = mode.is_extend()
-
-        # Token-level inputs
-        input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        input_ids[:bs] = 1
-        positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        # Use slot 1 (not 0) for out_cache_loc. Slot 0 is the permanent padding
-        # slot shared between target and draft models; writing target page
-        # indices there could be out-of-bounds for the draft's smaller KV pool.
-        out_cache_loc = torch.ones(num_tokens, dtype=torch.int64, device=device)
-
-        # Batch-level inputs -- req_pool_indices=1 (not 0) for the same reason.
-        seq_lens = torch.ones(bs, dtype=torch.int64, device=device)
-        seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-        req_pool_indices = torch.ones(bs, dtype=torch.int64, device=device)
-
-        if is_extend:
-            if mode.is_target_verify() and spec_info is not None:
-                tokens_per_req = spec_info.draft_token_num
-            elif mode.is_draft_extend() and self.draft_token_num:
-                tokens_per_req = self.draft_token_num
-            else:
-                tokens_per_req = 1
-            extend_seq_lens = torch.full(
-                (bs,), tokens_per_req, dtype=torch.int32, device=device
-            )
-            extend_prefix_lens = torch.zeros(bs, dtype=torch.int32, device=device)
-            extend_start_loc = torch.arange(
-                0, bs * tokens_per_req, tokens_per_req, dtype=torch.int32, device=device
-            )
-            extend_num_tokens = bs * tokens_per_req
-            extend_seq_lens_cpu = [tokens_per_req] * bs
-            extend_prefix_lens_cpu = [0] * bs
-            extend_logprob_start_lens_cpu = [0] * bs
-        else:
-            extend_seq_lens = None
-            extend_prefix_lens = None
-            extend_start_loc = None
-            extend_num_tokens = None
-            extend_seq_lens_cpu = None
-            extend_prefix_lens_cpu = None
-            extend_logprob_start_lens_cpu = None
-
-        return ForwardBatch(
-            forward_mode=mode,
-            batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=bs,
-            orig_seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
-            return_logprob=False,
-            extend_num_tokens=extend_num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_start_loc=extend_start_loc,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
-            capture_hidden_mode=capture_hidden_mode,
-            spec_info=spec_info,
-            # Text-only requests produce mm_inputs=[None]*bs at runtime, NOT
-            # None. Dynamo guards on ``mm_inputs is None`` so match it.
-            mm_inputs=[None] * bs,
-        )
 
     def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
         """Slice padded spec outputs back to real request shapes.
