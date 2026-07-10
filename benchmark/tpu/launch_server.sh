@@ -388,24 +388,19 @@ args=(
 [[ "$ENABLE_TORCH_COMPILE" == "1" ]] && args+=(--enable-torch-compile)
 [[ -n "${JSON_MODEL_OVERRIDE:-}" ]] && args+=(--json-model-override-args "$JSON_MODEL_OVERRIDE")
 [[ "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]] && args+=(--disable-overlap-schedule)
-# Multinode rendezvous flags, only when fanned across hosts.
-if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
-    if [[ "$USE_RAY" == "1" ]]; then
-        # Ray assigns node ranks and the rendezvous addr from the discovered
-        # cluster; only hint nnodes (the head may still override it from
-        # ray.nodes()). No --node-rank / --dist-init-addr here.
-        args+=(--nnodes "$NNODES")
-    else
-        args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
-    fi
+# Rendezvous flags. In Ray mode NNODES is the source of truth (default 1; an
+# explicit NNODES wins) and is always passed with --use-ray, independent of
+# ENABLE_MULTIHOST -- Ray discovers node ranks and the rendezvous addr from the
+# live cluster, so no --node-rank / --dist-init-addr. (NNODES=0 opts into
+# head-side auto-detection of the node count.) Off Ray, the multinode flags are
+# only needed when fanned across hosts.
+if [[ "$USE_RAY" == "1" ]]; then
+    args+=(--nnodes "$NNODES" --use-ray)
+elif [[ "$ENABLE_MULTIHOST" == "1" ]]; then
+    args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
 fi
 # KV offloading to host RAM (hierarchical cache); orthogonal to multihost.
 [[ "${KV_OFFLOAD:-0}" == "1" ]] && args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO:-2.0}")
-# Ray scheduler mode: the head Engine launches scheduler actors on every node via
-# Ray, auto-detecting nnodes + slice topology (peer hostnames) from the live
-# cluster — so only the head runs this script and no TPU_WORKER_HOSTNAMES is
-# needed. Enabled purely by env; the user supplies only NNODES.
-[[ "$USE_RAY" == "1" ]] && args+=(--use-ray)
 
 # Escape hatch for any launch_server flag not surfaced above, e.g.
 #   EXTRA_ARGS="--weight-loader-disable-mmap" MODEL=... ./launch_server.sh

@@ -47,10 +47,8 @@ class SchedulerActor:
         pp_rank: int,
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
-        tpu_worker_hostnames: Optional[str] = None,
     ):
         import dataclasses
-        import os
 
         from sglang.srt.environ import envs
         from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
@@ -66,12 +64,10 @@ class SchedulerActor:
                 server_args, dist_init_addr=dist_init_addr
             )
 
-        # Ray-discovered, physically-ordered TPU host list (see
-        # engine._discover_tpu_worker_hostnames). Set it before the TPU env
-        # bootstrap so _prepare_tpu_env builds the slicebuilder from it instead
-        # of this pod's own env. This deliberately overrides any pre-set value.
-        if tpu_worker_hostnames:
-            os.environ["TPU_WORKER_HOSTNAMES"] = tpu_worker_hostnames
+        # The Ray-discovered, physically-ordered TPU host list is injected into
+        # this actor's environment as TPU_WORKER_HOSTNAMES via runtime_env at
+        # launch (see ray_utils.tpu_actor_runtime_env), so the TPU env bootstrap
+        # below (_prepare_tpu_env) reads it straight from os.environ.
 
         # TPU: replay run_scheduler_process's per-process env bootstrap (RANK/
         # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder + RPA-v3 pool

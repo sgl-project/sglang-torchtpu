@@ -6952,10 +6952,15 @@ class ServerArgs:
         return max(FLA_CHUNK_SIZE, self.page_size)
 
     def check_server_args(self):
-        # Check parallel size constraints
+        # Check parallel size constraints. nnodes=0 is the Ray auto-detect
+        # sentinel (TPU only): the real count is resolved from the live cluster
+        # at scheduler launch, so defer the divisibility check until then.
+        assert self.nnodes >= 1 or (self.use_ray and self.device == "tpu"), (
+            "nnodes=0 (auto-detect) is only valid with --use-ray on TPU"
+        )
         assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+            self.nnodes == 0 or (self.tp_size * self.pp_size) % self.nnodes == 0
+        ), "tp_size must be divisible by number of nodes"
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1

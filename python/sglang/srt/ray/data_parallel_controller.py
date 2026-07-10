@@ -28,6 +28,7 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
+from sglang.srt.hardware_backend.tpu.ray_utils import tpu_actor_runtime_env
 from sglang.srt.ray.engine import _accelerator_actor_options
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -187,6 +188,7 @@ class RayDataParallelController(DataParallelController):
                     actor = SchedulerActor.options(
                         num_cpus=0,
                         **_accelerator_actor_options(server_args),
+                        **tpu_actor_runtime_env(self.tpu_worker_hostnames),
                         name=(
                             f"sglang_scheduler_node{self.rank0_node_ip}"
                             f"_dp{actual_dp_rank}_pp{pp_rank}_tp{tp_rank}"
@@ -207,7 +209,6 @@ class RayDataParallelController(DataParallelController):
                         pp_rank=pp_rank,
                         dp_rank=actual_dp_rank,
                         dist_init_addr=dist_init_addr,
-                        tpu_worker_hostnames=self.tpu_worker_hostnames,
                     )
                     self.scheduler_actors.append(actor)
 

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 import threading
 from typing import Callable, Optional
 
@@ -25,7 +24,6 @@ import ray
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group as create_placement_group,
-    remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -34,6 +32,11 @@ from sglang.srt.entrypoints.engine import (
     SchedulerInitResult,
     _calculate_rank_ranges,
     _compute_parallelism_ranks,
+)
+from sglang.srt.hardware_backend.tpu.ray_utils import (
+    detect_tpu_nnodes,
+    discover_tpu_worker_hostnames,
+    tpu_actor_runtime_env,
 )
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -64,82 +67,6 @@ def _accelerator_actor_options(server_args: ServerArgs, count: int = 1) -> dict:
     if server_args.device == "tpu":
         return {"num_gpus": 0, "resources": {"TPU": count}}
     return {"num_gpus": count}
-
-
-def _detect_tpu_nnodes() -> int:
-    """Count alive Ray nodes that advertise the ``TPU`` resource.
-
-    Used to auto-derive ``nnodes`` for TPU ray runs so the operator doesn't have
-    to pass ``--nnodes`` -- the placement group and rank math then follow the live
-    cluster. Returns 0 if nothing is detectable (caller keeps server_args.nnodes).
-    """
-    try:
-        return sum(
-            1
-            for node in ray.nodes()
-            if node.get("Alive") and float(node.get("Resources", {}).get("TPU", 0)) > 0
-        )
-    except Exception as e:  # pragma: no cover - defensive; fall back to server_args
-        logger.warning("Failed to count TPU nodes from Ray: %s", e)
-        return 0
-
-
-@ray.remote(num_cpus=0, num_gpus=0)
-def _get_worker_id_and_address():
-    """Ray task: return this node's ``(TPU_WORKER_ID, ip)`` for slice ordering."""
-    return os.environ.get("TPU_WORKER_ID"), ray.util.get_node_ip_address()
-
-
-def _discover_tpu_worker_hostnames(nnodes: int) -> Optional[str]:
-    """Discover the physically-ordered TPU host list from the live Ray cluster.
-
-    The torch_tpu slicebuilder (``_prepare_tpu_env``) needs hosts ordered by
-    physical slice position (``TPU_WORKER_ID``). We always discover this from Ray
-    (ignoring any pre-set ``TPU_WORKER_HOSTNAMES`` in the environment) by probing
-    every node for its ``TPU_WORKER_ID`` and IP, then sorting by ``TPU_WORKER_ID``
-    -- never by the arbitrary ``ray.nodes()`` order. Returns None if it can't be
-    discovered, in which case each actor falls back to its own pod env.
-    """
-    if nnodes <= 1:
-        return None
-
-    # One probe per node via a SPREAD placement group so each lands on a distinct
-    # host; sort by TPU_WORKER_ID afterwards to recover physical order.
-    pg = None
-    try:
-        pg = create_placement_group([{"CPU": 1}] * nnodes, strategy="SPREAD")
-        ray.get(pg.ready())
-        probes = ray.get(
-            [
-                _get_worker_id_and_address.options(
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg, placement_group_bundle_index=i
-                    )
-                ).remote()
-                for i in range(nnodes)
-            ]
-        )
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning("Ray discovery: failed to probe TPU worker hostnames: %s", e)
-        return None
-    finally:
-        if pg is not None:
-            remove_placement_group(pg)
-
-    if any(worker_id is None for worker_id, _ in probes):
-        logger.warning(
-            "Ray discovery: TPU_WORKER_ID missing on some nodes; cannot order "
-            "hosts. Actors will fall back to their own pod env."
-        )
-        return None
-
-    ordered = sorted(probes, key=lambda p: int(p[0]))
-    hostnames = ",".join(ip for _, ip in ordered)
-    logger.info(
-        "Ray discovery: TPU_WORKER_HOSTNAMES=%s (ordered by TPU_WORKER_ID)",
-        hostnames,
-    )
-    return hostnames
 
 
 @dataclasses.dataclass
@@ -207,11 +134,11 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        # TPU + Ray: auto-detect the cluster shape from the live Ray cluster so
-        # the operator doesn't have to pass --nnodes or a pre-ordered host list.
+        # TPU + Ray: honor server_args.nnodes, discovering the pre-ordered host
+        # list from the live cluster. nnodes=0 opts into auto-detecting the count.
         tpu_worker_hostnames = None
         if server_args.use_ray and server_args.device == "tpu":
-            # _detect_tpu_nnodes() below calls ray.nodes() -- the Ray *state API*,
+            # detect_tpu_nnodes() below calls ray.nodes() -- the Ray *state API*,
             # which (unlike the placement-group / actor APIs) does NOT auto-connect
             # via RAY_ADDRESS. Connect explicitly first so auto-detection sees the
             # live cluster; otherwise it fails with "Ray has not been started yet",
@@ -219,17 +146,21 @@ class RayEngine(Engine):
             # no host can satisfy (STRICT_PACK), hanging forever at pg.ready().
             if not ray.is_initialized():
                 ray.init(address="auto", ignore_reinit_error=True)
-            detected = _detect_tpu_nnodes()
-            if detected > server_args.nnodes:
+            # server_args.nnodes is the source of truth: any explicit value is
+            # trusted as-is, including nnodes=1 for a single host on a multi-node
+            # Ray cluster. nnodes=0 is the opt-in "auto-detect" sentinel -- only
+            # then do we derive the count from the live cluster.
+            if server_args.nnodes == 0:
+                detected = detect_tpu_nnodes()
+                resolved = max(detected, 1)
                 logger.info(
-                    "Ray discovery: detected %d TPU node(s); overriding "
-                    "nnodes=%d -> %d",
+                    "Ray discovery: nnodes=0 (auto); detected %d TPU node(s), "
+                    "using nnodes=%d",
                     detected,
-                    server_args.nnodes,
-                    detected,
+                    resolved,
                 )
-                server_args = dataclasses.replace(server_args, nnodes=detected)
-            tpu_worker_hostnames = _discover_tpu_worker_hostnames(server_args.nnodes)
+                server_args = dataclasses.replace(server_args, nnodes=resolved)
+            tpu_worker_hostnames = discover_tpu_worker_hostnames(server_args.nnodes)
 
             if server_args.nnodes <= 1:
                 # Single-host Ray: no multihost host list to rebuild from, so
@@ -317,6 +248,7 @@ class RayEngine(Engine):
                         actor = SchedulerActor.options(
                             num_cpus=0,
                             **_accelerator_actor_options(server_args),
+                            **tpu_actor_runtime_env(tpu_worker_hostnames),
                             name=f"sglang_scheduler_node{rank0_node_ip}_pp{pp_rank}_tp{tp_rank}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}",
                             scheduling_strategy=PlacementGroupSchedulingStrategy(
                                 placement_group=pg,
@@ -333,7 +265,6 @@ class RayEngine(Engine):
                             pp_rank=pp_rank,
                             dp_rank=0,
                             dist_init_addr=dist_init_addr,
-                            tpu_worker_hostnames=tpu_worker_hostnames,
                         )
                         scheduler_actors.append(actor)
 
