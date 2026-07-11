@@ -260,8 +260,7 @@ class TestTpuDraftKvOffload(CustomTestCase):
         _assert_backup_load_roundtrip(self, dev, host, [3, 0, 6])
 
     def test_draft_pool_gates_on_shared_counter(self):
-        # set_draft_kv_pool must hand the whole-batch gate to the draft device
-        # pool: the draft forward waits via its OWN pool's counter.
+        # set_draft_kv_pool must hand the whole-batch gate to the draft device pool: the draft forward waits via its OWN pool's counter.
         target_dev, target_host = _make_pools(layer_num=2)
         draft_dev, draft_host = _make_pools(layer_num=1)
         controller = _make_controller(target_dev, target_host, draft_dev, draft_host)
