@@ -310,9 +310,9 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         expected_kv = (self.seq_lens + self.DRAFT_TOKEN_NUM).to(torch.int32)
         self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
         # Each sequence verifies draft_token_num query tokens.
-        expected_cu_q = (
-            torch.arange(self.bs + 1) * self.DRAFT_TOKEN_NUM
-        ).to(torch.int32)
+        expected_cu_q = (torch.arange(self.bs + 1) * self.DRAFT_TOKEN_NUM).to(
+            torch.int32
+        )
         self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
         # TARGET_VERIFY is not decode: distribution = [0, bs, bs].
         self.assertTrue(

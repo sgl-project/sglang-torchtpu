@@ -294,8 +294,11 @@ NUM_CONTINUOUS_DECODE_STEPS=${NUM_CONTINUOUS_DECODE_STEPS:-}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
 # InferenceX parity: FP8 weights + FP8 KV cache by default. Set either to the
 # empty string to fall back to the sglang default (e.g. bf16 checkpoints).
-QUANTIZATION=${QUANTIZATION:-fp8}
-KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
+# Use ${VAR-default} (no colon) so an explicit empty value disables it. Having
+# colon would treat empty variable as unset and incorrectly re-apply default
+# value specified here.
+QUANTIZATION=${QUANTIZATION-fp8}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
 # 1 (default, InferenceX parity) → pass --disable-radix-cache. Benchmark
 # prompts share synthetic prefixes, so radix cache would short-circuit
 # prefills and inflate results (it also hides larger-bucket compiles when
