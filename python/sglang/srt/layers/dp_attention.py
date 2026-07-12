@@ -571,9 +571,10 @@ def dp_scatter(
         )
         n = local_tokens.shape[0]
         if n > 0:
-            rows = torch.arange(n, dtype=torch.int64, device=global_tokens.device)
-            idx = rows + get_attention_dp_rank() * n
-            local_tokens.copy_(global_tokens.index_select(0, idx))
+            # MAX_LEN gives equal-length per-rank blocks, so this rank's rows
+            # are the contiguous range [dp_rank * n, (dp_rank + 1) * n).
+            start = get_attention_dp_rank() * n
+            local_tokens.copy_(global_tokens[start : start + n])
         return
 
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
