@@ -527,13 +527,11 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    # NOTE: Use an equality comparison instead of `dp_padding_mode.is_max_len()`
-    # here because this runs inside the torch.compile'd forward. Dynamo cannot
-    # wrap the bound method of a sourceless enum instance (the enum lives on the
-    # graph-input `forward_batch`), which raises
-    # `Unsupported: SourcelessBuilder.create does not know how to wrap 'method'`.
-    # `DpPaddingMode.MAX_LEN` is a module-level constant, so the comparison is
-    # traceable (same pattern already used elsewhere in this file).
+    # Check the padding mode by comparing against the DpPaddingMode.MAX_LEN
+    # constant directly, rather than calling `dp_padding_mode.is_max_len()`.
+    # This runs inside a compiled forward, and calling the enum's bound method
+    # can cause tracing errors under full compilation. The comparison is
+    # equivalent (same pattern used elsewhere in this file).
     if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
