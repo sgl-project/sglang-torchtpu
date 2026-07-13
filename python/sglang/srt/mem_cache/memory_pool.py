@@ -739,7 +739,7 @@ class KVCache(abc.ABC):
         )
         self.mem_usage = 0
 
-        # used for chunked cpu-offloading
+        # number of tokens per chunk for cpu offloading
         self.cpu_offloading_chunk_size = 8192
 
         # default state for optional layer-wise transfer control
