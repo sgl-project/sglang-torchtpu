@@ -38,8 +38,9 @@
 # actually need to inspect graphs:
 #   ENABLE_HLO_DUMP=1 ENABLE_TORCH_COMPILE_DEBUG=1 MODEL=... ./launch_server.sh
 #
-# See ./README.md for the shared env contract (PYTHON, JAX_BAZEL, HF cache,
-# compile cache) and the full launch + bench recipe.
+# Static environment (PYTHON, SGLANG_PLATFORM, HF cache, LIBTPU_INIT_ARGS,
+# TORCH_LOGS, ...) is sourced from ./common_env.sh. See ./README.md for the full
+# launch + bench recipe.
 #
 # Overridable env vars (with defaults shown):
 #   MODEL=                         # REQUIRED — HF repo or local path
@@ -93,6 +94,11 @@
 #   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
 #   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
 set -euo pipefail
+
+# Shared static TPU env (PYTHON, SGLANG_PLATFORM, HF cache, LIBTPU_INIT_ARGS,
+# TORCH_LOGS, ...) lives in common_env.sh next to this script — source it so
+# every caller gets the same environment. Per-launch config stays below.
+source "$(dirname "${BASH_SOURCE[0]}")/common_env.sh"
 
 MODEL=${MODEL:-}
 if [[ -z "$MODEL" ]]; then
@@ -190,29 +196,14 @@ else
     unset TPU_VISIBLE_CHIPS TPU_CHIPS_PER_HOST_BOUNDS TPU_HOST_BOUNDS 2>/dev/null || true
 fi
 
-export SGLANG_PLATFORM=tpu
+# SGLANG_PLATFORM / SGLANG_TPU_OVERLAP_PROFILE / MATERIALIZE_COLLECTIVE_TENSORS
+# are exported by common_env.sh (sourced above).
 if [[ -n "${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-}" ]]; then
     export SGLANG_TPU_DECODE_PROCESS_INTERVAL
 fi
-# Per-phase scheduler/worker timing dumps every ~5 s (cheap).
-export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
-
-
-export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
-
-# HF cache. Defaults here are generic (standard HF cache, online download).
-# The team's TPU hosts keep weights on a GCS-FUSE mount and run fully offline;
-# export HF_HOME / HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE to match — see
-# ./README.md.
-export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
-export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 
 # ===== torch.compile debug =====
-# +recompiles surfaces recompilation churn cheaply. Avoid +dynamo /
-# +output_code / +guards here — those stream per-bytecode tracing logs
-# synchronously and turn a ~minute compile into 10+ minutes plus a
-# multi-GB log file.
-export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
+# TORCH_LOGS is exported by common_env.sh.
 if [[ "$ENABLE_TORCH_COMPILE_DEBUG" == "1" ]]; then
     # FX + lowered graphs per compile (~100s of MB at 32B/tp=8).
     export TORCH_COMPILE_DEBUG=1
@@ -236,22 +227,8 @@ if [[ "$ENABLE_COMPILE_CACHE" == "1" ]]; then
     export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=1
 fi
 
-# ===== XLA / libtpu init =====
-# XLA/libtpu tuning flags used for TP/EP TPU serving. Latency-hiding scheduler
-# and async collective fusion keep collectives from serializing behind matmuls;
-# post-SPMD collective-matmul modes and SparseCore collective offload disables
-# avoid TP=8 correctness issues seen with default collective lowering. Override
-# the whole string to retune. Changing it invalidates the compile cache.
-export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
---xla_tpu_enable_async_collective_fusion=true \
---xla_tpu_overlap_compute_collective_tc=true \
---xla_tpu_enable_async_collective_fusion_multiple_steps=true \
---xla_tpu_enable_latency_hiding_scheduler=true \
---xla_latency_hiding_scheduler_rerun=10 \
---xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative \
---xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
---xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
---xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
+# LIBTPU_INIT_ARGS (XLA/libtpu TP/EP serving tuning + DP-attention hardening) is
+# exported by common_env.sh. Override that var to retune (invalidates the cache).
 
 # ===== XLA HLO dump (opt-in) =====
 # Match on `tt_jit.*` — torch_tpu compiles are named `tt_jit_<op>`; a
@@ -381,5 +358,5 @@ args=(
 EXTRA_ARGS=${EXTRA_ARGS:-}
 [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
 
-PYTHON=${PYTHON:-python3}
+# PYTHON is exported by common_env.sh (default python3).
 exec "$PYTHON" "${args[@]}" 2>&1
