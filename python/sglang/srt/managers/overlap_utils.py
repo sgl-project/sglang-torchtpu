@@ -206,6 +206,8 @@ class FutureMap:
         cheaper slice assign.
         """
         if self._use_dynamic_index:
+            if values.dtype != buf.dtype:
+                values = values.to(buf.dtype)
             buf.index_copy_(0, fi.indices, values)
         else:
             buf[fi.interval] = values

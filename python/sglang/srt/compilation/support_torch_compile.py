@@ -57,6 +57,29 @@ class CompilePolicy(ABC):
     def unpad_outputs(self, out: Any, context: Any) -> Any:
         """Adapt padded compiled outputs back to the caller-visible shape."""
 
+    # Speculative draft-decode I/O shaping. Base is a no-op; the TPU spec policy
+    # overrides these to pad/trim the compiled draft-decode forward. Kept on the
+    # base so a runner can call them on any installed policy without a guard.
+    def pad_draft_decode(self, forward_batch: Any) -> None:
+        """Shape the speculative draft-decode batch for the compiled forward."""
+
+    def unpad_draft_outputs(self, outputs: Any, forward_batch: Any) -> Any:
+        """Undo ``pad_draft_decode`` on the draft outputs (default: passthrough)."""
+        return outputs
+
+
+class NoopCompilePolicy(CompilePolicy):
+    """Default noop policy a runner carries until a real one installs itself."""
+
+    def install(self) -> bool:
+        return False
+
+    def precompile(self) -> None:
+        pass
+
+    def unpad_outputs(self, out: Any, context: Any) -> Any:
+        return out
+
 
 def support_torch_compile(
     obj: T | None = None,

@@ -763,8 +763,13 @@ class LlamaForCausalLM(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
+        # When tie_word_embeddings=True, lm_head IS embed_tokens, so deleting
+        # embed_tokens.weight also removes lm_head.weight. Guard with hasattr to
+        # avoid a double-delete AttributeError.
+        if hasattr(self.model.embed_tokens, "weight"):
+            del self.model.embed_tokens.weight
+        if hasattr(self.lm_head, "weight"):
+            del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
         if _is_xpu:

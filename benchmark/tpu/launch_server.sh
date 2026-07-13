@@ -51,11 +51,14 @@
 #                                  # tensor-parallel within the TP group). For a
 #                                  # MoE model set EP to a divisor of TP_SIZE and
 #                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
-#   MAX_RUNNING=64                 # in-flight request cap (>= bench concurrency)
+#   CONC=64                        # bench concurrency this server is sized for
+#   MAX_RUNNING=$CONC              # in-flight request cap (InferenceX parity:
+#                                  # exactly the bench concurrency)
 #   PAGE_SIZE=128
-#   CONTEXT_LEN=                  # passed through if set
+#   ISL=8192 OSL=1024              # bench shape, only used to derive CONTEXT_LEN
+#   CONTEXT_LEN=$((ISL+OSL+20))    # tight context (InferenceX parity)
 #   CHUNKED_PREFILL_SIZE=4096      # per-forward token cap
-#   MAX_PREFILL_TOKENS=            # passed through if set
+#   MAX_PREFILL_TOKENS=            # defaults to CHUNKED_PREFILL_SIZE
 #   MAX_TOTAL_TOKENS=              # passed through if set
 #   ATTENTION_BACKEND=pallas_tpu_rpa_v3
 #   DISABLE_OVERLAP_SCHEDULE=     # 1 passes --disable-overlap-schedule
@@ -68,10 +71,9 @@
 #   MEM_FRACTION_STATIC=           # passed through if set (sglang default
 #                                  # 0.4; bump to 0.85 for high-concurrency
 #                                  # to leave more HBM for KV cache)
-#   KV_CACHE_DTYPE=                # passed through if set; "fp8" halves
-#                                  # KV traffic and roughly doubles per-step
-#                                  # decode speed for memory-bound regimes.
-#                                  # Leave empty for sglang default (auto).
+#   QUANTIZATION=fp8               # --quantization. Set empty to disable
+#                                  # (e.g. for bf16 checkpoints)
+#   KV_CACHE_DTYPE=fp8_e4m3        # fp8 KV
 #   ENABLE_HLO_DUMP=0              # 1 → dump HLO modules to $HLO_DUMP_DIR
 #   ENABLE_TORCH_COMPILE_DEBUG=0   # 1 → dump FX/lowered to $TORCH_COMPILE_DEBUG_DIR
 #   ENABLE_PROFILER_ENDPOINT=1     # 1 → set SGLANG_TORCH_PROFILER_DIR so
@@ -269,13 +271,18 @@ fi
 
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-30000}
-MAX_RUNNING=${MAX_RUNNING:-64}
+# InferenceX parity: size the server to the bench leg. max-running-requests is
+# exactly the bench concurrency and context-length is a tight ISL+OSL+20.
+CONC=${CONC:-64}
+MAX_RUNNING=${MAX_RUNNING:-$CONC}
 PAGE_SIZE=${PAGE_SIZE:-128}
-CONTEXT_LEN=${CONTEXT_LEN:-}
+ISL=${ISL:-8192}
+OSL=${OSL:-1024}
+CONTEXT_LEN=${CONTEXT_LEN:-$((ISL + OSL + 20))}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
 # Pin the runtime prefill cap so TPU's derived token bucket grid is stable.
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-4096}
-MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-}
+MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-$CHUNKED_PREFILL_SIZE}
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-}
 # Maximum batch size cap for torch.compile and bucketing grids.
 TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
@@ -285,11 +292,18 @@ TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
 NUM_CONTINUOUS_DECODE_STEPS=${NUM_CONTINUOUS_DECODE_STEPS:-}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
-KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
-# 1 → pass --disable-radix-cache to sglang. Useful when validating warmup
-# scripts: with radix on, repeated synthetic prompts share a long prefix
-# and sglang short-circuits the prefill, hiding the larger-bucket compiles.
-DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
+# InferenceX parity: FP8 weights + FP8 KV cache by default. Set either to the
+# empty string to fall back to the sglang default (e.g. bf16 checkpoints).
+# Use ${VAR-default} (no colon) so an explicit empty value disables it. Having
+# colon would treat empty variable as unset and incorrectly re-apply default
+# value specified here.
+QUANTIZATION=${QUANTIZATION-fp8}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
+# 1 (default, InferenceX parity) → pass --disable-radix-cache. Benchmark
+# prompts share synthetic prefixes, so radix cache would short-circuit
+# prefills and inflate results (it also hides larger-bucket compiles when
+# validating warmup scripts).
+DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
 
 echo "==== launch config ===="
 echo "  model              = $MODEL"
@@ -299,9 +313,9 @@ echo "  tp_size            = $TP_SIZE"
   echo "  multihost          = nnodes=$NNODES node_rank=$NODE_RANK dist=$DIST_INIT_ADDR (chips/host=$CHIPS_PER_HOST)"
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
 echo "  host:port          = $HOST:$PORT"
-echo "  max_running        = $MAX_RUNNING"
+echo "  max_running        = $MAX_RUNNING  (CONC=$CONC)"
 echo "  page_size          = $PAGE_SIZE"
-echo "  context_len        = ${CONTEXT_LEN:-<unset>}"
+echo "  context_len        = $CONTEXT_LEN  (ISL=$ISL OSL=$OSL)"
 echo "  attention_backend  = $ATTENTION_BACKEND"
 echo "  chunked_prefill    = $CHUNKED_PREFILL_SIZE"
 echo "  max_prefill_tokens = ${MAX_PREFILL_TOKENS:-<unset>}"
@@ -310,6 +324,7 @@ echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
 echo "  num_cont_decode    = ${NUM_CONTINUOUS_DECODE_STEPS:-<unset>}"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
+echo "  quantization       = ${QUANTIZATION:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
 echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
@@ -343,6 +358,7 @@ args=(
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
+[[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
 [[ -n "$TORCH_COMPILE_MAX_BS" ]] && args+=(--torch-compile-max-bs "$TORCH_COMPILE_MAX_BS")
 [[ -n "$CONTEXT_LEN" ]] && args+=(--context-length "$CONTEXT_LEN")

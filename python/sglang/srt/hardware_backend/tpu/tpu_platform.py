@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
 _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 # Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,
@@ -325,10 +326,12 @@ class TpuSRTPlatform(SRTPlatform):
 
     @contextmanager
     def weight_loading_context(self, weights):
-        try:
-            yield _sync_weight_stream(weights)
-        finally:
-            torch.tpu.synchronize()
+        # No eager drain at load exit: torch.tpu.synchronize() here deadlocks
+        # EAGLE3 draft init under TP>1 -- rank 0 blocks on an async buffer while
+        # peers reach the post-load barrier. Let it resolve at the first aligned
+        # sync instead. Periodic syncs in _sync_weight_stream still bound HBM
+        # during large loads.
+        yield _sync_weight_stream(weights)
 
     def empty_cache(self) -> None:
         pass

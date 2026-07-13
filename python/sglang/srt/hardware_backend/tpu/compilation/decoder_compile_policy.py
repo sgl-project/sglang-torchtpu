@@ -192,7 +192,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         self.compiled_forward_shim = CompiledForwardShim(compiled, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
-        self.model_runner.compiled_forward_shim = self
+        self.model_runner.compile_policy = self
 
         if is_dp_attention_enabled():
             self._install_dp_idle_as_decode()
@@ -328,10 +328,16 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: Any | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Build generic text decoder warmup inputs."""
         forward_batch = self._make_dummy_forward_batch(
-            num_tokens=num_tokens, bs=bs, mode=mode
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
         )
         return (forward_batch.input_ids, forward_batch.positions, forward_batch), {}
 
@@ -342,12 +348,20 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: Any | None = None,
     ) -> None:
         """Build and execute one dummy forward pass for compilation."""
         args, kwargs = self._make_warmup_inputs(
-            num_tokens=num_tokens, bs=bs, mode=mode, variant=variant
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            variant=variant,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
         )
         forward_batch = args[2]
+        self._seed_dummy_req_to_token(num_tokens)
 
         model = self.model_runner.model
         # Set the DP metadata before the pad shim runs, just like serving does,
@@ -394,18 +408,48 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             [bs] * dp_size, dtype=torch.int64, device=device
         )
 
+    def _dummy_kv_slot(self) -> int:
+        """KV-pool slot for dummy ``req_pool_indices``/``out_cache_loc``."""
+        return 0
+
+    def _dummy_tokens_per_req(self, mode: ForwardMode, spec_info: Any | None) -> int:
+        """Extend tokens per request in the dummy batch (1 for plain extend)."""
+        return 1
+
+    def _dummy_mm_inputs(self, bs: int) -> Any:
+        """``mm_inputs`` field for the dummy batch (``None`` for plain decoders)."""
+        return None
+
+    def _seed_dummy_req_to_token(self, num_tokens: int) -> None:
+        """Seed req_to_token rows for the dummy batch.
+
+        No-op for plain decoders: row 0 stays all-zeros (page 0, the reserved
+        padding page), which is exactly the harmless state padded batches expect.
+        The spec policy overrides this to seed slot 1 with a valid page index.
+        """
+        return
+
     def _make_dummy_forward_batch(
-        self, num_tokens: int, bs: int, mode: ForwardMode
+        self,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        *,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: Any | None = None,
     ) -> ForwardBatch:
         """Construct a dummy ForwardBatch at the target bucket shape."""
         device = self.model_runner.device
-        is_extend = mode == ForwardMode.EXTEND
+        is_extend = mode.is_extend()
+        slot = self._dummy_kv_slot()
 
         # Token-level inputs
         input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
         input_ids[:bs] = 1
         positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        out_cache_loc = torch.full(
+            (num_tokens,), slot, dtype=torch.int64, device=device
+        )
 
         # MROPE runtime positions are real [3, num_tokens] tensors. Keep strides
         # identical here so Dynamo does not guard-miss after precompile.
@@ -416,19 +460,26 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         # Batch-level inputs
         seq_lens = torch.ones(bs, dtype=torch.int64, device=device)
         seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-        req_pool_indices = torch.zeros(bs, dtype=torch.int64, device=device)
+        req_pool_indices = torch.full((bs,), slot, dtype=torch.int64, device=device)
 
+        tokens_per_req = self._dummy_tokens_per_req(mode, spec_info)
         extend_seq_lens = (
-            torch.ones(bs, dtype=torch.int32, device=device) if is_extend else None
+            torch.full((bs,), tokens_per_req, dtype=torch.int32, device=device)
+            if is_extend
+            else None
         )
         extend_prefix_lens = (
             torch.zeros(bs, dtype=torch.int32, device=device) if is_extend else None
         )
         extend_start_loc = (
-            torch.arange(0, bs, dtype=torch.int32, device=device) if is_extend else None
+            torch.arange(
+                0, bs * tokens_per_req, tokens_per_req, dtype=torch.int32, device=device
+            )
+            if is_extend
+            else None
         )
-        extend_num_tokens = bs if is_extend else None
-        extend_seq_lens_cpu = [1] * bs if is_extend else None
+        extend_num_tokens = bs * tokens_per_req if is_extend else None
+        extend_seq_lens_cpu = [tokens_per_req] * bs if is_extend else None
         extend_prefix_lens_cpu = [0] * bs if is_extend else None
         # Match runtime extend metadata; None vs list creates guard misses.
         extend_logprob_start_lens_cpu = [0] * bs if is_extend else None
@@ -458,7 +509,9 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             attn_backend=self.model_runner.attn_backend,
             # Model accesses ``capture_hidden_mode.need_capture()``; default
             # of None would raise AttributeError inside the compiled region.
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+            mm_inputs=self._dummy_mm_inputs(bs),
         )
 
 
@@ -585,14 +638,25 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: Any | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         if not self._uses_input_embeds(self.owner):
             return super()._make_warmup_inputs(
-                num_tokens=num_tokens, bs=bs, mode=mode, variant=variant
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                variant=variant,
+                capture_hidden_mode=capture_hidden_mode,
+                spec_info=spec_info,
             )
 
         forward_batch = self._make_dummy_forward_batch(
-            num_tokens=num_tokens, bs=bs, mode=mode
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
         )
 
         positions = (

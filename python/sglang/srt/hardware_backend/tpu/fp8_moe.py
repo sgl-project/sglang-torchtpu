@@ -319,6 +319,7 @@ def apply_tpu_fp8_moe(
     activation: str,
     block_quant: bool,
     apply_router_weight_on_input: bool,
+    no_combine: bool = False,
 ):
     """Run TPU FP8 MoE through the Pallas fused grouped-GEMM backend."""
     if apply_router_weight_on_input:
@@ -350,5 +351,6 @@ def apply_tpu_fp8_moe(
         activation=activation,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        no_combine=no_combine,
     )
     return StandardCombineInput(hidden_states=output)

@@ -347,22 +347,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
 
         # Host-resident fast path: when req_to_token is on CPU, build the
         # metadata on host (one H2D) instead of the on-device gather/reshape
-        # that recompiles per shape. Only non-spec decode/extend; other modes
-        # use the device path below.
-        _host_ok = (
-            req_to_token.device.type == "cpu"
-            and forward_batch.spec_info is None
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_extend()
-                # IDLE batches can occur for DP-attention ranks with no requests.
-                # They must still run a dummy forward to stay in lockstep, join
-                # the cross-rank collectives, and take the same host metadata
-                # path as active decode/extend forwards.
-                or forward_batch.forward_mode.is_idle()
-            )
-        )
-        if _host_ok:
+        # that recompiles per shape.
+        if req_to_token.device.type == "cpu":
             return self._build_metadata_host(
                 forward_batch,
                 page_size,
@@ -482,15 +468,32 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         torch-CPU ops (never traced -> no per-shape recompile) and H2D'd once.
         kv_lens stays on device; ``distribution`` is the caller's cached buffer.
         """
-        is_extend = forward_batch.forward_mode.is_extend()
+        if forward_batch.forward_mode.is_target_verify():
+            # TARGET_VERIFY: the KV cache already includes the draft tokens,
+            # so bump seq_lens by draft_token_num (shape-stable device add).
+            assert forward_batch.spec_info is not None
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            kv_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+            extend_seq_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
+        elif forward_batch.forward_mode.is_extend():
+            # EXTEND and DRAFT_EXTEND: seq_lens / extend_seq_lens are current.
+            assert forward_batch.extend_seq_lens is not None
+            kv_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+        else:
+            kv_lens = forward_batch.seq_lens.to(torch.int32)
+            if (
+                forward_batch.forward_mode.is_decode()
+                and forward_batch.spec_info is not None
+            ):
+                # Multi-step draft decode: each step's backend has a different
+                # speculative_step_id.  Bump seq_lens so the kernel sees KV
+                # entries from prior draft steps.
+                kv_lens = kv_lens + self.speculative_step_id + 1
+            extend_seq_lens = torch.ones(bs, dtype=torch.int32)
 
         # Small per-batch tensors -> host.
         req_pool_indices = forward_batch.req_pool_indices.to("cpu", torch.int64)
-        if is_extend:
-            assert forward_batch.extend_seq_lens is not None
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
-        else:
-            extend_seq_lens = torch.ones(bs, dtype=torch.int32)
 
         cu_q_lens = torch.zeros(bs + 1, dtype=torch.int32)
         cu_q_lens[1:] = torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
@@ -512,8 +515,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
         # Hybrid-SWA: translate full-pool pages to SWA-pool pages. The host path
-        # gates regardless of SWA (see _host_ok), so this must mirror the device
-        # path (lines ~395-409) or SWA layers would address the full pool.
+        # gates only on req_to_token residency, so this must mirror the device
+        # path or SWA layers would address the full pool.
         # full_to_swa_index_mapping is host-resident (CPU) on TPU, so do the
         # lookup here on the CPU page_indices and H2D the result once — keeping
         # this builder free of on-device gathers.
@@ -537,7 +540,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
         return PallasForwardMetadata(
-            kv_lens=forward_batch.seq_lens.to(torch.int32),
+            kv_lens=kv_lens,
             cu_q_lens=cu_q_lens.to(device, non_blocking=True),
             cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
             page_indices=page_indices.to(device, non_blocking=True),

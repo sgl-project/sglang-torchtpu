@@ -527,7 +527,12 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    if forward_batch.dp_padding_mode.is_max_len():
+    # Check the padding mode by comparing against the DpPaddingMode.MAX_LEN
+    # constant directly, rather than calling `dp_padding_mode.is_max_len()`.
+    # This runs inside a compiled forward, and calling the enum's bound method
+    # can cause tracing errors under full compilation. The comparison is
+    # equivalent (same pattern used elsewhere in this file).
+    if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -566,9 +571,10 @@ def dp_scatter(
         )
         n = local_tokens.shape[0]
         if n > 0:
-            rows = torch.arange(n, dtype=torch.int64, device=global_tokens.device)
-            idx = rows + get_attention_dp_rank() * n
-            local_tokens.copy_(global_tokens.index_select(0, idx))
+            # MAX_LEN gives equal-length per-rank blocks, so this rank's rows
+            # are the contiguous range [dp_rank * n, (dp_rank + 1) * n).
+            start = get_attention_dp_rank() * n
+            local_tokens.copy_(global_tokens[start : start + n])
         return
 
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],

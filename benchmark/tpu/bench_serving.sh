@@ -16,7 +16,7 @@
 #   ./bench_serving.sh
 #
 # Example — Qwen3-32B concurrency/shape sweep:
-#   MODEL=Qwen/Qwen3-32B SWEEP="16:8192:512 64:8192:512" WARMUP_REQUESTS=auto ./bench_serving.sh
+#   MODEL=Qwen/Qwen3-32B SWEEP="16:8192:512 64:8192:512" ./bench_serving.sh
 # Each SWEEP token is "concurrency:isl:osl". The server's max-running-requests
 # must be >= the largest concurrency. Per-tuple num_prompts defaults to
 # concurrency x PROMPTS_PER_CONCURRENCY (so each in-flight slot processes
@@ -36,18 +36,20 @@
 #   BACKEND=sglang
 #   DATASET_NAME=random
 #   TOKENIZE_PROMPT=0              # 1 sends exact input_ids; requires BACKEND=sglang
-#   ISL=1024                        # single-run input length
+#   ISL=8192                        # single-run input length
 #   OSL=1024                        # single-run output length
 #   BATCH_SIZE=64                   # single-run max-concurrency
 #   NUM_PROMPTS=                    # single-run total prompts (defaults
 #                                   # to BATCH_SIZE * PROMPTS_PER_CONCURRENCY)
-#   PROMPTS_PER_CONCURRENCY=1       # used to derive NUM_PROMPTS when unset
-#   WARMUP_REQUESTS=0               # off — compile-bucket warmup is now a
-#                                   # separate step (./warmup.sh). Set >0, or
-#                                   # "auto" (→ the leg's concurrency), to
-#                                   # re-enable bench_serving's own warmup.
+#   PROMPTS_PER_CONCURRENCY=10      # used to derive NUM_PROMPTS when unset
+#                                   # (10x concurrency matches InferenceX)
+#   WARMUP_REQUESTS=auto            # "auto" → 2x the leg's concurrency
+#                                   # (matches InferenceX's --num-warmups
+#                                   # 2*CONC). Set an explicit count, or 0
+#                                   # to skip and rely on ./warmup.sh.
 #   SEED=1
-#   RANDOM_RANGE_RATIO=1.0          # 0.8 to match the torchtpu-vllm reference
+#   RANDOM_RANGE_RATIO=0.8          # lens uniform in [0.8*L, L]. Matches the
+#                                   # InferenceX harness (and torchtpu-vllm)
 #   PROFILE=0                       # 1 → torch profiler /start_profile capture
 #   PROFILE_NUM_STEPS=5
 #   PROFILE_OUTPUT_DIR=             # auto-generated when PROFILE=1
@@ -73,14 +75,14 @@ BASE_URL=${BASE_URL:-http://127.0.0.1:30000}
 BACKEND=${BACKEND:-sglang}
 DATASET_NAME=${DATASET_NAME:-random}
 TOKENIZE_PROMPT=${TOKENIZE_PROMPT:-0}
-ISL=${ISL:-1024}
+ISL=${ISL:-8192}
 OSL=${OSL:-1024}
 BATCH_SIZE=${BATCH_SIZE:-64}
-PROMPTS_PER_CONCURRENCY=${PROMPTS_PER_CONCURRENCY:-1}
+PROMPTS_PER_CONCURRENCY=${PROMPTS_PER_CONCURRENCY:-10}
 NUM_PROMPTS=${NUM_PROMPTS:-}
-WARMUP_REQUESTS=${WARMUP_REQUESTS:-0}
+WARMUP_REQUESTS=${WARMUP_REQUESTS:-auto}
 SEED=${SEED:-1}
-RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-1.0}
+RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO:-0.8}
 PROFILE=${PROFILE:-0}
 PROFILE_NUM_STEPS=${PROFILE_NUM_STEPS:-5}
 PROFILE_OUTPUT_DIR=${PROFILE_OUTPUT_DIR:-}
@@ -139,10 +141,10 @@ run_one() {
     local output_file="$OUTPUT_DIR/${tag}.jsonl"
     local profile_prefix="${MODEL_SLUG}-${tag}"
 
-    # Resolve "auto" → concurrency so the warmup actually exercises the
-    # measurement's batch bucket.
+    # Resolve "auto" → 2x concurrency (InferenceX parity) so the warmup
+    # saturates the measurement's batch bucket before timing starts.
     local warmup_n="$WARMUP_REQUESTS"
-    [[ "$warmup_n" == "auto" ]] && warmup_n="$bs"
+    [[ "$warmup_n" == "auto" ]] && warmup_n=$((2 * bs))
 
     local args=(
         -m sglang.bench_serving
