@@ -104,6 +104,86 @@ class TestTpuTransferDataPlane(CustomTestCase):
     def test_roundtrip_fp8(self):
         self._roundtrip_for_dtype(torch.float8_e4m3fn)
 
+    # ---- MHA resharding: lane-slice math + sliced gather/scatter -----------
+
+    def test_compute_lane_slice_directions(self):
+        # total_kv_heads=4, kv_packing=2 (bf16): 1 KV head == 1 packed lane.
+        kvp, total = 2, 4
+        # equal 2->2: whole per-rank head set at offset 0.
+        self.assertEqual(
+            T.compute_lane_slice(2, 2, 0, 0, total, kvp), (0, 2, 0, 2, True)
+        )
+        # fan-in 4->2: rank0 -> dst lane 0, rank1 -> dst lane 1 (each sends 1 lane).
+        self.assertEqual(
+            T.compute_lane_slice(4, 2, 0, 0, total, kvp), (0, 1, 0, 1, True)
+        )
+        self.assertEqual(
+            T.compute_lane_slice(4, 2, 1, 0, total, kvp), (0, 1, 1, 1, False)
+        )
+        # fan-out 2->4: one prefill rank feeds decode rank0 (src lane0) and
+        # rank1 (src lane1), both landing at dst offset 0.
+        self.assertEqual(
+            T.compute_lane_slice(2, 4, 0, 0, total, kvp), (0, 1, 0, 1, True)
+        )
+        self.assertEqual(
+            T.compute_lane_slice(2, 4, 0, 1, total, kvp), (1, 1, 0, 1, True)
+        )
+
+    def test_compute_lane_slice_gqa_replication(self):
+        # total_kv_heads=2 < prefill_tp=4: src_replication=2, so ranks 0/1 are
+        # replicas of head 0 and ranks 2/3 of head 1. dst_tp=2 (dst_heads=1) so
+        # all land at dst lane 0; the unique index dedups the replicas.
+        kvp, total = 2, 2
+        for rank in (0, 1):
+            self.assertEqual(
+                T.compute_lane_slice(4, 2, rank, 0, total, kvp), (0, 1, 0, 1, True)
+            )
+        for rank in (2, 3):
+            self.assertEqual(
+                T.compute_lane_slice(4, 2, rank, 0, total, kvp), (0, 1, 0, 1, True)
+            )
+
+    def test_compute_lane_slice_fp8_odd_head_raises(self):
+        # fp8 kv_packing=4: 1 lane holds 2 KV heads, so an odd head boundary is
+        # not packing-aligned and must be rejected.
+        with self.assertRaises(ValueError):
+            T.compute_lane_slice(4, 2, 0, 0, total_kv_heads=3, kv_packing=4)
+
+    def test_compute_lane_slice_zero_total_raises(self):
+        # total_kv_heads=0 means the decode side never advertised its KV-head
+        # count. Fail loud rather than divide by zero or guess a fallback.
+        with self.assertRaises(ValueError):
+            T.compute_lane_slice(4, 2, 0, 0, total_kv_heads=0, kv_packing=2)
+
+    def test_lane_slice_gather_scatter_roundtrip(self):
+        # 5D fused layout [nb, ps, lanes, kv_packing, head_dim]; send src lanes
+        # [0:2] into dst lanes [2:4], leaving other lanes untouched.
+        src = _FakePool(8, 4, (4, 2, 16), layers=2, dtype=torch.bfloat16)
+        dst = _FakePool(8, 4, (4, 2, 16), layers=2, dtype=torch.bfloat16)
+        _fill_random(src)
+        sbufs = T.get_layer_page_buffers(src)
+        dbufs = T.get_layer_page_buffers(dst)
+        specs = T.layer_page_specs(dbufs)
+        src_pages = np.array([1, 4, 6], dtype=np.int64)
+        dst_pages = np.array([7, 0, 3], dtype=np.int64)
+
+        blobs = T.gather_pages_to_host(sbufs, src_pages, lane_slice=(0, 2))
+        T.scatter_pages_from_host(
+            dbufs, dst_pages, blobs, specs, dst_lane_slice=(2, 2)
+        )
+        for li in range(2):
+            for sp, dp in zip(src_pages, dst_pages):
+                self.assertTrue(
+                    torch.equal(
+                        src.kv_buffer[li][sp][:, 0:2], dst.kv_buffer[li][dp][:, 2:4]
+                    ),
+                    f"layer {li} lane slice {sp}->{dp} mismatch",
+                )
+            # untouched dst lanes [0:2] stay zero
+            self.assertEqual(
+                torch.count_nonzero(dst.kv_buffer[li][:, :, 0:2]).item(), 0
+            )
+
     def test_rejects_non_fused_pool(self):
         class TokenPool:  # k_buffer/v_buffer style, no kv_buffer
             k_buffer = [torch.zeros(4, 2, 8)]
@@ -145,20 +225,26 @@ class TestTpuTransferDataPlane(CustomTestCase):
 # --------------------------------------------------------------------------
 
 
-def _bare_manager(mode, pool, aux_tensors):
+def _bare_manager(mode, pool, aux_tensors, attn_tp_size=1, engine_rank=0):
     """Construct a TpuKVManager with only the CommonKVManager state our data
     /control-plane methods touch — bypassing distributed/bootstrap init."""
     m = object.__new__(TpuKVManager)
+    m._name = "TpuKVManager"
     m.disaggregation_mode = mode
+    m.kv_pool = None
     m.request_status = {}
     m.failure_records = {}
     m.failure_lock = threading.Lock()
     m._endpoint_locks = defaultdict(threading.Lock)
     m.bootstrap_timeout = 60
     m.waiting_timeout = 60
+    # attn_tp identity for resharding slice math (default single-rank, equal TP).
+    m.attn_tp_size = attn_tp_size
     m.kv_args = SimpleNamespace(
         aux_data_ptrs=[t.data_ptr() for t in aux_tensors],
         aux_item_lens=[t[0].nbytes for t in aux_tensors],
+        engine_rank=engine_rank,
+        total_kv_head_num=0,
     )
     m._aux_keepalive = aux_tensors  # keep buffers alive for ctypes
 
@@ -225,6 +311,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
                 b"3",  # num pages
                 b"1",  # required_dst_info_num
                 b"0",  # decode_prefix_len
+                b"0",  # dst_tp_rank
+                b"1",  # decode_attn_tp_size
+                b"0",  # total_kv_heads
             ]
         )
         deadline = time.time() + 5
@@ -318,14 +407,14 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         reaches the room total, not when any single (e.g. last) push finishes."""
         prefill, *_ = self._make_pair()
         room = 5050
-        # Room total is 4 pages, delivered as two 2-page chunks.
-        prefill._note_push_submitted(room, total_pages=4)
-        prefill._note_push_submitted(room, total_pages=4)  # idempotent
-        # One chunk's push drains -> only 2/4 pages -> not complete yet.
-        prefill._note_push_done(room, n_pages=2)
+        # Room total is 4 lane-page units, delivered as two 2-unit chunks.
+        prefill._note_push_submitted(room, total_units=4)
+        prefill._note_push_submitted(room, total_units=4)  # idempotent
+        # One chunk's push drains -> only 2/4 units -> not complete yet.
+        prefill._note_push_done(room, n_units=2)
         self.assertNotEqual(prefill.request_status.get(room), KVPoll.Success)
         # The other chunk's push drains -> 4/4 -> complete.
-        prefill._note_push_done(room, n_pages=2)
+        prefill._note_push_done(room, n_units=2)
         self.assertEqual(prefill.request_status[room], KVPoll.Success)
 
     def test_prefill_failure_suppresses_late_success(self):
@@ -334,13 +423,13 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         prefill, *_ = self._make_pair()
         room = 6060
         prefill.request_status[room] = KVPoll.WaitingForInput
-        prefill._note_push_submitted(room, total_pages=4)
+        prefill._note_push_submitted(room, total_units=4)
         # A chunk fails (drops the progress entry + records Failed).
         prefill._note_push_failed(room)
         prefill.update_status(room, KVPoll.Failed)
         # A sibling push drains afterwards: must be a no-op (entry gone), not
         # resurrect the room as Success.
-        prefill._note_push_done(room, n_pages=2)
+        prefill._note_push_done(room, n_units=2)
         self.assertEqual(prefill.request_status[room], KVPoll.Failed)
 
     def test_parallel_channels_roundtrip(self):
@@ -410,6 +499,224 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         self.assertEqual(decode.request_status.get(room), KVPoll.Success)
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
         self.assertTrue(torch.equal(daux[0][4], paux[0][2]))
+
+
+# --------------------------------------------------------------------------
+# 2a. MHA resharding protocol (heterogeneous attn_tp) — CPU only
+# --------------------------------------------------------------------------
+
+
+class TestTpuReshardingProtocol(CustomTestCase):
+    """Drive the real gather_and_push / _handle_kvdata / process_decode_pending
+    paths across heterogeneous attn_tp, asserting each prefill rank's KV-head
+    slice lands in the right decode lanes, aux is written exactly once, and the
+    KVPoll status machine reaches Success. ``kv_packing=2`` (bf16) so 1 KV head
+    == 1 packed lane; ``total_kv_heads=4``."""
+
+    DTYPE = torch.bfloat16
+    PAGE = 4
+    HEAD_DIM = 16
+    KVP = 2
+    TOTAL = 4
+
+    def _pool(self, lanes: int, layers: int = 2) -> _FakePool:
+        return _FakePool(16, self.PAGE, (lanes, self.KVP, self.HEAD_DIM), layers, self.DTYPE)
+
+    def _mgr(self, mode, pool, aux, attn_tp_size: int, engine_rank: int):
+        return _bare_manager(mode, pool, aux, attn_tp_size, engine_rank)
+
+    def test_fan_in_two_prefill_into_one_decode(self):
+        # prefill_tp=2 (each rank holds 2 KV heads == 2 lanes) -> decode_tp=1
+        # (holds all 4 heads == 4 lanes). rank0 fills decode lanes [0:2], rank1
+        # fills [2:4]; only rank0 (dst offset 0) writes aux.
+        layers = 2
+        p0pool, p1pool = self._pool(2, layers), self._pool(2, layers)
+        dpool = self._pool(4, layers)
+        _fill_random(p0pool)
+        _fill_random(p1pool)
+        paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
+        daux = [torch.zeros(8, 16, dtype=torch.int32)]
+
+        p0 = self._mgr(DisaggregationMode.PREFILL, p0pool, paux, 2, 0)
+        p1 = self._mgr(DisaggregationMode.PREFILL, p1pool, paux, 2, 1)
+        decode = self._mgr(DisaggregationMode.DECODE, dpool, daux, 1, 0)
+
+        room = 900
+        src_pages = np.array([2, 5, 9], dtype=np.int64)
+        dst_pages = np.array([0, 11, 4], dtype=np.int64)
+        decode.register_decode_state(room, dst_pages, aux_index=3)
+        ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
+        info_kw = dict(dst_tp_rank=0, decode_attn_tp_size=1, total_kv_heads=self.TOTAL)
+        p0.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3, **info_kw)}
+        p1.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3, **info_kw)}
+
+        # Both prefill ranks pass aux_index; only rank0 should actually send it.
+        p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+        self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)  # half
+        p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+
+        self.assertEqual(decode.request_status[room], KVPoll.Success)
+        for li in range(layers):
+            for sp, dp in zip(src_pages, dst_pages):
+                self.assertTrue(
+                    torch.equal(
+                        p0pool.kv_buffer[li][sp][:, 0:2],
+                        dpool.kv_buffer[li][dp][:, 0:2],
+                    ),
+                    f"fan-in layer {li}: rank0 -> decode lanes[0:2] mismatch",
+                )
+                self.assertTrue(
+                    torch.equal(
+                        p1pool.kv_buffer[li][sp][:, 0:2],
+                        dpool.kv_buffer[li][dp][:, 2:4],
+                    ),
+                    f"fan-in layer {li}: rank1 -> decode lanes[2:4] mismatch",
+                )
+        # aux written exactly once (by rank0), equal to prefill row 6.
+        self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
+
+    def test_fan_out_one_prefill_into_two_decode(self):
+        # prefill_tp=1 (holds all 4 heads == 4 lanes) -> decode_tp=2 (each rank
+        # holds 2 heads == 2 lanes). decode rank0 gets src lanes [0:2], decode
+        # rank1 gets src lanes [2:4]; both land at their own offset 0 and both
+        # receive aux.
+        layers = 2
+        ppool = self._pool(4, layers)
+        d0pool, d1pool = self._pool(2, layers), self._pool(2, layers)
+        _fill_random(ppool)
+        paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
+        d0aux = [torch.zeros(8, 16, dtype=torch.int32)]
+        d1aux = [torch.zeros(8, 16, dtype=torch.int32)]
+
+        prefill = self._mgr(DisaggregationMode.PREFILL, ppool, paux, 1, 0)
+        d0 = self._mgr(DisaggregationMode.DECODE, d0pool, d0aux, 2, 0)
+        d1 = self._mgr(DisaggregationMode.DECODE, d1pool, d1aux, 2, 1)
+
+        room = 901
+        src_pages = np.array([1, 7, 12], dtype=np.int64)
+        d0_pages = np.array([3, 9, 0], dtype=np.int64)
+        d1_pages = np.array([2, 5, 8], dtype=np.int64)
+        d0.register_decode_state(room, d0_pages, aux_index=4)
+        d1.register_decode_state(room, d1_pages, aux_index=1)
+        ep0 = _tcp_endpoint("127.0.0.1", d0.rank_port)
+        ep1 = _tcp_endpoint("127.0.0.1", d1.rank_port)
+        prefill.transfer_infos[room] = {
+            ep0: _PrefillTransferInfo(
+                room, ep0, 3, dst_tp_rank=0, decode_attn_tp_size=2, total_kv_heads=self.TOTAL
+            ),
+            ep1: _PrefillTransferInfo(
+                room, ep1, 3, dst_tp_rank=1, decode_attn_tp_size=2, total_kv_heads=self.TOTAL
+            ),
+        }
+
+        prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        d0._handle_kvdata(d0.server_socket.recv_multipart())
+        d1._handle_kvdata(d1.server_socket.recv_multipart())
+        d0.process_decode_pending(room)
+        d1.process_decode_pending(room)
+
+        self.assertEqual(d0.request_status[room], KVPoll.Success)
+        self.assertEqual(d1.request_status[room], KVPoll.Success)
+        for li in range(layers):
+            for sp, dp in zip(src_pages, d0_pages):
+                self.assertTrue(
+                    torch.equal(
+                        ppool.kv_buffer[li][sp][:, 0:2], d0pool.kv_buffer[li][dp][:, 0:2]
+                    ),
+                    f"fan-out layer {li}: src lanes[0:2] -> decode0 mismatch",
+                )
+            for sp, dp in zip(src_pages, d1_pages):
+                self.assertTrue(
+                    torch.equal(
+                        ppool.kv_buffer[li][sp][:, 2:4], d1pool.kv_buffer[li][dp][:, 0:2]
+                    ),
+                    f"fan-out layer {li}: src lanes[2:4] -> decode1 mismatch",
+                )
+        # both decode ranks receive aux at their own index.
+        self.assertTrue(torch.equal(d0aux[0][4], paux[0][6]))
+        self.assertTrue(torch.equal(d1aux[0][1], paux[0][6]))
+
+
+class TestTpuReshardTransferTimeFailure(CustomTestCase):
+    """An unsupported fp8 reshard is NOT pre-flighted at handshake — a Failed set
+    on the TRSFR recv thread would be clobbered by the sender's later
+    WaitingForInput/Transferring (update_status uses max() and KVPoll.Failed == 0).
+    It instead fails cleanly at transfer time in ``gather_and_push`` — the state
+    machine's last step, where Failed sticks — mirroring how mooncake fails a
+    transfer in send_kvcache. Pools use tail ``(lanes, 4, hd)`` so
+    ``_on_pool_attached`` reads ``_kv_packing=4`` (fp8) from the shape."""
+
+    PAGE = 4
+    HEAD_DIM = 16
+    DTYPE = torch.bfloat16  # _kv_packing comes from shape[3], not the dtype
+
+    def _fp8_pool(self, lanes: int, layers: int = 2) -> _FakePool:
+        return _FakePool(16, self.PAGE, (lanes, 4, self.HEAD_DIM), layers, self.DTYPE)
+
+    def _prefill(self, attn_tp_size: int, lanes: int, engine_rank: int = 0):
+        aux = [torch.zeros(8, 16, dtype=torch.int32)]
+        return _bare_manager(
+            DisaggregationMode.PREFILL,
+            self._fp8_pool(lanes),
+            aux,
+            attn_tp_size,
+            engine_rank,
+        )
+
+    def _record_and_gather(self, m, room, **info_kw):
+        # The handshake just records the endpoint (no pre-flight); the reshard
+        # compatibility is only exercised when gather_and_push resolves the slice.
+        ep = _tcp_endpoint("127.0.0.1", m.rank_port)
+        m.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3, **info_kw)}
+        # The sender advances this room to WaitingForInput before send() calls
+        # gather; seed it so the terminal Failed lands (update_status won't
+        # create a fresh entry for Failed — the anti-resurrection guard). The
+        # transfer-time Failed overwriting this WaitingForInput is exactly the
+        # "Failed sticks at the end of the state machine" property under test.
+        m.update_status(room, KVPoll.WaitingForInput)
+        src_pages = np.array([0, 1, 2], dtype=np.int64)
+        m.gather_and_push(room, src_pages, 0, True, aux_index=0)
+
+    def test_handshake_does_not_preflight_fail(self):
+        # _record_decode_endpoint must NOT touch request_status/failure_records
+        # for an unsupported config — failing there gets clobbered by max().
+        m = self._prefill(attn_tp_size=4, lanes=1, engine_rank=0)
+        room = 4240
+        ep = _tcp_endpoint("127.0.0.1", 55550)
+        m._record_decode_endpoint(
+            room, ep, 3, dst_tp_rank=0, decode_attn_tp_size=8, total_kv_heads=8
+        )
+        self.assertNotIn(room, m.failure_records)
+        self.assertNotIn(room, m.request_status)
+
+    def test_fp8_odd_head_fails_cleanly_at_transfer(self):
+        # The reported config: fp8, prefill_tp=4 -> decode_tp=8, total=8 -> each
+        # decode rank wants 1 (odd) KV head == half a lane, which the packed-lane
+        # layout can't slice. gather_and_push fails the room cleanly, landing a
+        # terminal Failed that poll() can read.
+        m = self._prefill(attn_tp_size=4, lanes=1, engine_rank=0)
+        room = 4242
+        self._record_and_gather(
+            m, room, dst_tp_rank=0, decode_attn_tp_size=8, total_kv_heads=8
+        )
+        self.assertEqual(m.check_status(room), KVPoll.Failed)
+        self.assertIn(room, m.failure_records)
+        self.assertIn("packing-aligned", m.failure_records[room])
+
+    def test_zero_total_fails_cleanly_at_transfer(self):
+        # decode never advertised its KV-head count (total_kv_heads=0): also an
+        # unsupported reshard, failed cleanly via the same transfer-time path.
+        m = self._prefill(attn_tp_size=4, lanes=1, engine_rank=0)
+        room = 4243
+        self._record_and_gather(
+            m, room, dst_tp_rank=0, decode_attn_tp_size=8, total_kv_heads=0
+        )
+        self.assertEqual(m.check_status(room), KVPoll.Failed)
+        self.assertIn(room, m.failure_records)
 
 
 # --------------------------------------------------------------------------

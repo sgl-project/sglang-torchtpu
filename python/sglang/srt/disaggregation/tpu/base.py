@@ -88,6 +88,17 @@ def _tcp_endpoint(ip: str, port: int) -> str:
     return f"tcp://{ip}:{port}"
 
 
+def _resolve_total_kv_heads(kv_args: KVArgs, attn_tp_size: int) -> int:
+    """Global KV-head count. Prefer the explicit ``total_kv_head_num`` (set by
+    prefill.py / decode.py); fall back to ``kv_head_num * attn_tp_size`` (per-rank
+    x TP). Mirrors ``common/staging_buffer.resolve_total_kv_heads`` but avoids the
+    dependency for a one-liner."""
+    total = getattr(kv_args, "total_kv_head_num", 0) or 0
+    if total > 0:
+        return total
+    return int(getattr(kv_args, "kv_head_num", 0) or 0) * max(1, attn_tp_size)
+
+
 class TpuKVManagerBase(CommonKVManager):
     """Shared manager scaffolding: pool attachment, the ZMQ recv-loop starter,
     and role dispatch. Subclasses provide the data-plane methods + role init."""
@@ -235,11 +246,12 @@ class TpuKVManagerBase(CommonKVManager):
         expected decode rank has reported. Shared across backends; subclasses
         choose what value to stash per endpoint via ``_record_decode_endpoint``."""
         # [TAG, room, decode_ip, decode_port, aux_present, num_pages,
-        #  required_dst_info_num, decode_prefix_len]
-        if len(msg) != 8:
+        #  required_dst_info_num, decode_prefix_len,
+        #  dst_tp_rank, decode_attn_tp_size, total_kv_heads]
+        if len(msg) != 11:
             raise ValueError(
                 f"Malformed {TAG_TRSFR.decode()} message. "
-                f"Expected 8 frames, got {len(msg)}."
+                f"Expected 11 frames, got {len(msg)}."
             )
         room = int(msg[1].decode())
         decode_ip = msg[2].decode()
@@ -247,17 +259,43 @@ class TpuKVManagerBase(CommonKVManager):
         num_pages = int(msg[5].decode())
         required = int(msg[6].decode())
         prefix_len = int(msg[7].decode())
+        dst_tp_rank = int(msg[8].decode())
+        decode_attn_tp_size = int(msg[9].decode())
+        total_kv_heads = int(msg[10].decode())
 
+        logger.info(
+            "[pd_kv_resharding] _handle_transfer room=%s endpoint=%s:%s num_pages=%d "
+            "required=%d dst_tp_rank=%d decode_attn_tp=%d total_kv_heads=%d",
+            room,
+            decode_ip,
+            decode_port,
+            num_pages,
+            required,
+            dst_tp_rank,
+            decode_attn_tp_size,
+            total_kv_heads,
+        )
         endpoint = _tcp_endpoint(decode_ip, decode_port)
         bucket = self.transfer_infos.setdefault(room, {})
-        bucket[endpoint] = self._record_decode_endpoint(room, endpoint, num_pages)
+        bucket[endpoint] = self._record_decode_endpoint(
+            room, endpoint, num_pages, dst_tp_rank, decode_attn_tp_size, total_kv_heads
+        )
         self.req_to_decode_prefix_len[room] = prefix_len
         if len(bucket) >= required:
             self.update_status(room, KVPoll.WaitingForInput)
 
-    def _record_decode_endpoint(self, room: int, endpoint: str, num_pages: int):
+    def _record_decode_endpoint(
+        self,
+        room: int,
+        endpoint: str,
+        num_pages: int,
+        dst_tp_rank: int = 0,
+        decode_attn_tp_size: int = 1,
+        total_kv_heads: int = 0,
+    ):
         """Hook: value to store in ``transfer_infos[room][endpoint]``. Default is
-        the endpoint string itself; a backend may store a richer record."""
+        the endpoint string itself; a backend may store a richer record (the
+        ``tpu`` backend stashes the decode's TP identity for resharding)."""
         return endpoint
 
     # ---- abstract role + data-plane seam --------------------------------
@@ -371,6 +409,14 @@ class TpuKVReceiverBase(CommonKVReceiver):
         # Record destination pages locally; the decode does its own pull/scatter.
         self.kv_mgr.register_decode_state(self.bootstrap_room, kv_indices, aux_index)
 
+        # Resharding metadata (MHA heterogeneous attn_tp): the prefill needs the
+        # decode's TP identity to compute which KV-head slice to send this rank
+        # (see transfer.compute_lane_slice / conn.gather_and_push). total_kv_heads
+        # is echoed for a prefill-side consistency check.
+        dst_attn_tp_size = self.kv_mgr.attn_tp_size
+        dst_tp_rank = self.kv_mgr.kv_args.engine_rank % max(1, dst_attn_tp_size)
+        total_kv_heads = _resolve_total_kv_heads(self.kv_mgr.kv_args, dst_attn_tp_size)
+
         num_pages = len(kv_indices)
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -385,6 +431,9 @@ class TpuKVReceiverBase(CommonKVReceiver):
                         str(num_pages).encode(),
                         str(self.required_dst_info_num).encode(),
                         str(decode_prefix_len or 0).encode(),
+                        str(dst_tp_rank).encode(),
+                        str(dst_attn_tp_size).encode(),
+                        str(total_kv_heads).encode(),
                     ]
                 )
         self.init_time = time.time()

@@ -428,8 +428,13 @@ class DecodePreallocQueue:
         # (H2D); hand it the pool so it can index_copy_ into the buffers.
         if hasattr(kv_manager, "attach_kv_pool"):
             kv_manager.attach_kv_pool(self.token_to_kv_pool)
-        # Staging buffer setup (only when heterogeneous TP staging is enabled)
-        if self.enable_staging and not self.is_mla_backend:
+        # KV-head metadata. The prefill's heterogeneous-attn_tp resharding path
+        # (TPU compute_lane_slice) resolves total_kv_heads from these, so they
+        # must be advertised even when the common staging buffer is off —
+        # mirroring the unconditional assignment on the prefill side. Gating them
+        # on enable_staging left decode advertising total_kv_heads=0, which made
+        # compute_lane_slice divide by zero on the prefill.
+        if not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
             if hasattr(kv_pool_for_heads, "full_kv_pool"):
                 kv_pool_for_heads = kv_pool_for_heads.full_kv_pool
@@ -437,11 +442,17 @@ class DecodePreallocQueue:
             if per_rank_kv_heads > 0:
                 kv_args.kv_head_num = per_rank_kv_heads
                 kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
-            if hasattr(kv_manager, "set_kv_buffer_tensors"):
-                kv_pool = kv_pool_for_heads
-                if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
+
+            # Staging buffer tensor wiring (only when heterogeneous TP staging
+            # is enabled).
+            if self.enable_staging and hasattr(kv_manager, "set_kv_buffer_tensors"):
+                if hasattr(kv_pool_for_heads, "k_buffer") and hasattr(
+                    kv_pool_for_heads, "v_buffer"
+                ):
                     kv_manager.set_kv_buffer_tensors(
-                        kv_pool.k_buffer, kv_pool.v_buffer, kv_pool.page_size
+                        kv_pool_for_heads.k_buffer,
+                        kv_pool_for_heads.v_buffer,
+                        kv_pool_for_heads.page_size,
                     )
         # Raiden needs the per-layer device KV tensors (it indexes their major
         # dim as pages). The TPU fused KV pool exposes them via kv_buffer.

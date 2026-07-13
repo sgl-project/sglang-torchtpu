@@ -32,8 +32,15 @@ with the forward loop:
   scheduler's disagg-decode polling phase, between forwards). The background
   ZMQ thread only *receives* bytes into host memory and stashes them.
 
-Deliberately scoped to the common single-/multi-host MHA case: no MLA, PP,
-CP, DP-attention, mamba/SWA state, or heterogeneous-TP staging.
+Supports MHA resharding across heterogeneous attention TP (fan-in, fan-out,
+and GQA replication): the prefill slices each decode endpoint's KV-head
+sub-range off the fused buffer's packed-lane axis and the decode scatters it
+into the matching lanes (see ``transfer.compute_lane_slice`` and
+``gather_and_push`` / ``process_decode_pending``). Only packing-aligned head
+boundaries are supported (bf16 always; fp8 needs even head counts).
+
+Otherwise scoped to the common single-/multi-host MHA case: no MLA, PP, CP,
+DP-attention, or mamba/SWA state.
 """
 
 from __future__ import annotations
@@ -153,20 +160,34 @@ class _DecodeTransferState:
     that count to the prefill in the bootstrap handshake, so both sides agree on
     it up front.
 
-    ``scattered_pages`` accumulates across chunks so we mark the room Success
-    only once *every* page has landed. Chunks are pushed by a pool of prefill
-    worker threads (``_PUSH_POOL_WORKERS``) over parallel channels and so can
-    arrive out of order; completion is a page count reaching ``num_pages``, not
-    an ``is_last`` marker (which could conclude early on a short last chunk).
-    See ``_note_push_*`` for the prefill-side completion counterpart."""
+    Completion is tracked in **lane-page units** rather than plain pages. Under
+    MHA resharding a decode rank may be filled by *several* prefill ranks, each
+    covering all pages but only a KV-head sub-slice (``num_lanes`` of the
+    ``dst_lane_total`` packed lanes this rank holds). Page counting would then
+    conclude Success as soon as the first source's pages land. ``scattered``
+    instead accumulates ``chunk_pages * chunk_lanes`` and completes at
+    ``target = num_pages * dst_lane_total``. For the equal-attn_tp path every
+    chunk covers all lanes, so this reduces to the old page accounting scaled by
+    ``dst_lane_total``. See ``_note_push_*`` for the prefill-side counterpart."""
 
-    __slots__ = ("dst_page_indices", "aux_index", "num_pages", "scattered_pages")
+    __slots__ = (
+        "dst_page_indices",
+        "aux_index",
+        "num_pages",
+        "dst_lane_total",
+        "target",
+        "scattered",
+    )
 
-    def __init__(self, dst_page_indices: np.ndarray, aux_index: Optional[int]):
+    def __init__(
+        self, dst_page_indices: np.ndarray, aux_index: Optional[int], dst_lane_total: int
+    ):
         self.dst_page_indices = dst_page_indices
         self.aux_index = aux_index
         self.num_pages = len(dst_page_indices)
-        self.scattered_pages = 0
+        self.dst_lane_total = dst_lane_total
+        self.target = self.num_pages * dst_lane_total
+        self.scattered = 0
 
 
 class _PendingChunk:
@@ -174,26 +195,62 @@ class _PendingChunk:
     the main thread. ``layer_blobs`` holds one entry per layer: a pooled
     :class:`StageBuf` on the TPU path (the wire bytes were copied straight into
     pinned staging by the recv thread — see ``_recv_layers``) or raw ``bytes``
-    on the CPU fallback path. ``aux_blobs`` are always small ``bytes`` rows."""
+    on the CPU fallback path. ``aux_blobs`` are always small ``bytes`` rows.
 
-    __slots__ = ("index_start", "num_pages", "layer_blobs", "aux_blobs")
+    ``dst_lane_start`` / ``num_lanes`` locate the chunk's KV-head slice on the
+    packed-lane axis (dim 2) of the decode buffer (MHA resharding); the
+    equal-attn_tp path sends ``dst_lane_start=0`` and ``num_lanes`` == the full
+    per-rank lane count."""
 
-    def __init__(self, index_start, num_pages, layer_blobs, aux_blobs):
+    __slots__ = (
+        "index_start",
+        "num_pages",
+        "layer_blobs",
+        "aux_blobs",
+        "dst_lane_start",
+        "num_lanes",
+    )
+
+    def __init__(
+        self, index_start, num_pages, layer_blobs, aux_blobs, dst_lane_start, num_lanes
+    ):
         self.index_start = index_start
         self.num_pages = num_pages
         self.layer_blobs = layer_blobs
         self.aux_blobs = aux_blobs
+        self.dst_lane_start = dst_lane_start
+        self.num_lanes = num_lanes
 
 
 class _PrefillTransferInfo:
-    """Prefill-side record of where to push a room's KV bytes."""
+    """Prefill-side record of where to push a room's KV bytes, plus the decode
+    rank's TP identity so ``gather_and_push`` can compute the KV-head slice to
+    send this rank under MHA resharding."""
 
-    __slots__ = ("room", "decode_endpoint", "num_pages")
+    __slots__ = (
+        "room",
+        "decode_endpoint",
+        "num_pages",
+        "dst_tp_rank",
+        "decode_attn_tp_size",
+        "total_kv_heads",
+    )
 
-    def __init__(self, room: int, decode_endpoint: str, num_pages: int):
+    def __init__(
+        self,
+        room: int,
+        decode_endpoint: str,
+        num_pages: int,
+        dst_tp_rank: int = 0,
+        decode_attn_tp_size: int = 1,
+        total_kv_heads: int = 0,
+    ):
         self.room = room
         self.decode_endpoint = decode_endpoint
         self.num_pages = num_pages
+        self.dst_tp_rank = dst_tp_rank
+        self.decode_attn_tp_size = decode_attn_tp_size
+        self.total_kv_heads = total_kv_heads
 
 
 class TpuKVManager(TpuKVManagerBase):
@@ -248,11 +305,25 @@ class TpuKVManager(TpuKVManagerBase):
         self._start_decode_thread()
 
     def _on_pool_attached(self) -> None:
+        # Fused RPA v3 layer buffer: [num_blocks, page_size, kv_heads_packed,
+        # kv_packing, head_dim]. Cache the packed-lane count (dim 2, == this
+        # rank's full KV-head lanes) and kv_packing (dim 3) for MHA resharding
+        # slice math. Fall back gracefully for non-5D CPU test pools.
+        buf0 = self.layer_buffers[0] if self.layer_buffers else None
+        if buf0 is not None and buf0.dim() >= 4:
+            self._num_lanes_full = int(buf0.shape[2])
+            self._kv_packing = int(buf0.shape[3])
+        else:
+            self._num_lanes_full = 1
+            self._kv_packing = 1
         logger.info(
-            "TpuKVManager attached KV pool %s: %d layer buffers, page tail %s",
+            "TpuKVManager attached KV pool %s: %d layer buffers, page tail %s, "
+            "num_lanes_full=%d kv_packing=%d",
             type(self.kv_pool).__name__,
             len(self.layer_buffers),
             self.layer_specs[0][1] if self.layer_specs else None,
+            self._num_lanes_full,
+            self._kv_packing,
         )
 
     # ---- prefill side ---------------------------------------------------
@@ -260,33 +331,61 @@ class TpuKVManager(TpuKVManagerBase):
     def _start_prefill_thread(self):
         self._serve(TAG_TRSFR, self._handle_transfer)
 
-    def _record_decode_endpoint(self, room: int, endpoint: str, num_pages: int):
-        # Stash a full record so gather_and_push can read ``.decode_endpoint``.
-        return _PrefillTransferInfo(room, endpoint, num_pages)
+    def _record_decode_endpoint(
+        self,
+        room: int,
+        endpoint: str,
+        num_pages: int,
+        dst_tp_rank: int = 0,
+        decode_attn_tp_size: int = 1,
+        total_kv_heads: int = 0,
+    ):
+        # No handshake-time reshard pre-flight here: a Failed set on this TRSFR
+        # recv thread would be clobbered by the sender's later WaitingForInput/
+        # Transferring (update_status uses max() and KVPoll.Failed == 0). Instead
+        # an unsupported reshard fails cleanly at transfer time in
+        # ``gather_and_push`` — the state machine's last step, where Failed sticks
+        # (mirrors how mooncake fails a transfer in send_kvcache).
+        #
+        # Stash a full record so gather_and_push can read the endpoint + the
+        # decode rank's TP identity (for the resharding head slice).
+        return _PrefillTransferInfo(
+            room,
+            endpoint,
+            num_pages,
+            dst_tp_rank,
+            decode_attn_tp_size,
+            total_kv_heads,
+        )
 
-    def _note_push_submitted(self, room: int, total_pages: int) -> None:
-        """Main thread: register the room's push-progress entry (with the total
-        page count agreed in the bootstrap handshake) before any push is
-        submitted, so a failing sibling can invalidate it and a worker can't
-        recreate a fresh one behind a recorded failure."""
+    def _note_push_submitted(self, room: int, total_units: int) -> None:
+        """Main thread: register the room's push-progress entry with the total
+        work in **lane-page units** (``full_num_pages * Σ_endpoints num_lanes``)
+        before any push is submitted, so a failing sibling can invalidate it and
+        a worker can't recreate a fresh one behind a recorded failure. Under
+        fan-out one prefill rank pushes a different KV-head slice to each decode
+        endpoint, so the total sums lanes over endpoints; equal/fan-in have a
+        single endpoint and it reduces to ``num_pages * num_lanes``."""
         with self._push_progress_lock:
             if room not in self._push_progress:
-                self._push_progress[room] = {"drained": 0, "total": total_pages}
+                self._push_progress[room] = {"drained": 0, "total": total_units}
 
-    def _note_push_done(self, room: int, n_pages: int) -> None:
-        """Worker thread: a chunk push of ``n_pages`` pages drained. Conclude
-        Success once the drained page count reaches the room total — the same
-        known-total accounting as the decode's scatter side, so completion needs
-        no ``is_last`` marker and is immune to pushes draining out of order."""
+    def _note_push_done(self, room: int, n_units: int) -> None:
+        """Worker thread: a chunk push of ``n_units`` lane-page units drained
+        (``chunk_pages * chunk_lanes``). Conclude Success once the drained units
+        reach the room total — the same known-total accounting as the decode's
+        scatter side, so completion needs no ``is_last`` marker and is immune to
+        pushes draining out of order."""
         with self._push_progress_lock:
             ent = self._push_progress.get(room)
             if ent is None:
                 return  # already failed/cleared
-            ent["drained"] += n_pages
+            ent["drained"] += n_units
             done = ent["drained"] >= ent["total"]
             if done:
                 self._push_progress.pop(room, None)
         if done:
+            logger.info("[pd_kv_resharding] prefill room=%s all pushes drained", room)
             self.update_status(room, KVPoll.Success)
 
     def _note_push_failed(self, room: int) -> None:
@@ -294,6 +393,61 @@ class TpuKVManager(TpuKVManagerBase):
         sibling push can't then conclude Success over the recorded failure."""
         with self._push_progress_lock:
             self._push_progress.pop(room, None)
+
+    def _endpoint_lane_slice(self, info: "_PrefillTransferInfo"):
+        """Resolve the KV-head slice this prefill rank must send to one decode
+        endpoint. Returns ``(lane_slice, dst_lane_start, num_lanes, sends_aux)``
+        where ``lane_slice`` is ``(start, count)`` on the packed-lane axis (or
+        None for the equal-attn_tp path, which sends the whole per-rank page)."""
+        prefill_tp = self.attn_tp_size
+        decode_tp = info.decode_attn_tp_size or prefill_tp
+        num_lanes_full = getattr(self, "_num_lanes_full", 1)
+        if decode_tp == prefill_tp:
+            # Fast path: no resharding, whole page, byte-identical to before.
+            return None, 0, num_lanes_full, True
+        local_tp_rank = self.kv_args.engine_rank % max(1, prefill_tp)
+        src_lane_start, lane_count, dst_lane_start, _num_heads, sends_aux = (
+            tpu_transfer.compute_lane_slice(
+                prefill_tp,
+                decode_tp,
+                local_tp_rank,
+                info.dst_tp_rank,
+                info.total_kv_heads,
+                getattr(self, "_kv_packing", 1),
+            )
+        )
+        return (src_lane_start, lane_count), dst_lane_start, lane_count, sends_aux
+
+    def _gather_slice(self, page_indices: np.ndarray, lane_slice):
+        """Main-thread D2H of ``page_indices`` (optionally restricted to the
+        ``lane_slice`` KV-head sub-range). Returns
+        ``(layer_frames, stages, d2h_future, nbytes)``; ``stages`` is None on the
+        CPU/bytes fallback path."""
+        pool = getattr(self, "_stage_pool", None)
+        use_stage = (
+            pool is not None
+            and self.layer_buffers
+            and self.layer_buffers[0].device.type != "cpu"
+        )
+        d2h_future = None
+        if use_stage:
+            if getattr(self, "_async_d2h", False):
+                d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
+                    self.layer_buffers, page_indices, pool, lane_slice=lane_slice
+                )
+            else:
+                stages = tpu_transfer.gather_pages_to_stage(
+                    self.layer_buffers, page_indices, pool, lane_slice=lane_slice
+                )
+            layer_frames = [st.mv() for st in stages]
+            nbytes = sum(st.nbytes for st in stages)
+        else:
+            stages = None
+            layer_frames = tpu_transfer.gather_pages_to_host(
+                self.layer_buffers, page_indices, lane_slice=lane_slice
+            )
+            nbytes = sum(len(b) for b in layer_frames)
+        return layer_frames, stages, d2h_future, nbytes
 
     def gather_and_push(
         self,
@@ -303,11 +457,22 @@ class TpuKVManager(TpuKVManagerBase):
         is_last_chunk: bool,
         aux_index: Optional[int],
     ):
-        """Runs on the scheduler MAIN thread (from TpuKVSender.send): gather
-        the requested KV pages off-device (D2H) and read the aux row, then
+        """Runs on the scheduler MAIN thread (from TpuKVSender.send): for each
+        decode endpoint, gather the KV pages off-device (D2H) — sliced to the
+        endpoint's KV-head sub-range under MHA resharding — read the aux row, and
         hand the resulting host bytes to a background thread for the ZMQ push.
-        The device touch (index_select / .cpu()) is therefore serialised with
-        the forward loop; only host work happens on the background thread."""
+        The device touch (index_select / .cpu()) is serialised with the forward
+        loop; only host work happens on the background thread. In the common
+        equal-attn_tp case there is a single endpoint and a single whole-page
+        gather (byte-identical to the pre-resharding path)."""
+        # An earlier chunk of this room may already have failed (e.g. an
+        # unsupported fp8 reshard). Skip so we don't re-enter compute_lane_slice
+        # and re-raise/re-log. The terminal Failed set in the except below sticks
+        # (no later non-Failed update to clobber it via max()), so this is a
+        # reliable dedup for subsequent chunks. ``.get`` (not check_status) so a
+        # room absent from request_status is a no-op rather than a KeyError.
+        if self.request_status.get(room) == KVPoll.Failed:
+            return
         self._require_pool()
         try:
             bucket = self.transfer_infos.get(room)
@@ -315,98 +480,119 @@ class TpuKVManager(TpuKVManagerBase):
                 raise KVTransferError(room, "no decode endpoint registered")
 
             page_indices = np.asarray(page_indices, dtype=np.int64)
-            pool = getattr(self, "_stage_pool", None)
-            use_stage = (
-                pool is not None
-                and self.layer_buffers
-                and self.layer_buffers[0].device.type != "cpu"
-            )
-            _t0 = time.perf_counter()
-            d2h_future = None
-            if use_stage:
-                # Zero-copy: D2H straight into pinned pooled buffers; the wire
-                # frames are their memoryviews (sent copy=False in _push).
-                if getattr(self, "_async_d2h", False):
-                    d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
-                        self.layer_buffers, page_indices, pool
+            n_pages = len(page_indices)
+
+            # Resolve each endpoint's head slice up front so we can register the
+            # room total (lane-page units, summed over endpoints) before any push
+            # is submitted — a fast-draining worker must not race the entry.
+            plans = []  # (endpoint, lane_slice, dst_lane_start, num_lanes, sends_aux)
+            total_units = 0
+            for info in bucket.values():
+                lane_slice, dst_lane_start, num_lanes, sends_aux = (
+                    self._endpoint_lane_slice(info)
+                )
+                plans.append(
+                    (info.decode_endpoint, lane_slice, dst_lane_start, num_lanes, sends_aux)
+                )
+                total_units += info.num_pages * num_lanes
+            self._note_push_submitted(room, total_units)
+
+            aux_blobs_all: List[bytes] = []
+            if is_last_chunk and aux_index is not None:
+                aux_blobs_all = tpu_transfer.read_aux_row(self.kv_args, aux_index)
+
+            n_ch = getattr(self, "_n_channels", 1)
+            stats = getattr(self, "_gather_stats", None)
+            for endpoint, lane_slice, dst_lane_start, num_lanes, sends_aux in plans:
+                _t0 = time.perf_counter()
+                layer_frames, stages, d2h_future, nbytes = self._gather_slice(
+                    page_indices, lane_slice
+                )
+                if stats is not None:
+                    stats.record(time.perf_counter() - _t0, nbytes)
+                aux_blobs = aux_blobs_all if sends_aux else []
+                units = n_pages * num_lanes
+                logger.info(
+                    "[pd_kv_resharding] gather_and_push room=%s endpoint=%s "
+                    "index_start=%d n_pages=%d lane_slice=%s dst_lane_start=%d "
+                    "num_lanes=%d aux=%s bytes=%d",
+                    room,
+                    endpoint,
+                    index_start,
+                    n_pages,
+                    lane_slice,
+                    dst_lane_start,
+                    num_lanes,
+                    bool(aux_blobs),
+                    nbytes,
+                )
+                if n_ch > 1:
+                    self._push_pool.submit(
+                        self._push_channels,
+                        room,
+                        endpoint,
+                        index_start,
+                        n_pages,
+                        dst_lane_start,
+                        num_lanes,
+                        units,
+                        aux_blobs,
+                        layer_frames,
+                        stages,
+                        d2h_future,
+                        n_ch,
                     )
                 else:
-                    stages = tpu_transfer.gather_pages_to_stage(
-                        self.layer_buffers, page_indices, pool
+                    payload = (
+                        [
+                            TAG_KVDATA,
+                            str(room).encode(),
+                            str(index_start).encode(),
+                            str(n_pages).encode(),
+                            str(dst_lane_start).encode(),
+                            str(num_lanes).encode(),
+                            str(len(aux_blobs)).encode(),
+                        ]
+                        + aux_blobs
+                        + layer_frames
                     )
-                layer_frames = [st.mv() for st in stages]
-                nbytes = sum(st.nbytes for st in stages)
-            else:
-                stages = None
-                layer_frames = tpu_transfer.gather_pages_to_host(
-                    self.layer_buffers, page_indices
-                )
-                nbytes = sum(len(b) for b in layer_frames)
-            stats = getattr(self, "_gather_stats", None)
-            if stats is not None:
-                stats.record(time.perf_counter() - _t0, nbytes)
-
-            aux_blobs: List[bytes] = []
-            if is_last_chunk and aux_index is not None:
-                aux_blobs = tpu_transfer.read_aux_row(self.kv_args, aux_index)
-
-            endpoints = [info.decode_endpoint for info in bucket.values()]
-            # Register the room's total (from the handshake) before submitting,
-            # so a worker draining fast can't race the entry's creation.
-            total_pages = next(iter(bucket.values())).num_pages
-            self._note_push_submitted(room, total_pages)
-            n_ch = getattr(self, "_n_channels", 1)
-            if n_ch > 1:
-                # Parallel path (#3): shard the layers across N streams.
-                self._push_pool.submit(
-                    self._push_channels,
-                    room,
-                    endpoints,
-                    index_start,
-                    len(page_indices),
-                    aux_blobs,
-                    layer_frames,
-                    stages,
-                    d2h_future,
-                    n_ch,
-                )
-            else:
-                payload = (
-                    [
-                        TAG_KVDATA,
-                        str(room).encode(),
-                        str(index_start).encode(),
-                        str(len(page_indices)).encode(),
-                        str(len(aux_blobs)).encode(),
-                    ]
-                    + aux_blobs
-                    + layer_frames
-                )
-                self._push_pool.submit(
-                    self._push,
-                    room,
-                    endpoints,
-                    payload,
-                    len(page_indices),
-                    stages,
-                    d2h_future,
-                )
+                    self._push_pool.submit(
+                        self._push,
+                        room,
+                        endpoint,
+                        payload,
+                        units,
+                        stages,
+                        d2h_future,
+                    )
         except Exception as e:
-            logger.exception("KV gather failed for room %s", room)
             self._note_push_failed(room)
+            if isinstance(e, tpu_transfer.ReshardUnsupportedError):
+                # Expected, actionable failure: the TPU packed-lane fp8 layout
+                # can't slice an odd per-rank head. Failing here at transfer time
+                # (like mooncake's send_kvcache) makes this Failed terminal — the
+                # sender has no later non-Failed update to clobber it via
+                # update_status's max() — so poll() reliably concludes Failed.
+                # Log cleanly without a traceback.
+                logger.error(
+                    "[pd_kv_resharding] room %s unsupported reshard: %s", room, e
+                )
+            else:
+                logger.exception("KV gather failed for room %s", room)
             self.record_failure(room, f"TPU KV gather failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
     def _push(
         self,
         room: int,
-        endpoints: List[str],
+        endpoint: str,
         payload: List,
-        n_pages: int,
+        units: int,
         stages=None,
         d2h_future=None,
     ):
-        """Background thread: host-only ZMQ send of the gathered KV bytes.
+        """Background thread: host-only ZMQ send of one endpoint's gathered KV
+        bytes.
 
         With pooled staging (``stages`` set) the layer frames are the pinned
         buffers' memoryviews, sent **zero-copy** (``copy=False``); the buffers
@@ -417,24 +603,21 @@ class TpuKVManager(TpuKVManagerBase):
         try:
             if d2h_future is not None:
                 d2h_future.wait()
-            trackers = []
-            for endpoint in endpoints:
-                sock = self._connect(endpoint)
-                with self._endpoint_locks[endpoint]:
-                    if stages is not None:
-                        trackers.append(
-                            sock.send_multipart(payload, copy=False, track=True)
-                        )
-                    else:
-                        sock.send_multipart(payload)
-            for t in trackers:
-                t.wait()
+            sock = self._connect(endpoint)
+            with self._endpoint_locks[endpoint]:
+                if stages is not None:
+                    tracker = sock.send_multipart(payload, copy=False, track=True)
+                else:
+                    tracker = None
+                    sock.send_multipart(payload)
+            if tracker is not None:
+                tracker.wait()
             if stages is not None:
                 for st in stages:
                     st.release()
-            # Count this chunk's pages toward the room total; Success fires once
-            # every page has drained, regardless of push completion order.
-            self._note_push_done(room, n_pages)
+            # Count this chunk's lane-page units toward the room total; Success
+            # fires once every unit has drained, regardless of push order.
+            self._note_push_done(room, units)
         except Exception as e:
             # On failure don't recycle the buffers: zmq (copy=False) may still
             # hold them until its send drains — let GC reclaim them instead.
@@ -457,19 +640,23 @@ class TpuKVManager(TpuKVManagerBase):
     def _push_channels(
         self,
         room: int,
-        endpoints: List[str],
+        endpoint: str,
         index_start: int,
         num_pages: int,
+        dst_lane_start: int,
+        num_lanes: int,
+        units: int,
         aux_blobs: List[bytes],
         layer_frames: List,
         stages,
         d2h_future,
         n_ch: int,
     ):
-        """Background thread (#3): send the chunk as ``n_ch`` messages over
-        ``n_ch`` parallel sockets, each carrying a contiguous layer slice. Aux
-        rides channel 0. Frame: ``[TAG_KVDATA_CH, room, index_start, num_pages,
-        ch, n_ch, layer_lo, num_layers, num_aux] + aux + layer_slice``."""
+        """Background thread (#3): send one endpoint's chunk as ``n_ch`` messages
+        over ``n_ch`` parallel sockets, each carrying a contiguous layer slice.
+        Aux rides channel 0. Frame: ``[TAG_KVDATA_CH, room, index_start,
+        num_pages, dst_lane_start, num_lanes, ch, n_ch, layer_lo, num_layers,
+        num_aux] + aux + layer_slice``."""
         try:
             if d2h_future is not None:
                 d2h_future.wait()
@@ -477,41 +664,42 @@ class TpuKVManager(TpuKVManagerBase):
             bounds = [(c * n_layers) // n_ch for c in range(n_ch + 1)]
             copy_false = stages is not None
             trackers = []
-            for endpoint in endpoints:
-                socks = self._channel_sockets(endpoint, n_ch)
-                for ch in range(n_ch):
-                    lo, hi = bounds[ch], bounds[ch + 1]
-                    aux = aux_blobs if ch == 0 else []
-                    msg = (
-                        [
-                            TAG_KVDATA_CH,
-                            str(room).encode(),
-                            str(index_start).encode(),
-                            str(num_pages).encode(),
-                            str(ch).encode(),
-                            str(n_ch).encode(),
-                            str(lo).encode(),
-                            str(n_layers).encode(),
-                            str(len(aux)).encode(),
-                        ]
-                        + aux
-                        + layer_frames[lo:hi]
-                    )
-                    sock = socks[ch]
-                    with self._endpoint_locks[(endpoint, ch)]:
-                        if copy_false:
-                            trackers.append(
-                                sock.send_multipart(msg, copy=False, track=True)
-                            )
-                        else:
-                            sock.send_multipart(msg)
+            socks = self._channel_sockets(endpoint, n_ch)
+            for ch in range(n_ch):
+                lo, hi = bounds[ch], bounds[ch + 1]
+                aux = aux_blobs if ch == 0 else []
+                msg = (
+                    [
+                        TAG_KVDATA_CH,
+                        str(room).encode(),
+                        str(index_start).encode(),
+                        str(num_pages).encode(),
+                        str(dst_lane_start).encode(),
+                        str(num_lanes).encode(),
+                        str(ch).encode(),
+                        str(n_ch).encode(),
+                        str(lo).encode(),
+                        str(n_layers).encode(),
+                        str(len(aux)).encode(),
+                    ]
+                    + aux
+                    + layer_frames[lo:hi]
+                )
+                sock = socks[ch]
+                with self._endpoint_locks[(endpoint, ch)]:
+                    if copy_false:
+                        trackers.append(
+                            sock.send_multipart(msg, copy=False, track=True)
+                        )
+                    else:
+                        sock.send_multipart(msg)
             for t in trackers:
                 t.wait()
             if stages is not None:
                 for st in stages:
                     st.release()
-            # See _push: count this chunk's pages toward the room total.
-            self._note_push_done(room, num_pages)
+            # See _push: count this chunk's lane-page units toward the room total.
+            self._note_push_done(room, units)
         except Exception as e:
             logger.exception("KV channel push failed for room %s", room)
             self._note_push_failed(room)
@@ -573,24 +761,43 @@ class TpuKVManager(TpuKVManagerBase):
     def register_decode_state(
         self, room: int, dst_indices: np.ndarray, aux_index: Optional[int]
     ):
+        # dst_lane_total = this decode rank's full KV-head lane count (dim 2 of
+        # the fused buffer). Completion (head-page units) needs every page filled
+        # across all these lanes, which under fan-in arrives from several prefill
+        # sources at different lane offsets.
+        dst_lane_total = getattr(self, "_num_lanes_full", 1)
+        state = _DecodeTransferState(
+            np.asarray(dst_indices, dtype=np.int64), aux_index, dst_lane_total
+        )
         with self.decode_states_lock:
-            self.decode_states[room] = _DecodeTransferState(
-                np.asarray(dst_indices, dtype=np.int64), aux_index
-            )
+            self.decode_states[room] = state
+        logger.info(
+            "[pd_kv_resharding] register_decode_state room=%s num_pages=%d "
+            "dst_lane_total=%d target=%d",
+            room,
+            state.num_pages,
+            dst_lane_total,
+            state.target,
+        )
 
     def _handle_kvdata(self, msg: List):
         """Background thread: parse a KVDATA frame and stash the chunk. The layer
         bytes are copied once, straight into pinned staging (``_recv_layers``);
         NO device ops here — the H2D scatter happens on the main thread in
         process_decode_pending(). ``msg`` items are ``zmq.Frame``s (copy=False)."""
-        # [TAG, room, index_start, num_pages, num_aux] + aux + layers
+        # [TAG, room, index_start, num_pages, dst_lane_start, num_lanes, num_aux]
+        #   + aux + layers
         room = int(bytes(msg[1]).decode())
         index_start = int(bytes(msg[2]).decode())
         num_pages = int(bytes(msg[3]).decode())
-        num_aux = int(bytes(msg[4]).decode())
-        aux_blobs = [bytes(f) for f in msg[5 : 5 + num_aux]]
-        layer_blobs = self._recv_layers(msg[5 + num_aux :])
-        chunk = _PendingChunk(index_start, num_pages, layer_blobs, aux_blobs)
+        dst_lane_start = int(bytes(msg[4]).decode())
+        num_lanes = int(bytes(msg[5]).decode())
+        num_aux = int(bytes(msg[6]).decode())
+        aux_blobs = [bytes(f) for f in msg[7 : 7 + num_aux]]
+        layer_blobs = self._recv_layers(msg[7 + num_aux :])
+        chunk = _PendingChunk(
+            index_start, num_pages, layer_blobs, aux_blobs, dst_lane_start, num_lanes
+        )
         with self.decode_pending_lock:
             self.decode_pending[room].append(chunk)
 
@@ -600,20 +807,26 @@ class TpuKVManager(TpuKVManagerBase):
         the complete chunk for the main-thread scatter (same as _handle_kvdata).
         Each channel's layer frames are copied once, straight into pinned staging
         (``_recv_layers``)."""
-        # [TAG, room, index_start, num_pages, ch, n_ch, lo, n_layers, num_aux]
+        # [TAG, room, index_start, num_pages, dst_lane_start, num_lanes,
+        #  ch, n_ch, lo, n_layers, num_aux]
         room = int(bytes(msg[1]).decode())
         index_start = int(bytes(msg[2]).decode())
         num_pages = int(bytes(msg[3]).decode())
-        ch = int(bytes(msg[4]).decode())
-        n_ch = int(bytes(msg[5]).decode())
-        lo = int(bytes(msg[6]).decode())
-        n_layers = int(bytes(msg[7]).decode())
-        num_aux = int(bytes(msg[8]).decode())
-        aux_blobs = [bytes(f) for f in msg[9 : 9 + num_aux]]
+        dst_lane_start = int(bytes(msg[4]).decode())
+        num_lanes = int(bytes(msg[5]).decode())
+        ch = int(bytes(msg[6]).decode())
+        n_ch = int(bytes(msg[7]).decode())
+        lo = int(bytes(msg[8]).decode())
+        n_layers = int(bytes(msg[9]).decode())
+        num_aux = int(bytes(msg[10]).decode())
+        aux_blobs = [bytes(f) for f in msg[11 : 11 + num_aux]]
         # One copy: wire -> pinned staging (or bytes on the CPU fallback path).
-        staged = self._recv_layers(msg[9 + num_aux :])
+        staged = self._recv_layers(msg[11 + num_aux :])
 
-        key = (room, index_start)
+        # Key on dst_lane_start too: under fan-in several prefill sources push to
+        # the SAME (room, index_start) but different lane offsets, and their
+        # channels must not reassemble into one another.
+        key = (room, index_start, dst_lane_start)
         complete = None
         with self._chan_reasm_lock:
             ent = self._chan_reasm.get(key)
@@ -623,6 +836,7 @@ class TpuKVManager(TpuKVManagerBase):
                     "got": set(),
                     "aux": [],
                     "num_pages": num_pages,
+                    "num_lanes": num_lanes,
                 }
                 self._chan_reasm[key] = ent
             for i, st in enumerate(staged):
@@ -640,15 +854,32 @@ class TpuKVManager(TpuKVManagerBase):
                 complete["num_pages"],
                 complete["layers"],
                 complete["aux"],
+                dst_lane_start,
+                complete["num_lanes"],
             )
             with self.decode_pending_lock:
                 self.decode_pending[room].append(chunk)
 
+    def _expected_chunk_bytes(self, num_pages: int, num_lanes: int) -> int:
+        """Total bytes a chunk of ``num_pages`` pages x ``num_lanes`` packed
+        lanes should carry across all layers, from the fused buffer geometry
+        (``page_size * kv_packing * head_dim * dtype_size`` per lane per page).
+        Used to hard-validate incoming slices instead of silently reshaping."""
+        total = 0
+        for buf in self.layer_buffers:
+            # buf: [num_blocks, page_size, kv_heads_packed, kv_packing, head_dim]
+            page_size = buf.shape[1]
+            per_lane = int(np.prod(buf.shape[3:])) * buf.element_size()
+            total += num_pages * page_size * num_lanes * per_lane
+        return total
+
     def process_decode_pending(self, room: int) -> None:
         """Runs on the scheduler MAIN thread (from TpuKVReceiver.poll): drain
-        any received chunks for ``room`` and scatter them H2D into the decode
-        KV pool. Marks the room Success once every page has landed. The device
-        touch (index_copy_) is serialised with the forward loop."""
+        any received chunks for ``room`` and scatter them H2D into the decode KV
+        pool — each into its KV-head lane sub-range under MHA resharding. Marks
+        the room Success once every lane-page unit has landed (a decode rank may
+        be filled by several prefill sources at different lane offsets). The
+        device touch (index_copy_) is serialised with the forward loop."""
         with self.decode_pending_lock:
             pending = self.decode_pending.get(room)
             if not pending:
@@ -667,19 +898,46 @@ class TpuKVManager(TpuKVManagerBase):
             dst_pages = state.dst_page_indices[
                 chunk.index_start : chunk.index_start + chunk.num_pages
             ]
+            fail_reason = None
             if len(dst_pages) != chunk.num_pages:
+                fail_reason = (
+                    f"page count mismatch: prefill sent {chunk.num_pages} at "
+                    f"offset {chunk.index_start} but decode only has "
+                    f"{len(dst_pages)} dst pages"
+                )
+            elif chunk.dst_lane_start + chunk.num_lanes > state.dst_lane_total:
+                fail_reason = (
+                    f"lane range [{chunk.dst_lane_start}:"
+                    f"{chunk.dst_lane_start + chunk.num_lanes}] exceeds this "
+                    f"decode rank's {state.dst_lane_total} lanes"
+                )
+            else:
+                # Hard-validate the received bytes match the sliced geometry
+                # (replaces the old silent reshape which could corrupt KV).
+                got = sum(
+                    b.nbytes if isinstance(b, StageBuf) else len(b)
+                    for b in chunk.layer_blobs
+                )
+                want = self._expected_chunk_bytes(chunk.num_pages, chunk.num_lanes)
+                if got != want:
+                    fail_reason = (
+                        f"[pd_kv_resharding] chunk byte mismatch: got {got} want "
+                        f"{want} (num_pages={chunk.num_pages} num_lanes="
+                        f"{chunk.num_lanes} dst_lane_start={chunk.dst_lane_start})"
+                    )
+            if fail_reason is not None:
                 # Hand back staging held by this and every still-undrained chunk
                 # (scatter would otherwise have released them in its finally).
                 for c in chunks[i:]:
                     self._release_staged(c)
-                self.record_failure(
-                    room,
-                    f"page count mismatch: prefill sent {chunk.num_pages} at "
-                    f"offset {chunk.index_start} but decode only has "
-                    f"{len(dst_pages)} dst pages",
-                )
+                self.record_failure(room, fail_reason)
                 self.update_status(room, KVPoll.Failed)
                 return
+
+            # Whole-page (equal attn_tp) fast path uses None to skip the narrow.
+            full = chunk.dst_lane_start == 0 and chunk.num_lanes == state.dst_lane_total
+            dst_lane_slice = None if full else (chunk.dst_lane_start, chunk.num_lanes)
+
             _t0 = time.perf_counter()
             pool = getattr(self, "_stage_pool", None)
             if (
@@ -693,10 +951,15 @@ class TpuKVManager(TpuKVManagerBase):
                     chunk.layer_blobs,
                     self.layer_specs,
                     pool,
+                    dst_lane_slice=dst_lane_slice,
                 )
             else:
                 tpu_transfer.scatter_pages_from_host(
-                    self.layer_buffers, dst_pages, chunk.layer_blobs, self.layer_specs
+                    self.layer_buffers,
+                    dst_pages,
+                    chunk.layer_blobs,
+                    self.layer_specs,
+                    dst_lane_slice=dst_lane_slice,
                 )
             stats = getattr(self, "_scatter_stats", None)
             if stats is not None:
@@ -707,18 +970,29 @@ class TpuKVManager(TpuKVManagerBase):
                         for b in chunk.layer_blobs
                     ),
                 )
-            state.scattered_pages += chunk.num_pages
+            state.scattered += chunk.num_pages * chunk.num_lanes
+            logger.info(
+                "[pd_kv_resharding] scatter room=%s index_start=%d num_pages=%d "
+                "dst_lane_slice=%s scattered=%d/%d",
+                room,
+                chunk.index_start,
+                chunk.num_pages,
+                dst_lane_slice,
+                state.scattered,
+                state.target,
+            )
             # Aux rides the prefill's last chunk only, so its presence — not an
             # is_last flag — is the signal to write it.
             if chunk.aux_blobs and state.aux_index is not None:
                 tpu_transfer.write_aux_row(
                     self.kv_args, state.aux_index, chunk.aux_blobs
                 )
-            # Conclude only once every page has landed. The full count is known
-            # up front (the decode allocated exactly these pages and handshaked
-            # the count to the prefill), so completion doesn't depend on chunk
-            # ordering or an is_last marker.
-            if state.scattered_pages >= state.num_pages:
+            # Conclude only once every lane-page unit has landed. The full target
+            # is known up front (the decode allocated exactly these pages and
+            # holds a fixed lane count), so completion doesn't depend on chunk
+            # ordering, source count, or an is_last marker.
+            if state.scattered >= state.target:
+                logger.info("[pd_kv_resharding] decode room=%s complete", room)
                 self.update_status(room, KVPoll.Success)
 
 
