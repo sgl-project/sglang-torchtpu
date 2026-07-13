@@ -103,14 +103,15 @@ class TpuSRTPlatform(SRTPlatform):
         # (TpuRaidenHiCacheController.load), so req_to_token must stay
         # host-resident: a device-resident req_to_token would put the other
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
-        # SGLANG_TPU_HOST_R2T=1 for raiden.
+        # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
         if server_args.hicache_io_backend == "raiden":
-            if os.environ.get("SGLANG_TPU_HOST_R2T") == "0":
+            if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
                 logger.warning(
-                    "Overriding SGLANG_TPU_HOST_R2T=0 -> 1: the raiden KV-offload "
-                    "backend requires host-resident req_to_token."
+                    "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: the "
+                    "raiden KV-offload backend requires host-resident "
+                    "req_to_token."
                 )
-            os.environ["SGLANG_TPU_HOST_R2T"] = "1"
+            os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
 
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
