@@ -3500,6 +3500,24 @@ class ServerArgs:
                     "Re-run with --hicache-mem-layout page_first_fused."
                 )
 
+            # TODO: support more backend but for now left a guard for other configs
+            if self.use_mla_backend():
+                raise ValueError(
+                    f"{self.hicache_io_backend} KV offloading supports only dense "
+                    "MHA models; this is an MLA model, which has no fused TPU host "
+                    "pool. Disable --enable-hierarchical-cache, or serve without "
+                    "the TPU KV-offload io backend."
+                )
+
+            if self.attention_backend != "pallas_tpu_rpa_v3":
+                raise ValueError(
+                    f"{self.hicache_io_backend} KV offloading requires "
+                    "--attention-backend pallas_tpu_rpa_v3 (the only TPU backend "
+                    "with the HiCache reload-commit hook and fused KV pool), but "
+                    f"got {self.attention_backend!r}. Re-run with "
+                    "--attention-backend pallas_tpu_rpa_v3, or disable KV offload."
+                )
+
         if (
             self.hicache_io_backend == "raiden"
             and self.hicache_storage_backend is not None

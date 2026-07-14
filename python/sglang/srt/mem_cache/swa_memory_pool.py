@@ -119,10 +119,6 @@ class SWAKVPool(BaseSWAKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
-    def tpu_commit_pending_loads(self) -> None:
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.drain_commits()
-
     def get_kv_size_bytes(self):
         k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
         k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
