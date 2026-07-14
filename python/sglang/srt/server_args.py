@@ -838,6 +838,9 @@ class ServerArgs:
     # For TPU backend
     tpu_compile_tokens: Optional[List[int]] = None
     tpu_compile_bs: Optional[List[int]] = None
+    tpu_worker_hostnames: Optional[str] = None
+    torch_tpu_slicebuilder_addresses: Optional[str] = None
+    torch_tpu_topology: Optional[str] = None
 
     def __post_init__(self):
         """
@@ -6833,6 +6836,33 @@ class ServerArgs:
                 "Defaults to powers of two when unset."
             ),
         )
+        parser.add_argument(
+            "--tpu-worker-hostnames",
+            type=str,
+            default=ServerArgs.tpu_worker_hostnames,
+            help=(
+                "Comma-separated TPU worker hostnames (TPU_WORKER_HOSTNAMES). "
+                "Auto-discovered by the Ray engine for multihost when unset."
+            ),
+        )
+        parser.add_argument(
+            "--torch-tpu-slicebuilder-addresses",
+            type=str,
+            default=ServerArgs.torch_tpu_slicebuilder_addresses,
+            help=(
+                "TORCH_TPU_SLICEBUILDER_ADDRESSES for the TPU backend. "
+                "Auto-populated by the Ray engine when unset."
+            ),
+        )
+        parser.add_argument(
+            "--torch-tpu-topology",
+            type=str,
+            default=ServerArgs.torch_tpu_topology,
+            help=(
+                "TORCH_TPU_TOPOLOGY for the TPU backend. "
+                "Auto-populated by the Ray engine when unset."
+            ),
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -6955,9 +6985,9 @@ class ServerArgs:
         # Check parallel size constraints. nnodes=0 is the Ray auto-detect
         # sentinel (TPU only): the real count is resolved from the live cluster
         # at scheduler launch, so defer the divisibility check until then.
-        assert self.nnodes >= 1 or (self.use_ray and self.device == "tpu"), (
-            "nnodes=0 (auto-detect) is only valid with --use-ray on TPU"
-        )
+        assert self.nnodes >= 1 or (
+            self.use_ray and self.device == "tpu"
+        ), "nnodes=0 (auto-detect) is only valid with --use-ray on TPU"
         assert (
             self.nnodes == 0 or (self.tp_size * self.pp_size) % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"

@@ -18,13 +18,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 import ray
 from ray.util.placement_group import (
     PlacementGroup,
-    placement_group as create_placement_group,
 )
+from ray.util.placement_group import placement_group as create_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from sglang.srt.entrypoints.engine import (
@@ -32,11 +32,6 @@ from sglang.srt.entrypoints.engine import (
     SchedulerInitResult,
     _calculate_rank_ranges,
     _compute_parallelism_ranks,
-)
-from sglang.srt.hardware_backend.tpu.ray_utils import (
-    detect_tpu_nnodes,
-    discover_tpu_worker_hostnames,
-    tpu_actor_runtime_env,
 )
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -67,6 +62,28 @@ def _accelerator_actor_options(server_args: ServerArgs, count: int = 1) -> dict:
     if server_args.device == "tpu":
         return {"num_gpus": 0, "resources": {"TPU": count}}
     return {"num_gpus": count}
+
+
+def _actor_options(server_args: ServerArgs) -> dict:
+    """Ray ``.options()`` kwargs shared by every scheduler actor: CPU +
+    accelerator resource reservation (GPU or TPU) and, on TPU, the env injected
+    via ``runtime_env``.
+
+    Composes the device-agnostic resource reservation with the TPU-only
+    ``runtime_env`` injection (empty for GPU) so both actor launch sites build
+    identical options from one place. The TPU env vars are read from the
+    launcher-computed fields on ``server_args`` (see ``tpu_actor_runtime_env``).
+    The ``hardware_backend.tpu`` import is lazy and gated on ``device == "tpu"``
+    so the GPU Ray path never imports the TPU package (keeps GPU launch immune to
+    heavy/optional TPU imports; byte-identical GPU options either way).
+    """
+    options = {"num_cpus": 0}
+    options.update(_accelerator_actor_options(server_args))
+    if server_args.device == "tpu":
+        from sglang.srt.hardware_backend.tpu.ray_utils import tpu_actor_runtime_env
+
+        options.update(tpu_actor_runtime_env(server_args))
+    return options
 
 
 @dataclasses.dataclass
@@ -136,20 +153,22 @@ class RayEngine(Engine):
         """
         # TPU + Ray: honor server_args.nnodes, discovering the pre-ordered host
         # list from the live cluster. nnodes=0 opts into auto-detecting the count.
-        tpu_worker_hostnames = None
+        # The computed TPU env is stashed on server_args (tpu_worker_hostnames /
+        # torch_tpu_slicebuilder_addresses / torch_tpu_topology) and injected into
+        # every scheduler actor via runtime_env -- the only channel Ray propagates;
+        # it does NOT forward the driver's os.environ mutations.
         if server_args.use_ray and server_args.device == "tpu":
-            # detect_tpu_nnodes() below calls ray.nodes() -- the Ray *state API*,
-            # which (unlike the placement-group / actor APIs) does NOT auto-connect
-            # via RAY_ADDRESS. Connect explicitly first so auto-detection sees the
-            # live cluster; otherwise it fails with "Ray has not been started yet",
-            # falls back to nnodes=1, and builds a single tp_size-wide bundle that
-            # no host can satisfy (STRICT_PACK), hanging forever at pg.ready().
+            # Lazy TPU import: keeps the GPU Ray path from importing the TPU
+            # package (see _actor_options).
+            from sglang.srt.hardware_backend.tpu.ray_utils import (
+                detect_tpu_nnodes,
+                discover_tpu_worker_hostnames,
+            )
+
             if not ray.is_initialized():
                 ray.init(address="auto", ignore_reinit_error=True)
-            # server_args.nnodes is the source of truth: any explicit value is
-            # trusted as-is, including nnodes=1 for a single host on a multi-node
-            # Ray cluster. nnodes=0 is the opt-in "auto-detect" sentinel -- only
-            # then do we derive the count from the live cluster.
+
+            # Detect nnodes if not specified. This is needed for TPU multihost.
             if server_args.nnodes == 0:
                 detected = detect_tpu_nnodes()
                 resolved = max(detected, 1)
@@ -160,21 +179,29 @@ class RayEngine(Engine):
                     resolved,
                 )
                 server_args = dataclasses.replace(server_args, nnodes=resolved)
-            tpu_worker_hostnames = discover_tpu_worker_hostnames(server_args.nnodes)
 
             if server_args.nnodes <= 1:
-                # Single-host Ray: no multihost host list to rebuild from, so
-                # seed the (localhost) slicebuilder env once here in the driver.
-                # Same-node actors inherit this identical port list via Ray's
-                # env propagation, keeping their PJRT slicebuilder consistent.
-                # Multihost actors rebuild deterministically from the discovered
-                # node IPs (see _prepare_tpu_env), so seeding is skipped there --
-                # keeping the orchestrator's logs free of the localhost line.
                 from sglang.srt.hardware_backend.tpu.patches import (
-                    _prepare_tpu_env,
+                    compute_single_host_tpu_env,
                 )
 
-                _prepare_tpu_env(server_args.tp_size)
+                single_host_env = compute_single_host_tpu_env(server_args.tp_size)
+                server_args = dataclasses.replace(
+                    server_args,
+                    torch_tpu_slicebuilder_addresses=single_host_env[
+                        "TORCH_TPU_SLICEBUILDER_ADDRESSES"
+                    ],
+                    torch_tpu_topology=single_host_env.get("TORCH_TPU_TOPOLOGY"),
+                )
+            else:
+                tpu_worker_hostnames = discover_tpu_worker_hostnames(server_args.nnodes)
+                if tpu_worker_hostnames:
+                    # Multihost: stash the physically-ordered (TPU_WORKER_ID) host
+                    # list. Actors rebuild the slicebuilder deterministically from it
+                    # (see _prepare_tpu_env), so the port list is identical everywhere.
+                    server_args = dataclasses.replace(
+                        server_args, tpu_worker_hostnames=tpu_worker_hostnames
+                    )
 
         pg = ray.util.get_current_placement_group()
         if pg is None:
@@ -204,12 +231,29 @@ class RayEngine(Engine):
 
         nnodes = server_args.nnodes
 
-        # co-located with the Engine and rank0 scheduler at the same node
-        engine_bundle, engine_ip = _find_engine_bundle(pg, nnodes)
-        bundle_for_node = [engine_bundle] + [
-            i for i in range(nnodes) if i != engine_bundle
-        ]
-        rank0_node_ip = engine_ip
+        if server_args.use_ray and server_args.device == "tpu" and nnodes > 1:
+            # TPU multihost: the slicebuilder endpoint list and MASTER_ADDR are
+            # ordered by physical TPU_WORKER_ID, so rank r must land on the host
+            # whose TPU_WORKER_ID == r // devices_per_host. Ray bundle indices are
+            # NOT guaranteed to follow TPU_WORKER_ID order (they only coincide for
+            # nnodes==2 with the head on worker 0), so probe each bundle's physical
+            # worker id and order bundle_for_node by it. Also verifies rank0
+            # (worker 0) is co-located with the Engine; anything inconsistent
+            # raises here instead of hanging later at PJRT bind / rendezvous.
+            from sglang.srt.hardware_backend.tpu.ray_utils import (
+                order_tpu_bundles_by_worker_id,
+            )
+
+            bundle_for_node, rank0_node_ip = order_tpu_bundles_by_worker_id(pg, nnodes)
+        else:
+            # GPU (or single host): rank placement is independent of any physical
+            # slice order, so co-locate rank0 with the Engine and keep numeric
+            # bundle order for the remaining nodes.
+            engine_bundle, engine_ip = _find_engine_bundle(pg, nnodes)
+            bundle_for_node = [engine_bundle] + [
+                i for i in range(nnodes) if i != engine_bundle
+            ]
+            rank0_node_ip = engine_ip
 
         if server_args.dp_size == 1:
             # Launch tensor parallel scheduler actors
@@ -246,9 +290,7 @@ class RayEngine(Engine):
                         )
 
                         actor = SchedulerActor.options(
-                            num_cpus=0,
-                            **_accelerator_actor_options(server_args),
-                            **tpu_actor_runtime_env(tpu_worker_hostnames),
+                            **_actor_options(server_args),
                             name=f"sglang_scheduler_node{rank0_node_ip}_pp{pp_rank}_tp{tp_rank}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}",
                             scheduling_strategy=PlacementGroupSchedulingStrategy(
                                 placement_group=pg,
@@ -307,7 +349,6 @@ class RayEngine(Engine):
                     pg,
                     bundle_for_node,
                     rank0_node_ip,
-                    tpu_worker_hostnames,
                 ),
                 None,
             )
@@ -320,7 +361,6 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: list,
         rank0_node_ip: str,
-        tpu_worker_hostnames: Optional[str] = None,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
@@ -356,7 +396,6 @@ class RayEngine(Engine):
             pg,
             bundle_for_node,
             rank0_node_ip,
-            tpu_worker_hostnames,
         )
 
         # Start the DP controller's event loop in a daemon thread.

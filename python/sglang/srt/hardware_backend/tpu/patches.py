@@ -10,6 +10,7 @@ All patches are idempotent.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 
 from sglang.srt.environ import envs
@@ -102,12 +103,21 @@ def _set_torch_tpu_topology_env_multihost(
     os.environ.setdefault("TORCH_TPU_TOPOLOGY", ",".join(str(d) for d in chip_dims))
 
 
-def _set_torch_tpu_topology_env_single(world_size: int) -> None:
-    """Set the slicebuilder + topology env for a single-host process group.
+def compute_single_host_tpu_env(world_size: int) -> dict:
+    """Compute the single-host slicebuilder + topology env WITHOUT mutating
+    ``os.environ``.
 
     Picks ``world_size`` free localhost ports for the per-rank slicebuilder
     endpoints; topology is ``1,1,1`` for ``world_size == 1``, else the
-    torch_tpu-derived grid when one is available.
+    torch_tpu-derived grid when one is available. Returns a dict with
+    ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` (always) and ``TORCH_TPU_TOPOLOGY``
+    (when known).
+
+    Returning the values (rather than writing them) lets the Ray driver compute
+    the shared port list once and inject it into every same-host actor via
+    ``runtime_env`` -- Ray does NOT propagate the driver's own ``os.environ``
+    mutations to actors, so each actor computing this independently would pick a
+    different port list and the slicebuilder would never rendezvous.
     """
     try:
         import portpicker
@@ -116,7 +126,7 @@ def _set_torch_tpu_topology_env_single(world_size: int) -> None:
     except ImportError:
         import socket
 
-        # Hold sockets open until env var is written so OS doesn't reassign.
+        # Hold sockets open until the ports are read so the OS doesn't reassign.
         _held = [
             socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)
         ]
@@ -126,21 +136,37 @@ def _set_torch_tpu_topology_env_single(world_size: int) -> None:
         for s in _held:
             s.close()
 
-    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
-        f"localhost:{p}" for p in sb_ports
-    )
+    env = {
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(f"localhost:{p}" for p in sb_ports)
+    }
 
     if world_size == 1:
-        os.environ.setdefault("TORCH_TPU_TOPOLOGY", "1,1,1")
+        env["TORCH_TPU_TOPOLOGY"] = "1,1,1"
     else:
         try:
             from torch_tpu._internal.utils import hardware
 
             topo = hardware.get_tpu_topology(world_size)
             if topo:
-                os.environ.setdefault("TORCH_TPU_TOPOLOGY", topo)
+                env["TORCH_TPU_TOPOLOGY"] = topo
         except Exception:
             pass
+
+    return env
+
+
+def _set_torch_tpu_topology_env_single(world_size: int) -> None:
+    """Set the slicebuilder + topology env for a single-host process group.
+
+    Thin wrapper over ``compute_single_host_tpu_env`` for the non-Ray / in-process
+    path: addresses are always written; topology is only filled when unset.
+    """
+    env = compute_single_host_tpu_env(world_size)
+    os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = env[
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES"
+    ]
+    if "TORCH_TPU_TOPOLOGY" in env:
+        os.environ.setdefault("TORCH_TPU_TOPOLOGY", env["TORCH_TPU_TOPOLOGY"])
 
 
 def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> None:
@@ -178,13 +204,12 @@ def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> No
     if len(hosts) > 1:
         # Multihost slicebuilder endpoints are deterministic
         # (``host:base_port+i`` over the Ray-discovered node IPs), so rebuild
-        # them unconditionally. Ray propagates the driver's env to every actor,
-        # so an actor can inherit the driver's stale *single-host* values
-        # (``localhost:*`` addresses + a single-box topology). Those are always
-        # wrong for a multi-host slice and, left in place, strand each host
-        # trying to bind the whole slice on localhost -> PJRT device binding
-        # aborts. Drop any inherited copies so the helper recomputes from the
-        # real node IPs; recompute is idempotent.
+        # them unconditionally. Defensively drop any single-host values
+        # (``localhost:*`` addresses + a single-box topology) that a launcher or
+        # inherited env may have left behind: they are always wrong for a
+        # multi-host slice and, left in place, strand each host trying to bind
+        # the whole slice on localhost -> PJRT device binding aborts. The helper
+        # then recomputes from the real node IPs; recompute is idempotent.
         os.environ.pop("TORCH_TPU_SLICEBUILDER_ADDRESSES", None)
         os.environ.pop("TORCH_TPU_TOPOLOGY", None)
         _set_torch_tpu_topology_env_multihost(
@@ -601,7 +626,12 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
+def _log_env(when: str) -> None:
+    logger.info("%s, env: %s", when, json.dumps(dict(sorted(os.environ.items()))))
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
+    _log_env("Before TPU patches")
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
     _register_tpu_compile_backend()
@@ -612,4 +642,4 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _register_aten_fallbacks()
-    logger.info("TPU patches applied.")
+    _log_env("TPU patches applied")

@@ -28,8 +28,7 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
-from sglang.srt.hardware_backend.tpu.ray_utils import tpu_actor_runtime_env
-from sglang.srt.ray.engine import _accelerator_actor_options
+from sglang.srt.ray.engine import _actor_options
 from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import bind_port, get_zmq_socket, get_zmq_socket_on_host
@@ -52,7 +51,6 @@ class RayDataParallelController(DataParallelController):
         placement_group,
         bundle_for_node: List[int],
         rank0_node_ip: str,
-        tpu_worker_hostnames: Optional[str] = None,
     ):
         # Set Ray-specific attributes BEFORE super().__init__() because the
         # parent constructor calls launch_dp_schedulers / launch_dp_attention_schedulers
@@ -60,7 +58,6 @@ class RayDataParallelController(DataParallelController):
         self.pg = placement_group
         self.bundle_for_node = bundle_for_node
         self.rank0_node_ip = rank0_node_ip
-        self.tpu_worker_hostnames = tpu_worker_hostnames
         self.scheduler_actors: List = []
         self.event_loop_refs: List = []
 
@@ -186,9 +183,7 @@ class RayDataParallelController(DataParallelController):
                     dist_init_addr = f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
 
                     actor = SchedulerActor.options(
-                        num_cpus=0,
-                        **_accelerator_actor_options(server_args),
-                        **tpu_actor_runtime_env(self.tpu_worker_hostnames),
+                        **_actor_options(server_args),
                         name=(
                             f"sglang_scheduler_node{self.rank0_node_ip}"
                             f"_dp{actual_dp_rank}_pp{pp_rank}_tp{tp_rank}"

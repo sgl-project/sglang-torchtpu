@@ -24,8 +24,8 @@ import os
 from typing import Optional
 
 import ray
+from ray.util.placement_group import placement_group as create_placement_group
 from ray.util.placement_group import (
-    placement_group as create_placement_group,
     remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -109,16 +109,116 @@ def discover_tpu_worker_hostnames(nnodes: int) -> Optional[str]:
     return hostnames
 
 
-def tpu_actor_runtime_env(tpu_worker_hostnames: Optional[str]) -> dict:
-    """Ray ``.options()`` kwargs injecting the discovered TPU host list into a
-    scheduler actor's environment.
+def _resolve_bundle_order_from_probes(
+    probes: list[tuple[Optional[str], str]], engine_ip: str
+) -> tuple[list[int], str]:
+    """Turn per-bundle ``(TPU_WORKER_ID, ip)`` probes into a physically-ordered
+    ``bundle_for_node`` plus the rank-0 host IP.
 
-    The actor reads ``TPU_WORKER_HOSTNAMES`` from its env during TPU bootstrap
-    (``_prepare_tpu_env``); setting it via ``runtime_env`` keeps the generic
-    ``SchedulerActor`` constructor free of a TPU-specific parameter. Returns an
-    empty dict when there is nothing to inject (single-host or discovery failed),
-    so actors fall back to their own pod env.
+    ``probes[bundle_idx]`` is the ``(TPU_WORKER_ID, ip)`` observed on Ray
+    placement-group bundle ``bundle_idx``. The returned ``bundle_for_node[k]``
+    is the bundle index whose physical ``TPU_WORKER_ID == k``, so scheduler node
+    ``k`` lands on physical worker ``k`` -- matching the slicebuilder endpoint
+    list and ``MASTER_ADDR`` (both ordered by ``TPU_WORKER_ID``; see
+    ``discover_tpu_worker_hostnames`` / ``monkey_patch_torch_tpu_env``). Ray does
+    not guarantee bundle indices follow ``TPU_WORKER_ID`` order, so relying on
+    numeric bundle order silently misplaces ranks for nnodes >= 3.
+
+    Also verifies rank-0 (``TPU_WORKER_ID == 0``) is co-located with the Engine,
+    since ``MASTER_ADDR`` points at worker 0 and the rank-0 scheduler must share
+    the Engine's node. Raises ``RuntimeError`` on any inconsistency (missing /
+    duplicate / non-contiguous worker ids, or engine not on worker 0) instead of
+    letting the run hang later at PJRT bind / rendezvous.
+
+    Pure function (no Ray calls) so the ordering + validation can be unit-tested.
     """
-    if not tpu_worker_hostnames:
+    nnodes = len(probes)
+
+    if any(worker_id is None for worker_id, _ in probes):
+        raise RuntimeError(
+            "Ray TPU multihost: TPU_WORKER_ID missing on some bundles "
+            f"({probes}); cannot order ranks by physical slice position."
+        )
+
+    worker_id_to_bundle: dict[int, int] = {}
+    worker_id_to_ip: dict[int, str] = {}
+    for bundle_idx, (worker_id, ip) in enumerate(probes):
+        wid = int(worker_id)
+        if wid in worker_id_to_bundle:
+            raise RuntimeError(
+                f"Ray TPU multihost: duplicate TPU_WORKER_ID={wid} across "
+                f"bundles {worker_id_to_bundle[wid]} and {bundle_idx} ({probes})."
+            )
+        worker_id_to_bundle[wid] = bundle_idx
+        worker_id_to_ip[wid] = ip
+
+    if sorted(worker_id_to_bundle) != list(range(nnodes)):
+        raise RuntimeError(
+            "Ray TPU multihost: TPU_WORKER_IDs are not contiguous 0.."
+            f"{nnodes - 1}; got {sorted(worker_id_to_bundle)} ({probes})."
+        )
+
+    bundle_for_node = [worker_id_to_bundle[k] for k in range(nnodes)]
+    rank0_node_ip = worker_id_to_ip[0]
+
+    if engine_ip != rank0_node_ip:
+        raise RuntimeError(
+            f"Ray TPU multihost: Engine runs on {engine_ip} but TPU worker 0 is "
+            f"on {rank0_node_ip}. The rank-0 scheduler must be co-located with "
+            "the Engine (MASTER_ADDR points at worker 0). Start the Ray head / "
+            "Engine on the host whose TPU_WORKER_ID is 0."
+        )
+
+    return bundle_for_node, rank0_node_ip
+
+
+def order_tpu_bundles_by_worker_id(
+    placement_group, nnodes: int
+) -> tuple[list[int], str]:
+    """Probe the live placement group and order bundles by physical TPU_WORKER_ID.
+
+    Returns ``(bundle_for_node, rank0_node_ip)`` where ``bundle_for_node[k]`` is
+    the bundle on the host with ``TPU_WORKER_ID == k`` and ``rank0_node_ip`` is
+    that of worker 0. See ``_resolve_bundle_order_from_probes`` for the ordering
+    contract and validation. Raises ``RuntimeError`` on any inconsistency.
+    """
+    engine_ip = ray.util.get_node_ip_address()
+    probes = ray.get(
+        [
+            _get_worker_id_and_address.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group, placement_group_bundle_index=i
+                )
+            ).remote()
+            for i in range(nnodes)
+        ]
+    )
+    return _resolve_bundle_order_from_probes(probes, engine_ip)
+
+
+def tpu_actor_runtime_env(server_args) -> dict:
+    """Ray ``.options()`` kwargs injecting the launcher-computed TPU env vars into
+    a scheduler actor's environment.
+
+    Reads the individual fields the Ray engine stashed on ``server_args`` and maps
+    each to the env var the actor's TPU bootstrap (``_prepare_tpu_env``) reads:
+    ``TPU_WORKER_HOSTNAMES`` (multihost host list), or the shared single-host
+    ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` / ``TORCH_TPU_TOPOLOGY``. Passing them via
+    ``runtime_env`` is the only reliable channel -- Ray does NOT propagate the
+    driver's ``os.environ`` mutations to actors -- and keeps the generic
+    ``SchedulerActor`` constructor free of TPU-specific parameters. Returns an
+    empty dict when there is nothing to inject (GPU or non-Ray), so actors fall
+    back to their own pod env.
+    """
+    env_vars = {}
+    if server_args.tpu_worker_hostnames:
+        env_vars["TPU_WORKER_HOSTNAMES"] = server_args.tpu_worker_hostnames
+    if server_args.torch_tpu_slicebuilder_addresses:
+        env_vars["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = (
+            server_args.torch_tpu_slicebuilder_addresses
+        )
+    if server_args.torch_tpu_topology:
+        env_vars["TORCH_TPU_TOPOLOGY"] = server_args.torch_tpu_topology
+    if not env_vars:
         return {}
-    return {"runtime_env": {"env_vars": {"TPU_WORKER_HOSTNAMES": tpu_worker_hostnames}}}
+    return {"runtime_env": {"env_vars": env_vars}}
