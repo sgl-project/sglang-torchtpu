@@ -128,6 +128,7 @@ def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
 
     controller = TpuHiCacheController.__new__(TpuHiCacheController)
     controller.io_backend = "torch_tpu"
+    controller.device = target_dev.device  # move_indices re-pins onto this
     controller.mem_pool_device = target_dev
     controller.mem_pool_host = target_host
     controller.has_draft = False
@@ -303,6 +304,9 @@ class TestTpuDraftKvOffload(CustomTestCase):
         )
         producer_id = controller.start_loading()
         self.assertGreaterEqual(producer_id, 0)
+        # The forward's commit point (init_forward_metadata); wait() is only
+        # the consumer gate and does not drain.
+        target_dev.tpu_commit_pending_loads()
         controller.layer_done_counter.set_consumer(producer_id)
         controller.layer_done_counter.wait()
 
@@ -341,12 +345,171 @@ class TestTpuDraftKvOffload(CustomTestCase):
             CacheOperation(host_indices, device_indices, node_id=0)
         )
         producer_id = controller.start_loading()
+        target_dev.tpu_commit_pending_loads()  # the forward's commit point
         controller.layer_done_counter.set_consumer(producer_id)
         controller.layer_done_counter.wait()
         for layer in range(target_dev.layer_num):
             self.assertTrue(
                 torch.equal(target_dev.kv_buffer[layer][pages].cpu(), orig[layer])
             )
+
+
+@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
+class TestTpuKvOffloadConcurrency(CustomTestCase):
+    """Guards the stage/commit split against the XLA buffer-donation race."""
+
+    def test_reload_commit_thread_ownership(self):
+        # Deterministic invariant check: staging runs on the worker thread,
+        # the kv_buffer scatter is deferred past staging-done, and the commit
+        # runs on the thread that drains (the forward-dispatch thread in
+        # production). Fails immediately if the scatter ever moves back into
+        # the worker's reload task.
+        import threading
+
+        from sglang.srt.managers.cache_controller import CacheOperation
+
+        target_dev, target_host = _make_pools(layer_num=2)
+        controller = _make_controller(target_dev, target_host)
+
+        pages = [1, 4, 2]
+        orig = _seed_pages(target_dev, pages)
+        device_indices = torch.cat(
+            [
+                torch.arange(pid * PAGE_SIZE, (pid + 1) * PAGE_SIZE, device=DEV)
+                for pid in pages
+            ]
+        )
+        host_indices = target_host.alloc(len(device_indices))
+        self.assertIsNotNone(host_indices)
+
+        controller.write_queue.append(
+            CacheOperation(host_indices, device_indices, node_id=0)
+        )
+        controller.start_writing()
+        controller._backup_inflight.synchronize()
+        for layer in range(target_dev.layer_num):  # evict
+            target_dev.kv_buffer[layer][pages] = 0
+
+        # Record which thread runs each half of the reload.
+        threads = {}
+        orig_stage, orig_commit = target_host.load_stage, target_host.load_commit
+
+        def _stage(*args, **kwargs):
+            threads["stage"] = threading.current_thread().name
+            return orig_stage(*args, **kwargs)
+
+        def _commit(*args, **kwargs):
+            threads["commit"] = threading.current_thread().name
+            return orig_commit(*args, **kwargs)
+
+        target_host.load_stage, target_host.load_commit = _stage, _commit
+        try:
+            controller.load_queue.append(
+                CacheOperation(host_indices, device_indices, node_id=0)
+            )
+            producer_id = controller.start_loading()
+            self.assertGreaterEqual(producer_id, 0)
+
+            # Staging done (worker event set) but NOT yet drained: the
+            # scatter must not have run — kv_buffer still holds the eviction
+            # zeros, and load_commit has not been called from any thread.
+            controller.layer_done_counter.events[producer_id].synchronize()
+            self.assertEqual(threads.get("stage"), "test-kv-offload-h2d")
+            self.assertNotIn("commit", threads)
+            for layer in range(target_dev.layer_num):
+                self.assertEqual(
+                    target_dev.kv_buffer[layer][pages].cpu().abs().sum().item(),
+                    0.0,
+                    "kv_buffer scatter ran before the commit drain — the "
+                    "worker thread touched a donatable buffer",
+                )
+
+            # The production commit point (init_forward_metadata ->
+            # tpu_commit_pending_loads) drains on the dispatch thread; wait()
+            # is only the consumer gate.
+            target_dev.tpu_commit_pending_loads()
+            controller.layer_done_counter.set_consumer(producer_id)
+            controller.layer_done_counter.wait()
+            self.assertEqual(threads.get("commit"), threading.current_thread().name)
+            for layer in range(target_dev.layer_num):
+                self.assertTrue(
+                    torch.equal(target_dev.kv_buffer[layer][pages].cpu(), orig[layer])
+                )
+        finally:
+            target_host.load_stage, target_host.load_commit = (
+                orig_stage,
+                orig_commit,
+            )
+
+    def test_reload_survives_concurrent_donation_churn(self):
+        # Race miniature: donating dispatches churn the kv_buffer on this
+        # thread (as the attention op does) while reloads stage on the
+        # worker; drain, then assert bit-exact restoration. The pre-split
+        # design crashes or loses scatters here.
+        from torch_tpu._internal import pallas as _torch_pallas
+
+        from sglang.srt.managers.cache_controller import CacheOperation
+
+        target_dev, target_host = _make_pools(layer_num=2)
+        controller = _make_controller(target_dev, target_host)
+
+        # Identity kernel that donates its input, mirroring the RPA op's
+        # donate_argnums/alias pattern: every call invalidates + rebinds the
+        # buffer's PJRT handle, then the alias copies the result back so the
+        # contents survive for the readback asserts.
+        def _donating_identity(x):
+            return x + 0
+
+        donate = _torch_pallas.custom_jax_kernel(
+            _donating_identity,
+            name="test_kv_offload_donating_identity",
+            donate_argnums=[0],
+            input_output_aliases={0: 0},
+            warn_deprecated=False,
+        )
+        for layer in range(target_dev.layer_num):  # compile before timing races
+            donate(target_dev.kv_buffer[layer])
+
+        pages = [5, 1, 3]
+        device_indices = torch.cat(
+            [
+                torch.arange(pid * PAGE_SIZE, (pid + 1) * PAGE_SIZE, device=DEV)
+                for pid in pages
+            ]
+        )
+        for _round in range(4):
+            orig = _seed_pages(target_dev, pages)
+            host_indices = target_host.alloc(len(device_indices))
+            self.assertIsNotNone(host_indices)
+            controller.write_queue.append(
+                CacheOperation(host_indices, device_indices, node_id=0)
+            )
+            controller.start_writing()
+            controller._backup_inflight.synchronize()
+            for layer in range(target_dev.layer_num):  # evict
+                target_dev.kv_buffer[layer][pages] = 0
+
+            controller.load_queue.append(
+                CacheOperation(host_indices, device_indices, node_id=0)
+            )
+            producer_id = controller.start_loading()
+
+            # Donation churn concurrent with the in-flight staging: 64
+            # dispatches x layer_num handle invalidations per round.
+            for _ in range(64):
+                for layer in range(target_dev.layer_num):
+                    donate(target_dev.kv_buffer[layer])
+
+            target_dev.tpu_commit_pending_loads()  # the forward's commit point
+            controller.layer_done_counter.set_consumer(producer_id)
+            controller.layer_done_counter.wait()
+            for layer in range(target_dev.layer_num):
+                self.assertTrue(
+                    torch.equal(target_dev.kv_buffer[layer][pages].cpu(), orig[layer]),
+                    f"round {_round} layer {layer}: reload lost or garbled "
+                    "under concurrent buffer donation",
+                )
+            target_host.free(host_indices)
 
 
 if __name__ == "__main__":

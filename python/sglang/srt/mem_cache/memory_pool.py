@@ -795,6 +795,11 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def tpu_commit_pending_loads(self) -> None:
+        """Land deferred hierarchical-cache reload writes into kv_buffer."""
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.drain_commits()
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 

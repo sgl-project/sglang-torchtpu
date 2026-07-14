@@ -1007,9 +1007,16 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                 f"supports io_backend='torch_tpu', got {io_backend!r}"
             )
 
+        staged = self.load_stage(device_pool, host_indices, device_indices)
+        self.load_commit(device_pool, staged)
+
+    def load_stage(self, device_pool, host_indices, device_indices):
+        """
+        Returns ``(src_all, dst_ids, host_all)`` or None if nothing to load.
+        """
         dst_ids, num_pages, num_padded_pages = self._padded_ids(device_indices)
         if num_pages == 0:
-            return
+            return None
 
         # host_indices is host-born (move_indices keeps it on CPU); index the
         # CPU host buffer directly. ``.cpu()`` is a no-op here (no sync).
@@ -1023,19 +1030,25 @@ class TpuFusedMHATokenToKVPoolHost(HostKVCache):
                 (num_padded_pages - num_pages,) + tuple(host_all.shape[1:])
             )
             host_all = torch.cat([host_all, pad], dim=0)  # [num_padded_pages, ...]
-        # Single async H2D (DMA engine, overlaps the prior forward). host_all /
-        # src_all stay alive until the barrier below (DMA in flight).
+        # Single async H2D (DMA engine, overlaps the prior forward).
         src_all = host_all.to(device_pool.kv_buffer[0].device, non_blocking=True)
 
-        # Native in-place scatter into each live per-layer buffer -- src_all[:, L]
-        # is the source for layer L. No Pallas, no staging.
+        # host_all rides along to stay alive until the commit (the DMA may
+        # still be reading it).
+        return src_all, dst_ids, host_all
+
+    def load_commit(self, device_pool, staged):
+        """Scheduler-thread half of the reload: scatter the staged tensor into
+        the live per-layer device buffers. MUST run on the scheduler thread
+        with no forward in flight (BatchDoneCounter drains commits at its gate
+        points): the single in-order PJRT queue then orders the scatter before
+        the next forward's reads, and the scatter's dependency on ``src_all``
+        orders it after the staging DMA -- no host sync anywhere."""
+        if staged is None:
+            return
+        src_all, dst_ids, _host_all = staged
         for layer_id in range(self.layer_num):
             device_pool.kv_buffer[layer_id][dst_ids] = src_all[:, layer_id]
-
-        # One barrier: every scatter (and the H2D feeding it) lands before the
-        # worker signals this batch's done-event (no-stale).
-        torch.tpu.synchronize()
-        del host_all, src_all
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend

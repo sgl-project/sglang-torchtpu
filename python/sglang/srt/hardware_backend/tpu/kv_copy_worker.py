@@ -7,10 +7,10 @@ the main scheduler thread. Modeled on the vLLM torch_tpu offload ``_DmaWorker``:
 the FIFO queue serializes tasks, so at most one transfer per direction runs at a
 time, and each ``submit`` returns a completion event set when the task returns.
 
-Because a transfer task ends with a blocking device sync
-(``_tpu_sync(..., wait=True)`` over the gathered / scattered buffers), a set
-event implies the DMA has physically landed on-device -- which is exactly what
-HiCache's ack queues need before a node is unlocked / made loadable.
+A set event means the task returned: for D2H write-back that implies the
+backup landed in host memory (the task blocks on the copy); for the H2D
+reload it means staging is enqueued -- the commit scatter's on-device operand
+dependency covers the landing, no host sync needed.
 
 Two worker threads must never share one instance across directions: a slow D2H
 must not be able to head-of-line block an H2D (and vice versa), so each

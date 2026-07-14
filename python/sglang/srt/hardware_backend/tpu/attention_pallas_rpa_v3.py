@@ -281,6 +281,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # ------------------------------------------------------------------ #
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        forward_batch.token_to_kv_pool.tpu_commit_pending_loads()
+
         # Look up the cached RPA ``distribution`` on TPU, so we don't build it,
         # don't H2D it per step, and don't need the barrier that ensured the RPA
         # kernel launched only after that H2D finished.
