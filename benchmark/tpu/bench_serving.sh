@@ -58,10 +58,19 @@
 #   SWEEP=                          # space-separated "c:isl:osl" tuples
 #                                   # (overrides ISL/OSL/BATCH_SIZE/NUM_PROMPTS)
 #   HEALTH_TIMEOUT=600              # seconds to wait for /health -> 200
+#   DUMP_META=1                     # 1 → write <tag>.meta.json next to each
+#                                   # <tag>.jsonl (repro record for the CI
+#                                   # dashboard; pulls live /server_info); 0 skips
 #   PYTHON=python3                  # interpreter with torch_tpu + sglang installed
 #   JAX_BAZEL=                      # opt-in; only for a Bazel-built torch_tpu
 
 set -euo pipefail
+
+# Resolve this script's dir so we can find dump_meta.py regardless of CWD.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# 1 (default) → write <tag>.meta.json next to each <tag>.jsonl (reproducibility
+# record for the CI dashboard). Set 0 to skip.
+DUMP_META=${DUMP_META:-1}
 
 MODEL=${MODEL:-}
 if [[ -z "$MODEL" ]]; then
@@ -193,6 +202,38 @@ run_one() {
     "$PYTHON" "${args[@]}"
     echo
     echo "→ summary appended to $output_file"
+
+    # ===== reproducibility metadata dump =====
+    # One <tag>.meta.json per config, next to the metrics <tag>.jsonl. Records
+    # the workload/bench args + git + versions, and pulls the LIVE server config
+    # from $BASE_URL/server_info so the record reflects what the server is
+    # actually running (not a stale launch-side file). Never fatal.
+    if [[ "$DUMP_META" == "1" ]]; then
+        local meta_file="$OUTPUT_DIR/${tag}.meta.json"
+        local bench_argv_json
+        bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${args[@]}")
+        "$PYTHON" "$SCRIPT_DIR/dump_meta.py" --kind bench --out "$meta_file" \
+            --json bench_argv="$bench_argv_json" \
+            --set model="$MODEL" \
+            --set model_slug="$MODEL_SLUG" \
+            --set base_url="$BASE_URL" \
+            --set backend="$BACKEND" \
+            --set dataset_name="$DATASET_NAME" \
+            --set tokenize_prompt="$TOKENIZE_PROMPT" \
+            --set isl="$isl" \
+            --set osl="$osl" \
+            --set concurrency="$bs" \
+            --set num_prompts="$num_prompts" \
+            --set prompts_per_concurrency="$PROMPTS_PER_CONCURRENCY" \
+            --set warmup_requests="$warmup_n" \
+            --set seed="$SEED" \
+            --set random_range_ratio="$RANDOM_RANGE_RATIO" \
+            --set profile="$PROFILE" \
+            --set summary_file="${tag}.jsonl" \
+            --server-info-url "$BASE_URL" \
+            || echo "WARN: dump_meta failed for $tag; continuing" >&2
+        echo "→ metadata written to $meta_file"
+    fi
 }
 
 if [[ -n "$SWEEP" ]]; then
