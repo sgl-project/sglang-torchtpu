@@ -155,12 +155,6 @@ class BatchDoneCounter:
         self.consumer_index = index
 
     def wait(self) -> None:
-        # Deliberately does NOT drain commits: the per-forward commit point is
-        # the attention backend's init_forward_metadata (via
-        # KVCache.tpu_commit_pending_loads), which runs before this gate on
-        # every forward in both eager and compiled modes. This is only the
-        # whole-batch gate: block until this batch's own reload is staged
-        # (the commit + on-device ordering cover the rest).
         if self.consumer_index < 0:
             return
         ev = self.events[self.consumer_index]
@@ -845,14 +839,6 @@ class HiCacheController:
         if device_indices is None:
             return None
         if self.io_backend == "torch_tpu":
-            # The TPU allocator hands indices back on device, but on this
-            # backend the radix tree is CPU-resident (host-resident
-            # req_to_token; node.value / prefix_indices live on CPU). The
-            # returned tensor becomes node.value on load-back — leaving it on
-            # device poisons the tree and the next prefix concat dies with a
-            # cross-device torch.cat ("cat(): tensor is expected to be on
-            # tpu, got cpu"). Mirror raiden_cache_controller.load(): store
-            # the CPU copy; move_indices re-pins to device for the DMA.
             device_indices = device_indices.cpu()
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
