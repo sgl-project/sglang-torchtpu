@@ -225,9 +225,27 @@ def _pad_forward_batch_inputs(
 ) -> tuple[int, int]:
     """Pad ForwardBatch tensors to next bucket shape and return original sizes."""
     if forward_batch.return_logprob:
-        raise NotImplementedError(
-            "return_logprob is not supported on the TPU backend yet."
-        )
+        # Output (next-token) logprobs are computed by the eager Sampler AFTER
+        # the compiled forward returns next_token_logits, so they don't affect
+        # the compiled graph's shapes. Only INPUT/prompt logprobs (echo) run
+        # inside the LogitsProcessor over dynamically-pruned states, which would
+        # break the static-shape compiled forward. Reject only that case.
+        needs_input_logprob = False
+        if (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu or []
+            start_lens_cpu = forward_batch.extend_logprob_start_lens_cpu or []
+            for extend_len, start_len in zip(extend_seq_lens_cpu, start_lens_cpu):
+                if extend_len - start_len > 0:
+                    needs_input_logprob = True
+                    break
+        if needs_input_logprob:
+            raise NotImplementedError(
+                "input/prompt logprobs (echo) are not supported on the TPU "
+                "compiled backend yet; only output (next-token) logprobs are."
+            )
 
     is_decode = forward_batch.forward_mode.is_decode()
     real_q = forward_batch.input_ids.shape[0]

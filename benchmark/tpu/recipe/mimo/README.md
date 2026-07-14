@@ -13,7 +13,7 @@ on `tpu7x`: FP8 weights + FP8 KV cache, torch.compile, `pallas_tpu_rpa_v3` atten
 
 ### MiMo-V2.5 (310B) — single host
 ```bash
-./launch_mimo_25.sh 
+./launch_mimo_25.sh
 ```
 
 ### MiMo-V2.5-Pro (1T) — 2 hosts

@@ -965,14 +965,44 @@ def calculate_tiling(
     tile_m = bf16_bf16_tile_m * lhs_mod // rhs_mod
     tile_m = min(tile_m, dims.size_m)
 
-    # Per-buffer VMEM target for triple-buffered RHS. Matches ullm reference;
-    # the pre-#157 overhead subtraction + 5MiB spill + scale-bytes inflation
-    # shrank rhs_vmem_target unnecessarily.
+    # Per-buffer VMEM target for triple-buffered RHS.
     num_rhs_buffers = 3
-    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
     base_rhs_size_bytes = (
         dims.size_k * dims.size_n * rhs_bits // 8 * base_rhs_bytes_multiplier
     )
+
+    scratch_reserve_bytes = 0
+    if fuse_act:
+        acc_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4  # bf16 vs f32 acc
+        out_bytes = 2  # bf16 output / partial-out tile
+        lhs_bytes = lhs_bits // 8
+        scratch_bytes_per_m = (
+            (
+                2 * dims.size_n * acc_bytes  # gate||up accumulator
+                + 2 * dims.size_k * lhs_bytes  # lhs tile + double buffer
+                + 2 * dims.size_n * out_bytes  # out tile + double buffer
+            )
+            * 3
+            // 2
+        )
+        scratch_reserve_bytes = tile_m * scratch_bytes_per_m
+
+        scratch_budget = vmem_limit_bytes // 2
+        if scratch_reserve_bytes > scratch_budget:
+            sublane = dims.size_lhs_sublane
+            fit_tile_m = scratch_budget // scratch_bytes_per_m // sublane * sublane
+            if fit_tile_m < sublane:
+                raise ValueError(
+                    f"fuse_act={fuse_act!r}: even the minimum tile_m={sublane} "
+                    f"needs {sublane * scratch_bytes_per_m} B of VMEM scratch, over "
+                    f"half the {vmem_limit_bytes} B budget "
+                    f"(size_n={dims.size_n}, size_k={dims.size_k}); raise "
+                    "vmem_limit_bytes or shrink the per-expert n/k."
+                )
+            tile_m = fit_tile_m
+            scratch_reserve_bytes = tile_m * scratch_bytes_per_m
+
+    rhs_vmem_target = (vmem_limit_bytes - scratch_reserve_bytes) // num_rhs_buffers
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
     # smaller than 2x of mxu_column_size.
