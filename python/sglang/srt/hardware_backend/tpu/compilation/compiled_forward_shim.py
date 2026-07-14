@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 DEFAULT_TPU_COMPILE_MAX_BS = 64
 
 # Fields whose token dim gets padded to the token bucket.
-_TOKEN_FIELDS = ("input_ids", "positions")
+_TOKEN_FIELDS = ("input_ids", "positions", "out_cache_loc")
 
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
