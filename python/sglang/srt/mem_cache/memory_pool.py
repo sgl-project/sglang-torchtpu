@@ -159,9 +159,10 @@ class ReqToTokenPool:
         # Host-resident req_to_token: keep the page table on CPU so the index
         # write and attention-metadata build run on host, avoiding the on-device
         # gather/scatter recompiles. Default on for TPU
-        # (SGLANG_TPU_HOST_R2T=0 opts out); self.device stays the real (tpu) device.
+        # (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 opts out); self.device stays the
+        # real (tpu) device.
         self.host_resident = (
-            str(device).startswith("tpu") and envs.SGLANG_TPU_HOST_R2T.get()
+            str(device).startswith("tpu") and envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get()
         )
         r2t_device = "cpu" if self.host_resident else device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -739,7 +740,7 @@ class KVCache(abc.ABC):
         )
         self.mem_usage = 0
 
-        # used for chunked cpu-offloading
+        # number of tokens per chunk for cpu offloading
         self.cpu_offloading_chunk_size = 8192
 
         # default state for optional layer-wise transfer control

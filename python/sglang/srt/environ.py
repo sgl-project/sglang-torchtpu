@@ -672,7 +672,7 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
-    SGLANG_TPU_HOST_R2T = EnvBool(True)
+    SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_ASYNC_H2D = EnvBool(True)
@@ -709,6 +709,7 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_GC_LOG", "SGLANG_LOG_GC")
+    _print_deprecated_env("SGLANG_TPU_HOST_R2T", "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST")
     _print_deprecated_env(
         "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "SGLANG_MOE_NVFP4_DISPATCH"
     )
