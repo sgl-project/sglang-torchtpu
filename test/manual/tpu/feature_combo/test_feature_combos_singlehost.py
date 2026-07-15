@@ -1,27 +1,14 @@
-"""Single-host feature-combination tests — one file, gradually stacking
-features (milestone combo track; multihost P/D lives in
-multihost/test_feature_combos.py, real-model nightly quad in
-test/registered/tpu/test_qwen3_moe_feature_combo_nightly.py).
-Current pass/fail matrix + failure signatures: COMBO_STATUS.md (same dir).
+"""Single-host feature-combination tests: the milestone combo gate.
 
-WHICH COMBINATIONS EXIST HERE — the interaction principle
-----------------------------------------------------------
-A combo earns a row only when its features can AFFECT EACH OTHER: they share
-mutable state (KV pools, radix indices), threads (reload workers vs forward
-dispatch), or collectives (DP gather). Combos whose interaction surface is
-structurally equivalent to an already-tested row are deduced, not run — e.g.
-SWA x KV-offload is not a row because SWA and MHA share the same pool/reload
-machinery (homogeneous); MHA x KV-offload passing certifies both, and a
-SWA-specific break would be a pool-wrapper unit bug, not a combination bug.
-Depth also does NOT live here: when a combo turns red, the diagnosed
-mechanism gets a dedicated fast unit test next to the mechanism (see
-TestTpuKvOffloadConcurrency in test_tpu_kv_offload.py for the pattern); this
-file stays a functional gate — few scenarios, correctness-asserted, ~2min.
+A combo earns a row only when its features can AFFECT each other (shared KV
+pools/indices, threads, or collectives); equivalent combos are deduced, not
+run, and mechanism depth lives in unit tests next to the mechanism. Full
+principle, pass/fail matrix, and failure signatures: COMBO_STATUS.md (same
+dir). Multihost P/D: multihost/test_feature_combos.py. Real-model nightly
+quad: test/registered/tpu/test_qwen3_moe_feature_combo_nightly.py.
 
-Combos (each = the SAME scenario suite; ALL rows run under torch.compile —
-the serving recipes ship compiled, so compiled is what gets certified.
-Default shape = the full v7x host, tp=8; dp is carved out of tp, so every
-combo uses the same 8 chips):
+All rows run under torch.compile (the serving recipes ship compiled) at the
+full v7x-host shape; dp is carved out of tp, so every combo uses 8 chips:
   1     prefix caching + EAGLE3 spec + KV offloading        (tp=8)
         interaction: draft KV piggybacks target slots; spec multiplies
         forwards racing the reload worker.
@@ -30,33 +17,12 @@ combo uses the same 8 chips):
         interaction: per-rank pools + idle-rank dummy batches vs reload/evict.
   3     prefix caching + DP attention + KV offloading + spec (tp=8 x dp=2)
 
-Scenario suite (runs under every combo):
-  * cold vs warm multi-page reuse (+ spec verify/accept on the cache-hit
-    request when spec is on — the interaction case),
-  * shared system-prefix across distinct questions,
-  * eviction -> HiCache host reload (churn past the device pool, then the
-    prefix must come BACK: cached >= pages — plain radix would miss),
-  * flush -> repopulate,
-  * concurrent churn wave: one batched submission mixing evicted-prefix
-    hits with fresh docs against the tight pool — mixed prefill/decode
-    batches, reload-while-others-decode, and retract/preemption pressure
-    (the paths sequential scenarios can never reach; cf. #152),
-  * greedy determinism: cache-hit output bit-identical to cold output.
-  DP configs prime every rank first (each DP rank has its own radix tree —
-  a prefix cached on rank 0 is a miss on rank 1 until primed).
-
 ONE COMBO PER PROCESS: TPU runtime re-init in-process is fragile (PJRT
-teardown/reinit), so each combo builds its engine in a fresh interpreter.
-Run one combo directly, or all three sequentially via subprocesses:
+teardown/reinit), so each combo builds its engine in a fresh interpreter:
 
     SGLANG_PLATFORM=tpu HF_HUB_OFFLINE=1 \
         python test/manual/tpu/feature_combo/test_feature_combos_singlehost.py 1
-    python test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-
-Known landmine scenario 3 is designed to step on if present: the plain
-torch_tpu HiCacheController load path writes device tensors into the
-CPU-resident radix tree on host->HBM reload (raiden .cpu()s them; see
-cache_controller.move_indices notes) — a crash there is a real bug.
+    # arg = 1 | 1tp1 | 2 | 3 | all
 """
 
 import os
@@ -85,11 +51,6 @@ _BASE = dict(  # always on: prefix caching + KV offloading
     max_total_tokens=POOL,
     mem_fraction_static=0.4,
     skip_server_warmup=True,
-    # Policy: combos are tested ONLY under torch.compile — the serving
-    # recipes run compiled (cf. benchmark/tpu recipes), so the compiled
-    # path is the one that must be certified. (First run of this policy
-    # immediately caught silent reload corruption that eager hides — see
-    # COMBO_STATUS.md.)
     enable_torch_compile=True,
 )
 _SPEC = dict(  # + EAGLE3 (spec-on-TPU recipe: overlap schedule off)
@@ -100,11 +61,7 @@ _SPEC = dict(  # + EAGLE3 (spec-on-TPU recipe: overlap schedule off)
     speculative_num_draft_tokens=4,
     disable_overlap_schedule=True,
 )
-# DP attention at the serving shape: dp is CARVED OUT OF tp (devices = tp_size,
-# requirement tp % dp == 0; attn_tp = tp/dp) — so tp=8 x dp=2 uses the same 8
-# chips as combo 1. The idle-rank bug reproduces identically at every carving
-# (2026-07-15 sweep: tp2/dp2, tp4/dp2, tp8/dp2, tp8/dp4, tp8/dp8), so one
-# serving-shape row suffices.
+
 _DP = dict(tp_size=8, dp_size=2, enable_dp_attention=True)
 
 COMBOS = {
@@ -333,9 +290,9 @@ class TestFeatureCombo(unittest.TestCase):
 
 
 def _run_all():
-    """Run each combo in a FRESH interpreter (TPU runtime re-init is fragile
-    in-process), sequentially: 1 -> 2 -> 3. Fail fast per user preference for
-    isolating which added feature broke."""
+    """Run every combo sequentially, each in a FRESH interpreter (TPU runtime
+    re-init in-process is fragile). Fail fast so the first red row identifies
+    which added feature broke."""
     for combo in ("1", "1tp1", "2", "3"):
         print(f"\n{'#' * 60}\n# combo {combo}: {COMBOS[combo]['name']}\n{'#' * 60}")
         env = {**os.environ, "COMBO": combo}
