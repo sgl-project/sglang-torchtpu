@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_moe_expert_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -755,13 +756,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
         topk_ids = topk_ids.to(torch.int32)
+        if moe_runner_config.num_fused_shared_experts:
+            raise NotImplementedError(
+                "Fused shared experts are not supported on the TPU MoE path."
+            )
         no_combine = moe_runner_config.no_combine
         # The kernel gets the EP-masked weights (non-local slots -> 0) so it can
         # zero those slots in the no_combine output; the combine downstream uses
         # the original unmasked router weights (from dispatch_output).
         kernel_topk_weights = topk_weights.to(x.dtype)
         kernel_topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
-            kernel_topk_weights, topk_ids
+            kernel_topk_weights,
+            topk_ids,
+            layer.num_local_experts,
+            get_moe_expert_parallel_rank(),
         )
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
