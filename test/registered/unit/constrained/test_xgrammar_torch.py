@@ -1,14 +1,17 @@
 """CPU unit tests for xgrammar constrained decoding on the TPU backend.
 
-Covers the packed-bitmask torch fallback (the only mask-apply path available
-on TPU) and structural checks that the xgrammar dispatch and the sampler TP
-sync handle the `tpu` device type.
+Covers the packed-bitmask torch fallback and verifies that xgrammar dispatches
+TPU tensors through it.
 """
 
 import inspect
 import unittest
 
 import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 class TestXGrammarBitmaskTorchFallback(unittest.TestCase):
