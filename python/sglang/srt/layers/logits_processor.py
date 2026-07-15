@@ -889,6 +889,17 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        # TPU: use fp32 for target verification because the bf16 vocab-parallel
+        # collective is not bit-reproducible across TP ranks. Different logits can
+        # produce different EAGLE accept counts and deadlock subsequent collectives.
+        if (
+            _is_tpu
+            and self.do_tensor_parallel_all_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and logits.dtype != torch.float32
+        ):
+            logits = logits.float()
+
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)

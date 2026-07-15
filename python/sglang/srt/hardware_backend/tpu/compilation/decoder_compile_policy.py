@@ -95,9 +95,12 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
     if hidden_states is not None and real_q < hidden_states.shape[0]:
         out.hidden_states = hidden_states[:real_q]
 
-    # Restore real batch_size so downstream consumers (sampler, logprob,
-    # scheduler hooks) don't iterate over ghost slots.
+    # Restore real batch_size and seq_lens so downstream consumers (sampler,
+    # logprob, scheduler hooks, the prefill-only dummy-token sizing in
+    # tp_worker) don't iterate over ghost slots.
     forward_batch.batch_size = real_b
+    if forward_batch.seq_lens.shape[0] > real_b:
+        forward_batch.seq_lens = forward_batch.seq_lens[:real_b]
     return out
 
 

@@ -7,6 +7,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -501,6 +502,41 @@ def _dp_gather_via_all_reduce(
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
+def _dp_gather_tpu_all_reduce(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    is_partial: bool,
+):
+    """Combine per-group contributions with one all-reduce on TPU, instead of
+    fill_(0) + reduce-scatter + all-gather — which on hybrid shapes would need
+    a per-rank fill_(0) conditional (divergent graphs the in-graph collectives
+    can't tolerate) and each rank's local rows divisible by the attention-TP
+    size (they aren't). The all-reduce runs on the fresh padded ``contrib``
+    (not the persistent ``global_tokens`` buffer) via the registered
+    GroupCoordinator op.
+
+    MAX_LEN: every slot holds global_rows / dp_size rows; a different count is
+    a buffer-sizing bug and fails loud.
+    """
+    if not is_partial:
+        local_tokens = local_tokens * attn_rank0_scale(local_tokens)
+    expected_rows = global_tokens.shape[0] // get_attention_dp_size()
+    if local_tokens.shape[0] != expected_rows:
+        raise ValueError(
+            f"dp gather: local contribution has {local_tokens.shape[0]} rows "
+            f"but the global buffer slot holds {expected_rows}."
+        )
+    # Rows and offsets are Python ints (constant per compiled bucket), so the
+    # slot placement is a single statically-shaped pad.
+    start = get_attention_dp_rank() * expected_rows
+    contrib = F.pad(
+        local_tokens,
+        (0, 0, start, global_tokens.shape[0] - start - local_tokens.shape[0]),
+    )
+    contrib = get_tp_group().all_reduce(contrib)
+    global_tokens.copy_(contrib)
+
+
 def _dp_gather_via_all_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -511,6 +547,13 @@ def _dp_gather_via_all_gather(
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
+    if _is_tpu:
+        # TODO: remove this branch and _dp_gather_tpu_all_reduce once torch_tpu
+        # keeps rank-divergent in-graph collectives (today it drops the
+        # collective on ranks whose traced graph lacks the consumer). The
+        # standard reduce-scatter + all-gather path below works once it does.
+        _dp_gather_tpu_all_reduce(global_tokens, local_tokens, is_partial)
+        return
     if not is_partial:
         if get_attention_tp_rank() != 0:
             local_tokens.fill_(0)
@@ -527,11 +570,10 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    # Check the padding mode by comparing against the DpPaddingMode.MAX_LEN
-    # constant directly, rather than calling `dp_padding_mode.is_max_len()`.
-    # This runs inside a compiled forward, and calling the enum's bound method
-    # can cause tracing errors under full compilation. The comparison is
-    # equivalent (same pattern used elsewhere in this file).
+    # TODO: revert to dp_padding_mode.is_max_len() once the torch pin is
+    # >= 2.14. This function is traced under torch.compile on TPU, and the
+    # pinned torch's dynamo cannot trace methods of enums computed inside
+    # the graph (fixed upstream).
     if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
@@ -652,3 +694,26 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+
+
+@functools.lru_cache(maxsize=None)
+def _attn_rank0_scale_cached_impl(
+    device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    return torch.tensor(
+        1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
+    )
+
+
+def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
+    """0/1 device scalar: 1 on attn-TP rank 0, 0 elsewhere.
+
+    A cached device tensor (not a Python float) so torch.compile lifts it as
+    a runtime graph input rather than folding the per-rank value — folding
+    would diverge each rank's graph, the collective drop this avoids. The
+    multiply also keeps the residual consumer (and its upstream collective)
+    live on the zero ranks.
+
+    TODO: remove once torch_tpu keeps rank-divergent in-graph collectives.
+    """
+    return _attn_rank0_scale_cached_impl(ref.device, ref.dtype)

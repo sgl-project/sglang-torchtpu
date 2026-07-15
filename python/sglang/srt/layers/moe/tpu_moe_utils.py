@@ -6,16 +6,21 @@ import torch
 
 
 def mask_tpu_moe_non_local_experts(
-    topk_weights: torch.Tensor, topk_ids: torch.Tensor
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    moe_ep_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mask EP non-local expert slots before the TPU Pallas MoE kernel.
+    """Translate global expert IDs to this EP rank's local IDs and mask the rest.
 
-    StandardDispatcher remaps experts not owned by the current EP rank to -1.
-    The TPU Pallas fused-MoE kernel expects non-negative local expert IDs, so
-    route those slots to expert 0 and zero their routing weights.
+    The dispatcher hands the TPU runner global expert IDs
+    (skip_local_expert_mapping). The TPU Pallas fused-MoE kernel expects
+    non-negative local expert IDs, so shift IDs into this rank's local range,
+    route non-local slots to expert 0, and zero their routing weights.
     """
-    valid = topk_ids >= 0
+    local_ids = topk_ids - moe_ep_rank * num_local_experts
+    valid = (local_ids >= 0) & (local_ids < num_local_experts)
     return (
         topk_weights * valid.to(topk_weights.dtype),
-        torch.where(valid, topk_ids, torch.zeros_like(topk_ids)),
+        torch.where(valid, local_ids, 0),
     )
