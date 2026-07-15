@@ -229,6 +229,52 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # base-class accounting; the buffers are fused so we split evenly.
         return size_bytes // 2, size_bytes // 2
 
+    # ------------------------------------------------------------------ #
+    # CPU offload / restore
+    # ------------------------------------------------------------------ #
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        """Copy the KV rows at ``indices`` out to host.
+
+        Overrides the base version, which stores K and V in two separate
+        tensors, while this pool uses one fused KV tensor per layer.
+        """
+        # Indices might be on host and need to be copied to device.
+        indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
+        self.device_module.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            layer_kv = self.kv_buffer[layer_id].flatten(0, 1)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                kv_cpu = layer_kv.index_select(0, chunk_indices).to(
+                    "cpu", non_blocking=True
+                )
+                kv_cache_cpu[-1].append(kv_cpu)
+        self.device_module.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        """Copy the KV rows at ``indices`` from host to device.
+
+        Inverse of `get_cpu_copy`.
+        """
+        # Indices might be on host and need to be copied to device.
+        indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
+        self.device_module.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            layer_kv = self.kv_buffer[layer_id].flatten(0, 1)
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
+                assert kv_cpu.shape[0] == len(chunk_indices)
+                kv_chunk = kv_cpu.to(layer_kv.device, non_blocking=True)
+                layer_kv.index_copy_(0, chunk_indices, kv_chunk)
+        self.device_module.synchronize()
+
     # ``get_fused_kv_buffer`` is the canonical accessor on TPU; the Pallas
     # backend uses it directly.
     def get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:

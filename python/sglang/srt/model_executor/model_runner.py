@@ -35,6 +35,7 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -378,6 +379,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_draft_worker = is_draft_worker
         self.is_generation = model_config.is_generation
         self.device_timer = None
+        # Default no-op compile policy; a real policy replaces it on install
+        # (see DecoderTpuCompilePolicy.install). Lets callers invoke policy hooks
+        # (e.g. draft-decode pad/unpad) without None/hasattr guards.
+        self.compile_policy = NoopCompilePolicy()
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -3319,6 +3324,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+    def pad_spec_draft_decode(self, forward_batch: ForwardBatch) -> None:
+        """Shape the speculative draft-decode batch for this runner's compiled
+        forward (e.g. pad to a static bucket). Delegates to the installed compile
+        policy; the default ``NoopCompilePolicy`` makes this a no-op.
+        """
+        self.compile_policy.pad_draft_decode(forward_batch)
+
+    def unpad_spec_draft_outputs(self, outputs, forward_batch: ForwardBatch):
+        """Trim this runner's draft-decode outputs back to the real batch size,
+        undoing ``pad_spec_draft_decode``. Delegates to the installed compile
+        policy; the default ``NoopCompilePolicy`` passes outputs through.
+        """
+        return self.compile_policy.unpad_draft_outputs(outputs, forward_batch)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

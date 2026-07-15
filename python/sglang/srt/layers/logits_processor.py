@@ -440,7 +440,24 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                if _is_tpu:
+                    # Set dtype to int32 rather than cumsum's default int64.
+                    # 32-bit integers are TPU native while s64 requires
+                    # emulation, and its buggy lowering can run into
+                    # "Unsupported conversion from vmreg/vreg to U64". int32
+                    # is plenty for per-batch token counts.
+                    last_index = (
+                        torch.cumsum(
+                            logits_metadata.extend_seq_lens,
+                            dim=0,
+                            dtype=torch.int32,
+                        )
+                        - 1
+                    )
+                else:
+                    last_index = (
+                        torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                    )
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
@@ -871,6 +888,17 @@ class LogitsProcessor(nn.Module):
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
+
+        # TPU: use fp32 for target verification because the bf16 vocab-parallel
+        # collective is not bit-reproducible across TP ranks. Different logits can
+        # produce different EAGLE accept counts and deadlock subsequent collectives.
+        if (
+            _is_tpu
+            and self.do_tensor_parallel_all_gather
+            and logits_metadata.forward_mode.is_target_verify()
+            and logits.dtype != torch.float32
+        ):
+            logits = logits.float()
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:

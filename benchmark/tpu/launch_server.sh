@@ -46,8 +46,9 @@
 # actually need to inspect graphs:
 #   ENABLE_HLO_DUMP=1 ENABLE_TORCH_COMPILE_DEBUG=1 MODEL=... ./launch_server.sh
 #
-# See ./README.md for the shared env contract (PYTHON, JAX_BAZEL, HF cache,
-# compile cache) and the full launch + bench recipe.
+# Static environment (PYTHON, SGLANG_PLATFORM, HF cache, LIBTPU_INIT_ARGS,
+# TORCH_LOGS, ...) is sourced from ./common_env.sh. See ./README.md for the full
+# launch + bench recipe.
 #
 # Overridable env vars (with defaults shown):
 #   MODEL=                         # REQUIRED — HF repo or local path
@@ -59,11 +60,14 @@
 #                                  # tensor-parallel within the TP group). For a
 #                                  # MoE model set EP to a divisor of TP_SIZE and
 #                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
-#   MAX_RUNNING=64                 # in-flight request cap (>= bench concurrency)
+#   CONC=64                        # bench concurrency this server is sized for
+#   MAX_RUNNING=$CONC              # in-flight request cap (InferenceX parity:
+#                                  # exactly the bench concurrency)
 #   PAGE_SIZE=128
-#   CONTEXT_LEN=                  # passed through if set
+#   ISL=8192 OSL=1024              # bench shape, only used to derive CONTEXT_LEN
+#   CONTEXT_LEN=$((ISL+OSL+20))    # tight context (InferenceX parity)
 #   CHUNKED_PREFILL_SIZE=4096      # per-forward token cap
-#   MAX_PREFILL_TOKENS=            # passed through if set
+#   MAX_PREFILL_TOKENS=            # defaults to CHUNKED_PREFILL_SIZE
 #   MAX_TOTAL_TOKENS=              # passed through if set
 #   ATTENTION_BACKEND=pallas_tpu_rpa_v3
 #   DISABLE_OVERLAP_SCHEDULE=     # 1 passes --disable-overlap-schedule
@@ -76,10 +80,9 @@
 #   MEM_FRACTION_STATIC=           # passed through if set (sglang default
 #                                  # 0.4; bump to 0.85 for high-concurrency
 #                                  # to leave more HBM for KV cache)
-#   KV_CACHE_DTYPE=                # passed through if set; "fp8" halves
-#                                  # KV traffic and roughly doubles per-step
-#                                  # decode speed for memory-bound regimes.
-#                                  # Leave empty for sglang default (auto).
+#   QUANTIZATION=fp8               # --quantization. Set empty to disable
+#                                  # (e.g. for bf16 checkpoints)
+#   KV_CACHE_DTYPE=fp8_e4m3        # fp8 KV
 #   ENABLE_HLO_DUMP=0              # 1 → dump HLO modules to $HLO_DUMP_DIR
 #   ENABLE_TORCH_COMPILE_DEBUG=0   # 1 → dump FX/lowered to $TORCH_COMPILE_DEBUG_DIR
 #   ENABLE_PROFILER_ENDPOINT=1     # 1 → set SGLANG_TORCH_PROFILER_DIR so
@@ -105,6 +108,11 @@
 #   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
 #   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
 set -euo pipefail
+
+# Shared static TPU env (PYTHON, SGLANG_PLATFORM, HF cache, LIBTPU_INIT_ARGS,
+# TORCH_LOGS, ...) lives in common_env.sh next to this script — source it so
+# every caller gets the same environment. Per-launch config stays below.
+source "$(dirname "${BASH_SOURCE[0]}")/common_env.sh"
 
 MODEL=${MODEL:-}
 if [[ -z "$MODEL" ]]; then
@@ -219,29 +227,14 @@ else
     unset TPU_VISIBLE_CHIPS TPU_CHIPS_PER_HOST_BOUNDS TPU_HOST_BOUNDS 2>/dev/null || true
 fi
 
-export SGLANG_PLATFORM=tpu
+# SGLANG_PLATFORM / SGLANG_TPU_OVERLAP_PROFILE / MATERIALIZE_COLLECTIVE_TENSORS
+# are exported by common_env.sh (sourced above).
 if [[ -n "${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-}" ]]; then
     export SGLANG_TPU_DECODE_PROCESS_INTERVAL
 fi
-# Per-phase scheduler/worker timing dumps every ~5 s (cheap).
-export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
-
-
-export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
-
-# HF cache. Defaults here are generic (standard HF cache, online download).
-# The team's TPU hosts keep weights on a GCS-FUSE mount and run fully offline;
-# export HF_HOME / HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE to match — see
-# ./README.md.
-export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
-export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 
 # ===== torch.compile debug =====
-# +recompiles surfaces recompilation churn cheaply. Avoid +dynamo /
-# +output_code / +guards here — those stream per-bytecode tracing logs
-# synchronously and turn a ~minute compile into 10+ minutes plus a
-# multi-GB log file.
-export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
+# TORCH_LOGS is exported by common_env.sh.
 if [[ "$ENABLE_TORCH_COMPILE_DEBUG" == "1" ]]; then
     # FX + lowered graphs per compile (~100s of MB at 32B/tp=8).
     export TORCH_COMPILE_DEBUG=1
@@ -265,22 +258,8 @@ if [[ "$ENABLE_COMPILE_CACHE" == "1" ]]; then
     export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=1
 fi
 
-# ===== XLA / libtpu init =====
-# XLA/libtpu tuning flags used for TP/EP TPU serving. Latency-hiding scheduler
-# and async collective fusion keep collectives from serializing behind matmuls;
-# post-SPMD collective-matmul modes and SparseCore collective offload disables
-# avoid TP=8 correctness issues seen with default collective lowering. Override
-# the whole string to retune. Changing it invalidates the compile cache.
-export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
---xla_tpu_enable_async_collective_fusion=true \
---xla_tpu_overlap_compute_collective_tc=true \
---xla_tpu_enable_async_collective_fusion_multiple_steps=true \
---xla_tpu_enable_latency_hiding_scheduler=true \
---xla_latency_hiding_scheduler_rerun=10 \
---xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative \
---xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
---xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
---xla_tpu_enable_sparse_core_collective_offload_all_gather=false"}
+# LIBTPU_INIT_ARGS (XLA/libtpu TP/EP serving tuning + DP-attention hardening) is
+# exported by common_env.sh. Override that var to retune (invalidates the cache).
 
 # ===== XLA HLO dump (opt-in) =====
 # Match on `tt_jit.*` — torch_tpu compiles are named `tt_jit_<op>`; a
@@ -300,13 +279,18 @@ fi
 
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-30000}
-MAX_RUNNING=${MAX_RUNNING:-64}
+# InferenceX parity: size the server to the bench leg. max-running-requests is
+# exactly the bench concurrency and context-length is a tight ISL+OSL+20.
+CONC=${CONC:-64}
+MAX_RUNNING=${MAX_RUNNING:-$CONC}
 PAGE_SIZE=${PAGE_SIZE:-128}
-CONTEXT_LEN=${CONTEXT_LEN:-}
+ISL=${ISL:-8192}
+OSL=${OSL:-1024}
+CONTEXT_LEN=${CONTEXT_LEN:-$((ISL + OSL + 20))}
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
 # Pin the runtime prefill cap so TPU's derived token bucket grid is stable.
 CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-4096}
-MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-}
+MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-$CHUNKED_PREFILL_SIZE}
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-}
 # Maximum batch size cap for torch.compile and bucketing grids.
 TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
@@ -316,11 +300,18 @@ TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-}
 TPU_COMPILE_BS=${TPU_COMPILE_BS:-}
 NUM_CONTINUOUS_DECODE_STEPS=${NUM_CONTINUOUS_DECODE_STEPS:-}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-}
-KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-}
-# 1 → pass --disable-radix-cache to sglang. Useful when validating warmup
-# scripts: with radix on, repeated synthetic prompts share a long prefix
-# and sglang short-circuits the prefill, hiding the larger-bucket compiles.
-DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-0}
+# InferenceX parity: FP8 weights + FP8 KV cache by default. Set either to the
+# empty string to fall back to the sglang default (e.g. bf16 checkpoints).
+# Use ${VAR-default} (no colon) so an explicit empty value disables it. Having
+# colon would treat empty variable as unset and incorrectly re-apply default
+# value specified here.
+QUANTIZATION=${QUANTIZATION-fp8}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
+# 1 (default, InferenceX parity) → pass --disable-radix-cache. Benchmark
+# prompts share synthetic prefixes, so radix cache would short-circuit
+# prefills and inflate results (it also hides larger-bucket compiles when
+# validating warmup scripts).
+DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
 
 echo "==== launch config ===="
 echo "  model              = $MODEL"
@@ -335,9 +326,9 @@ if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
 fi
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
 echo "  host:port          = $HOST:$PORT"
-echo "  max_running        = $MAX_RUNNING"
+echo "  max_running        = $MAX_RUNNING  (CONC=$CONC)"
 echo "  page_size          = $PAGE_SIZE"
-echo "  context_len        = ${CONTEXT_LEN:-<unset>}"
+echo "  context_len        = $CONTEXT_LEN  (ISL=$ISL OSL=$OSL)"
 echo "  attention_backend  = $ATTENTION_BACKEND"
 echo "  chunked_prefill    = $CHUNKED_PREFILL_SIZE"
 echo "  max_prefill_tokens = ${MAX_PREFILL_TOKENS:-<unset>}"
@@ -346,6 +337,7 @@ echo "  tpu_compile_tokens = ${TPU_COMPILE_TOKENS:-<derived>}"
 echo "  tpu_compile_bs     = ${TPU_COMPILE_BS:-<derived>}"
 echo "  num_cont_decode    = ${NUM_CONTINUOUS_DECODE_STEPS:-<unset>}"
 echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
+echo "  quantization       = ${QUANTIZATION:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
 echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
@@ -379,6 +371,7 @@ args=(
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
+[[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
 [[ -n "$TORCH_COMPILE_MAX_BS" ]] && args+=(--torch-compile-max-bs "$TORCH_COMPILE_MAX_BS")
 [[ -n "$CONTEXT_LEN" ]] && args+=(--context-length "$CONTEXT_LEN")
@@ -410,5 +403,5 @@ fi
 EXTRA_ARGS=${EXTRA_ARGS:-}
 [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
 
-PYTHON=${PYTHON:-python3}
+# PYTHON is exported by common_env.sh (default python3).
 exec "$PYTHON" "${args[@]}" 2>&1

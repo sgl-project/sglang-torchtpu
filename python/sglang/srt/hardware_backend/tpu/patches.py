@@ -362,7 +362,13 @@ def _patch_compute_position_torch() -> None:
         ).to(torch.int64)
         extend_start_loc = torch.zeros_like(extend_seq_lens)
         if extend_seq_lens.numel() > 1:
-            extend_start_loc[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+            # Set dtype to int32 rather than cumsum's default int64.
+            # 32-bit integers are TPU native while s64 requires emulation,
+            # and its buggy lowering can run into "Unsupported conversion
+            # from vmreg/vreg to U64". Token counts fit int32 comfortably.
+            extend_start_loc[1:] = torch.cumsum(
+                extend_seq_lens[:-1], dim=0, dtype=torch.int32
+            )
         return positions_cpu.to(device), extend_start_loc
 
     forward_batch_info.compute_position_torch = compute_position_torch_cpu_staged

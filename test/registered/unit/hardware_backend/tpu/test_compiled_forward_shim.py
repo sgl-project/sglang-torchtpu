@@ -54,7 +54,14 @@ class _ForwardModeMock:
         return self._mode == "idle"
 
     def is_extend(self):
-        return self._mode == "extend"
+        # Real ForwardMode.is_extend() is True for TARGET_VERIFY too (it is an
+        # extend-family mode), so mirror that here; otherwise the shim guard's
+        # `is_extend() and not is_target_verify()` short-circuit isn't tested
+        # faithfully.
+        return self._mode in ("extend", "target_verify")
+
+    def is_target_verify(self):
+        return self._mode == "target_verify"
 
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
@@ -80,6 +87,8 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         return_logprob=return_logprob,
         dp_padding_mode=None,
         global_num_tokens_cpu=None,
+        # Real ForwardBatch always carries spec_info (None when not spec).
+        spec_info=None,
     )
 
 
@@ -109,7 +118,7 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual((real_q, real_b), (4, 1))
         self.assertEqual(fb.input_ids.shape[0], 8)
         self.assertEqual(fb.positions.shape[0], 8)
-        self.assertEqual(fb.out_cache_loc.shape[0], 4)
+        self.assertEqual(fb.out_cache_loc.shape[0], 8)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.extend_seq_lens.shape[0], 4)
 
@@ -132,6 +141,23 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [3, 3, 3, 0])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
+        self.assertEqual(fb.batch_size, 4)
+
+    def test_target_verify_pins_token_dim_to_draft_token_num(self):
+        # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:
+        # the extend branch would over-pad it up to the nearest token bucket.
+        fb = _forward_batch(real_t=8, real_b=2, mode="target_verify")  # bs=2, dtn=4
+        fb.spec_info = SimpleNamespace(draft_token_num=4)
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64, 128]),  # must NOT be used for verify
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (8, 2))
+        # pad_b = max_val = 4; pad_t = 4 * draft_token_num(4) = 16, not 64.
+        self.assertEqual(fb.input_ids.shape[0], 16)
+        self.assertEqual(fb.positions.shape[0], 16)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.batch_size, 4)
 
     def test_decode_uses_bs_bucketer_for_tokens(self):
@@ -188,14 +214,63 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertIsNone(fb.extend_seq_lens)
 
-    def test_return_logprob_raises(self):
+    def test_input_logprob_rejected(self):
+        # An extend request that also asks for INPUT/prompt (echo) logprobs
+        # (start_len < extend_len) still can't run on the compiled backend: the
+        # LogitsProcessor would compute them over dynamically-pruned states.
         fb = _forward_batch(real_t=4, real_b=1, return_logprob=True)
-        with self.assertRaisesRegex(NotImplementedError, "return_logprob"):
+        fb.extend_logprob_start_lens_cpu = [0]  # extend_len(4) - start_len(0) > 0
+        with self.assertRaisesRegex(NotImplementedError, "input/prompt logprobs"):
             _pad_forward_batch_inputs(
                 fb,
                 t_bucketer=_bucketer("Token", [64]),
                 b_bucketer=_bucketer("Bs", [1]),
             )
+
+    def test_output_logprob_passes(self):
+        # OUTPUT (next-token) logprobs only: start_len == extend_len, so there
+        # are no prompt positions to score inside the compiled forward. The
+        # guard must let it through (the eager Sampler produces them afterwards).
+        fb = _forward_batch(real_t=4, real_b=1, return_logprob=True)
+        fb.extend_logprob_start_lens_cpu = [4]  # extend_len - start_len == 0
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (4, 1))
+        self.assertEqual(fb.input_ids.shape[0], 8)
+
+    def test_decode_output_logprob_passes(self):
+        # Decode-mode logprob requests are output-only (not an extend batch), so
+        # the input-logprob path never triggers and the request must pass.
+        fb = _forward_batch(real_t=2, real_b=2, mode="decode", return_logprob=True)
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 4)
+
+    def test_target_verify_output_logprob_passes(self):
+        # Spec-decode target-verify is an extend-family mode (is_extend() is
+        # True), but it never produces INPUT/prompt logprobs: LogitsProcessor
+        # treats it like decode (_get_pruned_states -> pruned_states = all hidden
+        # states, input_logprob_indices = None; from_forward_batch excludes it
+        # from extend_return_logprob). So there are no dynamically-pruned states
+        # and the guard must let it through even with return_logprob set. The
+        # batch pads to the static verify shape (pad_b * draft_token_num).
+        fb = _forward_batch(
+            real_t=6, real_b=3, mode="target_verify", return_logprob=True
+        )
+        fb.spec_info = SimpleNamespace(draft_token_num=2, hidden_states=None)
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [4]),
+        )
+        self.assertEqual((real_q, real_b), (6, 3))
+        self.assertEqual(fb.input_ids.shape[0], 8)  # pad_b(4) * draft_token_num(2)
 
 
 class TestDefaultKwargHelpers(CustomTestCase):
@@ -233,7 +308,12 @@ class TestCompiledForwardShim(CustomTestCase):
             )
         )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -243,7 +323,12 @@ class TestCompiledForwardShim(CustomTestCase):
     def test_passes_args_through(self):
         compiled = MagicMock(return_value=SimpleNamespace())
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
 
@@ -263,7 +348,12 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim("ids", "pos", fb, pp_proxy_tensors=None)
         compiled.assert_called_once_with("ids", "pos", fb)
 
@@ -274,7 +364,12 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
 
@@ -287,7 +382,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim = CompiledForwardShim(
             MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
         )
-        out = shim(None, None, SimpleNamespace())
+        out = shim(None, None, SimpleNamespace(is_prefill_only=False))
         self.assertIs(out, out_obj)
 
     def test_no_op_when_already_at_real_shape(self):
@@ -299,7 +394,12 @@ class TestCompiledForwardShim(CustomTestCase):
         shim = CompiledForwardShim(
             MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
         )
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -312,18 +412,40 @@ class TestCompiledForwardShim(CustomTestCase):
             return_value=SimpleNamespace(next_token_logits=torch.zeros(4, 10))
         )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=8, _tpu_real_b=2, batch_size=4)
+        fb = SimpleNamespace(
+            _tpu_real_q=8,
+            _tpu_real_b=2,
+            batch_size=4,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 2)
 
     def test_does_not_touch_batch_size_when_real_keys_missing(self):
         # forward_idle / split_prefill skip the pad hook, so the slicer
         # must not mutate batch_size in that case.
-        fb = SimpleNamespace(batch_size=4)
+        fb = SimpleNamespace(batch_size=4, is_prefill_only=False)
         compiled = MagicMock(return_value=SimpleNamespace())
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 4)
+
+    def test_pins_is_prefill_only_for_compiled_call_and_restores(self):
+        # The compiled graph must see a batch-invariant is_prefill_only
+        # (pinned False); the worker's sampling gate reads the true value
+        # after the forward, so it is restored.
+        seen = {}
+
+        def compiled(input_ids, positions, forward_batch):
+            seen["during"] = forward_batch.is_prefill_only
+            return SimpleNamespace()
+
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = SimpleNamespace(batch_size=0, is_prefill_only=True)
+        shim(None, None, fb)
+        self.assertIs(seen["during"], False)
+        self.assertIs(fb.is_prefill_only, True)
 
 
 class TestBuildBucketers(CustomTestCase):
@@ -355,6 +477,18 @@ class TestBuildBucketers(CustomTestCase):
         t_b, b_b = build_bucketers(sa, max_t=2048, max_b=16)
         self.assertEqual(t_b.buckets, [64, 512])
         self.assertEqual(b_b.buckets, [1, 2])
+
+    def test_token_buckets_above_max_t_dropped(self):
+        # Token buckets feed only the EXTEND path, which never exceeds max_t
+        # (chunked-prefill / context cap), so buckets above it are dropped --
+        # they would compile dead shapes serving can't reach.
+        sa = self._server_args(tpu_compile_tokens=[64, 512, 2048, 4096])
+        t_b, _ = build_bucketers(sa, max_t=2048, max_b=8)
+        self.assertEqual(t_b.buckets, [64, 512, 2048])  # 4096 dropped
+        # If every user bucket is above the cap, fall back to max_t itself.
+        sa2 = self._server_args(tpu_compile_tokens=[4096])
+        t_b2, _ = build_bucketers(sa2, max_t=2048, max_b=8)
+        self.assertEqual(t_b2.buckets, [2048])
 
     def test_falls_back_to_power_bucketer_when_unset(self):
         # min_val hardcoded: 64 (T), 1 (B).
@@ -530,12 +664,13 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
         self.assertEqual(fb.global_num_tokens_gpu.dtype, torch.int64)
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [16, 16])
 
-    def test_pins_is_prefill_only_false(self):
-        # An idle batch computes is_prefill_only=True. Pinning False keeps the
-        # guarded flag stable so the compiled logits processor never recompiles.
+    def test_does_not_mutate_is_prefill_only(self):
+        # The is_prefill_only pin lives in CompiledForwardShim.__call__ (pinned
+        # False for the compiled call, restored after); applying bucket
+        # metadata must leave the worker-visible flag untouched.
         fb = self._fb()
         _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
-        self.assertIs(fb.is_prefill_only, False)
+        self.assertIs(fb.is_prefill_only, True)
 
     def test_clears_cached_local_offsets(self):
         fb = self._fb()

@@ -35,10 +35,32 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    SpecDecodeCompilePolicyMixin,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _spec_enabled(model_runner: ModelRunner) -> bool:
+    """Whether speculative decoding is active for this runner."""
+    return not model_runner.spec_algorithm.is_none()
+
+
+def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
+    """Compose spec-decode compile behavior over ``policy_cls`` when spec decoding
+    is active.
+    """
+    if not _spec_enabled(model_runner):
+        return policy_cls
+    if issubclass(policy_cls, SpecDecodeCompilePolicyMixin):
+        return policy_cls
+    return type(
+        f"Spec{policy_cls.__name__}", (SpecDecodeCompilePolicyMixin, policy_cls), {}
+    )
+
 
 # This module lives outside the tpu/ tree, so __name__ does not start with
 # the TPU logger root. Pass a short suffix so the logger lands cleanly under
@@ -94,7 +116,15 @@ class TpuGraphRunner:
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
         # Fail loudly on compile-limit hits to expose latency cliffs early.
-        if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit"):
+        # NOTE: fail_on_recompile_limit_hit and suppress_errors are mutually
+        # exclusive (torch._dynamo asserts). flashinfer_backend sets
+        # suppress_errors=True at import when SGLANG_ENABLE_TORCH_COMPILE is set,
+        # so only enable the fail-loud flag when suppress_errors is off. The
+        # recompile ceiling is already raised to 1024 above, so the limit is not
+        # hit in practice.
+        if hasattr(torch._dynamo.config, "fail_on_recompile_limit_hit") and not getattr(
+            torch._dynamo.config, "suppress_errors", False
+        ):
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
@@ -124,6 +154,20 @@ class TpuGraphRunner:
                     f"method {method_name!r}, but the module has no such method."
                 )
 
+            # Compose the default spec behavior over the model's own policy when
+            # spec decoding is active and the policy doesn't already implement spec.
+            if _spec_enabled(model_runner) and not issubclass(
+                policy_cls, SpecDecodeCompilePolicyMixin
+            ):
+                logger.warning(
+                    "Speculative decoding is active and %s ships its own compile "
+                    "policy %s; composing the default SpecDecodeCompilePolicyMixin over "
+                    "it.",
+                    type(module).__name__,
+                    policy_cls.__name__,
+                )
+            policy_cls = _augment_spec_policy(policy_cls, model_runner)
+
             policy = policy_cls(
                 model_runner=model_runner,
                 owner=module,
@@ -138,12 +182,14 @@ class TpuGraphRunner:
                 policy.precompile()
 
         if not installed_any:
+            fallback_cls = _augment_spec_policy(DecoderTpuCompilePolicy, model_runner)
             logger.info(
                 "enable_torch_compile=True but %s declares no TPU compile "
-                "policies; falling back to DecoderTpuCompilePolicy on forward.",
+                "policies; falling back to %s on forward.",
                 type(self.model).__name__,
+                fallback_cls.__name__,
             )
-            fallback_policy = DecoderTpuCompilePolicy(
+            fallback_policy = fallback_cls(
                 model_runner=model_runner,
                 owner=self.model,
                 method_name="forward",

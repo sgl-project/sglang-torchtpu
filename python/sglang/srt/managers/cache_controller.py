@@ -1246,8 +1246,10 @@ class TpuHiCacheController(HiCacheController):
     streams, and gates the whole forward at once). Only __init__ and the
     load/backup dispatch differ; everything else is inherited.
 
-    TODO: speculative decoding is not supported yet on this path. Will support as
-    followup
+    Draft KV follows the same logistics: draft and target
+    share device slot indices and the draft host pool is sized to the target's
+    slot count, so each backup/reload reuses the target's index pair for a
+    second gather/copy on the draft pools, covered by the same done-event.
     """
 
     def __init__(self, *args, **kwargs):
@@ -1264,6 +1266,10 @@ class TpuHiCacheController(HiCacheController):
         # Depth-1 async write-back (see start_writing).
         self._backup_worker = TpuKvCopyWorker("kv-offload-d2h")
         self._backup_inflight = None  # _ThreadDoneEvent | None
+
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+        super().set_draft_kv_pool(draft_device_pool, draft_host_pool)
+        draft_device_pool.register_layer_transfer_counter(self.layer_done_counter)
 
     def reset(self):
         if self._backup_inflight is not None:
@@ -1293,12 +1299,23 @@ class TpuHiCacheController(HiCacheController):
             self._backup_inflight.synchronize()
 
         staged = self.mem_pool_host.backup_gather(self.mem_pool_device, device_indices)
+        # Draft KV shares the target's slot indices; gather it inline too
+        staged_draft = (
+            self.mem_pool_host_draft.backup_gather(
+                self.mem_pool_device_draft, device_indices
+            )
+            if self.has_draft
+            else None
+        )
 
         mem_pool_host = self.mem_pool_host
+        mem_pool_host_draft = self.mem_pool_host_draft
 
         def _drain():
             if staged is not None:
                 mem_pool_host.backup_copy_d2h(staged, host_indices)
+            if staged_draft is not None:
+                mem_pool_host_draft.backup_copy_d2h(staged_draft, host_indices)
 
         done = self._backup_worker.submit(_drain)
         self._backup_inflight = done
@@ -1322,12 +1339,19 @@ class TpuHiCacheController(HiCacheController):
 
         mem_pool_host = self.mem_pool_host
         mem_pool_device = self.mem_pool_device
+        has_draft = self.has_draft
+        mem_pool_host_draft = self.mem_pool_host_draft
+        mem_pool_device_draft = self.mem_pool_device_draft
         io_backend = self.io_backend
 
         def _producer():
             mem_pool_host.load_to_device_all(
                 mem_pool_device, host_indices, device_indices, io_backend
             )
+            if has_draft:
+                mem_pool_host_draft.load_to_device_all(
+                    mem_pool_device_draft, host_indices, device_indices, io_backend
+                )
 
         # The worker event is set only after the reload barrier (load_to_device_all
         # reads the source host pages, runs the H2D, and syncs).

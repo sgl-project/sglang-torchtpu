@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+
 # Default size for libtpu's premapped (pinned, DMA-mapped) host staging pool.
 _DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 # Flush torch_tpu's lazy host->device weight-copy graph once this much work accumulates,
@@ -112,14 +113,15 @@ class TpuSRTPlatform(SRTPlatform):
         # (TpuRaidenHiCacheController.load), so req_to_token must stay
         # host-resident: a device-resident req_to_token would put the other
         # nodes' prefix indices on device and mix devices in the prefix cat. Pin
-        # SGLANG_TPU_HOST_R2T=1 for raiden.
+        # SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 for raiden.
         if server_args.hicache_io_backend == "raiden":
-            if os.environ.get("SGLANG_TPU_HOST_R2T") == "0":
+            if os.environ.get("SGLANG_TPU_REQ_TO_TOKEN_ON_HOST") == "0":
                 logger.warning(
-                    "Overriding SGLANG_TPU_HOST_R2T=0 -> 1: the raiden KV-offload "
-                    "backend requires host-resident req_to_token."
+                    "Overriding SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=0 -> 1: the "
+                    "raiden KV-offload backend requires host-resident "
+                    "req_to_token."
                 )
-            os.environ["SGLANG_TPU_HOST_R2T"] = "1"
+            os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
 
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page
@@ -335,10 +337,12 @@ class TpuSRTPlatform(SRTPlatform):
 
     @contextmanager
     def weight_loading_context(self, weights):
-        try:
-            yield _sync_weight_stream(weights)
-        finally:
-            torch.tpu.synchronize()
+        # No eager drain at load exit: torch.tpu.synchronize() here deadlocks
+        # EAGLE3 draft init under TP>1 -- rank 0 blocks on an async buffer while
+        # peers reach the post-load barrier. Let it resolve at the first aligned
+        # sync instead. Periodic syncs in _sync_weight_stream still bound HBM
+        # during large loads.
+        yield _sync_weight_stream(weights)
 
     def empty_cache(self) -> None:
         pass

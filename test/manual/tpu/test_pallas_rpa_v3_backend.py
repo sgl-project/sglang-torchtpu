@@ -48,10 +48,16 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
     reshape) never touch ``self._op``, so leaving it as ``None`` is safe.
     """
 
-    def __init__(self, page_size: int, req_to_token: torch.Tensor) -> None:
+    def __init__(
+        self,
+        page_size: int,
+        req_to_token: torch.Tensor,
+        speculative_step_id: int = 0,
+    ) -> None:
         AttentionBackend.__init__(self)
         self.device = req_to_token.device
         self.page_size = page_size
+        self.speculative_step_id = speculative_step_id
         # _build_metadata reads req_to_token_pool.req_to_token only.
         self.req_to_token_pool = types.SimpleNamespace(req_to_token=req_to_token)
         self.forward_metadata = None
@@ -66,10 +72,12 @@ def _make_forward_batch(
     req_pool_indices: torch.Tensor,
     forward_mode: ForwardMode,
     extend_seq_lens: Optional[torch.Tensor] = None,
+    spec_info=None,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     """Minimal fake ForwardBatch for ``_build_metadata``.
 
-    Only the four fields read by ``_build_metadata`` are populated. Using a
+    Only the fields read by ``_build_metadata`` are populated. Using a
     ``SimpleNamespace`` (instead of a real ``ForwardBatch``) keeps the test
     independent of the model-runner construction graph.
     """
@@ -78,7 +86,8 @@ def _make_forward_batch(
         req_pool_indices=req_pool_indices,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
-        spec_info=None,
+        spec_info=spec_info,
+        seq_lens_cpu=seq_lens_cpu,
     )
 
 
@@ -100,7 +109,9 @@ def _build_req_to_token(
 def _build_meta(backend, fb) -> PallasForwardMetadata:
     """Mirror ``init_forward_metadata``."""
     distribution = backend._get_cached_rpa_distribution(
-        fb.forward_mode.is_decode(), backend._real_batch_size(fb), fb.seq_lens.device
+        fb.forward_mode.is_decode(),
+        backend._non_empty_batch_size(fb),
+        fb.seq_lens.device,
     )
     return backend._build_metadata(fb, distribution)
 
@@ -273,6 +284,103 @@ class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
         self.assertTrue(torch.equal(meta.cu_kv_lens, expected_cu_kv))
 
 
+class TestPallasRpaV3MetadataSpec(CustomTestCase):
+    """Spec-decode modes on the host-resident fast path."""
+
+    PAGE_SIZE = 16
+    PAGES_PER_SEQ = 4
+    MAX_CONTEXT_LEN = PAGE_SIZE * PAGES_PER_SEQ  # 64
+    DRAFT_TOKEN_NUM = 4
+
+    def setUp(self):
+        self.bs = 3
+        self.req_to_token = _build_req_to_token(
+            num_reqs=8, max_context_len=self.MAX_CONTEXT_LEN
+        )
+        self.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
+        self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
+        self.spec_info = types.SimpleNamespace(draft_token_num=self.DRAFT_TOKEN_NUM)
+
+    def test_target_verify_bumps_kv_lens_and_cu_q_lens(self):
+        backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=self.spec_info,
+        )
+        meta = _build_meta(backend, fb)
+        # KV cache already holds the draft tokens: kv_lens = seq_lens + draft.
+        expected_kv = (self.seq_lens + self.DRAFT_TOKEN_NUM).to(torch.int32)
+        self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
+        # Each sequence verifies draft_token_num query tokens.
+        expected_cu_q = (torch.arange(self.bs + 1) * self.DRAFT_TOKEN_NUM).to(
+            torch.int32
+        )
+        self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
+        # TARGET_VERIFY is not decode: distribution = [0, bs, bs].
+        self.assertTrue(
+            torch.equal(
+                meta.distribution,
+                torch.tensor([0, self.bs, self.bs], dtype=torch.int32),
+            )
+        )
+
+    def test_draft_decode_bumps_kv_lens_by_step_id(self):
+        step_id = 2
+        backend = _BackendUnderTest(
+            self.PAGE_SIZE, self.req_to_token, speculative_step_id=step_id
+        )
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=self.spec_info,
+        )
+        meta = _build_meta(backend, fb)
+        # Draft step sees KV entries from prior steps: kv_lens += step_id + 1.
+        expected_kv = (self.seq_lens + step_id + 1).to(torch.int32)
+        self.assertTrue(torch.equal(meta.kv_lens, expected_kv))
+        # One query token per sequence, as in plain decode.
+        expected_cu_q = torch.arange(self.bs + 1, dtype=torch.int32)
+        self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
+
+    def test_draft_extend_uses_extend_seq_lens(self):
+        backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        extend_seq_lens = torch.tensor([3, 1, 2], dtype=torch.int32)
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.DRAFT_EXTEND,
+            extend_seq_lens=extend_seq_lens,
+            spec_info=self.spec_info,
+        )
+        meta = _build_meta(backend, fb)
+        self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
+        expected_cu_q = torch.tensor([0, 3, 4, 6], dtype=torch.int32)
+        self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
+
+    def test_spec_page_indices_match_non_spec(self):
+        # The page-indices gather is mode-independent; spec modes must produce
+        # the same rectangular layout as plain decode.
+        backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        fb_spec = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=self.spec_info,
+        )
+        fb_plain = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.DECODE,
+        )
+        meta_spec = _build_meta(backend, fb_spec)
+        meta_plain = _build_meta(backend, fb_plain)
+        self.assertTrue(torch.equal(meta_spec.page_indices, meta_plain.page_indices))
+        self.assertTrue(torch.equal(meta_spec.cu_kv_lens, meta_plain.cu_kv_lens))
+
+
 class TestRpaDistribution(CustomTestCase):
     """The cached ``distribution`` values that ``_build_metadata`` depends on:
     ``[bs]*3`` for decode, ``[0, bs, bs]`` otherwise; int32.
@@ -289,6 +397,53 @@ class TestRpaDistribution(CustomTestCase):
         self.assertTrue(torch.equal(ext, torch.tensor([0, 3, 3], dtype=torch.int32)))
         # Repeat call for the same key is a cache hit -> same tensor object.
         self.assertIs(backend._get_cached_rpa_distribution(True, 3, device), dec)
+
+
+class TestNonEmptyBatchSize(CustomTestCase):
+    """``_non_empty_batch_size`` clips trailing zero-length sync-padding rows
+    from the RPA active count; ``_pre_bucket_padded_batch_size`` keeps them.
+    """
+
+    def setUp(self):
+        self.backend = _BackendUnderTest(
+            16, _build_req_to_token(num_reqs=8, max_context_len=64)
+        )
+
+    def _fb(self, seq_lens_list, with_cpu=True):
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32)
+        return _make_forward_batch(
+            seq_lens=seq_lens,
+            req_pool_indices=torch.arange(len(seq_lens_list), dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=seq_lens if with_cpu else None,
+        )
+
+    def test_no_padding_rows_returns_full_count(self):
+        fb = self._fb([10, 24, 33])
+        self.assertEqual(self.backend._pre_bucket_padded_batch_size(fb), 3)
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 3)
+
+    def test_trailing_zero_rows_are_clipped(self):
+        fb = self._fb([10, 24, 0, 0])
+        self.assertEqual(self.backend._pre_bucket_padded_batch_size(fb), 4)
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
+
+    def test_all_zero_rows_active_is_zero(self):
+        fb = self._fb([0, 0, 0])
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 0)
+
+    def test_interior_zero_row_raises(self):
+        # A zero between live rows is not the sync-padding tail layout; it
+        # would leave a padding row inside the active range, so fail loud.
+        fb = self._fb([10, 0, 33])
+        with self.assertRaises(ValueError):
+            self.backend._non_empty_batch_size(fb)
+
+    def test_missing_seq_lens_cpu_derives_from_device(self):
+        # Without the host copy, the clip derives from device seq_lens rather
+        # than degrading to the padded count.
+        fb = self._fb([10, 24, 0, 0], with_cpu=False)
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
 
 
 if __name__ == "__main__":

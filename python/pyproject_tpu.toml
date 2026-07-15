@@ -14,11 +14,6 @@ classifiers = [
   "License :: OSI Approved :: Apache Software License",
 ]
 
-# torch_tpu and libtpu are pinned to specific wheels published to a private
-# package server (workload-identity auth on CI; gcloud ADC on dev); see the
-# [[tool.uv.index]] block below. torch and jax[tpu] are installed alongside by
-# scripts/ci/tpu/tpu_ci_install_dependency.sh. Installing this pyproject
-# requires credentials for the torch-tpu virtual registry.
 dependencies = [
   "IPython",
   "aiohttp",
@@ -69,10 +64,22 @@ dependencies = [
   "uvloop",
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
+
+  # The pins below form one TPU stack and must be upgraded and validated
+  # together:
+  # - torch-tpu and torch must be ABI compatible.
+  # - torch and torchvision must be ABI compatible.
+  # - torch-tpu and libtpu must be validated together.
+  # - jax and jaxlib must be compatible with libtpu.
+  # torch-tpu wheels come from a private package server (see the
+  # [[tool.uv.index]] block below); installing them requires registry
+  # credentials (workload identity on CI, gcloud ADC on dev machines).
   "torch-tpu==0.1.1.dev20260707090224",
-  # Keep libtpu (PJRT runtime) pinned with the torch-tpu wheel. libtpu 0.0.41
-  # regresses GDN compilation with scoped VMEM OOMs in CI.
-  "libtpu==0.0.40",
+  "libtpu==0.0.42.1",
+  "torch==2.11.0",
+  "torchvision==0.26.0",
+  "jax==0.10.2",
+  "jaxlib==0.10.2",
 ]
 
 [project.optional-dependencies]
@@ -104,8 +111,8 @@ test = [
   "tabulate",
 ]
 
-# Mirrors srt_npu / all_npu / dev_npu shape. torch_tpu and libtpu are
-# pinned in `dependencies`; jax[tpu] is installed by the CI script. See header.
+# Mirrors srt_npu / all_npu / dev_npu shape. All TPU stack pins (torch_tpu,
+# libtpu, torch, torchvision, jax, jaxlib) live in `dependencies`.
 srt_tpu = []
 all_tpu = []
 dev_tpu = ["sglang[all_tpu]", "sglang[test]", "sglang[ray]"]

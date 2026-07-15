@@ -20,6 +20,10 @@
 #   SPEC_DRAFT_TOKENS Speculative num draft tokens (default: 4)
 #   SKIP_BASELINE     Set to 1 to skip baseline run
 #   SKIP_EAGLE        Set to 1 to skip EAGLE3 run
+#   CONTEXT_LEN       Context length (default: 4096)
+#   COMPILE           Set to 1 to enable torch.compile (default: 0)
+#   COMPILE_BS        Compile batch sizes (default: 1)
+#   COMPILE_TOKENS    Compile token buckets (default: 256)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -37,6 +41,11 @@ SPEC_TOPK="${SPEC_TOPK:-1}"
 SPEC_DRAFT_TOKENS="${SPEC_DRAFT_TOKENS:-4}"
 SKIP_BASELINE="${SKIP_BASELINE:-0}"
 SKIP_EAGLE="${SKIP_EAGLE:-0}"
+CONTEXT_LEN="${CONTEXT_LEN:-4096}"
+COMPILE="${COMPILE:-0}"
+COMPILE_BS="${COMPILE_BS:-1}"
+COMPILE_TOKENS="${COMPILE_TOKENS:-256}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 
 export SGLANG_PLATFORM=tpu
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
@@ -86,6 +95,7 @@ run_benchmark() {
         python3 "$REPO_ROOT/benchmark/mtbench/bench_sglang_eagle.py" \
             --num-questions "$NUM_QUESTIONS" \
             --parallel "$PARALLEL" \
+            --max-new-tokens "$MAX_NEW_TOKENS" \
             --host 127.0.0.1 \
             --port "$PORT" \
             --backend srt \
@@ -97,6 +107,7 @@ run_benchmark() {
     python3 "$REPO_ROOT/benchmark/mtbench/bench_sglang_eagle.py" \
         --num-questions "$NUM_QUESTIONS" \
         --parallel "$PARALLEL" \
+        --max-new-tokens "$MAX_NEW_TOKENS" \
         --host 127.0.0.1 \
         --port "$PORT" \
         --backend srt \
@@ -108,7 +119,7 @@ run_benchmark() {
 # Common server args
 BASE_ARGS=(
     --model-path "$MODEL"
-    --context-length 4096
+    --context-length "$CONTEXT_LEN"
     --device tpu
     --tp-size "$TP_SIZE"
     --dtype bfloat16
@@ -119,6 +130,20 @@ BASE_ARGS=(
     --watchdog-timeout 3600
     --skip-server-warmup
 )
+
+if [ "$COMPILE" = "1" ]; then
+    BASE_ARGS+=(
+        --enable-torch-compile
+        --tpu-compile-bs $COMPILE_BS
+        --tpu-compile-tokens $COMPILE_TOKENS
+    )
+    # Remove --skip-server-warmup since torch.compile does its own warmup
+    _filtered=()
+    for arg in "${BASE_ARGS[@]}"; do
+        [[ "$arg" != "--skip-server-warmup" ]] && _filtered+=("$arg")
+    done
+    BASE_ARGS=("${_filtered[@]}")
+fi
 
 echo "============================================"
 echo "  EAGLE3 E2E Benchmark"
@@ -131,6 +156,8 @@ echo "Parallel:    $PARALLEL"
 echo "Spec steps:  $SPEC_STEPS"
 echo "Spec topk:   $SPEC_TOPK"
 echo "Draft tokens: $SPEC_DRAFT_TOKENS"
+echo "Context len: $CONTEXT_LEN"
+echo "Compile:     $COMPILE"
 echo "============================================"
 
 # ---- Baseline (no spec decode) ----

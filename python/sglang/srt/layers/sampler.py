@@ -185,6 +185,8 @@ class Sampler(nn.Module):
                     )
                 del probs
 
+        batch_next_token_ids = batch_next_token_ids.to(torch.int64)
+
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
             if SGLANG_RETURN_ORIGINAL_LOGPROB:
