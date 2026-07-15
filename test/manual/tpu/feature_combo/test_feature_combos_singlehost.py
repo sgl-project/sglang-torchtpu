@@ -12,7 +12,6 @@ full v7x-host shape; dp is carved out of tp, so every combo uses 8 chips:
   1     prefix caching + EAGLE3 spec + KV offloading        (tp=8)
         interaction: draft KV piggybacks target slots; spec multiplies
         forwards racing the reload worker.
-  1tp1  combo 1 single-chip smoke (fast bisection variant)
   2     prefix caching + DP attention + KV offloading       (tp=8 x dp=2)
         interaction: per-rank pools + idle-rank dummy batches vs reload/evict.
   3     prefix caching + DP attention + KV offloading + spec (tp=8 x dp=2)
@@ -22,7 +21,7 @@ teardown/reinit), so each combo builds its engine in a fresh interpreter:
 
     SGLANG_PLATFORM=tpu HF_HUB_OFFLINE=1 \
         python test/manual/tpu/feature_combo/test_feature_combos_singlehost.py 1
-    # arg = 1 | 1tp1 | 2 | 3 | all
+    # arg = 1 | 2 | 3 | all
 """
 
 import os
@@ -68,11 +67,6 @@ COMBOS = {
     # Default = the full-host serving shape (v7x host = 8 devices): real TP
     # sharding (per-rank KV pools, sharded draft), the shape that ships.
     "1": dict(name="prefix+spec+kvoffload", engine={**_BASE, "tp_size": 8, **_SPEC}),
-    # Single-chip smoke variant: fast iteration when bisecting a red combo 1.
-    "1tp1": dict(
-        name="prefix+spec+kvoffload (tp=1 smoke)",
-        engine={**_BASE, "tp_size": 1, **_SPEC},
-    ),
     "2": dict(name="prefix+dp+kvoffload", engine={**_BASE, **_DP}),
     "3": dict(name="prefix+dp+kvoffload+spec (quad)", engine={**_BASE, **_DP, **_SPEC}),
 }
@@ -293,7 +287,7 @@ def _run_all():
     """Run every combo sequentially, each in a FRESH interpreter (TPU runtime
     re-init in-process is fragile). Fail fast so the first red row identifies
     which added feature broke."""
-    for combo in ("1", "1tp1", "2", "3"):
+    for combo in ("1", "2", "3"):
         print(f"\n{'#' * 60}\n# combo {combo}: {COMBOS[combo]['name']}\n{'#' * 60}")
         env = {**os.environ, "COMBO": combo}
         rc = subprocess.call([sys.executable, os.path.abspath(__file__)], env=env)
