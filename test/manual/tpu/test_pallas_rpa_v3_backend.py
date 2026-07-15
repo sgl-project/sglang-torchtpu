@@ -73,6 +73,7 @@ def _make_forward_batch(
     forward_mode: ForwardMode,
     extend_seq_lens: Optional[torch.Tensor] = None,
     spec_info=None,
+    seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
     """Minimal fake ForwardBatch for ``_build_metadata``.
 
@@ -86,6 +87,7 @@ def _make_forward_batch(
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
         spec_info=spec_info,
+        seq_lens_cpu=seq_lens_cpu,
     )
 
 
@@ -107,7 +109,9 @@ def _build_req_to_token(
 def _build_meta(backend, fb) -> PallasForwardMetadata:
     """Mirror ``init_forward_metadata``."""
     distribution = backend._get_cached_rpa_distribution(
-        fb.forward_mode.is_decode(), backend._real_batch_size(fb), fb.seq_lens.device
+        fb.forward_mode.is_decode(),
+        backend._non_empty_batch_size(fb),
+        fb.seq_lens.device,
     )
     return backend._build_metadata(fb, distribution)
 
@@ -393,6 +397,53 @@ class TestRpaDistribution(CustomTestCase):
         self.assertTrue(torch.equal(ext, torch.tensor([0, 3, 3], dtype=torch.int32)))
         # Repeat call for the same key is a cache hit -> same tensor object.
         self.assertIs(backend._get_cached_rpa_distribution(True, 3, device), dec)
+
+
+class TestNonEmptyBatchSize(CustomTestCase):
+    """``_non_empty_batch_size`` clips trailing zero-length sync-padding rows
+    from the RPA active count; ``_pre_bucket_padded_batch_size`` keeps them.
+    """
+
+    def setUp(self):
+        self.backend = _BackendUnderTest(
+            16, _build_req_to_token(num_reqs=8, max_context_len=64)
+        )
+
+    def _fb(self, seq_lens_list, with_cpu=True):
+        seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32)
+        return _make_forward_batch(
+            seq_lens=seq_lens,
+            req_pool_indices=torch.arange(len(seq_lens_list), dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            seq_lens_cpu=seq_lens if with_cpu else None,
+        )
+
+    def test_no_padding_rows_returns_full_count(self):
+        fb = self._fb([10, 24, 33])
+        self.assertEqual(self.backend._pre_bucket_padded_batch_size(fb), 3)
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 3)
+
+    def test_trailing_zero_rows_are_clipped(self):
+        fb = self._fb([10, 24, 0, 0])
+        self.assertEqual(self.backend._pre_bucket_padded_batch_size(fb), 4)
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
+
+    def test_all_zero_rows_active_is_zero(self):
+        fb = self._fb([0, 0, 0])
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 0)
+
+    def test_interior_zero_row_raises(self):
+        # A zero between live rows is not the sync-padding tail layout; it
+        # would leave a padding row inside the active range, so fail loud.
+        fb = self._fb([10, 0, 33])
+        with self.assertRaises(ValueError):
+            self.backend._non_empty_batch_size(fb)
+
+    def test_missing_seq_lens_cpu_derives_from_device(self):
+        # Without the host copy, the clip derives from device seq_lens rather
+        # than degrading to the padded count.
+        fb = self._fb([10, 24, 0, 0], with_cpu=False)
+        self.assertEqual(self.backend._non_empty_batch_size(fb), 2)
 
 
 if __name__ == "__main__":
