@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_moe_expert_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -319,6 +320,7 @@ def apply_tpu_fp8_moe(
     activation: str,
     block_quant: bool,
     apply_router_weight_on_input: bool,
+    no_combine: bool = False,
 ):
     """Run TPU FP8 MoE through the Pallas fused grouped-GEMM backend."""
     if apply_router_weight_on_input:
@@ -331,7 +333,16 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
-    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
+    if layer.num_fused_shared_experts:
+        raise NotImplementedError(
+            "Fused shared experts are not supported on the TPU MoE path."
+        )
+    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+        topk_weights,
+        topk_ids,
+        layer.num_local_experts,
+        get_moe_expert_parallel_rank(),
+    )
 
     w1_scale = layer.w13_weight_scale_inv if block_quant else layer.w13_weight_scale
     w2_scale = layer.w2_weight_scale_inv if block_quant else layer.w2_weight_scale
@@ -350,5 +361,6 @@ def apply_tpu_fp8_moe(
         activation=activation,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        no_combine=no_combine,
     )
     return StandardCombineInput(hidden_states=output)

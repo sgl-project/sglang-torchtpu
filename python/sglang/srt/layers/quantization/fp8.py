@@ -1988,6 +1988,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 activation=moe_runner_config.activation,
                 block_quant=self.block_quant,
                 apply_router_weight_on_input=moe_runner_config.apply_router_weight_on_input,
+                no_combine=moe_runner_config.no_combine,
             )
 
         if use_intel_amx_backend(layer):

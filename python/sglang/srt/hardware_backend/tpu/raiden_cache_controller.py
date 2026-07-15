@@ -71,7 +71,7 @@ class TpuRaidenHiCacheController(HiCacheController):
         # raiden's DMA addresses pages by int, so moving them to CPU keeps every
         # index tensor host-resident: node.value / prefix_indices stay on CPU and
         # the schedule_policy prefix cat stays single-device under the
-        # host-resident req_to_token (SGLANG_TPU_HOST_R2T=1). A device tensor here
+        # host-resident req_to_token (SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1). A device tensor here
         # would torch.cat onto the CPU prefix indices as a cross-device cat.
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
