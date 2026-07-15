@@ -1,0 +1,32 @@
+name: Probe runner Node24 support (temporary)
+#
+# One-off compatibility check for whether x64-docker-build-node's Actions
+# Runner agent supports Node 24 (required by docker/login-action@v4+). Uses
+# dummy credentials — never real secrets — and no `environment:`, so it
+# needs no reviewer approval. Delete this file once the answer is known.
+
+on:
+  push:
+    branches: [ci/radixark-docker-pipeline]
+
+jobs:
+  probe:
+    runs-on: x64-docker-build-node
+    steps:
+      - name: Runner diagnostics
+        run: |
+          uname -a
+          node --version || echo "no node in default PATH"
+          cat /actions-runner/.runner 2>/dev/null || cat ~/actions-runner/.runner 2>/dev/null || echo "no .runner file found at expected paths"
+
+      - name: Node24 action compatibility probe (expected to fail auth, not runner-support)
+        id: probe
+        continue-on-error: true
+        uses: docker/login-action@v4
+        with:
+          username: probe
+          password: probe
+
+      - name: Report result
+        run: |
+          echo "docker/login-action@v4 step outcome: ${{ steps.probe.outcome }}"
