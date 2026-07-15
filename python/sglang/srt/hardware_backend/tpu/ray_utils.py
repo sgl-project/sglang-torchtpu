@@ -196,25 +196,74 @@ def order_tpu_bundles_by_worker_id(
     return _resolve_bundle_order_from_probes(probes, engine_ip)
 
 
-def tpu_actor_runtime_env(server_args) -> dict:
-    """Ray ``.options()`` kwargs injecting the launcher-computed TPU env vars into
-    a scheduler actor's environment.
+# Config env namespaces the launcher (benchmark/tpu/launch_server.sh) exports at
+# runtime and that a scheduler actor needs, but Ray drops: the actor only inherits
+# the raylet's env (the container env at `ray start`), which predates those exports
+# -- and worker nodes never run launch_server.sh at all. We forward these from the
+# driver's os.environ via runtime_env (see _forwarded_driver_env). Allowlist, not
+# denylist: missing an entry just leaves it dropped (status quo, safe), whereas
+# forwarding a per-chip/per-node var would clobber Ray's per-actor value.
+_FORWARD_ENV_PREFIXES = ("SGLANG_", "TORCH_", "HF_", "TRANSFORMERS_")
+_FORWARD_ENV_NAMES = frozenset(
+    {"LIBTPU_INIT_ARGS", "XLA_FLAGS", "TPU_PREMAPPED_BUFFER_SIZE"}
+)
+# Never forward, even when a prefix matches: these are per-chip/per-node (Ray sets
+# them per actor -- forwarding the driver's copy makes every actor grab the same
+# chip and crash) or are the physically-ordered slice env injected separately
+# below from server_args (which must win over any inherited copy).
+_NEVER_FORWARD_ENV = frozenset(
+    {
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
+        "TPU_WORKER_HOSTNAMES",
+        "TPU_VISIBLE_CHIPS",
+        "TPU_CHIPS_PER_HOST_BOUNDS",
+        "TPU_HOST_BOUNDS",
+    }
+)
 
-    Reads the individual fields the Ray engine stashed on ``server_args`` and maps
-    each to the env var the actor's TPU bootstrap (``_prepare_tpu_env``) reads:
-    ``TPU_WORKER_HOSTNAMES`` (multihost host list), or the shared single-host
-    ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` / ``TORCH_TPU_TOPOLOGY``. Passing them via
-    ``runtime_env`` is the only reliable channel -- Ray does NOT propagate the
-    driver's ``os.environ`` mutations to actors -- and keeps the generic
-    ``SchedulerActor`` constructor free of TPU-specific parameters. Returns an
-    empty dict when there is nothing to inject (GPU or non-Ray), so actors fall
-    back to their own pod env.
+
+def _forwarded_driver_env(environ=None) -> dict:
+    """Pick the driver's config env vars that should be forwarded to scheduler actors.
+
+    Returns ``{name: value}`` for every var in ``environ`` (default ``os.environ``)
+    whose name is in ``_FORWARD_ENV_NAMES`` or matches a ``_FORWARD_ENV_PREFIXES``
+    prefix, minus ``_NEVER_FORWARD_ENV``. ``environ`` is injectable for unit tests.
     """
-    env_vars = {}
-    # Inject an empty string too (single-host on a multi-host slice), so the
-    # actor overrides the slice-wide value inherited from `ray start` rather
-    # than falling back to it -- only None (GPU / discovery failed) means
-    # "don't inject, let the actor use its own pod env".
+    if environ is None:
+        environ = os.environ
+    forwarded = {}
+    for name, value in environ.items():
+        if name in _NEVER_FORWARD_ENV:
+            continue
+        if name in _FORWARD_ENV_NAMES or name.startswith(_FORWARD_ENV_PREFIXES):
+            forwarded[name] = value
+    return forwarded
+
+
+def tpu_actor_runtime_env(server_args) -> dict:
+    """Ray ``.options()`` kwargs injecting the env a scheduler actor needs.
+
+    Ray does NOT propagate the driver's ``os.environ`` to actors (they inherit only
+    the raylet's env), so ``runtime_env`` is the sole channel. Two sources merge
+    into one ``env_vars`` dict:
+
+    1. The launcher-set config the driver has but the actor lost (``LIBTPU_INIT_ARGS``,
+       compile-cache, ``SGLANG_*`` / ``TORCH_*`` toggles), via ``_forwarded_driver_env``.
+    2. The launcher-*computed* TPU slice env stashed on ``server_args``:
+       ``TPU_WORKER_HOSTNAMES`` (multihost host list) or the single-host
+       ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` / ``TORCH_TPU_TOPOLOGY``, read by the
+       actor's TPU bootstrap (``_prepare_tpu_env``).
+
+    Source 2 always wins over any inherited copy of the same var (it is the
+    physically-ordered / single-host-override value). Returns an empty dict when
+    there is nothing to inject, so actors fall back to their own pod env.
+    """
+    env_vars = _forwarded_driver_env()
+    # Computed slice env overrides any forwarded/inherited copy. Inject an empty
+    # string too (single-host on a multi-host slice), so the actor overrides the
+    # slice-wide value inherited from `ray start` rather than falling back to it --
+    # only None (GPU / discovery failed) means "don't inject, use the pod env".
     if server_args.tpu_worker_hostnames is not None:
         env_vars["TPU_WORKER_HOSTNAMES"] = server_args.tpu_worker_hostnames
     if server_args.torch_tpu_slicebuilder_addresses:

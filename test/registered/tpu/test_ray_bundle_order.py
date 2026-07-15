@@ -22,6 +22,7 @@ Usage:
     python test/registered/tpu/test_ray_bundle_order.py
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -36,6 +37,7 @@ pytest.importorskip("ray")
 
 from sglang.srt.hardware_backend.tpu.patches import compute_single_host_tpu_env
 from sglang.srt.hardware_backend.tpu.ray_utils import (
+    _forwarded_driver_env,
     _resolve_bundle_order_from_probes,
     tpu_actor_runtime_env,
 )
@@ -172,10 +174,15 @@ class TestTpuActorRuntimeEnv(CustomTestCase):
     the single-host slicebuilder-port mismatch (each actor otherwise picks its own).
     """
 
+    # These assert the exact env_vars dict, so clear os.environ first -- otherwise
+    # the driver's ambient SGLANG_*/TORCH_*/... vars get forwarded and pollute it
+    # (that forwarding is covered by TestForwardedDriverEnv below).
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_empty_when_no_tpu_fields(self):
-        # GPU / non-Ray: nothing to inject -> no runtime_env key at all.
+        # GPU / non-Ray, nothing to forward or inject -> no runtime_env key at all.
         self.assertEqual(tpu_actor_runtime_env(_server_args()), {})
 
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_multihost_injects_worker_hostnames(self):
         env = tpu_actor_runtime_env(_server_args(tpu_worker_hostnames="ipA,ipB"))
         self.assertEqual(
@@ -191,6 +198,7 @@ class TestTpuActorRuntimeEnv(CustomTestCase):
         env = tpu_actor_runtime_env(_server_args(tpu_worker_hostnames=""))
         self.assertEqual(env["runtime_env"]["env_vars"]["TPU_WORKER_HOSTNAMES"], "")
 
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_single_host_injects_slicebuilder_and_topology(self):
         env = tpu_actor_runtime_env(
             _server_args(
@@ -206,6 +214,7 @@ class TestTpuActorRuntimeEnv(CustomTestCase):
             },
         )
 
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_single_host_topology_optional(self):
         # torch_tpu_topology may be unknown (None) -- only addresses get injected.
         env = tpu_actor_runtime_env(
@@ -215,6 +224,83 @@ class TestTpuActorRuntimeEnv(CustomTestCase):
             env["runtime_env"]["env_vars"],
             {"TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1"},
         )
+
+
+class TestForwardedDriverEnv(CustomTestCase):
+    """Ray drops the launcher's runtime env on scheduler actors (they inherit only
+    the raylet env). _forwarded_driver_env picks the driver's config vars to forward
+    via runtime_env, by an allowlist -- never per-chip/per-node vars, which would
+    make every actor grab the same chip.
+    """
+
+    def test_forwards_allowlisted_prefixes_and_names(self):
+        env = {
+            "SGLANG_TPU_OVERLAP_PROFILE": "1",
+            "TORCH_LOGS": "+recompiles",
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "LIBTPU_INIT_ARGS": "--xla_tpu_scoped_vmem_limit_kib=65536",
+            "XLA_FLAGS": "--xla_dump_to=/tmp",
+            "TPU_PREMAPPED_BUFFER_SIZE": "4294967296",
+        }
+        self.assertEqual(_forwarded_driver_env(env), env)
+
+    def test_never_forwards_per_chip_or_computed_vars(self):
+        # Per-chip placement (Ray sets these per actor) + the physically-ordered
+        # slice env (injected separately from server_args) must never be forwarded.
+        env = {
+            "TPU_VISIBLE_CHIPS": "3",
+            "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+            "TPU_HOST_BOUNDS": "1,1,1",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1",
+            "TORCH_TPU_TOPOLOGY": "2,1,1",
+            "TPU_WORKER_HOSTNAMES": "ipA,ipB",
+        }
+        self.assertEqual(_forwarded_driver_env(env), {})
+
+    def test_ignores_non_allowlisted_vars(self):
+        # Distributed rank / Ray internals / shell + pod identity are out of scope.
+        env = {
+            "RANK": "4",
+            "LOCAL_RANK": "4",
+            "WORLD_SIZE": "16",
+            "MASTER_ADDR": "10.0.0.1",
+            "RAY_ADDRESS": "127.0.0.1:6379",
+            "HOSTNAME": "node-0",
+            "PATH": "/usr/bin",
+        }
+        self.assertEqual(_forwarded_driver_env(env), {})
+
+    def test_mixed_env_keeps_only_allowlisted(self):
+        env = {
+            "SGLANG_PLATFORM": "tpu",  # forwarded
+            "TPU_VISIBLE_CHIPS": "3",  # never
+            "RANK": "4",  # ignored
+            "LIBTPU_INIT_ARGS": "--flag",  # forwarded
+        }
+        self.assertEqual(
+            _forwarded_driver_env(env),
+            {"SGLANG_PLATFORM": "tpu", "LIBTPU_INIT_ARGS": "--flag"},
+        )
+
+    @mock.patch.dict(
+        os.environ,
+        {"TORCH_TPU_TOPOLOGY": "9,9,9", "SGLANG_PLATFORM": "tpu"},
+        clear=True,
+    )
+    def test_computed_value_wins_over_inherited(self):
+        # Driver has a stale TORCH_TPU_TOPOLOGY, but it's in _NEVER_FORWARD, so only
+        # the computed value from server_args reaches the actor. The unrelated
+        # forwarded var rides along.
+        env = tpu_actor_runtime_env(
+            _server_args(
+                torch_tpu_slicebuilder_addresses="localhost:1",
+                torch_tpu_topology="2,1,1",
+            )
+        )
+        env_vars = env["runtime_env"]["env_vars"]
+        self.assertEqual(env_vars["TORCH_TPU_TOPOLOGY"], "2,1,1")
+        self.assertEqual(env_vars["SGLANG_PLATFORM"], "tpu")
 
 
 class TestComputeSingleHostTpuEnv(CustomTestCase):
@@ -261,15 +347,18 @@ class TestActorOptions(CustomTestCase):
             {"num_cpus": 0, "num_gpus": 1},
         )
 
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_tpu_options_reserve_tpu_resource_no_env(self):
         from sglang.srt.ray.engine import _actor_options
 
-        # No TPU env stashed -> tpu_actor_runtime_env is empty, so no runtime_env.
+        # No TPU env stashed + empty driver env -> tpu_actor_runtime_env forwards
+        # nothing and injects nothing, so no runtime_env key.
         self.assertEqual(
             _actor_options(_server_args(device="tpu")),
             {"num_cpus": 0, "num_gpus": 0, "resources": {"TPU": 1}},
         )
 
+    @mock.patch.dict(os.environ, {}, clear=True)
     def test_tpu_options_merge_runtime_env(self):
         from sglang.srt.ray.engine import _actor_options
 

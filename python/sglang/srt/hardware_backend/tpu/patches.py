@@ -10,7 +10,6 @@ All patches are idempotent.
 from __future__ import annotations
 
 import importlib
-import json
 import os
 
 from sglang.srt.environ import envs
@@ -24,6 +23,22 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 ]
 
 _dynamic_compile_unwrapped = False
+
+# Important TPU env vars logged at the end of ``_prepare_tpu_env`` so
+# multi-process / multi-host init issues are diagnosable from a single line.
+_IMPORTANT_TPU_ENV_VARS = (
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+    "TORCH_TPU_BASE_PORT",
+    "TORCH_TPU_DEVICES_PER_HOST",
+    "TPU_WORKER_HOSTNAMES",
+    "TPU_WORKER_ID",
+    "TPU_TOPOLOGY",
+    "TPU_PREMAPPED_BUFFER_SIZE",
+    "LIBTPU_INIT_ARGS",
+    "XLA_FLAGS",
+    "SGLANG_NATIVE_MOVE_KV_CACHE",
+)
 
 
 def _configure_eager_mode() -> None:
@@ -223,10 +238,14 @@ def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> No
         # inherited by child ranks -- don't clobber an already-set value.
         _set_torch_tpu_topology_env_single(world_size)
 
+    # Only vars that are actually set are printed to keep the output focused.
     logger.info(
-        "TPU env: TORCH_TPU_SLICEBUILDER_ADDRESSES=%s, TORCH_TPU_TOPOLOGY=%s",
-        os.environ.get("TORCH_TPU_SLICEBUILDER_ADDRESSES"),
-        os.environ.get("TORCH_TPU_TOPOLOGY"),
+        "TPU env:\n%s",
+        "\n".join(
+            f"  {k}={os.environ[k]}"
+            for k in _IMPORTANT_TPU_ENV_VARS
+            if k in os.environ
+        ),
     )
 
 
@@ -626,12 +645,7 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
-def _log_env(when: str) -> None:
-    logger.info("%s, env: %s", when, json.dumps(dict(sorted(os.environ.items()))))
-
-
 def apply_tpu_patches(world_size: int = 1) -> None:
-    _log_env("Before TPU patches")
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
     _register_tpu_compile_backend()
@@ -642,4 +656,3 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _register_aten_fallbacks()
-    _log_env("TPU patches applied")

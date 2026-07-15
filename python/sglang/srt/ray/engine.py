@@ -155,18 +155,34 @@ class RayEngine(Engine):
         # list from the live cluster. nnodes=0 opts into auto-detecting the count.
         # The computed TPU env is stashed on server_args (tpu_worker_hostnames /
         # torch_tpu_slicebuilder_addresses / torch_tpu_topology) and injected into
-        # every scheduler actor via runtime_env -- the only channel Ray propagates;
-        # it does NOT forward the driver's os.environ mutations.
+        # every scheduler actor via runtime_env -- the only channel Ray propagates,
+        # since it does NOT forward the driver's os.environ. runtime_env also carries
+        # a curated allowlist of the driver's launcher-set config env that the actor
+        # would otherwise lose (see ray_utils._forwarded_driver_env).
         if server_args.use_ray and server_args.device == "tpu":
             # Lazy TPU import: keeps the GPU Ray path from importing the TPU
             # package (see _actor_options).
             from sglang.srt.hardware_backend.tpu.ray_utils import (
+                _forwarded_driver_env,
                 detect_tpu_nnodes,
                 discover_tpu_worker_hostnames,
             )
 
             if not ray.is_initialized():
                 ray.init(address="auto", ignore_reinit_error=True)
+
+            # Log (once, here on the driver -- not per actor) the launcher-set config
+            # env we forward to every scheduler actor via runtime_env, since Ray
+            # would otherwise drop it (actors inherit only the raylet env). Values
+            # included so the full LIBTPU_INIT_ARGS / flags are visible in one line.
+            forwarded_env = _forwarded_driver_env()
+            if forwarded_env:
+                logger.info(
+                    "Ray TPU: forwarding %d driver env var(s) to scheduler actors "
+                    "via runtime_env: %s",
+                    len(forwarded_env),
+                    ", ".join(f"{k}={v}" for k, v in sorted(forwarded_env.items())),
+                )
 
             # Detect nnodes if not specified. This is needed for TPU multihost.
             if server_args.nnodes == 0:
@@ -199,7 +215,7 @@ class RayEngine(Engine):
             # co-located Engine (enforced by _find_engine_bundle) -- live on ONE
             # node; the endpoints are random free localhost ports picked ONCE on
             # the driver and injected so every same-node actor agrees on the port
-            # list (Ray doesn't propagate the driver's os.environ, and "localhost"
+            # list (Ray doesn't auto-propagate the driver's os.environ, and "localhost"
             # resolves to each actor's own loopback -- valid precisely because
             # they share the node). Multi-host: endpoints are deterministic
             # (host:base_port+i), so the driver only stashes the physically-
