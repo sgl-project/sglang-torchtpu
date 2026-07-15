@@ -26,6 +26,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
+# ray is an optional extra (project.optional-dependencies "ray"), but the sglang
+# imports below pull in ray_utils -> `import ray`. Skip the whole module when the
+# extra is absent so collection doesn't fail with ModuleNotFoundError; the
+# stage-a-test-tpu-unit runner image installs sglang[ray] so it actually runs.
+pytest.importorskip("ray")
+
 from sglang.srt.hardware_backend.tpu.patches import compute_single_host_tpu_env
 from sglang.srt.hardware_backend.tpu.ray_utils import (
     _resolve_bundle_order_from_probes,
@@ -174,6 +182,14 @@ class TestTpuActorRuntimeEnv(CustomTestCase):
             env,
             {"runtime_env": {"env_vars": {"TPU_WORKER_HOSTNAMES": "ipA,ipB"}}},
         )
+
+    def test_single_host_injects_empty_worker_hostnames(self):
+        # nnodes<=1 on a multi-host slice: "" must be injected (not skipped as
+        # falsy) so the actor overrides the slice-wide TPU_WORKER_HOSTNAMES it
+        # inherits from `ray start` -- otherwise it takes the multihost branch
+        # and hangs. None (GPU / discovery failed) stays uninjected.
+        env = tpu_actor_runtime_env(_server_args(tpu_worker_hostnames=""))
+        self.assertEqual(env["runtime_env"]["env_vars"]["TPU_WORKER_HOSTNAMES"], "")
 
     def test_single_host_injects_slicebuilder_and_topology(self):
         env = tpu_actor_runtime_env(

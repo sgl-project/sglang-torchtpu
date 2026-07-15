@@ -179,7 +179,31 @@ class RayEngine(Engine):
                     resolved,
                 )
                 server_args = dataclasses.replace(server_args, nnodes=resolved)
+                # Run the (tp_size * pp_size) % nnodes check that
+                # check_server_args deferred for nnodes=0. A non-divisor
+                # under-provisions the placement group and the launch hangs
+                # forever -- fail loud instead.
+                if (server_args.tp_size * server_args.pp_size) % resolved != 0:
+                    raise ValueError(
+                        f"Auto-detected {resolved} TPU node(s), but "
+                        f"tp_size * pp_size = "
+                        f"{server_args.tp_size * server_args.pp_size} is not "
+                        f"divisible by {resolved}. The placement group would be "
+                        "under-provisioned and the launch would hang. Pass "
+                        "--nnodes explicitly to match your TPU slice topology."
+                    )
 
+            # Single vs multi host stay separate (not merged) because the
+            # slicebuilder is built differently. Single-host: nnodes==1 forces a
+            # STRICT_PACK 1-bundle placement group, so all tp actors -- and the
+            # co-located Engine (enforced by _find_engine_bundle) -- live on ONE
+            # node; the endpoints are random free localhost ports picked ONCE on
+            # the driver and injected so every same-node actor agrees on the port
+            # list (Ray doesn't propagate the driver's os.environ, and "localhost"
+            # resolves to each actor's own loopback -- valid precisely because
+            # they share the node). Multi-host: endpoints are deterministic
+            # (host:base_port+i), so the driver only stashes the physically-
+            # ordered host list and each actor rebuilds them itself.
             if server_args.nnodes <= 1:
                 from sglang.srt.hardware_backend.tpu.patches import (
                     compute_single_host_tpu_env,
@@ -188,6 +212,13 @@ class RayEngine(Engine):
                 single_host_env = compute_single_host_tpu_env(server_args.tp_size)
                 server_args = dataclasses.replace(
                     server_args,
+                    # Force TPU_WORKER_HOSTNAMES="" into every actor. On a
+                    # multi-host GKE slice each pod inherits the slice-wide
+                    # value from `ray start`; without overriding it, the actor's
+                    # _prepare_tpu_env / monkey_patch_torch_tpu_env would see
+                    # len(hosts) > 1, take the multihost branch, discard the
+                    # injected single-host slicebuilder, and hang at rendezvous.
+                    tpu_worker_hostnames="",
                     torch_tpu_slicebuilder_addresses=single_host_env[
                         "TORCH_TPU_SLICEBUILDER_ADDRESSES"
                     ],

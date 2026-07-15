@@ -211,7 +211,11 @@ def tpu_actor_runtime_env(server_args) -> dict:
     back to their own pod env.
     """
     env_vars = {}
-    if server_args.tpu_worker_hostnames:
+    # Inject an empty string too (single-host on a multi-host slice), so the
+    # actor overrides the slice-wide value inherited from `ray start` rather
+    # than falling back to it -- only None (GPU / discovery failed) means
+    # "don't inject, let the actor use its own pod env".
+    if server_args.tpu_worker_hostnames is not None:
         env_vars["TPU_WORKER_HOSTNAMES"] = server_args.tpu_worker_hostnames
     if server_args.torch_tpu_slicebuilder_addresses:
         env_vars["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = (

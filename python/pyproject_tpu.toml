@@ -78,6 +78,12 @@ dependencies = [
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 
+# Ray is required only for the --use-ray multihost launch path (RayEngine).
+# Mirrors the `ray` extra in the base pyproject so `sglang[ray]` resolves on TPU
+# builds too; pulled into dev_tpu so the TPU unit-test image gets it (otherwise
+# test_ray_bundle_order.py's importorskip("ray") silently skips forever).
+ray = ["ray[default]>=2.54.0"]
+
 tracing = [
   "opentelemetry-api",
   "opentelemetry-exporter-otlp",
@@ -102,7 +108,7 @@ test = [
 # pinned in `dependencies`; jax[tpu] is installed by the CI script. See header.
 srt_tpu = []
 all_tpu = []
-dev_tpu = ["sglang[all_tpu]", "sglang[test]"]
+dev_tpu = ["sglang[all_tpu]", "sglang[test]", "sglang[ray]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
