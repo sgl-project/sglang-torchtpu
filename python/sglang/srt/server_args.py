@@ -3771,6 +3771,24 @@ class ServerArgs:
             ), "cuda_graph_config[decode].bs should contain positive batch sizes"
             decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
 
+        if self.device == "tpu":
+            # Couple the compile-bucket max (torch_compile_max_bs) with the
+            # scheduler (max_running_requests) so a decode batch can never fall
+            # outside the compiled buckets.
+            from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+                reconcile_tpu_batch_limits,
+            )
+
+            (
+                self.torch_compile_max_bs,
+                self.tpu_compile_bs,
+                self.max_running_requests,
+            ) = reconcile_tpu_batch_limits(
+                self.torch_compile_max_bs,
+                self.tpu_compile_bs,
+                self.max_running_requests,
+            )
+
         if prefill_cuda_graph_config.max_bs is None:
             # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.

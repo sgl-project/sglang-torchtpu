@@ -12,7 +12,7 @@ from __future__ import annotations
 import functools
 import inspect
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -516,45 +516,38 @@ class CompiledForwardShim:
         return out
 
 
-def resolve_compile_caps(
-    *,
-    chunked_prefill_size: int | None,
-    max_prefill_tokens: int | None,
-    context_len: int | None,
-    torch_compile_max_bs: int | None,
+def reconcile_tpu_batch_limits(
+    torch_compile_max_bs: int,
+    tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
-) -> tuple[int, int]:
-    """Resolve (max_t, max_b) limits for compilation bucketing."""
-    candidates = [
-        c
-        for c in (chunked_prefill_size, max_prefill_tokens, context_len)
-        if c and c > 0
-    ]
-    if not candidates:
-        raise ValueError(
-            "Cannot determine max_t for TPU compile bucketing: "
-            "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
-        )
-    # TPU serving should compile the requested scheduler capacity by default for
-    # practical benchmark sizes (for example max_running_requests=64). Avoid
-    # blindly expanding to very large upstream defaults unless the user raises
-    # torch_compile_max_bs or pins --tpu-compile-bs.
-    max_running_compile_bs = (
-        min(max_running_requests, DEFAULT_TPU_COMPILE_MAX_BS)
-        if max_running_requests
-        else 1
-    )
-    max_b = max(torch_compile_max_bs or 1, max_running_compile_bs)
-    if max_running_requests and max_b < max_running_requests:
-        logger.warning(
-            "[compiled forward shim] TPU compile bs cap=%d < max_running_requests=%d; "
-            "batches above %d are outside the TPU compile grid. Raise "
-            "--torch-compile-max-bs or pin --tpu-compile-bs to cover them.",
-            max_b,
-            max_running_requests,
-            max_b,
-        )
-    return min(candidates), max_b
+) -> tuple[int, Optional[List[int]], int]:
+    """
+    1. `torch_compile_max_bs` is set to be the max of
+    `DEFAULT_TPU_COMPILE_MAX_BS`, the `max(ts_compile_bs)` (if set), or
+    `max_running_requests` (if set). This determines the max bucket size we
+    will compile for TPUs.
+
+    2. If `max_running_requests` is not set, then it is set to be
+    `torch_compile_max_bs`, otherwise we may run into a case where the number
+    of requests passed in is greater than the max bucket size we have compiled.
+
+    3. If `ts_compile_bs` is set but the max value is smaller than
+    `torch_compile_max_bs`, then we will append the larger size to it to make
+    sure it gets compiled.
+    """
+    tcmb = max(torch_compile_max_bs, DEFAULT_TPU_COMPILE_MAX_BS)
+    if tpu_compile_bs:
+        tcmb = max(tcmb, max(tpu_compile_bs))
+
+    if max_running_requests is not None:
+        tcmb = max(tcmb, max_running_requests)
+    else:
+        max_running_requests = tcmb
+
+    if tpu_compile_bs and max(tpu_compile_bs) < tcmb:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {tcmb})
+
+    return tcmb, tpu_compile_bs, max_running_requests
 
 
 def build_bucketers(
