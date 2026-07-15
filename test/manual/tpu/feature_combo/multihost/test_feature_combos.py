@@ -3,15 +3,9 @@
 Row 1 (``pd``):   prefix caching + KV offloading (HiCache) + P/D disaggregation
 Row 2 (``spec``): prefix caching + EAGLE3 speculative decoding + KV offloading
 
-Both tests drive a 2-pass probe (same prompts twice, long shared prefix) and
-assert from ``meta_info`` that the features actually functioned — not merely
-that the servers stayed up:
-
-* every request returns non-empty text,
-* pass 2 reports ``cached_tokens >= MIN_CACHED_TOKENS`` (real prefix hit;
-  with the deliberately small device pool the prefix takes the HiCache
-  write-backup path),
-* (spec only) ``spec_verify_ct > 0`` and ``accept_length > MIN_ACCEPT_LENGTH``.
+Both tests drive a 2-pass probe (same long-shared-prefix prompts twice) and
+assert from ``meta_info`` that the features actually functioned, not merely
+that the servers stayed up — see ``run_probe`` for the exact oracle.
 
 Topology & roles (auto-detected from the GKE TPU env, override via NODE_RANK):
   pd:    host 0 = prefill engine (tp=8) + mini-LB + probe/asserts
