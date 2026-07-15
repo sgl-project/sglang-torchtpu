@@ -23,7 +23,7 @@ Run the SAME command on BOTH pods, e.g. from the workstation:
   ./multihost-scripts/k8s_launch.sh -j tpu-dev-pod-gcs-d -n grok-2-tpuv7 \
     'cd /cache/work/sglang-jax-workdir/sglang-torchtpu && \
      PYTHON=/cache/venv/bin/python HF_HUB_OFFLINE=1 \
-     /cache/venv/bin/python test/manual/tpu/multihost/test_feature_combos.py pd'
+     /cache/venv/bin/python test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
 
 Engines are launched through the canonical benchmark/tpu launchers
 (launch_prefill.sh / launch_decode.sh / launch_server.sh) so the TPU env

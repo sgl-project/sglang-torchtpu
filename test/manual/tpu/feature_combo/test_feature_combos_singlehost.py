@@ -2,11 +2,33 @@
 features (milestone combo track; multihost P/D lives in
 multihost/test_feature_combos.py, real-model nightly quad in
 test/registered/tpu/test_qwen3_moe_feature_combo_nightly.py).
+Current pass/fail matrix + failure signatures: COMBO_STATUS.md (same dir).
 
-Combos (each = the SAME max-coverage scenario suite under a richer config):
-  1  prefix caching + EAGLE3 spec + KV offloading          (tp=1)
-  2  prefix caching + DP attention + KV offloading         (tp=2 x dp=2)
-  3  prefix caching + DP attention + KV offloading + spec  (tp=2 x dp=2, quad)
+WHICH COMBINATIONS EXIST HERE — the interaction principle
+----------------------------------------------------------
+A combo earns a row only when its features can AFFECT EACH OTHER: they share
+mutable state (KV pools, radix indices), threads (reload workers vs forward
+dispatch), or collectives (DP gather). Combos whose interaction surface is
+structurally equivalent to an already-tested row are deduced, not run — e.g.
+SWA x KV-offload is not a row because SWA and MHA share the same pool/reload
+machinery (homogeneous); MHA x KV-offload passing certifies both, and a
+SWA-specific break would be a pool-wrapper unit bug, not a combination bug.
+Depth also does NOT live here: when a combo turns red, the diagnosed
+mechanism gets a dedicated fast unit test next to the mechanism (see
+TestTpuKvOffloadConcurrency in test_tpu_kv_offload.py for the pattern); this
+file stays a functional gate — few scenarios, correctness-asserted, ~2min.
+
+Combos (each = the SAME scenario suite; ALL rows run under torch.compile —
+the serving recipes ship compiled, so compiled is what gets certified.
+Default shape = the full v7x host, tp=8; dp is carved out of tp, so every
+combo uses the same 8 chips):
+  1     prefix caching + EAGLE3 spec + KV offloading        (tp=8)
+        interaction: draft KV piggybacks target slots; spec multiplies
+        forwards racing the reload worker.
+  1tp1  combo 1 single-chip smoke (fast bisection variant)
+  2     prefix caching + DP attention + KV offloading       (tp=8 x dp=2)
+        interaction: per-rank pools + idle-rank dummy batches vs reload/evict.
+  3     prefix caching + DP attention + KV offloading + spec (tp=8 x dp=2)
 
 Scenario suite (runs under every combo):
   * cold vs warm multi-page reuse (+ spec verify/accept on the cache-hit
@@ -15,6 +37,10 @@ Scenario suite (runs under every combo):
   * eviction -> HiCache host reload (churn past the device pool, then the
     prefix must come BACK: cached >= pages — plain radix would miss),
   * flush -> repopulate,
+  * concurrent churn wave: one batched submission mixing evicted-prefix
+    hits with fresh docs against the tight pool — mixed prefill/decode
+    batches, reload-while-others-decode, and retract/preemption pressure
+    (the paths sequential scenarios can never reach; cf. #152),
   * greedy determinism: cache-hit output bit-identical to cold output.
   DP configs prime every rank first (each DP rank has its own radix tree —
   a prefix cached on rank 0 is a miss on rank 1 until primed).
@@ -24,8 +50,8 @@ teardown/reinit), so each combo builds its engine in a fresh interpreter.
 Run one combo directly, or all three sequentially via subprocesses:
 
     SGLANG_PLATFORM=tpu HF_HUB_OFFLINE=1 \
-        python test/manual/tpu/test_feature_combos_singlehost.py 1
-    python test/manual/tpu/test_feature_combos_singlehost.py all   # 1 -> 2 -> 3
+        python test/manual/tpu/feature_combo/test_feature_combos_singlehost.py 1
+    python test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
 
 Known landmine scenario 3 is designed to step on if present: the plain
 torch_tpu HiCacheController load path writes device tensors into the
@@ -59,6 +85,12 @@ _BASE = dict(  # always on: prefix caching + KV offloading
     max_total_tokens=POOL,
     mem_fraction_static=0.4,
     skip_server_warmup=True,
+    # Policy: combos are tested ONLY under torch.compile — the serving
+    # recipes run compiled (cf. benchmark/tpu recipes), so the compiled
+    # path is the one that must be certified. (First run of this policy
+    # immediately caught silent reload corruption that eager hides — see
+    # COMBO_STATUS.md.)
+    enable_torch_compile=True,
 )
 _SPEC = dict(  # + EAGLE3 (spec-on-TPU recipe: overlap schedule off)
     speculative_algorithm="EAGLE3",
@@ -68,16 +100,21 @@ _SPEC = dict(  # + EAGLE3 (spec-on-TPU recipe: overlap schedule off)
     speculative_num_draft_tokens=4,
     disable_overlap_schedule=True,
 )
-_DP = dict(tp_size=2, dp_size=2, enable_dp_attention=True)  # + DP attention
+# DP attention at the serving shape: dp is CARVED OUT OF tp (devices = tp_size,
+# requirement tp % dp == 0; attn_tp = tp/dp) — so tp=8 x dp=2 uses the same 8
+# chips as combo 1. The idle-rank bug reproduces identically at every carving
+# (2026-07-15 sweep: tp2/dp2, tp4/dp2, tp8/dp2, tp8/dp4, tp8/dp8), so one
+# serving-shape row suffices.
+_DP = dict(tp_size=8, dp_size=2, enable_dp_attention=True)
 
 COMBOS = {
-    "1": dict(name="prefix+spec+kvoffload", engine={**_BASE, "tp_size": 1, **_SPEC}),
-    # Same combo at the full-host serving shape (v7x host = 8 devices):
-    # exercises spec + hicache under real TP sharding (per-rank KV pools,
-    # sharded draft) rather than the single-chip smoke config.
-    "1tp8": dict(
-        name="prefix+spec+kvoffload (tp=8)",
-        engine={**_BASE, "tp_size": 8, **_SPEC},
+    # Default = the full-host serving shape (v7x host = 8 devices): real TP
+    # sharding (per-rank KV pools, sharded draft), the shape that ships.
+    "1": dict(name="prefix+spec+kvoffload", engine={**_BASE, "tp_size": 8, **_SPEC}),
+    # Single-chip smoke variant: fast iteration when bisecting a red combo 1.
+    "1tp1": dict(
+        name="prefix+spec+kvoffload (tp=1 smoke)",
+        engine={**_BASE, "tp_size": 1, **_SPEC},
     ),
     "2": dict(name="prefix+dp+kvoffload", engine={**_BASE, **_DP}),
     "3": dict(name="prefix+dp+kvoffload+spec (quad)", engine={**_BASE, **_DP, **_SPEC}),
@@ -241,12 +278,65 @@ class TestFeatureCombo(unittest.TestCase):
         _, c2, _, _ = self._gen(COUNT_LONG)
         self.assertGreaterEqual(c2, 3 * PAGE_SIZE)
 
+    def test_5_concurrent_churn(self):
+        # Correct-under-load: every scenario above sends ONE request at a
+        # time, so the engine never sees mixed prefill+decode batches, a
+        # reload racing another request's decode, competing reloads of the
+        # same evicted prefix, or retract/preemption when the pool runs dry.
+        # That last path is a proven gap: #152's decode-retract crash was
+        # found by a concurrency bench, not by this suite. One batched wave
+        # against the tight pool covers all of it with the same oracle:
+        # every evicted-prefix hit must still equal the solo-run baseline.
+        ref = self._prime_all_ranks(COUNT_LONG)
+        for doc in CHURN:  # evict the primed prefix out of every device pool
+            self._gen(doc, max_new=1)
+
+        prompts, hot_idx = [], []
+        for _ in range(2 * self.dp_size):  # >= 2 hits per DP rank on average
+            prompts.extend(CHURN[:3])
+            hot_idx.append(len(prompts))
+            prompts.append(COUNT_LONG)
+        outs = self.engine.generate(
+            prompts,
+            [{"temperature": 0.0, "max_new_tokens": MAX_NEW}] * len(prompts),
+        )
+        self.assertEqual(len(outs), len(prompts))
+        # Only the correctness oracle: routing/timing decide whether a given
+        # hit reloads from host or recomputes, but greedy output must be
+        # bit-identical either way. Divergence = lost/garbled reload or a
+        # retract that corrupted KV.
+        for k, i in enumerate(hot_idx):
+            self.assertEqual(
+                outs[i]["text"],
+                ref,
+                f"concurrent wave: evicted-prefix hit #{k} diverged from baseline",
+            )
+
+    def test_6_host_overflow_recompute(self):
+        # Overflow BOTH tiers: churn far past the host pool (hicache_ratio x
+        # device pool) so the primed prefix can be evicted from device AND
+        # host. When no reload is possible the engine must recompute —
+        # correctly. Certifies the "offload gave the data back up" path.
+        # Deliberately no cached_tokens assertion: depending on write policy
+        # and LRU timing the prefix may still partially reload; the only
+        # invariant is that the output equals the baseline either way.
+        ref = self._prime_all_ranks(COUNT_LONG)
+        for _ in range(3):  # ~3x the churn that fills the device pool
+            for doc in CHURN:
+                self._gen(doc, max_new=1)
+        for k in range(2 * self.dp_size):
+            text, _, v, al = self._gen(COUNT_LONG)
+            self.assertEqual(
+                text, ref, f"repeat {k}: output after full-tier eviction diverged"
+            )
+            self._assert_spec(v, al, f"repeat {k} (post-overflow)")
+
 
 def _run_all():
     """Run each combo in a FRESH interpreter (TPU runtime re-init is fragile
     in-process), sequentially: 1 -> 2 -> 3. Fail fast per user preference for
     isolating which added feature broke."""
-    for combo in ("1", "1tp8", "2", "3"):
+    for combo in ("1", "1tp1", "2", "3"):
         print(f"\n{'#' * 60}\n# combo {combo}: {COMBOS[combo]['name']}\n{'#' * 60}")
         env = {**os.environ, "COMBO": combo}
         rc = subprocess.call([sys.executable, os.path.abspath(__file__)], env=env)
