@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 DEFAULT_TPU_COMPILE_MAX_BS = 64
 
 # Fields whose token dim gets padded to the token bucket.
-_TOKEN_FIELDS = ("input_ids", "positions")
+_TOKEN_FIELDS = ("input_ids", "positions", "out_cache_loc")
 
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
@@ -137,13 +137,6 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
     forward_batch.global_dp_buffer_len = pad_t * dp_size
     set_dp_buffer_len(pad_t * dp_size, pad_t, True, [pad_t] * dp_size)
 
-    # Pin is_prefill_only. An idle batch computes it as True (all() over zero
-    # requests) while real batches are False. The compiled forward reads this
-    # value, so it must be identical across all batches to avoid a serve-time
-    # recompile. Pinning False is safe because the flag only enables logprob
-    # capture and pooling, and TPU supports neither.
-    forward_batch.is_prefill_only = False
-
 
 def _dp_attn_compute_padding(
     forward_batch,
@@ -225,9 +218,27 @@ def _pad_forward_batch_inputs(
 ) -> tuple[int, int]:
     """Pad ForwardBatch tensors to next bucket shape and return original sizes."""
     if forward_batch.return_logprob:
-        raise NotImplementedError(
-            "return_logprob is not supported on the TPU backend yet."
-        )
+        # Output (next-token) logprobs are computed by the eager Sampler AFTER
+        # the compiled forward returns next_token_logits, so they don't affect
+        # the compiled graph's shapes. Only INPUT/prompt logprobs (echo) run
+        # inside the LogitsProcessor over dynamically-pruned states, which would
+        # break the static-shape compiled forward. Reject only that case.
+        needs_input_logprob = False
+        if (
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu or []
+            start_lens_cpu = forward_batch.extend_logprob_start_lens_cpu or []
+            for extend_len, start_len in zip(extend_seq_lens_cpu, start_lens_cpu):
+                if extend_len - start_len > 0:
+                    needs_input_logprob = True
+                    break
+        if needs_input_logprob:
+            raise NotImplementedError(
+                "input/prompt logprobs (echo) are not supported on the TPU "
+                "compiled backend yet; only output (next-token) logprobs are."
+            )
 
     is_decode = forward_batch.forward_mode.is_decode()
     real_q = forward_batch.input_ids.shape[0]
@@ -420,7 +431,20 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
-        out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
+        # Pin is_prefill_only for the compiled forward. An idle batch computes
+        # it as True (all() over zero requests) while real batches are False;
+        # the compiled forward reads the value, so it must be identical across
+        # all batches to avoid a serve-time recompile. The worker's sampling
+        # gate reads it after the forward — a prefill-only batch
+        # (max_new_tokens=0) has no sampling metadata to run the sampler
+        # with — so the original value is restored even if the forward
+        # raises.
+        orig_prefill_only = forward_batch.is_prefill_only
+        forward_batch.is_prefill_only = False
+        try:
+            out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
+        finally:
+            forward_batch.is_prefill_only = orig_prefill_only
         out = self.policy.unpad_outputs(out, forward_batch)
 
         # Check for serving-time XLA recompilation (once per forward call).

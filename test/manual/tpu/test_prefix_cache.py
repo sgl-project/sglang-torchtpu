@@ -34,7 +34,6 @@ Usage:
 import os
 import unittest
 
-MODEL = "Qwen/Qwen3-0.6B"
 PAGE_SIZE = 64
 MAX_NEW = 12
 POOL = 4096  # small KV pool so the same engine can be driven into eviction
@@ -89,12 +88,19 @@ def _gen(engine, prompt, n=MAX_NEW):
 
 
 def _gen_batch(engine, prompts, n=MAX_NEW):
-    outs = engine.generate(prompts, {"temperature": 0.0, "max_new_tokens": n})
+    # n: shared decode length, or a per-prompt list for heterogeneous batches.
+    ns = n if isinstance(n, list) else [n] * len(prompts)
+    outs = engine.generate(
+        prompts, [{"temperature": 0.0, "max_new_tokens": m} for m in ns]
+    )
     return [(o["text"], o["meta_info"].get("cached_tokens", 0)) for o in outs]
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuPrefixCache(unittest.TestCase):
+    MODEL = "Qwen/Qwen3-0.6B"
+    EXTRA_ENGINE_KWARGS = {}
+
     @classmethod
     def setUpClass(cls):
         os.environ["SGLANG_PLATFORM"] = "tpu"
@@ -102,7 +108,7 @@ class TestTpuPrefixCache(unittest.TestCase):
 
         from transformers import AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(MODEL)
+        tok = AutoTokenizer.from_pretrained(cls.MODEL)
         assert len(tok.encode(COUNT_LONG)) >= 3 * PAGE_SIZE, (
             f"COUNT_LONG tokenizes to fewer than {3 * PAGE_SIZE} tokens; "
             "test_1 and test_5 assertions will always fail"
@@ -115,7 +121,7 @@ class TestTpuPrefixCache(unittest.TestCase):
         import sglang as sgl
 
         cls.engine = sgl.Engine(
-            model_path=MODEL,
+            model_path=cls.MODEL,
             device="tpu",
             tp_size=1,
             dtype="bfloat16",
@@ -124,6 +130,7 @@ class TestTpuPrefixCache(unittest.TestCase):
             mem_fraction_static=0.4,
             max_total_tokens=POOL,
             skip_server_warmup=True,
+            **cls.EXTRA_ENGINE_KWARGS,
         )
 
     @classmethod
@@ -198,6 +205,158 @@ class TestTpuPrefixCache(unittest.TestCase):
         out2, c2 = _gen(self.engine, COUNT_LONG)
         self.assertLess(c2, PAGE_SIZE, "expected COUNT_LONG to be evicted (cache miss)")
         self.assertEqual(out1, out2, "output changed after eviction (pool corruption)")
+
+
+COUNT_EXT = _count_prompt(150)
+
+SHORT_PREFIX = _count_prompt(30)
+SUF_A = " What single number comes next? Answer:"
+SUF_B = " List the next three numbers. Answer:"
+
+SWA_RATIO = 0.5  # swa pool = POOL * ratio; makes SWA the binding pool (test_10)
+# ~1924 tokens: overflows the 2048-token SWA pool (after COUNT_LONG is cached)
+# while the 4096-token full pool stays ~50% used -> SWA-only eviction pressure.
+BIG_DOC = "Article 99. " + ", ".join(str(90000 + j) for j in range(480)) + "."
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
+class TestTpuSwaPrefixCache(TestTpuPrefixCache):
+    """Prefix-cache correctness on a hybrid-SWA model (gpt-oss-20b, window=128).
+
+    Runs every scenario of :class:`TestTpuPrefixCache` against ``SWARadixCache``
+    + the two-pool ``SWAKVPool`` (alternating sliding/full layers), then adds
+    window-boundary, window-slide (tombstone), SWA-pool-eviction, and a
+    concurrent slide/evict-while-locked scenario.
+    Runs with ``swa_full_tokens_ratio=0.5`` so the SWA pool (2048 tok) is the
+    binding constraint, as in production.
+
+    Usage (single class):
+        SGLANG_PLATFORM=tpu TPU_VISIBLE_CHIPS=0 \
+            python test/manual/tpu/test_prefix_cache.py TestTpuSwaPrefixCache
+    """
+
+    MODEL = "openai/gpt-oss-20b"
+    EXTRA_ENGINE_KWARGS = {"swa_full_tokens_ratio": SWA_RATIO}
+
+    @classmethod
+    def setUpClass(cls):
+        from transformers import AutoConfig, AutoTokenizer
+
+        cfg = AutoConfig.from_pretrained(cls.MODEL)
+        cls.window = getattr(cfg, "sliding_window", None)
+        assert cls.window and cls.window >= 2 * PAGE_SIZE, (
+            f"expected a sliding window of >= 2 pages, got {cls.window}; "
+            "the window-boundary assertions below assume it"
+        )
+        # Decode length that provably slides the window past any prompt:
+        # decode-time eviction fires every `interval` (= window) tokens with a
+        # window+page margin, so LONG_NEW >= interval + window + 2*page suffices.
+        cls.LONG_NEW = 3 * cls.window + PAGE_SIZE
+
+        # BIG_DOC must overflow the SWA pool even after decode-time
+        # self-eviction, yet fit in it alone (with room to decode).
+        swa_pool = int(POOL * SWA_RATIO)
+        n_big = len(AutoTokenizer.from_pretrained(cls.MODEL).encode(BIG_DOC))
+        assert (
+            swa_pool - cls.window - PAGE_SIZE < n_big <= swa_pool - PAGE_SIZE - MAX_NEW
+        ), (
+            f"BIG_DOC tokenizes to {n_big}; test_10 needs it in "
+            f"({swa_pool - cls.window - PAGE_SIZE}, {swa_pool - PAGE_SIZE - MAX_NEW}]"
+        )
+        super().setUpClass()
+
+    # (6) Extend from a cached prefix that exceeds the SWA window: the reused --
+    #     prefix's SWA KV is only valid for the tail window, and the extension
+    #     allocates with prefix_lens > 0 (full->swa last_loc translation).
+    def test_6_swa_extend_from_cached_prefix(self):
+        cold_ext, c0 = _gen(self.engine, COUNT_EXT)
+        self.assertEqual(c0, 0, "cold run after flush must not hit cache")
+        self.engine.flush_cache()
+        _gen(self.engine, COUNT_LONG)  # prime: caches a prefix > window
+        warm_ext, c1 = _gen(self.engine, COUNT_EXT)
+        self.assertGreaterEqual(
+            c1, self.window, "extension did not reuse a beyond-window prefix"
+        )
+        self.assertEqual(
+            warm_ext, cold_ext, "extending from a cached SWA prefix changed output"
+        )
+
+    # (7) Shared prefix shorter than the window: all of its SWA KV must be ----
+    #     in-window on reuse, and the result must not depend on the primer.
+    def test_7_swa_subwindow_shared_prefix(self):
+        target = SHORT_PREFIX + SUF_B
+        cold, c0 = _gen(self.engine, target)
+        self.assertEqual(c0, 0, "cold run after flush must not hit cache")
+        self.engine.flush_cache()
+        _gen(self.engine, SHORT_PREFIX + SUF_A)  # primer writes the prefix
+        warm, c1 = _gen(self.engine, target)
+        self.assertGreaterEqual(
+            c1, PAGE_SIZE, "target did not reuse the sub-window shared prefix"
+        )
+        self.assertEqual(warm, cold, "sub-window cached prefix KV depends on primer")
+
+    # (8) Decode past the window: the prompt's SWA KV is tombstoned mid-decode.
+    #     A re-query must NOT reuse the tombstoned prefix (match-past-tombstone
+    #     gate) and must recompute bit-identically (no corruption from free_swa).
+    def test_8_swa_window_slide_long_decode(self):
+        out1, _ = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        self.assertTrue(out1, "long decode returned empty")
+        out2, c2 = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        self.assertLess(c2, PAGE_SIZE, "reused a tombstoned (window-slid) prefix")
+        self.assertEqual(out2, out1, "recompute after window slide changed output")
+
+    # (9) Match past a tombstone: the cached sequence is tombstoned-head +
+    #     live tail >= window, so extending it MAY reuse across the tombstone
+    #     and must equal a cold full recompute.
+    def test_9_swa_match_past_tombstone(self):
+        out1, _ = _gen(self.engine, COUNT_LONG, n=self.LONG_NEW)
+        ext = COUNT_LONG + out1
+        warm, cw = _gen(self.engine, ext)
+        self.engine.flush_cache()
+        cold, c0 = _gen(self.engine, ext)
+        self.assertEqual(c0, 0, "cold run after flush must not hit cache")
+        self.assertGreaterEqual(
+            cw, self.window, "extension did not reuse across the tombstone"
+        )
+        self.assertEqual(warm, cold, "reuse across a tombstone changed output")
+
+    # (10) SWA-pool-bound eviction: BIG_DOC overflows only the SWA pool, so ---
+    #      swa-LRU eviction (not full-pool eviction) must reclaim COUNT_LONG;
+    #      the requery must miss and recompute identically.
+    def test_10_swa_pool_bound_eviction(self):
+        out1, _ = _gen(self.engine, COUNT_LONG)
+        txt, _ = _gen(self.engine, BIG_DOC)
+        self.assertTrue(txt, "SWA-pool-overflow request returned empty")
+        out2, c2 = _gen(self.engine, COUNT_LONG)
+        self.assertLess(c2, PAGE_SIZE, "expected SWA-pool eviction of COUNT_LONG")
+        self.assertEqual(out2, out1, "output changed after SWA-pool eviction")
+
+    # (11) Concurrency: three sharers of the primed prefix decode past the ----
+    #      window in ONE in-flight batch
+    def test_11_swa_concurrent_slide_evict_locked_prefix(self):
+        extend = _count_prompt(180)  # shares COUNT_LONG's prefix, longer tail
+        prompts = [COUNT_LONG, COUNT_EXT, extend] + CHURN[:3]
+        news = [self.LONG_NEW] * 3 + [MAX_NEW] * 3
+
+        refs = []
+        for p, n in zip(prompts, news):
+            self.engine.flush_cache()
+            refs.append(_gen(self.engine, p, n=n)[0])
+
+        self.engine.flush_cache()
+        _gen(self.engine, COUNT_LONG)  # prime the shared prefix into the tree
+        outs = _gen_batch(self.engine, prompts, n=news)
+        texts = [t for t, _ in outs]
+        cached = [c for _, c in outs]
+
+        self.assertTrue(all(texts), "a concurrent request returned empty")
+        for i in range(3):
+            self.assertGreaterEqual(
+                cached[i], self.window, f"sharer {i} did not reuse the primed prefix"
+            )
+        self.assertEqual(
+            texts, refs, "concurrent window-slide/eviction changed request outputs"
+        )
 
 
 if __name__ == "__main__":

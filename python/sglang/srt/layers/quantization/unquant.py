@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_moe_expert_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -754,9 +755,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
-        topk_weights = topk_weights.to(x.dtype)
         topk_ids = topk_ids.to(torch.int32)
-        topk_weights, topk_ids = mask_tpu_moe_non_local_experts(topk_weights, topk_ids)
+        if moe_runner_config.num_fused_shared_experts:
+            raise NotImplementedError(
+                "Fused shared experts are not supported on the TPU MoE path."
+            )
+        no_combine = moe_runner_config.no_combine
+        # The kernel gets the EP-masked weights (non-local slots -> 0) so it can
+        # zero those slots in the no_combine output; the combine downstream uses
+        # the original unmasked router weights (from dispatch_output).
+        kernel_topk_weights = topk_weights.to(x.dtype)
+        kernel_topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
+            kernel_topk_weights,
+            topk_ids,
+            layer.num_local_experts,
+            get_moe_expert_parallel_rank(),
+        )
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
         # from SGLang's (num_experts, n, k) happens once in
@@ -770,10 +784,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             w2=layer.w2_weight,
             w1_bias=getattr(layer, "w13_weight_bias", None),
             w2_bias=getattr(layer, "w2_weight_bias", None),
-            topk_weights=topk_weights,
+            topk_weights=kernel_topk_weights,
             topk_ids=topk_ids,
             topk=int(topk_ids.shape[-1]),
             activation=moe_runner_config.activation,
+            no_combine=no_combine,
         )
         return StandardCombineInput(hidden_states=output)
 

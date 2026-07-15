@@ -33,9 +33,11 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils.common import (
     get_bool_env_var,
     is_hip,
+    is_tpu,
 )
 
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if TYPE_CHECKING:
@@ -95,11 +97,16 @@ class StandardDispatcher(BaseDispatcher):
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
+        # - the TPU runner takes global IDs and translates/masks them itself
+        #   (mask_tpu_moe_non_local_experts); keeping the mapping out of the
+        #   dispatcher also keeps lazily-created module state out of the
+        #   compiled graph, whose guards precompiled TPU programs depend on
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
             or backend.is_flashinfer_trtllm_routed()
             or self.enable_flashinfer_mxfp4_moe
+            or _is_tpu
         )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts

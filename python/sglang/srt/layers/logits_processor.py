@@ -440,7 +440,24 @@ class LogitsProcessor(nn.Module):
         ):
             # Prefill without input logprobs.
             if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                if _is_tpu:
+                    # Set dtype to int32 rather than cumsum's default int64.
+                    # 32-bit integers are TPU native while s64 requires
+                    # emulation, and its buggy lowering can run into
+                    # "Unsupported conversion from vmreg/vreg to U64". int32
+                    # is plenty for per-batch token counts.
+                    last_index = (
+                        torch.cumsum(
+                            logits_metadata.extend_seq_lens,
+                            dim=0,
+                            dtype=torch.int32,
+                        )
+                        - 1
+                    )
+                else:
+                    last_index = (
+                        torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                    )
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]

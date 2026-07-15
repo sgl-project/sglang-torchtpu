@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Shared static environment for sglang torch_tpu serving. Sourced by
+# launch_server.sh, so every recipe/benchmark that calls it gets the same env.
+# Only *static* exports that are identical across launches live here; per-launch
+# / per-model config (MODEL, TP_SIZE, CONTEXT_LEN, MEM_FRACTION_STATIC, ...) stays
+# in launch_server.sh and the recipe launch scripts. Override any var by
+# exporting it before launch.
+#
+
+# Interpreter with torch_tpu + sglang (editable) installed. Point at a venv if
+# not on PATH, e.g. PYTHON=/path/to/.venv/bin/python.
+export PYTHON=${PYTHON:-python3}
+
+# Out-of-tree TPU platform plugin.
+export SGLANG_PLATFORM=${SGLANG_PLATFORM:-tpu}
+
+# HF cache: generic defaults (standard cache, online download). Hosts that keep
+# weights on a local/GCS mount and run offline export HF_HOME + HF_HUB_OFFLINE=1
+# + TRANSFORMERS_OFFLINE=1 themselves.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
+
+# sglang / TPU serving knobs.
+export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=${SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION:-0}
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=${SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN:-1}
+# Per-phase scheduler/worker timing dumps every ~5 s (cheap).
+export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
+export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
+
+# torch.compile logging: +recompiles surfaces recompilation churn cheaply. Avoid
+# +dynamo / +output_code / +guards — they stream per-bytecode tracing logs and
+# turn a ~minute compile into 10+ minutes plus a multi-GB log file.
+export TORCH_LOGS=${TORCH_LOGS:-+recompiles}
+
+# XLA / libtpu tuning for TP/EP TPU serving. Latency-hiding scheduler + async
+# collective fusion keep collectives off the matmul critical path; the post-SPMD
+# collective-matmul modes and the four SparseCore-offload=false flags are the
+# DP-attention hardening set (avoid TP correctness issues / SparseCore halts).
+# Overriding this string invalidates the compile cache.
+export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_scoped_vmem_limit_kib=65536 \
+--xla_tpu_enable_async_collective_fusion=true \
+--xla_tpu_overlap_compute_collective_tc=true \
+--xla_tpu_enable_async_collective_fusion_multiple_steps=true \
+--xla_tpu_enable_latency_hiding_scheduler=true \
+--xla_latency_hiding_scheduler_rerun=10 \
+--xla_tpu_all_gather_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd_conservative \
+--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false \
+--xla_tpu_offload_gather_to_sparsecore=false \
+--xla_tpu_enable_sparse_core_collective_offload_all_gather=false \
+--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false"}

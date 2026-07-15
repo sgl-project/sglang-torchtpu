@@ -523,7 +523,11 @@ class ModelRunnerKVCacheMixin:
                 # match (e.g. GPT-OSS) this is a no-op.
                 swa_head_num = max(
                     1,
-                    self.model_config.hf_text_config.swa_num_key_value_heads
+                    getattr(
+                        self.model_config.hf_text_config,
+                        "swa_num_key_value_heads",
+                        self.model_config.hf_text_config.num_key_value_heads,
+                    )
                     // get_attention_tp_size(),
                 )
                 self.token_to_kv_pool = SWAKVPool(
