@@ -287,35 +287,62 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # don't H2D it per step, and don't need the barrier that ensured the RPA
         # kernel launched only after that H2D finished.
         device = forward_batch.seq_lens.device
-        real_bs = self._real_batch_size(forward_batch)
+        non_empty_bs = self._non_empty_batch_size(forward_batch)
         is_decode = forward_batch.forward_mode.is_decode()
-        distribution = self._get_cached_rpa_distribution(is_decode, real_bs, device)
+        distribution = self._get_cached_rpa_distribution(
+            is_decode, non_empty_bs, device
+        )
         self.forward_metadata = self._build_metadata(forward_batch, distribution)
 
     @staticmethod
-    def _real_batch_size(forward_batch: ForwardBatch) -> int:
+    def _pre_bucket_padded_batch_size(forward_batch: ForwardBatch) -> int:
+        """Scheduler row count before compile-bucket padding. Includes the
+        zero-length rows the DP MLP sync appends, so it is not the
+        token-carrying count (see _non_empty_batch_size)."""
         return int(
             getattr(forward_batch, "_tpu_real_b", forward_batch.seq_lens.shape[0])
         )
 
+    def _non_empty_batch_size(self, forward_batch: ForwardBatch) -> int:
+        """Token-carrying row count fed to the RPA distribution. A zero-length
+        row marked active makes the kernel attend an empty KV range and stall,
+        so clip the padded count to the live prefix (DP sync zero-pads the
+        tail). Prefers seq_lens_cpu, falls back to device seq_lens, never the
+        padded count; interior zeros raise rather than hang."""
+        bs = self._pre_bucket_padded_batch_size(forward_batch)
+        if bs == 0:
+            return bs
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        seq_lens = seq_lens_cpu if seq_lens_cpu is not None else forward_batch.seq_lens
+        live = int(torch.count_nonzero(seq_lens[:bs]).item())
+        if live == bs:
+            return bs
+        if torch.any(seq_lens[:live] == 0):
+            raise ValueError(
+                "RPA active-row clip: zero-length rows are not tail-contiguous "
+                f"(live={live}, batch={bs}); batch layout violates the DP "
+                "sync-padding invariant."
+            )
+        return live
+
     def _get_cached_rpa_distribution(
-        self, is_decode: bool, real_bs: int, device
+        self, is_decode: bool, non_empty_bs: int, device
     ) -> torch.Tensor:
-        """Cached RPA ``distribution`` on TPU for (is_decode, real_bs, device)."""
+        """Cached RPA ``distribution`` on TPU for (is_decode, non_empty_bs, device)."""
         device = torch.device(device)
-        key = (is_decode, real_bs, device)
+        key = (is_decode, non_empty_bs, device)
         cached = self._distribution_cache.get(key)
         if cached is not None:
             return cached
 
-        dist = self._make_rpa_distribution_cpu(is_decode, real_bs).to(device)
+        dist = self._make_rpa_distribution_cpu(is_decode, non_empty_bs).to(device)
         dist.tolist()  # one-time blocking sync: wait until the H2D completes
         self._distribution_cache[key] = dist
         return dist
 
     @staticmethod
-    def _make_rpa_distribution_cpu(is_decode: bool, real_bs: int) -> torch.Tensor:
-        num_active = torch.tensor(real_bs, dtype=torch.int32)
+    def _make_rpa_distribution_cpu(is_decode: bool, non_empty_bs: int) -> torch.Tensor:
+        num_active = torch.tensor(non_empty_bs, dtype=torch.int32)
         if is_decode:
             return num_active.repeat(3)
         zero = torch.zeros((), dtype=torch.int32)

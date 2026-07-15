@@ -38,6 +38,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    attn_rank0_scale,
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
@@ -77,9 +79,11 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_tpu,
 )
 
 _is_cuda = is_cuda()
+_is_tpu = is_tpu()
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
@@ -426,6 +430,19 @@ def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
 
 
+def _tpu_hybrid_reduce_scatter_unsupported() -> bool:
+    """True on hybrid DP attention on TPU (attention-TP group > 1 rank, i.e.
+    tp_size > dp_size); plain TP never reaches the gated paths.
+
+    dp_reduce_scatter_tensor scatters over the full TP group with output
+    sized input_rows // tp_size, so it needs input_rows divisible by tp_size.
+    Small/idle decode buckets (e.g. 2 rows over 8 ranks) aren't, so route
+    through all-reduce + dp_scatter instead. should_use_reduce_scatter and
+    _scatter_hidden_states must agree on this.
+    """
+    return _is_tpu and is_dp_attention_enabled() and get_attention_tp_size() > 1
+
+
 class LayerCommunicator:
     def __init__(
         self,
@@ -701,13 +718,18 @@ class LayerCommunicator:
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
+        if _tpu_hybrid_reduce_scatter_unsupported():
+            return False
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
             if should_use_dp_reduce_scatterv():
                 return True
-            if forward_batch.dp_padding_mode.is_max_len():
+            # TODO: revert to dp_padding_mode.is_max_len() once the torch
+            # pin is >= 2.14; the pinned torch's dynamo cannot trace methods
+            # of enums computed inside the graph (fixed upstream).
+            if forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN:
                 return True
         if nsa_use_prefill_cp(forward_batch):
             return True
@@ -982,6 +1004,17 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     disabled=not is_allocation_symmetric(),
                 ):
                     hidden_states, residual = layernorm(hidden_states, residual)
+            elif _is_tpu:
+                # Rank-uniform form of the `attn_tp_rank == 0` residual add
+                # below: a rank conditional traces divergent graphs and drops
+                # the upstream collective on ranks whose graph lacks the
+                # consumer. The 0/1 scale keeps every graph identical while
+                # only rank 0 adds the residual.
+                # TODO: remove once torch_tpu keeps rank-divergent in-graph
+                # collectives; revert to `elif context.attn_tp_rank == 0`.
+                hidden_states = hidden_states + residual * attn_rank0_scale(
+                    hidden_states
+                )
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
@@ -1228,7 +1261,14 @@ class CommunicateSummableTensorPairFn:
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),
             )
-        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
+        elif (
+            allow_reduce_scatter
+            # TODO: revert to dp_padding_mode.is_max_len() once the torch
+            # pin is >= 2.14; the pinned torch's dynamo cannot trace methods
+            # of enums computed inside the graph (fixed upstream).
+            and forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN
+            and not _tpu_hybrid_reduce_scatter_unsupported()
+        ):
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)

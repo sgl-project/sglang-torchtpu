@@ -308,7 +308,12 @@ class TestCompiledForwardShim(CustomTestCase):
             )
         )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -318,7 +323,12 @@ class TestCompiledForwardShim(CustomTestCase):
     def test_passes_args_through(self):
         compiled = MagicMock(return_value=SimpleNamespace())
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
 
@@ -338,7 +348,12 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim("ids", "pos", fb, pp_proxy_tensors=None)
         compiled.assert_called_once_with("ids", "pos", fb)
 
@@ -349,7 +364,12 @@ class TestCompiledForwardShim(CustomTestCase):
         compiled = MagicMock(return_value=SimpleNamespace())
         compiled.__signature__ = inspect.signature(forward)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
 
@@ -362,7 +382,7 @@ class TestCompiledForwardShim(CustomTestCase):
         shim = CompiledForwardShim(
             MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
         )
-        out = shim(None, None, SimpleNamespace())
+        out = shim(None, None, SimpleNamespace(is_prefill_only=False))
         self.assertIs(out, out_obj)
 
     def test_no_op_when_already_at_real_shape(self):
@@ -374,7 +394,12 @@ class TestCompiledForwardShim(CustomTestCase):
         shim = CompiledForwardShim(
             MagicMock(return_value=out_obj), policy=DecoderTpuCompilePolicy()
         )
-        fb = SimpleNamespace(_tpu_real_q=4, _tpu_real_b=2)
+        fb = SimpleNamespace(
+            _tpu_real_q=4,
+            _tpu_real_b=2,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         out = shim(None, None, fb)
         self.assertEqual(out.next_token_logits.shape, (2, 10))
         self.assertEqual(out.hidden_states.shape, (4, 5))
@@ -387,18 +412,40 @@ class TestCompiledForwardShim(CustomTestCase):
             return_value=SimpleNamespace(next_token_logits=torch.zeros(4, 10))
         )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
-        fb = SimpleNamespace(_tpu_real_q=8, _tpu_real_b=2, batch_size=4)
+        fb = SimpleNamespace(
+            _tpu_real_q=8,
+            _tpu_real_b=2,
+            batch_size=4,
+            is_prefill_only=False,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 2)
 
     def test_does_not_touch_batch_size_when_real_keys_missing(self):
         # forward_idle / split_prefill skip the pad hook, so the slicer
         # must not mutate batch_size in that case.
-        fb = SimpleNamespace(batch_size=4)
+        fb = SimpleNamespace(batch_size=4, is_prefill_only=False)
         compiled = MagicMock(return_value=SimpleNamespace())
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         shim(None, None, fb)
         self.assertEqual(fb.batch_size, 4)
+
+    def test_pins_is_prefill_only_for_compiled_call_and_restores(self):
+        # The compiled graph must see a batch-invariant is_prefill_only
+        # (pinned False); the worker's sampling gate reads the true value
+        # after the forward, so it is restored.
+        seen = {}
+
+        def compiled(input_ids, positions, forward_batch):
+            seen["during"] = forward_batch.is_prefill_only
+            return SimpleNamespace()
+
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = SimpleNamespace(batch_size=0, is_prefill_only=True)
+        shim(None, None, fb)
+        self.assertIs(seen["during"], False)
+        self.assertIs(fb.is_prefill_only, True)
 
 
 class TestBuildBucketers(CustomTestCase):
@@ -617,12 +664,13 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
         self.assertEqual(fb.global_num_tokens_gpu.dtype, torch.int64)
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [16, 16])
 
-    def test_pins_is_prefill_only_false(self):
-        # An idle batch computes is_prefill_only=True. Pinning False keeps the
-        # guarded flag stable so the compiled logits processor never recompiles.
+    def test_does_not_mutate_is_prefill_only(self):
+        # The is_prefill_only pin lives in CompiledForwardShim.__call__ (pinned
+        # False for the compiled call, restored after); applying bucket
+        # metadata must leave the worker-visible flag untouched.
         fb = self._fb()
         _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
-        self.assertIs(fb.is_prefill_only, False)
+        self.assertIs(fb.is_prefill_only, True)
 
     def test_clears_cached_local_offsets(self):
         fb = self._fb()

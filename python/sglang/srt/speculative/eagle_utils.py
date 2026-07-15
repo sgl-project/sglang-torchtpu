@@ -309,3 +309,194 @@ def verify_tree_greedy_func(
             topk,
         )
     return predicts, accept_index, accept_token_num
+
+
+def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    """Keep the top-k probabilities per row and renormalize (torch fallback)."""
+    vocab = probs.shape[-1]
+    ks = top_ks.clamp(min=1, max=vocab).to(torch.long).reshape(-1, 1)
+    sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+    kth = sorted_probs.gather(-1, ks - 1)  # k-th largest prob per row
+    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _top_p_renorm_prob_torch(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    """Keep the nucleus (top-p) per row and renormalize (torch fallback)."""
+    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    ps = top_ps.to(probs.dtype).reshape(-1, 1)
+    # Keep a token if the prefix mass *before* it is still below p (so the token
+    # that crosses the threshold is included).
+    keep_sorted = (cumsum - sorted_probs) < ps
+    keep = torch.zeros_like(probs, dtype=torch.bool)
+    keep.scatter_(-1, sorted_idx, keep_sorted)
+    kept = torch.where(keep, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def top_k_renorm_prob_func(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    need_top_k_sampling: bool = True,
+) -> torch.Tensor:
+    if _use_torch_native:
+        if not need_top_k_sampling:
+            return probs
+        return _top_k_renorm_prob_torch(probs, top_ks)
+    from sgl_kernel import top_k_renorm_prob
+
+    return top_k_renorm_prob(probs, top_ks)
+
+
+def top_p_renorm_prob_func(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    if _use_torch_native:
+        return _top_p_renorm_prob_torch(probs, top_ps)
+    from sgl_kernel import top_p_renorm_prob
+
+    return top_p_renorm_prob(probs, top_ps)
+
+
+def _tree_speculative_sampling_target_only_torch(
+    predicts: torch.Tensor,  # mutable, flat [bs * num_draft_tokens]
+    accept_index: torch.Tensor,  # mutable, [bs, num_draft_tokens]
+    accept_token_num: torch.Tensor,  # mutable, [bs]
+    candidates: torch.Tensor,  # [bs, num_draft_tokens]
+    retrive_index: torch.Tensor,  # [bs, num_draft_tokens] (global flat positions)
+    uniform_samples: torch.Tensor,  # [bs, num_draft_tokens]
+    uniform_samples_for_final_sampling: torch.Tensor,  # [bs]
+    target_probs: torch.Tensor,  # [bs, num_draft_tokens, vocab]
+    draft_probs: torch.Tensor,  # mutable, [bs, num_draft_tokens, vocab]
+    threshold_single: float,
+    threshold_acc: float,
+    topk: int,
+):
+    """TPU torch port of ``tree_speculative_sampling_target_only`` for topk=1.
+
+    For topk=1 the draft tree is a chain, so this is sequential rejection
+    sampling along the chain, followed by an inverse-CDF sample of the bonus/corrected
+    token from the renormalized residual.
+    """
+    assert topk == 1, (
+        "TPU tree speculative sampling currently supports topk=1 only, "
+        f"got topk={topk}."
+    )
+    threshold_acc = max(float(threshold_acc), 1e-9)
+    bs, num_draft = candidates.shape
+    device = candidates.device
+    ar = torch.arange(bs, device=device)
+    cand = candidates.to(torch.long)
+
+    coin = uniform_samples[:, 0].to(target_probs.dtype).clone()
+    num_acc = torch.zeros(bs, dtype=torch.long, device=device)
+    active = torch.ones(bs, dtype=torch.bool, device=device)
+    has_rejected = torch.zeros(bs, dtype=torch.bool, device=device)
+    rejected_token = torch.zeros(bs, dtype=torch.long, device=device)
+    out_tokens = torch.zeros(bs, num_draft, dtype=predicts.dtype, device=device)
+
+    for j in range(1, num_draft):
+        cur_pos = num_acc  # parent position whose target row gates candidate j
+        tok_j = cand[:, j]
+        tp = target_probs[ar, cur_pos, tok_j]
+        accept_cond = (coin <= tp / threshold_acc) | (tp >= threshold_single)
+        accept_now = active & accept_cond
+        reject_now = active & ~accept_cond
+
+        # Write the accepted draft token at column num_acc (pre-increment).
+        write_col = torch.where(accept_now, num_acc, torch.zeros_like(num_acc))
+        out_tokens[ar, write_col] = torch.where(
+            accept_now, tok_j.to(predicts.dtype), out_tokens[ar, write_col]
+        )
+        rejected_token = torch.where(reject_now, tok_j, rejected_token)
+        has_rejected = has_rejected | reject_now
+
+        num_acc = num_acc + accept_now.long()
+        coin = torch.where(accept_now, uniform_samples[ar, j].to(coin.dtype), coin)
+        active = active & ~reject_now
+
+    # Bonus / corrected token: sample from the renormalized residual of the
+    # last accepted position's target row.
+    cur_pos = num_acc
+    target_row = target_probs[ar, cur_pos].to(torch.float32)
+    vocab_idx = torch.arange(target_row.shape[-1], device=device).view(1, -1)
+    rejected_mask = has_rejected.view(bs, 1) & (vocab_idx == rejected_token.view(bs, 1))
+    resid = torch.where(rejected_mask, torch.zeros_like(target_row), target_row)
+    resid_sum = resid.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    u = uniform_samples_for_final_sampling.to(torch.float32) * resid_sum.squeeze(-1)
+    cdf = torch.cumsum(resid, dim=-1)
+    bonus_id = (cdf < u.unsqueeze(-1)).sum(dim=-1).clamp_(max=resid.shape[-1] - 1)
+    out_tokens[ar, num_acc] = bonus_id.to(predicts.dtype)
+
+    # Scatter results: predicts[retrive_index[bx, k]] = out_tokens[bx, k] for
+    # the num_acc+1 valid columns; accept_index marks them, rest = -1.
+    col = torch.arange(num_draft, device=device)
+    valid = col.unsqueeze(0) <= num_acc.unsqueeze(1)  # [bs, num_draft]
+    idx = retrive_index.to(torch.long)
+    # Static-shape scatter: boolean-mask indexing (predicts[idx[valid]] = ...)
+    # lowers to nonzero() on TPU (data-dependent shape -> D2H sync/OOM), so scatter
+    # all positions with an index tensor and keep the prior value where not accepted.
+    # Safe for topk=1, whose retrieve chain has no -1 padding or duplicate targets.
+    flat_idx = idx.reshape(-1)
+    flat_valid = valid.reshape(-1)
+    flat_val = out_tokens.reshape(-1).to(predicts.dtype)
+    predicts[flat_idx] = torch.where(flat_valid, flat_val, predicts[flat_idx])
+    accept_index[:bs] = torch.where(
+        valid,
+        retrive_index.to(accept_index.dtype),
+        torch.tensor(-1, dtype=accept_index.dtype, device=device),
+    )
+    accept_token_num[:bs] = num_acc.to(accept_token_num.dtype)
+
+
+def tree_speculative_sampling_target_only_func(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    threshold_single: float = 1.0,
+    threshold_acc: float = 1.0,
+    deterministic: bool = True,
+    topk: int = 1,
+):
+    """Dispatch to the torch port (TPU, topk=1) or the sgl_kernel op."""
+    if _use_torch_native:
+        _tree_speculative_sampling_target_only_torch(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            retrive_index=retrive_index,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            topk=topk,
+        )
+        return
+    from sgl_kernel import tree_speculative_sampling_target_only
+
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=deterministic,
+    )
