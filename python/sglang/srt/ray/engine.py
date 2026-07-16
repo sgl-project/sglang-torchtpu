@@ -166,6 +166,7 @@ class RayEngine(Engine):
                 _forwarded_driver_env,
                 detect_tpu_nnodes,
                 discover_tpu_worker_hostnames,
+                redact_env_for_log,
             )
 
             if not ray.is_initialized():
@@ -181,7 +182,7 @@ class RayEngine(Engine):
                     "Ray TPU: forwarding %d driver env var(s) to scheduler actors "
                     "via runtime_env: %s",
                     len(forwarded_env),
-                    ", ".join(f"{k}={v}" for k, v in sorted(forwarded_env.items())),
+                    redact_env_for_log(forwarded_env),
                 )
 
             # Detect nnodes if not specified. This is needed for TPU multihost.

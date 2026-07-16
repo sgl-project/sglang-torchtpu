@@ -39,6 +39,7 @@ from sglang.srt.hardware_backend.tpu.patches import compute_single_host_tpu_env
 from sglang.srt.hardware_backend.tpu.ray_utils import (
     _forwarded_driver_env,
     _resolve_bundle_order_from_probes,
+    redact_env_for_log,
     tpu_actor_runtime_env,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -397,6 +398,50 @@ class TestDetectTpuNnodes(CustomTestCase):
             ray_utils.ray, "nodes", side_effect=RuntimeError("boom")
         ):
             self.assertEqual(ray_utils.detect_tpu_nnodes(), 0)
+
+
+class TestRedactEnvForLog(CustomTestCase):
+    """The forwarded set includes secrets (e.g. HF_TOKEN, forwarded so the actor can
+    auth to the Hub). redact_env_for_log masks their values so they never land in the
+    driver log, while still showing that the var is being forwarded.
+    """
+
+    def test_masks_secret_values(self):
+        env = {
+            "HF_TOKEN": "hf_supersecret",
+            "AWS_SECRET_ACCESS_KEY": "abc123",
+            "MY_API_KEY": "k",
+            "DB_PASSWORD": "pw",
+        }
+        out = redact_env_for_log(env)
+        # Names still present, values gone.
+        self.assertNotIn("hf_supersecret", out)
+        self.assertNotIn("abc123", out)
+        self.assertNotIn("pw", out)
+        self.assertIn("HF_TOKEN=***", out)
+        self.assertIn("AWS_SECRET_ACCESS_KEY=***", out)
+        self.assertIn("MY_API_KEY=***", out)
+        self.assertIn("DB_PASSWORD=***", out)
+
+    def test_keeps_non_secret_values(self):
+        env = {
+            "SGLANG_PLATFORM": "tpu",
+            "LIBTPU_INIT_ARGS": "--xla_tpu_scoped_vmem_limit_kib=65536",
+        }
+        out = redact_env_for_log(env)
+        self.assertIn("SGLANG_PLATFORM=tpu", out)
+        self.assertIn("LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=65536", out)
+        self.assertNotIn("***", out)
+
+    def test_sorted_and_mixed(self):
+        env = {"TORCH_LOGS": "+recompiles", "HF_TOKEN": "secret"}
+        # Keys sorted: HF_TOKEN before TORCH_LOGS; only the token masked.
+        self.assertEqual(
+            redact_env_for_log(env), "HF_TOKEN=***, TORCH_LOGS=+recompiles"
+        )
+
+    def test_empty(self):
+        self.assertEqual(redact_env_for_log({}), "")
 
 
 if __name__ == "__main__":

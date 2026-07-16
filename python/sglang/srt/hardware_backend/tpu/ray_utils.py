@@ -241,6 +241,31 @@ def _forwarded_driver_env(environ=None) -> dict:
     return forwarded
 
 
+# Case-insensitive substrings marking an env var whose *value* is a secret. Such
+# vars are still forwarded to actors (e.g. HF_TOKEN, which the actor needs to auth
+# to the Hugging Face Hub), but their values must be masked whenever we log the
+# forwarded set -- otherwise a token lands in plaintext in the driver log.
+_SECRET_ENV_SUBSTRINGS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL")
+
+
+def _is_secret_env(name: str) -> bool:
+    upper = name.upper()
+    return any(sub in upper for sub in _SECRET_ENV_SUBSTRINGS)
+
+
+def redact_env_for_log(env: dict) -> str:
+    """Format ``{name: value}`` as a ``k=v`` list for logging, masking secret values.
+
+    A var whose name looks like a secret (see ``_SECRET_ENV_SUBSTRINGS``) is shown as
+    ``NAME=***`` so operators can still see it is being forwarded without leaking the
+    value. Keys are sorted for stable, greppable output.
+    """
+    return ", ".join(
+        f"{name}={'***' if _is_secret_env(name) else value}"
+        for name, value in sorted(env.items())
+    )
+
+
 def tpu_actor_runtime_env(server_args) -> dict:
     """Ray ``.options()`` kwargs injecting the env a scheduler actor needs.
 
