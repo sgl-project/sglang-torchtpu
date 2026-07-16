@@ -177,6 +177,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
+    "pallas_tpu_mla",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
