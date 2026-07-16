@@ -136,7 +136,9 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     if server_args.use_ray and len(hosts) > 1:
         os.environ["MASTER_ADDR"] = hosts[0]
     else:
-        os.environ.setdefault("MASTER_ADDR", hosts[0] if len(hosts) > 1 else "127.0.0.1")
+        os.environ.setdefault(
+            "MASTER_ADDR", hosts[0] if len(hosts) > 1 else "127.0.0.1"
+        )
     os.environ.setdefault("MASTER_PORT", "29500")
 
 

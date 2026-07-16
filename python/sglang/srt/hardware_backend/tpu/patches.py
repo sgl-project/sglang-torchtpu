@@ -242,9 +242,7 @@ def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> No
     logger.info(
         "TPU env:\n%s",
         "\n".join(
-            f"  {k}={os.environ[k]}"
-            for k in _IMPORTANT_TPU_ENV_VARS
-            if k in os.environ
+            f"  {k}={os.environ[k]}" for k in _IMPORTANT_TPU_ENV_VARS if k in os.environ
         ),
     )
 
