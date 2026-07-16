@@ -142,6 +142,7 @@ class BatchDoneCounter:
 
     def update_producer(self) -> int:
         next_index = (self.producer_index + 1) % self.num_counters
+        # Backpressure: don't reuse a slot whose prior reload is still in flight.
         ev = self.events[next_index]
         if ev is not None:
             ev.synchronize()
@@ -162,7 +163,13 @@ class BatchDoneCounter:
             ev.synchronize()
 
     def reset(self) -> None:
-        # Commit (not drop) anything staged: nodes were already acked loadable.
+        """Reset lifecycle: land pending commits, then clear every slot.
+
+        Staged reloads are committed rather than dropped — their nodes were
+        already acked loadable, so dropping would leave stale device pages
+        behind an ack. Commit failures downgrade to drop-with-log so a
+        flush/reset can always recover the counter.
+        """
         try:
             self.drain_commits()
         except Exception:
@@ -1301,9 +1308,13 @@ class TpuHiCacheController(HiCacheController):
         super().reset()
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
-        # A staged-but-uncommitted reload targeting these pages must commit
-        # before they are freed: a later commit would scatter stale bytes over
-        # whoever reallocates them.
+        """Eviction lifecycle: land all pending reload commits, then free.
+
+        Ordering invariant (commit-before-free): a staged-but-uncommitted
+        reload targeting these pages must scatter into the kv_buffers while
+        the pages are still owned by their node; freeing first would let a
+        later commit write stale bytes over whoever reallocates them.
+        """
         self.layer_done_counter.drain_commits()
         return super().evict_device(device_indices)
 
@@ -1323,9 +1334,9 @@ class TpuHiCacheController(HiCacheController):
         if self._backup_inflight is not None:
             self._backup_inflight.synchronize()
 
-        # Any staged-but-uncommitted reload must land in the kv_buffers before
-        # we gather from them (backup of a just-reloaded node would otherwise
-        # read pre-reload bytes).
+        # Write-back lifecycle: land pending reload commits, then gather.
+        # Ordering invariant (commit-before-read): backing up a just-reloaded
+        # node must gather post-reload bytes, so its scatter lands first.
         self.layer_done_counter.drain_commits()
 
         staged = self.mem_pool_host.backup_gather(self.mem_pool_device, device_indices)
@@ -1373,11 +1384,13 @@ class TpuHiCacheController(HiCacheController):
         mem_pool_host_draft = self.mem_pool_host_draft
         mem_pool_device_draft = self.mem_pool_device_draft
 
-        # Donation-safe split: the worker thread only STAGES (host gather +
-        # H2D into fresh tensors, targeted sync); the kv_buffer scatter is a
-        # commit closure the BatchDoneCounter runs on the scheduler thread at
-        # its gate points, where no forward can be donating the KV cache.
-        staged = {}
+        # Reload lifecycle: the worker thread STAGES (host gather + H2D into
+        # fresh tensors); the scatter into live kv_buffers is deferred as a
+        # commit closure that BatchDoneCounter runs at its gate points on the
+        # scheduler thread. Donation safety: worker threads never touch the
+        # (donatable) kv_buffer handles — only the dispatch thread commits.
+        # Values are load_stage's (src_all staging tensor, padded dst page ids).
+        staged: dict[str, Optional[tuple[torch.Tensor, torch.Tensor]]] = {}
 
         def _producer():
             staged["target"] = mem_pool_host.load_stage(
