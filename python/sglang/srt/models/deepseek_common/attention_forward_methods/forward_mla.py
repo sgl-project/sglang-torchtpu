@@ -31,6 +31,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
+    _is_tpu,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -642,8 +643,10 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_piecewise_cuda_graph():
-                # torch dynamo requires out= op was called where output tensor was non-contiguous
+            if is_in_piecewise_cuda_graph() or _is_tpu:
+                # Dynamo can't trace bmm with a non-contiguous out= tensor, so
+                # traced paths (piecewise cuda graph, TPU whole-graph compile)
+
                 attn_bmm_output = (
                     torch.bmm(attn_output.transpose(0, 1), self.w_vc)
                     .transpose(0, 1)
