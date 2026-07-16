@@ -2080,7 +2080,7 @@ def get_compiler_backend(mode=None) -> str:
     # OOT platforms provide their own compile backend.
     from sglang.srt.platforms import current_platform
 
-    if current_platform.is_out_of_tree():
+    if current_platform.is_out_of_tree() or current_platform.is_tpu():
         return current_platform.get_compile_backend(mode)
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():

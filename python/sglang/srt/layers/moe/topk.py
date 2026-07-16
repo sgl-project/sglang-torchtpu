@@ -109,6 +109,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -124,6 +125,9 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
+# torch_tpu's compile backend cannot lower the top-k routing graphs (Inductor
+# LoweringException in scheduling); the eager math runs fine on TPU.
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
@@ -699,7 +703,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=not _is_tpu, backend=get_compiler_backend(), disable=_is_npu)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -790,7 +794,7 @@ def grouped_topk_cpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=not _is_tpu, backend=get_compiler_backend(), disable=_is_npu)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -828,7 +832,7 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=not _is_tpu, backend=get_compiler_backend(), disable=_is_npu)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -919,7 +923,7 @@ def biased_topk_jit_kernel_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=not _is_tpu, backend=get_compiler_backend(), disable=_is_npu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1010,7 +1014,7 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=not _is_tpu, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
