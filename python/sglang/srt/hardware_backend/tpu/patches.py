@@ -541,7 +541,7 @@ def _patch_torch_native_attn_backend() -> None:
 _support_triton_patched = False
 
 
-_PALLAS_TPU_BACKENDS = ("pallas_tpu_flash", "pallas_tpu_rpa_v3")
+_PALLAS_TPU_BACKENDS = ("pallas_tpu_flash", "pallas_tpu_rpa_v3", "pallas_tpu_mla")
 
 
 def _patch_support_triton_for_tpu() -> None:

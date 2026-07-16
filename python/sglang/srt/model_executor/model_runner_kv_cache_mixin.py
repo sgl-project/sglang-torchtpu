@@ -603,7 +603,12 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = MLATokenToKVPool(
+                MlaPoolCls = (
+                    current_platform.get_mla_kv_pool_cls()
+                    if current_platform.is_tpu()
+                    else MLATokenToKVPool
+                )
+                self.token_to_kv_pool = MlaPoolCls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,

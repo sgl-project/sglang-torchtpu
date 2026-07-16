@@ -28,7 +28,11 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, get_tensor_size_bytes
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    get_tensor_size_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -345,3 +349,226 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         kv_data_lens = [buf.nbytes for buf in self.kv_buffer]
         kv_item_lens = [buf[0].nbytes * self.page_size for buf in self.kv_buffer]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+
+class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
+    """MLA latent KV pool with the paged 4D layout consumed by the Pallas MLA kernel.
+
+    The MLA v2 kernel (``layers/attention/pallas/mla_ragged_paged_attention_v2``)
+    reads and writes the latent cache as a single paged buffer per layer::
+
+        [num_pages,
+         page_size // kv_packing,
+         kv_packing,
+         align(kv_lora_rank, 128) + align(qk_rope_head_dim, 128)]
+
+    where ``kv_packing = 32 // bits_per_dtype_elem`` (2 for bf16). The last dim
+    pads the nope (latent) and rope segments *independently* to 128 — for
+    DeepSeek (512 + 64) that is 512 + 128 = 640, with the rope values living at
+    offset ``nope_dim`` (512), not ``kv_lora_rank + 0``. Like the MHA twin
+    above, the kernel performs the cache write itself (the buffer is donated to
+    the pallas call), so ``set_kv_buffer`` / ``set_mla_kv_buffer`` must never
+    be called.
+    """
+
+    HEAD_DIM_ALIGNMENT = 128
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        use_nsa: bool = False,
+        override_kv_cache_dim: Optional[int] = None,
+    ):
+        # Bypass ``MLATokenToKVPool.__init__``: its ``_create_buffers``
+        # allocates the flat [size, 1, 576] layout, which the Pallas MLA
+        # kernel cannot address. Initialize the ``KVCache`` base directly and
+        # build the paged buffers ourselves (same pattern as
+        # ``TpuFusedMHATokenToKVPool``).
+        from sglang.srt.mem_cache.memory_pool import (
+            KVCache,  # local import to avoid cycles
+        )
+
+        if use_nsa or override_kv_cache_dim is not None:
+            raise NotImplementedError(
+                "NSA / kv_cache_dim overrides are not supported by the TPU "
+                "fused MLA pool."
+            )
+
+        KVCache.__init__(
+            self,
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+        # Keep the real (possibly fp8) dtype as storage: the kernel owns cache
+        # writes, so the CUDA fp8-as-uint8 index_put workaround does not apply
+        # (see TpuFusedMHATokenToKVPool.__init__ for the full rationale).
+        self.store_dtype = self.dtype
+
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.use_nsa = False
+        self.nsa_kv_cache_store_fp8 = False
+        # Logical (upstream) cache dim: nope + rope unpadded. Kept for
+        # compatibility with consumers of the flat MLA pool.
+        self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+        # Physical segment dims: each aligned to 128 *independently* (the
+        # kernel slices the last axis at ``nope_dim``, so a combined align
+        # would misplace the rope segment for kv_lora_rank % 128 != 0).
+        self.nope_dim = (
+            _cdiv(kv_lora_rank, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
+        )
+        self.rope_dim = (
+            _cdiv(qk_rope_head_dim, self.HEAD_DIM_ALIGNMENT) * self.HEAD_DIM_ALIGNMENT
+        )
+        self.padded_kv_cache_dim = self.nope_dim + self.rope_dim
+
+        self.kv_packing = _torch_dtype_packing(self.store_dtype)
+        if self.size % self.page_size != 0:
+            raise ValueError(
+                f"size ({self.size}) must be divisible by page_size "
+                f"({self.page_size}) for the TPU fused MLA pool."
+            )
+        if self.page_size % self.kv_packing != 0:
+            raise ValueError(
+                f"page_size ({self.page_size}) must be divisible by kv_packing "
+                f"({self.kv_packing}) for the TPU fused MLA pool."
+            )
+        # Pad with one extra page so loc == 0 (the padded-token slot) is
+        # harmless; the TPU allocator hands out page IDs starting at 1.
+        self.num_pages = self.size // self.page_size + 1
+
+        self._create_buffers()
+
+        self.device_module = torch.get_device_module(self.device)
+
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self._finalize_allocation_log(size)
+
+    # ------------------------------------------------------------------ #
+    # Buffer creation / accessors
+    # ------------------------------------------------------------------ #
+
+    def _create_buffers(self):
+        shape = (
+            self.num_pages,
+            self.page_size // self.kv_packing,
+            self.kv_packing,
+            self.padded_kv_cache_dim,
+        )
+        logger.info(
+            "Allocating fused TPU MLA KV buffers: layers=%d, shape per layer=%s, "
+            "dtype=%s (nope_dim=%d, rope_dim=%d)",
+            self.layer_num,
+            shape,
+            self.store_dtype,
+            self.nope_dim,
+            self.rope_dim,
+        )
+        # fp8: allocate as zeroed uint8 and reinterpret (see the MHA twin).
+        if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            self.kv_buffer = [
+                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
+                    self.store_dtype
+                )
+                for _ in range(self.layer_num)
+            ]
+        else:
+            self.kv_buffer = [
+                torch.zeros(shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+
+    # ``get_fused_kv_buffer`` is the canonical accessor on TPU; the Pallas MLA
+    # backend passes it straight to the kernel (donated).
+    def get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.kv_buffer[layer_id - self.start_layer]
+
+    def _logical_latent_view(self, layer_id: int) -> torch.Tensor:
+        """Token-ordered logical view ``[num_tokens, 1, padded_kv_cache_dim]``.
+
+        Flattening (page, row, col) of the paged layout recovers token order:
+        token ``t`` of page ``p`` lives at ``[p, t // kv_packing,
+        t % kv_packing]``, so the flat index is exactly ``p * page_size + t``.
+        """
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        n_pages, rows, packing, dim = buf.shape
+        return buf.view(n_pages * rows * packing, 1, dim)
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        view = self._logical_latent_view(layer_id)
+        if self.nope_dim == self.kv_lora_rank:
+            # Rope segment is adjacent to the unpadded latent: the logical
+            # [nope + rope] layout is a contiguous prefix slice.
+            return view[..., : self.kv_cache_dim]
+        raise NotImplementedError(
+            "get_key_buffer on the TPU fused MLA pool requires "
+            "kv_lora_rank % 128 == 0 (rope segment starts at nope_dim, which "
+            f"!= kv_lora_rank: {self.nope_dim} != {self.kv_lora_rank})."
+        )
+
+    def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._logical_latent_view(layer_id)[..., : self.kv_lora_rank]
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "kv_buffer")
+        kv_size_bytes = 0
+        for kv_cache in self.kv_buffer:
+            kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        return kv_size_bytes
+
+    def get_contiguous_buf_infos(self):
+        kv_data_ptrs = [buf.data_ptr() for buf in self.kv_buffer]
+        kv_data_lens = [buf.nbytes for buf in self.kv_buffer]
+        # One item = one page (buf[0] is a full page in the paged layout).
+        kv_item_lens = [buf[0].nbytes for buf in self.kv_buffer]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    # ------------------------------------------------------------------ #
+    # Writes
+    # ------------------------------------------------------------------ #
+
+    def set_kv_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "TpuFusedMLATokenToKVPool.set_kv_buffer was called. The Pallas MLA "
+            "kernel writes the latent KV cache itself via the donated cache "
+            "argument; any out-of-band write would be overwritten on the next "
+            "forward. If you hit this, the calling code path is incompatible "
+            "with the pallas_tpu_mla backend (e.g. the non-absorbed MHA "
+            "prefill path) — the DeepSeek dispatch handler must return "
+            "AttnForwardMethod.MLA for every forward mode."
+        )
+
+    def set_mla_kv_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "TpuFusedMLATokenToKVPool.set_mla_kv_buffer was called; the Pallas "
+            "MLA kernel owns cache writes (see set_kv_buffer)."
+        )
