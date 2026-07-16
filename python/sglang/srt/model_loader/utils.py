@@ -264,7 +264,13 @@ def should_async_load(weight: torch.Tensor) -> bool:
     For host (CPU) tensors, using a threadpool can overlap H2D copies
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
+
+    TPU does not support async loading, return False for TPU
     """
+    from sglang.srt.utils.common import is_tpu
+
+    if is_tpu():
+        return False
     device = getattr(weight, "device", None)
     if device is None:
         return False
