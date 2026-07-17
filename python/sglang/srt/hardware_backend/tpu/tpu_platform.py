@@ -75,7 +75,17 @@ class TpuSRTPlatform(SRTPlatform):
     def apply_server_args_defaults(self, server_args) -> None:
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
-        _prepare_tpu_env(server_args.tp_size)
+        # Under Ray the slicebuilder/topology env is built per-rank after the
+        # cluster's real node IPs are discovered (multihost: per-actor from Ray
+        # IPs in _prepare_tpu_env; single-host: seeded once in
+        # RayEngine._launch_scheduler_processes). Building it here -- in the
+        # orchestrator, before discovery -- would emit a bogus single-host
+        # (localhost) env that never applies to the actual ranks. Still apply
+        # the libtpu/env overrides now so actors inherit them before importing
+        # torch_tpu.
+        _prepare_tpu_env(
+            server_args.tp_size, setup_slicebuilder=not server_args.use_ray
+        )
 
         if server_args.dtype is None or server_args.dtype == "auto":
             server_args.dtype = "bfloat16"

@@ -56,12 +56,24 @@ class SchedulerActor:
             get_numa_node_if_available,
             numa_bind_to_node,
         )
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
 
         # Override dist_init_addr if provided (for multi-node)
         if dist_init_addr:
             server_args = dataclasses.replace(
                 server_args, dist_init_addr=dist_init_addr
             )
+
+        # The Ray-discovered, physically-ordered TPU host list is injected into
+        # this actor's environment as TPU_WORKER_HOSTNAMES via runtime_env at
+        # launch (see ray_utils.tpu_actor_runtime_env), so the TPU env bootstrap
+        # below (_prepare_tpu_env) reads it straight from os.environ.
+
+        # TPU: replay run_scheduler_process's per-process env bootstrap (RANK/
+        # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder + RPA-v3 pool
+        # swap) before Scheduler triggers PJRT init. Ray actors skip that mp
+        # entry point. No-op for non-TPU.
+        monkey_patch_torch_tpu_env(server_args, tp_rank)
 
         # Get actual GPU IDs from Ray runtime context
         accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
@@ -125,8 +137,9 @@ class SchedulerActor:
         try:
             import torch
 
-            # Need to set the GPU id for the event loop for nccl to work
-            torch.cuda.set_device(self.scheduler.ps.gpu_id)
+            # Need to set the device for the event loop for collective communication to work
+            device_module = torch.get_device_module(self.scheduler.device)
+            device_module.set_device(self.scheduler.ps.gpu_id)
             self.scheduler.run_event_loop()
         except Exception as e:
             logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")

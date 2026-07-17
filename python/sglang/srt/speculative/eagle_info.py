@@ -30,7 +30,12 @@ from sglang.srt.speculative.eagle_info_v2 import (
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
-from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+from sglang.srt.speculative.eagle_utils import (
+    top_k_renorm_prob_func,
+    top_p_renorm_prob_func,
+    tree_speculative_sampling_target_only_func,
+    verify_tree_greedy_func,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -44,16 +49,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, is_tpu, next_power_of_2
+from sglang.srt.utils import is_tpu, next_power_of_2
 
 _is_tpu = is_tpu()
-
-if is_cuda() or is_musa():
-    from sgl_kernel import (
-        top_k_renorm_prob,
-        top_p_renorm_prob,
-        tree_speculative_sampling_target_only,
-    )
 
 logger = logging.getLogger(__name__)
 
@@ -322,15 +320,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens. Force greedy sampling on AMD
+        # Sample tokens. Force greedy sampling on AMD.
         is_all_greedy = sampling_info.is_all_greedy
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+        tree_sample_available = TREE_SPEC_KERNEL_AVAILABLE or (
+            _is_tpu and self.topk == 1
+        )
+        if (not is_all_greedy) and (not tree_sample_available):
             logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
-                "Falling back to greedy verification."
+                "Tree speculative sampling kernel unavailable (likely AMD/HIP build "
+                "or TPU topk>1). Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+        if is_all_greedy or not tree_sample_available:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -354,14 +355,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             target_probs = F.softmax(
                 logits_output.next_token_logits / expanded_temperature, dim=-1
             )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
+            target_probs = top_k_renorm_prob_func(
                 target_probs,
                 torch.repeat_interleave(
                     sampling_info.top_ks, self.draft_token_num, dim=0
                 ),
+                need_top_k_sampling=sampling_info.need_top_k_sampling,
             )  # (bs * draft_token_num, vocab_size)
             if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
+                target_probs = top_p_renorm_prob_func(
                     target_probs,
                     torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
@@ -381,7 +383,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             coins_for_final_sampling = torch.rand(
                 (bs,), dtype=torch.float32, device=batch.device
             )
-            tree_speculative_sampling_target_only(
+            tree_speculative_sampling_target_only_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=num_correct_drafts,  # mutable
@@ -397,6 +399,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 threshold_single=get_global_server_args().speculative_accept_threshold_single,
                 threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
                 deterministic=True,
+                topk=self.topk,
             )
 
             # Sync sampling results across TP ranks: different GPUs may
