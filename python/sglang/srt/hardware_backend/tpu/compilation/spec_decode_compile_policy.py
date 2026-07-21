@@ -367,6 +367,8 @@ class SpecDecodeCompilePolicyMixin:
         pad_b = self.b_bucketer.next_bucket(real_bs)
         if pad_b == real_bs:
             return
+        # Draft extend has a fixed token count per request, so
+        # an independent token bucket is unnecessary.
         forward_batch._pad_inputs_to_size(model_runner, pad_b * num_draft_tokens, pad_b)
         forward_batch.batch_size = pad_b
         setattr(forward_batch, _REAL_B_KEY, real_bs)
