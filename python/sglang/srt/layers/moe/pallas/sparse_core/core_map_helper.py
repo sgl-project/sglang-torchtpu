@@ -18,26 +18,31 @@ from jax._src.pallas import core as pl_core
 
 def _empty_out_ref(out_type):
     aval = pl_core._convert_out_shape_to_aval(out_type)
-    memory_space = (None if isinstance(aval.memory_space, jax_core.MemorySpace)
-                    else aval.memory_space)
+    memory_space = (
+        None
+        if isinstance(aval.memory_space, jax_core.MemorySpace)
+        else aval.memory_space
+    )
     value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
     return jax_core.new_ref(value, memory_space=memory_space)
 
 
-def kernel(body,
-           *,
-           out_type,
-           mesh,
-           scratch_types=(),
-           compiler_params=None,
-           interpret=False,
-           cost_estimate=None,
-           debug=False,
-           name=None,
-           metadata=None):
+def kernel(
+    body,
+    *,
+    out_type,
+    mesh,
+    scratch_types=(),
+    compiler_params=None,
+    interpret=False,
+    cost_estimate=None,
+    debug=False,
+    name=None,
+    metadata=None
+):
     """Drop-in replacement for ``pl.kernel`` that lowers via ``core_map``."""
     single_output = not isinstance(out_type, (tuple, list))
-    out_types = (out_type, ) if single_output else out_type
+    out_types = (out_type,) if single_output else out_type
 
     @api.jit
     def run(*operands):

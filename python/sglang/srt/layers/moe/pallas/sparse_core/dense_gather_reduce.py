@@ -66,35 +66,35 @@ def _sc_gather_reduce(
 ) -> jax.Array:
     """Performs a gather-reduce operation on SparseCore.
 
-  This kernel groups rows of the operand ``op`` based on ``idx``, sums them
-  up, and scatters the results. The gather and add operations are performed
-  in fp32, and the results are written back in bf16.
+    This kernel groups rows of the operand ``op`` based on ``idx``, sums them
+    up, and scatters the results. The gather and add operations are performed
+    in fp32, and the results are written back in bf16.
 
-  Equivalent JAX code::
+    Equivalent JAX code::
 
-    gathered = op[idx, :]
-    if topk_weights is not None:
-      flat_weights = topk_weights.flatten()
-      gathered = gathered * flat_weights[:, None].astype(jnp.float32)
-    gathered = jnp.reshape(gathered, (-1, reduce_group_size, op.shape[1]))
-    output = jnp.sum(gathered.astype(jnp.float32), axis=1).astype(jnp.bfloat16)
+      gathered = op[idx, :]
+      if topk_weights is not None:
+        flat_weights = topk_weights.flatten()
+        gathered = gathered * flat_weights[:, None].astype(jnp.float32)
+      gathered = jnp.reshape(gathered, (-1, reduce_group_size, op.shape[1]))
+      output = jnp.sum(gathered.astype(jnp.float32), axis=1).astype(jnp.bfloat16)
 
-  Args:
-    op: The operand matrix [B, K] in f32 or bf16 to gather from and reduce.
-    idx: The indices [M,] in int32 guiding the gather.
-    topk_weights: Optional weights [M // 128, 128] in bf16 to apply to the
-      gathered rows before reduction.
-    reduce_group_size: The number of gathered rows to sum per output row.
-    single_sc: Whether to use a single SparseCore.
-    col_chunk_size: The size of column chunks to process.
-    row_chunk_size: The size of row chunks for internal processing. Must be ``2
-      * reduce_group_size``.
-    topk_wgt_zero_nan: If True, treat zero ``topk_weights`` as indicators of NaN
-      during multiplication, resulting in zero output.
+    Args:
+      op: The operand matrix [B, K] in f32 or bf16 to gather from and reduce.
+      idx: The indices [M,] in int32 guiding the gather.
+      topk_weights: Optional weights [M // 128, 128] in bf16 to apply to the
+        gathered rows before reduction.
+      reduce_group_size: The number of gathered rows to sum per output row.
+      single_sc: Whether to use a single SparseCore.
+      col_chunk_size: The size of column chunks to process.
+      row_chunk_size: The size of row chunks for internal processing. Must be ``2
+        * reduce_group_size``.
+      topk_wgt_zero_nan: If True, treat zero ``topk_weights`` as indicators of NaN
+        during multiplication, resulting in zero output.
 
-  Returns:
-    The reduced result as a bf16 matrix [M / reduce_group_size, K].
-  """
+    Returns:
+      The reduced result as a bf16 matrix [M / reduce_group_size, K].
+    """
 
     sc_info = pltpu.get_tpu_info().sparse_core
     if sc_info is None:
@@ -132,16 +132,16 @@ def _sc_gather_reduce(
         num_col_chunks = K // col_chunk_size
         packing = 32 // jax.dtypes.itemsize_bits(op.dtype)
 
-        subcore_first_row_chunk = (lax.axis_index(
-            ("core", "subcore")) * num_row_chunks)
+        subcore_first_row_chunk = lax.axis_index(("core", "subcore")) * num_row_chunks
 
-        in_spec = pl.BlockSpec((row_chunk_size, ), lambda i:
-                               (subcore_first_row_chunk + i, ))
-        in_specs = (in_spec, ) * (1 + (weights_hbm_ref is not None))
+        in_spec = pl.BlockSpec(
+            (row_chunk_size,), lambda i: (subcore_first_row_chunk + i,)
+        )
+        in_specs = (in_spec,) * (1 + (weights_hbm_ref is not None))
 
-        @functools.partial(pltpu.emit_pipeline,
-                           grid=(num_row_chunks, ),
-                           in_specs=in_specs)
+        @functools.partial(
+            pltpu.emit_pipeline, grid=(num_row_chunks,), in_specs=in_specs
+        )
         def idx_pipeline(idx_ref, weights_ref=None):
             row_chunk_idx = subcore_first_row_chunk + pl.program_id(0)
 
@@ -152,7 +152,8 @@ def _sc_gather_reduce(
             if row_chunk_size % row_subchunk_size:
                 raise ValueError(
                     f"row_chunk_size needs to be a multiple of {row_subchunk_size}, but"
-                    f" got {row_chunk_size}")
+                    f" got {row_chunk_size}"
+                )
 
             @functools.partial(
                 pltpu.emit_pipeline,
@@ -161,8 +162,7 @@ def _sc_gather_reduce(
                     (pl.Indirect(row_subchunk_size), col_chunk_size),
                     lambda r, c: (
                         lax.div(
-                            idx_ref[pl.ds(r * row_subchunk_size,
-                                          row_subchunk_size)],
+                            idx_ref[pl.ds(r * row_subchunk_size, row_subchunk_size)],
                             packing,
                         ),
                         c,
@@ -178,10 +178,14 @@ def _sc_gather_reduce(
                 out_ref = out_ref.bitcast(op.dtype)
 
                 row_slice = pl.ds(
-                    pl.program_id(0) * row_subchunk_size, row_subchunk_size)
+                    pl.program_id(0) * row_subchunk_size, row_subchunk_size
+                )
                 subchunk_idxs = idx_ref[row_slice]
-                weights = (None if weights_ref is None else
-                           weights_ref[row_slice].astype(jnp.float32))
+                weights = (
+                    None
+                    if weights_ref is None
+                    else weights_ref[row_slice].astype(jnp.float32)
+                )
 
                 unpack_col_chunk = 32  # 32 seems to works best when tuning.
 
@@ -201,8 +205,7 @@ def _sc_gather_reduce(
                             else:
                                 assert packing == 2
                                 row_data = jnp.where(
-                                    lax.bitwise_and(subchunk_idxs[row],
-                                                    1) == 0,
+                                    lax.bitwise_and(subchunk_idxs[row], 1) == 0,
                                     row_data[0],
                                     row_data[1],
                                 )
@@ -211,7 +214,9 @@ def _sc_gather_reduce(
                                 if topk_wgt_zero_nan:
                                     row_data = jnp.where(
                                         weights[row] == 0.0,
-                                        jnp.zeros_like(row_data), row_data)
+                                        jnp.zeros_like(row_data),
+                                        row_data,
+                                    )
                             row_datas.append(row_data)
 
                         # Tree reduction to reduce critical path and stalls
@@ -219,8 +224,7 @@ def _sc_gather_reduce(
                             next_level = []
                             for i in range(0, len(row_datas), 2):
                                 if i + 1 < len(row_datas):
-                                    next_level.append(row_datas[i] +
-                                                      row_datas[i + 1])
+                                    next_level.append(row_datas[i] + row_datas[i + 1])
                                 else:
                                     next_level.append(row_datas[i])
                             row_datas = next_level
@@ -228,24 +232,18 @@ def _sc_gather_reduce(
                     out = jnp.stack(accs, axis=0).astype(op.dtype)
                     out_ref[:, pl.ds(col_base, unpack_col_chunk)] = out
 
-            data_pipeline(in_hbm_ref.bitcast(jnp.int32),
-                          out_hbm_ref.bitcast(jnp.int32))
+            data_pipeline(in_hbm_ref.bitcast(jnp.int32), out_hbm_ref.bitcast(jnp.int32))
 
         idx_pipeline(
-            idx_hbm_ref,
-            *([weights_hbm_ref] if weights_hbm_ref is not None else []))
+            idx_hbm_ref, *([weights_hbm_ref] if weights_hbm_ref is not None else [])
+        )
 
     return kernel(op, idx, topk_weights)  # pylint: disable=no-value-for-parameter
 
 
-def _jax_fallback(x,
-                  indices,
-                  topk_weights,
-                  reduce_group_size,
-                  topk_wgt_zero_nan=False):
+def _jax_fallback(x, indices, topk_weights, reduce_group_size, topk_wgt_zero_nan=False):
     token_hidden_full = x[indices]
-    cur_sorted = token_hidden_full.reshape(
-        (-1, reduce_group_size, x.shape[-1]))
+    cur_sorted = token_hidden_full.reshape((-1, reduce_group_size, x.shape[-1]))
     # topk_weights is already 2D [tokens, reduce_group_size]
     cur_topk_weights = jnp.expand_dims(topk_weights, axis=-1)
     # Accumulate in float32 to match reference precision and Pallas kernel
@@ -254,12 +252,12 @@ def _jax_fallback(x,
         cur_weighted = jnp.where(
             cur_topk_weights == 0.0,
             0.0,
-            cur_sorted.astype(jnp.float32) *
-            cur_topk_weights.astype(jnp.float32),
+            cur_sorted.astype(jnp.float32) * cur_topk_weights.astype(jnp.float32),
         )
     else:
-        cur_weighted = cur_sorted.astype(
-            jnp.float32) * cur_topk_weights.astype(jnp.float32)
+        cur_weighted = cur_sorted.astype(jnp.float32) * cur_topk_weights.astype(
+            jnp.float32
+        )
     out = cur_weighted.sum(axis=-2)
     return out.astype(x.dtype)
 
@@ -274,17 +272,17 @@ def dense_gather_reduce(
 ) -> jax.Array:
     """Wrapper that redirects to Pallas dense gather reduce kernel if constraints are met.
 
-  Otherwise, it falls back to the JAX baseline.
+    Otherwise, it falls back to the JAX baseline.
 
-  Args:
-    x: Input array [out_size, hidden_size].
-    indices: Gather indices [out_size].
-    topk_weights: 2D weights [tokens, reduce_group_size], where tokens *
-      reduce_group_size = out_size.
-    reduce_group_size: Group size for reduction (topk).
-    topk_wgt_zero_nan: If True, treat zero weights as indicators of NaN during
-      multiplication, resulting in zero output.
-  """
+    Args:
+      x: Input array [out_size, hidden_size].
+      indices: Gather indices [out_size].
+      topk_weights: 2D weights [tokens, reduce_group_size], where tokens *
+        reduce_group_size = out_size.
+      reduce_group_size: Group size for reduction (topk).
+      topk_wgt_zero_nan: If True, treat zero weights as indicators of NaN during
+        multiplication, resulting in zero output.
+    """
     if is_compatible(x, indices, reduce_group_size):
         K = x.shape[-1]
         # The kernel slices the operand along the hidden (column) dimension,
@@ -313,5 +311,4 @@ def dense_gather_reduce(
                 topk_wgt_zero_nan=topk_wgt_zero_nan,
             )
     # Fallback to JAX baseline
-    return _jax_fallback(x, indices, topk_weights, reduce_group_size,
-                         topk_wgt_zero_nan)
+    return _jax_fallback(x, indices, topk_weights, reduce_group_size, topk_wgt_zero_nan)

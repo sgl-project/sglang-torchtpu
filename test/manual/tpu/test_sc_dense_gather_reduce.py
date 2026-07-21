@@ -15,7 +15,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.moe.pallas.sparse_core import dense_gather_reduce as dgr_mod
 from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
-    dense_gather_reduce, is_compatible)
+    dense_gather_reduce,
+    is_compatible,
+)
 
 jax.config.parse_flags_with_absl()
 
@@ -32,8 +34,7 @@ def reference_dense_gather_reduce(
     weights_for_mul = topk_weights_1d[:, None].astype(jnp.float32)
     gathered = x[indices].astype(jnp.float32)
     if topk_wgt_zero_nan:
-        gathered = jnp.where(weights_for_mul == 0.0, 0.0,
-                             gathered * weights_for_mul)
+        gathered = jnp.where(weights_for_mul == 0.0, 0.0, gathered * weights_for_mul)
     else:
         gathered = gathered * weights_for_mul
     out = gathered.reshape(-1, reduce_group_size, gathered.shape[-1])
@@ -50,7 +51,8 @@ class DenseGatherReduceTest(jtu.JaxTestCase):
             dtype=d,
             reduce_group_size=rg,
             topk_wgt_zero_nan=wzn,
-        ) for o, h, d, rg, wzn in itertools.chain(
+        )
+        for o, h, d, rg, wzn in itertools.chain(
             itertools.product(
                 [400, 840],
                 [128, 512, 8192],
@@ -110,15 +112,16 @@ class DenseGatherReduceTest(jtu.JaxTestCase):
             self.skipTest("dense_gather_reduce is not supported on TPUv6e")
 
     @parameterized.parameters(*_test_cases)
-    def test_sc_dense_gather_reduce(self, out_size, hidden_size, dtype,
-                                    reduce_group_size, topk_wgt_zero_nan):
+    def test_sc_dense_gather_reduce(
+        self, out_size, hidden_size, dtype, reduce_group_size, topk_wgt_zero_nan
+    ):
         key = jax.random.key(0)
         x = jax.random.normal(key, (out_size, hidden_size), jnp.float32)
         x = x.astype(dtype)
         indices = jax.random.permutation(key, out_size)
         topk_weights = jax.random.normal(
-            key, (out_size // reduce_group_size, reduce_group_size),
-            jnp.bfloat16)
+            key, (out_size // reduce_group_size, reduce_group_size), jnp.bfloat16
+        )
 
         if topk_wgt_zero_nan:
             mask = jax.random.bernoulli(key, 0.2, topk_weights.shape)
@@ -164,8 +167,8 @@ class DenseGatherReduceTest(jtu.JaxTestCase):
         indices = jax.random.permutation(key, out_size)
 
         topk_weights = jnp.ones(
-            (out_size // reduce_group_size, reduce_group_size),
-            dtype=jnp.bfloat16)
+            (out_size // reduce_group_size, reduce_group_size), dtype=jnp.bfloat16
+        )
 
         for nan_row in nan_rows:
             gathered_indices = jnp.where(indices == nan_row)[0]
@@ -217,12 +220,13 @@ class DenseGatherReduceTest(jtu.JaxTestCase):
         indices = jax.random.permutation(key, out_size)
         # weights = arange(M)
         topk_weights = jnp.arange(out_size, dtype=jnp.float32).reshape(
-            out_size // reduce_group_size, reduce_group_size)
+            out_size // reduce_group_size, reduce_group_size
+        )
 
-        actual = dense_gather_reduce(x, indices, topk_weights,
-                                     reduce_group_size)
-        desired = reference_dense_gather_reduce(x, indices, topk_weights,
-                                                reduce_group_size)
+        actual = dense_gather_reduce(x, indices, topk_weights, reduce_group_size)
+        desired = reference_dense_gather_reduce(
+            x, indices, topk_weights, reduce_group_size
+        )
         try:
             np.testing.assert_allclose(actual, desired, atol=1e-2, rtol=1e-2)
         except AssertionError as e:
@@ -241,9 +245,9 @@ class IsCompatibleTest(parameterized.TestCase):
     """
 
     def _fake_tpu_info(self, num_lanes, num_cores=1, num_subcores=1):
-        sparse_core = types.SimpleNamespace(num_lanes=num_lanes,
-                                            num_cores=num_cores,
-                                            num_subcores=num_subcores)
+        sparse_core = types.SimpleNamespace(
+            num_lanes=num_lanes, num_cores=num_cores, num_subcores=num_subcores
+        )
         return types.SimpleNamespace(sparse_core=sparse_core)
 
     # (num_lanes, dtype, reduce_group_size, expected_is_compatible)
@@ -259,17 +263,19 @@ class IsCompatibleTest(parameterized.TestCase):
         # v7x-like (num_lanes=16), bf16: 16//8//2 = 1 -> valid.
         ("v7x_bf16_topk8_ok", 16, jnp.bfloat16, 8, True),
     )
-    def test_output_block_packing_gate(self, num_lanes, dtype,
-                                       reduce_group_size, expected):
+    def test_output_block_packing_gate(
+        self, num_lanes, dtype, reduce_group_size, expected
+    ):
         op = jnp.zeros((4096, 128), dtype)
-        idx = jnp.zeros((4096, ), jnp.int32)
+        idx = jnp.zeros((4096,), jnp.int32)
         with mock.patch.object(
-                dgr_mod.pltpu,
-                "get_tpu_info",
-                return_value=self._fake_tpu_info(num_lanes=num_lanes)):
+            dgr_mod.pltpu,
+            "get_tpu_info",
+            return_value=self._fake_tpu_info(num_lanes=num_lanes),
+        ):
             self.assertEqual(
-                is_compatible(op, idx, reduce_group_size=reduce_group_size),
-                expected)
+                is_compatible(op, idx, reduce_group_size=reduce_group_size), expected
+            )
 
 
 if __name__ == "__main__":

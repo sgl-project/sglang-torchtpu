@@ -32,7 +32,7 @@ class GatherTest(jtu.JaxTestCase):
         key = jax.random.key(0)
         x = jax.random.normal(key, (in_size, hidden_size), jnp.float32)
         x = x.astype(dtype)
-        indices = jax.random.randint(key, (out_size, ), 0, in_size, jnp.int32)
+        indices = jax.random.randint(key, (out_size,), 0, in_size, jnp.int32)
 
         start_arr = jnp.array([start], jnp.int32)
         end_arr = jnp.array([end], jnp.int32)
@@ -70,14 +70,16 @@ class GatherTest(jtu.JaxTestCase):
 
         for in_size, out_size, hidden_size in benchmark_shapes:
 
-            print(f"\n=== Running shape: in={in_size}, out={out_size},"
-                  f" hidden={hidden_size} ===")
+            print(
+                f"\n=== Running shape: in={in_size}, out={out_size},"
+                f" hidden={hidden_size} ==="
+            )
 
             key = jax.random.key(0)
-            x = jax.random.normal(key, (in_size, hidden_size),
-                                  jnp.float32).astype(dtype)
-            indices = jax.random.randint(key, (out_size, ), 0, in_size,
-                                         jnp.int32)
+            x = jax.random.normal(key, (in_size, hidden_size), jnp.float32).astype(
+                dtype
+            )
+            indices = jax.random.randint(key, (out_size,), 0, in_size, jnp.int32)
 
             # For benchmark, use full coverage to test peak performance
             start = 0
@@ -110,14 +112,14 @@ class GatherTest(jtu.JaxTestCase):
                 res_v2_sliced = res_v2[start:end]
                 err_v2 = jnp.max(jnp.abs(res_v2_sliced - res_jax_sliced))
                 err_v2_str = f"{float(err_v2):.6f}"
-                np.testing.assert_allclose(res_v2_sliced,
-                                           res_jax_sliced,
-                                           atol=1e-2,
-                                           rtol=1e-2)
+                np.testing.assert_allclose(
+                    res_v2_sliced, res_jax_sliced, atol=1e-2, rtol=1e-2
+                )
             except Exception:  # pylint: disable=broad-except
                 print(
                     f"[Warning] V2 Kernel failed for shape ({in_size}, {out_size},"
-                    f" {hidden_size})")
+                    f" {hidden_size})"
+                )
 
             print(f"V2 Kernel: {t_v2_str}")
             print(f"V2 Kernel vs JAX Max Err: {err_v2_str}")

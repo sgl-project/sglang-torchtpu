@@ -2,8 +2,6 @@
 
 import unittest
 
-import torch
-
 from sglang.test.test_utils import CustomTestCase
 
 try:
@@ -30,12 +28,10 @@ def _quantize(w_f32, quant_mode):
         return wq, s[:, :, None, :].astype(jnp.bfloat16)  # [g, 1, 1, 2n]
     if quant_mode == "block128":
         kb = k // 128
-        s = jnp.clip(
-            jnp.abs(w_f32.reshape(g, kb, 128, n2)).max(axis=2) / _FMAX, 1e-12
+        s = jnp.clip(jnp.abs(w_f32.reshape(g, kb, 128, n2)).max(axis=2) / _FMAX, 1e-12)
+        wq = jnp.clip(w_f32 / jnp.repeat(s, 128, axis=1), -_FMAX, _FMAX).astype(
+            jnp.float8_e4m3fn
         )
-        wq = jnp.clip(
-            w_f32 / jnp.repeat(s, 128, axis=1), -_FMAX, _FMAX
-        ).astype(jnp.float8_e4m3fn)
         return wq, s[:, :, None, :].astype(jnp.bfloat16)  # [g, kb, 1, 2n]
     raise ValueError(quant_mode)
 
@@ -59,11 +55,18 @@ class TestFusedActScales(CustomTestCase):
         rhs, scale = _quantize(w_f32, quant_mode)
 
         fused = gmm_v2(
-            lhs=lhs, rhs=rhs, group_sizes=group_sizes, rhs_scale=scale,
-            fuse_act="silu", preferred_element_type=jnp.bfloat16,
+            lhs=lhs,
+            rhs=rhs,
+            group_sizes=group_sizes,
+            rhs_scale=scale,
+            fuse_act="silu",
+            preferred_element_type=jnp.bfloat16,
         )
         plain = gmm_v2(
-            lhs=lhs, rhs=rhs, group_sizes=group_sizes, rhs_scale=scale,
+            lhs=lhs,
+            rhs=rhs,
+            group_sizes=group_sizes,
+            rhs_scale=scale,
             preferred_element_type=jnp.bfloat16,
         )
         ref = apply_act_fn(
@@ -98,8 +101,12 @@ class TestFusedActScales(CustomTestCase):
         gs = jnp.full((g,), m // g, jnp.int32)
         with self.assertRaises(AssertionError):
             gmm_v2(
-                lhs=lhs, rhs=wq, group_sizes=gs, rhs_scale=scale,
-                fuse_act="silu", preferred_element_type=jnp.bfloat16,
+                lhs=lhs,
+                rhs=wq,
+                group_sizes=gs,
+                rhs_scale=scale,
+                fuse_act="silu",
+                preferred_element_type=jnp.bfloat16,
             )
 
 
