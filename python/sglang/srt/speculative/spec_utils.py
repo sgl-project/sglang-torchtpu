@@ -4,6 +4,7 @@ import functools
 import logging
 import os
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
@@ -18,15 +19,19 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
-from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.mem_cache.common import (
+    alloc_paged_token_slots_extend,
+    alloc_token_slots,
+    get_last_loc,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # V2 (triton) path: re-export upstream's maintained kernels from cache_locs.
-# NOTE: `assign_req_to_token_pool_func` and `get_src_tgt_cache_loc` are NOT
-# imported here -- they are defined locally below with a TPU/torch-native
-# branch (the local defs would otherwise shadow these imports).
 from sglang.srt.speculative.triton_ops.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
+)
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    assign_draft_cache_locs_contiguous as assign_draft_cache_locs_contiguous,
 )
 from sglang.srt.speculative.triton_ops.cache_locs import (
     assign_extend_cache_locs as assign_extend_cache_locs,
@@ -45,6 +50,9 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 )
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_accept_out_cache_loc as fill_accept_out_cache_loc,
+)
+from sglang.srt.speculative.triton_ops.eagle import (
+    fill_bonus_tokens as fill_bonus_tokens,
 )
 from sglang.srt.utils import (
     is_cuda,
@@ -85,6 +93,325 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+HostTensor = torch.Tensor | Callable[[], torch.Tensor] | None
+
+
+def _route_to_req_to_token_device(
+    req_to_token: torch.Tensor,
+    device_tensor: torch.Tensor,
+    host_tensor: HostTensor,
+) -> torch.Tensor:
+    """Use an existing host shadow when the request table is host-resident."""
+    if req_to_token.device.type != "cpu" or host_tensor is None:
+        return device_tensor
+    return host_tensor() if callable(host_tensor) else host_tensor
+
+
+def _assign_req_to_token_pool_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Pure-Torch request-table update for TPU/XLA."""
+    if batch_size == 0:
+        return
+    device = req_to_token.device
+    req_pool_indices = req_pool_indices[:batch_size].to(device)
+    start_offset = start_offset[:batch_size].to(device)
+    end_offset = end_offset[:batch_size].to(device)
+    out_cache_loc = out_cache_loc.to(device)
+    lengths = end_offset - start_offset
+    max_len = min(
+        int(req_to_token.shape[1]),
+        int(out_cache_loc.numel()) if out_cache_loc.numel() > 0 else 0,
+    )
+    if max_len == 0:
+        return
+    offsets = torch.arange(max_len, device=device, dtype=start_offset.dtype)
+    mask = offsets[None, :] < lengths[:, None]
+    src_starts = torch.cumsum(lengths, dim=0) - lengths
+    src_index = (src_starts[:, None] + offsets[None, :]).clamp(
+        max=out_cache_loc.numel() - 1
+    )
+    dst_index = start_offset[:, None] + offsets[None, :]
+    row_index = req_pool_indices[:, None].expand(batch_size, max_len)
+    dst_index = torch.where(mask, dst_index, torch.zeros_like(dst_index))
+    row_index = torch.where(mask, row_index, torch.zeros_like(row_index))
+    values = torch.where(
+        mask,
+        out_cache_loc[src_index].to(req_to_token.dtype),
+        req_to_token[row_index, dst_index],
+    )
+    req_to_token[row_index, dst_index] = values
+
+
+def assign_req_to_token_pool_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+) -> None:
+    if _is_tpu:
+        _assign_req_to_token_pool_torch(
+            req_pool_indices,
+            req_to_token,
+            start_offset,
+            end_offset,
+            out_cache_loc,
+            batch_size,
+        )
+        return
+    assign_req_to_token_pool[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        end_offset,
+        out_cache_loc,
+        req_to_token.shape[1],
+        next_power_of_2(batch_size),
+    )
+
+
+def allocate_and_assign_decode_cache(
+    *,
+    tree_cache,
+    req_to_token_pool,
+    req_pool_indices: torch.Tensor,
+    cur_kv_lens_cpu: torch.Tensor,
+    nxt_kv_lens_cpu: torch.Tensor,
+    num_needed_tokens: int,
+    batch_size: int,
+    device,
+    host_req_pool_indices: HostTensor = None,
+) -> torch.Tensor:
+    """Allocate SpecV2 decode slots and update the request page table."""
+    req_to_token = req_to_token_pool.req_to_token
+    host_resident = req_to_token_pool.host_resident
+    if host_resident:
+        rows = _route_to_req_to_token_device(
+            req_to_token, req_pool_indices, host_req_pool_indices
+        )
+        cur_kv_lens = cur_kv_lens_cpu
+        nxt_kv_lens = nxt_kv_lens_cpu
+    else:
+        rows = req_pool_indices
+        cur_kv_lens = cur_kv_lens_cpu.to(device=device)
+        nxt_kv_lens = nxt_kv_lens_cpu.to(device=device)
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    if allocator.page_size == 1:
+        out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
+        out_cache_loc_host = None
+    else:
+        last_loc = get_last_loc(req_to_token, rows, cur_kv_lens)
+        out_cache_loc = alloc_paged_token_slots_extend(
+            tree_cache,
+            cur_kv_lens,
+            cur_kv_lens_cpu,
+            nxt_kv_lens,
+            nxt_kv_lens_cpu,
+            last_loc,
+            num_needed_tokens,
+        )
+        out_cache_loc_host = getattr(allocator, "last_alloc_extend_cpu", None)
+
+    assign_locs = out_cache_loc
+    if host_resident:
+        assign_locs = (
+            out_cache_loc.cpu() if out_cache_loc_host is None else out_cache_loc_host
+        )
+    assign_req_to_token_pool_func(
+        rows,
+        req_to_token,
+        cur_kv_lens,
+        nxt_kv_lens,
+        assign_locs,
+        batch_size,
+    )
+    return out_cache_loc
+
+
+def assign_draft_cache_locs_contiguous_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    topk: int,
+    speculative_num_steps: int,
+    *,
+    host_req_pool_indices: HostTensor = None,
+    host_seq_lens: HostTensor = None,
+) -> None:
+    """Gather the draft-write slots for a dense chain."""
+    bs = seq_lens.shape[0]
+    if _is_tpu:
+        if bs == 0:
+            return
+        rows = _route_to_req_to_token_device(
+            req_to_token, req_pool_indices, host_req_pool_indices
+        ).to(req_to_token.device, dtype=torch.int64)
+        starts = _route_to_req_to_token_device(
+            req_to_token, seq_lens, host_seq_lens
+        ).to(req_to_token.device, dtype=torch.int64)
+        width = topk * speculative_num_steps
+        offsets = torch.arange(width, device=req_to_token.device, dtype=torch.int64)
+        gathered = req_to_token[rows[:, None], starts[:, None] + offsets[None, :]]
+        out_cache_loc.view(bs, width).copy_(
+            gathered.to(out_cache_loc.device, dtype=out_cache_loc.dtype)
+        )
+        return
+    assign_draft_cache_locs_contiguous[(bs,)](
+        req_pool_indices,
+        req_to_token,
+        seq_lens,
+        out_cache_loc,
+        req_to_token.shape[1],
+        topk,
+        speculative_num_steps,
+    )
+
+
+def assign_extend_cache_locs_kernel_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    """Fixed-shape ragged gather used for verify and accepted-slot moves."""
+    bs = req_pool_indices.shape[0]
+    if _is_tpu:
+        if bs == 0:
+            return
+        r2t_device = req_to_token.device
+        out_device = out_cache_loc.device
+        cap = out_cache_loc.numel()
+        starts = start_offset.to(r2t_device, dtype=torch.int64)
+        ends = end_offset.to(r2t_device, dtype=torch.int64)
+        rows = req_pool_indices.to(r2t_device, dtype=torch.int64)
+        lengths = (ends - starts).clamp(min=0)
+        inclusive_ends = torch.cumsum(lengths, dim=0)
+        exclusive_starts = inclusive_ends - lengths
+        positions = torch.arange(cap, device=r2t_device, dtype=torch.int64)
+        segments = (
+            (positions[:, None] >= inclusive_ends[None, :])
+            .to(torch.int64)
+            .sum(dim=1)
+            .clamp(max=bs - 1)
+        )
+        columns = (starts[segments] + positions - exclusive_starts[segments]).clamp(
+            min=0, max=req_to_token.shape[1] - 1
+        )
+        gathered = req_to_token[rows[segments], columns].to(
+            out_device, dtype=out_cache_loc.dtype
+        )
+        valid = torch.arange(cap, device=out_device) < inclusive_ends[-1].to(out_device)
+        out_cache_loc.copy_(torch.where(valid, gathered, out_cache_loc))
+        return
+    assign_extend_cache_locs[(bs,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        end_offset,
+        out_cache_loc,
+        req_to_token.shape[1],
+        next_power_of_2(bs),
+    )
+
+
+def assign_extend_cache_locs_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    batch_size: int,
+    draft_token_num: int,
+    device,
+    *,
+    host_req_pool_indices: HostTensor = None,
+    host_seq_lens: HostTensor = None,
+) -> torch.Tensor:
+    """Allocate and gather verify cache locations on the supported backend."""
+    dtype = torch.int32 if _is_npu else torch.int64
+    out = torch.zeros(batch_size * draft_token_num, dtype=dtype, device=device)
+    if _is_npu:
+        torch.ops.npu.cache_loc_update(
+            req_pool_indices, req_to_token, start_offset, end_offset, out
+        )
+        return out
+    if _is_tpu:
+        req_pool_indices = _route_to_req_to_token_device(
+            req_to_token, req_pool_indices, host_req_pool_indices
+        )
+        start_offset = _route_to_req_to_token_device(
+            req_to_token, start_offset, host_seq_lens
+        )
+        end_offset = start_offset + draft_token_num
+    assign_extend_cache_locs_kernel_func(
+        req_pool_indices, req_to_token, start_offset, end_offset, out
+    )
+    return out
+
+
+def fill_bonus_tokens_func(
+    accept_tokens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    bonus_tokens: torch.Tensor,
+    num_draft_tokens: int,
+) -> None:
+    bs = accept_lens.shape[0]
+    if _is_tpu:
+        if bs == 0:
+            return
+        indices = (
+            torch.arange(bs, device=accept_lens.device, dtype=torch.int64)
+            * num_draft_tokens
+            + accept_lens.to(torch.int64)
+            - 1
+        )
+        bonus_tokens.copy_(accept_tokens.reshape(-1)[indices].to(bonus_tokens.dtype))
+        return
+    fill_bonus_tokens[(bs,)](accept_tokens, accept_lens, bonus_tokens, num_draft_tokens)
+
+
+def fill_accepted_out_cache_loc_func(
+    accept_index: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    accepted_out_cache_loc: torch.Tensor,
+) -> None:
+    """Compact accepted source slots to the front, preserving order."""
+    size = accept_index.numel()
+    if _is_tpu:
+        if size == 0:
+            return
+        flat = accept_index.reshape(-1).to(torch.int64)
+        mask = flat != -1
+        mask_i = mask.to(torch.int64)
+        destinations = torch.cumsum(mask_i, dim=0) - mask_i
+        values = out_cache_loc.reshape(-1)[flat.clamp(min=0)].to(
+            accepted_out_cache_loc.dtype
+        )
+        discard = torch.full_like(destinations, size)
+        buffer = torch.zeros(
+            size + 1,
+            dtype=accepted_out_cache_loc.dtype,
+            device=accepted_out_cache_loc.device,
+        )
+        buffer.scatter_(0, torch.where(mask, destinations, discard), values)
+        accepted_out_cache_loc.copy_(buffer[:size])
+        return
+    fill_accept_out_cache_loc[(size,)](
+        accept_index,
+        out_cache_loc,
+        accepted_out_cache_loc,
+        next_power_of_2(size),
+    )
 
 
 def fast_sample(probs: torch.Tensor, num_samples: int = 1):
@@ -310,82 +637,6 @@ def create_extend_after_decode_spec_info_func(
         positions,
         bonus_tokens,
         next_power_of_2(max(speculative_num_steps + 1, len(seq_lens))),
-    )
-
-
-def _assign_req_to_token_pool_torch(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    batch_size: int,
-):
-    """Pure-PyTorch implementation of assign_req_to_token_pool for TPU/XLA."""
-    if batch_size == 0:
-        return
-    device = req_to_token.device
-    req_pool_indices = req_pool_indices[:batch_size].to(device)
-    start_offset = start_offset[:batch_size].to(device)
-    end_offset = end_offset[:batch_size].to(device)
-    out_cache_loc = out_cache_loc.to(device)
-    lengths = end_offset - start_offset
-    # Use the KV pool width as a safe upper bound for max_len to avoid
-    # a host-device sync from torch.max().item().
-    max_len = min(
-        int(req_to_token.shape[1]),
-        int(out_cache_loc.numel()) if out_cache_loc.numel() > 0 else 0,
-    )
-    if max_len == 0:
-        return
-    offsets = torch.arange(
-        max_len, device=req_to_token.device, dtype=start_offset.dtype
-    )
-    mask = offsets[None, :] < lengths[:, None]  # (batch_size, max_len)
-    src_starts = torch.cumsum(lengths, dim=0) - lengths
-    src_index = (src_starts[:, None] + offsets[None, :]).clamp(
-        max=out_cache_loc.numel() - 1
-    )
-    dst_index = start_offset[:, None] + offsets[None, :]
-    row_index = req_pool_indices[:, None].expand(batch_size, max_len)
-    # Redirect masked-out positions to the padding row (row 0, col 0).
-    dst_index = torch.where(mask, dst_index, torch.zeros_like(dst_index))
-    row_index = torch.where(mask, row_index, torch.zeros_like(row_index))
-    vals = torch.where(
-        mask,
-        out_cache_loc[src_index].to(req_to_token.dtype),
-        req_to_token[row_index, dst_index],
-    )
-    req_to_token[row_index, dst_index] = vals
-
-
-def assign_req_to_token_pool_func(
-    req_pool_indices: torch.Tensor,
-    req_to_token: torch.Tensor,
-    start_offset: torch.Tensor,
-    end_offset: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    batch_size: int,
-):
-    if _use_torch_native:
-        _assign_req_to_token_pool_torch(
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            batch_size,
-        )
-        return
-
-    assign_req_to_token_pool[(batch_size,)](
-        req_pool_indices,
-        req_to_token,
-        start_offset,
-        end_offset,
-        out_cache_loc,
-        req_to_token.shape[1],
-        next_power_of_2(batch_size),
     )
 
 
@@ -1040,20 +1291,17 @@ def move_accept_tokens_to_target_kvcache(
         device=device,
     )
     accept_out_cache_loc = torch.zeros(size, dtype=torch.int64, device=device)
-    assign_extend_cache_locs[(bs,)](
+    assign_extend_cache_locs_kernel_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,
         batch.seq_lens,
         batch.seq_lens + num_correct_drafts + 1,
         tgt_cache_loc,
-        batch.req_to_token_pool.req_to_token.shape[1],
-        next_power_of_2(bs),
     )
-    fill_accept_out_cache_loc[(size,)](
+    fill_accepted_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,
-        next_power_of_2(size),
     )
     token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
         tgt_cache_loc, accept_out_cache_loc

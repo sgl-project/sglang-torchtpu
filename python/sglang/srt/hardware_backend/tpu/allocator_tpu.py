@@ -141,6 +141,10 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         )
         out_indices = out_indices_cpu.to(self.device, non_blocking=True)
 
+        # Keep the CPU indices for host-resident req_to_token updates to avoid
+        # synchronizing on a device-to-host copy.
+        self.last_alloc_extend_cpu = out_indices_cpu
+
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 

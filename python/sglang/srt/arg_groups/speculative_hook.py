@@ -332,21 +332,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    # The legacy V1 EAGLE worker (default; used by the TPU backend) has no overlap
-    # support, so force synchronous scheduling. Only EAGLE/EAGLE3 have a V1 worker;
-    # STANDALONE always uses V2 and must keep overlap.
-    if (
-        server_args.speculative_algorithm in ("EAGLE", "EAGLE3")
-        and server_args.speculative_eagle_worker == "v1"
-        and not server_args.disable_overlap_schedule
-    ):
-        server_args.disable_overlap_schedule = True
-        logger.warning(
-            "--speculative-eagle-worker=v1 does not support overlap scheduling; "
-            "forcing --disable-overlap-schedule on. Pass --speculative-eagle-worker=v2 "
-            "to use the overlap-capable worker."
-        )
-
     if resolved_view(server_args).disable_overlap_schedule:
         logger.warning(
             "Non-overlap (synchronous) spec v2 is used for eagle/eagle3/standalone "

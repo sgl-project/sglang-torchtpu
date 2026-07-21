@@ -140,6 +140,10 @@ class TpuSRTPlatform(SRTPlatform):
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
             if spec_algo == "EAGLE3":
+                if server_args.speculative_use_rejection_sampling:
+                    raise NotImplementedError(
+                        "EAGLE3 rejection sampling is not supported on TPU yet."
+                    )
                 if (server_args.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
                         "EAGLE3 topk > 1 is not supported on TPU yet."

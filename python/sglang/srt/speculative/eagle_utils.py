@@ -576,9 +576,9 @@ def eagle_prepare_for_verify(
         ForwardBatch,
         ForwardMode,
     )
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-    from sglang.srt.speculative.triton_ops.cache_locs import (
+    from sglang.srt.speculative.spec_utils import (
         assign_extend_cache_locs_func,
+        prepare_mamba_track_for_verify,
     )
 
     if not batch.forward_mode.is_idle():
@@ -600,6 +600,8 @@ def eagle_prepare_for_verify(
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
+            host_req_pool_indices=batch.req_pool_indices_cpu,
+            host_seq_lens=batch.seq_lens_cpu,
         )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
@@ -742,15 +744,22 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        if _use_torch_native:
+            top_k_renorm_prob = top_k_renorm_prob_func
+            top_p_renorm_prob = top_p_renorm_prob_func
+            tree_speculative_sampling_target_only = (
+                tree_speculative_sampling_target_only_func
+            )
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
 
-        from sglang.srt.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
+            from sglang.srt.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
 
         use_rejection_sampling = (
             get_global_server_args().speculative_use_rejection_sampling
@@ -802,11 +811,14 @@ def eagle_sample(
         # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+        if _use_torch_native:
+            sampling_fn = tree_speculative_sampling_target_only
+        else:
+            sampling_fn = (
+                chain_speculative_sampling_triton
+                if use_rejection_sampling
+                else tree_speculative_sampling_target_only
+            )
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

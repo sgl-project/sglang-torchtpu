@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _get_hbm_usage_mb,
     _hbm_delta_str,
+    _restore_forward_batch_metadata,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -192,12 +193,33 @@ class SpecDecodeCompilePolicyMixin:
         Carries the attributes Dynamo probes without affecting the forward
         result, so both branches of ``if spec_info is not None`` are traced.
         """
-        return EagleDraftInput.create_idle_input(
-            device=self.model_runner.device,
+        return self._make_idle_draft_input(
             hidden_size=self.eagle_hidden_size or 1,
-            dtype=self.model_runner.dtype,
-            topk=self.speculative_eagle_topk,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+    def _make_idle_draft_input(
+        self, *, hidden_size: int, capture_hidden_mode: CaptureHiddenMode
+    ) -> EagleDraftInput:
+        """Build a warmup stub without consulting process-global ServerArgs."""
+        device = self.model_runner.device
+        return EagleDraftInput(
+            bonus_tokens=torch.empty(0, device=device, dtype=torch.int32),
+            hidden_states=torch.empty(
+                (0, hidden_size), device=device, dtype=self.model_runner.dtype
+            ),
+            topk_p=torch.empty(
+                (0, self.speculative_eagle_topk),
+                device=device,
+                dtype=torch.float32,
+            ),
+            topk_index=torch.empty(
+                (0, self.speculative_eagle_topk),
+                device=device,
+                dtype=torch.int64,
+            ),
+            draft_probs=None,
+            capture_hidden_mode=capture_hidden_mode,
         )
 
     def _make_verify_spec_info(self) -> Any:
@@ -225,7 +247,7 @@ class SpecDecodeCompilePolicyMixin:
         # DRAFT_EXTEND extends by the same width. Other extend modes use 1.
         if mode.is_target_verify() and spec_info is not None:
             return spec_info.draft_token_num
-        if mode.is_draft_extend() and self.draft_token_num:
+        if mode.is_draft_extend_v2() and self.draft_token_num:
             return self.draft_token_num
         return 1
 
@@ -275,7 +297,7 @@ class SpecDecodeCompilePolicyMixin:
 
         # Restore real batch_size so downstream consumers (sampler, logprob,
         # scheduler hooks) don't iterate over ghost slots.
-        forward_batch.batch_size = real_b
+        _restore_forward_batch_metadata(forward_batch, real_b)
         return out
 
     def pad_draft_decode(self, forward_batch: Any) -> None:
@@ -307,6 +329,10 @@ class SpecDecodeCompilePolicyMixin:
             forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,
         )
 
+        mm_inputs = getattr(forward_batch, "mm_inputs", None)
+        if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+            forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
+
         # EagleDraftInput seeds consumed by select_top_k_tokens.
         spec_info = forward_batch.spec_info
         if spec_info is not None:
@@ -327,7 +353,23 @@ class SpecDecodeCompilePolicyMixin:
         real_bs = getattr(forward_batch, _REAL_B_KEY, None)
         if real_bs is None:
             return outputs
-        return tuple(t[:real_bs] for t in outputs)
+        forward_batch.batch_size = real_bs
+        # draft_probs is absent when rejection sampling is disabled.
+        return tuple(t[:real_bs] if t is not None else None for t in outputs)
+
+    def pad_draft_extend_v2(
+        self, forward_batch: Any, model_runner: Any, num_draft_tokens: int
+    ) -> None:
+        """Bucket V2 draft-extend before attention metadata is constructed."""
+        if self.b_bucketer is None:
+            return
+        real_bs = int(forward_batch.seq_lens.shape[0])
+        pad_b = self.b_bucketer.next_bucket(real_bs)
+        if pad_b == real_bs:
+            return
+        forward_batch._pad_inputs_to_size(model_runner, pad_b * num_draft_tokens, pad_b)
+        forward_batch.batch_size = pad_b
+        setattr(forward_batch, _REAL_B_KEY, real_bs)
 
 
 class SpecDecoderTpuCompilePolicy(

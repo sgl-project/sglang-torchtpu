@@ -93,6 +93,27 @@ class TestTpuPlatformMemory(CustomTestCase):
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
+    def test_rejection_sampling_is_rejected(self):
+        args = SimpleNamespace(
+            dtype=None,
+            attention_backend=None,
+            disable_cuda_graph=False,
+            disable_piecewise_cuda_graph=False,
+            enable_torch_compile=True,
+            disable_overlap_schedule=False,
+            mem_fraction_static=None,
+            tp_size=1,
+            use_ray=False,
+            hicache_io_backend=None,
+            speculative_algorithm="EAGLE3",
+            speculative_eagle_topk=1,
+            speculative_use_rejection_sampling=True,
+            page_size=None,
+        )
+        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
+            with self.assertRaisesRegex(NotImplementedError, "rejection sampling"):
+                TpuSRTPlatform().apply_server_args_defaults(args)
+
     @patch(
         "sglang.srt.hardware_backend.tpu.tpu_platform.TpuSRTPlatform.apply_server_args_defaults"
     )

@@ -104,10 +104,15 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
     # Restore real batch_size and seq_lens so downstream consumers (sampler,
     # logprob, scheduler hooks, the prefill-only dummy-token sizing in
     # tp_worker) don't iterate over ghost slots.
+    _restore_forward_batch_metadata(forward_batch, real_b)
+    return out
+
+
+def _restore_forward_batch_metadata(forward_batch: Any, real_b: int) -> None:
+    """Remove compile-only batch rows before eager post-forward consumers."""
     forward_batch.batch_size = real_b
     if forward_batch.seq_lens.shape[0] > real_b:
         forward_batch.seq_lens = forward_batch.seq_lens[:real_b]
-    return out
 
 
 class DecoderTpuCompilePolicy(CompilePolicy):
@@ -477,7 +482,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
     ) -> ForwardBatch:
         """Construct a dummy ForwardBatch at the target bucket shape."""
         device = self.model_runner.device
-        is_extend = mode.is_extend()
+        is_extend = mode.is_extend(include_draft_extend_v2=True)
         slot = self._dummy_kv_slot()
 
         # Token-level inputs
