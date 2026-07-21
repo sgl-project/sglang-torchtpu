@@ -49,6 +49,7 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "ray",
   "requests",
   "scipy",
   "sentencepiece",
@@ -80,6 +81,7 @@ dependencies = [
   "torchvision==0.26.0",
   "jax==0.10.2",
   "jaxlib==0.10.2",
+  "runai-model-streamer[s3,gcs,azure]",
 ]
 
 [project.optional-dependencies]
