@@ -1,6 +1,7 @@
 """Unit tests for HostKVCache alloc/free bookkeeping (double-alloc / double-free detection)."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -26,16 +27,25 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             enable_memory_saver=False,
         )
-        self.host_pool = MHATokenToKVPoolHost(
-            device_pool=self.device_pool,
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=self.page_size,
-            layout="layer_first",
-            pin_memory=False,
-            device="cpu",
-            allocator_type="default",
-        )
+        # The host pool is tiny, but HostKVCache reserves a fixed 10 GB of host
+        # RAM as headroom; on low-memory CI runners the available RAM can be
+        # below that reserve, so even a ~0-byte request fails construction.
+        # Pretend there is ample free RAM so this bookkeeping test is
+        # independent of the runner's memory.
+        with patch(
+            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory"
+        ) as mock_vm:
+            mock_vm.return_value.available = 1 << 40  # 1 TiB
+            self.host_pool = MHATokenToKVPoolHost(
+                device_pool=self.device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=self.page_size,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+                allocator_type="default",
+            )
 
     def test_double_alloc(self):
         indices = self.host_pool.alloc(4)
