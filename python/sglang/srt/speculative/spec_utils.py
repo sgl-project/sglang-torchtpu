@@ -219,7 +219,7 @@ def allocate_and_assign_decode_cache(
             last_loc,
             num_needed_tokens,
         )
-        out_cache_loc_host = getattr(allocator, "last_alloc_extend_cpu", None)
+        out_cache_loc_host = allocator.last_alloc_extend_cpu
 
     assign_locs = out_cache_loc
     if host_resident:
@@ -380,10 +380,10 @@ def fill_bonus_tokens_func(
     fill_bonus_tokens[(bs,)](accept_tokens, accept_lens, bonus_tokens, num_draft_tokens)
 
 
-def fill_accepted_out_cache_loc_func(
+def fill_accept_out_cache_loc_func(
     accept_index: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    accepted_out_cache_loc: torch.Tensor,
+    accept_out_cache_loc: torch.Tensor,
 ) -> None:
     """Compact accepted source slots to the front, preserving order."""
     size = accept_index.numel()
@@ -395,21 +395,21 @@ def fill_accepted_out_cache_loc_func(
         mask_i = mask.to(torch.int64)
         destinations = torch.cumsum(mask_i, dim=0) - mask_i
         values = out_cache_loc.reshape(-1)[flat.clamp(min=0)].to(
-            accepted_out_cache_loc.dtype
+            accept_out_cache_loc.dtype
         )
         discard = torch.full_like(destinations, size)
         buffer = torch.zeros(
             size + 1,
-            dtype=accepted_out_cache_loc.dtype,
-            device=accepted_out_cache_loc.device,
+            dtype=accept_out_cache_loc.dtype,
+            device=accept_out_cache_loc.device,
         )
         buffer.scatter_(0, torch.where(mask, destinations, discard), values)
-        accepted_out_cache_loc.copy_(buffer[:size])
+        accept_out_cache_loc.copy_(buffer[:size])
         return
     fill_accept_out_cache_loc[(size,)](
         accept_index,
         out_cache_loc,
-        accepted_out_cache_loc,
+        accept_out_cache_loc,
         next_power_of_2(size),
     )
 
@@ -1298,7 +1298,7 @@ def move_accept_tokens_to_target_kvcache(
         batch.seq_lens + num_correct_drafts + 1,
         tgt_cache_loc,
     )
-    fill_accepted_out_cache_loc_func(
+    fill_accept_out_cache_loc_func(
         accept_index,
         batch.out_cache_loc,
         accept_out_cache_loc,

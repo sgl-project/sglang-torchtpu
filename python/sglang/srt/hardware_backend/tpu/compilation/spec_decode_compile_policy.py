@@ -201,7 +201,7 @@ class SpecDecodeCompilePolicyMixin:
     def _make_idle_draft_input(
         self, *, hidden_size: int, capture_hidden_mode: CaptureHiddenMode
     ) -> EagleDraftInput:
-        """Build a warmup stub without consulting process-global ServerArgs."""
+        """Build a warmup stub."""
         device = self.model_runner.device
         return EagleDraftInput(
             bonus_tokens=torch.empty(0, device=device, dtype=torch.int32),

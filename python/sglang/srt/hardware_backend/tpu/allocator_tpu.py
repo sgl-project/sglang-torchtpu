@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
+    def __init__(self, *args, **kwargs):
+        self.last_alloc_extend_cpu = None
+        super().__init__(*args, **kwargs)
+
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
         self.free_pages = torch.arange(
@@ -54,6 +58,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.release_pages = torch.empty((0,), dtype=torch.int32, device="cpu")
         self.is_not_in_free_group = True
         self.free_group = []
+        self.last_alloc_extend_cpu = None
 
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.

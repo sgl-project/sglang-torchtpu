@@ -77,13 +77,16 @@ class TestAllocatorPoolLifecycle(CustomTestCase):
 
     def test_clear_restores_full_pool(self):
         a = _make_allocator(size=32, page_size=4)
+        self.assertIsNone(a.last_alloc_extend_cpu)
         # Drain a couple of pages, then clear() must restore IDs 1..8.
         out = a.alloc(8)  # 2 pages worth of tokens
         self.assertIsNotNone(out)
         self.assertEqual(len(a.free_pages), 6)
+        a.last_alloc_extend_cpu = torch.tensor([1, 2], dtype=torch.int32)
         a.clear()
         self.assertEqual(len(a.free_pages), 8)
         self.assertEqual(int(a.free_pages.min()), 1)
+        self.assertIsNone(a.last_alloc_extend_cpu)
 
 
 class TestAllocDecode(CustomTestCase):
