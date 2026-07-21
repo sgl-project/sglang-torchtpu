@@ -28,7 +28,7 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
         case _:
             target_bytes = (128 * 1024) * 0.8
 
-    # Calculate max safe column size based on VMEM budget and aligne to 128.
+    # Calculate max safe column size based on VMEM budget and align to 128.
     num_buffers = 2
     bytes_per_col = (lanes + lanes // packing) * 4 * num_buffers
     max_safe_col = int((target_bytes // bytes_per_col) // 128) * 128
