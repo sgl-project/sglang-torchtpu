@@ -405,7 +405,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
             )
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
             seq_lens = forward_batch.seq_lens.to(torch.int32)

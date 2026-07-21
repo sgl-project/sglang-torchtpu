@@ -225,7 +225,7 @@ class SpecDecodeCompilePolicyMixin:
         # DRAFT_EXTEND extends by the same width. Other extend modes use 1.
         if mode.is_target_verify() and spec_info is not None:
             return spec_info.draft_token_num
-        if mode.is_draft_extend() and self.draft_token_num:
+        if mode.is_draft_extend_v2() and self.draft_token_num:
             return self.draft_token_num
         return 1
 
