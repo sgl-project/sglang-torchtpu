@@ -41,7 +41,11 @@ from sglang.srt.disaggregation.tpu.conn import (
     _tcp_endpoint,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
+
+# Enable Perfetto tracing for tests to exercise tracing code paths
+envs.SGLANG_ENABLE_PERFETTO_TRACING.set(True)
 
 
 def _skip_if_no_tpu() -> bool:

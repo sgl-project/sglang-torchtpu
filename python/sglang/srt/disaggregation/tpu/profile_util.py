@@ -7,7 +7,18 @@ import threading
 import time
 from typing import Any
 
-_PERFETTO = True
+class _LazyPerfetto:
+    """Lazy initializer/evaluator for _PERFETTO flag using sglang envs."""
+
+    def __bool__(self) -> bool:
+        try:
+            from sglang.srt.environ import envs
+            return bool(envs.SGLANG_ENABLE_PERFETTO_TRACING.get())
+        except Exception:
+            return False
+
+
+_PERFETTO = _LazyPerfetto()
 
 
 def _fmt_bytes(n: float) -> str:
