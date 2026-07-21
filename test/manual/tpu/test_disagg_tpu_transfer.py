@@ -41,7 +41,11 @@ from sglang.srt.disaggregation.tpu.conn import (
     _tcp_endpoint,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
+
+# Enable Perfetto tracing for tests to exercise tracing code paths
+envs.SGLANG_ENABLE_PERFETTO_TRACING.set(True)
 
 
 def _skip_if_no_tpu() -> bool:
@@ -149,6 +153,8 @@ def _bare_manager(mode, pool, aux_tensors):
     """Construct a TpuKVManager with only the CommonKVManager state our data
     /control-plane methods touch — bypassing distributed/bootstrap init."""
     m = object.__new__(TpuKVManager)
+    m._name = "TpuKVManager"
+    m.kv_pool = None
     m.disaggregation_mode = mode
     m.request_status = {}
     m.failure_records = {}
@@ -163,6 +169,11 @@ def _bare_manager(mode, pool, aux_tensors):
     m._aux_keepalive = aux_tensors  # keep buffers alive for ctypes
 
     ctx = zmq.Context.instance()
+    m._zmq_ctx = ctx
+    m._socket_cache = {}
+    m._monitor_cache = {}
+    m._socket_lock = threading.Lock()
+
     sock = ctx.socket(zmq.PULL)
     sock.setsockopt(zmq.RCVTIMEO, 5000)
     port = sock.bind_to_random_port("tcp://127.0.0.1")
