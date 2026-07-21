@@ -181,6 +181,17 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4, 4, 0, 0])
         self.assertEqual(fb.batch_size, 4)
 
+    def test_draft_extend_v2_rejects_unset_num_tokens_per_req(self):
+        fb = _forward_batch(real_t=8, real_b=2, mode="draft_extend_v2")
+        fb.spec_info = SimpleNamespace(num_tokens_per_req=-1)
+
+        with self.assertRaisesRegex(AssertionError, "num_tokens_per_req > 0"):
+            _pad_forward_batch_inputs(
+                fb,
+                t_bucketer=_bucketer("Token", [64]),
+                b_bucketer=_bucketer("Bs", [1, 4]),
+            )
+
     def test_decode_uses_bs_bucketer_for_tokens(self):
         # In DECODE, token-axis tensors share the bs bucketer
         # (one query token per running seq).

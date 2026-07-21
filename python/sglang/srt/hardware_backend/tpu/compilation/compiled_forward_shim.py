@@ -267,7 +267,12 @@ def _pad_forward_batch_inputs(
         real_q_out, real_b_out = real_q, real_b
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)
-        pad_t = pad_b * forward_batch.spec_info.num_tokens_per_req
+        num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
+        assert num_tokens_per_req > 0, (
+            "DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, "
+            f"got {num_tokens_per_req}"
+        )
+        pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling

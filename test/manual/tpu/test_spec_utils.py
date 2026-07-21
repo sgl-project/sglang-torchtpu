@@ -64,6 +64,20 @@ def test_draft_cache_gather_randomized_and_empty():
         assert torch.equal(out, expected.to(torch.int64))
 
 
+def test_draft_cache_gather_at_pool_boundary():
+    table = torch.arange(2 * 8, dtype=torch.int32).reshape(2, 8)
+    rows = torch.tensor([0, 1], dtype=torch.int32)
+    starts = torch.tensor([5, 5], dtype=torch.int32)
+    out = torch.empty(6, dtype=torch.int64)
+
+    with _ForceTpu():
+        kernels.assign_draft_cache_locs_contiguous_func(
+            rows, table, starts, out, topk=1, speculative_num_steps=3
+        )
+
+    assert torch.equal(out, torch.tensor([5, 6, 7, 13, 14, 15]))
+
+
 def test_draft_cache_uses_host_shadows():
     table = torch.arange(4 * 32).reshape(4, 32)
     out = torch.zeros(4, dtype=torch.int32)
