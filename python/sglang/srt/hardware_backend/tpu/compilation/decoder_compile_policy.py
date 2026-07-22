@@ -38,16 +38,22 @@ _COMPILE_BAR_FORMAT = (
 )
 
 
-def _materialize_out(out: Any, forward_batch: Any) -> None:
-    """Sync returned tensors and backend-marked KV side effects."""
+def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
+    """Sync returned tensors and backend-marked KV side effects.
+
+    attn_backend / token_to_kv_pool come from the model_runner: upstream moved
+    both off ForwardBatch (attn_backend now flows through ForwardContext, and the
+    KV pool is held by the attention backend / model_runner), so warmup reads them
+    from the runner rather than the batch.
+    """
     tensors: list[torch.Tensor] = []
 
     next_token_logits = getattr(out, "next_token_logits", None)
     if isinstance(next_token_logits, torch.Tensor):
         tensors.append(next_token_logits)
 
-    if getattr(forward_batch.attn_backend, "requires_kv_sync_after_compile", False):
-        pool = forward_batch.token_to_kv_pool
+    if getattr(attn_backend, "requires_kv_sync_after_compile", False):
+        pool = token_to_kv_pool
         for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
             tensors.append(pool.get_fused_kv_buffer(layer_id))
 
@@ -216,24 +222,37 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         An idle rank may take a different code path than decode, but with DP
         attention all ranks must run the same code. Relabel idle as DECODE.
+
+        Upstream removed ``ModelRunner.forward_idle`` (idle now flows through
+        ``ModelRunner.forward`` -> the eager runner), so hook ``forward`` and
+        relabel idle batches at entry; the ``is_idle()`` guard keeps decode /
+        extend batches untouched.
         """
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         model_runner = self.model_runner
         # Idempotent: a re-install (tests, warmups) must not nest a second
-        # wrapper around an already-wrapped forward_idle.
-        if getattr(model_runner.forward_idle, "_tpu_idle_as_decode", False):
+        # wrapper around an already-wrapped forward.
+        if getattr(model_runner.forward, "_tpu_idle_as_decode", False):
             return
-        orig_forward_idle = model_runner.forward_idle
+        orig_forward = model_runner.forward
 
-        def forward_idle(forward_batch, pp_proxy_tensors=None):
-            if forward_batch.batch_size > 0 and is_dp_attention_enabled():
+        def forward(forward_batch, *args, **kwargs):
+            # Relabel only; forward()'s decode path (eager runner) runs
+            # prepare_forward_batch exactly once. Do NOT prepare here — the
+            # shim's _prepare is not idempotent, and a second call overwrites
+            # _REAL_Q/_REAL_B with the already-padded size, so outputs never get
+            # unpadded (garbage decode under DP attention).
+            if (
+                forward_batch.forward_mode.is_idle()
+                and forward_batch.batch_size > 0
+                and is_dp_attention_enabled()
+            ):
                 forward_batch.forward_mode = ForwardMode.DECODE
-                model_runner.model.prepare_forward_batch(forward_batch)
-            return orig_forward_idle(forward_batch, pp_proxy_tensors)
+            return orig_forward(forward_batch, *args, **kwargs)
 
-        forward_idle._tpu_idle_as_decode = True
-        model_runner.forward_idle = forward_idle
+        forward._tpu_idle_as_decode = True
+        model_runner.forward = forward
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Forward serving-time recompilation checks to the installed shim."""
@@ -375,11 +394,26 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         model.prepare_forward_batch(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
+        # The compiled forward resolves its attention backend from the forward
+        # context (upstream moved attn_backend off ForwardBatch into a
+        # ForwardContext). Serving establishes it in ModelRunner.forward, but the
+        # warmup path invokes the compiled forward directly, so set it here too.
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
-        with torch.no_grad():
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ), torch.no_grad():
             out = self.owner.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
-            _materialize_out(out, forward_batch)
+            _materialize_out(
+                out,
+                self.model_runner.attn_backend,
+                self.model_runner.token_to_kv_pool,
+            )
 
     def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
         return _unpad_decoder_outputs(out, forward_batch)
@@ -506,10 +540,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             mrope_positions=mrope_positions,
-            attn_backend=self.model_runner.attn_backend,
             # Model accesses ``capture_hidden_mode.need_capture()``; default
             # of None would raise AttributeError inside the compiled region.
             capture_hidden_mode=capture_hidden_mode,

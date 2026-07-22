@@ -17,7 +17,6 @@ on:
   # Disabled in sglang-torchtpu: TPU PRs should not spawn extra GPU checks.
   # Extra CI remains available via workflow_dispatch and workflow_call.
   # pull_request:
-  #   branches: [main]
   #   # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
   #   # is added after the latest push — otherwise GHA leaves the stale
   #   # skipped run in place and there's no way to enable extra without
@@ -32,6 +31,11 @@ on:
         default: false
       test_parallel_dispatch:
         description: "Test parallel dispatch behavior (simulates scheduled run)"
+        required: false
+        type: boolean
+        default: false
+      run_all_tests:
+        description: "Run all tests — bypasses paths-filter (needed when dispatching against long-lived branches whose diff against main can't resolve a merge-base in a shallow clone)"
         required: false
         type: boolean
         default: false
@@ -119,7 +123,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       needs.check-changes.result == 'success' &&
-      needs.call-gate.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
@@ -132,7 +136,7 @@ jobs:
   # =============================================== extra-a (1-/2-gpu) ===============================================
   extra-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-a-test-1-gpu-small
@@ -145,7 +149,7 @@ jobs:
 
   extra-a-test-1-gpu-large:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-a-test-1-gpu-large
@@ -159,7 +163,7 @@ jobs:
 
   extra-a-test-2-gpu-large:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-a-test-2-gpu-large
@@ -173,7 +177,7 @@ jobs:
   # =============================================== extra-b (4-/8-gpu) ===============================================
   extra-b-test-4-gpu-h100:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-4-gpu-h100
@@ -186,7 +190,7 @@ jobs:
 
   extra-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-4-gpu-b200
@@ -200,7 +204,7 @@ jobs:
 
   extra-b-test-8-gpu-h200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-8-gpu-h200
@@ -211,9 +215,23 @@ jobs:
       run_timeout_minutes: '60'
     secrets: inherit
 
+  extra-b-test-deepep-4-gpu-b200:
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: extra-b-test-deepep-4-gpu-b200
+      runner_config: deepep-4-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      run_timeout_minutes: '60'
+      timeout_per_file: '1800'
+    secrets: inherit
+
   extra-b-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-deepep-8-gpu-h200
@@ -240,6 +258,7 @@ jobs:
         extra-b-test-4-gpu-h100,
         extra-b-test-4-gpu-b200,
         extra-b-test-8-gpu-h200,
+        extra-b-test-deepep-4-gpu-b200,
         extra-b-test-deepep-8-gpu-h200,
       ]
     if: always()

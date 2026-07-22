@@ -92,9 +92,6 @@ class TpuKVManagerBase(CommonKVManager):
     """Shared manager scaffolding: pool attachment, the ZMQ recv-loop starter,
     and role dispatch. Subclasses provide the data-plane methods + role init."""
 
-    # Overridden by subclasses for log / error text and recv-thread names.
-    BACKEND_NAME = "tpu"
-
     def __init__(
         self,
         args: KVArgs,
@@ -102,11 +99,10 @@ class TpuKVManagerBase(CommonKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # Concrete subclass name, used in logs, error messages, thread names.
+        self._name = type(self).__name__
         if is_mla_backend:
-            raise NotImplementedError(
-                f"The {self.BACKEND_NAME!r} disaggregation backend does not "
-                "support MLA models yet."
-            )
+            raise NotImplementedError(f"{self._name} does not support MLA models yet.")
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
         # Filled in later by the scheduler via attach_kv_pool(); the bootstrap
@@ -125,6 +121,12 @@ class TpuKVManagerBase(CommonKVManager):
             self._init_prefill()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._init_decode()
+        else:
+            raise ValueError(
+                f"{self._name} expects disaggregation mode "
+                f"{DisaggregationMode.PREFILL} or {DisaggregationMode.DECODE}, "
+                f"got {self.disaggregation_mode}"
+            )
 
     # ---- pool attachment (shared) ---------------------------------------
 
@@ -133,6 +135,11 @@ class TpuKVManagerBase(CommonKVManager):
         Extracts the block-indexed per-layer buffers + their dtype/shape specs
         (shared), then defers backend-specific setup to ``_on_pool_attached``.
         Called once at scheduler init."""
+        if self.kv_pool is not None:
+            raise RuntimeError(
+                f"{self._name}: a KV pool is already attached. "
+                "A second attach is unexpected."
+            )
         self.kv_pool = kv_pool
         self.layer_buffers = tpu_transfer.get_layer_page_buffers(kv_pool)
         self.layer_specs = tpu_transfer.layer_page_specs(self.layer_buffers)
@@ -143,7 +150,7 @@ class TpuKVManagerBase(CommonKVManager):
         Default just logs the attachment."""
         logger.info(
             "%s attached KV pool %s: %d layer buffers",
-            type(self).__name__,
+            self._name,
             type(self.kv_pool).__name__,
             len(self.layer_buffers) if self.layer_buffers else 0,
         )
@@ -151,7 +158,7 @@ class TpuKVManagerBase(CommonKVManager):
     def _require_pool(self):
         if self.layer_buffers is None:
             raise RuntimeError(
-                f"{type(self).__name__}.attach_kv_pool() was never called; the "
+                f"{self._name}.attach_kv_pool() was never called; the "
                 "KV pool tensors are required for TPU P/D transfer."
             )
 
@@ -166,29 +173,28 @@ class TpuKVManagerBase(CommonKVManager):
         own buffers) instead of materialising ``bytes`` — the handler then copies
         each frame straight into its destination, saving one host copy. The tag
         is read via ``bytes(msg[0])`` so the dispatch works for either form."""
+        name = self._name
 
         def loop():
             while True:
                 try:
                     msg = self.server_socket.recv_multipart(copy=copy)
                 except Exception as e:  # pragma: no cover - socket teardown
-                    logger.debug("%s recv loop ending: %s", self.BACKEND_NAME, e)
+                    logger.warning("%s recv loop ending: %s", name, e)
                     return
                 if not msg or bytes(msg[0]) != expected_tag:
-                    logger.warning(
-                        "%s recv: unexpected msg tag %r", self.BACKEND_NAME, msg[:1]
-                    )
+                    logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
                     continue
                 try:
                     handler(msg)
                 except Exception:
                     logger.exception(
-                        "%s: error handling %r message", self.BACKEND_NAME, expected_tag
+                        "%s: error handling %r message", name, expected_tag
                     )
 
         threading.Thread(
             target=loop,
-            name=f"{self.BACKEND_NAME}-kv-{self.disaggregation_mode.value}",
+            name=f"{name}-{self.disaggregation_mode.value}",
             daemon=True,
         ).start()
 
@@ -199,28 +205,27 @@ class TpuKVManagerBase(CommonKVManager):
 
         ``copy=False`` receives zero-copy ``zmq.Frame``s (see :meth:`_serve`);
         the tag is read via ``bytes(msg[0])`` so dispatch works either way."""
+        name = self._name
 
         def loop():
             while True:
                 try:
                     msg = self.server_socket.recv_multipart(copy=copy)
                 except Exception as e:  # pragma: no cover - socket teardown
-                    logger.debug("%s recv loop ending: %s", self.BACKEND_NAME, e)
+                    logger.warning("%s recv loop ending: %s", name, e)
                     return
                 handler = handlers.get(bytes(msg[0])) if msg else None
                 if handler is None:
-                    logger.warning(
-                        "%s recv: unexpected msg tag %r", self.BACKEND_NAME, msg[:1]
-                    )
+                    logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
                     continue
                 try:
                     handler(msg)
                 except Exception:
-                    logger.exception("%s: error handling %r", self.BACKEND_NAME, msg[0])
+                    logger.exception("%s: error handling %r", name, msg[0])
 
         threading.Thread(
             target=loop,
-            name=f"{self.BACKEND_NAME}-kv-{self.disaggregation_mode.value}",
+            name=f"{name}-{self.disaggregation_mode.value}",
             daemon=True,
         ).start()
 
@@ -231,6 +236,11 @@ class TpuKVManagerBase(CommonKVManager):
         choose what value to stash per endpoint via ``_record_decode_endpoint``."""
         # [TAG, room, decode_ip, decode_port, aux_present, num_pages,
         #  required_dst_info_num, decode_prefix_len]
+        if len(msg) != 8:
+            raise ValueError(
+                f"Malformed {TAG_TRSFR.decode()} message. "
+                f"Expected 8 frames, got {len(msg)}."
+            )
         room = int(msg[1].decode())
         decode_ip = msg[2].decode()
         decode_port = int(msg[3].decode())

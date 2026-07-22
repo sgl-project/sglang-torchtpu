@@ -1082,8 +1082,8 @@ def _ragged_paged_attention_kernel_loop(
                                         bq_c,
                                         bk_c,
                                         bv_c,
-                                        l_ref.at[*lm_slice],
-                                        m_ref.at[*lm_slice],
+                                        l_ref.at[lm_slice],
+                                        m_ref.at[lm_slice],
                                         processed_q_len=processed_q_len + bq_start,
                                         processed_kv_len=processed_kv_len + bkv_start,
                                         effective_kv_len=effective_kv_len,
@@ -1095,7 +1095,7 @@ def _ragged_paged_attention_kernel_loop(
                                     cur_p,
                                     cur_v,
                                     cur_exp_m_diff,
-                                    acc_ref.at[*lm_slice],
+                                    acc_ref.at[lm_slice],
                                 )
 
             # Load acc and calculate final output.

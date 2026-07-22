@@ -85,7 +85,7 @@ class RaidenKVTransfer:
 
     def __init__(
         self,
-        device_pool: "TpuFusedMHATokenToKVPool",
+        device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
     ):
         from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager

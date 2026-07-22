@@ -75,16 +75,32 @@ class TpuSRTPlatform(SRTPlatform):
     def apply_server_args_defaults(self, server_args) -> None:
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
-        _prepare_tpu_env(server_args.tp_size)
+        # Under Ray the slicebuilder/topology env is built per-rank after the
+        # cluster's real node IPs are discovered (multihost: per-actor from Ray
+        # IPs in _prepare_tpu_env; single-host: seeded once in
+        # RayEngine._launch_scheduler_processes). Building it here -- in the
+        # orchestrator, before discovery -- would emit a bogus single-host
+        # (localhost) env that never applies to the actual ranks. Still apply
+        # the libtpu/env overrides now so actors inherit them before importing
+        # torch_tpu.
+        _prepare_tpu_env(
+            server_args.tp_size, setup_slicebuilder=not server_args.use_ray
+        )
 
         if server_args.dtype is None or server_args.dtype == "auto":
-            server_args.dtype = "bfloat16"
+            server_args.override("tpu.apply_server_args_defaults", dtype="bfloat16")
 
         if server_args.attention_backend is None:
-            server_args.attention_backend = self.get_default_attention_backend()
+            server_args.override(
+                "tpu.apply_server_args_defaults",
+                attention_backend=self.get_default_attention_backend(),
+            )
 
-        server_args.disable_cuda_graph = True
-        server_args.disable_piecewise_cuda_graph = True
+        server_args.override(
+            "tpu.apply_server_args_defaults",
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+        )
         # ``enable_torch_compile`` is honored on TPU and wired up by
         # ``TpuGraphRunner`` (see ``ModelRunner.init_device_graphs``). Off by
         # default (the SGLang-wide default); opt in with ``--enable-torch-compile``.
@@ -97,7 +113,9 @@ class TpuSRTPlatform(SRTPlatform):
         # ``--disable-overlap-schedule``.
 
         if server_args.mem_fraction_static is None:
-            server_args.mem_fraction_static = 0.40
+            server_args.override(
+                "tpu.apply_server_args_defaults", mem_fraction_static=0.40
+            )
 
         # raiden's load-back keeps the reloaded prefix's slot indices on CPU
         # (TpuRaidenHiCacheController.load), so req_to_token must stay
@@ -133,7 +151,7 @@ class TpuSRTPlatform(SRTPlatform):
                 )
 
         if server_args.page_size is None:
-            server_args.page_size = 64
+            server_args.override("tpu.apply_server_args_defaults", page_size=64)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -182,9 +200,13 @@ class TpuSRTPlatform(SRTPlatform):
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
         from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
             TpuFusedMHATokenToKVPoolHost,
         )
+
+        # Upstream relocated MHATokenToKVPoolHost from mem_cache.memory_pool_host
+        # into the mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the
+        # fork's own class and still lives in memory_pool_host.
+        from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.server_args import get_global_server_args
 
         # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the

@@ -85,7 +85,7 @@ class StageBuf:
 
     __slots__ = ("nbytes", "_t", "_pool", "_locked")
 
-    def __init__(self, nbytes: int, pool: Optional["PinnedHostPool"]):
+    def __init__(self, nbytes: int, pool: Optional[PinnedHostPool]):
         self.nbytes = nbytes
         self._t = torch.empty(nbytes, dtype=torch.uint8)  # 64B-aligned (torch CPU)
         self._pool = pool

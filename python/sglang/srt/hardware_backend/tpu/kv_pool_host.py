@@ -42,11 +42,11 @@ RAIDEN_LAYOUT = "fused_raiden"
 class TpuRaidenHostKVCache(HostKVCache):
     """Page-granular host KV pool whose storage + transfer live in raiden."""
 
-    device_pool: "TpuFusedMHATokenToKVPool"
+    device_pool: TpuFusedMHATokenToKVPool
 
     def __init__(
         self,
-        device_pool: "TpuFusedMHATokenToKVPool",
+        device_pool: TpuFusedMHATokenToKVPool,
         host_to_device_ratio: float,
         host_size: int,
         page_size: int,
@@ -164,7 +164,7 @@ class TpuRaidenHostKVCache(HostKVCache):
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
-    ) -> "RaidenFutureEvent":
+    ) -> RaidenFutureEvent:
         """D2H for all layers in one raiden call; returns its future-event."""
         device_pages = self._to_page_ids(device_indices)
         host_pages = self._to_page_ids(host_indices)
@@ -172,7 +172,7 @@ class TpuRaidenHostKVCache(HostKVCache):
 
     def load_all_layer(
         self, device_pool, host_indices, device_indices
-    ) -> "RaidenFutureEvent":
+    ) -> RaidenFutureEvent:
         """H2D for all layers in one raiden call; returns its future-event."""
         host_pages = self._to_page_ids(host_indices)
         device_pages = self._to_page_ids(device_indices)

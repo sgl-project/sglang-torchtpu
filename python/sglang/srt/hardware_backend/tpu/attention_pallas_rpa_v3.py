@@ -249,7 +249,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # second page_indices tensor with indices translated into the SWA
         # sub-pool. ``token_to_kv_pool`` carries the full→swa index mapping.
         self._is_hybrid_swa = bool(getattr(model_runner, "is_hybrid_swa", False))
-        self._token_to_kv_pool = model_runner.token_to_kv_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
 
         # fp8 KV cache: when the resolved cache dtype is fp8, K/V are quantized
         # before the kernel call and the kernel dequantizes on read via
@@ -281,7 +281,11 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # ------------------------------------------------------------------ #
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        forward_batch.token_to_kv_pool.tpu_commit_pending_loads()
+        # Land deferred HiCache reload commits into the KV buffers before any
+        # layer reads KV; this hook runs per forward in eager AND compiled.
+        # Use the backend's cached pool: upstream moved token_to_kv_pool off
+        # ForwardBatch onto the attn backend (see self.token_to_kv_pool above).
+        self.token_to_kv_pool.tpu_commit_pending_loads()
 
         # Look up the cached RPA ``distribution`` on TPU, so we don't build it,
         # don't H2D it per step, and don't need the barrier that ensured the RPA
@@ -401,7 +405,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
             )
-        elif forward_batch.forward_mode.is_draft_extend():
+        elif forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
             # initial prefill; seq_lens and extend_seq_lens are current.
             seq_lens = forward_batch.seq_lens.to(torch.int32)
@@ -457,7 +461,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             # first token of each page and divide by page_size again.
             # ``full_to_swa_index_mapping`` is registered by
             # ``SWATokenToKVPoolAllocator`` at init time.
-            full_to_swa = self._token_to_kv_pool.full_to_swa_index_mapping
+            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
@@ -551,7 +555,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # this builder free of on-device gathers.
         swa_page_indices: Optional[torch.Tensor] = None
         if self._is_hybrid_swa:
-            full_to_swa = self._token_to_kv_pool.full_to_swa_index_mapping
+            full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
                 "Hybrid-SWA model is configured but full_to_swa_index_mapping "
                 "has not been registered yet — did the allocator finish init?"
@@ -642,7 +646,7 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         if layer.v_head_dim < layer.qk_head_dim:
             v = torch.nn.functional.pad(v, (0, layer.qk_head_dim - layer.v_head_dim))
 
-        kv_cache = forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
         op = self._op
 

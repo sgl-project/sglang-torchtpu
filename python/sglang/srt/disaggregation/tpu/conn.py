@@ -563,7 +563,7 @@ class TpuKVManager(TpuKVManagerBase):
         return [bytes(f) for f in frames]
 
     @staticmethod
-    def _release_staged(chunk: "_PendingChunk") -> None:
+    def _release_staged(chunk: _PendingChunk) -> None:
         """Return any pooled StageBufs held by a chunk that won't be scattered
         (failure / teardown paths). No-op for the bytes (CPU) path."""
         for b in chunk.layer_blobs:

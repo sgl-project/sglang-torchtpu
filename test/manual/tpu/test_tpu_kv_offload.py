@@ -143,6 +143,13 @@ def _make_controller(target_dev, target_host, draft_dev=None, draft_host=None):
     controller.load_queue = []
     controller.ack_write_queue = []
     controller.ack_load_queue = []
+    # Storage (L3) is off in these data-plane tests, but the merged base
+    # HiCacheController write/load paths read these flags (set in __init__, which
+    # this __new__ fixture bypasses), so mirror their defaults.
+    controller.enable_storage = False
+    controller.storage_backend = None
+    controller.storage_backend_type = None
+    controller.enable_storage_metrics = False
     if draft_dev is not None:
         controller.set_draft_kv_pool(draft_dev, draft_host)
     return controller

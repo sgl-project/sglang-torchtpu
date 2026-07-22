@@ -1,17 +1,21 @@
-"""Unit tests for the FutureMap dynamic-index path (overlap_utils).
+"""Unit tests for the FutureMap dynamic-index store path (overlap_utils).
 
-On backends that bake a Python-int index as a compile-time constant (torch_tpu /
-XLA), the overlap FutureMap keeps its circular-buffer write offset on-device and
-writes with ``index_copy_`` instead of a slice assignment, so the future-map
-store does not recompile every step. These tests pin two things on CPU (no TPU
+On backends that bake a buffer WRITE offset as a compile-time constant
+(torch_tpu / XLA), the overlap FutureMap routes future-buffer writes through
+``_store`` with a tensor-indexed ``index_copy_`` instead of a ``buf[indices] =
+values`` setitem, so the compiled store graph shape stays static across overlap
+steps (no per-step XLA recompile). These tests pin two things on CPU (no TPU
 needed):
 
 * ``_device_use_dynamic_index`` selects that path only for the listed backends.
-* The dynamic path is **bit-identical** to the plain slice path — same indices,
-  same interval, same buffer contents — across many allocations including
-  circular-buffer wrap-around. That equivalence is the whole correctness claim;
-  it is device-independent, so we force the flag on a CPU FutureMap and diff the
-  two paths.
+* The dynamic (``index_copy_``) store is **bit-identical** to the plain setitem
+  store — same buffer contents — for the unique-row writes the relay issues.
+  That equivalence is the whole correctness claim; it is device-independent, so
+  we force the flag on a CPU FutureMap and diff the two paths.
+
+Upstream reworked FutureMap from a circular future-index buffer into a
+pool-indexed relay (writes keyed by req_pool_idx via publish/stash); the
+dynamic-index ``_store`` seam (fork PR #78) is preserved and is what we test.
 """
 
 import unittest
@@ -32,18 +36,22 @@ from sglang.srt.managers.overlap_utils import (
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-# A non-speculative SpeculativeAlgorithm stub: FutureMap.__init__ only calls
-# ``.is_none()`` (True -> the simple token_ids_buf path we exercise here).
+# A non-speculative SpeculativeAlgorithm stub. FutureMap.__init__ only stores it
+# (spec methods are hit lazily on the first stash, which these tests do not do).
 _SPEC_NONE = SimpleNamespace(is_none=lambda: True)
 
 
-def _make_future_map(*, max_running_requests=4, device="cpu") -> FutureMap:
+def _make_future_map(*, req_pool_size=16, device="cpu") -> FutureMap:
+    # FutureMap sizes its per-req_pool_idx buffers from
+    # req_to_token_pool.req_to_token.shape[0].
+    req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.zeros((req_pool_size, 1), dtype=torch.int64)
+    )
     return FutureMap(
-        max_running_requests=max_running_requests,
-        chunked_prefill_size=0,  # -> max_num_chunks = 0, future_limit = mrr * 3
-        context_len=0,
         device=device,
         spec_algo=_SPEC_NONE,
+        req_to_token_pool=req_to_token_pool,
+        needs_cpu_seq_lens=True,
     )
 
 
@@ -71,74 +79,56 @@ class TestDeviceUseDynamicIndex(CustomTestCase):
 
 
 class TestFutureMapInit(CustomTestCase):
-    def test_cpu_uses_static_path_and_no_device_counter(self):
-        fm = _make_future_map()
+    def test_cpu_uses_static_path(self):
+        fm = _make_future_map(req_pool_size=8)
+        # CPU is not a dynamic-index backend, so writes use the plain setitem.
         self.assertFalse(fm._use_dynamic_index)
-        # future_ct_dev is only allocated on the dynamic path.
-        self.assertFalse(hasattr(fm, "future_ct_dev"))
-        self.assertEqual(fm.future_limit, 12)  # 4 * (3 + 0)
-
-    def test_dynamic_path_allocates_device_counter(self):
-        # Simulate a dynamic-index backend on CPU (so no real TPU is required).
-        fm = _make_future_map()
-        fm._use_dynamic_index = True
-        fm.future_ct_dev = torch.zeros((), dtype=torch.int64)
-        self.assertEqual(fm.future_ct_dev.item(), 0)
+        # Buffers are sized by the req->token pool row count.
+        self.assertEqual(fm.output_tokens_buf.shape[0], 8)
+        self.assertEqual(fm.new_seq_lens_buf.shape[0], 8)
 
 
 class TestDynamicIndexEquivalence(CustomTestCase):
-    """The dynamic (index_copy_) path must equal the slice path exactly."""
+    """``_store``'s dynamic (index_copy_) path must equal the static setitem path."""
 
-    @staticmethod
-    def _force_dynamic(fm: FutureMap) -> FutureMap:
+    def test_store_dynamic_matches_static_across_writes(self):
+        static_fm = _make_future_map(
+            req_pool_size=16
+        )  # _use_dynamic_index=False on CPU
+        dyn_fm = _make_future_map(req_pool_size=16)
+        dyn_fm._use_dynamic_index = True
+        self.assertFalse(static_fm._use_dynamic_index)
+
+        # Unique-row writes (the only kind the relay issues): a mix of contiguous
+        # intervals, a singleton, and a set that revisits row 0 in a later step.
+        index_sets = [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7, 8],
+            [9, 10, 11],
+            [12],
+            [13, 14, 15, 0],
+        ]
+        sbuf = torch.zeros(16, dtype=torch.int64)
+        dbuf = torch.zeros(16, dtype=torch.int64)
+        for step, idxs in enumerate(index_sets):
+            indices = torch.tensor(idxs, dtype=torch.int64)
+            values = torch.arange(len(idxs), dtype=torch.int64) + 1000 * (step + 1)
+            static_fm._store(sbuf, indices, values)
+            dyn_fm._store(dbuf, indices, values)
+            self.assertTrue(
+                torch.equal(sbuf, dbuf),
+                msg=f"step {step} idxs {idxs}: buffers diverged\n{sbuf}\n{dbuf}",
+            )
+
+    def test_store_casts_values_to_buffer_dtype(self):
+        # _store casts values to the buffer dtype before writing (main #134: the
+        # sampler returns int64 ids that must land in the buffer's dtype).
+        fm = _make_future_map(req_pool_size=8)
         fm._use_dynamic_index = True
-        fm.future_ct_dev = torch.zeros((), dtype=torch.int64, device=fm.device)
-        return fm
-
-    def test_indices_interval_and_writes_match_across_wraparound(self):
-        static_fm = _make_future_map()  # _use_dynamic_index = False on CPU
-        dyn_fm = self._force_dynamic(_make_future_map())
-
-        # token_ids_buf is torch.empty (uninitialized) — zero both so the diff
-        # reflects only the written slots, not garbage in the untouched ones.
-        static_fm.token_ids_buf.zero_()
-        dyn_fm.token_ids_buf.zero_()
-
-        # future_limit = 12; a mixed sequence that wraps several times and pushes
-        # start past future_limit into the buffer headroom (future_buffer_len 20).
-        bs_sequence = [4, 4, 4, 5, 3, 1, 4, 4, 5, 2, 4, 4]
-
-        for step, bs in enumerate(bs_sequence):
-            fi_static = static_fm.alloc_future_indices(bs)
-            fi_dyn = dyn_fm.alloc_future_indices(bs)
-
-            # Same slice and same (now tensor-valued) indices.
-            self.assertEqual(fi_static.interval, fi_dyn.interval)
-            self.assertTrue(
-                torch.equal(fi_static.indices, fi_dyn.indices),
-                msg=f"step {step} bs {bs}: {fi_static.indices} != {fi_dyn.indices}",
-            )
-            # On-device counter must stay in lockstep with the host counter.
-            self.assertEqual(static_fm.future_ct, dyn_fm.future_ct)
-            self.assertEqual(dyn_fm.future_ct_dev.item(), dyn_fm.future_ct)
-
-            # The actual store must land identically: slice assign vs index_copy_.
-            values = torch.arange(bs, dtype=torch.int64) + 1000 * (step + 1)
-            static_fm._store(static_fm.token_ids_buf, fi_static, values)
-            dyn_fm._store(dyn_fm.token_ids_buf, fi_dyn, values)
-            self.assertTrue(
-                torch.equal(static_fm.token_ids_buf, dyn_fm.token_ids_buf),
-                msg=f"step {step}: buffers diverged",
-            )
-
-    def test_indices_are_contiguous_and_match_interval(self):
-        # Sanity on the dynamic indices themselves: they are exactly the interval
-        # [start, end) materialized as a tensor.
-        dyn_fm = self._force_dynamic(_make_future_map())
-        fi = dyn_fm.alloc_future_indices(5)
-        self.assertEqual((fi.interval.start, fi.interval.stop), (1, 6))
-        self.assertTrue(torch.equal(fi.indices, torch.arange(1, 6, dtype=torch.int64)))
-        self.assertEqual(fi.indices.dtype, torch.int64)
+        buf = torch.zeros(8, dtype=torch.int64)
+        fm._store(buf, torch.tensor([1, 2]), torch.tensor([5, 6], dtype=torch.int32))
+        self.assertEqual(buf[1].item(), 5)
+        self.assertEqual(buf[2].item(), 6)
 
 
 if __name__ == "__main__":

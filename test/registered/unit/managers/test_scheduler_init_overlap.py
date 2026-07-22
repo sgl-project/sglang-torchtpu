@@ -36,9 +36,14 @@ def _make_scheduler(*, enable_overlap: bool) -> Scheduler:
     s.forward_stream = object()  # sentinel; only used on the stream path
     s.enable_overlap = enable_overlap
     s.spec_algorithm = MagicMock()
-    s.max_running_requests = 8
-    s.chunked_prefill_size = 2048
-    s.model_config = SimpleNamespace(context_len=4096)
+    # FutureMap is always-on; its factory reads the draft worker's attn backends
+    # (target-only when there is no draft worker) and the req->token pool.
+    s.draft_worker = None
+    s.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(attn_backend=object()))
+    s.req_to_token_pool = object()
+    # Passed positionally to decide_needs_cpu_seq_lens (patched in the runner),
+    # so it only needs to exist as a sentinel.
+    s.server_args = object()
     return s
 
 
@@ -46,14 +51,17 @@ def _run_init_overlap(s: Scheduler, *, use_mlx: bool, supports_streams: bool):
     """Invoke init_overlap with use_mlx() and the platform capability stubbed.
 
     Returns the MagicMock standing in for ``torch.get_device_module(device)`` so
-    callers can assert whether stream factories were touched.
+    callers can assert whether stream factories were touched. ``needs_cpu_seq_lens``
+    resolution is pinned to True so these stay focused on stream gating.
     """
     mock_platform = MagicMock()
     mock_platform.supports_overlap_streams.return_value = supports_streams
     mock_device_module = MagicMock()
     with patch(f"{_SCHED_MOD}.use_mlx", return_value=use_mlx), patch(
         f"{_SCHED_MOD}.current_platform", mock_platform
-    ), patch("torch.get_device_module", return_value=mock_device_module):
+    ), patch(f"{_SCHED_MOD}.decide_needs_cpu_seq_lens", return_value=True), patch(
+        "torch.get_device_module", return_value=mock_device_module
+    ):
         Scheduler.init_overlap(s)
     return mock_device_module
 
@@ -73,9 +81,12 @@ class TestInitOverlapStreamGating(CustomTestCase):
         self.assertFalse(hasattr(s, "schedule_stream"))
         dm.stream.assert_not_called()
         dm.Stream.assert_not_called()
-        # Overlap bookkeeping is shared with the GPU path.
+        # Overlap bookkeeping is shared with the GPU path. FutureMap is always
+        # built from (device, req_to_token_pool, needs_cpu_seq_lens).
         self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
-        s.spec_algorithm.create_future_map.assert_called_once_with(8, 2048, 4096, "cpu")
+        s.spec_algorithm.create_future_map.assert_called_once_with(
+            s.device, s.req_to_token_pool, needs_cpu_seq_lens=True
+        )
         self.assertEqual(s.batch_record_buf, [None, None])
         self.assertEqual(s.batch_record_ct, 0)
 
@@ -93,26 +104,29 @@ class TestInitOverlapStreamGating(CustomTestCase):
         self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
         self.assertEqual(s.batch_record_buf, [None, None])
 
-    def test_single_queue_overlap_disabled_has_no_future_map(self):
-        """With overlap disabled, the single-queue path still avoids streams and
-        leaves future_map None (mirrors the GPU disabled path)."""
+    def test_single_queue_overlap_disabled_still_builds_future_map(self):
+        """With overlap disabled, the single-queue path still avoids streams, but
+        FutureMap is always-on now (input_ids relay used in both modes), so it is
+        built before the enable_overlap early-return."""
         s = _make_scheduler(enable_overlap=False)
         dm = _run_init_overlap(s, use_mlx=False, supports_streams=False)
 
         self.assertFalse(s.use_overlap_streams)
         self.assertIsInstance(s.forward_stream_ctx, nullcontext)
-        self.assertIsNone(s.future_map)
+        self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
         self.assertFalse(hasattr(s, "copy_stream"))
         dm.Stream.assert_not_called()
 
     def test_mlx_is_untouched(self):
-        """MLX keeps its own early-return path: no streams, no FutureMap, and an
-        empty result_queue. use_mlx() wins regardless of the stream capability."""
+        """MLX keeps its own early-return path: no streams and an empty
+        result_queue, and it returns before forward_stream_ctx is set. FutureMap
+        is still built first (always-on input_ids relay). use_mlx() wins
+        regardless of the stream capability."""
         s = _make_scheduler(enable_overlap=True)
         dm = _run_init_overlap(s, use_mlx=True, supports_streams=True)
 
         self.assertFalse(s.use_overlap_streams)
-        self.assertIsNone(s.future_map)
+        self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
         self.assertEqual(len(s.result_queue), 0)
         self.assertFalse(hasattr(s, "forward_stream_ctx"))
         dm.stream.assert_not_called()
@@ -142,7 +156,9 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.use_overlap_streams = use_overlap_streams
         s.forward_stream_ctx = nullcontext()
-        s.future_map = MagicMock()
+        # The relay itself (FutureMap stash vs ngram skip) is covered elsewhere;
+        # here we only assert it is invoked with this iter's payload.
+        s._relay_forward_payload = MagicMock()
         s.cur_batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
         return s
 
@@ -156,7 +172,7 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         Scheduler.launch_batch_sample_if_needed(s, br)  # must not raise
 
         br.copy_to_cpu.assert_called_once()
-        s.future_map.store_to_map.assert_called_once_with(br.future_indices, br)
+        s._relay_forward_payload.assert_called_once_with(br.future_indices, br)
         self.assertIsNone(br.delay_sample_func)  # closure released
 
     def test_multi_stream_waits_on_schedule_stream(self):
@@ -177,7 +193,7 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
             s, SimpleNamespace(delay_sample_func=None)
         )
         self.assertIsNone(out)
-        s.future_map.store_to_map.assert_not_called()
+        s._relay_forward_payload.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -101,7 +101,9 @@ class TpuGraphRunner:
             # flag (kernel_warmup pre-compile loops on the CUDA side;
             # any future TPU equivalent should follow the same
             # convention).
-            model_runner.server_args.enable_torch_compile = False
+            model_runner.server_args.override(
+                "tpu_graph_runner", enable_torch_compile=False
+            )
             return
 
         # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph
@@ -223,7 +225,7 @@ class TpuGraphRunner:
             if callable(set_checker):
                 set_checker(checker, model_label=label)
 
-    def can_run(self, forward_batch: ForwardBatch) -> bool:
+    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
 
         PJRT/libtpu caches HLO compilations internally and dispatches
@@ -231,7 +233,7 @@ class TpuGraphRunner:
         normal ``self.model.forward(...)`` call path, not through a
         replay step. This method exists because ModelRunner.forward
         gates the replay branch on
-        ``self.graph_runner and self.graph_runner.can_run(...)`` —
+        ``self.<decode|prefill>_cuda_graph_runner.can_run_graph(...)`` —
         returning False keeps that branch off on TPU.
         """
         return False

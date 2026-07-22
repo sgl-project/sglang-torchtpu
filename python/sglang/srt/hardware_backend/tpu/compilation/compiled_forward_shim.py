@@ -332,7 +332,7 @@ def _pad_forward_batch_inputs(
 _KV_OFFLOAD_WARMUP_WARN_BLOCKS: int = 2048
 
 
-def precompile_kv_offload(host_pool: "TpuFusedMHATokenToKVPoolHost") -> None:
+def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
     """Dummy-run the real reload/backup transfer methods across pow2 block
     buckets to pre-compile their XLA programs.
     """
