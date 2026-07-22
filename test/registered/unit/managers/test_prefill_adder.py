@@ -482,13 +482,12 @@ class TestPrefillAdder(CustomTestCase):
         )
         return adder, req
 
-    def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
-        # alloc_extend needs extend_num_tokens + page_size per request. If the
-        # scheduler hands out all of rem_swa_tokens, alloc_extend cannot get its
-        # extra page and OOMs. With the fix, extend_input_len must cap at
-        # rem_swa_tokens - page_size so the page is reserved.
+    def test_add_chunked_req_hybrid_swa_reserves_overlap_headroom(self):
+        # alloc_extend needs an extra page, while overlap scheduling can still
+        # have the retained SWA window in flight. Keep both out of the chunk.
         PAGE_SIZE = 64
-        REM_SWA = 100
+        WINDOW_SIZE = 128
+        REM_SWA = 300
         adder, req = self._build_hybrid_swa_chunked_req(
             page_size=PAGE_SIZE, rem_swa=REM_SWA
         )
@@ -499,23 +498,31 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_called_once()
         start, end = req.set_extend_range.call_args.args
         new_len = end - start
-        self.assertLessEqual(new_len + PAGE_SIZE, REM_SWA)
-        self.assertEqual(new_len, REM_SWA - PAGE_SIZE)
+        self.assertLessEqual(new_len + WINDOW_SIZE + PAGE_SIZE, REM_SWA)
+        expected_len = (REM_SWA - WINDOW_SIZE - PAGE_SIZE) // PAGE_SIZE * PAGE_SIZE
+        self.assertEqual(new_len, expected_len)
+        self.assertEqual(new_len % PAGE_SIZE, 0)
 
-    def test_add_chunked_req_hybrid_swa_defers_when_swa_below_page(self):
-        # When rem_swa_tokens <= page_size there is no room to serve even the
-        # reservation, so the chunked req must be deferred (returned unchanged)
-        # instead of falling back to rem_chunk_tokens and bypassing SWA budget.
+    def test_add_chunked_req_hybrid_swa_defers_without_overlap_headroom(self):
+        # Without room beyond the retained window and allocator page, defer the
+        # chunk instead of bypassing the SWA budget via the fallback below.
         PAGE_SIZE = 64
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
-        )
+        WINDOW_SIZE = 128
+        for rem_swa in (
+            WINDOW_SIZE + PAGE_SIZE,
+            WINDOW_SIZE + PAGE_SIZE + 1,
+            WINDOW_SIZE + 2 * PAGE_SIZE - 1,
+        ):
+            with self.subTest(rem_swa=rem_swa):
+                adder, req = self._build_hybrid_swa_chunked_req(
+                    page_size=PAGE_SIZE, rem_swa=rem_swa
+                )
 
-        result = adder.add_chunked_req(req)
+                result = adder.add_chunked_req(req)
 
-        self.assertIs(result, req)
-        req.set_extend_range.assert_not_called()
-        self.assertEqual(len(adder.can_run_list), 0)
+                self.assertIs(result, req)
+                req.set_extend_range.assert_not_called()
+                self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
         cases = [
@@ -523,8 +530,8 @@ class TestPrefillAdder(CustomTestCase):
             (64, None, 128, 16, 128 + 16, "no_cap_floor_active"),
             (200, None, 256, 32, 256 + 32, "no_cap_floor_active_other_dims"),
             (300, None, 128, 16, 300 + 16, "no_cap_floor_inactive"),
-            (200, 50, 64, 8, 64 + 8, "cap_binds_then_floor"),
-            (300, 500, 64, 64, 300 + 64, "cap_does_not_bind"),
+            (200, 50, 64, 8, 50 + 64 + 8, "chunk_and_window_reserved"),
+            (300, 500, 64, 64, 300 + 64 + 64, "chunk_below_cap"),
             (0, None, 128, 16, 128 + 16, "extend_zero_floor_only"),
         ]
         for extend, rem_chunk, window, page, expected, label in cases:
