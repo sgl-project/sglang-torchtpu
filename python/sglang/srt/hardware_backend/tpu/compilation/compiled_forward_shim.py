@@ -57,6 +57,11 @@ _REAL_B_KEY = "_tpu_real_b"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
 
 
+def _extend_batch_cap(t_bucketer: Bucketer, b_bucketer: Bucketer) -> int:
+    """Return the largest reachable fixed batch shape for EXTEND."""
+    return min(t_bucketer.max_val, b_bucketer.max_val)
+
+
 def _static_default_kwargs(fn: Callable[..., Any]) -> dict[str, Any]:
     signature = getattr(fn, "__signature__", None)
     if signature is None:
@@ -106,11 +111,11 @@ def _dp_attn_select_bucket_shape(
         pad_t = b_bucketer.next_bucket(max(real_q, max_tokens_per_rank))
         pad_b = b_bucketer.next_bucket(max(real_b, max_tokens_per_rank))
     else:
-        # Extend always pads to the max batch bucket. Precompile mirrors this in
-        # DecoderTpuCompilePolicy._precompile_extend (which compiles extend only
-        # at b_bucketer.max_val), so the two must change together.
+        # Extend pads to one fixed batch shape. It cannot contain more requests
+        # than tokens, so cap the shape by the token ceiling when decode
+        # concurrency is larger. Precompile mirrors this choice.
         # TODO(wyzhang): Support multiple batch size buckets for extend/prefill.
-        pad_b = b_bucketer.max_val
+        pad_b = _extend_batch_cap(t_bucketer, b_bucketer)
         pad_t = t_bucketer.next_bucket(max(real_q, max_tokens_per_rank, pad_b))
     return pad_t, pad_b
 
@@ -277,7 +282,7 @@ def _pad_forward_batch_inputs(
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
-        pad_b = b_bucketer.max_val
+        pad_b = _extend_batch_cap(t_bucketer, b_bucketer)
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
@@ -517,35 +522,32 @@ class CompiledForwardShim:
 
 
 def reconcile_tpu_batch_limits(
-    torch_compile_max_bs: int,
+    torch_compile_max_bs: int | None,
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
 ) -> tuple[int, Optional[List[int]], int]:
-    """
-    1. `torch_compile_max_bs` is set to be the max of
-    `DEFAULT_TPU_COMPILE_MAX_BS`, the `max(ts_compile_bs)` (if set), or
-    `max_running_requests` (if set). This determines the max bucket size we
-    will compile for TPUs.
-
-    2. If `max_running_requests` is not set, then it is set to be
-    `torch_compile_max_bs`, otherwise we may run into a case where the number
-    of requests passed in is greater than the max bucket size we have compiled.
-
-    3. If `ts_compile_bs` is set but the max value is smaller than
-    `torch_compile_max_bs`, then we will append the larger size to it to make
-    sure it gets compiled.
-    """
-    tcmb = max(torch_compile_max_bs, DEFAULT_TPU_COMPILE_MAX_BS)
-    if tpu_compile_bs:
-        tcmb = max(tcmb, max(tpu_compile_bs))
+    """Make the TPU compile grid cover scheduler concurrency without dead shapes."""
+    explicit_compile_limits = [
+        limit
+        for limit in (
+            torch_compile_max_bs,
+            max(tpu_compile_bs) if tpu_compile_bs else None,
+        )
+        if limit is not None
+    ]
+    tcmb = (
+        max(explicit_compile_limits)
+        if explicit_compile_limits
+        else DEFAULT_TPU_COMPILE_MAX_BS
+    )
 
     if max_running_requests is not None:
         tcmb = max(tcmb, max_running_requests)
     else:
         max_running_requests = tcmb
 
-    if tpu_compile_bs and max(tpu_compile_bs) < tcmb:
-        tpu_compile_bs = sorted(set(tpu_compile_bs) | {tcmb})
+    if tpu_compile_bs and max(tpu_compile_bs) < max_running_requests:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {max_running_requests})
 
     return tcmb, tpu_compile_bs, max_running_requests
 

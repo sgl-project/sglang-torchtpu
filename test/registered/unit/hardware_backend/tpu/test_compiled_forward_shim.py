@@ -16,6 +16,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
     _dp_attn_apply_bucket_metadata,
     _dp_attn_select_bucket_shape,
+    _extend_batch_cap,
     _matches_default,
     _pad_forward_batch_inputs,
     _static_default_kwargs,
@@ -146,6 +147,16 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_prefix_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.batch_size, 4)
+
+    def test_extend_batch_cap_does_not_exceed_token_ceiling(self):
+        fb = _forward_batch(real_t=4, real_b=2, mode="extend")
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [4]),
+            b_bucketer=_bucketer("Bs", [1, 8]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 4)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
 
     def test_target_verify_pins_token_dim_to_draft_token_num(self):
         # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:
@@ -543,16 +554,22 @@ class TestBuildBucketers(CustomTestCase):
         self.assertEqual(t_b.buckets, [64, 2048])
         self.assertEqual(b_b.buckets, [1, 2, 4, 8])
 
+    def test_extend_batch_cap_uses_reachable_minimum(self):
+        self.assertEqual(
+            _extend_batch_cap(
+                _bucketer("Token", [64, 4096]),
+                _bucketer("Bs", [1, 8192]),
+            ),
+            4096,
+        )
+
 
 class TestReconcileTpuBatchLimits(CustomTestCase):
-    """`reconcile_tpu_batch_limits` (ServerArgs.__post_init__ on TPU) pins the
-    compiled batch-grid ceiling (`torch_compile_max_bs`) and the scheduler
-    concurrency (`max_running_requests`) to one value, and grows an explicit
-    `--tpu-compile-bs` list to cover it, so a decode batch can never fall
-    outside the compiled grid (Task #40)."""
+    """The compiled grid covers scheduler concurrency without compiling past
+    explicit limits when no larger serving batch is reachable (Task #40)."""
 
     def _r(
-        self, torch_compile_max_bs=32, tpu_compile_bs=None, max_running_requests=None
+        self, torch_compile_max_bs=None, tpu_compile_bs=None, max_running_requests=None
     ):
         return reconcile_tpu_batch_limits(
             torch_compile_max_bs, tpu_compile_bs, max_running_requests
@@ -567,17 +584,19 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         )
 
     def test_explicit_torch_compile_max_bs_above_default_honored(self):
-        # rule 1 uses max(..., 64), so an explicit higher value survives.
         tcmb, _, mrr = self._r(torch_compile_max_bs=128)
         self.assertEqual((tcmb, mrr), (128, 128))
+
+    def test_explicit_torch_compile_max_bs_below_default_avoids_dead_shapes(self):
+        self.assertEqual(self._r(torch_compile_max_bs=8), (8, None, 8))
 
     def test_max_running_requests_grows_ceiling(self):
         # --max-running-requests 128 -> grid ceiling 128, served (not clamped 64).
         self.assertEqual(self._r(max_running_requests=128), (128, None, 128))
 
     def test_tpu_compile_bs_sets_ceiling_and_concurrency(self):
-        tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8, 64, 128])
-        self.assertEqual((tcmb, mrr, max(bs)), (128, 128, 128))
+        tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8])
+        self.assertEqual((tcmb, mrr, bs), (8, 8, [1, 8]))
 
     def test_both_set_and_agree(self):
         tcmb, bs, mrr = self._r(
@@ -593,12 +612,20 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         self.assertIn(128, bs)
         self.assertEqual(max(bs), 128)
 
+    def test_bucket_list_only_grows_to_scheduler_concurrency(self):
+        tcmb, bs, mrr = self._r(
+            torch_compile_max_bs=128,
+            tpu_compile_bs=[1, 8],
+            max_running_requests=32,
+        )
+        self.assertEqual((tcmb, bs, mrr), (128, [1, 8, 32], 32))
+
     def test_invariant_grid_always_covers_concurrency(self):
         cases = [
-            (32, None, None),
-            (32, None, 200),
-            (32, [1, 8, 64], 256),
-            (32, [1, 8, 64, 512], None),
+            (None, None, None),
+            (None, None, 200),
+            (None, [1, 8, 64], 256),
+            (None, [1, 8, 64, 512], None),
             (256, None, 128),
         ]
         for tcmb_in, bs_in, mrr_in in cases:

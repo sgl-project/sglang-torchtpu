@@ -17,6 +17,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
     CompiledForwardShim,
+    _extend_batch_cap,
     _pad_forward_batch_inputs,
     _restore_forward_batch_inputs,
     build_bucketers,
@@ -286,7 +287,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self.b_bucketer.max_val
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
@@ -617,7 +618,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self.b_bucketer.max_val
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
