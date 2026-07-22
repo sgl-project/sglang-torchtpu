@@ -7,10 +7,15 @@ how to install, pad, and precompile annotated module boundaries.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, ClassVar, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 __all__ = [
     "CompilePolicy",
+    "DecoderCompilePolicy",
+    "NoopCompilePolicy",
     "get_torch_compile_policy",
     "support_torch_compile",
 ]
@@ -56,31 +61,37 @@ class CompilePolicy(ABC):
     def precompile(self) -> None:
         """Warm compile artifacts for this policy."""
 
+
+class DecoderCompilePolicy(CompilePolicy):
+    """Compile policy for decoder boundaries driven by a ForwardBatch."""
+
+    def precompile_draft(
+        self, draft_attn_backend: Any, draft_extend_attn_backend: Any
+    ) -> None:
+        """Run warmup after speculative-draft attention backends are available."""
+
     @abstractmethod
-    def unpad_outputs(self, out: Any, context: Any) -> Any:
-        """Adapt padded compiled outputs back to the caller-visible shape."""
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Prepare a normal or target forward before attention planning."""
 
     # TODO: Move output adaptation into a platform-neutral compile runner once
     # another backend adopts annotation-driven policy installation.
+    @abstractmethod
+    def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
+        """Finalize outputs and batch state after a normal or target forward."""
 
-    # Speculative draft-decode I/O shaping. Base is a no-op; the TPU spec policy
-    # overrides these to pad/trim the compiled draft-decode forward. Kept on the
-    # base so a runner can call them on any installed policy without a guard.
-    def pad_draft_decode(self, forward_batch: Any) -> None:
-        """Shape the speculative draft-decode batch for the compiled forward."""
+    def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Prepare a speculative forward before attention planning."""
 
-    def pad_draft_extend_v2(
-        self, forward_batch: Any, model_runner: Any, num_draft_tokens: int
-    ) -> None:
-        """Shape a V2 draft-extend batch for the compiled forward."""
-
-    def unpad_draft_outputs(self, outputs: Any, forward_batch: Any) -> Any:
-        """Undo ``pad_draft_decode`` on the draft outputs (default: passthrough)."""
+    def finalize_spec_forward_batch(
+        self, outputs: Any, forward_batch: ForwardBatch
+    ) -> Any:
+        """Finalize outputs from a speculative forward."""
         return outputs
 
 
-class NoopCompilePolicy(CompilePolicy):
-    """Default noop policy a runner carries until a real one installs itself."""
+class NoopCompilePolicy(DecoderCompilePolicy):
+    """Default noop policy carried until a decoder policy installs itself."""
 
     def install(self) -> bool:
         return False
@@ -88,8 +99,11 @@ class NoopCompilePolicy(CompilePolicy):
     def precompile(self) -> None:
         pass
 
-    def unpad_outputs(self, out: Any, context: Any) -> Any:
-        return out
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        pass
+
+    def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
+        return outputs
 
 
 def support_torch_compile(

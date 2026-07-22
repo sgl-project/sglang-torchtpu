@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.compilation.support_torch_compile import CompilePolicy
+from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
@@ -476,7 +476,7 @@ class CompiledForwardShim:
     def __init__(
         self,
         compiled_fn: Callable[..., Any],
-        policy: CompilePolicy,
+        policy: DecoderCompilePolicy,
     ) -> None:
         self.fn = compiled_fn
         self.policy = policy
@@ -533,7 +533,7 @@ class CompiledForwardShim:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
-        out = self.policy.unpad_outputs(out, forward_batch)
+        out = self.policy.finalize_forward_batch(out, forward_batch)
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).

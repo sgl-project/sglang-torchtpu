@@ -255,6 +255,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             speculative_moe_a2a_backend_context(),
         ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+            self.draft_runner.compile_policy.precompile_draft(
+                self.draft_attn_backend, self.draft_extend_attn_backend
+            )
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
             self._capture_cuda_graphs()
@@ -547,7 +550,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1
                 ):
-                    self.draft_runner.pad_spec_draft_decode(forward_batch)
+                    self.draft_runner.compile_policy.prepare_spec_forward_batch(
+                        forward_batch
+                    )
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
@@ -556,7 +561,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_runner.unpad_spec_draft_outputs(
+                    self.draft_runner.compile_policy.finalize_spec_forward_batch(
                         (parent_list, top_scores_index, draft_tokens, draft_probs),
                         forward_batch,
                     )

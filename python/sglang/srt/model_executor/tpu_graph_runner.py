@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.compilation.support_torch_compile import (
+    DecoderCompilePolicy,
     get_torch_compile_policy,
 )
 from sglang.srt.environ import envs
@@ -54,7 +55,9 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
     """Compose spec-decode compile behavior over ``policy_cls`` when spec decoding
     is active.
     """
-    if not _spec_enabled(model_runner):
+    if not _spec_enabled(model_runner) or not issubclass(
+        policy_cls, DecoderCompilePolicy
+    ):
         return policy_cls
     if issubclass(policy_cls, SpecDecodeCompilePolicyMixin):
         return policy_cls
@@ -163,8 +166,10 @@ class TpuGraphRunner:
 
             # Compose the default spec behavior over the model's own policy when
             # spec decoding is active and the policy doesn't already implement spec.
-            if _spec_enabled(model_runner) and not issubclass(
-                policy_cls, SpecDecodeCompilePolicyMixin
+            if (
+                _spec_enabled(model_runner)
+                and issubclass(policy_cls, DecoderCompilePolicy)
+                and not issubclass(policy_cls, SpecDecodeCompilePolicyMixin)
             ):
                 logger.warning(
                     "Speculative decoding is active and %s ships its own compile "

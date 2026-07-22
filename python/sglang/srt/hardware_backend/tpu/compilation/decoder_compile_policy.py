@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import inspect
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, ClassVar, Optional
 
+import msgspec
 import torch
 import tqdm
 
-from sglang.srt.compilation.support_torch_compile import CompilePolicy
+from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
@@ -30,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
 
@@ -110,7 +112,136 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
     return out
 
 
-class DecoderTpuCompilePolicy(CompilePolicy):
+class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
+    """Mode-specific fields used to construct a dummy precompile ForwardBatch."""
+
+    # TPU Spec V2 uses int64 for every out_cache_loc; match it during warmup to
+    # avoid a compiled-graph guard miss.
+    _OUT_CACHE_LOC_DTYPE: ClassVar[torch.dtype] = torch.int64
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    out_cache_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    orig_seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens_sum: int
+    extend_num_tokens: Optional[int]
+    extend_seq_lens: Optional[torch.Tensor]
+    extend_prefix_lens: Optional[torch.Tensor]
+    extend_start_loc: Optional[torch.Tensor]
+    extend_seq_lens_cpu: Optional[list[int]]
+    extend_prefix_lens_cpu: Optional[list[int]]
+    extend_logprob_start_lens_cpu: Optional[list[int]]
+
+    @staticmethod
+    def _extend_metadata_fields(
+        is_extend: bool,
+        bs: int,
+        tokens_per_req: int,
+        prefix: int,
+        device: str | torch.device,
+    ) -> dict[str, Any]:
+        if not is_extend:
+            return {
+                "extend_num_tokens": None,
+                "extend_seq_lens": None,
+                "extend_prefix_lens": None,
+                "extend_start_loc": None,
+                "extend_seq_lens_cpu": None,
+                "extend_prefix_lens_cpu": None,
+                "extend_logprob_start_lens_cpu": None,
+            }
+        return {
+            "extend_num_tokens": bs * tokens_per_req,
+            "extend_seq_lens": torch.full(
+                (bs,), tokens_per_req, dtype=torch.int32, device=device
+            ),
+            "extend_prefix_lens": torch.full(
+                (bs,), prefix, dtype=torch.int32, device=device
+            ),
+            "extend_start_loc": torch.arange(
+                0, bs * tokens_per_req, tokens_per_req, dtype=torch.int32, device=device
+            ),
+            "extend_seq_lens_cpu": [tokens_per_req] * bs,
+            "extend_prefix_lens_cpu": [prefix] * bs,
+            "extend_logprob_start_lens_cpu": [0] * bs,
+        }
+
+    @classmethod
+    def default(
+        cls,
+        num_tokens: int,
+        bs: int,
+        is_extend: bool,
+        tokens_per_req: int,
+        *,
+        device: str | torch.device,
+        slot: int,
+    ) -> _DummyForwardBatchFields:
+        """Reserved-slot layout for DECODE / EXTEND / TARGET_VERIFY."""
+        input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        input_ids[:bs] = 1
+        seq_lens = torch.ones(bs, dtype=torch.int64, device=device)
+        return cls(
+            input_ids=input_ids,
+            positions=torch.zeros(num_tokens, dtype=torch.int64, device=device),
+            out_cache_loc=torch.full(
+                (num_tokens,), slot, dtype=cls._OUT_CACHE_LOC_DTYPE, device=device
+            ),
+            seq_lens=seq_lens,
+            orig_seq_lens=seq_lens,
+            seq_lens_cpu=torch.ones(bs, dtype=torch.int64),
+            req_pool_indices=torch.full((bs,), slot, dtype=torch.int64, device=device),
+            seq_lens_sum=bs,
+            **cls._extend_metadata_fields(is_extend, bs, tokens_per_req, 0, device),
+        )
+
+    @classmethod
+    def draft_extend(
+        cls,
+        num_tokens: int,
+        bs: int,
+        tokens_per_req: int,
+        *,
+        device: str | torch.device,
+        page_size: int,
+    ) -> _DummyForwardBatchFields:
+        """Realistic per-request layout for DRAFT_EXTEND_V2."""
+        de_ctx = int(page_size)  # 1 page of context
+        de_prefix = max(de_ctx - tokens_per_req, 0)
+
+        input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+        input_ids[:bs] = 1
+        # query positions per request: [prefix, prefix + tokens_per_req)
+        positions = de_prefix + torch.arange(tokens_per_req, device=device).repeat(
+            bs
+        ).to(torch.int64)
+        # distinct KV write locations: request r (1..bs) uses page r, extend
+        # tokens at the tail of its page.
+        r = torch.arange(1, bs + 1, device=device)
+        base = (r * de_ctx + de_prefix).view(bs, 1)
+        out_cache_loc = (
+            (base + torch.arange(tokens_per_req, device=device).view(1, -1))
+            .reshape(-1)
+            .to(cls._OUT_CACHE_LOC_DTYPE)
+        )
+        return cls(
+            input_ids=input_ids,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+            seq_lens=torch.full((bs,), de_ctx, dtype=torch.int64, device=device),
+            orig_seq_lens=torch.full((bs,), de_ctx, dtype=torch.int32, device=device),
+            seq_lens_cpu=torch.full((bs,), de_ctx, dtype=torch.int64),
+            req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int64, device=device),
+            seq_lens_sum=de_ctx * bs,
+            # DRAFT_EXTEND_V2 always carries extend metadata (prefix = de_prefix).
+            **cls._extend_metadata_fields(True, bs, tokens_per_req, de_prefix, device),
+        )
+
+
+class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
     platform = "tpu"
@@ -140,6 +271,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
         self.extend_bs: int | None = None
+        self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
 
     def _extend_compile_cap(self) -> int:
@@ -249,14 +381,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         def _prepare(forward_batch: ForwardBatch) -> None:
             if existing_prep is not None:
                 existing_prep(forward_batch)
-            real_q, real_b = _pad_forward_batch_inputs(
-                forward_batch,
-                t_bucketer,
-                b_bucketer,
-                extend_bs=self.extend_bs,
-            )
-            setattr(forward_batch, _REAL_Q_KEY, real_q)
-            setattr(forward_batch, _REAL_B_KEY, real_b)
+            self.prepare_forward_batch(forward_batch)
 
         outer_model.prepare_forward_batch = _prepare
 
@@ -277,6 +402,19 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Bucket a normal or target forward before attention planning."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        real_q, real_b = _pad_forward_batch_inputs(
+            forward_batch,
+            self.t_bucketer,
+            self.b_bucketer,
+            extend_bs=self.extend_bs,
+        )
+        setattr(forward_batch, _REAL_Q_KEY, real_q)
+        setattr(forward_batch, _REAL_B_KEY, real_b)
 
     def _install_dp_idle_as_decode(self) -> None:
         """Run idle DP batches as DECODE.
@@ -416,7 +554,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         mode: ForwardMode,
         variant: str = "plain",
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-        spec_info: Any | None = None,
+        spec_info: SpecInput | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
         """Build generic text decoder warmup inputs."""
         forward_batch = self._make_dummy_forward_batch(
@@ -436,7 +574,8 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         mode: ForwardMode,
         variant: str = "plain",
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
-        spec_info: Any | None = None,
+        spec_info: SpecInput | None = None,
+        attn_backend: Any | None = None,
     ) -> None:
         """Build and execute one dummy forward pass for compilation."""
         args, kwargs = self._make_warmup_inputs(
@@ -448,7 +587,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             spec_info=spec_info,
         )
         forward_batch = args[2]
-        self._seed_dummy_req_to_token(num_tokens)
+        self._seed_dummy_req_to_token(forward_batch)
 
         model = self.model_runner.model
         # Set the DP metadata before the pad shim runs, just like serving does,
@@ -457,7 +596,9 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         if is_dp_attention_enabled():
             self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+        forward_attn_backend = attn_backend or self.model_runner.attn_backend
+        forward_attn_backend.init_forward_metadata(forward_batch)
 
         # The compiled forward resolves its attention backend from the forward
         # context (upstream moved attn_backend off ForwardBatch into a
@@ -470,18 +611,18 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with forward_context(
-            ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ForwardContext(attn_backend=forward_attn_backend)
         ), torch.no_grad():
             out = self.owner.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
             _materialize_out(
                 out,
-                self.model_runner.attn_backend,
+                forward_attn_backend,
                 self.model_runner.token_to_kv_pool,
             )
 
-    def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
-        return _unpad_decoder_outputs(out, forward_batch)
+    def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
+        return _unpad_decoder_outputs(outputs, forward_batch)
 
     def _set_dp_attention_metadata(
         self, forward_batch: ForwardBatch, num_tokens: int, bs: int, mode: ForwardMode
@@ -514,7 +655,9 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         """KV-pool slot for dummy ``req_pool_indices``/``out_cache_loc``."""
         return 0
 
-    def _dummy_tokens_per_req(self, mode: ForwardMode, spec_info: Any | None) -> int:
+    def _dummy_tokens_per_req(
+        self, mode: ForwardMode, spec_info: SpecInput | None
+    ) -> int:
         """Extend tokens per request in the dummy batch (1 for plain extend)."""
         return 1
 
@@ -522,12 +665,12 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         """``mm_inputs`` field for the dummy batch (``None`` for plain decoders)."""
         return None
 
-    def _seed_dummy_req_to_token(self, num_tokens: int) -> None:
+    def _seed_dummy_req_to_token(self, forward_batch: ForwardBatch) -> None:
         """Seed req_to_token rows for the dummy batch.
 
         No-op for plain decoders: row 0 stays all-zeros (page 0, the reserved
         padding page), which is exactly the harmless state padded batches expect.
-        The spec policy overrides this to seed slot 1 with a valid page index.
+        The spec policy overrides this to seed valid page indices.
         """
         return
 
@@ -541,76 +684,66 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         spec_info: Any | None = None,
     ) -> ForwardBatch:
         """Construct a dummy ForwardBatch at the target bucket shape."""
-        device = self.model_runner.device
-        is_extend = mode.is_extend(include_draft_extend_v2=True)
-        slot = self._dummy_kv_slot()
-
-        # Token-level inputs
-        input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        input_ids[:bs] = 1
-        positions = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        out_cache_loc = torch.full(
-            (num_tokens,), slot, dtype=torch.int64, device=device
-        )
+        tokens_per_req = self._dummy_tokens_per_req(mode, spec_info)
+        layout = self._dummy_layout(mode, num_tokens, bs, tokens_per_req)
 
         # MROPE runtime positions are real [3, num_tokens] tensors. Keep strides
         # identical here so Dynamo does not guard-miss after precompile.
         mrope_positions = None
         if getattr(self.model_runner, "model_is_mrope", False):
-            mrope_positions = positions.unsqueeze(0).expand(3, -1).contiguous()
-
-        # Batch-level inputs
-        seq_lens = torch.ones(bs, dtype=torch.int64, device=device)
-        seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-        req_pool_indices = torch.full((bs,), slot, dtype=torch.int64, device=device)
-
-        tokens_per_req = self._dummy_tokens_per_req(mode, spec_info)
-        extend_seq_lens = (
-            torch.full((bs,), tokens_per_req, dtype=torch.int32, device=device)
-            if is_extend
-            else None
-        )
-        extend_prefix_lens = (
-            torch.zeros(bs, dtype=torch.int32, device=device) if is_extend else None
-        )
-        extend_start_loc = (
-            torch.arange(
-                0, bs * tokens_per_req, tokens_per_req, dtype=torch.int32, device=device
-            )
-            if is_extend
-            else None
-        )
-        extend_num_tokens = bs * tokens_per_req if is_extend else None
-        extend_seq_lens_cpu = [tokens_per_req] * bs if is_extend else None
-        extend_prefix_lens_cpu = [0] * bs if is_extend else None
-        # Match runtime extend metadata; None vs list creates guard misses.
-        extend_logprob_start_lens_cpu = [0] * bs if is_extend else None
+            mrope_positions = layout.positions.unsqueeze(0).expand(3, -1).contiguous()
 
         return ForwardBatch(
             forward_mode=mode,
             batch_size=bs,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=bs,
-            orig_seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            seq_lens_cpu=seq_lens_cpu,
-            positions=positions,
+            input_ids=layout.input_ids,
+            req_pool_indices=layout.req_pool_indices,
+            seq_lens=layout.seq_lens,
+            seq_lens_sum=layout.seq_lens_sum,
+            orig_seq_lens=layout.orig_seq_lens,
+            out_cache_loc=layout.out_cache_loc,
+            seq_lens_cpu=layout.seq_lens_cpu,
+            positions=layout.positions,
             return_logprob=False,
-            extend_num_tokens=extend_num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_start_loc=extend_start_loc,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-            extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+            extend_num_tokens=layout.extend_num_tokens,
+            extend_seq_lens=layout.extend_seq_lens,
+            extend_prefix_lens=layout.extend_prefix_lens,
+            extend_start_loc=layout.extend_start_loc,
+            extend_seq_lens_cpu=layout.extend_seq_lens_cpu,
+            extend_prefix_lens_cpu=layout.extend_prefix_lens_cpu,
+            extend_logprob_start_lens_cpu=layout.extend_logprob_start_lens_cpu,
             mrope_positions=mrope_positions,
             # Model accesses ``capture_hidden_mode.need_capture()``; default
             # of None would raise AttributeError inside the compiled region.
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
             mm_inputs=self._dummy_mm_inputs(bs),
+        )
+
+    def _dummy_layout(
+        self,
+        mode: ForwardMode,
+        num_tokens: int,
+        bs: int,
+        tokens_per_req: int,
+    ) -> _DummyForwardBatchFields:
+        """Pick the mode-varying layout for the dummy batch."""
+        device = self.model_runner.device
+        if mode.is_draft_extend_v2():
+            return _DummyForwardBatchFields.draft_extend(
+                num_tokens,
+                bs,
+                tokens_per_req,
+                device=device,
+                page_size=self.model_runner.server_args.page_size,
+            )
+        return _DummyForwardBatchFields.default(
+            num_tokens,
+            bs,
+            mode.is_extend() and not mode.is_target_verify(),
+            tokens_per_req,
+            device=device,
+            slot=self._dummy_kv_slot(),
         )
 
 
@@ -640,10 +773,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
-    def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
+    def finalize_forward_batch(self, out: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
-        out = super().unpad_outputs(out, forward_batch)
+        out = super().finalize_forward_batch(out, forward_batch)
         if real_q is None:
             return out
         if isinstance(out, torch.Tensor):

@@ -160,7 +160,7 @@ class EagleDraftWorkerBase(ABC):
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
-        draft_model_runner.pad_spec_draft_extend_v2(forward_batch, num_draft_tokens)
+        draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )

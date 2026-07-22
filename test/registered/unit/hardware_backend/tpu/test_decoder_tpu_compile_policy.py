@@ -56,6 +56,7 @@ def _model_runner(device="cpu"):
         attn_backend=_FakeAttnBackend(),
         req_to_token_pool=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
+        server_args=SimpleNamespace(page_size=1, dp_size=1),
     )
 
 
@@ -155,7 +156,7 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
         policy = Qwen3VLDecoderTpuCompilePolicy()
         out = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
-        result = policy.unpad_outputs(out, self._forward_batch())
+        result = policy.finalize_forward_batch(out, self._forward_batch())
 
         self.assertEqual(result.shape, (3, 4))
 
@@ -182,7 +183,7 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
         forward_batch.mm_input_embeds = torch.zeros(5, 4)
         hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
-        result = policy.unpad_outputs(hidden_states, forward_batch)
+        result = policy.finalize_forward_batch(hidden_states, forward_batch)
         last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
         sampled_hidden_states = result[last_index]
 
@@ -197,7 +198,7 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
         hidden = torch.zeros(5, 4)
         aux = [torch.ones(5, 4), torch.full((5, 4), 2.0)]
 
-        result_hidden, result_aux = policy.unpad_outputs(
+        result_hidden, result_aux = policy.finalize_forward_batch(
             (hidden, aux), self._forward_batch()
         )
 
@@ -210,7 +211,7 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
             {"hidden_states": torch.zeros(5, 4), "residual": torch.ones(5, 4)}
         )
 
-        result = policy.unpad_outputs(out, self._forward_batch())
+        result = policy.finalize_forward_batch(out, self._forward_batch())
 
         self.assertEqual(result["hidden_states"].shape, (5, 4))
         self.assertEqual(result["residual"].shape, (5, 4))
@@ -226,7 +227,7 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
         out = torch.arange(20, dtype=torch.float32).reshape(5, 4)
 
-        result = policy.unpad_outputs(out, forward_batch)
+        result = policy.finalize_forward_batch(out, forward_batch)
 
         self.assertEqual(result.shape, (3, 4))
         self.assertEqual(forward_batch.batch_size, 2)
@@ -473,9 +474,10 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
             prepare_forward_batch=MagicMock(),
         ),
         attn_backend=_FakeAttnBackend(),
-        # _run_one seeds req_to_token row 1; needs a real indexable tensor.
+        # _run_one seeds req_to_token rows; needs a real indexable tensor
+        # (draft extend seeds one row per request in the bucket).
         req_to_token_pool=SimpleNamespace(
-            req_to_token=torch.zeros(4, 4096, dtype=torch.int64)
+            req_to_token=torch.zeros(16, 4096, dtype=torch.int64)
         ),
         token_to_kv_pool=SimpleNamespace(),
         model_config=SimpleNamespace(hidden_size=16),
@@ -487,6 +489,8 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
             speculative_num_draft_tokens=num_steps + 1,
             speculative_algorithm="EAGLE3",
             speculative_eagle_topk=1,
+            page_size=1,
+            dp_size=1,
         ),
     )
 
@@ -559,6 +563,33 @@ class TestSpecPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mr.attn_backend.calls, [])
 
+    def test_draft_precompiles_all_serving_forward_families(self):
+        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        mr.server_args.page_size = 8
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        decode_backends = [_FakeAttnBackend(), _FakeAttnBackend()]
+        draft_backend = SimpleNamespace(attn_backends=decode_backends)
+        draft_extend_backend = _FakeAttnBackend()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy.precompile_draft(draft_backend, draft_extend_backend)
+
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
+        self.assertEqual(decode_backends[0].calls, [(1, 1), (4, 4)])
+        self.assertEqual(decode_backends[1].calls, [(1, 1), (4, 4)])
+        self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
+        modes = [call.args[2].forward_mode for call in mr.model.forward.call_args_list]
+        self.assertEqual(
+            modes,
+            [ForwardMode.EXTEND] * 2
+            + [ForwardMode.DECODE] * 4
+            + [ForwardMode.DRAFT_EXTEND_V2] * 2,
+        )
+
     def test_non_eagle3_algorithm_raises(self):
         # The spec policy enforces the supported algorithm at construction (only
         # EAGLE3 today); an unsupported algorithm fails loudly rather than
@@ -570,8 +601,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
 
 
 class TestSpecDummyForwardBatch(CustomTestCase):
-    """Spec dummy batches carry spec_info + slot-1 KV seeding, and TARGET_VERIFY
-    sizes extend metadata to draft_token_num tokens per request."""
+    """Spec dummy batches carry spec_info and slot-1 KV seeding."""
 
     def test_target_verify_batch_shapes_and_capture_mode(self):
         policy = _make_spec_policy(num_steps=3)  # draft_token_num = 4
@@ -585,9 +615,10 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         )
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
         self.assertIsNotNone(fb.spec_info)
-        # draft_token_num (=4) tokens per request.
-        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4, 4, 4])
-        self.assertEqual(fb.extend_num_tokens, 16)
+        # Runtime TARGET_VERIFY is decode-like and leaves extend metadata unset.
+        self.assertIsNone(fb.extend_seq_lens)
+        self.assertIsNone(fb.extend_prefix_lens)
+        self.assertIsNone(fb.extend_num_tokens)
         # Slot-1 KV seeding (avoids draft/target pool conflicts): not slot 0.
         self.assertEqual(fb.out_cache_loc.tolist(), [1] * 16)
         self.assertEqual(fb.req_pool_indices.tolist(), [1, 1, 1, 1])
@@ -605,6 +636,37 @@ class TestSpecDummyForwardBatch(CustomTestCase):
             spec_info=policy._make_null_spec_info(),
         )
         self.assertIsNotNone(fb.spec_info)
+
+    def test_draft_extend_uses_per_request_kv_pages(self):
+        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        mr.server_args.page_size = 8
+        policy = _make_spec_policy(mr, bs_buckets=(1, 4))
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=16,
+            bs=4,
+            mode=ForwardMode.DRAFT_EXTEND_V2,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            spec_info=policy._make_draft_extend_spec_info(),
+        )
+
+        self.assertEqual(fb.positions.tolist(), [4, 5, 6, 7] * 4)
+        self.assertEqual(
+            fb.out_cache_loc.tolist(),
+            list(range(12, 16))
+            + list(range(20, 24))
+            + list(range(28, 32))
+            + list(range(36, 40)),
+        )
+        self.assertEqual(fb.out_cache_loc.dtype, torch.int64)
+        self.assertEqual(fb.extend_seq_lens.tolist(), [4] * 4)
+        self.assertEqual(fb.extend_prefix_lens.tolist(), [4] * 4)
+
+        policy._seed_dummy_req_to_token(fb)
+        req_to_token = mr.req_to_token_pool.req_to_token
+        for row in range(1, 5):
+            self.assertEqual(
+                req_to_token[row, :8].tolist(), list(range(row * 8, row * 8 + 8))
+            )
 
 
 class TestSpecDraftDecodePadding(CustomTestCase):
@@ -626,7 +688,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
             batch_size=3,
         )
 
-        policy.pad_draft_decode(forward_batch)
+        policy._pad_draft_decode(forward_batch)
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch._tpu_real_b, 3)
@@ -671,7 +733,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             real_b=4,
             rows=32,
         )
-        policy.unpad_outputs(out, fb)
+        policy.finalize_forward_batch(out, fb)
         # Verify emits one logit per draft token -> real_q, not real_b.
         self.assertEqual(out.next_token_logits.shape[0], 16)
         self.assertEqual(out.hidden_states.shape[0], 16)  # FULL -> real_q
@@ -687,7 +749,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             real_b=4,
             rows=16,
         )
-        policy.unpad_outputs(out, fb)
+        policy.finalize_forward_batch(out, fb)
         self.assertEqual(out.next_token_logits.shape[0], 4)  # not verify -> real_b
         self.assertEqual(out.hidden_states.shape[0], 4)  # LAST -> real_b
 
@@ -700,7 +762,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             real_b=4,
             rows=8,
         )
-        policy.unpad_outputs(out, fb)
+        policy.finalize_forward_batch(out, fb)
         self.assertEqual(out.next_token_logits.shape[0], 4)
         self.assertEqual(out.hidden_states.shape[0], 4)
 

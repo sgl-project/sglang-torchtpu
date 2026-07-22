@@ -977,7 +977,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 self.init_decode_cuda_graph()
         else:
-            self.decode_cuda_graph_runner = self.eager_runner
+            # EAGLE draft workers own their decode-style graph capture, but TPU
+            # still uses this hook to install its torch.compile policy. The TPU
+            # graph runner does not capture or replay a device graph.
+            if self.device == "tpu" and get_flags().capture.enable_torch_compile:
+                self.init_decode_cuda_graph()
+            else:
+                self.decode_cuda_graph_runner = self.eager_runner
 
         # Register forward hooks AFTER cuda-graph capture so their tensor ops are
         # not traced into any captured graph — capture stays hook-free and hooks
@@ -3241,25 +3247,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
-
-    def pad_spec_draft_decode(self, forward_batch: ForwardBatch) -> None:
-        """Shape the speculative draft-decode batch for this runner's compiled
-        forward (e.g. pad to a static bucket). Delegates to the installed compile
-        policy; the default ``NoopCompilePolicy`` makes this a no-op.
-        """
-        self.compile_policy.pad_draft_decode(forward_batch)
-
-    def pad_spec_draft_extend_v2(
-        self, forward_batch: ForwardBatch, num_draft_tokens: int
-    ) -> None:
-        self.compile_policy.pad_draft_extend_v2(forward_batch, self, num_draft_tokens)
-
-    def unpad_spec_draft_outputs(self, outputs, forward_batch: ForwardBatch):
-        """Trim this runner's draft-decode outputs back to the real batch size,
-        undoing ``pad_spec_draft_decode``. Delegates to the installed compile
-        policy; the default ``NoopCompilePolicy`` passes outputs through.
-        """
-        return self.compile_policy.unpad_draft_outputs(outputs, forward_batch)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
