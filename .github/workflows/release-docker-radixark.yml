@@ -32,7 +32,7 @@ jobs:
   build-and-push:
     if: github.repository == 'sgl-project/sglang-torchtpu'
     environment: radixark-docker
-    runs-on: x64-docker-build-node
+    runs-on: linux-x64-k3s-docker-build
     steps:
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
