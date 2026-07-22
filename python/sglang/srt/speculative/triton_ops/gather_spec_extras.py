@@ -6,10 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_tpu
-
-_is_tpu = is_tpu()
-
 
 @triton.jit
 def _gather_rows_kernel(
@@ -80,19 +76,6 @@ def gather_spec_extras(
     indices = indices.contiguous()
     m = indices.shape[0]
     has_hidden = hidden_states_buf is not None
-
-    if _is_tpu:
-        row_indices = indices.to(dtype=torch.int64)
-        return (
-            torch.index_select(topk_p_buf, 0, row_indices),
-            torch.index_select(topk_index_buf, 0, row_indices),
-            torch.index_select(output_tokens_buf, 0, row_indices),
-            (
-                torch.index_select(hidden_states_buf, 0, row_indices)
-                if has_hidden
-                else None
-            ),
-        )
 
     topk_p = _empty_like_rows(topk_p_buf, m)
     topk_index = _empty_like_rows(topk_index_buf, m)

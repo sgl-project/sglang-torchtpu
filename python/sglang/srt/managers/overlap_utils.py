@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
+from sglang.srt.speculative.spec_utils import gather_spec_extras_func
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
@@ -288,7 +288,7 @@ class FutureMap:
                 draft_input.topk_index,
                 bonus_tokens,
                 hidden_states,
-            ) = gather_spec_extras(
+            ) = gather_spec_extras_func(
                 indices,
                 self.topk_p_buf,
                 self.topk_index_buf,

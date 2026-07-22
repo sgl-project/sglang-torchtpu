@@ -5,17 +5,18 @@ from unittest.mock import Mock, patch
 
 import torch
 
+import sglang.srt.speculative.eagle_utils as eagle_utils
 import sglang.srt.speculative.spec_utils as kernels
-import sglang.srt.speculative.triton_ops.gather_spec_extras as gather_kernels
 
 
 class _ForceTpu:
     def __enter__(self):
-        self.previous = kernels._is_tpu
+        self.previous = kernels._is_tpu, kernels._use_torch_native
         kernels._is_tpu = True
+        kernels._use_torch_native = True
 
     def __exit__(self, *_):
-        kernels._is_tpu = self.previous
+        kernels._is_tpu, kernels._use_torch_native = self.previous
 
 
 def test_gather_spec_extras_matches_row_indexing():
@@ -26,13 +27,9 @@ def test_gather_spec_extras_matches_row_indexing():
         torch.arange(4, dtype=torch.int64),
         torch.arange(24, dtype=torch.bfloat16).reshape(4, 2, 3),
     )
-    previous = gather_kernels._is_tpu
-    gather_kernels._is_tpu = True
-    try:
-        actual = gather_kernels.gather_spec_extras(indices, *buffers)
-        empty = gather_kernels.gather_spec_extras(indices[:0], *buffers)
-    finally:
-        gather_kernels._is_tpu = previous
+    with _ForceTpu():
+        actual = kernels.gather_spec_extras_func(indices, *buffers)
+        empty = kernels.gather_spec_extras_func(indices[:0], *buffers)
 
     expected_indices = indices.to(torch.int64)
     for result, source in zip(actual, buffers):
@@ -236,11 +233,11 @@ def test_extend_cache_router_uses_host_shadows():
     assert torch.equal(out, torch.tensor([69, 70, 103, 104]))
 
 
-def test_allocator_reuses_host_allocation_shadow():
+def test_allocator_fills_caller_owned_host_allocation():
     table = torch.zeros((4, 32), dtype=torch.int32)
     host_out = torch.tensor([101, 102, 103, 104], dtype=torch.int32)
     device_out = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
-    allocator = SimpleNamespace(page_size=4, last_alloc_extend_cpu=host_out)
+    allocator = SimpleNamespace(page_size=4)
     tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
     pool = SimpleNamespace(req_to_token=table, host_resident=True)
     host_rows = Mock(return_value=torch.tensor([2, 3]))
@@ -248,11 +245,13 @@ def test_allocator_reuses_host_allocation_shadow():
     nxt = torch.tensor([7, 9], dtype=torch.int32)
     with (
         patch.object(kernels, "get_last_loc", return_value=torch.tensor([1, 2])),
-        patch.object(
-            kernels, "alloc_paged_token_slots_extend", return_value=device_out
-        ),
+        patch.object(kernels, "alloc_paged_token_slots_extend") as alloc,
         patch.object(kernels, "assign_req_to_token_pool_func") as assign,
     ):
+        alloc.side_effect = lambda *args, **kwargs: (
+            kwargs["out_cache_loc_host"].copy_(host_out),
+            device_out,
+        )[1]
         result = kernels.allocate_and_assign_decode_cache(
             tree_cache=tree_cache,
             req_to_token_pool=pool,
@@ -265,7 +264,8 @@ def test_allocator_reuses_host_allocation_shadow():
             host_req_pool_indices=host_rows,
         )
     assert result is device_out
-    assert assign.call_args.args[4] is host_out
+    assert torch.equal(assign.call_args.args[4], host_out)
+    assert alloc.call_args.kwargs["out_cache_loc_host"] is assign.call_args.args[4]
     host_rows.assert_called_once_with()
 
 
@@ -330,10 +330,7 @@ def test_allocator_device_resident_uses_paged_device_result():
     table = torch.zeros((4, 32), dtype=torch.int32)
     rows = torch.tensor([2, 3], dtype=torch.int64)
     device_out = torch.tensor([11, 12, 13, 14], dtype=torch.int64)
-    allocator = SimpleNamespace(
-        page_size=4,
-        last_alloc_extend_cpu=torch.tensor([101, 102, 103, 104]),
-    )
+    allocator = SimpleNamespace(page_size=4)
     tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
     pool = SimpleNamespace(req_to_token=table, host_resident=False)
     cur = torch.tensor([5, 7], dtype=torch.int32)
@@ -365,34 +362,45 @@ def test_allocator_device_resident_uses_paged_device_result():
     assert assign.call_args.args[4] is device_out
 
 
-def test_allocator_host_resident_falls_back_to_device_copy():
-    table = torch.zeros((4, 32), dtype=torch.int32)
-    host_copy = torch.tensor([101, 102, 103, 104], dtype=torch.int32)
-    device_out = Mock()
-    device_out.cpu.return_value = host_copy
-    allocator = SimpleNamespace(page_size=4, last_alloc_extend_cpu=None)
-    tree_cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
-    pool = SimpleNamespace(req_to_token=table, host_resident=True)
-    cur = torch.tensor([5, 7], dtype=torch.int32)
-    nxt = torch.tensor([7, 9], dtype=torch.int32)
-    with (
-        patch.object(kernels, "get_last_loc", return_value=torch.tensor([1, 2])),
-        patch.object(
-            kernels, "alloc_paged_token_slots_extend", return_value=device_out
+def test_eagle_prepare_for_decode_uses_torch_native_allocator():
+    reqs = [
+        SimpleNamespace(kv_allocated_len=2, kv_committed_len=3, decode_batch_idx=0),
+        SimpleNamespace(kv_allocated_len=5, kv_committed_len=1, decode_batch_idx=0),
+    ]
+    req_pool_indices = torch.tensor([2, 3], dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor([2, 3], dtype=torch.int64)
+    batch = SimpleNamespace(
+        maybe_evict_swa=Mock(),
+        batch_size=Mock(return_value=2),
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=False)
         ),
-        patch.object(kernels, "assign_req_to_token_pool_func") as assign,
-    ):
-        result = kernels.allocate_and_assign_decode_cache(
-            tree_cache=tree_cache,
-            req_to_token_pool=pool,
-            req_pool_indices=torch.tensor([2, 3]),
-            cur_kv_lens_cpu=cur,
-            nxt_kv_lens_cpu=nxt,
-            num_needed_tokens=4,
-            batch_size=2,
-            device=torch.device("cpu"),
-        )
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        reqs=reqs,
+        tree_cache=object(),
+        req_to_token_pool=SimpleNamespace(host_resident=True),
+        req_pool_indices=req_pool_indices,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        device=torch.device("cpu"),
+    )
+    out = torch.arange(5)
 
-    assert result is device_out
-    device_out.cpu.assert_called_once_with()
-    assert assign.call_args.args[4] is host_copy
+    with (
+        patch.object(eagle_utils, "_use_torch_native", True),
+        patch.object(eagle_utils, "get_alloc_reserve_per_decode", return_value=4),
+        patch.object(
+            kernels, "allocate_and_assign_decode_cache", return_value=out
+        ) as allocate,
+    ):
+        eagle_utils.eagle_prepare_for_decode(batch)
+
+    allocate.assert_called_once()
+    kwargs = allocate.call_args.kwargs
+    assert kwargs["tree_cache"] is batch.tree_cache
+    assert kwargs["req_to_token_pool"] is batch.req_to_token_pool
+    assert kwargs["req_pool_indices"] is req_pool_indices
+    assert kwargs["host_req_pool_indices"] is req_pool_indices_cpu
+    assert kwargs["num_needed_tokens"] == 5
+    assert kwargs["batch_size"] == 2
+    assert torch.equal(kwargs["cur_kv_lens_cpu"], torch.tensor([2, 5]))
+    assert torch.equal(kwargs["nxt_kv_lens_cpu"], torch.tensor([7, 5]))

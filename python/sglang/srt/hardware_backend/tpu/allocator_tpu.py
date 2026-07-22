@@ -45,11 +45,6 @@ if TYPE_CHECKING:
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
-
-    def __init__(self, *args, **kwargs):
-        self.last_alloc_extend_cpu = None
-        super().__init__(*args, **kwargs)
-
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
         self.free_pages = torch.arange(
@@ -58,7 +53,6 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.release_pages = torch.empty((0,), dtype=torch.int32, device="cpu")
         self.is_not_in_free_group = True
         self.free_group = []
-        self.last_alloc_extend_cpu = None
 
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.
@@ -92,6 +86,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int = None,
+        out_indices_cpu: torch.Tensor = None,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -130,11 +125,12 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         else:
             free_pages_cpu = torch.empty((0,), dtype=torch.int32, device="cpu")
 
-        out_indices_cpu = torch.empty(
-            (extend_num_tokens,),
-            dtype=torch.int32,
-            device="cpu",
-        )
+        if out_indices_cpu is None:
+            out_indices_cpu = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int32,
+                device="cpu",
+            )
         alloc_extend_naive(
             prefix_lens_cpu,
             seq_lens_cpu,
@@ -145,10 +141,6 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             "cpu",
         )
         out_indices = out_indices_cpu.to(self.device, non_blocking=True)
-
-        # Keep the CPU indices for host-resident req_to_token updates to avoid
-        # synchronizing on a device-to-host copy.
-        self.last_alloc_extend_cpu = out_indices_cpu
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

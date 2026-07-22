@@ -893,7 +893,10 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+    from sglang.srt.speculative.spec_utils import (
+        allocate_and_assign_decode_cache,
+        assign_req_to_token_pool_func,
+    )
 
     bs = batch.batch_size()
 
@@ -938,38 +941,53 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
 
-    # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
-    # barrier has chained to the prev forward -> host stalls a full forward.
-    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    if page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-    else:
-        last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            cur_kv_lens_device,
-        )
-        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
-        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-            batch.tree_cache,
-            cur_kv_lens_device,
-            cur_kv_lens_cpu,
-            nxt_kv_lens_device,
-            nxt_kv_lens_cpu,
-            last_loc,
-            num_needed_tokens,
+    if _use_torch_native and batch.req_to_token_pool.host_resident:
+        out_cache_loc = allocate_and_assign_decode_cache(
+            tree_cache=batch.tree_cache,
+            req_to_token_pool=batch.req_to_token_pool,
             req_pool_indices=batch.req_pool_indices,
-            batch=batch,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch_size=bs,
+            device=batch.device,
+            host_req_pool_indices=batch.req_pool_indices_cpu,
         )
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        cur_kv_lens_device,
-        nxt_kv_lens_device,
-        out_cache_loc,
-        bs,
-    )
+    else:
+        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+        # barrier has chained to the prev forward -> host stalls a full forward.
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        if page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                cur_kv_lens_device,
+            )
+            device_type = getattr(
+                batch.device, "type", str(batch.device).split(":", 1)[0]
+            )
+            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                batch.tree_cache,
+                cur_kv_lens_device,
+                cur_kv_lens_cpu,
+                nxt_kv_lens_device,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                req_pool_indices=batch.req_pool_indices,
+                batch=batch,
+            )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            cur_kv_lens_device,
+            nxt_kv_lens_device,
+            out_cache_loc,
+            bs,
+        )
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:

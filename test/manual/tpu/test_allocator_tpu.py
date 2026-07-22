@@ -77,16 +77,13 @@ class TestAllocatorPoolLifecycle(CustomTestCase):
 
     def test_clear_restores_full_pool(self):
         a = _make_allocator(size=32, page_size=4)
-        self.assertIsNone(a.last_alloc_extend_cpu)
         # Drain a couple of pages, then clear() must restore IDs 1..8.
         out = a.alloc(8)  # 2 pages worth of tokens
         self.assertIsNotNone(out)
         self.assertEqual(len(a.free_pages), 6)
-        a.last_alloc_extend_cpu = torch.tensor([1, 2], dtype=torch.int32)
         a.clear()
         self.assertEqual(len(a.free_pages), 8)
         self.assertEqual(int(a.free_pages.min()), 1)
-        self.assertIsNone(a.last_alloc_extend_cpu)
 
 
 class TestAllocDecode(CustomTestCase):
@@ -333,6 +330,25 @@ class TestAllocExtend(CustomTestCase):
         self.assertEqual(out.shape, (5,))
         # Two pages consumed (the formula in the kernel is roundup-based).
         self.assertEqual(len(a.free_pages), 8 - 2)
+
+    def test_extend_fills_caller_owned_host_output(self):
+        a = _make_allocator(size=32, page_size=4)
+        prefix_lens = torch.tensor([0], dtype=torch.int32)
+        seq_lens = torch.tensor([5], dtype=torch.int32)
+        last_loc = torch.tensor([-1], dtype=torch.int32)
+        host_out = torch.empty(5, dtype=torch.int32)
+
+        out = a.alloc_extend(
+            prefix_lens,
+            prefix_lens.clone(),
+            seq_lens,
+            seq_lens.clone(),
+            last_loc,
+            extend_num_tokens=5,
+            out_indices_cpu=host_out,
+        )
+
+        self.assertTrue(torch.equal(host_out, out.cpu()))
 
     def test_extend_returns_none_when_pool_too_small(self):
         a = _make_allocator(size=8, page_size=4)  # 2 usable pages

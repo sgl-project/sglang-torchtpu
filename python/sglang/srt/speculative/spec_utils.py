@@ -18,7 +18,6 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -54,6 +53,7 @@ from sglang.srt.speculative.triton_ops.eagle import (
 from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
+from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
@@ -95,6 +95,50 @@ else:
 logger = logging.getLogger(__name__)
 
 HostTensor = torch.Tensor | Callable[[], torch.Tensor] | None
+
+
+def _gather_spec_extras_torch(
+    indices: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    hidden_states_buf: Optional[torch.Tensor],
+):
+    row_indices = indices.to(dtype=torch.int64)
+    return (
+        torch.index_select(topk_p_buf, 0, row_indices),
+        torch.index_select(topk_index_buf, 0, row_indices),
+        torch.index_select(output_tokens_buf, 0, row_indices),
+        (
+            torch.index_select(hidden_states_buf, 0, row_indices)
+            if hidden_states_buf is not None
+            else None
+        ),
+    )
+
+
+def gather_spec_extras_func(
+    indices: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    hidden_states_buf: Optional[torch.Tensor],
+):
+    if _use_torch_native:
+        return _gather_spec_extras_torch(
+            indices,
+            topk_p_buf,
+            topk_index_buf,
+            output_tokens_buf,
+            hidden_states_buf,
+        )
+    return gather_spec_extras(
+        indices,
+        topk_p_buf,
+        topk_index_buf,
+        output_tokens_buf,
+        hidden_states_buf,
+    )
 
 
 def _route_to_req_to_token_device(
@@ -157,7 +201,7 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ) -> None:
-    if _is_tpu:
+    if _use_torch_native:
         _assign_req_to_token_pool_torch(
             req_pool_indices,
             req_to_token,
@@ -209,6 +253,11 @@ def allocate_and_assign_decode_cache(
         out_cache_loc = alloc_token_slots(tree_cache, num_needed_tokens)
         out_cache_loc_host = None
     else:
+        out_cache_loc_host = (
+            torch.empty(num_needed_tokens, dtype=torch.int32, device="cpu")
+            if host_resident
+            else None
+        )
         last_loc = get_last_loc(req_to_token, rows, cur_kv_lens)
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache,
@@ -218,8 +267,8 @@ def allocate_and_assign_decode_cache(
             nxt_kv_lens_cpu,
             last_loc,
             num_needed_tokens,
+            out_cache_loc_host=out_cache_loc_host,
         )
-        out_cache_loc_host = allocator.last_alloc_extend_cpu
 
     assign_locs = out_cache_loc
     if host_resident:
@@ -237,6 +286,35 @@ def allocate_and_assign_decode_cache(
     return out_cache_loc
 
 
+def _assign_draft_cache_locs_contiguous_torch(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    topk: int,
+    speculative_num_steps: int,
+    *,
+    host_req_pool_indices: HostTensor = None,
+    host_seq_lens: HostTensor = None,
+) -> None:
+    """Torch-native draft-write slot gather for a dense chain."""
+    bs = seq_lens.shape[0]
+    if bs == 0:
+        return
+    rows = _route_to_req_to_token_device(
+        req_to_token, req_pool_indices, host_req_pool_indices
+    ).to(req_to_token.device, dtype=torch.int64)
+    starts = _route_to_req_to_token_device(req_to_token, seq_lens, host_seq_lens).to(
+        req_to_token.device, dtype=torch.int64
+    )
+    width = topk * speculative_num_steps
+    offsets = torch.arange(width, device=req_to_token.device, dtype=torch.int64)
+    gathered = req_to_token[rows[:, None], starts[:, None] + offsets[None, :]]
+    out_cache_loc.view(bs, width).copy_(
+        gathered.to(out_cache_loc.device, dtype=out_cache_loc.dtype)
+    )
+
+
 def assign_draft_cache_locs_contiguous_func(
     req_pool_indices: torch.Tensor,
     req_to_token: torch.Tensor,
@@ -250,20 +328,16 @@ def assign_draft_cache_locs_contiguous_func(
 ) -> None:
     """Gather the draft-write slots for a dense chain."""
     bs = seq_lens.shape[0]
-    if _is_tpu:
-        if bs == 0:
-            return
-        rows = _route_to_req_to_token_device(
-            req_to_token, req_pool_indices, host_req_pool_indices
-        ).to(req_to_token.device, dtype=torch.int64)
-        starts = _route_to_req_to_token_device(
-            req_to_token, seq_lens, host_seq_lens
-        ).to(req_to_token.device, dtype=torch.int64)
-        width = topk * speculative_num_steps
-        offsets = torch.arange(width, device=req_to_token.device, dtype=torch.int64)
-        gathered = req_to_token[rows[:, None], starts[:, None] + offsets[None, :]]
-        out_cache_loc.view(bs, width).copy_(
-            gathered.to(out_cache_loc.device, dtype=out_cache_loc.dtype)
+    if _use_torch_native:
+        _assign_draft_cache_locs_contiguous_torch(
+            req_pool_indices,
+            req_to_token,
+            seq_lens,
+            out_cache_loc,
+            topk,
+            speculative_num_steps,
+            host_req_pool_indices=host_req_pool_indices,
+            host_seq_lens=host_seq_lens,
         )
         return
     assign_draft_cache_locs_contiguous[(bs,)](
@@ -286,7 +360,7 @@ def assign_extend_cache_locs_kernel_func(
 ) -> None:
     """Fixed-shape ragged gather used for verify and accepted-slot moves."""
     bs = req_pool_indices.shape[0]
-    if _is_tpu:
+    if _use_torch_native:
         if bs == 0:
             return
         r2t_device = req_to_token.device
@@ -345,7 +419,7 @@ def assign_extend_cache_locs_func(
             req_pool_indices, req_to_token, start_offset, end_offset, out
         )
         return out
-    if _is_tpu:
+    if _use_torch_native:
         req_pool_indices = _route_to_req_to_token_device(
             req_to_token, req_pool_indices, host_req_pool_indices
         )
@@ -366,7 +440,7 @@ def fill_bonus_tokens_func(
     num_draft_tokens: int,
 ) -> None:
     bs = accept_lens.shape[0]
-    if _is_tpu:
+    if _use_torch_native:
         if bs == 0:
             return
         indices = (
@@ -387,7 +461,7 @@ def fill_accept_out_cache_loc_func(
 ) -> None:
     """Compact accepted source slots to the front, preserving order."""
     size = accept_index.numel()
-    if _is_tpu:
+    if _use_torch_native:
         if size == 0:
             return
         flat = accept_index.reshape(-1).to(torch.int64)
@@ -1319,6 +1393,8 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_global_server_args().enable_mamba_extra_buffer():
         return
+    from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
+
     set_mamba_track_indices_from_reqs(batch)
     batch.mamba_track_mask = None
     batch.mamba_track_seqlens = None
