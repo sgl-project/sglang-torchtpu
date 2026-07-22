@@ -371,6 +371,9 @@ class SpecDecodeCompilePolicyMixin:
         # an independent token bucket is unnecessary.
         forward_batch._pad_inputs_to_size(model_runner, pad_b * num_draft_tokens, pad_b)
         forward_batch.batch_size = pad_b
+        # Intentionally leave _REAL_Q_KEY unset. draft extend consumes the
+        # output later using its own select-index gather instead of generic
+        # prefix unpadding.
         setattr(forward_batch, _REAL_B_KEY, real_bs)
 
 
