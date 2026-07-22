@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Protocol
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -47,6 +48,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _get_pages_per_seq(max_context_len: int, page_size: int) -> int:
+    return (max_context_len + page_size - 1) // page_size
 
 
 @dataclass
@@ -312,7 +317,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
+        self.max_context_len = (
+            model_runner.model_config.context_len
+            + get_req_to_token_extra_context_len(model_runner.server_args)
+        )
         self.req_to_token_pool = model_runner.req_to_token_pool
+        req_to_token_width = self.req_to_token_pool.req_to_token.shape[1]
+        if self.max_context_len > req_to_token_width:
+            raise ValueError(
+                "RPA context capacity exceeds the request-to-token table width: "
+                f"required={self.max_context_len}, available={req_to_token_width}."
+            )
 
         # Hybrid-SWA models keep two KV sub-pools and need a
         # second page_indices tensor with indices translated into the SWA
@@ -464,8 +479,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         device = forward_batch.seq_lens.device
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
-        max_context_len = req_to_token.shape[1]
-        pages_per_seq = max_context_len // page_size
+        pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
 
         # Host-resident fast path: when req_to_token is on CPU, build the
         # metadata on host (one H2D) instead of the on-device gather/reshape
@@ -590,11 +604,13 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         torch-CPU ops (never traced -> no per-shape recompile) and H2D'd once.
         kv_lens stays on device; ``distribution`` is the caller's cached buffer.
         """
+        kv_len_bump = 0
         if forward_batch.forward_mode.is_target_verify():
             # TARGET_VERIFY: the KV cache already includes the draft tokens,
             # so bump seq_lens by draft_token_num (shape-stable device add).
             assert forward_batch.spec_info is not None
             draft_token_num = forward_batch.spec_info.draft_token_num
+            kv_len_bump = draft_token_num
             kv_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
             extend_seq_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
         elif self._is_extend_including_draft(forward_batch.forward_mode):
@@ -611,8 +627,19 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # Multi-step draft decode: each step's backend has a different
                 # speculative_step_id.  Bump seq_lens so the kernel sees KV
                 # entries from prior draft steps.
-                kv_lens = kv_lens + self.speculative_step_id + 1
+                kv_len_bump = self.speculative_step_id + 1
+                kv_lens = kv_lens + kv_len_bump
             extend_seq_lens = torch.ones(bs, dtype=torch.int32)
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and bs > 0:
+            max_kv_len = int(seq_lens_cpu[:bs].max().item()) + kv_len_bump
+            capacity = pages_per_seq * page_size
+            if max_kv_len > capacity:
+                raise ValueError(
+                    "RPA KV length exceeds the per-request page-table capacity: "
+                    f"required={max_kv_len}, available={capacity}."
+                )
 
         # Small per-batch tensors -> host.
         req_pool_indices = forward_batch.req_pool_indices.to("cpu", torch.int64)
