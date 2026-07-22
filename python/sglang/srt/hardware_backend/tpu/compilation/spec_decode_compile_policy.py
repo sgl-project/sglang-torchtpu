@@ -80,6 +80,7 @@ class SpecDecodeCompilePolicyMixin:
         if mode.is_idle():
             return
         if mode.is_decode():
+            forward_batch.spec_info.keep_outputs_padded = True
             self._pad_draft_decode(forward_batch)
         elif mode.is_draft_extend_v2():
             self._pad_draft_extend(forward_batch)
@@ -519,6 +520,9 @@ class SpecDecodeCompilePolicyMixin:
                 outputs.hidden_states = hidden_states[:n_real]
 
         _restore_forward_batch_inputs(forward_batch, real_q, real_b)
+        spec_info = forward_batch.spec_info
+        if spec_info is not None:
+            spec_info.keep_outputs_padded = False
         return outputs
 
     def _pad_draft_decode(self, forward_batch: ForwardBatch) -> None:
@@ -576,17 +580,30 @@ class SpecDecodeCompilePolicyMixin:
             spec_info.topk_index = _pad_first_dim(spec_info.topk_index, pad_b)
             spec_info.hidden_states = _pad_first_dim(spec_info.hidden_states, pad_b)
 
+            # input_ids is built later by the per-step draft loop.
+            spec_info.record_padding(
+                logical_batch_size=real_bs,
+                physical_batch_size=pad_b,
+                logical_num_tokens=real_bs * self.speculative_eagle_topk,
+                physical_num_tokens=pad_b * self.speculative_eagle_topk,
+            )
+
         forward_batch.batch_size = pad_b
         setattr(forward_batch, _REAL_B_KEY, real_bs)
 
     def finalize_spec_forward_batch(
-        self, outputs: tuple, forward_batch: ForwardBatch
-    ) -> tuple:
+        self, outputs: Any, forward_batch: ForwardBatch
+    ) -> Any:
         """Trim draft outputs and restore the logical batch state."""
         real_bs = getattr(forward_batch, _REAL_B_KEY, None)
+        spec_info = forward_batch.spec_info
         if real_bs is None:
+            if spec_info is not None:
+                spec_info.keep_outputs_padded = False
             return outputs
         forward_batch.batch_size = real_bs
+        if spec_info is not None:
+            spec_info.keep_outputs_padded = False
         # draft_probs is absent when rejection sampling is disabled.
         return tuple(t[:real_bs] if t is not None else None for t in outputs)
 
@@ -594,20 +611,33 @@ class SpecDecodeCompilePolicyMixin:
         """Bucket V2 draft-extend before attention metadata is constructed."""
         if self.b_bucketer is None:
             return
+        draft_extend_input = forward_batch.spec_info
         real_bs = int(forward_batch.seq_lens.shape[0])
+        real_tokens = int(forward_batch.input_ids.shape[0])
         pad_b = self.b_bucketer.next_bucket(real_bs)
         if pad_b == real_bs:
             return
-        # Draft extend has a fixed token count per request, so it does not need
-        # an independent token bucket.
+        pad_tokens = pad_b * self.draft_token_num
+        # Draft extend has a fixed width, so it needs no token bucket.
+        # This also grows its owned token- and request-axis tensors.
         forward_batch._pad_inputs_to_size(
-            self.model_runner, pad_b * self.draft_token_num, pad_b
+            model_runner=self.model_runner,
+            num_tokens=pad_tokens,
+            bs=pad_b,
         )
         forward_batch.batch_size = pad_b
         # Intentionally leave _REAL_Q_KEY unset. draft extend consumes the
         # output later using its own select-index gather instead of generic
         # prefix unpadding.
         setattr(forward_batch, _REAL_B_KEY, real_bs)
+
+        if isinstance(draft_extend_input, EagleDraftExtendInput):
+            draft_extend_input.record_padding(
+                logical_batch_size=real_bs,
+                physical_batch_size=pad_b,
+                logical_num_tokens=real_tokens,
+                physical_num_tokens=pad_tokens,
+            )
 
 
 class SpecDecoderTpuCompilePolicy(

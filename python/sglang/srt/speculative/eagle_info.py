@@ -973,44 +973,6 @@ class EagleDraftExtendInput(SpecInput):
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def _pad_draft_extend_for_tpu(
-        self, batch: ScheduleBatch, speculative_num_steps: int
-    ):
-        """Pad draft-extend tensors to a fixed size for XLA shape stability.
-
-        XLA/torch.compile traces tensor shapes at compile time. Without
-        padding, every different accept count produces a different total
-        token count, triggering recompilation. Pad to the worst case
-        (speculative_num_steps + 1) * bs so one compiled graph is reused.
-        """
-        bs = len(self.seq_lens)
-        padded_len = (speculative_num_steps + 1) * bs
-        actual_len = self.input_ids.numel()
-        pad_size = max(padded_len - actual_len, 0)
-        if pad_size > 0:
-            self.input_ids = torch.nn.functional.pad(
-                self.input_ids, (0, pad_size), value=0
-            )
-            if batch.out_cache_loc is not None:
-                batch.out_cache_loc = torch.nn.functional.pad(
-                    batch.out_cache_loc, (0, pad_size), value=0
-                )
-            if self.hidden_states is not None:
-                self.hidden_states = torch.nn.functional.pad(
-                    self.hidden_states,
-                    (0, 0, 0, pad_size),  # pad first dim only
-                    value=0,
-                )
-        elif batch.out_cache_loc is not None:
-            oc_len = batch.out_cache_loc.numel()
-            target_len = self.input_ids.numel()
-            if oc_len > target_len:
-                batch.out_cache_loc = batch.out_cache_loc[:target_len]
-            elif oc_len < target_len:
-                batch.out_cache_loc = torch.nn.functional.pad(
-                    batch.out_cache_loc, (0, target_len - oc_len), value=0
-                )
-
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
@@ -1020,9 +982,6 @@ class EagleDraftExtendInput(SpecInput):
         assert batch.spec_info is self
         if batch.forward_mode.is_idle():
             return
-
-        if _is_tpu:
-            self._pad_draft_extend_for_tpu(batch, speculative_num_steps)
 
         # The function below populates `self.positions` and `self.bonus_tokens`;
         # the worker reads `self.bonus_tokens` to construct next iter's

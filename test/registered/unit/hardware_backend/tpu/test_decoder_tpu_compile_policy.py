@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -809,12 +810,37 @@ class TestSpecDummyForwardBatch(CustomTestCase):
                 req_to_token[row, :8].tolist(), list(range(row * 8, row * 8 + 8))
             )
 
+    def test_draft_extend_uses_multiple_pages_when_tokens_exceed_page(self):
+        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        mr.server_args.page_size = 2
+        policy = _make_spec_policy(mr, bs_buckets=(1, 2))
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=8,
+            bs=2,
+            mode=ForwardMode.DRAFT_EXTEND_V2,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            spec_info=policy._make_draft_extend_spec_info(),
+        )
+
+        self.assertEqual(fb.positions.tolist(), [0, 1, 2, 3] * 2)
+        self.assertEqual(
+            fb.out_cache_loc.tolist(),
+            list(range(4, 8)) + list(range(8, 12)),
+        )
+        self.assertEqual(fb.seq_lens.tolist(), [4, 4])
+
+        policy._seed_dummy_req_to_token(fb)
+        req_to_token = mr.req_to_token_pool.req_to_token
+        self.assertEqual(req_to_token[1, :4].tolist(), list(range(4, 8)))
+        self.assertEqual(req_to_token[2, :4].tolist(), list(range(8, 12)))
+
 
 class TestSpecDraftDecodePadding(CustomTestCase):
     def test_pads_mrope_and_cpu_seq_lens_from_three_to_four(self):
         policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
         forward_batch = SimpleNamespace(
-            spec_info=SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            spec_info=EagleDraftInput(
                 topk_p=torch.zeros((3, 1)),
                 topk_index=torch.zeros((3, 1), dtype=torch.int64),
                 hidden_states=torch.zeros((3, 16)),
@@ -830,7 +856,7 @@ class TestSpecDraftDecodePadding(CustomTestCase):
             batch_size=3,
         )
 
-        policy._pad_draft_decode(forward_batch)
+        policy.prepare_spec_forward_batch(forward_batch)
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch._tpu_real_b, 3)
@@ -846,6 +872,23 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         )
         self.assertTrue(torch.all(forward_batch.mrope_positions[:, 3:] == 0))
         self.assertEqual(forward_batch.spec_info.topk_p.shape, (4, 1))
+        self.assertTrue(forward_batch.spec_info.keep_outputs_padded)
+
+    def test_idle_does_not_request_padded_outputs(self):
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        spec_info = EagleDraftInput(
+            topk_p=torch.zeros((0, 1)),
+            topk_index=torch.zeros((0, 1), dtype=torch.int64),
+            hidden_states=torch.zeros((0, 16)),
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            spec_info=spec_info,
+        )
+
+        policy.prepare_spec_forward_batch(forward_batch)
+
+        self.assertFalse(spec_info.keep_outputs_padded)
 
 
 class TestSpecUnpadOutputs(CustomTestCase):
@@ -862,6 +905,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             capture_hidden_mode=capture,
             batch_size=rows,
             seq_lens=torch.zeros(rows, dtype=torch.int32),
+            spec_info=None,
             _tpu_real_q=real_q,
             _tpu_real_b=real_b,
         )

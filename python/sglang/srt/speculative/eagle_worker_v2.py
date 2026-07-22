@@ -557,13 +557,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
-                )
+                draft_outputs = self.draft_forward(forward_batch)
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_runner.compile_policy.finalize_spec_forward_batch(
-                        (parent_list, top_scores_index, draft_tokens, draft_probs),
-                        forward_batch,
+                        outputs=draft_outputs,
+                        forward_batch=forward_batch,
                     )
                 )
 

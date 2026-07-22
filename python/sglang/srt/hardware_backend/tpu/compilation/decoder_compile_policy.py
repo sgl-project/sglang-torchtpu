@@ -211,19 +211,20 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         out_cache_loc_dtype: torch.dtype,
     ) -> _DummyForwardBatchFields:
         """Realistic per-request layout for DRAFT_EXTEND_V2."""
-        de_ctx = int(page_size)  # 1 page of context
-        de_prefix = max(de_ctx - tokens_per_req, 0)
+        num_context_pages = max(1, (tokens_per_req + page_size - 1) // page_size)
+        context_len = num_context_pages * page_size  # 1 or more pages of context
+        prefix_len = context_len - tokens_per_req
 
         input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
         input_ids[:bs] = 1
         # query positions per request: [prefix, prefix + tokens_per_req)
-        positions = de_prefix + torch.arange(tokens_per_req, device=device).repeat(
+        positions = prefix_len + torch.arange(tokens_per_req, device=device).repeat(
             bs
         ).to(torch.int64)
-        # distinct KV write locations: request r (1..bs) uses page r, extend
-        # tokens at the tail of its page.
+        # distinct KV write locations: request r (1..bs) uses a disjoint page
+        # span, with extend tokens at the tail of that span.
         r = torch.arange(1, bs + 1, device=device)
-        base = (r * de_ctx + de_prefix).view(bs, 1)
+        base = (r * context_len + prefix_len).view(bs, 1)
         out_cache_loc = (
             (base + torch.arange(tokens_per_req, device=device).view(1, -1))
             .reshape(-1)
@@ -233,14 +234,16 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc,
-            seq_lens=torch.full((bs,), de_ctx, dtype=torch.int64, device=device),
-            orig_seq_lens=torch.full((bs,), de_ctx, dtype=torch.int32, device=device),
-            seq_lens_cpu=torch.full((bs,), de_ctx, dtype=torch.int64),
+            seq_lens=torch.full((bs,), context_len, dtype=torch.int64, device=device),
+            orig_seq_lens=torch.full(
+                (bs,), context_len, dtype=torch.int32, device=device
+            ),
+            seq_lens_cpu=torch.full((bs,), context_len, dtype=torch.int64),
             req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int64, device=device),
             req_pool_indices_cpu=torch.arange(1, bs + 1, dtype=torch.int64),
-            seq_lens_sum=de_ctx * bs,
-            # DRAFT_EXTEND_V2 always carries extend metadata (prefix = de_prefix).
-            **cls._extend_metadata_fields(True, bs, tokens_per_req, de_prefix, device),
+            seq_lens_sum=context_len * bs,
+            # DRAFT_EXTEND_V2 always carries extend metadata (prefix = prefix_len).
+            **cls._extend_metadata_fields(True, bs, tokens_per_req, prefix_len, device),
         )
 
 
@@ -443,6 +446,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         setattr(forward_batch, _REAL_Q_KEY, real_q)
         setattr(forward_batch, _REAL_B_KEY, real_b)
+        spec_info = forward_batch.spec_info
+        if spec_info is not None:
+            spec_info.record_padding(
+                logical_batch_size=real_b,
+                physical_batch_size=int(forward_batch.seq_lens.shape[0]),
+                logical_num_tokens=real_q,
+                physical_num_tokens=int(forward_batch.input_ids.shape[0]),
+            )
 
     def _install_dp_idle_as_decode(self) -> None:
         """Run idle DP batches as DECODE.

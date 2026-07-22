@@ -534,7 +534,9 @@ class CompiledForwardShim:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
-        out = self.policy.finalize_forward_batch(out, forward_batch)
+        spec_info = forward_batch.spec_info
+        if spec_info is None or not spec_info.keep_outputs_padded:
+            out = self.policy.finalize_forward_batch(out, forward_batch)
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).

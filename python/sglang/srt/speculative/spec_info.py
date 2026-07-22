@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
+import msgspec
 import torch
 
 from sglang.srt.speculative.spec_registry import (
@@ -253,9 +254,36 @@ class SpecInputType(IntEnum):
     NGRAM_VERIFY = auto()
 
 
+class SpecPaddingState(msgspec.Struct, frozen=True):
+    """Logical and physical shapes for one speculative execution phase."""
+
+    logical_batch_size: int
+    physical_batch_size: int
+    logical_num_tokens: int
+    physical_num_tokens: int
+
+
 class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
+        self.padding_state: Optional[SpecPaddingState] = None
+        self.keep_outputs_padded: bool = False
+
+    def record_padding(
+        self,
+        *,
+        logical_batch_size: int,
+        physical_batch_size: int,
+        logical_num_tokens: int,
+        physical_num_tokens: int,
+    ) -> SpecPaddingState:
+        self.padding_state = SpecPaddingState(
+            logical_batch_size=logical_batch_size,
+            physical_batch_size=physical_batch_size,
+            logical_num_tokens=logical_num_tokens,
+            physical_num_tokens=physical_num_tokens,
+        )
+        return self.padding_state
 
     # Cross-algorithm phase guards. Used by attention backends and
     # ForwardBatch padding logic to dispatch on phase without hardcoding the
