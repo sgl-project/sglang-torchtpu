@@ -20,6 +20,14 @@ logger = get_logger(__name__)
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("sglang.srt.layers.vocab_parallel_embedding", "get_masked_input_and_mask"),
     ("sglang.srt.layers.rotary_embedding.utils", "apply_rotary_pos_emb_native"),
+    (
+        "sglang.srt.sampling.penaltylib.repetition_penalty",
+        "apply_scaling_penalties",
+    ),
+    (
+        "sglang.srt.sampling.sampling_batch_info",
+        "apply_scaling_penalties",
+    ),
 ]
 
 _dynamic_compile_unwrapped = False

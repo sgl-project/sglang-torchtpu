@@ -69,6 +69,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -76,13 +77,11 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_npu,
-    is_tpu,
     round_up,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
-_is_tpu = is_tpu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -1210,7 +1209,7 @@ class Qwen3LLMModel(Qwen3Model):
         return hidden_states, aux_hidden_states
 
 
-if _is_tpu:
+if current_platform.supports_torch_compile():
     from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
         Qwen3VLDecoderTpuCompilePolicy,
     )

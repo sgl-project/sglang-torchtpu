@@ -23,10 +23,13 @@ T = TypeVar("T")
 class CompilePolicy(ABC):
     """Base class for annotation-driven torch.compile policies."""
 
+    # ``platform`` selects the runner that may install this policy. ``backend``
+    # is only an optional torch.compile backend override; keeping these separate
+    # avoids treating a backend registration name as hardware identity.
+    platform: ClassVar[str | None] = None
     backend: ClassVar[str | None] = None
     fullgraph: ClassVar[bool] = True
     dynamic: ClassVar[bool] = False
-    should_precompile: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -56,6 +59,9 @@ class CompilePolicy(ABC):
     @abstractmethod
     def unpad_outputs(self, out: Any, context: Any) -> Any:
         """Adapt padded compiled outputs back to the caller-visible shape."""
+
+    # TODO: Move output adaptation into a platform-neutral compile runner once
+    # another backend adopts annotation-driven policy installation.
 
     # Speculative draft-decode I/O shaping. Base is a no-op; the TPU spec policy
     # overrides these to pad/trim the compiled draft-decode forward. Kept on the

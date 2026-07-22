@@ -38,6 +38,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     SpecDecodeCompilePolicyMixin,
 )
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -131,6 +132,8 @@ class TpuGraphRunner:
 
         _register_tpu_compile_backend()
 
+        # TODO: Move policy discovery and installation into a reusable compile
+        # runner when a second platform adopts support_torch_compile metadata.
         modules = (
             self.model.modules()
             if callable(getattr(self.model, "modules", None))
@@ -142,7 +145,7 @@ class TpuGraphRunner:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
                 continue
-            if policy_cls.backend not in (None, "tpu"):
+            if policy_cls.platform not in (None, current_platform.device_type):
                 continue
 
             method_name = "forward"

@@ -95,6 +95,10 @@ class SRTPlatform(DeviceMixin):
         """
         return "inductor"
 
+    def supports_torch_compile(self) -> bool:
+        """Whether this platform consumes annotation-driven compile policies."""
+        return False
+
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError

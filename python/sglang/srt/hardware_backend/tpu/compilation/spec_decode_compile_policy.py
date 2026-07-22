@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _restore_forward_batch_inputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _COMPILE_BAR_FORMAT,
@@ -252,6 +253,13 @@ class SpecDecodeCompilePolicyMixin:
             return out
 
         next_token_logits = getattr(out, "next_token_logits", None)
+        hidden_states = getattr(out, "hidden_states", None)
+        if next_token_logits is None and hidden_states is None:
+            # Inner decoder boundaries return raw tensors/tuples. Delegate
+            # cooperatively so a model-specific policy later in the MRO (for
+            # example Qwen3-VL) can slice those outputs and restore metadata.
+            return super().unpad_outputs(out, forward_batch)
+
         if next_token_logits is not None and real_b < next_token_logits.shape[0]:
             # TARGET_VERIFY outputs bs * draft_token_num logits (one per draft
             # token across all requests); slicing to real_b would drop verify
@@ -263,7 +271,6 @@ class SpecDecodeCompilePolicyMixin:
             if logit_rows < next_token_logits.shape[0]:
                 out.next_token_logits = next_token_logits[:logit_rows]
 
-        hidden_states = getattr(out, "hidden_states", None)
         if hidden_states is not None:
             # Capture-LAST (draft extend) emits one hidden row per
             # sequence (batch-dim), so slice to real_b. Every other capture mode
@@ -273,9 +280,7 @@ class SpecDecodeCompilePolicyMixin:
             if n_real < hidden_states.shape[0]:
                 out.hidden_states = hidden_states[:n_real]
 
-        # Restore real batch_size so downstream consumers (sampler, logprob,
-        # scheduler hooks) don't iterate over ghost slots.
-        forward_batch.batch_size = real_b
+        _restore_forward_batch_inputs(forward_batch, real_q, real_b)
         return out
 
     def pad_draft_decode(self, forward_batch: Any) -> None:
