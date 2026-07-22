@@ -119,6 +119,7 @@ class TestTpuGraphRunner(CustomTestCase):
             tpu_compile_tokens=None,
             tpu_compile_bs=None,
             torch_compile_max_bs=8,
+            prefill_max_requests=None,
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
         )

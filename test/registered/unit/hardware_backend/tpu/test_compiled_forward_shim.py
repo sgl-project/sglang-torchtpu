@@ -60,7 +60,10 @@ class _ForwardModeMock:
         # extend-family mode), so mirror that here; otherwise the shim guard's
         # `is_extend() and not is_target_verify()` short-circuit isn't tested
         # faithfully.
-        return self._mode in ("extend", "target_verify")
+        return self._mode in ("extend", "mixed", "target_verify")
+
+    def is_mixed(self):
+        return self._mode == "mixed"
 
     def is_target_verify(self):
         return self._mode == "target_verify"
@@ -71,7 +74,7 @@ class _ForwardModeMock:
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
-    extend = mode in ("extend", "draft_extend_v2")
+    extend = mode in ("extend", "mixed", "draft_extend_v2")
     return SimpleNamespace(
         input_ids=torch.arange(real_t, dtype=torch.int32),
         positions=torch.arange(real_t, dtype=torch.int32),
@@ -157,6 +160,42 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertEqual(fb.input_ids.shape[0], 4)
         self.assertEqual(fb.seq_lens.shape[0], 4)
+
+    def test_extend_cap_is_independent_from_decode_buckets(self):
+        fb = _forward_batch(real_t=10, real_b=3, mode="extend")
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [16, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4, 16, 64, 256]),
+            extend_bs=4,
+        )
+        self.assertEqual(fb.input_ids.shape[0], 16)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+
+    def test_extend_rejects_batch_above_compile_cap(self):
+        fb = _forward_batch(real_t=10, real_b=5, mode="extend")
+        with self.assertRaisesRegex(ValueError, "exceeds its compile cap 4"):
+            _pad_forward_batch_inputs(
+                fb,
+                t_bucketer=_bucketer("Token", [16, 64]),
+                b_bucketer=_bucketer("Bs", [1, 4, 16, 64, 256]),
+                extend_bs=4,
+            )
+
+    def test_mixed_batch_uses_decode_bucket_above_prefill_cap(self):
+        fb = _forward_batch(real_t=80, real_b=56, mode="mixed")
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64, 128]),
+            b_bucketer=_bucketer("Bs", [16, 32, 64]),
+            extend_bs=16,
+        )
+
+        self.assertEqual((real_q, real_b), (80, 56))
+        self.assertEqual(fb.input_ids.shape[0], 128)
+        self.assertEqual(fb.seq_lens.shape[0], 64)
+        self.assertEqual(fb.extend_seq_lens.shape[0], 64)
+        self.assertEqual(fb.batch_size, 64)
 
     def test_target_verify_pins_token_dim_to_draft_token_num(self):
         # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:

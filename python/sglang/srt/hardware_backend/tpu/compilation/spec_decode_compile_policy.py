@@ -13,7 +13,6 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
-    _extend_batch_cap,
     _restore_forward_batch_inputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
@@ -151,7 +150,7 @@ class SpecDecodeCompilePolicyMixin:
         """Compile EXTEND with CaptureHiddenMode.FULL at the fixed batch cap."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
-        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
+        bs = self._extend_compile_cap()
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         logger.info(
             "[spec compile policy] EXTEND(FULL): %d shapes "

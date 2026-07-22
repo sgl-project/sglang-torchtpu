@@ -399,6 +399,24 @@ def _make_spec_policy(
 class TestSpecPrecompileLoops(CustomTestCase):
     """Target spec precompile covers its serving forward families."""
 
+    def test_extend_full_uses_configured_prefill_cap(self):
+        mr = _spec_model_runner(num_steps=3)
+        policy = _make_spec_policy(
+            mr,
+            token_buckets=(1024, 4096),
+            bs_buckets=(16, 32, 64),
+        )
+        policy.extend_bs = 16
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy._precompile_extend_full()
+
+        self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
+
     def test_target_precompiles_all_spec_modes(self):
         mr = _spec_model_runner(num_steps=3)  # draft_token_num = 4
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))

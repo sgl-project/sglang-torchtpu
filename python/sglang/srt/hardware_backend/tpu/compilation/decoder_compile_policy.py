@@ -139,7 +139,13 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self.extend_bs: int | None = None
         self._logged_vl_warmup_variants: set[str] = set()
+
+    def _extend_compile_cap(self) -> int:
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
@@ -196,6 +202,13 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        if is_dp_attention_enabled():
+            self.extend_bs = b_bucketer.max_val
+        else:
+            self.extend_bs = min(
+                server_args.prefill_max_requests or b_bucketer.max_val,
+                b_bucketer.max_val,
+            )
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)
@@ -204,7 +217,10 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             if existing_prep is not None:
                 existing_prep(forward_batch)
             real_q, real_b = _pad_forward_batch_inputs(
-                forward_batch, t_bucketer, b_bucketer
+                forward_batch,
+                t_bucketer,
+                b_bucketer,
+                extend_bs=self.extend_bs,
             )
             setattr(forward_batch, _REAL_Q_KEY, real_q)
             setattr(forward_batch, _REAL_B_KEY, real_b)
@@ -291,7 +307,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
+        bs = self._extend_compile_cap()
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
@@ -622,7 +638,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
+        bs = self._extend_compile_cap()
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
