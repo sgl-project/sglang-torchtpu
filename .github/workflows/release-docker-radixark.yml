@@ -62,9 +62,14 @@ jobs:
           TAG: ${{ inputs.tag }}
           DOCKER_TARGET: ${{ inputs.docker_target }}
         run: |
+          # Build from this fork's checked-out source. Without BRANCH_TYPE=local
+          # the Dockerfile's framework_final stage falls through to a deliberate
+          # `exit 1` (it would otherwise require SGL_VERSION or USE_LATEST_SGLANG
+          # to clone upstream sglang, which is not what this fork should build).
           docker buildx build \
             --target "$DOCKER_TARGET" \
             --platform linux/amd64 \
+            --build-arg BRANCH_TYPE=local \
             --push \
             -f docker/Dockerfile \
             -t "radixark/sglang-torchtpu:$TAG" \

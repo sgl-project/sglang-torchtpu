@@ -21,11 +21,13 @@ name: PR Test Extra (AMD)
 # (it now exercises the ROCm canary kernels end-to-end).
 
 on:
-  pull_request:
-    # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
-    # is added after the latest push. See call-gate.if for the matching guard
-    # that prevents unrelated label additions from dispatching a full run.
-    types: [opened, synchronize, reopened, labeled]
+  # Disabled in sglang-torchtpu: TPU PRs should not spawn AMD extra GPU checks.
+  # AMD extra CI remains available via workflow_dispatch and workflow_call.
+  # pull_request:
+  #   # `labeled` lets the workflow re-fire when `run-ci-extra` (or `run-ci`)
+  #   # is added after the latest push. See call-gate.if for the matching guard
+  #   # that prevents unrelated label additions from dispatching a full run.
+  #   types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       runner_arch:
