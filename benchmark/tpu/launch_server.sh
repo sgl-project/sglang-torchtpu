@@ -404,4 +404,6 @@ EXTRA_ARGS=${EXTRA_ARGS:-}
 [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
 
 # PYTHON is exported by common_env.sh (default python3).
+set -x
 exec "$PYTHON" "${args[@]}" 2>&1
+set +x
