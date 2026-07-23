@@ -278,7 +278,30 @@ def _register_aten_fallbacks() -> None:
     def _count_nonzero_dim_intlist(self, dim):
         return (self != 0).to(torch.int64).sum(dim=dim)
 
-    logger.info("Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList")
+    # torch_tpu can't lower aten::masked_scatter_: the ATen kernel computes
+    # source offsets with a prefix scan whose accumulator defaults to int64, and
+    # XLA:TPU cannot materialize an int64 value in vector registers ("Unsupported
+    # conversion vmreg/vreg to U64"). Re-express it and force the scan to stay
+    # int32.
+    @torch.library.register_kernel("aten::masked_scatter_", "PrivateUse1")
+    def _masked_scatter_(self, mask, source):
+        src_flat = source.to(self.dtype).reshape(-1)
+        if src_flat.numel() == 0:
+            return self
+        flat_mask = mask.to(torch.bool).broadcast_to(self.shape).reshape(-1)
+        idx = (
+            torch.cumsum(flat_mask.to(torch.int32), 0, dtype=torch.int32) - 1
+        ).clamp(min=0)
+        out = torch.where(flat_mask, src_flat[idx], self.reshape(-1)).reshape(
+            self.shape
+        )
+        self.copy_(out)
+        return self
+
+    logger.info(
+        "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
+        "masked_scatter_"
+    )
 
 
 _set_device_patched = False
@@ -590,6 +613,7 @@ def _patch_support_triton_for_tpu() -> None:
         "sglang.srt.utils",
         "sglang.srt.mem_cache.common",
         "sglang.srt.model_executor.forward_batch_info",
+        "sglang.srt.layers.rotary_embedding.mrope",
     ):
         try:
             mod = importlib.import_module(modname)

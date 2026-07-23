@@ -58,6 +58,8 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
         return policy_cls
     if issubclass(policy_cls, SpecDecodeCompilePolicyMixin):
         return policy_cls
+    if not issubclass(policy_cls, DecoderTpuCompilePolicy):
+        return policy_cls
     return type(
         f"Spec{policy_cls.__name__}", (SpecDecodeCompilePolicyMixin, policy_cls), {}
     )
