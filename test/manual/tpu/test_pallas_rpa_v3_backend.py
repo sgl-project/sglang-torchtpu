@@ -351,7 +351,7 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         fb = _make_forward_batch(
             seq_lens=self.seq_lens,
             req_pool_indices=self.req_pool_indices,
-            forward_mode=ForwardMode.DRAFT_EXTEND,
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
             extend_seq_lens=extend_seq_lens,
             spec_info=self.spec_info,
         )
@@ -359,6 +359,14 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         self.assertTrue(torch.equal(meta.kv_lens, self.seq_lens.to(torch.int32)))
         expected_cu_q = torch.tensor([0, 3, 4, 6], dtype=torch.int32)
         self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
+
+    def test_verify_buffer_update_is_noop(self):
+        backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        self.assertIsNone(
+            backend.update_verify_buffers_to_fill_after_draft(
+                self.spec_info, cuda_graph_bs=8
+            )
+        )
 
     def test_spec_page_indices_match_non_spec(self):
         # The page-indices gather is mode-independent; spec modes must produce

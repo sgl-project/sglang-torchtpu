@@ -123,7 +123,6 @@ BASE_ARGS=(
     --device tpu
     --tp-size "$TP_SIZE"
     --dtype bfloat16
-    --disable-overlap-schedule
     --decode-log-interval 1
     --host 127.0.0.1
     --port "$PORT"

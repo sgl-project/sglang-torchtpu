@@ -241,6 +241,7 @@ def _pad_forward_batch_inputs(
             )
 
     is_decode = forward_batch.forward_mode.is_decode()
+    is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
 
@@ -264,6 +265,15 @@ def _pad_forward_batch_inputs(
         pad_b = b_bucketer.next_bucket(real_b)
         pad_t = pad_b * forward_batch.spec_info.draft_token_num
         real_q_out, real_b_out = real_q, real_b
+    elif is_draft_extend_v2 and forward_batch.spec_info is not None:
+        pad_b = b_bucketer.next_bucket(real_b)
+        num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
+        assert num_tokens_per_req > 0, (
+            "DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, "
+            f"got {num_tokens_per_req}"
+        )
+        pad_t = pad_b * num_tokens_per_req
+        real_q_out, real_b_out = real_q, real_b
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
@@ -283,6 +293,11 @@ def _pad_forward_batch_inputs(
             mrope_pos, (0, pad_t - mrope_pos.shape[-1])
         )
 
+    if is_draft_extend_v2:
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc.shape[0] < pad_t:
+            forward_batch.out_cache_loc = _zero_pad_1d(out_cache_loc, pad_t)
+
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
@@ -295,7 +310,7 @@ def _pad_forward_batch_inputs(
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
         if val is None:
-            if not forward_batch.forward_mode.is_extend():
+            if not (forward_batch.forward_mode.is_extend() or is_draft_extend_v2):
                 continue
             val = []
         elif isinstance(val, torch.Tensor):
@@ -325,6 +340,49 @@ def _pad_forward_batch_inputs(
     forward_batch.batch_size = pad_b
 
     return real_q_out, real_b_out
+
+
+def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) -> None:
+    """Undo in-place TPU bucketing before eager outer-model processing.
+
+    Restore real token and batch shapes so downstream logits and sampling do
+    not observe the compiled inner decoder's padded ghost slots.
+    """
+    for field in _TOKEN_FIELDS:
+        value = getattr(forward_batch, field, None)
+        if isinstance(value, torch.Tensor) and value.shape[0] > real_q:
+            setattr(forward_batch, field, value[:real_q])
+
+    mrope_positions = getattr(forward_batch, "mrope_positions", None)
+    if isinstance(mrope_positions, torch.Tensor) and mrope_positions.shape[-1] > real_q:
+        forward_batch.mrope_positions = mrope_positions[..., :real_q]
+
+    for field in _BS_FIELDS:
+        value = getattr(forward_batch, field, None)
+        if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
+            setattr(forward_batch, field, value[:real_b])
+
+    for field in _BS_CPU_LIST_FIELDS:
+        value = getattr(forward_batch, field, None)
+        if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
+            setattr(forward_batch, field, value[:real_b])
+        elif isinstance(value, list) and len(value) > real_b:
+            setattr(forward_batch, field, value[:real_b])
+
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    if isinstance(mm_inputs, list) and len(mm_inputs) > real_b:
+        forward_batch.mm_inputs = mm_inputs[:real_b]
+
+    mm_input_embeds = getattr(forward_batch, "mm_input_embeds", None)
+    if isinstance(mm_input_embeds, torch.Tensor) and mm_input_embeds.shape[0] > real_q:
+        forward_batch.mm_input_embeds = mm_input_embeds[:real_q]
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    hidden_states = getattr(spec_info, "hidden_states", None)
+    if isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] > real_q:
+        spec_info.hidden_states = hidden_states[:real_q]
+
+    forward_batch.batch_size = real_b
 
 
 # Warming above this many pow2 blocks is correct but means warmup runs a

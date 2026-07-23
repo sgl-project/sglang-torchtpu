@@ -105,8 +105,7 @@ class WeightsRef:
             w = pltpu.bitcast(w, packing_dtype)
         return w
 
-    def get_scale(self, b_id: int, scale_block_n: int = 1, up_scale_start_n: int = 0):
-        del up_scale_start_n
+    def get_scale(self, b_id: int, scale_block_n: int = 1):
         # Quantization subchannel scale per quant block
         s = self.scale[..., b_id, :, :]
         if scale_block_n != 1:
@@ -148,15 +147,13 @@ class FusedWeightsRef:
 
         return w
 
-    def get_scale(self, b_id: int, scale_block_n: int = 1, up_scale_start_n: int = 0):
+    def get_scale(self, b_id: int, scale_block_n: int = 1):
         # Quantization subchannel scale per quant block
         s = self.gate.scale[..., b_id, :, :]
         s_up = self.up.scale[..., b_id, :, :]
         if scale_block_n != 1:
             s = jnp.repeat(s, scale_block_n, axis=-1)
             s_up = jnp.repeat(s_up, scale_block_n, axis=-1)
-        if up_scale_start_n and s_up.shape[-1] > up_scale_start_n:
-            s_up = s_up[..., up_scale_start_n:]
         s = jnp.concatenate([s, s_up], axis=-1)
         return s
 
@@ -469,7 +466,7 @@ def inner_kernel(
                     )
                     if cfgs.rhs_cfgs.has_scale:
                         tiled_rhs_scale = tiled_rhs_ref.get_scale(
-                            b_id, cfgs.rhs_cfgs.scale_block_n, cfgs.dims.size_n
+                            b_id, cfgs.rhs_cfgs.scale_block_n
                         )
                         scale = tiled_rhs_scale[..., start_n:end_n]
                         assert scale.shape[0] == 1
@@ -534,7 +531,7 @@ def inner_kernel(
                     if cfgs.rhs_cfgs.has_scale:
                         b_id = start_k // cfgs.rhs_cfgs.quant_block_size
                         rhs_scale_slice = tiled_rhs_ref.get_scale(
-                            b_id, cfgs.rhs_cfgs.scale_block_n, cfgs.dims.size_n
+                            b_id, cfgs.rhs_cfgs.scale_block_n
                         )
                         block_acc *= rhs_scale_slice[..., start_n:end_n].astype(
                             acc_ref.dtype
@@ -924,7 +921,13 @@ def kernel_main(
         # Up half = sub-view of rhs_ref at column size_n.
         rhs_up_ref = WeightsRef(
             weight=rhs_ref.weight.at[..., cfgs.dims.size_n :],
-            scale=rhs_ref.scale,
+            # The scale ref must be offset to point to the up half's columns
+            # like the weight ref.
+            scale=(
+                rhs_ref.scale.at[..., cfgs.dims.size_n // cfgs.rhs_cfgs.scale_block_n :]
+                if rhs_ref.scale is not None
+                else None
+            ),
             bias=(
                 rhs_ref.bias.at[..., cfgs.dims.size_n :]
                 if rhs_ref.bias is not None
@@ -1190,6 +1193,12 @@ def make_gmm_configs(
             scale_block_n = 128
         else:
             scale_block_n = rhs.shape[2] // rhs_scale.shape[3]
+        if fuse_act is not None:
+            assert dims.size_n % scale_block_n == 0, (
+                f"fused activation requires the gate/up boundary "
+                f"({dims.size_n}) to align with the RHS scale block size "
+                f"({scale_block_n})"
+            )
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via

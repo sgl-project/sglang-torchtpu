@@ -181,8 +181,8 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         """
         self._run_and_diff(
             m=32,
-            k=64,
-            n=64,
+            k=128,
+            n=128,
             g=4,
             topk=2,
             activation="silu",
@@ -195,8 +195,8 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         gelu branches in ``_activation``."""
         self._run_and_diff(
             m=32,
-            k=64,
-            n=64,
+            k=128,
+            n=128,
             g=4,
             topk=2,
             activation="gelu",
@@ -215,8 +215,8 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         """
         self._run_and_diff(
             m=3,
-            k=64,
-            n=64,
+            k=128,
+            n=128,
             g=4,
             topk=8,
             activation="silu",
@@ -230,8 +230,8 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         pad/un-permute path that aligned shapes would miss."""
         self._run_and_diff(
             m=8,
-            k=64,
-            n=64,
+            k=128,
+            n=128,
             g=4,
             topk=3,
             activation="silu",
@@ -250,8 +250,8 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         ids = flat.reshape(m, topk)
         self._run_and_diff(
             m=m,
-            k=64,
-            n=64,
+            k=128,
+            n=128,
             g=g,
             topk=topk,
             activation="silu",
@@ -269,8 +269,8 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
         ids = jnp.zeros((m, topk), dtype=jnp.int32)
         self._run_and_diff(
             m=m,
-            k=64,
-            n=64,
+            k=128,
+            n=128,
             g=g,
             topk=topk,
             activation="silu",
@@ -283,19 +283,16 @@ class TestFusedMoEJaxKernelVsReference(unittest.TestCase):
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestFusedMoEJaxKernelGuards(unittest.TestCase):
     """Negative tests pinning the kernel's documented error contracts
-    (raised via the module-level ``_activation`` helper)."""
+    (raised via the module-level ``_fuse_act_name`` helper)."""
 
-    def test_swiglu_oai_raises_not_implemented(self):
-        """The GPT-OSS-specific gating is not wired up; the kernel must
-        say so loudly rather than silently dispatching to silu/gelu."""
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _activation
+    def test_swiglu_oai_maps_to_kernel_name(self):
+        """SGLang spells the GPT-OSS gating ``swiglu_oai``; gmm_v2's
+        in-kernel ``fuse_act`` spells it ``swigluoai``. Both spellings must
+        map through, since the activation is applied inside GMM1."""
+        from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
 
-        # Build a dummy [m*topk, 2n] array — the function only cares
-        # about its last dim being even.
-        x = jnp.zeros((4, 8), dtype=jnp.bfloat16)
-        with self.assertRaises(NotImplementedError) as cm:
-            _activation(x, "swiglu_oai")
-        self.assertIn("swiglu_oai", str(cm.exception))
+        self.assertEqual(_fuse_act_name("swiglu_oai"), "swigluoai")
+        self.assertEqual(_fuse_act_name("swigluoai"), "swigluoai")
 
     def test_unknown_activation_raises_not_implemented(self):
         """A typo or future activation name shouldn't fall through to a
@@ -303,11 +300,10 @@ class TestFusedMoEJaxKernelGuards(unittest.TestCase):
         the offending value, so a model that requests a new activation
         gets a clear failure mode.
         """
-        from sglang.srt.layers.moe.pallas.fused_moe_op import _activation
+        from sglang.srt.layers.moe.pallas.fused_moe_op import _fuse_act_name
 
-        x = jnp.zeros((4, 8), dtype=jnp.bfloat16)
         with self.assertRaises(NotImplementedError) as cm:
-            _activation(x, "relu2")
+            _fuse_act_name("relu2")
         self.assertIn("relu2", str(cm.exception))
 
 

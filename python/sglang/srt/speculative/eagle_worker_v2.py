@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -80,6 +81,7 @@ from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
+    fill_bonus_tokens_func,
     generate_token_bitmask,
     load_token_map,
     move_accept_tokens_to_target_kvcache,
@@ -90,7 +92,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.speculative.triton_ops.eagle import fill_bonus_tokens
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -122,6 +123,8 @@ logger = logging.getLogger(__name__)
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
+    if not current_platform.supports_overlap_streams():
+        return None, contextlib.nullcontext()
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
@@ -400,6 +403,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
+        # TPU sets disable_cuda_graph after cuda_graph_config is parsed, so the
+        # decode backend can remain Backend.FULL even though capture is disabled.
+        if self.server_args.disable_cuda_graph:
+            return
+
         if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
             return
 
@@ -539,12 +547,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     not forward_batch.forward_mode.is_idle()
                     and self.speculative_num_steps > 1
                 ):
+                    self.draft_runner.pad_spec_draft_decode(forward_batch)
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(forward_batch)
+                )
+                parent_list, top_scores_index, draft_tokens, draft_probs = (
+                    self.draft_runner.unpad_spec_draft_outputs(
+                        (parent_list, top_scores_index, draft_tokens, draft_probs),
+                        forward_batch,
+                    )
                 )
 
         if batch.forward_mode.is_idle():
@@ -1673,7 +1688,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             # stride = accept_tokens per-req width = accept_index.shape[1]
             # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens[(bs,)](
+            fill_bonus_tokens_func(
                 accept_tokens,
                 accept_lens,
                 bonus_tokens,
