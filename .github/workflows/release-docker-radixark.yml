@@ -42,8 +42,28 @@ jobs:
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Build BEFORE authenticating to Docker Hub. RADIXARK_DOCKERHUB_TOKEN is an
+      # org Access Token scoped to ONLY radixark/sglang-torchtpu. While logged in
+      # with it, Docker Hub refuses to mint pull tokens for out-of-scope repos, so
+      # public base images (e.g. nvidia/cuda) fail with "insufficient scopes".
+      # Building unauthenticated pulls those bases anonymously; we log in only for
+      # the push step below. The k3s runner is native linux/amd64, so the image
+      # lands in the daemon here and no --platform/emulation is needed.
+      - name: Build image
+        env:
+          TAG: ${{ inputs.tag }}
+          DOCKER_TARGET: ${{ inputs.docker_target }}
+        run: |
+          # BRANCH_TYPE=local builds from this fork's checked-out source. Without
+          # it the Dockerfile's framework_final stage hits a deliberate `exit 1`
+          # (it would otherwise require SGL_VERSION or USE_LATEST_SGLANG to clone
+          # upstream sglang, which is not what this fork should build).
+          docker build \
+            --target "$DOCKER_TARGET" \
+            --build-arg BRANCH_TYPE=local \
+            -f docker/Dockerfile \
+            -t "radixark/sglang-torchtpu:$TAG" \
+            .
 
       # RADIXARK_DOCKERHUB_USERNAME/TOKEN MUST be a Docker Hub organization Access
       # Token scoped to only the radixark/sglang-torchtpu repo (Read & Write),
@@ -57,20 +77,7 @@ jobs:
           username: ${{ secrets.RADIXARK_DOCKERHUB_USERNAME }}
           password: ${{ secrets.RADIXARK_DOCKERHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Push image
         env:
           TAG: ${{ inputs.tag }}
-          DOCKER_TARGET: ${{ inputs.docker_target }}
-        run: |
-          # Build from this fork's checked-out source. Without BRANCH_TYPE=local
-          # the Dockerfile's framework_final stage falls through to a deliberate
-          # `exit 1` (it would otherwise require SGL_VERSION or USE_LATEST_SGLANG
-          # to clone upstream sglang, which is not what this fork should build).
-          docker buildx build \
-            --target "$DOCKER_TARGET" \
-            --platform linux/amd64 \
-            --build-arg BRANCH_TYPE=local \
-            --push \
-            -f docker/Dockerfile \
-            -t "radixark/sglang-torchtpu:$TAG" \
-            .
+        run: docker push "radixark/sglang-torchtpu:$TAG"
