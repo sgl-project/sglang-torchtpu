@@ -55,7 +55,9 @@ class TestMaskedScatterTpu(CustomTestCase):
             mask = torch.zeros(N, 1, dtype=torch.bool)
             mask[torch.randperm(N)[:K]] = True
             src = (torch.arange(K * H) % 97).reshape(K, H).to(dt)
-            self._assert_matches_cpu(torch.zeros(N, H, dtype=dt), mask.expand(N, H), src)
+            self._assert_matches_cpu(
+                torch.zeros(N, H, dtype=dt), mask.expand(N, H), src
+            )
 
     def test_mask_patterns(self):
         # general 2D
@@ -92,6 +94,18 @@ class TestMaskedScatterTpu(CustomTestCase):
         self._assert_matches_cpu(
             torch.zeros(1), torch.tensor([True]), torch.tensor([7.0])
         )
+
+    def test_empty_source_with_true_mask_raises(self):
+        # Empty source + a True mask is invalid input; both CPU and the TPU
+        # kernel must raise (the kernel must not silently no-op).
+        base = torch.arange(20.0)
+        mask = torch.zeros(20, dtype=torch.bool)
+        mask[3] = True
+        source = torch.randn(0)
+        with self.assertRaises(RuntimeError):
+            base.clone().masked_scatter_(mask, source)
+        with self.assertRaises(RuntimeError):
+            base.to(self.dev).masked_scatter_(mask.to(self.dev), source.to(self.dev))
 
     def test_large_count_exceeds_float32(self):
         # More than 2**24 True elements: the index scan must stay int-exact.

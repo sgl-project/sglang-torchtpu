@@ -415,9 +415,7 @@ def _flash_attention_kernel_single_batch_single_step(
                 f"kv block size must be a multiple of {NUM_LANES}"
             )
         q_segment_ids = q_segment_ids_tile_ref[batch_idx[0]]  # [block_q, NUM_LANES].
-        q_segment_ids = jnp.tile(
-            q_segment_ids, (1, repeats)
-        )  # [block_q, block_k].
+        q_segment_ids = jnp.tile(q_segment_ids, (1, repeats))  # [block_q, block_k].
         kv_segment_ids = kv_segment_ids_tile_ref[batch_idx[0], :1]  # [1, block_k].
         mask = jnp.equal(q_segment_ids, kv_segment_ids).astype(jnp.bool_)
 

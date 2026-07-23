@@ -278,20 +278,21 @@ def _register_aten_fallbacks() -> None:
     def _count_nonzero_dim_intlist(self, dim):
         return (self != 0).to(torch.int64).sum(dim=dim)
 
-    # torch_tpu can't lower aten::masked_scatter_: the ATen kernel computes
-    # source offsets with a prefix scan whose accumulator defaults to int64, and
-    # XLA:TPU cannot materialize an int64 value in vector registers ("Unsupported
-    # conversion vmreg/vreg to U64"). Re-express it and force the scan to stay
-    # int32.
+    # TODO: Remove the fallback after https://github.com/google-pytorch/torch_tpu/issues/2491 is resolved.
     @torch.library.register_kernel("aten::masked_scatter_", "PrivateUse1")
     def _masked_scatter_(self, mask, source):
         src_flat = source.to(self.dtype).reshape(-1)
         if src_flat.numel() == 0:
+            if mask.to(torch.bool).any():
+                raise RuntimeError(
+                    "masked_scatter_: source has fewer elements than the number "
+                    "of ones in the mask"
+                )
             return self
         flat_mask = mask.to(torch.bool).broadcast_to(self.shape).reshape(-1)
-        idx = (
-            torch.cumsum(flat_mask.to(torch.int32), 0, dtype=torch.int32) - 1
-        ).clamp(min=0)
+        idx = (torch.cumsum(flat_mask.to(torch.int32), 0, dtype=torch.int32) - 1).clamp(
+            min=0
+        )
         out = torch.where(flat_mask, src_flat[idx], self.reshape(-1)).reshape(
             self.shape
         )
