@@ -42,26 +42,27 @@ jobs:
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
 
-      # Build with an ISOLATED, empty Docker config so NO Docker Hub credential is
-      # sent while pulling public base images. RADIXARK_DOCKERHUB_TOKEN is an org
-      # Access Token scoped to ONLY radixark/sglang-torchtpu; whenever it is
-      # present in ~/.docker/config.json, Docker Hub rejects pulls of out-of-scope
-      # repos (e.g. nvidia/cuda) with "insufficient scopes". That credential is
-      # written by the login step below AND persists on the runner's volume across
-      # runs, so merely ordering login after build is NOT enough — the build must
-      # actively ignore it. A throwaway empty DOCKER_CONFIG makes base pulls
-      # anonymous; we authenticate only for the push step. (Runner is native
-      # linux/amd64, so the image builds into the daemon here, no --platform.)
       - name: Build image
         env:
           TAG: ${{ inputs.tag }}
           DOCKER_TARGET: ${{ inputs.docker_target }}
         run: |
+          # Drop any persisted Docker Hub credential before building. The scoped
+          # RADIXARK_DOCKERHUB_TOKEN is an org Access Token scoped to ONLY
+          # radixark/sglang-torchtpu; it is written to ~/.docker/config.json by the
+          # login step below and, because the runner's home is on a persistent
+          # volume, survives across runs. While it is present Docker Hub rejects
+          # pulls of out-of-scope public bases (e.g. nvidia/cuda) with
+          # "insufficient scopes". Logging out makes those pulls anonymous; we
+          # re-authenticate only for the push step.
+          docker logout || true
+          # Force BuildKit: the Dockerfile uses `RUN --mount`, which the legacy
+          # builder rejects. NOTE: do not isolate this via an empty DOCKER_CONFIG —
+          # that disables buildx and silently falls back to the legacy builder.
           # BRANCH_TYPE=local builds from this fork's checked-out source; without
-          # it the Dockerfile's framework_final stage hits a deliberate `exit 1`.
-          BUILD_DOCKER_CONFIG="$(mktemp -d)"
-          trap 'rm -rf "$BUILD_DOCKER_CONFIG"' EXIT
-          DOCKER_CONFIG="$BUILD_DOCKER_CONFIG" docker build \
+          # it the framework_final stage hits a deliberate `exit 1`. The runner is
+          # native linux/amd64, so no --platform/emulation is needed.
+          DOCKER_BUILDKIT=1 docker build \
             --target "$DOCKER_TARGET" \
             --build-arg BRANCH_TYPE=local \
             -f docker/Dockerfile \
