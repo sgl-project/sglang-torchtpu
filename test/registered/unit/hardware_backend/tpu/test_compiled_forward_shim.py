@@ -63,10 +63,13 @@ class _ForwardModeMock:
     def is_target_verify(self):
         return self._mode == "target_verify"
 
+    def is_draft_extend_v2(self):
+        return self._mode == "draft_extend_v2"
+
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
-    extend = mode == "extend"
+    extend = mode in ("extend", "draft_extend_v2")
     return SimpleNamespace(
         input_ids=torch.arange(real_t, dtype=torch.int32),
         positions=torch.arange(real_t, dtype=torch.int32),
@@ -159,6 +162,35 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.positions.shape[0], 16)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.batch_size, 4)
+
+    def test_draft_extend_v2_uses_forward_mode_api(self):
+        fb = _forward_batch(real_t=8, real_b=2, mode="draft_extend_v2")
+        fb.spec_info = SimpleNamespace(
+            num_tokens_per_req=4,
+            hidden_states=torch.zeros(8, 16),
+        )
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 16)
+        self.assertEqual(fb.out_cache_loc.shape[0], 16)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4, 0, 0])
+        self.assertEqual(fb.extend_seq_lens_cpu, [4, 4, 0, 0])
+        self.assertEqual(fb.batch_size, 4)
+
+    def test_draft_extend_v2_rejects_unset_num_tokens_per_req(self):
+        fb = _forward_batch(real_t=8, real_b=2, mode="draft_extend_v2")
+        fb.spec_info = SimpleNamespace(num_tokens_per_req=-1)
+
+        with self.assertRaisesRegex(AssertionError, "num_tokens_per_req > 0"):
+            _pad_forward_batch_inputs(
+                fb,
+                t_bucketer=_bucketer("Token", [64]),
+                b_bucketer=_bucketer("Bs", [1, 4]),
+            )
 
     def test_decode_uses_bs_bucketer_for_tokens(self):
         # In DECODE, token-axis tensors share the bs bucketer

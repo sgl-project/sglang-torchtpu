@@ -69,6 +69,11 @@ class CompilePolicy(ABC):
     def pad_draft_decode(self, forward_batch: Any) -> None:
         """Shape the speculative draft-decode batch for the compiled forward."""
 
+    def pad_draft_extend_v2(
+        self, forward_batch: Any, model_runner: Any, num_draft_tokens: int
+    ) -> None:
+        """Shape a V2 draft-extend batch for the compiled forward."""
+
     def unpad_draft_outputs(self, outputs: Any, forward_batch: Any) -> Any:
         """Undo ``pad_draft_decode`` on the draft outputs (default: passthrough)."""
         return outputs

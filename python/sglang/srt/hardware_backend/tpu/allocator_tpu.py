@@ -45,7 +45,6 @@ if TYPE_CHECKING:
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
-
     def clear(self) -> None:
         # Slot 0 is reserved as the dummy-padding page, so page IDs start at 1.
         self.free_pages = torch.arange(
@@ -87,6 +86,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int = None,
+        out_indices_cpu: torch.Tensor = None,
     ):
         if self.debug_mode:
             assert torch.all(
@@ -125,11 +125,12 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         else:
             free_pages_cpu = torch.empty((0,), dtype=torch.int32, device="cpu")
 
-        out_indices_cpu = torch.empty(
-            (extend_num_tokens,),
-            dtype=torch.int32,
-            device="cpu",
-        )
+        if out_indices_cpu is None:
+            out_indices_cpu = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int32,
+                device="cpu",
+            )
         alloc_extend_naive(
             prefix_lens_cpu,
             seq_lens_cpu,

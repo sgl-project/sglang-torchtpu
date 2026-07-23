@@ -1746,14 +1746,6 @@ class ServerArgs:
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
-    speculative_eagle_worker: A[
-        Literal["v1", "v2"],
-        "EAGLE/EAGLE3 speculative worker implementation. 'v1' (default) is the "
-        "legacy standalone worker (used by the TPU backend); it does not support "
-        "overlap scheduling, so selecting it forces --disable-overlap-schedule on. "
-        "'v2' is the upstream unified worker that also drives overlap scheduling.",
-    ] = "v1"
-
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
     decoupled_spec_bind_endpoint: A[

@@ -3249,6 +3249,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         self.compile_policy.pad_draft_decode(forward_batch)
 
+    def pad_spec_draft_extend_v2(
+        self, forward_batch: ForwardBatch, num_draft_tokens: int
+    ) -> None:
+        self.compile_policy.pad_draft_extend_v2(forward_batch, self, num_draft_tokens)
+
     def unpad_spec_draft_outputs(self, outputs, forward_batch: ForwardBatch):
         """Trim this runner's draft-decode outputs back to the real batch size,
         undoing ``pad_spec_draft_decode``. Delegates to the installed compile

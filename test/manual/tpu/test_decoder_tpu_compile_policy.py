@@ -317,7 +317,11 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             token_to_kv_pool=pool,
         )
         with patch("torch_tpu._internal.sync.sync.synchronize") as sync:
-            _materialize_out(SimpleNamespace(next_token_logits=logits), forward_batch)
+            _materialize_out(
+                SimpleNamespace(next_token_logits=logits),
+                forward_batch.attn_backend,
+                forward_batch.token_to_kv_pool,
+            )
         sync.assert_called_once()
         tensors, kwargs = sync.call_args
         self.assertEqual(tensors[0], [logits, kv0, kv1])
@@ -367,8 +371,7 @@ def _make_spec_policy(
 
 
 class TestSpecPrecompileLoops(CustomTestCase):
-    """Target spec precompile fires EXTEND + DECODE + TARGET_VERIFY +
-    EXTEND(FULL); the draft worker skips precompile entirely."""
+    """Target spec precompile covers its serving forward families."""
 
     def test_target_precompiles_all_spec_modes(self):
         mr = _spec_model_runner(num_steps=3)  # draft_token_num = 4
@@ -465,6 +468,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             forward_mode=forward_mode,
             capture_hidden_mode=capture,
             batch_size=rows,
+            seq_lens=torch.zeros(rows, dtype=torch.int32),
             _tpu_real_q=real_q,
             _tpu_real_b=real_b,
         )
@@ -484,11 +488,12 @@ class TestSpecUnpadOutputs(CustomTestCase):
         self.assertEqual(out.next_token_logits.shape[0], 16)
         self.assertEqual(out.hidden_states.shape[0], 16)  # FULL -> real_q
         self.assertEqual(fb.batch_size, 4)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
 
     def test_capture_last_slices_hidden_to_real_b(self):
         policy = _make_spec_policy()
         out, fb = self._out_and_batch(
-            ForwardMode.DRAFT_EXTEND,
+            ForwardMode.DRAFT_EXTEND_V2,
             CaptureHiddenMode.LAST,
             real_q=8,
             real_b=4,

@@ -475,7 +475,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
     ) -> ForwardBatch:
         """Construct a dummy ForwardBatch at the target bucket shape."""
         device = self.model_runner.device
-        is_extend = mode.is_extend()
+        is_extend = mode.is_extend(include_draft_extend_v2=True)
         slot = self._dummy_kv_slot()
 
         # Token-level inputs

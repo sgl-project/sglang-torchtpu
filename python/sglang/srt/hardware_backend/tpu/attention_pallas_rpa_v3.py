@@ -280,6 +280,12 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
     # Metadata
     # ------------------------------------------------------------------ #
 
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info, cuda_graph_bs: Optional[int] = None
+    ):
+        # RPA-v3 rebuilds verify metadata and has no graph-capture buffers.
+        pass
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Land deferred HiCache reload commits into the KV buffers before any
         # layer reads KV; this hook runs per forward in eager AND compiled.
@@ -508,8 +514,8 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
             draft_token_num = forward_batch.spec_info.draft_token_num
             kv_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
             extend_seq_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
-        elif forward_batch.forward_mode.is_extend():
-            # EXTEND and DRAFT_EXTEND: seq_lens / extend_seq_lens are current.
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            # EXTEND and DRAFT_EXTEND_V2 use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
