@@ -49,7 +49,6 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  "ray",
   "requests",
   "scipy",
   "sentencepiece",
@@ -81,11 +80,11 @@ dependencies = [
   "torchvision==0.26.0",
   "jax==0.10.2",
   "jaxlib==0.10.2",
-  "runai-model-streamer[s3,gcs,azure]",
 ]
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 
 # Ray is required only for the --use-ray multihost launch path (RayEngine).
 # Mirrors the `ray` extra in the base pyproject so `sglang[ray]` resolves on TPU
@@ -117,7 +116,7 @@ test = [
 # libtpu, torch, torchvision, jax, jaxlib) live in `dependencies`.
 srt_tpu = []
 all_tpu = []
-dev_tpu = ["sglang[all_tpu]", "sglang[test]", "sglang[ray]"]
+dev_tpu = ["sglang[all_tpu]", "sglang[test]", "sglang[ray]", "sglang[runai]"]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

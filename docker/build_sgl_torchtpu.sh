@@ -65,8 +65,8 @@ while [[ $# -gt 0 ]]; do
       shift 1
       ;;
     *)
-      echo "Unknown argument: $1"
-      shift 1
+      echo "Error: Unknown argument: $1" >&2
+      exit 1
       ;;
   esac
 done

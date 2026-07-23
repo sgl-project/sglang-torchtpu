@@ -36,11 +36,7 @@ RUN cd /workspace/sglang/python && \
     sed -i 's/"torch-tpu==[^"]*"/"torch-tpu"/' pyproject_tpu.toml && \
     sed -i '/\[tool.uv\]/,$d' pyproject_tpu.toml && \
     cp pyproject_tpu.toml pyproject.toml && \
-    uv pip install --system .[all_tpu]
-
-# Set environment variables
-ENV SGLANG_USE_TPU_ENGINE=1
-ENV PYTHONPATH="/workspace/sglang/python:${PYTHONPATH}"
+    uv pip install --system .[all_tpu,ray,runai]
 
 # Default command
 CMD ["/bin/bash"]
