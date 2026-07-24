@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Render the single-host JobSet (jobset-tpu.yaml) for a suite.
+"""Render the unified JobSet (jobset-tpu.yaml). Single source of truth for rendering --
+used by _tpu-test.yml and runnable locally for dry-runs.
 
-Single source of truth for rendering -- used by _tpu-test.yml and runnable locally for
-dry-runs. Looks up the slice (topology + pool) for the host count in topology.yaml and
-substitutes the render vars; the container's own $VAR stays literal.
+Two modes:
+  single-host suite:  --suite <name>
+      hosts=1; run_suite runs the suite (each test self-launches its own server).
+  multi-host group:   --launch-script <rel-to-benchmark/tpu> --files "<f1> <f2> ..."
+                      --hosts N [--weights-pvc <pvc>] [--name <run-name>]
+      every host runs the launch script (it owns model+config); rank-0 runs each file.
+
+The SLICE (topology + pool) is looked up by host count in topology.yaml. Only the render
+vars are substituted; the container's own $spid / ${TPU_WORKER_ID} stay literal.
+${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT} expand to indented YAML blocks (empty when no PVC).
 
 Also computes the CI poll budget for a suite (--print-wait-seconds): a static AST scan
 of the registered tree sums est_time over the suite's enabled tests -- no sglang import
@@ -11,6 +19,7 @@ needed (same technique as discover_multihost.py). The workflow uses it so the po
 timeout scales with the suite instead of a fixed ceiling.
 
 Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
+       render_jobset.py --image <ref> --launch-script <rel> --files "<f>..." --hosts N
        render_jobset.py --suite <name> --print-wait-seconds
 """
 
@@ -30,6 +39,20 @@ _WAIT_FLOOR_SECONDS = 360
 # Positional order of register_*_ci(...) args (mirrors ci_register._PARAM_ORDER) so the
 # scan handles both register_tpu_ci(120, "suite") and register_tpu_ci(est_time=120, ...).
 _REGISTER_PARAMS = ("est_time", "suite", "nightly", "disabled")
+
+# Indentation matches jobset-tpu.yaml: volume items under `volumes:` at 16 spaces,
+# volumeMount items under `volumeMounts:` at 20 spaces.
+WEIGHTS_VOLUME_TMPL = (
+    "                - name: weights\n"
+    "                  persistentVolumeClaim:\n"
+    "                    claimName: {pvc}\n"
+    "                    readOnly: true"
+)
+WEIGHTS_MOUNT_TMPL = (
+    "                    - name: weights\n"
+    "                      mountPath: /weights\n"
+    "                      readOnly: true"
+)
 
 
 def dns_safe(name):
@@ -88,8 +111,13 @@ def suite_wait_seconds(suite, tests_dir="test/registered"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image")
-    ap.add_argument("--suite", required=True)
     ap.add_argument("--nightly", action="store_true")
+    ap.add_argument("--suite", default="")            # single-host mode
+    ap.add_argument("--launch-script", default="")    # multi-host mode
+    ap.add_argument("--files", default="")            # multi-host: space-separated
+    ap.add_argument("--hosts", type=int, default=1)
+    ap.add_argument("--weights-pvc", default="")
+    ap.add_argument("--name", default="")             # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
     ap.add_argument(
@@ -107,19 +135,37 @@ def main():
         ap.error("--image is required when rendering")
 
     slices = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["slices"]
-    hosts = 1
+
+    if a.launch_script:
+        hosts = a.hosts
+        run_name = dns_safe(a.name or a.launch_script)
+        suite = ""
+        if not a.files:
+            sys.exit("multi-host mode needs --files")
+    else:
+        if not a.suite:
+            sys.exit("need --suite (single-host) or --launch-script (multi-host)")
+        hosts = 1
+        run_name = dns_safe(a.suite)
+        suite = a.suite
+
     sl = slices.get(hosts, slices.get(str(hosts)))
     if not sl:
         sys.exit(f"no slice for hosts={hosts} in topology.yaml")
 
+    pvc = a.weights_pvc
     vals = {
         "IMAGE": a.image,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
         "POOL": sl["pool"],
-        "RUN_NAME": dns_safe(a.suite),
-        "SUITE": a.suite,
+        "RUN_NAME": run_name,
+        "SUITE": suite,
         "NIGHTLY_FLAG": "--nightly" if a.nightly else "",
+        "LAUNCH_SCRIPT": a.launch_script,
+        "TEST_FILES": a.files,
+        "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
+        "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
     }
 
     tpl = open(f"{a.dir}/jobset-tpu.yaml").read()

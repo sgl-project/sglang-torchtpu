@@ -1,8 +1,24 @@
-# Single-host TPU test workload -- a 1-pod JobSet that runs a registered suite via
-# run_suite (each test self-launches its own server). Rendered by render_jobset.py; the
-# render vars (do NOT write them as dollar-brace tokens in these comments -- the renderer
-# would substitute them here too) are IMAGE, HOSTS, TOPOLOGY, POOL, RUN_NAME, SUITE,
-# NIGHTLY_FLAG. Gating is handled by _tpu-test.
+# Unified TPU test workload -- ONE JobSet for ANY host count. Rendered by
+# .github/tpu-ci/render_jobset.py. Render vars (do NOT write them as dollar-brace tokens
+# in these comments -- the renderer would substitute them here too):
+#   IMAGE         digest-pinned image
+#   HOSTS         completions/parallelism (single-host = 1)
+#   TOPOLOGY/POOL node labels (looked up by host count in topology.yaml)
+#   RUN_NAME      DNS-safe label for the JobSet (a suite name or a launch-group name)
+#   SUITE         single-host: the run_suite suite; NIGHTLY_FLAG: --nightly or empty
+#   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/)
+#   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
+#   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
+# The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
+# literal. Gating is handled by the kind-aware _tpu-test.
+#
+# Launch model (branch on NNODES, from GKE's TPU_WORKER_HOSTNAMES):
+#   * single-host (nnodes<=1) -> each registered test self-launches (popen_launch_server);
+#     run_suite runs the suite directly.
+#   * multi-host  (nnodes>1)  -> every host runs the launch GROUP's recipe (it owns the
+#     model + config); rank 0 runs each of the group's TEST_FILES in LIVE-SERVER mode
+#     against the one server; workers serve until the leader tears down, then exit 0.
+#     Files sharing an identical launch spec share this one server (grouping).
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
@@ -12,6 +28,8 @@ spec:
   ttlSecondsAfterFinished: 7200
   failurePolicy:
     maxRestarts: 0
+  network:
+    enableDNSHostnames: true       # stable pod DNS for multi-host rendezvous
   replicatedJobs:
     - name: slice
       replicas: 1
@@ -40,6 +58,7 @@ spec:
                   emptyDir:
                     medium: Memory
                     sizeLimit: 16Gi
+${WEIGHTS_VOLUME}
               containers:
                 - name: test
                   image: ${IMAGE}
@@ -47,11 +66,44 @@ spec:
                   command: ["bash", "-lc"]
                   args:
                     - |
-                      set -euo pipefail
+                      set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
-                      echo "run=${RUN_NAME}"
-                      exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 1800
+                      NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
+                      RANK="${TPU_WORKER_ID:-0}"
+                      echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
+
+                      if [ "$NNODES" -le 1 ]; then
+                        # Single-host: each test self-launches its own server.
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 1800
+                      fi
+
+                      # Multi-host: every host runs the launch group's recipe (owns model+config).
+                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                          bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > /tmp/server.log 2>&1 &
+                      spid=$!
+                      if [ "$RANK" = "0" ]; then
+                        ok=0
+                        for i in $(seq 1 300); do
+                          curl -sf http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                          kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
+                          sleep 10
+                        done
+                        echo "== server.log tail =="; tail -n 60 /tmp/server.log
+                        [ "$ok" = 1 ] || { echo "FAIL: server never healthy"; exit 1; }
+                        # rank 0 runs every file in this launch group against the one server.
+                        rc=0
+                        for f in ${TEST_FILES}; do
+                          echo "== live-server test: $f =="
+                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 python3 "$f" || rc=1
+                        done
+                        kill "$spid" 2>/dev/null || true
+                        exit $rc
+                      else
+                        wait "$spid" || true
+                        echo "worker rank=$RANK done"
+                        exit 0
+                      fi
                   resources:
                     requests:
                       google.com/tpu: "4"
@@ -62,5 +114,6 @@ spec:
                   volumeMounts:
                     - name: dshm
                       mountPath: /dev/shm
+${WEIGHTS_MOUNT}
                   securityContext:
                     privileged: true
