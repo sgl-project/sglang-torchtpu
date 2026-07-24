@@ -453,6 +453,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     dsv4_state_lens: Optional[DSV4StateLens] = None,
     batch=None,
+    out_cache_loc_host: Optional[torch.Tensor] = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -472,6 +473,8 @@ def alloc_paged_token_slots_extend(
             extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
         if dsv4_state_lens is not None:
             extra_alloc_kwargs["dsv4_state_lens"] = dsv4_state_lens
+    if out_cache_loc_host is not None:
+        extra_alloc_kwargs["out_indices_cpu"] = out_cache_loc_host
 
     out = allocator.alloc_extend(
         prefix_lens,

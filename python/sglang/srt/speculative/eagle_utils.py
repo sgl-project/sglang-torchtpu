@@ -576,9 +576,9 @@ def eagle_prepare_for_verify(
         ForwardBatch,
         ForwardMode,
     )
-    from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
-    from sglang.srt.speculative.triton_ops.cache_locs import (
+    from sglang.srt.speculative.spec_utils import (
         assign_extend_cache_locs_func,
+        prepare_mamba_track_for_verify,
     )
 
     if not batch.forward_mode.is_idle():
@@ -600,6 +600,8 @@ def eagle_prepare_for_verify(
             batch_size=bs,
             draft_token_num=verify_input.draft_token_num,
             device=device,
+            host_req_pool_indices=batch.req_pool_indices_cpu,
+            host_seq_lens=batch.seq_lens_cpu,
         )
 
         batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
@@ -742,15 +744,22 @@ def eagle_sample(
             topk=verify_input.tree_topk,
         )
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        if _use_torch_native:
+            top_k_renorm_prob = top_k_renorm_prob_func
+            top_p_renorm_prob = top_p_renorm_prob_func
+            tree_speculative_sampling_target_only = (
+                tree_speculative_sampling_target_only_func
+            )
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
 
-        from sglang.srt.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
+            from sglang.srt.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
 
         use_rejection_sampling = (
             get_global_server_args().speculative_use_rejection_sampling
@@ -802,11 +811,14 @@ def eagle_sample(
         # coins for final sampling
         coins_for_final_sampling = torch.rand((bs,), dtype=torch.float32, device=device)
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
+        if _use_torch_native:
+            sampling_fn = tree_speculative_sampling_target_only
+        else:
+            sampling_fn = (
+                chain_speculative_sampling_triton
+                if use_rejection_sampling
+                else tree_speculative_sampling_target_only
+            )
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -881,7 +893,10 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+    from sglang.srt.speculative.spec_utils import (
+        allocate_and_assign_decode_cache,
+        assign_req_to_token_pool_func,
+    )
 
     bs = batch.batch_size()
 
@@ -926,38 +941,53 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
 
-    # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
-    # barrier has chained to the prev forward -> host stalls a full forward.
-    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    if page_size == 1:
-        out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
-    else:
-        last_loc = get_last_loc(
-            batch.req_to_token_pool.req_to_token,
-            batch.req_pool_indices,
-            cur_kv_lens_device,
-        )
-        device_type = getattr(batch.device, "type", str(batch.device).split(":", 1)[0])
-        out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
-            batch.tree_cache,
-            cur_kv_lens_device,
-            cur_kv_lens_cpu,
-            nxt_kv_lens_device,
-            nxt_kv_lens_cpu,
-            last_loc,
-            num_needed_tokens,
+    if _use_torch_native and batch.req_to_token_pool.host_resident:
+        out_cache_loc = allocate_and_assign_decode_cache(
+            tree_cache=batch.tree_cache,
+            req_to_token_pool=batch.req_to_token_pool,
             req_pool_indices=batch.req_pool_indices,
-            batch=batch,
+            cur_kv_lens_cpu=cur_kv_lens_cpu,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=num_needed_tokens,
+            batch_size=bs,
+            device=batch.device,
+            host_req_pool_indices=batch.req_pool_indices_cpu,
         )
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        cur_kv_lens_device,
-        nxt_kv_lens_device,
-        out_cache_loc,
-        bs,
-    )
+    else:
+        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+        # barrier has chained to the prev forward -> host stalls a full forward.
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        if page_size == 1:
+            out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
+        else:
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                cur_kv_lens_device,
+            )
+            device_type = getattr(
+                batch.device, "type", str(batch.device).split(":", 1)[0]
+            )
+            out_cache_loc = ALLOC_EXTEND_FUNCS[device_type](
+                batch.tree_cache,
+                cur_kv_lens_device,
+                cur_kv_lens_cpu,
+                nxt_kv_lens_device,
+                nxt_kv_lens_cpu,
+                last_loc,
+                num_needed_tokens,
+                req_pool_indices=batch.req_pool_indices,
+                batch=batch,
+            )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            cur_kv_lens_device,
+            nxt_kv_lens_device,
+            out_cache_loc,
+            bs,
+        )
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:

@@ -1624,9 +1624,9 @@ class ServerArgs:
         False
     )
     torch_compile_max_bs: A[
-        int,
+        Optional[int],
         "Set the maximum batch size when using torch compile.",
-    ] = 32
+    ] = None
     torchao_config: A[
         str,
         "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
@@ -1746,14 +1746,6 @@ class ServerArgs:
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
-    speculative_eagle_worker: A[
-        Literal["v1", "v2"],
-        "EAGLE/EAGLE3 speculative worker implementation. 'v1' (default) is the "
-        "legacy standalone worker (used by the TPU backend); it does not support "
-        "overlap scheduling, so selecting it forces --disable-overlap-schedule on. "
-        "'v2' is the upstream unified worker that also drives overlap scheduling.",
-    ] = "v1"
-
     # Decoupled speculative decoding: draft and verify run as
     # separate engines, currently connected by a ZMQ IPC mesh.
     decoupled_spec_bind_endpoint: A[
@@ -3210,6 +3202,8 @@ class ServerArgs:
             self.device = get_device()
         # strip device index from user if any (e.g. "cuda:0" -> "cuda")
         self.device = self.device.split(":")[0]
+        if self.device != "tpu" and self.torch_compile_max_bs is None:
+            self.torch_compile_max_bs = 32
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:
@@ -3778,6 +3772,32 @@ class ServerArgs:
                 self.torch_compile_max_bs > 0
             ), "cuda_graph_config[decode].bs should contain positive batch sizes"
             decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
+
+        if self.device == "tpu":
+            # Couple the compile-bucket max (torch_compile_max_bs) with the
+            # scheduler (max_running_requests) so a decode batch can never fall
+            # outside the compiled buckets.
+            from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+                reconcile_tpu_batch_limits,
+            )
+
+            (
+                self.torch_compile_max_bs,
+                self.tpu_compile_bs,
+                self.max_running_requests,
+            ) = reconcile_tpu_batch_limits(
+                self.torch_compile_max_bs,
+                self.tpu_compile_bs,
+                self.max_running_requests,
+            )
+            logger.info(
+                "TPU batch limits after reconciliation: "
+                "torch_compile_max_bs=%d, tpu_compile_bs=%s, "
+                "max_running_requests=%d",
+                self.torch_compile_max_bs,
+                self.tpu_compile_bs,
+                self.max_running_requests,
+            )
 
         if prefill_cuda_graph_config.max_bs is None:
             # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.

@@ -9,14 +9,17 @@ import torch
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
+    Qwen3VLDecoderTpuCompilePolicy,
     _materialize_out,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -78,6 +81,96 @@ def _run_cases(policy, mode):
             policy._precompile_extend()
         else:
             policy._precompile_decode()
+
+
+class TestQwen3VLDecoderUnpadding(CustomTestCase):
+    def _forward_batch(self):
+        return SimpleNamespace(
+            _tpu_real_q=3,
+            _tpu_real_b=2,
+            batch_size=4,
+            seq_lens=torch.zeros(4, dtype=torch.int32),
+        )
+
+    def test_slices_raw_hidden_states_before_logits_processing(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        out = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+        result = policy.unpad_outputs(out, self._forward_batch())
+
+        self.assertEqual(result.shape, (3, 4))
+
+    def test_rejects_dp_attention_at_install(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=True,
+        ), self.assertRaisesRegex(NotImplementedError, "does not support DP attention"):
+            policy.install()
+
+    def test_restores_extend_metadata_before_logits_processing(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        forward_batch = self._forward_batch()
+        forward_batch.input_ids = torch.arange(5)
+        forward_batch.positions = torch.arange(5)
+        forward_batch.out_cache_loc = torch.arange(5)
+        forward_batch.extend_seq_lens = torch.tensor([2, 1, 0, 0])
+        forward_batch.extend_seq_lens_cpu = [2, 1, 0, 0]
+        forward_batch.extend_prefix_lens_cpu = [0, 0, 0, 0]
+        forward_batch.extend_logprob_start_lens_cpu = [0, 0, 0, 0]
+        forward_batch.mm_input_embeds = torch.zeros(5, 4)
+        hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+        result = policy.unpad_outputs(hidden_states, forward_batch)
+        last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        sampled_hidden_states = result[last_index]
+
+        self.assertEqual(forward_batch.batch_size, 2)
+        self.assertEqual(forward_batch.extend_seq_lens.tolist(), [2, 1])
+        self.assertEqual(forward_batch.extend_seq_lens_cpu, [2, 1])
+        self.assertEqual(forward_batch.mm_input_embeds.shape, (3, 4))
+        self.assertEqual(sampled_hidden_states.shape, (2, 4))
+
+    def test_slices_hidden_and_aux_tuple(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        hidden = torch.zeros(5, 4)
+        aux = [torch.ones(5, 4), torch.full((5, 4), 2.0)]
+
+        result_hidden, result_aux = policy.unpad_outputs(
+            (hidden, aux), self._forward_batch()
+        )
+
+        self.assertEqual(result_hidden.shape, (3, 4))
+        self.assertEqual([value.shape for value in result_aux], [(3, 4), (3, 4)])
+
+    def test_keeps_pipeline_proxy_tensors_padded_for_next_stage(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        out = PPProxyTensors(
+            {"hidden_states": torch.zeros(5, 4), "residual": torch.ones(5, 4)}
+        )
+
+        result = policy.unpad_outputs(out, self._forward_batch())
+
+        self.assertEqual(result["hidden_states"].shape, (5, 4))
+        self.assertEqual(result["residual"].shape, (5, 4))
+
+    def test_spec_policy_delegates_raw_vl_output_unpadding(self):
+        class _SpecQwenPolicy(
+            SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
+        ):
+            pass
+
+        policy = object.__new__(_SpecQwenPolicy)
+        forward_batch = self._forward_batch()
+        forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        out = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+        result = policy.unpad_outputs(out, forward_batch)
+
+        self.assertEqual(result.shape, (3, 4))
+        self.assertEqual(forward_batch.batch_size, 2)
 
 
 class TestMakeDummyForwardBatch(CustomTestCase):
@@ -224,7 +317,11 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             token_to_kv_pool=pool,
         )
         with patch("torch_tpu._internal.sync.sync.synchronize") as sync:
-            _materialize_out(SimpleNamespace(next_token_logits=logits), forward_batch)
+            _materialize_out(
+                SimpleNamespace(next_token_logits=logits),
+                forward_batch.attn_backend,
+                forward_batch.token_to_kv_pool,
+            )
         sync.assert_called_once()
         tensors, kwargs = sync.call_args
         self.assertEqual(tensors[0], [logits, kv0, kv1])
@@ -274,8 +371,7 @@ def _make_spec_policy(
 
 
 class TestSpecPrecompileLoops(CustomTestCase):
-    """Target spec precompile fires EXTEND + DECODE + TARGET_VERIFY +
-    EXTEND(FULL); the draft worker skips precompile entirely."""
+    """Target spec precompile covers its serving forward families."""
 
     def test_target_precompiles_all_spec_modes(self):
         mr = _spec_model_runner(num_steps=3)  # draft_token_num = 4
@@ -372,6 +468,7 @@ class TestSpecUnpadOutputs(CustomTestCase):
             forward_mode=forward_mode,
             capture_hidden_mode=capture,
             batch_size=rows,
+            seq_lens=torch.zeros(rows, dtype=torch.int32),
             _tpu_real_q=real_q,
             _tpu_real_b=real_b,
         )
@@ -391,11 +488,12 @@ class TestSpecUnpadOutputs(CustomTestCase):
         self.assertEqual(out.next_token_logits.shape[0], 16)
         self.assertEqual(out.hidden_states.shape[0], 16)  # FULL -> real_q
         self.assertEqual(fb.batch_size, 4)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
 
     def test_capture_last_slices_hidden_to_real_b(self):
         policy = _make_spec_policy()
         out, fb = self._out_and_batch(
-            ForwardMode.DRAFT_EXTEND,
+            ForwardMode.DRAFT_EXTEND_V2,
             CaptureHiddenMode.LAST,
             real_q=8,
             real_b=4,

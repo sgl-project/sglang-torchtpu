@@ -15,11 +15,13 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_moe_expert_parallel_rank
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.platforms import current_platform
@@ -325,7 +327,9 @@ def apply_tpu_fp8_moe(
     """Run TPU FP8 MoE through the Pallas fused grouped-GEMM backend."""
     if apply_router_weight_on_input:
         raise NotImplementedError(
-            "apply_router_weight_on_input is not supported on TPU yet."
+            "apply_router_weight_on_input=True is unsupported in the TPU MoE "
+            "path: the Pallas fused-MoE kernel takes the raw hidden states and "
+            "applies the router weights itself, in the un-permute combine."
         )
     block_quant = block_quant and getattr(layer, "weight_block_size", None) is not None
 
@@ -333,19 +337,26 @@ def apply_tpu_fp8_moe(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
+    # Padded tokens might have expert index of -1, override the expert
+    # selection to expert 0.
+    valid = topk_ids >= 0
+    topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
+    topk_weights = topk_weights * valid.to(topk_weights.dtype)
     if layer.num_fused_shared_experts:
         raise NotImplementedError(
             "Fused shared experts are not supported on the TPU MoE path."
         )
-    topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
-        topk_weights,
-        topk_ids,
-        layer.num_local_experts,
-        get_moe_expert_parallel_rank(),
-    )
 
     w1_scale = layer.w13_weight_scale_inv if block_quant else layer.w13_weight_scale
     w2_scale = layer.w2_weight_scale_inv if block_quant else layer.w2_weight_scale
+
+    global_num_experts = 0
+    expert_group_offset = 0
+    ep_size = get_moe_expert_parallel_world_size()
+    ep_rank = get_moe_expert_parallel_rank()
+    if ep_size > 1:
+        global_num_experts = layer.num_local_experts * ep_size
+        expert_group_offset = ep_rank * layer.num_local_experts
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
@@ -362,5 +373,7 @@ def apply_tpu_fp8_moe(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         no_combine=no_combine,
+        global_num_experts=global_num_experts,
+        expert_group_offset=expert_group_offset,
     )
     return StandardCombineInput(hidden_states=output)

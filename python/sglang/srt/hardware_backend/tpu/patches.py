@@ -20,6 +20,14 @@ logger = get_logger(__name__)
 _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
     ("sglang.srt.layers.vocab_parallel_embedding", "get_masked_input_and_mask"),
     ("sglang.srt.layers.rotary_embedding.utils", "apply_rotary_pos_emb_native"),
+    (
+        "sglang.srt.sampling.penaltylib.repetition_penalty",
+        "apply_scaling_penalties",
+    ),
+    (
+        "sglang.srt.sampling.sampling_batch_info",
+        "apply_scaling_penalties",
+    ),
 ]
 
 _dynamic_compile_unwrapped = False
@@ -649,6 +657,42 @@ def _patch_req_to_token_pool_max_context_len() -> None:
     ReqToTokenPool.__init__ = wrapped_init
 
 
+def _patch_tpu_torch_pallas_register_positional() -> None:
+    """Let the torch_tpu bindings accept torch's inductor calling convention."""
+    try:
+        from torch_tpu._internal.pallas import tpu_torch_pallas
+    except ImportError:  # pragma: no cover - non-TPU host
+        return
+    orig_register = tpu_torch_pallas.register_custom_kernel
+    orig_call = tpu_torch_pallas.call_custom_kernel
+
+    try:
+        orig_register("_sglang_signature_probe", "probe", b"")
+    except TypeError:
+        pass  # skew present -- install the shims below
+    except Exception:  # pragma: no cover - signature already matches
+        return
+    else:
+        return
+
+    def register_custom_kernel(name, kernel_key, serialized_mlir_module):
+        return orig_register(
+            name, kernel_key, serialized_mlir_module=serialized_mlir_module
+        )
+
+    def call_custom_kernel(*args, **kwargs):
+        if args and not isinstance(args[0], str):
+            # torch codegen convention: (inputs, output_shapes, name, kernel_key)
+            inputs, output_shapes, name, kernel_key = args
+            return orig_call(
+                name, kernel_key, inputs=inputs, output_shapes=output_shapes
+            )
+        return orig_call(*args, **kwargs)
+
+    tpu_torch_pallas.register_custom_kernel = register_custom_kernel
+    tpu_torch_pallas.call_custom_kernel = call_custom_kernel
+
+
 def apply_tpu_patches(world_size: int = 1) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
@@ -660,3 +704,4 @@ def apply_tpu_patches(world_size: int = 1) -> None:
     _patch_support_triton_for_tpu()
     _patch_req_to_token_pool_max_context_len()
     _register_aten_fallbacks()
+    _patch_tpu_torch_pallas_register_positional()
