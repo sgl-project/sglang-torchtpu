@@ -75,7 +75,7 @@ dependencies = [
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
   "torch-tpu==0.1.1.dev20260707090224",
-  "libtpu==0.0.42.1",
+  "libtpu==0.0.40",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",
