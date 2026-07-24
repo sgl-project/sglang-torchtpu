@@ -845,7 +845,7 @@ class ServerArgs:
         int,
         Arg(
             help="The tensor parallelism size.",
-            aliases=["--tensor-parallel-size"],
+            aliases=["--tensor-parallel-size", "--tp"],
         ),
     ] = 1
     dcp_size: A[
