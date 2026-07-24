@@ -285,8 +285,7 @@ def _register_aten_fallbacks() -> None:
         if src_flat.numel() == 0:
             if mask.to(torch.bool).any():
                 raise RuntimeError(
-                    "masked_scatter_: source has fewer elements than the number "
-                    "of ones in the mask"
+                    "Number of elements of source < number of ones in mask"
                 )
             return self
         flat_mask = mask.to(torch.bool).broadcast_to(self.shape).reshape(-1)
