@@ -1,0 +1,49 @@
+# Reusable: build the TPU image ONCE (Cloud Build as tpu-ci, keyless WIF) from `ref`,
+# push to Artifact Registry, and output the immutable digest for the test jobs.
+name: _tpu-build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: "Digest-pinned image reference (repo@sha256:...)"
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT: sglang-torchtpu
+  AR_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc
+  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - id: build
+        run: |
+          set -euo pipefail
+          tag="$(date -u +%Y%m%d)-${GITHUB_SHA:0:12}-${{ github.run_id }}"
+          gcloud builds submit --config docker/cloudbuild.tpu.yaml \
+            --substitutions=_TAG="$tag" --project "$GCP_PROJECT"
+          digest="$(gcloud artifacts docker images describe "${AR_IMAGE}:${tag}" \
+            --format='value(image_summary.digest)')"
+          echo "digest=${AR_IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "built ${AR_IMAGE}@${digest}"

@@ -1,0 +1,9 @@
+# Detection source of truth: the SLICE for a given host count. render_jobset.py sizes
+# ONE JobSet template from this. Single-host suites (run_suite; each test self-launches
+# its own server) use hosts = 1. A suite does not pick topology or pool -- it only needs
+# a host count, and the slice (topology + node pool) is looked up here.
+#
+#   topology : cloud.google.com/gke-tpu-topology node label
+#   pool     : ci-tpu-pool node label
+slices:
+  1: { topology: 2x2x1, pool: pr-gate }   # single-host: PR gate + single-host nightly
