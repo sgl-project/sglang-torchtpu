@@ -192,25 +192,18 @@ class SchedulerProfilerManager:
             # TorchTPU xprof: capture TPU device activity (and host CPU only if
             # "CPU" was also requested).
             if _is_tpu and self._is_global_primary_rank():
-                from torch_tpu._internal.profiler import profiler_api
+                from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
 
                 subdir_parts = [self.profile_prefix or "profile"]
                 if self.profile_id:
                     subdir_parts.append(str(self.profile_id))
                 if stage is not None:
                     subdir_parts.append(stage.name)
-                out_dir = self.torch_profiler_output_dir / "-".join(subdir_parts)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                handler = profiler_api.xprof_trace_handler(dir_name=str(out_dir))
-                # "TPU" -> TPU-only; "TPU"+"CPU" -> CPU and TPU.
-                xprof_activities = [profiler_api.ProfilerActivity.TPU]
-                if "CPU" in activities:
-                    xprof_activities.append(profiler_api.ProfilerActivity.CPU)
-                self.tpu_profiler = profiler_api.profile(
-                    activities=xprof_activities,
-                    on_trace_ready=handler,
+                # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
+                self.tpu_profiler = start_tpu_profile(
+                    output_dir=self.torch_profiler_output_dir / "-".join(subdir_parts),
+                    with_cpu="CPU" in activities,
                 )
-                self.tpu_profiler.__enter__()
             self.profile_in_progress = True
         elif "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
@@ -391,8 +384,9 @@ class SchedulerProfilerManager:
             self.rpd_profile_path = None
 
         if self.tpu_profiler is not None:
-            # Exiting the context stops the xprof session.
-            self.tpu_profiler.__exit__(None, None, None)
+            from sglang.srt.hardware_backend.tpu.profiler import stop_tpu_profile
+
+            stop_tpu_profile(self.tpu_profiler)
             self.tpu_profiler = None
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
