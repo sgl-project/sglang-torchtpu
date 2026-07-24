@@ -1,0 +1,38 @@
+# Nightly TPU e2e. Builds the image ONCE, then runs the single-host suite via run_suite
+# (each test self-launches its own server) on the 2x2x1 pool.
+name: Nightly Test (TPU)
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # 09:00 UTC daily (low-PR hour); adjust as needed
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+
+concurrency:
+  group: tpu-slice-nightly
+  cancel-in-progress: false   # let a running nightly finish; don't stack them
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  single-host:
+    needs: build
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: nightly-tpu-4-v7
+      nightly: true
+    permissions:
+      contents: read
+      id-token: write
