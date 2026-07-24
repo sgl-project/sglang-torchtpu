@@ -265,16 +265,14 @@ def should_async_load(weight: torch.Tensor) -> bool:
     and improve throughput. For device tensors, threading often adds overhead
     (e.g., GIL contention) without benefit, so we do it synchronously.
 
-    TPU does not support async loading, return False for TPU
+    TPU loads must be synchronous: threaded copies race torch_tpu's enqueue path.
     """
     from sglang.srt.utils.common import is_tpu
 
-    if is_tpu():
-        return False
     device = getattr(weight, "device", None)
     if device is None:
         return False
-    return device.type == "cpu"
+    return device.type == "cpu" and not is_tpu()
 
 
 def maybe_executor_submit(
