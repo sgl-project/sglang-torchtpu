@@ -1,0 +1,66 @@
+# Single-host TPU test workload -- a 1-pod JobSet that runs a registered suite via
+# run_suite (each test self-launches its own server). Rendered by render_jobset.py; the
+# render vars (do NOT write them as dollar-brace tokens in these comments -- the renderer
+# would substitute them here too) are IMAGE, HOSTS, TOPOLOGY, POOL, RUN_NAME, SUITE,
+# NIGHTLY_FLAG. Gating is handled by _tpu-test.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: tpu-ci-${RUN_NAME}-
+  namespace: tpu-ci
+spec:
+  ttlSecondsAfterFinished: 7200
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${HOSTS}
+          parallelism: ${HOSTS}
+          activeDeadlineSeconds: 5400
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
+                ci-tpu-pool: ${POOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      echo "run=${RUN_NAME}"
+                      exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 1800
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                  securityContext:
+                    privileged: true

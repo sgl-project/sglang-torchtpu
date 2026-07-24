@@ -408,3 +408,11 @@ def test_eagle_prepare_for_decode_uses_torch_native_allocator():
     assert kwargs["batch_size"] == 2
     assert torch.equal(kwargs["cur_kv_lens_cpu"], torch.tensor([2, 5]))
     assert torch.equal(kwargs["nxt_kv_lens_cpu"], torch.tensor([7, 5]))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

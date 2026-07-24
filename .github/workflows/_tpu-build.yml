@@ -1,0 +1,71 @@
+# Reusable: build the TPU image ONCE (Cloud Build as tpu-ci, keyless WIF) from `ref`,
+# push to Artifact Registry, and output the immutable digest for the test jobs.
+name: _tpu-build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: "Digest-pinned image reference (repo@sha256:...)"
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT: sglang-torchtpu
+  AR_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc
+  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+          # Mint a plain tpu-ci access token; used via --access-token-file below.
+          token_format: 'access_token'
+          create_credentials_file: false
+      - uses: google-github-actions/setup-gcloud@v2
+      - id: build
+        env:
+          CI_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          # Tag the image with the ref we actually checked out and built (inputs.ref),
+          # not the workflow's github.sha (the caller's commit, which can differ).
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          tokfile="${RUNNER_TEMP}/tpu-ci.token"
+          printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
+          trap 'rm -f "$tokfile"' EXIT
+          tag="$(date -u +%Y%m%d)-${INPUT_REF:0:12}-${{ github.run_id }}"
+          bucket="${GCP_PROJECT}_cloudbuild"
+          object="source/${tag}.tgz"
+          # `gcloud builds submit` runs a client-side staging/service-usage pre-flight
+          # that is incompatible with WIF credentials (fails accessing the _cloudbuild
+          # bucket even though tpu-ci can write it). So stage the source with the plain
+          # storage client (which works) and create the build via the REST API, which
+          # skips that pre-flight entirely. See .github/tpu-ci/run_cloudbuild.py.
+          src="${RUNNER_TEMP}/source.tgz"
+          tar --exclude=./.git -czf "$src" -C "$GITHUB_WORKSPACE" .
+          gcloud storage cp "$src" "gs://${bucket}/${object}" --project "$GCP_PROJECT" \
+            --access-token-file="$tokfile"
+          digest="$(python3 .github/tpu-ci/run_cloudbuild.py \
+            --project "$GCP_PROJECT" --config docker/cloudbuild.tpu.yaml \
+            --bucket "$bucket" --object "$object" --tag "$tag" --token-file "$tokfile")"
+          echo "digest=${AR_IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+          echo "built ${AR_IMAGE}@${digest}"

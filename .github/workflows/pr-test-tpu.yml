@@ -1,0 +1,91 @@
+# PR gate: runs the registered TPU per-commit suite on a single-host 2x2x1 slice.
+#
+# Runs when EITHER:
+#   * the PR touches a TPU-explicit path (auto), OR
+#   * the PR carries the `tpu` label (manual opt-in -- for shared-code changes a
+#     maintainer judges need TPU coverage but that don't match those paths).
+#
+# Why path-OR-label instead of the label alone: a label added by the labeler bot's
+# GITHUB_TOKEN does NOT trigger a new workflow run, so relying on the label alone
+# would miss the auto case. The path check makes auto reliable; the label covers
+# manual. Keep the `tpu` path list below in sync with .github/labeler.yml.
+name: PR Test (TPU)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: pr-test-tpu-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    # dorny/paths-filter lists the PR's changed files via the GitHub API, which
+    # needs pull-requests: read (the repo's default token is otherwise too narrow).
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+    steps:
+      - name: Detect TPU-explicit path changes
+        id: paths
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            tpu:
+              - 'python/sglang/srt/hardware_backend/tpu/**'
+              - 'python/pyproject_tpu.toml'
+              - 'benchmark/tpu/**'
+              - 'docker/tpu.Dockerfile'
+              - 'docker/cloudbuild.tpu.yaml'
+              - 'test/registered/tpu/**'
+              - '.github/tpu-ci/**'
+              - '.github/workflows/_tpu-build.yml'
+              - '.github/workflows/_tpu-test.yml'
+              - '.github/workflows/pr-test-tpu.yml'
+              - '.github/workflows/nightly-test-tpu.yml'
+      - name: Gate on tpu-path change OR `tpu` label
+        id: gate
+        run: |
+          if [[ "${{ steps.paths.outputs.tpu }}" == "true" || \
+                "${{ contains(github.event.pull_request.labels.*.name, 'tpu') }}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Build the image once (keyless WIF). Fork PRs can't get WIF secrets, so keep the
+  # reserved slice for trusted branches only.
+  build:
+    needs: decide
+    if: >-
+      needs.decide.outputs.run == 'true'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      # PR head SHA (immutable, matches the pushed code) rather than the test-merge
+      # commit, whose merge_commit_sha lags a force-push and can check out stale code.
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Per-commit TPU suite on a single-host 2x2x1 slice (sized from topology.yaml).
+  integration:
+    needs: build
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      # PR head SHA (immutable, matches the pushed code) rather than the test-merge
+      # commit, whose merge_commit_sha lags a force-push and can check out stale code.
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      # Unit suite (kernels/backends; each test self-contained, no model server) is the
+      # per-commit gate. Serving suites (stage-b-*) that launch a real server run in the
+      # nightly workflow, not on every PR.
+      suite: stage-a-test-tpu-unit
+    permissions:
+      contents: read
+      id-token: write

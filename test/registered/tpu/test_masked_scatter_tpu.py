@@ -10,9 +10,13 @@ CPU ``masked_scatter_`` (the ground truth) for every case, across dtypes, mask
 patterns, broadcasting, source lengths, and edge cases (plus a randomized
 fuzz). Requires a real TPU device; skipped otherwise.
 
-Manual test (not CI-registered): run with
-``python -m unittest test.manual.tpu.test_masked_scatter_tpu`` on a TPU host.
+Run manually with
+``python -m unittest test.registered.tpu.test_masked_scatter_tpu`` on a TPU host.
 """
+
+from sglang.test.ci.ci_register import register_tpu_ci
+
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import unittest
 

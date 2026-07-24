@@ -85,6 +85,25 @@ npu:
       - '**/*npu*'
       - '**/*ascend*'
 
+# TPU specific -- auto-label ONLY for the TPU backend + explicit TPU files.
+# Deliberately NOT a broad '**/*tpu*' glob: shared code (python/sglang/srt/**,
+# scheduler/model_runner/etc.) is left to MANUAL labeling. Keep this list in sync
+# with the `tpu` path filter in .github/workflows/pr-test-tpu.yml.
+tpu:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/hardware_backend/tpu/**'
+      - 'python/pyproject_tpu.toml'
+      - 'benchmark/tpu/**'
+      - 'docker/tpu.Dockerfile'
+      - 'docker/cloudbuild.tpu.yaml'
+      - 'test/registered/tpu/**'
+      - '.github/tpu-ci/**'
+      - '.github/workflows/_tpu-build.yml'
+      - '.github/workflows/_tpu-test.yml'
+      - '.github/workflows/pr-test-tpu.yml'
+      - '.github/workflows/nightly-test-tpu.yml'
+
 # Blackwell
 blackwell:
   - changed-files:
