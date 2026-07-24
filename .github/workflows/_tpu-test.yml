@@ -1,5 +1,7 @@
-# Reusable: render the single-host JobSet for `suite` onto the already-built `image`
-# (digest), stream its logs, and gate on the JobSet Completed/Failed condition.
+# Reusable: render the unified JobSet onto the already-built `image` (digest), stream
+# its logs, and gate on the JobSet Completed/Failed condition. Two modes:
+#   * single-host suite  -> pass `suite` (run_suite runs it; hosts=1)
+#   * multi-host group    -> pass `launch_script` + `files` + `hosts` (+ weights_pvc)
 name: _tpu-test
 
 on:
@@ -11,21 +13,46 @@ on:
       image:
         required: true
         type: string          # repo@sha256:... from _tpu-build
-      suite:
-        required: true
-        type: string
       nightly:
         required: false
         type: boolean
         default: false
+      # --- single-host suite mode ---
+      suite:
+        required: false
+        type: string
+        default: ""
+      # --- multi-host launch-group mode ---
+      launch_script:
+        required: false
+        type: string
+        default: ""
+      files:
+        required: false
+        type: string
+        default: ""           # space-separated test files rank-0 runs
+      hosts:
+        required: false
+        type: number
+        default: 1
+      weights_pvc:
+        required: false
+        type: string
+        default: ""
+      run_name:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  # Runs of the same suite share a slice -> serialize them; different suites run free.
-  group: tpu-test-${{ inputs.suite }}
+  # Runs sharing a slice must serialize (no gang scheduler -> two multi-host JobSets on
+  # one pool could deadlock). Key on host count == the slice: all multi-host runs
+  # (hosts=2) serialize on the 2x2x2 pool; single-host (hosts=1) runs on pr-gate.
+  group: tpu-slice-${{ inputs.hosts }}
   cancel-in-progress: false
 
 env:
@@ -52,17 +79,22 @@ jobs:
           cluster_name: ${{ env.GKE_CLUSTER }}
           location: ${{ env.GKE_ZONE }}
 
-      - name: Render + run suite on TPU
+      - name: Render + run on TPU
         run: |
           set -euo pipefail
-          suite='${{ inputs.suite }}'
+          label='${{ inputs.run_name || inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           python3 .github/tpu-ci/render_jobset.py \
             --image '${{ inputs.image }}' \
             --suite '${{ inputs.suite }}' \
+            --launch-script '${{ inputs.launch_script }}' \
+            --files '${{ inputs.files }}' \
+            --hosts '${{ inputs.hosts }}' \
+            --weights-pvc '${{ inputs.weights_pvc }}' \
+            --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
-          grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|run_suite.py' /tmp/job.yaml | head
+          grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
           trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
@@ -73,15 +105,15 @@ jobs:
             [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ] && break || sleep 5
           done
 
-          # Stream logs (best effort; may restart while pods come up).
+          # Stream logs from every host (best effort; may restart while pods come up).
           kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
             --max-log-requests=10 --pod-running-timeout=15m --tail=-1 || true
 
-          for _ in $(seq 1 360); do
+          for _ in $(seq 1 480); do
             ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
             bad="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
-            [ "$ok" = "True" ]  && { echo "✅ ${suite} PASSED"; exit 0; }
-            [ "$bad" = "True" ] && { echo "❌ ${suite} FAILED"; kubectl -n tpu-ci describe "$name" | tail -n 80; exit 1; }
+            [ "$ok" = "True" ]  && { echo "✅ ${label} PASSED"; exit 0; }
+            [ "$bad" = "True" ] && { echo "❌ ${label} FAILED"; kubectl -n tpu-ci describe "$name" | tail -n 80; exit 1; }
             sleep 5
           done
-          echo "❌ ${suite} TIMED OUT"; exit 1
+          echo "❌ ${label} TIMED OUT"; exit 1
