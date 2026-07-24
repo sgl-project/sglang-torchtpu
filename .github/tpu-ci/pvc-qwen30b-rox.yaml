@@ -1,0 +1,55 @@
+# Step 2 of the ROX flow: expose the hydrated qwen30b disk as ReadOnlyMany so every
+# host of the multi-host JobSet can mount it read-only.
+#
+# Apply AFTER hydrate-qwen30b.yaml completes and AFTER deleting the RWO PVC (the SC is
+# Retain, so the disk survives). Fill __VOLUME_HANDLE__ with the hydrated disk's handle:
+#
+#   HANDLE=$(kubectl -n tpu-ci get pv \
+#     "$(kubectl -n tpu-ci get pvc qwen30b-rwo -o jsonpath='{.spec.volumeName}')" \
+#     -o jsonpath='{.spec.csi.volumeHandle}')
+#   kubectl -n tpu-ci delete pvc qwen30b-rwo            # Retain keeps the disk
+#   sed "s#__VOLUME_HANDLE__#${HANDLE}#" pvc-qwen30b-rox.yaml | kubectl apply -f -
+#
+# On GKE >=1.30.2 the disk auto-converts READ_WRITE_SINGLE -> READ_ONLY_MANY when this
+# ROX PV first mounts. The disk is zonal (us-central1-c) -- all CI pools are in that zone.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: qwen30b-rox-pv
+spec:
+  storageClassName: hyperdisk-ml-smoke
+  capacity:
+    storage: 80Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    namespace: tpu-ci
+    name: qwen30b-rox
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: __VOLUME_HANDLE__
+    fsType: ext4
+    readOnly: true
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.gke.io/zone
+              operator: In
+              values:
+                - us-central1-c
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qwen30b-rox
+  namespace: tpu-ci
+spec:
+  storageClassName: hyperdisk-ml-smoke
+  volumeName: qwen30b-rox-pv
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 80Gi
