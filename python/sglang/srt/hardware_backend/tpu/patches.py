@@ -549,11 +549,15 @@ def _patch_torch_native_attn_backend() -> None:
 _support_triton_patched = False
 
 
-_PALLAS_TPU_BACKENDS = ("pallas_tpu_flash", "pallas_tpu_rpa_v3")
+_PALLAS_TPU_BACKENDS = (
+    "pallas_tpu_flash",
+    "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_batched",
+)
 
 
 def _patch_support_triton_for_tpu() -> None:
-    """Make `support_triton("pallas_tpu_flash" | "pallas_tpu_rpa_v3")` return False.
+    """Make `support_triton` return False for every `_PALLAS_TPU_BACKENDS` name.
 
     SGLang gates Triton kernels behind `support_triton(attn_backend)`, which
     is a hardcoded name allowlist: `backend not in ["torch_native",

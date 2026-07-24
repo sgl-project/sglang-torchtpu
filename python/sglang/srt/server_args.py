@@ -213,12 +213,14 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    # TPU specific
+    "pallas_tpu_flash",
+    "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_batched",
     # Other platforms
     "intel_amx",
     "ascend",
     "intel_xpu",
-    "pallas_tpu_flash",
-    "pallas_tpu_rpa_v3",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton", "ascend"]
@@ -4303,6 +4305,7 @@ class ServerArgs:
                 "aiter",
                 # TPU
                 "pallas_tpu_rpa_v3",
+                "pallas_tpu_rpa_batched",
             ]
             prefill_attn_backend, decode_attn_backend = (
                 self._resolved_attention_backends()
