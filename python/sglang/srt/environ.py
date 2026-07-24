@@ -978,6 +978,11 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # MoE: offload the gather in permute and unpermute to SparseCore.
+    SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # xprof scope per task. Values <= 0 trace all chips or SparseCores.
+    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
+    SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_ASYNC_H2D = EnvBool(True)
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)

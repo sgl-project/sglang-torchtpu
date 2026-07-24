@@ -17,10 +17,10 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
     CompiledForwardShim,
+    _extend_batch_cap,
     _pad_forward_batch_inputs,
     _restore_forward_batch_inputs,
     build_bucketers,
-    resolve_compile_caps,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
@@ -172,13 +172,27 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         setattr(self.owner, self.method_name, compiled)
 
         server_args = self.model_runner.server_args
-        max_t, max_b = resolve_compile_caps(
-            chunked_prefill_size=server_args.chunked_prefill_size,
-            max_prefill_tokens=server_args.max_prefill_tokens,
-            context_len=self.model_runner.model_config.context_len,
-            torch_compile_max_bs=getattr(server_args, "torch_compile_max_bs", None),
-            max_running_requests=self.model_runner.max_running_requests,
-        )
+        # max_t = smallest positive prefill/context limit (extend never runs
+        # longer). max_b = the reconciled compile-batch ceiling, already grown to
+        # cover the scheduler concurrency in ServerArgs.__post_init__ via
+        # reconcile_tpu_batch_limits, so the grid covers every decode batch the
+        # scheduler can form (Task #40).
+        t_candidates = [
+            c
+            for c in (
+                server_args.chunked_prefill_size,
+                server_args.max_prefill_tokens,
+                self.model_runner.model_config.context_len,
+            )
+            if c and c > 0
+        ]
+        if not t_candidates:
+            raise ValueError(
+                "Cannot determine max_t for TPU compile bucketing: "
+                "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
+            )
+        max_t = min(t_candidates)
+        max_b = server_args.torch_compile_max_bs
         t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
@@ -273,7 +287,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self.b_bucketer.max_val
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
@@ -604,7 +618,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self.b_bucketer.max_val
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(

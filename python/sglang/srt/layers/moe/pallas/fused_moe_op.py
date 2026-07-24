@@ -54,6 +54,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 # Singleton: one ``torch.library`` op for the whole process. The JaxCallable
@@ -65,7 +67,7 @@ _PALLAS_MOE_OP = None
 
 # ---- JAX kernel body -------------------------------------------------------
 #
-# ``_fused_moe_jax`` (with ``_fuse_act_name`` and ``_lookup_tile_info``) is the
+# ``_fused_moe_jax`` (with ``_fuse_act_name``) is the
 # function that ``torch_tpu._internal.pallas.jax_op`` exports and that all the
 # per-shape JAX traces specialise. It lives at module scope (not in the
 # ``_build_fused_moe_op`` closure) so unit tests can import and call it
@@ -75,45 +77,17 @@ _PALLAS_MOE_OP = None
 # JAX is imported inside each function body, not at module scope, so importing
 # ``fused_moe_op`` on a non-TPU host stays cheap (the only inbound paths to
 # this module are TPU-only: ``UnquantizedFusedMoEMethod.forward_tpu`` and the
-# TPU pre-warm hook).
+# op registration in ``FusedMoE.__init__``, which is gated on ``_is_tpu``).
 
 
-def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups):
-    """Pick a ``TileSizes`` for this gmm_v2 call.
-
-    ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
-    shapes / dtypes, so it runs at JAX trace time (not at device exec
-    time). On a hit we pin the kernel's tile sizes to the tuned
-    triple; on a miss we hand ``None`` back to gmm_v2, which falls
-    through to its built-in ``calculate_tiling`` heuristic.
-
-    ``num_current_groups`` is set equal to ``num_total_groups``
-    because this bridge is single-host (no expert parallelism); when
-    EP is added the caller will need to pass the local group count
-    through.
-    """
+def _valid_rows_mask(group_sizes, expert_group_offset, local_num_experts, unsort_idx):
+    """Return a mask of which rows are owned by this rank."""
     import jax.numpy as jnp
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
-    from sglang.srt.layers.moe.pallas.tuned_block_sizes import (
-        get_tuned_block_sizes,
-    )
-
-    m, k = lhs.shape
-    _g, _k, n = rhs.shape
-    assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
-    quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
-    tm, tk, tn = get_tuned_block_sizes(
-        m=int(m),
-        k=int(k),
-        n=int(n),
-        num_total_groups=int(num_total_groups),
-        num_current_groups=int(num_total_groups),
-        lhs_dtype=str(jnp.dtype(lhs.dtype).name),
-        rhs_dtype=str(jnp.dtype(rhs.dtype).name),
-        quant_block_size=quant_block_size,
-    )
-    return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
+    gsum = jnp.cumulative_sum(group_sizes, include_initial=True)
+    row_start = gsum[expert_group_offset]
+    row_end = gsum[expert_group_offset + local_num_experts]
+    return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
 def _dividing_tile_k(base_tile_info):
@@ -178,6 +152,9 @@ def _fused_moe_jax(
     topk,
     activation_name,
     no_combine=False,
+    global_num_experts=0,
+    expert_group_offset=0,
+    use_sc_gather=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -230,12 +207,20 @@ def _fused_moe_jax(
     token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
     sorted_token_ids = token_indices[argsort_idx]
 
-    # one_hot+sum is cheaper on TPU than bincount.
-    group_sizes = jax.nn.one_hot(topk_ids_flat, num_experts, dtype=jnp.int32).sum(
-        axis=0
-    )
+    if use_sc_gather:
+        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
+            ragged_gather_v2,
+        )
 
-    x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
+        n_sorted = sorted_token_ids.shape[0]
+        x_sorted = ragged_gather_v2(
+            hidden_states,
+            sorted_token_ids,
+            jnp.array([0], dtype=jnp.int32),
+            jnp.array([n_sorted], dtype=jnp.int32),
+        )
+    else:
+        x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
     # GMM1: gate/up projection. For per-column/per-tensor scales (and MXFP4), the
     # gated activation is fused in-kernel: ``fuse_act`` makes gmm_v2 split the
     # [.., 2*n] accumulator and write only [.., n] = act(gate) * up, avoiding a
@@ -272,12 +257,33 @@ def _fused_moe_jax(
             "is unsupported: pad weights AND scales jointly at load time."
         )
 
+    use_group_offset = global_num_experts > num_experts
+    route_num_experts = global_num_experts if use_group_offset else num_experts
+    # one_hot+sum is cheaper on TPU than bincount.
+    group_sizes = jax.nn.one_hot(topk_ids_flat, route_num_experts, dtype=jnp.int32).sum(
+        axis=0
+    )
+    group_offset = (
+        jnp.array([expert_group_offset], dtype=jnp.int32) if use_group_offset else None
+    )
+
+    # The TensorCore path requires zero-initializing, while the SparseCore
+    # path does not since it skips masked rows entirely — rows the GMM
+    # never wrote are never read. no_combine gathers every row back, so it
+    # zero-initializes on both paths.
+    if use_sc_gather and not no_combine:
+        zero_init = False
+    else:
+        zero_init = True
+
     gmm1_out = gmm_v2(
         lhs=x_sorted,
         rhs=w1,
         group_sizes=group_sizes,
         rhs_scale=w1_scale,
         rhs_bias=w1_bias,
+        group_offset=group_offset,
+        zero_initialize=zero_init,
         preferred_element_type=out_dtype,
         # MXFP4 keeps the fuse_act-aware default tiling (tile_n is per-projection
         # when fused); compact FP8 pins an unfused tile.
@@ -299,15 +305,16 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    gmm2_tiling = _dividing_tile_k(
-        _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts)
-    )
+    # Tile sizes are derived by the kernel's own ``calculate_tiling``.
+    gmm2_tiling = _dividing_tile_k(calculate_tiling)
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
         group_sizes=group_sizes,
         rhs_scale=w2_scale,
         rhs_bias=w2_bias,
+        group_offset=group_offset,
+        zero_initialize=zero_init,
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
     )[
@@ -320,15 +327,66 @@ def _fused_moe_jax(
     # slot before the weighted reduction.
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
-    unsorted = gmm2_out[unsort_idx].reshape(m, topk, hidden_size)
+    if use_sc_gather:
+        if not no_combine:
+            # Fused gather + weighted top-k sum.
+            from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
+                dense_gather_reduce,
+            )
+            from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
+                ragged_gather_reduce,
+            )
+
+            if use_group_offset:
+                combined = ragged_gather_reduce(
+                    gmm2_out,
+                    unsort_idx.astype(jnp.int32),
+                    topk_weights.reshape(-1),
+                    _valid_rows_mask(
+                        group_sizes,
+                        expert_group_offset,
+                        num_experts,
+                        unsort_idx,
+                    ),
+                    topk,
+                )
+            else:
+                # All experts local: every row is valid, so use the maskless
+                # dense variant.
+                combined = dense_gather_reduce(
+                    gmm2_out,
+                    unsort_idx.astype(jnp.int32),
+                    topk_weights,
+                    topk,
+                )
+            return combined[:m_orig].astype(out_dtype)
+
+        # no_combine: just gather, without the weighted top-k sum.
+        from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
+            ragged_gather_v2,
+        )
+
+        n_sorted = unsort_idx.shape[0]
+        unsorted = ragged_gather_v2(
+            gmm2_out,
+            unsort_idx.astype(jnp.int32),
+            jnp.array([0], dtype=jnp.int32),
+            jnp.array([n_sorted], dtype=jnp.int32),
+        )
+    else:
+        # Gather on the TensorCore.
+        unsorted = gmm2_out[unsort_idx]
+    unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
     if no_combine:
-        # EP non-local slots are routed to local expert 0 for kernel legality
-        # and have zero kernel weights. Zero their raw per-slot output so the
-        # caller's later post-norm + weighted-sum path cannot consume expert-0
-        # garbage with the original, unmasked router weights.
-        valid_slots = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
-        return jnp.where(valid_slots, unsorted, jnp.zeros_like(unsorted))
+        # Zero the rows this rank did not compute, so it is safe for the
+        # caller to later run the weighted sum.
+        if use_group_offset:
+            valid_rows_mask = _valid_rows_mask(
+                group_sizes, expert_group_offset, num_experts, unsort_idx
+            )[: m_orig * topk].reshape(m_orig, topk, 1)
+            return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
+        return unsorted
 
     weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
     out = (unsorted * weights).sum(axis=1).astype(out_dtype)
@@ -336,12 +394,14 @@ def _fused_moe_jax(
 
 
 def _build_fused_moe_op():
-    """Lazily register the fused-MoE kernel as a torch custom op.
+    """Register the fused-MoE kernel as a torch custom op (idempotent).
 
     Mirrors ``_build_pallas_kernel_op`` in attention_pallas_rpa_v3.py — registration
     is heavy (``inspect.signature`` on a JAX function + JAX export) and
-    cannot run inside a dynamo trace, so we call this eagerly from the
-    TPU pre-warm hook and just look the op up from the model code path.
+    cannot run inside a dynamo trace, so ``FusedMoE.__init__``
+    (fused_moe_triton/layer.py) calls this eagerly at layer construction,
+    before torch.compile traces the model. The model code path just looks
+    up the op cached in ``_PALLAS_MOE_OP``.
     """
     global _PALLAS_MOE_OP
     if _PALLAS_MOE_OP is not None:
@@ -369,6 +429,9 @@ def _build_fused_moe_op():
         topk: int = 1,
         activation: str = "silu",
         no_combine: bool = False,
+        global_num_experts: int = 0,
+        expert_group_offset: int = 0,
+        use_sc_gather: int = 0,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -383,6 +446,9 @@ def _build_fused_moe_op():
             topk,
             activation,
             no_combine,
+            global_num_experts,
+            expert_group_offset,
+            use_sc_gather,
         )
 
     custom_op = _torch_pallas.jax_op(op_name, _wrapped)
@@ -400,6 +466,9 @@ def _build_fused_moe_op():
         topk: int = 1,
         activation: str = "silu",
         no_combine: bool = False,
+        global_num_experts: int = 0,
+        expert_group_offset: int = 0,
+        use_sc_gather: int = 0,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -430,6 +499,8 @@ def fused_moe_call(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     no_combine: bool = False,
+    global_num_experts: int = 0,
+    expert_group_offset: int = 0,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -458,4 +529,7 @@ def fused_moe_call(
         topk,
         activation,
         no_combine,
+        global_num_experts,
+        expert_group_offset,
+        int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
     )
