@@ -224,6 +224,7 @@ class FusedMoE(torch.nn.Module):
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
+        self.allow_backend_reduction = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
@@ -1239,6 +1240,13 @@ class FusedMoE(torch.nn.Module):
         else:
             return self.forward_impl(hidden_states, topk_output)
 
+    @property
+    def handles_moe_reduction(self) -> bool:
+        return bool(
+            self.quant_method is not None
+            and getattr(self.quant_method, "handles_moe_reduction", False)
+        )
+
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
@@ -1261,7 +1269,11 @@ class FusedMoE(torch.nn.Module):
                 ..., :origin_hidden_states_dim
             ].contiguous()
 
-        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+        if (
+            self.reduce_results
+            and (self.moe_tp_size > 1 or self.moe_ep_size > 1)
+            and not self.handles_moe_reduction
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states

@@ -433,23 +433,28 @@ def _build_fused_moe_op():
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
     ) -> jax.Array:
-        return _fused_moe_jax(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            w1_scale,
-            w2_scale,
-            w1_bias,
-            w2_bias,
-            topk,
-            activation,
-            no_combine,
-            global_num_experts,
-            expert_group_offset,
-            use_sc_gather,
+        from sglang.srt.hardware_backend.tpu.pallas_export import (
+            tpu_info_for_cpu_export,
         )
+
+        with tpu_info_for_cpu_export():
+            return _fused_moe_jax(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+                w1_bias,
+                w2_bias,
+                topk,
+                activation,
+                no_combine,
+                global_num_experts,
+                expert_group_offset,
+                use_sc_gather,
+            )
 
     custom_op = _torch_pallas.jax_op(op_name, _wrapped)
 

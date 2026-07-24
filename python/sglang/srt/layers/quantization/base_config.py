@@ -85,6 +85,8 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
 
+    handles_moe_reduction: bool = False
+
     def create_weights(
         self,
         layer: torch.nn.Module,
