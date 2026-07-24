@@ -969,6 +969,9 @@ class LogitsProcessor(nn.Module):
         ):
             logits = logits.float()
 
+        if _is_tpu:
+            logits = logits.contiguous().float()
+
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)

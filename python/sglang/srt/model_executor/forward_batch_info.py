@@ -55,6 +55,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_tpu,
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -73,6 +74,7 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 class ForwardMode(IntEnum):
@@ -1153,9 +1155,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         attn_tp_size = get_parallel().attn_tp_size
 
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
-            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
+            # Make sure that the padded length is divisible by attn_tp_size
+            # because we may need reduce-scatter across attn_tp dim.
+            # There is no reduce-scatter in LM logprob, so we do not need
+            # to adjust the padded length for logprob.
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            if _is_tpu:
+                # TPU DPA gather expects local_tokens.shape[0] == expected_rows;
+                # match global_num_tokens_cpu padding. expected_rows comes from
+                # formula global_tokens.shape[0] // get_attention_dp_size().
+                self.global_num_tokens_for_logprob_cpu[i] = ceil_align(
+                    self.global_num_tokens_for_logprob_cpu[i], attn_tp_size
+                )
 
         # make sure that each rank has the same number of tokens to do collective communication.
         # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
@@ -1279,6 +1290,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        if (
+            self.global_num_tokens_for_logprob_gpu is not None
+        ):
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    self.global_num_tokens_for_logprob_cpu,
+                    dtype=self.global_num_tokens_for_logprob_gpu.dtype,
+                    pin_memory=True,
+                ),
+                non_blocking=True,
+            )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
