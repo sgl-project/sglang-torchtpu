@@ -19,6 +19,17 @@ from sglang.srt.layers.attention.pallas.batched_rpa import (
     utils,
 )
 
+
+def combine_stacked_partials(m_all, l_all, acc_all):
+    """Merge per-lane online-softmax state into one normalized state."""
+    m_combined = jnp.max(m_all, axis=0)
+    alpha = jnp.exp(m_all - m_combined[None, ...])
+    l_combined = jnp.sum(alpha * l_all, axis=0)
+    acc_alpha = jax.vmap(lambda x: utils.broadcast_minor(x, acc_all.shape[1:]))(alpha)
+    acc_combined = jnp.sum(acc_alpha * acc_all, axis=0)
+    return m_combined, l_combined, acc_combined
+
+
 # Define inner kernel.
 
 
@@ -90,6 +101,16 @@ def calculate_and_store_out(
         out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
+    if cfgs.stacked:
+        is_complete = schedule_ref.is_last_k[step_idx, 0] == 1
+        jax.lax.cond(
+            is_complete,
+            jax.named_call(_accum, name="stacked_accum"),
+            lambda _: None,
+            0,
+        )
+        return
+
     for b in range(cfgs.batch_size):
         # Adding a conditional causes a scheduling barrier. In prefill, we often
         # use small block sizes, so it's not worth executing the accumulation
@@ -105,7 +126,7 @@ def calculate_and_store_out(
             _accum(b)
 
 
-def rpa_body(
+def _rpa_compute_body(
     # Inputs.
     q_vref: jax.Ref,
     kv_in_vref: jax.Ref,
@@ -157,7 +178,11 @@ def rpa_body(
             start_k_idx = jnp.maximum(0, sw_start_idx) // cfgs.bkv_sz
 
         is_first_k_block = k_idx == start_k_idx
-        reset_cond = jnp.logical_and(is_valid, is_first_k_block)
+        if cfgs.stacked:
+            is_first_k_block = schedule_ref.k_idx[step, 0] == start_k_idx
+            reset_cond = is_first_k_block
+        else:
+            reset_cond = jnp.logical_and(is_valid, is_first_k_block)
         m_scratch_ref[b_idx] = jnp.where(reset_cond, -jnp.inf, m_scratch_ref[b_idx])
         l_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, l_scratch_ref[b_idx])
         acc_scratch_ref[b_idx] = jnp.where(reset_cond, 0.0, acc_scratch_ref[b_idx])
@@ -271,6 +296,87 @@ def rpa_body(
     )
 
 
+def rpa_body(
+    q_vref: jax.Ref,
+    kv_in_vref: jax.Ref,
+    o_vref: jax.Ref,
+    schedule_ref: schedule.RpaSchedule,
+    m_scratch_ref: jax.Ref,
+    l_scratch_ref: jax.Ref,
+    acc_scratch_ref: jax.Ref,
+    *,
+    cu_q_lens_ref: jax.Ref,
+    kv_lens_ref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+):
+    step = pl.program_id(0)
+    is_finalize = jnp.logical_and(
+        cfgs.stacked, schedule_ref.do_writeback[step, 0] == -1
+    )
+
+    @pl.when(jnp.logical_not(is_finalize))
+    def _compute():
+        _rpa_compute_body(
+            q_vref,
+            kv_in_vref,
+            o_vref,
+            schedule_ref,
+            m_scratch_ref,
+            l_scratch_ref,
+            acc_scratch_ref,
+            cu_q_lens_ref=cu_q_lens_ref,
+            kv_lens_ref=kv_lens_ref,
+            cfgs=cfgs,
+        )
+
+    @pl.when(is_finalize)
+    def _finalize():
+        m_all = jnp.stack(
+            [
+                jnp.where(
+                    schedule_ref.s_idx[step, lane] >= 0,
+                    m_scratch_ref[lane],
+                    -jnp.inf,
+                )
+                for lane in range(cfgs.batch_size)
+            ]
+        )
+        l_all = jnp.stack(
+            [
+                jnp.where(
+                    schedule_ref.s_idx[step, lane] >= 0,
+                    l_scratch_ref[lane],
+                    0.0,
+                )
+                for lane in range(cfgs.batch_size)
+            ]
+        )
+        acc_all = jnp.stack(
+            [
+                jnp.where(
+                    schedule_ref.s_idx[step, lane] >= 0,
+                    acc_scratch_ref[lane],
+                    0.0,
+                )
+                for lane in range(cfgs.batch_size)
+            ]
+        )
+        m_combined, l_combined, acc_combined = combine_stacked_partials(
+            m_all, l_all, acc_all
+        )
+        m_scratch_ref[0] = m_combined
+        l_scratch_ref[0] = l_combined
+        acc_scratch_ref[0] = acc_combined
+        calculate_and_store_out(
+            step,
+            schedule_ref,
+            acc_scratch_ref,
+            l_scratch_ref,
+            o_vref,
+            cfgs=cfgs,
+        )
+
+
 # Define main kernel.
 
 
@@ -328,6 +434,8 @@ def create_allocs(
 def get_kernel_name(cfgs: configs.RpaConfigs) -> str:
     name = f"RPA{cfgs.mode.symbol}-p{cfgs.serve.page_size}"
     name += f"-b{cfgs.batch_size}-q{cfgs.bq_sz}-k{cfgs.bkv_sz}"
+    if cfgs.stacked:
+        name += "-stacked"
     if cfgs.model.sliding_window:
         name += f"-sw{cfgs.model.sliding_window}"
     return name
@@ -450,7 +558,8 @@ def rpa_kernel(
             for h, s in zip(flat_hbm, flat_smem):
                 if h.memory_space == pltpu.HBM:
                     read_size = (h.shape[0] // cfgs.max_steps_ub) * safe_steps
-                    read_size = utils.align_to(read_size, 1024)
+                    # Small metadata leaves can be shorter than the DMA alignment.
+                    read_size = jnp.minimum(utils.align_to(read_size, 1024), h.shape[0])
 
                     copy = pltpu.make_async_copy(
                         h.at[pl.ds(0, read_size)],

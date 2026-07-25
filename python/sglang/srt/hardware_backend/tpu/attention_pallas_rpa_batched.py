@@ -44,6 +44,7 @@ def _invoke_batched_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    stacked,
 ):
     # cu_kv_lens and attention_sink are not consumed by the batched kernel.
     del cu_kv_lens, attention_sink
@@ -63,6 +64,7 @@ def _invoke_batched_kernel(
         v_scale=v_scale,
         use_causal_mask=True,
         update_kv_cache=True,
+        stacked=stacked,
     )
 
 
@@ -73,6 +75,7 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     supports_attention_sink=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
     uses_draft_extend_v2=False,
+    supports_stacked_decode=True,
     min_page_size=256,
 )
 

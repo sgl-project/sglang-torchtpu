@@ -15,6 +15,11 @@ from jax.experimental.pallas import tpu as pltpu
 from sglang.srt.layers.attention.pallas.batched_rpa import configs, utils
 
 
+def stacked_lane_has_work(num_k, batch_size: int, lane: int):
+    """Whether ``lane`` owns at least one of ``num_k`` striped K blocks."""
+    return lane < jnp.minimum(num_k, batch_size)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SmemWrapper:
@@ -333,7 +338,80 @@ def compute_metadata(
         jax.lax.fori_loop(0, num_q, q_loop_fn, None)
 
     start_seq_idx, end_seq_idx = cfgs.mode.get_range(distribution_ref)
-    jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, None)
+    if not cfgs.stacked:
+        jax.lax.fori_loop(start_seq_idx, end_seq_idx, seq_loop, None)
+        return
+
+    @jax.named_scope("stacked_seq_loop")
+    def stacked_seq_loop(s_idx, base_step):
+        q_start = cu_q_lens_ref[s_idx]
+        q_end = cu_q_lens_ref[s_idx + 1]
+        k_len = kv_lens_ref[s_idx]
+        q_len = q_end - q_start
+        num_k = pl.cdiv(k_len, cfgs.bkv_sz)
+        num_compute_steps = pl.cdiv(num_k, cfgs.batch_size)
+        num_steps = num_compute_steps + 1
+
+        def clear_step(local_step, _):
+            step = base_step + local_step
+            for lane in range(cfgs.batch_size):
+                schedule.s_idx[step, lane] = -1
+                schedule.q_idx[step, lane] = 0
+                schedule.k_idx[step, lane] = 0
+                schedule.is_last_k[step, lane] = 0
+                schedule.do_writeback[step, lane] = 0
+                schedule.dma_q[step, lane, 0] = 0
+                schedule.dma_q[step, lane, 1] = 0
+                for page in range(cfgs.bkv_p_cache):
+                    schedule.dma_kv_cache[step, lane, page, 0] = 0
+                    schedule.dma_kv_cache[step, lane, page, 1] = 0
+                    schedule.dma_kv_cache[step, lane, page, 2] = 0
+                for page in range(cfgs.bkv_p_new):
+                    schedule.dma_kv_new[step, lane, page, 0] = 0
+                    schedule.dma_kv_new[step, lane, page, 1] = 0
+                    schedule.dma_kv_new[step, lane, page, 2] = 0
+                    schedule.dma_kv_new[step, lane, page, 3] = 0
+
+        jax.lax.fori_loop(0, num_steps, clear_step, None)
+
+        def stacked_k_loop(k_idx, _):
+            target_lane = k_idx % cfgs.batch_size
+            step = base_step + k_idx // cfgs.batch_size
+            k_loop(
+                k_idx,
+                step,
+                target_lane=target_lane,
+                s_idx=s_idx,
+                q_idx=0,
+                q_end=q_end,
+                q_src=q_start,
+                q_sz_task=jnp.minimum(q_len, cfgs.bq_sz),
+                k_len=k_len,
+                q_len=q_len,
+                end_k_idx=num_k,
+            )
+            schedule.is_last_k[step, target_lane] = 0
+
+        jax.lax.fori_loop(0, num_k, stacked_k_loop, None)
+
+        # Finalization is its own pipeline program. The body snapshots the
+        # per-lane online-softmax state before this step's dummy compute and
+        # only this step is allowed to schedule output DMA.
+        final_step = base_step + num_compute_steps
+        for lane in range(cfgs.batch_size):
+            lane_valid = stacked_lane_has_work(num_k, cfgs.batch_size, lane)
+            schedule.s_idx[final_step, lane] = jnp.where(lane_valid, s_idx, -1)
+        schedule.s_idx[final_step, 0] = s_idx
+        schedule.dma_q[final_step, 0, 0] = q_start
+        schedule.dma_q[final_step, 0, 1] = jnp.minimum(q_len, cfgs.bq_sz)
+        schedule.is_last_k[final_step, 0] = 1
+        schedule.do_writeback[final_step, 0] = -1
+        next_step = base_step + num_steps
+        for lane in range(cfgs.batch_size):
+            lane_lengths_ref[lane] = next_step
+        return next_step
+
+    jax.lax.fori_loop(start_seq_idx, end_seq_idx, stacked_seq_loop, 0)
 
 
 def rpa_metadata_schedule_kernel(
@@ -438,7 +516,8 @@ def rpa_metadata_schedule_kernel(
         write_size = h.shape[0]
         if write_size > 1:
             write_size = (write_size // cfgs.max_steps_ub) * safe_max_steps
-            write_size = utils.align_to(write_size, 1024)
+            # Small metadata leaves can be shorter than the DMA alignment.
+            write_size = jnp.minimum(utils.align_to(write_size, 1024), h.shape[0])
 
         copy = pltpu.make_async_copy(
             s.at[pl.ds(0, write_size)],

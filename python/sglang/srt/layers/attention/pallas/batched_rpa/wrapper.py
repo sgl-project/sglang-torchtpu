@@ -19,6 +19,8 @@ scheduler.py kernel. Kernel is calculated once and ammortized across different l
 Note: batched_rpa is build on top / derived from RPA3.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -338,6 +340,7 @@ def calculate_block_sizes(
         "out_dtype",
         "use_causal_mask",
         "update_kv_cache",
+        "stacked",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache"),
 )
@@ -366,6 +369,7 @@ def ragged_paged_attention(
     out_dtype: jnp.dtype | None = None,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,
+    stacked: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -469,6 +473,11 @@ def ragged_paged_attention(
     ):
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
+            if stacked:
+                effective_blocks = dataclasses.replace(
+                    effective_blocks,
+                    bkv_sz=max(page_size, utils.align_to(1024, page_size)),
+                )
         else:
             effective_blocks = prefill_block_sizes or default_prefill
 
@@ -478,6 +487,7 @@ def ragged_paged_attention(
             serve=serve_cfgs,
             vmem_limit_bytes=vmem_limit_bytes,
             mode=mode,
+            stacked=stacked and mode == configs.RpaCase.DECODE,
         )
         cfgs.validate_inputs(
             q=queries,

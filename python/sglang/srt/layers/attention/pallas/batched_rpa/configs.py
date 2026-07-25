@@ -128,6 +128,7 @@ class RpaConfigs:
     serve: ServingConfigs
     mode: RpaCase
     vmem_limit_bytes: int
+    stacked: bool = False
 
     # Expose block sizes for ease of use.
 
