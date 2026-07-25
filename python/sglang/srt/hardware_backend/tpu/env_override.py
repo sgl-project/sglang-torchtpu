@@ -23,6 +23,15 @@ _SPARSE_CORE_OFFLOAD_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
 )
 
+# libtpu 0.0.42.1 compiles the batched RPA attention kernel (--attention-backend
+# CUSTOM) ~7x slower without dynamic SMEM negotiation: it can't fit the kernel's
+# scheduling metadata in the default SMEM budget and falls back to a slow codegen
+# path. Enabling it restores fast compilation. Compile-time only; drop once the
+# upstream batched-RPA SMEM optimization lands. See google-pytorch/torchtpu-vllm#370.
+_SMEM_NEGOTIATION_OVERRIDES = (
+    "--xla_tpu_use_dynamic_smem_negotiation=true",
+)
+
 
 def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     existing = os.environ.get(_LIBTPU_INIT_ARGS, "")
@@ -37,7 +46,9 @@ def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
 
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
-    appended = _override_libtpu_flags(_SPARSE_CORE_OFFLOAD_OVERRIDES)
+    appended = _override_libtpu_flags(
+        _SPARSE_CORE_OFFLOAD_OVERRIDES + _SMEM_NEGOTIATION_OVERRIDES
+    )
     if appended:
         logger.info(
             "TPU env_override appended %d LIBTPU_INIT_ARGS flag(s): %s",
@@ -45,4 +56,4 @@ def apply_tpu_env_overrides() -> None:
             " ".join(appended),
         )
     else:
-        logger.debug("TPU env_override: LIBTPU_INIT_ARGS already has SC-off flags")
+        logger.debug("TPU env_override: LIBTPU_INIT_ARGS already has the override flags")
