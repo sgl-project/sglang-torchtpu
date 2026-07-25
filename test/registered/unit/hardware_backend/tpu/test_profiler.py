@@ -69,8 +69,18 @@ class TestInstallTpuProfileOptionsPatch(CustomTestCase):
         self.assertTrue(profiler_api._sglang_tpu_profile_options_patch_installed)
         self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
         self.assertEqual(options.tpu_num_sparse_cores_to_trace, 2)
+        # Tile cap only kicks in at a single SparseCore; here 2 leaves it off.
+        self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
         # Base fields survive the merge.
         self.assertEqual(options.host_tracer_level, 2)
+
+    def test_single_sparse_core_narrows_to_one_tile(self):
+        profiler_api = _fake_profiler_api()
+        options = self._install(profiler_api, num_chips=1, num_sparse_cores=1)
+
+        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
+        self.assertEqual(options.tpu_num_sparse_cores_to_trace, 1)
+        self.assertEqual(options.tpu_num_sparse_core_tiles_to_trace, 1)
 
     def test_one_limit_disabled(self):
         profiler_api = _fake_profiler_api()
@@ -78,6 +88,7 @@ class TestInstallTpuProfileOptionsPatch(CustomTestCase):
 
         self.assertEqual(options.tpu_num_chips_to_profile_per_task, 4)
         self.assertIsNone(options.tpu_num_sparse_cores_to_trace)
+        self.assertIsNone(options.tpu_num_sparse_core_tiles_to_trace)
 
     def test_both_limits_disabled_leaves_hook_untouched(self):
         profiler_api = _fake_profiler_api()
