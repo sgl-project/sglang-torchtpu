@@ -968,7 +968,9 @@ class LogitsProcessor(nn.Module):
             and logits.dtype != torch.float32
         ):
             logits = logits.float()
-
+        # FIXME: Without this change, TPU v7 will crash at warming up:
+        # https://gist.github.com/junyanxu/164a6246b01253ad3bddbec724ad192e.
+        # Need to investigate exactly why.
         if _is_tpu:
             logits = logits.contiguous().float()
 
