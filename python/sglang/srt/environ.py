@@ -980,6 +980,12 @@ class Envs:
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: use onehot dense matmul for small permute and unpermute/combine
+    # paths instead of gather. When set to 0, this is disabled. When set
+    # to a positive integer, this is the threshold for tokens per rank below
+    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
+    # and tune from there.
+    SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)

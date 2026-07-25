@@ -27,6 +27,10 @@ export MAX_PREFILL_TOKENS=$CHUNK
 export ENABLE_TORCH_COMPILE=1
 export TORCH_COMPILE_MAX_BS=$CONCUR
 
+# MoE: use dense matmul for small permute and unpermute/combine
+# which can be faster than gather/scatter.
+export SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=2048
+
 export EXTRA_ARGS="--tpu-fp8-runtime channelwise --sampling-defaults openai${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
 cd "$(dirname "$0")/../.."

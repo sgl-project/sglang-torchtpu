@@ -64,7 +64,6 @@ logger = logging.getLogger(__name__)
 # model will encounter.
 _PALLAS_MOE_OP = None
 
-
 # ---- JAX kernel body -------------------------------------------------------
 #
 # ``_fused_moe_jax`` (with ``_fuse_act_name``) is the
@@ -155,6 +154,7 @@ def _fused_moe_jax(
     global_num_experts=0,
     expert_group_offset=0,
     use_sc_gather=0,
+    permute_dense_threshold=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
 
@@ -207,7 +207,20 @@ def _fused_moe_jax(
     token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
     sorted_token_ids = token_indices[argsort_idx]
 
-    if use_sc_gather:
+    # Decide whether to use the dense permute/un-permute paths based on the
+    # number of rows (m) and the number of routed rows (m*topk).
+    use_dense_permute = m < permute_dense_threshold
+    use_dense_unpermute = (m * topk) < permute_dense_threshold and not no_combine
+
+    if use_dense_permute:
+        permute_matrix = jax.nn.one_hot(sorted_token_ids, m, dtype=hidden_states.dtype)
+        x_sorted = jax.lax.dot_general(
+            permute_matrix,
+            hidden_states,
+            (((1,), (0,)), ((), ())),
+            preferred_element_type=hidden_states.dtype,
+        )
+    elif use_sc_gather:
         from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import (
             ragged_gather_v2,
         )
@@ -270,8 +283,10 @@ def _fused_moe_jax(
     # The TensorCore path requires zero-initializing, while the SparseCore
     # path does not since it skips masked rows entirely — rows the GMM
     # never wrote are never read. no_combine gathers every row back, so it
-    # zero-initializes on both paths.
-    if use_sc_gather and not no_combine:
+    # zero-initializes on both paths. The dense un-permute multiplies every
+    # row (unwritten ones by weight 0), so unwritten rows must be zeros,
+    # not garbage — 0 * NaN would poison the sum.
+    if use_sc_gather and not no_combine and not use_dense_unpermute:
         zero_init = False
     else:
         zero_init = True
@@ -325,6 +340,20 @@ def _fused_moe_jax(
     # Un-permute back to token-major order. Models that apply a post-expert
     # norm ask the runner for no_combine output so they can RMSNorm each top-k
     # slot before the weighted reduction.
+    if use_dense_unpermute:
+        # Unpermute using dense matmul.
+        w_sorted = topk_weights.reshape(-1)[argsort_idx].astype(jnp.float32)
+        unpermute_matrix = (
+            jax.nn.one_hot(sorted_token_ids, m, dtype=jnp.float32) * w_sorted[:, None]
+        )
+        combined = jax.lax.dot_general(
+            unpermute_matrix,
+            gmm2_out.astype(jnp.float32),
+            (((0,), (0,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        return combined[:m_orig].astype(out_dtype)
+
     # TODO (Qinghan): check performance against scatter
     unsort_idx = jnp.argsort(argsort_idx)
     if use_sc_gather:
@@ -432,6 +461,7 @@ def _build_fused_moe_op():
         global_num_experts: int = 0,
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
+        permute_dense_threshold: int = 0,
     ) -> jax.Array:
         return _fused_moe_jax(
             hidden_states,
@@ -449,6 +479,7 @@ def _build_fused_moe_op():
             global_num_experts,
             expert_group_offset,
             use_sc_gather,
+            permute_dense_threshold,
         )
 
     custom_op = _torch_pallas.jax_op(op_name, _wrapped)
@@ -469,6 +500,7 @@ def _build_fused_moe_op():
         global_num_experts: int = 0,
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
+        permute_dense_threshold: int = 0,
     ):
         if no_combine:
             return hidden_states.new_empty(
@@ -532,4 +564,5 @@ def fused_moe_call(
         global_num_experts,
         expert_group_offset,
         int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
+        int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
     )
