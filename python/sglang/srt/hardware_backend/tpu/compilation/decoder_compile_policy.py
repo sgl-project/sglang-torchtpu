@@ -260,7 +260,8 @@ class DecoderTpuCompilePolicy(CompilePolicy):
                 and is_dp_attention_enabled()
                 and (
                     # This is necessary for preventing all Idle.
-                    max(forward_batch.global_num_tokens_cpu, default=0) > 0
+                    max(forward_batch.global_num_tokens_cpu, default=0)
+                    > 0
                 )
             ):
                 forward_batch.forward_mode = ForwardMode.DECODE

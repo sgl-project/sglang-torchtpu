@@ -1290,17 +1290,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
-        if (
-            _is_tpu and self.global_num_tokens_for_logprob_gpu is not None
-        ):
+        if _is_tpu and self.global_num_tokens_for_logprob_gpu is not None:
             self.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    self.global_num_tokens_for_logprob_cpu,
-                    dtype=self.global_num_tokens_for_logprob_gpu.dtype,
-                    pin_memory=True,
-                ),
-                non_blocking=True,
-            )
+                self.global_num_tokens_for_logprob_cpu, non_blocking=True)
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker

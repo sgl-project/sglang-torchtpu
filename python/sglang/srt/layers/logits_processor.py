@@ -970,8 +970,8 @@ class LogitsProcessor(nn.Module):
             logits = logits.float()
         # FIXME: Without this change, TPU v7 will crash at warming up:
         # https://gist.github.com/junyanxu/164a6246b01253ad3bddbec724ad192e.
-        # Need to investigate exactly why.
-        if _is_tpu:
+        # Need to investigate exactly why. Disable the env var to debug.
+        if _is_tpu and envs.SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS.get():
             logits = logits.contiguous().float()
 
         if self.do_tensor_parallel_all_gather:

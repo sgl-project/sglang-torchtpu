@@ -986,6 +986,8 @@ class Envs:
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_ASYNC_H2D = EnvBool(True)
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
+    # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
+    SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
