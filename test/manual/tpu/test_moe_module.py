@@ -48,6 +48,8 @@ class _MethodWithFakeRunnerConfig(UnquantizedFusedMoEMethod):
         self.moe_runner_config = SimpleNamespace(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            no_combine=False,
+            num_fused_shared_experts=0,
         )
 
 
@@ -191,6 +193,7 @@ class _MoeMockRunner:
         we don't need a real ``nn.Module``.
         """
         layer = SimpleNamespace()
+        layer.num_local_experts = num_experts
         layer.w13_weight = torch.nn.Parameter(
             torch.randn(num_experts, hidden, 2 * inter, dtype=dtype) * 0.05,
             requires_grad=False,
@@ -233,7 +236,12 @@ class _MoeMockRunner:
 
     def tpu_forward(self, layer, d_out):
         """Direct ``method.forward_tpu(layer, d_out)`` call."""
-        return self.method.forward_tpu(layer, d_out)
+        # Single-rank EP: no distributed process group in a unit test.
+        with patch(
+            "sglang.srt.layers.quantization.unquant.get_moe_expert_parallel_rank",
+            lambda: 0,
+        ):
+            return self.method.forward_tpu(layer, d_out)
 
     def dispatched_forward(self, layer, d_out):
         """``method.forward(layer, d_out)`` — routes through
@@ -241,7 +249,11 @@ class _MoeMockRunner:
         Use this with ``force_tpu_dispatch=True`` to integration-test
         the dispatch -> forward_tpu chain.
         """
-        return self.method.forward(layer, d_out)
+        with patch(
+            "sglang.srt.layers.quantization.unquant.get_moe_expert_parallel_rank",
+            lambda: 0,
+        ):
+            return self.method.forward(layer, d_out)
 
     # ---- captured state ----------------------------------------------
 
@@ -494,15 +506,24 @@ class TestForwardTpuContract(CustomTestCase):
         self.runner.tpu_forward(layer, d_out)
 
         kw = self.runner.kernel_kwargs
-        # No *_scale / *_bias kwargs may leak into the kernel call --
-        # production passes them positionally as None inside
-        # ``fused_moe_call``, but the unquant forward must never set
-        # them. Probe the recorded call.
-        for forbidden in ("w1_scale", "w2_scale", "w1_bias", "w2_bias"):
+        # No quantization scales may leak into the kernel call, and for a
+        # bias-less layer the bias kwargs (which unquant forward_tpu now
+        # forwards explicitly) must resolve to None.
+        for forbidden in ("w1_scale", "w2_scale"):
             self.assertNotIn(
                 forbidden,
                 kw,
                 f"unquant forward_tpu must not pass {forbidden}",
+            )
+        for bias_kw in ("w1_bias", "w2_bias"):
+            self.assertIn(
+                bias_kw,
+                kw,
+                f"unquant forward_tpu must forward {bias_kw} explicitly",
+            )
+            self.assertIsNone(
+                kw[bias_kw],
+                f"{bias_kw} must be None for a bias-less layer",
             )
 
 

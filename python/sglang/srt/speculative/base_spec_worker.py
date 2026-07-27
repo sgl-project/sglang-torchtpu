@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.speculative.spec_utils import (
+    assign_draft_cache_locs_contiguous_func,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -156,6 +160,7 @@ class EagleDraftWorkerBase(ABC):
             # Supply CPU mirror (extend_seq_lens are all num_draft_tokens) so
             # backend max() reads from list without a per-iter D2H sync.
             forward_batch.extend_seq_lens_cpu = [num_draft_tokens] * bs
+        draft_model_runner.pad_spec_draft_extend_v2(forward_batch, num_draft_tokens)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
             forward_batch
         )
@@ -187,9 +192,6 @@ class EagleDraftWorkerBase(ABC):
             CaptureHiddenMode,
             ForwardBatch,
         )
-        from sglang.srt.speculative.triton_ops.cache_locs import (
-            assign_draft_cache_locs_contiguous,
-        )
 
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
@@ -203,14 +205,15 @@ class EagleDraftWorkerBase(ABC):
                     device=batch.device,
                 )
                 # FIXME(lsyin): align with the default code path
-                assign_draft_cache_locs_contiguous[(bs,)](
+                assign_draft_cache_locs_contiguous_func(
                     batch.req_pool_indices,
                     req_to_token_pool.req_to_token,
                     batch.seq_lens,
                     batch.out_cache_loc,
-                    req_to_token_pool.req_to_token.shape[1],
                     topk,
                     num_steps,
+                    host_req_pool_indices=batch.req_pool_indices_cpu,
+                    host_seq_lens=batch.seq_lens_cpu,
                 )
             else:
                 # page_size > 1 + topk > 1: per-branch page-aligned draft pages.

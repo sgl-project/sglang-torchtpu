@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+import sglang.srt.hardware_backend.tpu.fp8_moe as tpu_fp8_moe
 import sglang.srt.layers.quantization.fp8 as fp8_mod
 from sglang.srt.layers.moe.pallas.fused_moe_op import (
     _build_fused_moe_op,
@@ -101,12 +102,14 @@ class TestTpuFp8MoE(CustomTestCase):
         method.moe_runner_config = SimpleNamespace(
             activation="silu",
             apply_router_weight_on_input=False,
+            no_combine=False,
         )
         method.block_quant = False
         hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
         topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.5]], dtype=torch.bfloat16)
         topk_ids = torch.tensor([[0, -1], [1, 0]], dtype=torch.int64)
         layer = SimpleNamespace(
+            num_fused_shared_experts=0,
             w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
             w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
             w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
@@ -116,20 +119,29 @@ class TestTpuFp8MoE(CustomTestCase):
             hidden_states=hidden_states,
             topk_output=(topk_weights, topk_ids, None),
         )
-        captured = {}
-
-        def fake_fused_moe_call(**kwargs):
-            captured.update(kwargs)
-            return torch.zeros_like(kwargs["hidden_states"])
-
         with (
             patch.object(fp8_mod, "_is_tpu", True),
-            patch(
-                "sglang.srt.layers.moe.pallas.fused_moe_op.fused_moe_call",
-                fake_fused_moe_call,
+            # Single-rank EP: no distributed process group in a unit test.
+            patch.object(
+                tpu_fp8_moe,
+                "get_moe_expert_parallel_world_size",
+                return_value=1,
             ),
+            patch.object(
+                tpu_fp8_moe,
+                "get_moe_expert_parallel_rank",
+                return_value=0,
+            ),
+            patch.object(
+                tpu_fp8_moe,
+                "fused_moe_call",
+                side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
+            ) as fused_moe,
         ):
             output = method.apply(layer, dispatch_output)
+
+        fused_moe.assert_called_once()
+        captured = fused_moe.call_args.kwargs
 
         self.assertEqual(output.hidden_states.shape, hidden_states.shape)
         self.assertIs(captured["w1"], layer.w13_weight)
@@ -138,12 +150,72 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertIs(captured["w2_scale"], layer.w2_weight_scale)
         self.assertEqual(captured["topk"], 2)
         self.assertEqual(captured["activation"], "silu")
+        self.assertEqual(captured["global_num_experts"], 0)
+        self.assertEqual(captured["expert_group_offset"], 0)
         torch.testing.assert_close(
             captured["topk_weights"],
             torch.tensor([[0.75, 0.0], [1.0, 0.5]], dtype=torch.bfloat16),
         )
         torch.testing.assert_close(
             captured["topk_ids"], torch.tensor([[0, 0], [1, 0]], dtype=torch.int32)
+        )
+
+    def test_fp8_moe_forwards_ep_metadata_multi_rank(self):
+        """EP enabled (world size 4, rank 2): the FP8 caller must compute
+        global_num_experts / expert_group_offset from the layer's local
+        expert count and forward them."""
+        method = object.__new__(Fp8MoEMethod)
+        method.moe_runner_config = SimpleNamespace(
+            activation="silu",
+            apply_router_weight_on_input=False,
+            no_combine=False,
+        )
+        method.block_quant = False
+        hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+        topk_weights = torch.tensor([[0.75, 0.25], [1.0, 0.5]], dtype=torch.bfloat16)
+        # Global expert ids outside rank 2's window [4, 6) stay untouched.
+        topk_ids = torch.tensor([[4, 5], [0, 7]], dtype=torch.int64)
+        layer = SimpleNamespace(
+            num_fused_shared_experts=0,
+            num_local_experts=2,
+            w13_weight=torch.empty(2, 8, 16, dtype=torch.float8_e4m3fn),
+            w2_weight=torch.empty(2, 8, 8, dtype=torch.float8_e4m3fn),
+            w13_weight_scale=torch.ones(2, 1, 1, 16, dtype=torch.float32),
+            w2_weight_scale=torch.ones(2, 1, 1, 8, dtype=torch.float32),
+        )
+        dispatch_output = SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+
+        with (
+            patch.object(fp8_mod, "_is_tpu", True),
+            patch.object(
+                tpu_fp8_moe,
+                "get_moe_expert_parallel_world_size",
+                return_value=4,
+            ),
+            patch.object(
+                tpu_fp8_moe,
+                "get_moe_expert_parallel_rank",
+                return_value=2,
+            ),
+            patch.object(
+                tpu_fp8_moe,
+                "fused_moe_call",
+                side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
+            ) as fused_moe,
+        ):
+            method.apply(layer, dispatch_output)
+
+        fused_moe.assert_called_once()
+        captured = fused_moe.call_args.kwargs
+        # global = num_local_experts(2) * world_size(4), offset = rank(2) * 2.
+        self.assertEqual(captured["global_num_experts"], 8)
+        self.assertEqual(captured["expert_group_offset"], 4)
+        torch.testing.assert_close(
+            captured["topk_ids"],
+            torch.tensor([[4, 5], [0, 7]], dtype=torch.int32),
         )
 
     def test_fp8_moe_runs_eager_and_compiled(self):

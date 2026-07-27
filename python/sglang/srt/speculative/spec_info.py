@@ -223,14 +223,6 @@ class SpeculativeAlgorithm(Enum):
             return MultiLayerEagleWorkerV2
 
         elif self.is_eagle():
-            if server_args.speculative_eagle_worker == "v1":
-                # Legacy standalone V1 worker (default; used by the TPU backend).
-                # It runs synchronously; overlap is forced off in
-                # handle_speculative_decoding when v1 is selected.
-                from sglang.srt.speculative.eagle_worker import EAGLEWorker
-
-                return EAGLEWorker
-
             from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
             return EAGLEWorkerV2

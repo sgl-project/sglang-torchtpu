@@ -12,7 +12,7 @@ from __future__ import annotations
 import functools
 import inspect
 import time
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -55,6 +55,11 @@ _BS_CPU_LIST_FIELDS = (
 _REAL_Q_KEY = "_tpu_real_q"
 _REAL_B_KEY = "_tpu_real_b"
 _DEFAULT_KWARG_TYPES = (type(None), bool, int, float, str)
+
+
+def _extend_batch_cap(t_bucketer: Bucketer, b_bucketer: Bucketer) -> int:
+    """Return the largest reachable fixed batch shape for EXTEND."""
+    return min(t_bucketer.max_val, b_bucketer.max_val)
 
 
 def _static_default_kwargs(fn: Callable[..., Any]) -> dict[str, Any]:
@@ -106,11 +111,11 @@ def _dp_attn_select_bucket_shape(
         pad_t = b_bucketer.next_bucket(max(real_q, max_tokens_per_rank))
         pad_b = b_bucketer.next_bucket(max(real_b, max_tokens_per_rank))
     else:
-        # Extend always pads to the max batch bucket. Precompile mirrors this in
-        # DecoderTpuCompilePolicy._precompile_extend (which compiles extend only
-        # at b_bucketer.max_val), so the two must change together.
+        # Extend pads to one fixed batch shape. It cannot contain more requests
+        # than tokens, so cap the shape by the token ceiling when decode
+        # concurrency is larger. Precompile mirrors this choice.
         # TODO(wyzhang): Support multiple batch size buckets for extend/prefill.
-        pad_b = b_bucketer.max_val
+        pad_b = _extend_batch_cap(t_bucketer, b_bucketer)
         pad_t = t_bucketer.next_bucket(max(real_q, max_tokens_per_rank, pad_b))
     return pad_t, pad_b
 
@@ -241,6 +246,7 @@ def _pad_forward_batch_inputs(
             )
 
     is_decode = forward_batch.forward_mode.is_decode()
+    is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
     real_b = forward_batch.seq_lens.shape[0]
 
@@ -264,10 +270,19 @@ def _pad_forward_batch_inputs(
         pad_b = b_bucketer.next_bucket(real_b)
         pad_t = pad_b * forward_batch.spec_info.draft_token_num
         real_q_out, real_b_out = real_q, real_b
+    elif is_draft_extend_v2 and forward_batch.spec_info is not None:
+        pad_b = b_bucketer.next_bucket(real_b)
+        num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
+        assert num_tokens_per_req > 0, (
+            "DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, "
+            f"got {num_tokens_per_req}"
+        )
+        pad_t = pad_b * num_tokens_per_req
+        real_q_out, real_b_out = real_q, real_b
     else:
         # Prefill/extend is precompiled at a fixed batch cap to avoid compiling
         # the full token_bucket x batch_bucket cross product.
-        pad_b = b_bucketer.max_val
+        pad_b = _extend_batch_cap(t_bucketer, b_bucketer)
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
 
@@ -283,6 +298,11 @@ def _pad_forward_batch_inputs(
             mrope_pos, (0, pad_t - mrope_pos.shape[-1])
         )
 
+    if is_draft_extend_v2:
+        out_cache_loc = forward_batch.out_cache_loc
+        if out_cache_loc.shape[0] < pad_t:
+            forward_batch.out_cache_loc = _zero_pad_1d(out_cache_loc, pad_t)
+
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
@@ -295,7 +315,7 @@ def _pad_forward_batch_inputs(
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
         if val is None:
-            if not forward_batch.forward_mode.is_extend():
+            if not (forward_batch.forward_mode.is_extend() or is_draft_extend_v2):
                 continue
             val = []
         elif isinstance(val, torch.Tensor):
@@ -325,6 +345,49 @@ def _pad_forward_batch_inputs(
     forward_batch.batch_size = pad_b
 
     return real_q_out, real_b_out
+
+
+def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) -> None:
+    """Undo in-place TPU bucketing before eager outer-model processing.
+
+    Restore real token and batch shapes so downstream logits and sampling do
+    not observe the compiled inner decoder's padded ghost slots.
+    """
+    for field in _TOKEN_FIELDS:
+        value = getattr(forward_batch, field, None)
+        if isinstance(value, torch.Tensor) and value.shape[0] > real_q:
+            setattr(forward_batch, field, value[:real_q])
+
+    mrope_positions = getattr(forward_batch, "mrope_positions", None)
+    if isinstance(mrope_positions, torch.Tensor) and mrope_positions.shape[-1] > real_q:
+        forward_batch.mrope_positions = mrope_positions[..., :real_q]
+
+    for field in _BS_FIELDS:
+        value = getattr(forward_batch, field, None)
+        if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
+            setattr(forward_batch, field, value[:real_b])
+
+    for field in _BS_CPU_LIST_FIELDS:
+        value = getattr(forward_batch, field, None)
+        if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
+            setattr(forward_batch, field, value[:real_b])
+        elif isinstance(value, list) and len(value) > real_b:
+            setattr(forward_batch, field, value[:real_b])
+
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    if isinstance(mm_inputs, list) and len(mm_inputs) > real_b:
+        forward_batch.mm_inputs = mm_inputs[:real_b]
+
+    mm_input_embeds = getattr(forward_batch, "mm_input_embeds", None)
+    if isinstance(mm_input_embeds, torch.Tensor) and mm_input_embeds.shape[0] > real_q:
+        forward_batch.mm_input_embeds = mm_input_embeds[:real_q]
+
+    spec_info = getattr(forward_batch, "spec_info", None)
+    hidden_states = getattr(spec_info, "hidden_states", None)
+    if isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] > real_q:
+        spec_info.hidden_states = hidden_states[:real_q]
+
+    forward_batch.batch_size = real_b
 
 
 # Warming above this many pow2 blocks is correct but means warmup runs a
@@ -458,45 +521,35 @@ class CompiledForwardShim:
         return out
 
 
-def resolve_compile_caps(
-    *,
-    chunked_prefill_size: int | None,
-    max_prefill_tokens: int | None,
-    context_len: int | None,
+def reconcile_tpu_batch_limits(
     torch_compile_max_bs: int | None,
+    tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
-) -> tuple[int, int]:
-    """Resolve (max_t, max_b) limits for compilation bucketing."""
-    candidates = [
-        c
-        for c in (chunked_prefill_size, max_prefill_tokens, context_len)
-        if c and c > 0
+) -> tuple[int, Optional[List[int]], int]:
+    """Make the TPU compile grid cover scheduler concurrency without dead shapes."""
+    explicit_compile_limits = [
+        limit
+        for limit in (
+            torch_compile_max_bs,
+            max(tpu_compile_bs) if tpu_compile_bs else None,
+        )
+        if limit is not None
     ]
-    if not candidates:
-        raise ValueError(
-            "Cannot determine max_t for TPU compile bucketing: "
-            "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
-        )
-    # TPU serving should compile the requested scheduler capacity by default for
-    # practical benchmark sizes (for example max_running_requests=64). Avoid
-    # blindly expanding to very large upstream defaults unless the user raises
-    # torch_compile_max_bs or pins --tpu-compile-bs.
-    max_running_compile_bs = (
-        min(max_running_requests, DEFAULT_TPU_COMPILE_MAX_BS)
-        if max_running_requests
-        else 1
+    tcmb = (
+        max(explicit_compile_limits)
+        if explicit_compile_limits
+        else DEFAULT_TPU_COMPILE_MAX_BS
     )
-    max_b = max(torch_compile_max_bs or 1, max_running_compile_bs)
-    if max_running_requests and max_b < max_running_requests:
-        logger.warning(
-            "[compiled forward shim] TPU compile bs cap=%d < max_running_requests=%d; "
-            "batches above %d are outside the TPU compile grid. Raise "
-            "--torch-compile-max-bs or pin --tpu-compile-bs to cover them.",
-            max_b,
-            max_running_requests,
-            max_b,
-        )
-    return min(candidates), max_b
+
+    if max_running_requests is not None:
+        tcmb = max(tcmb, max_running_requests)
+    else:
+        max_running_requests = tcmb
+
+    if tpu_compile_bs and max(tpu_compile_bs) < max_running_requests:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {max_running_requests})
+
+    return tcmb, tpu_compile_bs, max_running_requests
 
 
 def build_bucketers(

@@ -139,7 +139,20 @@ class TpuSRTPlatform(SRTPlatform):
         # Only EAGLE3 spec decoding is supported on TPU, and only with topk == 1
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
+            if server_args.attention_backend == "pallas_tpu_rpa_batched":
+                # Batched RPA has no draft-backend wiring in
+                # speculative.draft_utils, so reject here with a clear message
+                # rather than failing later during draft-backend creation.
+                raise NotImplementedError(
+                    "Speculative decoding is not supported with "
+                    "--attention-backend pallas_tpu_rpa_batched yet. Use "
+                    "--attention-backend pallas_tpu_rpa_v3 for speculative decoding."
+                )
             if spec_algo == "EAGLE3":
+                if server_args.speculative_use_rejection_sampling:
+                    raise NotImplementedError(
+                        "EAGLE3 rejection sampling is not supported on TPU yet."
+                    )
                 if (server_args.speculative_eagle_topk or 1) > 1:
                     raise NotImplementedError(
                         "EAGLE3 topk > 1 is not supported on TPU yet."
@@ -158,19 +171,23 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def get_default_attention_backend(self) -> str:
-        # Two Pallas backends are registered for TPU:
+        # Three Pallas backends are registered for TPU:
         #   - "pallas_tpu_rpa_v3" (default): ragged_paged_attention v3 kernel
         #     in `pallas/ragged_paged_attention_v3.py`. Single unified kernel
         #     for prefill + decode, fused KV cache (interleaved K/V, packed),
         #     decode-native batched call.
+        #   - "pallas_tpu_rpa_batched": the batched RPA kernel in
+        #     `pallas/batched_rpa`, a thin subclass of the same shared base as
+        #     v3 (see `attention_pallas_rpa_base`). Same fused KV cache, batches
+        #     sequences for higher throughput. No speculative decoding.
         #   - "pallas_tpu_flash": flash_attention for prefill/extend +
         #     `jax.experimental.pallas.ops.tpu.paged_attention` for decode.
-        #     Original implementation from PR #5; works against the flat
+        #     Original implementation from PR #5, works against the flat
         #     `MHATokenToKVPool` layout (no fused-pool swap required).
-        # Both are listed in `server_args.ATTENTION_BACKEND_CHOICES` and
+        # All are listed in `server_args.ATTENTION_BACKEND_CHOICES` and
         # registered in `layers.attention.attention_registry` (same place as
-        # `ascend` / `intel_xpu`; factories use lazy imports so non-TPU runs
-        # don't pull in jax/torch_tpu).
+        # `ascend` / `intel_xpu`). Factories use lazy imports so non-TPU runs
+        # don't pull in jax/torch_tpu.
         # Override to the reference path with `--attention-backend torch_native`.
         return "pallas_tpu_rpa_v3"
 
@@ -186,7 +203,10 @@ class TpuSRTPlatform(SRTPlatform):
         # time (set in ModelRunner.__init__, before _init_pools).
         from sglang.srt.server_args import get_global_server_args
 
-        if get_global_server_args().attention_backend == "pallas_tpu_rpa_v3":
+        if get_global_server_args().attention_backend in (
+            "pallas_tpu_rpa_v3",
+            "pallas_tpu_rpa_batched",
+        ):
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMHATokenToKVPool,
             )
@@ -239,6 +259,9 @@ class TpuSRTPlatform(SRTPlatform):
 
     def get_compile_backend(self, mode: str | None = None) -> str:
         return "tpu"
+
+    def supports_torch_compile(self) -> bool:
+        return True
 
     def get_piecewise_backend_cls(self) -> type:
         raise NotImplementedError("TPU piecewise backend not yet implemented.")

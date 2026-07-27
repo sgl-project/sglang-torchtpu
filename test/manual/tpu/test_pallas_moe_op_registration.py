@@ -13,17 +13,13 @@ The behaviour being guarded here:
     double-registration of the same op with a confusing error, so the
     module-level ``_PALLAS_MOE_OP`` singleton must short-circuit on
     subsequent calls.
-  * ``apply_tpu_patches`` (TPU backend init) invokes the builder via
-    ``_prewarm_fused_moe`` so the heavyweight JAX export happens before
-    dynamo tracing; if that hook becomes a no-op, the first ``forward_tpu``
-    call pays the full registration cost (and may graph-break inside dynamo).
-
 These tests require torch_tpu + JAX with a TPU backend visible to
 ``jax.devices()`` because ``_build_fused_moe_op`` does JAX export at
 registration time.
 """
 
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -74,10 +70,10 @@ class TestPallasMoeOpRegistration(CustomTestCase):
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
 class TestPallasMoeOpIdempotency(CustomTestCase):
-    """``_build_fused_moe_op`` is called both at TPU pre-warm time and
-    from ``fused_moe_call``. torch.library rejects double-registration
-    of the same op, so subsequent calls must return the cached singleton
-    instead of re-registering."""
+    """``_build_fused_moe_op`` is called during ``FusedMoE`` layer
+    construction and again from ``fused_moe_call``. torch.library rejects
+    double-registration of the same op, so subsequent calls must return
+    the cached singleton instead of re-registering."""
 
     def test_build_returns_same_singleton(self):
         from sglang.srt.layers.moe.pallas.fused_moe_op import _build_fused_moe_op
@@ -87,38 +83,64 @@ class TestPallasMoeOpIdempotency(CustomTestCase):
         self.assertIs(op_a, op_b)
 
 
-@unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)
-class TestPallasMoePrewarmHook(CustomTestCase):
-    """``apply_tpu_patches`` (TPU backend init) calls ``_prewarm_fused_moe``
-    so the JAX export (~hundreds of ms) happens before the first forward.
-    The hook must actually invoke ``_build_fused_moe_op`` -- a silent no-op
-    would defer registration to first inference and may cause a dynamo
-    graph break."""
+class TestPallasMoeCallContract(CustomTestCase):
+    """``fused_moe_call`` must forward its arguments to the registered
+    op in the op's exact positional order — no other test covers this
+    boundary. Runs without a TPU: the op builder is mocked out.
+    """
 
-    def test_prewarm_invokes_builder(self):
-        import sglang.srt.layers.moe.pallas.fused_moe_op as fmop
-        from sglang.srt.hardware_backend.tpu import patches
+    def test_forwards_ep_and_sparse_core_options_to_registered_op(self):
+        import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op
 
-        # Spy on ``_build_fused_moe_op`` without re-registering (which
-        # would fail because torch.library has already accepted the op
-        # from prior test runs in this process). ``_prewarm_fused_moe``
-        # imports the builder lazily, so it picks up the patched attribute.
-        original = fmop._build_fused_moe_op
-        called = []
+        hidden_states = torch.empty(2, 8, dtype=torch.bfloat16)
+        w1 = torch.empty(2, 8, 16, dtype=torch.bfloat16)
+        w2 = torch.empty(2, 8, 8, dtype=torch.bfloat16)
+        topk_weights = torch.empty(2, 2, dtype=torch.bfloat16)
+        topk_ids = torch.empty(2, 2, dtype=torch.int32)
 
-        def spy():
-            called.append(True)
-            return original()
+        expected = torch.empty_like(hidden_states)
+        op = Mock(return_value=expected)
 
-        fmop._build_fused_moe_op = spy
-        try:
-            patches._prewarm_fused_moe()
-            self.assertTrue(
-                called,
-                "_prewarm_fused_moe did not invoke _build_fused_moe_op",
+        with (
+            patch.object(fused_moe_op, "_build_fused_moe_op", return_value=op),
+            patch.object(
+                fused_moe_op.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER,
+                "get",
+                return_value=True,
+            ),
+        ):
+            actual = fused_moe_op.fused_moe_call(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                topk=2,
+                activation="silu",
+                global_num_experts=8,
+                expert_group_offset=4,
             )
-        finally:
-            fmop._build_fused_moe_op = original
+
+        self.assertIs(actual, expected)
+        # The tensor arguments must be the SAME objects passed above —
+        # fresh equal-valued tensors would break assert_called_once_with.
+        op.assert_called_once_with(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            None,  # w1_scale
+            None,  # w2_scale
+            None,  # w1_bias
+            None,  # w2_bias
+            2,  # topk
+            "silu",  # activation
+            False,  # no_combine
+            8,  # global_num_experts
+            4,  # expert_group_offset
+            1,  # use_sc_gather (int(True))
+        )
 
 
 if __name__ == "__main__":

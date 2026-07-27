@@ -864,6 +864,38 @@ class VisionIntelXPUAttention(nn.Module):
         return output
 
 
+def _build_tpu_segment_ids(
+    cu_seqlens: torch.Tensor | SingletonCache | None,
+    bsz: int,
+    seq_len: int,
+    *,
+    flatten_batch: bool,
+    device: torch.device,
+) -> torch.Tensor:
+    cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=device).to(
+        device=device, dtype=torch.int32
+    )
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+
+    if flatten_batch and bsz == 1:
+        starts = cu_seqlens[:-1].to(torch.int64)
+        markers = torch.zeros(seq_len + 1, device=device, dtype=torch.int32)
+        markers = markers.scatter_add(
+            0,
+            starts,
+            torch.ones(starts.shape, device=device, dtype=torch.int32),
+        )
+        return (markers.cumsum(0, dtype=torch.int32)[:seq_len] - 1).unsqueeze(0)
+
+    if seq_lens.shape[0] != bsz:
+        raise ValueError(
+            f"Expected {bsz} sequence lengths for a dense batch, got "
+            f"{seq_lens.shape[0]}"
+        )
+    positions = torch.arange(seq_len, device=device, dtype=torch.int32)
+    return (positions.unsqueeze(0) >= seq_lens.unsqueeze(1)).to(torch.int32)
+
+
 class VisionTpuAttention(nn.Module):
     _BLOCK_SIZE = 128
     supports_segment_ids = True
@@ -890,12 +922,63 @@ class VisionTpuAttention(nn.Module):
             softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(head_dim)
         )
         self._flash_op = _get_vision_flash_op(float(self.scale))
+        self._sdpa_fallback = VisionSdpaAttention(
+            head_dim=head_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            dropout=dropout,
+            flatten_batch=False,
+            softmax_in_single_precision=softmax_in_single_precision,
+            softmax_scale=softmax_scale,
+        )
 
-    def forward(self, q, k, v, bsz, segment_ids=None, **kwargs):
-        if self.flatten_batch:
-            assert bsz == 1
-        assert segment_ids is not None, "VisionTpuAttention requires segment_ids"
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        bsz,
+        cu_seqlens=None,
+        attention_mask=None,
+        segment_ids=None,
+        **kwargs,
+    ):
+        if attention_mask is not None and segment_ids is not None:
+            raise ValueError(
+                "TPU vision attention cannot combine attention_mask and segment_ids"
+            )
+
+        if k.shape[1] != v.shape[1] or k.shape[1] != q.shape[1]:
+            if k.shape[1] != v.shape[1] or q.shape[1] % k.shape[1] != 0:
+                raise ValueError(
+                    "TPU vision attention requires matching KV heads and an "
+                    "integer query-to-KV head ratio"
+                )
+            repeats = q.shape[1] // k.shape[1]
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+
+        if attention_mask is not None:
+            return self._sdpa_fallback(
+                q,
+                k,
+                v,
+                bsz,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+            )
+
         s = q.shape[0] // bsz
+        if segment_ids is None:
+            segment_ids = _build_tpu_segment_ids(
+                cu_seqlens,
+                bsz,
+                s,
+                flatten_batch=self.flatten_batch,
+                device=q.device,
+            )
+        else:
+            segment_ids = segment_ids.to(device=q.device, dtype=torch.int32)
         q, k, v = [rearrange(x, "(b s) h d -> b h s d", b=bsz) for x in [q, k, v]]
         pad = (-s) % self._BLOCK_SIZE
         if pad > 0:
@@ -1123,6 +1206,7 @@ class VisionAttention(nn.Module):
         Priority: server args override > constructor arg > platform default.
 
         Platform defaults:
+        - TPU: "tpu"
         - CUDA (Hopper SM90): "fa3"
         - CUDA (Blackwell SM100): "fa4"
         - CUDA (other): "triton_attn"
@@ -1133,6 +1217,8 @@ class VisionAttention(nn.Module):
             backend = override_backend
         elif passed_backend is not None:
             backend = passed_backend
+        elif _is_tpu:
+            backend = "tpu"
         elif is_cuda():
             major, minor = get_device_capability()
             if major == 9:
