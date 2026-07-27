@@ -321,7 +321,7 @@ class TpuSRTPlatform(SRTPlatform):
 
         from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches
 
-        apply_tpu_patches()
+        apply_tpu_patches(int(os.environ.get("WORLD_SIZE", "1")))
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

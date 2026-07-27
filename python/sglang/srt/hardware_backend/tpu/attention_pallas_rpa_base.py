@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Protocol
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -248,23 +249,24 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        output, _updated_kv = jax_kernel(
-            queries,
-            keys,
-            values,
-            kv_cache_fused,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            cu_kv_lens,
-            distribution,
-            attention_sink,
-            sm_scale,
-            sliding_window,
-            soft_cap,
-            k_scale,
-            v_scale,
-        )
+        with tpu_info_for_cpu_export():
+            output, _updated_kv = jax_kernel(
+                queries,
+                keys,
+                values,
+                kv_cache_fused,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                attention_sink,
+                sm_scale,
+                sliding_window,
+                soft_cap,
+                k_scale,
+                v_scale,
+            )
         return output
 
     def _fake_impl(

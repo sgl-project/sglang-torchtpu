@@ -192,7 +192,9 @@ def _set_torch_tpu_topology_env_single(world_size: int) -> None:
         os.environ.setdefault("TORCH_TPU_TOPOLOGY", env["TORCH_TPU_TOPOLOGY"])
 
 
-def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> None:
+def _prepare_tpu_env(
+    world_size: int | None = None, setup_slicebuilder: bool = True
+) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
 
     Applies LIBTPU_INIT_ARGS overrides, then dispatches to the multi-host or
@@ -205,6 +207,17 @@ def _prepare_tpu_env(world_size: int = 1, setup_slicebuilder: bool = True) -> No
     node discovery, so building it here would emit a bogus single-host
     (localhost) env that never applies to the real ranks.
     """
+    if world_size is None:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+    from sglang.srt.hardware_backend.tpu.pallas_export import (
+        configure_jax_export_env,
+    )
+
+    # JAX is an export frontend in the TorchTPU runtime. Configure one distinct
+    # logical CPU device per global Torch rank before any JAX backend starts.
+    configure_jax_export_env(world_size)
+
     # Apply LIBTPU_INIT_ARGS overrides before the early return and before
     # any torch_tpu import; libtpu reads these flags at load time.
     from sglang.srt.hardware_backend.tpu.env_override import (
@@ -721,7 +734,7 @@ def _patch_tpu_torch_pallas_register_positional() -> None:
     tpu_torch_pallas.call_custom_kernel = call_custom_kernel
 
 
-def apply_tpu_patches(world_size: int = 1) -> None:
+def apply_tpu_patches(world_size: int | None = None) -> None:
     _prepare_tpu_env(world_size)
     _configure_eager_mode()
     _register_tpu_compile_backend()

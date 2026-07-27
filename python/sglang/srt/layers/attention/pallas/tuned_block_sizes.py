@@ -3,15 +3,15 @@
 
 import logging
 
-import jax
 import jax.numpy as jnp
 
+from sglang.srt.hardware_backend.tpu.pallas_export import get_torch_tpu_device_kind
 from sglang.srt.layers.attention.pallas.util import get_tpu_version, next_power_of_2
 
 
 def get_device_name(num_devices: int | None = None) -> str:
     """Local copy of sgl_jax.srt.utils.jax_utils.get_device_name to avoid the jax-sglang dependency."""
-    kind = jax.devices()[0].device_kind
+    kind = get_torch_tpu_device_kind()
     if "TPU" not in kind:
         raise RuntimeError("Expected TPU devices")
     suffix = ""

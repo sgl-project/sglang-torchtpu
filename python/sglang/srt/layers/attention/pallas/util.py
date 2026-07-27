@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utility functions for ragged paged attention."""
 
-import jax
 from jax._src import dtypes
+
+from sglang.srt.hardware_backend.tpu.pallas_export import get_torch_tpu_device_kind
 
 
 def cdiv(a, b):
@@ -21,8 +22,9 @@ def get_dtype_packing(dtype):
 
 def get_tpu_version() -> int:
     """Returns the numeric version of the TPU, or -1 if not on TPU."""
-    kind = jax.devices()[0].device_kind
-    if "TPU" not in kind:
+    try:
+        kind = get_torch_tpu_device_kind()
+    except (ImportError, RuntimeError):
         return -1
     if kind.endswith(" lite"):
         kind = kind[: -len(" lite")]

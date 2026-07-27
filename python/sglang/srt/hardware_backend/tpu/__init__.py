@@ -5,7 +5,12 @@ The ``activate`` function is called during platform discovery and returns
 the fully-qualified platform class name when TPU hardware is available.
 """
 
+import importlib.util
+
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.pallas_export import (
+    configure_jax_export_platform,
+)
 
 logger = get_logger(__name__)
 
@@ -21,13 +26,17 @@ def activate():
     even need TPU access.  The real import is deferred to init_backend().
     """
     try:
-        import importlib.util
-
-        if importlib.util.find_spec("torch_tpu") is None:
-            return None
-
-        logger.info("TPU plugin detected (torch_tpu installable).")
-        return "sglang.srt.hardware_backend.tpu.tpu_platform:TpuSRTPlatform"
-    except Exception:
+        torch_tpu_available = importlib.util.find_spec("torch_tpu") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
         logger.debug("torch_tpu activation check failed.", exc_info=True)
         return None
+
+    if not torch_tpu_available:
+        return None
+
+    # Ownership violations must fail explicitly rather than making platform
+    # discovery report that an installed TorchTPU backend is unavailable.
+    configure_jax_export_platform()
+
+    logger.info("TPU plugin detected (torch_tpu installable).")
+    return "sglang.srt.hardware_backend.tpu.tpu_platform:TpuSRTPlatform"

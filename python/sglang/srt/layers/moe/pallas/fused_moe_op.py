@@ -55,6 +55,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +438,6 @@ def _build_fused_moe_op():
         return _PALLAS_MOE_OP
 
     import jax  # noqa: F401  (force loud failure if JAX is missing)
-    from torch_tpu._internal import pallas as _torch_pallas
 
     op_name = "sglang_tpu_pallas::fused_moe"
 
@@ -482,7 +482,7 @@ def _build_fused_moe_op():
             permute_dense_threshold,
         )
 
-    custom_op = _torch_pallas.jax_op(op_name, _wrapped)
+    custom_op = cpu_export_jax_op(op_name, _wrapped)
 
     def _fake_impl(
         hidden_states: torch.Tensor,

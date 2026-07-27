@@ -205,7 +205,12 @@ def order_tpu_bundles_by_worker_id(
 # forwarding a per-chip/per-node var would clobber Ray's per-actor value.
 _FORWARD_ENV_PREFIXES = ("SGLANG_", "TORCH_", "HF_", "TRANSFORMERS_")
 _FORWARD_ENV_NAMES = frozenset(
-    {"LIBTPU_INIT_ARGS", "XLA_FLAGS", "TPU_PREMAPPED_BUFFER_SIZE"}
+    {
+        "JAX_PLATFORMS",
+        "LIBTPU_INIT_ARGS",
+        "XLA_FLAGS",
+        "TPU_PREMAPPED_BUFFER_SIZE",
+    }
 )
 # Never forward, even when a prefix matches: these are per-chip/per-node (Ray sets
 # them per actor -- forwarding the driver's copy makes every actor grab the same
