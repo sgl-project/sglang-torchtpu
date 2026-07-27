@@ -23,6 +23,10 @@ Usage:
 --set values are strings (ints/floats/bools coerced); --json values are parsed
 as JSON (for arrays/objects). Nothing here is allowed to abort the run: every
 enrichment step is best-effort and records an "_error" note on failure.
+
+Credential-looking fields in the captured env and in /server_info (tokens,
+secrets, api_key, *_access_key, ...) are masked before the record is written --
+see _redact_secrets -- since the record is meant to feed a shared CI sink.
 """
 
 from __future__ import annotations
@@ -32,11 +36,62 @@ import datetime
 import json
 import os
 import platform
+import re
 import socket
 import subprocess
 import sys
 
 SCHEMA_VERSION = 1
+
+# Redaction of credential-looking values. The record is designed to feed a
+# shared CI dashboard sink, so any captured secret (a token/key set in the
+# launch env, or an api_key echoed back by /server_info) would leak to everyone
+# with dashboard access. We mask by *name*, matched on the name's
+# underscore/dash-delimited components (case-insensitive):
+#   - any component in _SECRET_WORDS (secret / password / credential / ...)
+#   - "token" only as the FINAL component, so credential names like
+#     BEARER_TOKEN / SLACK_TOKEN match but LLM-token knobs like
+#     SGLANG_MAX_THINK_TOKENS or SGLANG_..._PER_TOKEN_ACTIVATION do not
+#   - a "<qualifier>_key" pair (access_key / api_key / secret_key / ...), so
+#     real keys match but a bare "key" (e.g. SGLANG_ROUTING_KEY_POLICY) does not
+_REDACTED = "***redacted***"
+_SECRET_WORDS = frozenset(
+    {"secret", "password", "passwd", "credential", "credentials", "apikey"}
+)
+_SECRET_SUFFIX_WORDS = frozenset({"token"})
+_SECRET_KEY_QUALIFIERS = frozenset(
+    {"access", "api", "secret", "private", "signing", "encryption", "auth"}
+)
+
+
+def _looks_secret(name: str) -> bool:
+    """True if the field/env-var name reads as a credential and its value
+    should be masked. Name-based only; never inspects the value."""
+    parts = [p for p in re.split(r"[^a-z0-9]+", name.lower()) if p]
+    if not parts:
+        return False
+    if _SECRET_WORDS.intersection(parts):
+        return True
+    if parts[-1] in _SECRET_SUFFIX_WORDS:
+        return True
+    for prev, cur in zip(parts, parts[1:]):
+        if cur == "key" and prev in _SECRET_KEY_QUALIFIERS:
+            return True
+    return False
+
+
+def _redact_secrets(value):
+    """Recursively copy value, masking any dict entry whose key name looks like
+    a credential. Applied to captured env vars and to /server_info so tokens and
+    keys never land in the record that feeds the shared dashboard."""
+    if isinstance(value, dict):
+        return {
+            k: (_REDACTED if isinstance(k, str) and _looks_secret(k) else _redact_secrets(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_secrets(v) for v in value]
+    return value
 
 
 def _coerce(value: str):
@@ -164,7 +219,9 @@ def _fetch_server_info(url: str):
             # internal_states is large per-DP runtime state, not config; drop it.
             if isinstance(data, dict):
                 data.pop("internal_states", None)
-            return data
+            # /server_info echoes the full ServerArgs, including api_key /
+            # admin_api_key; mask any credential-looking field before recording.
+            return _redact_secrets(data)
         except Exception:
             continue
     return {"_error": f"could not reach {base}/server_info"}
@@ -229,6 +286,10 @@ def main() -> int:
         for name, value in os.environ.items():
             if name.startswith(prefix):
                 env[name] = value
+    # --env-prefix is a blanket match (e.g. every SGLANG_* var), which can sweep
+    # in credentials like SGLANG_BEARER_TOKEN / SGLANG_S3_SECRET_ACCESS_KEY. Mask
+    # them by name before they reach the record.
+    env = _redact_secrets(env)
 
     record = {
         "schema_version": SCHEMA_VERSION,

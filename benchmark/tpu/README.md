@@ -158,3 +158,11 @@ Every record has a top-level `schema_version` and a stable shape
 (`git` / `versions` / `config` / `env` [/ `server_info`]). A CI dashboard
 ingests the `*.meta.json` files plus the metrics `<tag>.jsonl` and joins them by
 `(hostname, model, git commit, timestamp)`.
+
+**Secrets are redacted.** The `env` capture is a blanket prefix match, and
+`/server_info` echoes the full server args, so a credential set in the
+environment (e.g. `SGLANG_BEARER_TOKEN`, `SGLANG_S3_SECRET_ACCESS_KEY`) or an
+`api_key` would otherwise land in the record and flow to the shared dashboard.
+Any field whose name reads as a credential (`*_token`, `*secret*`, `*password*`,
+`*_access_key`, `api_key`, …) has its value replaced with `***redacted***`
+before the record is written.
