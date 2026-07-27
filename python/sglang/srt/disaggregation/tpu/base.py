@@ -52,6 +52,8 @@ from collections import defaultdict
 from typing import List, Optional
 
 import numpy as np
+import torch
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -62,6 +64,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -107,9 +110,9 @@ class TpuKVManagerBase(CommonKVManager):
 
         # Filled in later by the scheduler via attach_kv_pool(); the bootstrap
         # queue owns the pool object and only it knows the concrete tensors.
-        self.kv_pool = None
-        self.layer_buffers: Optional[List] = None
-        self.layer_specs = None
+        self.kv_pool: Optional[KVCache] = None
+        self.layer_buffers: Optional[List[torch.Tensor]] = None
+        self.layer_specs: Optional[List[tpu_transfer.LayerPageSpec]] = None
 
         # Per-endpoint send locks (a single zmq PUSH socket must not be used
         # concurrently from multiple sender threads).
@@ -142,7 +145,7 @@ class TpuKVManagerBase(CommonKVManager):
 
     # ---- pool attachment (shared) ---------------------------------------
 
-    def attach_kv_pool(self, kv_pool) -> None:
+    def attach_kv_pool(self, kv_pool: KVCache) -> None:
         """Give the manager the concrete per-layer KV tensors it will transfer.
         Extracts the block-indexed per-layer buffers + their dtype/shape specs
         (shared), then defers backend-specific setup to ``_on_pool_attached``.
@@ -154,7 +157,7 @@ class TpuKVManagerBase(CommonKVManager):
             )
         self.kv_pool = kv_pool
         self.layer_buffers = tpu_transfer.get_layer_page_buffers(kv_pool)
-        self.layer_specs = tpu_transfer.layer_page_specs(self.layer_buffers)
+        self.layer_specs = tpu_transfer.extract_layer_page_specs(self.layer_buffers)
         self._on_pool_attached()
 
     def _on_pool_attached(self) -> None:
@@ -167,7 +170,7 @@ class TpuKVManagerBase(CommonKVManager):
             len(self.layer_buffers) if self.layer_buffers else 0,
         )
 
-    def _require_pool(self):
+    def _assert_layer_page_buffers(self):
         if self.layer_buffers is None:
             raise RuntimeError(
                 f"{self._name}.attach_kv_pool() was never called; the "
@@ -191,9 +194,12 @@ class TpuKVManagerBase(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart(copy=copy)
-                except Exception as e:  # pragma: no cover - socket teardown
-                    logger.warning("%s recv loop ending: %s", name, e)
+                except zmq.ContextTerminated:
+                    logger.warning("%s recv loop ending: ZMQ context terminated", name)
                     return
+                except Exception as e:  # pragma: no cover - socket teardown
+                    logger.exception("%s unexpected recv exception: %s", name, e)
+                    continue
                 if not msg or bytes(msg[0]) != expected_tag:
                     logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
                     continue
@@ -223,9 +229,12 @@ class TpuKVManagerBase(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart(copy=copy)
-                except Exception as e:  # pragma: no cover - socket teardown
-                    logger.warning("%s recv loop ending: %s", name, e)
+                except zmq.ContextTerminated:
+                    logger.warning("%s recv loop ending: ZMQ context terminated", name)
                     return
+                except Exception as e:  # pragma: no cover - socket teardown
+                    logger.exception("%s unexpected recv exception: %s", name, e)
+                    continue
                 handler = handlers.get(bytes(msg[0])) if msg else None
                 if handler is None:
                     logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
@@ -247,11 +256,12 @@ class TpuKVManagerBase(CommonKVManager):
         expected decode rank has reported. Shared across backends; subclasses
         choose what value to stash per endpoint via ``_record_decode_endpoint``."""
         # [TAG, room, decode_ip, decode_port, aux_present, num_pages,
-        #  required_dst_info_num, decode_prefix_len]
-        if len(msg) != 8:
+        #  required_dst_info_num, decode_prefix_len,
+        #  dst_tp_rank, decode_attn_tp_size]
+        if len(msg) != 10:
             raise ValueError(
                 f"Malformed {TAG_TRSFR.decode()} message. "
-                f"Expected 8 frames, got {len(msg)}."
+                f"Expected 10 frames, got {len(msg)}."
             )
         room = int(msg[1].decode())
         decode_ip = msg[2].decode()
@@ -259,18 +269,41 @@ class TpuKVManagerBase(CommonKVManager):
         num_pages = int(msg[5].decode())
         required = int(msg[6].decode())
         prefix_len = int(msg[7].decode())
+        dst_tp_rank = int(msg[8].decode())
+        decode_attn_tp_size = int(msg[9].decode())
 
+        logger.info(
+            "[pd_kv_resharding] _handle_transfer room=%s endpoint=%s:%s num_pages=%d "
+            "required=%d dst_tp_rank=%d decode_attn_tp=%d",
+            room,
+            decode_ip,
+            decode_port,
+            num_pages,
+            required,
+            dst_tp_rank,
+            decode_attn_tp_size,
+        )
         endpoint = _tcp_endpoint(decode_ip, decode_port)
         bucket = self.transfer_infos.setdefault(room, {})
-        bucket[endpoint] = self._record_decode_endpoint(room, endpoint, num_pages)
+        bucket[endpoint] = self.record_decode_endpoint(
+            room, endpoint, num_pages, dst_tp_rank, decode_attn_tp_size
+        )
         self.req_to_decode_prefix_len[room] = prefix_len
         if len(bucket) >= required:
             self.update_status(room, KVPoll.WaitingForInput)
 
-    def _record_decode_endpoint(self, room: int, endpoint: str, num_pages: int):
+    def record_decode_endpoint(
+        self,
+        room: int,
+        endpoint: str,
+        num_pages: int,
+        dst_tp_rank: int = 0,
+        decode_attn_tp_size: int = 1,
+    ):
         """Hook: value to store in ``transfer_infos[room][endpoint]``. Default is
-        the endpoint string itself; a backend may store a richer record."""
-        return endpoint
+        the endpoint string itself; a backend may store a richer record (the
+        ``tpu`` backend stashes the decode's TP identity for resharding)."""
+        raise NotImplementedError("record_decode_endpoint not implemented")
 
     # ---- abstract role + data-plane seam --------------------------------
 
@@ -390,7 +423,8 @@ class TpuKVReceiverBase(CommonKVReceiver):
 
         # Record destination pages locally; the decode does its own pull/scatter.
         self.kv_mgr.register_decode_state(self.bootstrap_room, kv_indices, aux_index)
-
+        dst_attn_tp_size = self.kv_mgr.attn_tp_size
+        dst_tp_rank = self.kv_mgr.kv_args.engine_rank % max(1, dst_attn_tp_size)
         num_pages = len(kv_indices)
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
@@ -405,6 +439,8 @@ class TpuKVReceiverBase(CommonKVReceiver):
                         str(num_pages).encode(),
                         str(self.required_dst_info_num).encode(),
                         str(decode_prefix_len or 0).encode(),
+                        str(dst_tp_rank).encode(),
+                        str(dst_attn_tp_size).encode(),
                     ]
                 )
         self.init_time = time.time()
