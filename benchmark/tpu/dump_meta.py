@@ -86,7 +86,11 @@ def _redact_secrets(value):
     keys never land in the record that feeds the shared dashboard."""
     if isinstance(value, dict):
         return {
-            k: (_REDACTED if isinstance(k, str) and _looks_secret(k) else _redact_secrets(v))
+            k: (
+                _REDACTED
+                if isinstance(k, str) and _looks_secret(k)
+                else _redact_secrets(v)
+            )
             for k, v in value.items()
         }
     if isinstance(value, list):
