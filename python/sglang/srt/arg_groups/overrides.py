@@ -1827,6 +1827,8 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     disable_shared_experts_fusion writes (post-publish writers exist for that
     field) stay in the handler."""
     moe_runner_backend = view.moe_runner_backend
+    if moe_runner_backend == "tpu_fused_rs" and view.device != "tpu":
+        raise ValueError("--moe-runner-backend tpu_fused_rs requires --device tpu")
     if view.quantization == "nvfp4_online":
         if not is_sm100_supported():
             raise ValueError(
