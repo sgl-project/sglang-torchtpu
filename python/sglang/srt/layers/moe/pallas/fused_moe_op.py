@@ -90,6 +90,52 @@ def _valid_rows_mask(group_sizes, expert_group_offset, local_num_experts, unsort
     return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
+def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
+    """Pick a ``TileSizes`` for this gmm_v2 call.
+
+    ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
+    shapes / dtypes, so it runs at JAX trace time (not at device exec
+    time). On a hit we pin the kernel's tile sizes to the tuned triple;
+    on a miss it returns ``get_default_gmm_block_sizes`` (a heuristic that
+    respects the shapes) — either way this returns a concrete
+    ``TileSizes``.
+
+    ``packed_fp4`` marks a uint8-packed FP4 rhs (stored K is half the real K),
+    so we key the lookup on the real K and the float4 dtype the kernel contracts
+    in -- otherwise packed w2 mismatches lhs K and falls back to the heuristic.
+
+    ``num_current_groups`` is set equal to ``num_total_groups``
+    because this bridge is single-host (no expert parallelism); when
+    EP is added the caller will need to pass the local group count
+    through.
+    """
+    import jax.numpy as jnp
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
+    from sglang.srt.layers.moe.pallas.tuned_block_sizes import (
+        get_tuned_block_sizes,
+    )
+
+    m, k = lhs.shape
+    _g, _k_raw, n = rhs.shape
+    # Packed FP4 stores 2 codes/byte along K, so real K = stored K * 2.
+    _k = _k_raw * 2 if packed_fp4 else _k_raw
+    assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
+    quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
+    rhs_dtype = "float4_e2m1fn" if packed_fp4 else str(jnp.dtype(rhs.dtype).name)
+    tm, tk, tn = get_tuned_block_sizes(
+        m=int(m),
+        k=int(k),
+        n=int(n),
+        num_total_groups=int(num_total_groups),
+        num_current_groups=int(num_total_groups),
+        lhs_dtype=str(jnp.dtype(lhs.dtype).name),
+        rhs_dtype=rhs_dtype,
+        quant_block_size=quant_block_size,
+    )
+    return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
+
+
 def _dividing_tile_k(base_tile_info):
     """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
     ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent).
@@ -178,6 +224,14 @@ def _fused_moe_jax(
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
 
+    # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
+    # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
+    # This governs *any* packed-float4 rhs: today only NVFP4 emits uint8, but the
+    # MXFP4-native path (not yet wired) would flow through here too — correct
+    # (block size is data-driven from the scale), just untested.
+    w1_packed = w1.dtype == jnp.uint8
+    w2_packed = w2.dtype == jnp.uint8
+
     # gmm_v2 needs the routed-row count ``m*topk`` to be a
     # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
     # the permute/gather operating on an already-aligned, fixed-bucket shape
@@ -243,7 +297,11 @@ def _fused_moe_jax(
     # halves, so run an unfused GMM1 and apply the activation in JAX for
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
+    # Packed FP4 fuses the SwiGLU in-kernel (gmm_v2 slices the up-half's per-block
+    # scale). Only compact block scales, which need distinct gate/up scale offsets,
+    # still run unfused with a separate JAX activation.
+    unfused_gmm1 = compact_block_scales
+    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
     if compact_block_scales:
@@ -305,8 +363,9 @@ def _fused_moe_jax(
         # when fused); compact FP8 pins an unfused tile.
         tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
+        packed_fp4=w1_packed,
     )
-    if compact_block_scales:
+    if unfused_gmm1:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
         )
@@ -321,8 +380,12 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    # Tile sizes are derived by the kernel's own ``calculate_tiling``.
-    gmm2_tiling = _dividing_tile_k(calculate_tiling)
+    # Packed FP4 w2 has a halved (packed) K; ``_lookup_tile_info`` is packed-aware
+    # (keys on the real K + the float4 dtype), so packed and bf16 w2 both go
+    # through the tuned lookup (tuned triple on a hit, heuristic on a miss).
+    gmm2_tiling = _dividing_tile_k(
+        _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts, packed_fp4=w2_packed)
+    )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -333,6 +396,7 @@ def _fused_moe_jax(
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
+        packed_fp4=w2_packed,
     )[
         :,
         :hidden_size,

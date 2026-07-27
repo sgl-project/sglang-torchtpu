@@ -64,6 +64,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_sm100_supported,
     is_sm120_supported,
+    is_tpu,
     round_up,
     set_weight_attrs,
 )
@@ -118,6 +119,8 @@ else:
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 
 def _sglang_fp4_gemm_fake(
@@ -1192,6 +1195,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
+        load_packed: bool = True,
+        fold_global_scale: bool = False,
+        global_scale: bool = True,
+        scale_dtype: Optional[str] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1206,6 +1213,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if use_per_token_activation is None
             else use_per_token_activation
         )
+        self.load_packed = load_packed
+        self.fold_global_scale = fold_global_scale
+        self.global_scale = global_scale
+        self.scale_dtype = scale_dtype
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1269,6 +1280,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         kv_cache_quant_algo = None
         group_size = None
         exclude_modules = []
+        checkpoint_format = config
 
         # Try flat format first (config.json quantization_config - preferred format)
         quant_method = config.get("quant_algo")
@@ -1316,6 +1328,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     kv_cache_quant_algo = "auto"
                 group_size = ModelOptFp4Config.common_group_size(config)
                 exclude_modules = quant_config.get("exclude_modules", [])
+                checkpoint_format = quant_config
             except (ValueError, KeyError):
                 raise ValueError(
                     "Cannot find 'quant_algo' in the model's quantization config. "
@@ -1341,11 +1354,16 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "specified in the quantization config"
             )
         return cls(
-            is_checkpoint_nvfp4_serialized,
-            kv_cache_quant_algo,
-            group_size,
-            exclude_modules,
-            config.get("packed_modules_mapping"),
+            is_checkpoint_nvfp4_serialized=is_checkpoint_nvfp4_serialized,
+            kv_cache_quant_algo=kv_cache_quant_algo,
+            group_size=group_size,
+            exclude_modules=exclude_modules,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+            use_per_token_activation=checkpoint_format.get("use_per_token_activation"),
+            load_packed=checkpoint_format.get("load_packed", True),
+            fold_global_scale=checkpoint_format.get("fold_global_scale", False),
+            global_scale=checkpoint_format.get("global_scale", True),
+            scale_dtype=checkpoint_format.get("scale_dtype"),
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
@@ -1413,6 +1431,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.handles_moe_reduction = False
 
     def create_weights(
         self,
@@ -1900,7 +1919,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
             use_marlin_fallback = moe_runner_backend.is_marlin()
-        if not is_blackwell_supported() and not use_marlin_fallback:
+        if not _is_tpu and not is_blackwell_supported() and not use_marlin_fallback:
             raise ValueError(
                 "Current platform does not support NVFP4"
                 " quantization with the selected MoE backend. Please use "
@@ -1958,6 +1977,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        if _is_tpu and self.quant_config.group_size != 512:
+            raise NotImplementedError(
+                "TPU NVFP4 MoE requires a block-512 checkpoint, "
+                f"got group_size={self.quant_config.group_size}."
+            )
+
         is_nvfp4_online = getattr(self.quant_config, "is_nvfp4_online", False)
         if not self.quant_config.is_checkpoint_nvfp4_serialized and not is_nvfp4_online:
             raise ValueError(
@@ -1983,6 +2008,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
+        if _is_tpu and not self.quant_config.global_scale:
+            checkpoint_scale_dtypes = {
+                None: torch.float32,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float8_e4m3fn": torch.float8_e4m3fn,
+                "fp8": torch.float8_e4m3fn,
+            }
+            scale_dtype_name = self.quant_config.scale_dtype
+            if scale_dtype_name not in checkpoint_scale_dtypes:
+                raise ValueError(
+                    f"Unsupported NVFP4 checkpoint scale_dtype={scale_dtype_name!r}"
+                )
+            weight_scale_dtype = checkpoint_scale_dtypes[scale_dtype_name]
         weight_loader = extra_weight_attrs.get("weight_loader")
         if is_nvfp4_online:
             weight_loader = self.get_online_weight_loader(layer, weight_loader)
@@ -2036,7 +2077,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # swizzle+allocate here to avoid GPU memory fragmentation
         if self.enable_flashinfer_trtllm_moe:
             layer.w13_blockscale_swizzled = None
-        else:
+        elif not _is_tpu:
             layer.w13_blockscale_swizzled = Parameter(
                 swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
             )
@@ -2056,7 +2097,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if self.enable_flashinfer_trtllm_moe:
             layer.w2_blockscale_swizzled = None
-        else:
+        elif not _is_tpu:
             layer.w2_blockscale_swizzled = Parameter(
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
@@ -2067,64 +2108,102 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
-        w13_weight_scale_shape = (
-            (layer.num_local_experts, 2)
-            if layer.moe_runner_config.is_gated
-            else (layer.num_local_experts,)
-        )
-        w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
-
-        w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
-
-        if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
-            # FP8 checkpoints usually store expert scales as weight_scale_inv.
-            # Online NVFP4 consumes them in the loader and writes the generated
-            # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
-            w13_source_weight_scale_inv = PerTensorScaleParameter(
-                data=torch.empty(0, dtype=torch.float32),
+        if not _is_tpu or self.quant_config.global_scale:
+            w13_weight_scale_shape = (
+                (layer.num_local_experts, 2)
+                if layer.moe_runner_config.is_gated
+                else (layer.num_local_experts,)
+            )
+            w13_weight_scale_2 = PerTensorScaleParameter(
+                data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
-            layer.register_parameter(
-                "w13_weight_scale_inv", w13_source_weight_scale_inv
-            )
-            w2_source_weight_scale_inv = PerTensorScaleParameter(
-                data=torch.empty(0, dtype=torch.float32),
+            layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
+
+            w2_weight_scale_2 = PerTensorScaleParameter(
+                data=torch.empty(layer.num_local_experts, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
-            layer.register_parameter("w2_weight_scale_inv", w2_source_weight_scale_inv)
+            layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+            if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
+                # FP8 checkpoints usually store expert scales as weight_scale_inv.
+                # Online NVFP4 consumes them in the loader and writes the generated
+                # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
+                w13_source_weight_scale_inv = PerTensorScaleParameter(
+                    data=torch.empty(0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter(
+                    "w13_weight_scale_inv", w13_source_weight_scale_inv
+                )
+                w2_source_weight_scale_inv = PerTensorScaleParameter(
+                    data=torch.empty(0, dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                layer.register_parameter(
+                    "w2_weight_scale_inv", w2_source_weight_scale_inv
+                )
 
-        w13_input_scale_shape = (layer.num_experts, num_shards)
-        w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        w13_input_scale._sglang_require_global_experts = True
-        layer.register_parameter("w13_input_scale", w13_input_scale)
+            extra_weight_attrs.update(
+                {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+            )
 
-        w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(layer.num_experts, dtype=torch.float32),
-            weight_loader=weight_loader,
-        )
-        w2_input_scale._sglang_require_global_experts = True
-        layer.register_parameter("w2_input_scale", w2_input_scale)
+            w13_input_scale_shape = (layer.num_experts, num_shards)
+            w13_input_scale = PerTensorScaleParameter(
+                data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            w13_input_scale._sglang_require_global_experts = True
+            layer.register_parameter("w13_input_scale", w13_input_scale)
+
+            w2_input_scale = PerTensorScaleParameter(
+                data=torch.empty(layer.num_experts, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            w2_input_scale._sglang_require_global_experts = True
+            layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
+        if _is_tpu:
+            # Transpose block-512 weights/scales into the Pallas packed-FP4 layout.
+            from sglang.srt.hardware_backend.tpu.fp4_moe import (
+                prepare_tpu_nvfp4_moe_weights,
+            )
+
+            # Preserve the checkpoint scale precision unless its config explicitly
+            # requests a supported narrower storage dtype.
+            _scale_dtypes = {
+                "fp32": torch.float32,
+                "bf16": torch.bfloat16,
+                "fp8": torch.float8_e4m3fn,
+            }
+            default_scale_dtype = self.quant_config.scale_dtype
+            if default_scale_dtype is None:
+                default_scale_dtype = (
+                    "bf16" if self.quant_config.global_scale else "fp32"
+                )
+            scale_dtype_aliases = {
+                "float32": "fp32",
+                "bfloat16": "bf16",
+                "float8_e4m3fn": "fp8",
+            }
+            default_scale_dtype = scale_dtype_aliases.get(
+                default_scale_dtype, default_scale_dtype
+            )
+            scale_dtype = _scale_dtypes[default_scale_dtype.lower()]
+            prepare_tpu_nvfp4_moe_weights(
+                layer,
+                group_size=self.quant_config.group_size,
+                scale_dtype=scale_dtype,
+                use_fused_rs=self.handles_moe_reduction,
+            )
+            return
+
         # GEMM1 scale processing is deferred until the input scale is known;
         # see _compute_gemm1_alphas, which splits w13's gate/up weight scales.
         moe_runner_backend = getattr(
@@ -2138,15 +2217,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if layer.w13_weight_scale_2.dim() == 1:
                     # Some checkpoints store a shared scale for w1/w3.
                     w13_weight_scale_2 = layer.w13_weight_scale_2
-                else:
-                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                        layer.w13_weight_scale_2[:, 0],
-                        layer.w13_weight_scale_2[:, 1],
-                    ):
-                        logger.warning_once(
-                            "w1_weight_scale_2 must match w3_weight_scale_2. "
-                            "Accuracy may be affected."
-                        )
+                elif layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                    layer.w13_weight_scale_2[:, 0],
+                    layer.w13_weight_scale_2[:, 1],
+                ):
+                    logger.warning_once(
+                        "w1_weight_scale_2 must match w3_weight_scale_2. "
+                        "Accuracy may be affected."
+                    )
 
                     w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
             else:
@@ -2441,6 +2519,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if _is_tpu:
+            import os
+
+            from sglang.srt.hardware_backend.tpu.fp4_moe import (
+                can_use_tpu_nvfp4_fused_rs,
+            )
+
+            fused_rs_setting = os.environ.get("SGLANG_TPU_FP4_FUSED_RS", "auto")
+            self.handles_moe_reduction = (
+                fused_rs_setting != "0"
+                and can_use_tpu_nvfp4_fused_rs(
+                    layer,
+                    group_size=self.quant_config.group_size,
+                    no_combine=moe_runner_config.no_combine,
+                )
+            )
+            if self.handles_moe_reduction:
+                logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
+            # TPU bypasses MoeRunner entirely; apply() dispatches straight to the
+            # Pallas fused grouped-GEMM. --moe-runner-backend is a no-op here.
+            return
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
@@ -2471,6 +2570,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.fp4_moe import apply_tpu_nvfp4_moe
+
+            return apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation=self.moe_runner_config.activation,
+                apply_router_weight_on_input=(
+                    self.moe_runner_config.apply_router_weight_on_input
+                ),
+                no_combine=self.moe_runner_config.no_combine,
+                use_fused_rs=self.handles_moe_reduction,
+            )
 
         # Note: dispatch_output may be a DeepEPLLDispatchOutput (no topk_output
         # attribute -- topk_ids/topk_weights live directly on the dispatch

@@ -51,15 +51,25 @@ class TestPallasExportEnvironment(CustomTestCase):
             "--xla_force_host_platform_device_count=4",
         )
 
-    def test_rejects_conflicting_platform_or_device_count(self):
+    def test_rejects_conflicting_platform(self):
         os.environ["JAX_PLATFORMS"] = "tpu"
         with self.assertRaisesRegex(RuntimeError, "requires JAX_PLATFORMS=cpu"):
             pallas_export.configure_jax_export_env(8)
 
+    def test_replaces_provisional_device_count_before_backend_initialization(self):
         os.environ["JAX_PLATFORMS"] = "cpu"
-        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=4"
-        with self.assertRaisesRegex(RuntimeError, "must equal WORLD_SIZE=8"):
-            pallas_export.configure_jax_export_env(8)
+        os.environ["XLA_FLAGS"] = (
+            "--xla_tpu_enable_async_collective_fusion=true "
+            "--xla_force_host_platform_device_count=1"
+        )
+
+        pallas_export.configure_jax_export_env(8)
+
+        self.assertEqual(
+            os.environ["XLA_FLAGS"],
+            "--xla_tpu_enable_async_collective_fusion=true "
+            "--xla_force_host_platform_device_count=8",
+        )
 
     def test_rejects_late_jax_import_or_backend_initialization(self):
         self.fake_sys.modules["jax"] = object()
@@ -71,6 +81,10 @@ class TestPallasExportEnvironment(CustomTestCase):
             _backends={"cpu": object()}
         )
         with self.assertRaisesRegex(RuntimeError, "JAX backend was initialized"):
+            pallas_export.configure_jax_export_env(8)
+
+        os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=1"
+        with self.assertRaisesRegex(RuntimeError, "Cannot change"):
             pallas_export.configure_jax_export_env(8)
 
     def test_worker_reuses_driver_world_size_configuration(self):
