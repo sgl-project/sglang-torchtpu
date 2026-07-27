@@ -278,6 +278,7 @@ def get_last_loc(
         "ascend",
         "torch_native",
         "pallas_tpu_rpa_v3",
+        "pallas_tpu_rpa_batched",
     )
 
     if _is_hip and uses_triton_dispatch:

@@ -50,6 +50,10 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
     num_sparse_cores = envs.SGLANG_TPU_PROFILE_NUM_SPARSE_CORES.get()
     chip_limit = num_chips if num_chips > 0 else None
     sparse_core_limit = num_sparse_cores if num_sparse_cores > 0 else None
+    # When tracing is narrowed to a single SparseCore, also narrow to a
+    # single tile within it to reduce the number of trace events to allow
+    # tracing more steps, otherwise we may run into dropping trace.
+    sparse_core_tile_limit = 1 if sparse_core_limit == 1 else None
     if chip_limit is None and sparse_core_limit is None:
         profiler_api._sglang_tpu_profile_options_patch_installed = True
         return
@@ -65,6 +69,7 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
         class _ProfileOptions(_tpu_impl.ProfileOptions):
             tpu_num_chips_to_profile_per_task: int | None = None
             tpu_num_sparse_cores_to_trace: int | None = None
+            tpu_num_sparse_core_tiles_to_trace: int | None = None
 
     except (ImportError, AttributeError, TypeError):
         logger.warning(
@@ -86,6 +91,7 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
             fields.update(
                 tpu_num_chips_to_profile_per_task=chip_limit,
                 tpu_num_sparse_cores_to_trace=sparse_core_limit,
+                tpu_num_sparse_core_tiles_to_trace=sparse_core_tile_limit,
             )
             return _ProfileOptions(**fields)
         except Exception:
@@ -100,8 +106,17 @@ def _install_tpu_profile_options_patch(profiler_api: ModuleType) -> None:
 
     profiler_api._get_profile_options = _get_options
     profiler_api._sglang_tpu_profile_options_patch_installed = True
+    # The tile cap is only derived when tracing a single SparseCore; omit the
+    # clause otherwise so the log doesn't read "(all tile(s))" for a branch
+    # that was never entered.
+    tile_clause = (
+        f" ({sparse_core_tile_limit} tile(s))"
+        if sparse_core_tile_limit is not None
+        else ""
+    )
     logger.info(
-        "[TPU profiler] limiting trace to %s chip(s), %s SparseCore(s) per task",
+        "[TPU profiler] limiting trace to %s chip(s), %s SparseCore(s)%s per task",
         chip_limit or "all",
         sparse_core_limit or "all",
+        tile_clause,
     )

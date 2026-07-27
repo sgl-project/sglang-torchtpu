@@ -389,6 +389,16 @@ class Sampler(nn.Module):
             # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+            #
+            # Use broadcast because TPU MIN all-reduce is unsupported.
+            if batch_next_token_ids.device.type == "tpu":
+                tp_group = (
+                    get_attention_tp_group()
+                    if is_dp_attention_enabled()
+                    else get_tp_group()
+                )
+                tp_group.broadcast(batch_next_token_ids, src=0)
+                return
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,

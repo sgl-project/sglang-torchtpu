@@ -27,6 +27,7 @@ from xgrammar import (
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
+    apply_token_bitmask_inplace,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -119,6 +120,8 @@ class XGrammarGrammar(BaseGrammarObject):
             import sgl_kernel_npu  # noqa: F401
 
             torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        elif logits.device.type == "tpu":
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_compile")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -241,6 +244,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "tpu":
+            apply_token_bitmask_inplace(logits, vocab_mask, backend="torch_compile")
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
