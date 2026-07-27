@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -198,6 +198,34 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+# Predicate for whether a forward's sequence is sharded across the attn-TP group
+# (vs. replicated on every rank). Injected at init; unset defaults to sharded.
+_attn_tp_sequence_sharded_predicate: Optional[Callable[[int], bool]] = None
+
+
+def register_attn_tp_sequence_sharded_predicate(
+    predicate: Callable[[int], bool],
+) -> None:
+    """Register the predicate for whether a forward is sharded across attn-TP."""
+    global _attn_tp_sequence_sharded_predicate
+    _attn_tp_sequence_sharded_predicate = predicate
+
+
+def _attn_tp_local_shard_bounds(num_tokens_per_dp: int) -> Tuple[int, int]:
+    """(tokens_per_rank, rank_offset) of this attn-TP rank's slice of the sequence.
+
+    A replicated (non-sharded) forward puts the whole sequence on every rank, so
+    the slice is the full range with no offset; localizing it as a shard would
+    drop real tokens on non-zero ranks.
+    """
+    predicate = _attn_tp_sequence_sharded_predicate
+    if predicate is not None and not predicate(num_tokens_per_dp):
+        return num_tokens_per_dp, 0
+    parallel = get_parallel()
+    tokens_per_rank = num_tokens_per_dp // parallel.attn_tp_size
+    return tokens_per_rank, tokens_per_rank * parallel.attn_tp_rank
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -207,12 +235,9 @@ def compute_local_num_token_non_padded(
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
-    attn_tp_rank = get_parallel().attn_tp_rank
-    attn_tp_size = get_parallel().attn_tp_size
-    tokens_per_rank = num_tokens_per_dp // attn_tp_size
-
+    tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(num_tokens_per_dp)
     return torch.clamp(
-        global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
+        global_num_token_non_padded - rank_offset,
         0,
         tokens_per_rank,
     )
