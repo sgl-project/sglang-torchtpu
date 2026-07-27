@@ -4,10 +4,11 @@ import logging
 import math
 from collections import defaultdict
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     alloc_paged_token_slots_extend_npu,
 )
@@ -19,6 +20,11 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_alloc_reserve_per_decode,
     get_last_loc,
+)
+from sglang.srt.speculative.spec_utils import (
+    fill_bonus_tokens_func,
+    renorm_draft_probs,
+    sample_draft_proposal,
 )
 from sglang.srt.speculative.triton_ops.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
@@ -33,6 +39,7 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.common import fast_topk
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -314,39 +321,43 @@ def build_tree_kernel_efficient(
     )
 
 
+@compiled_op
 def _verify_tree_greedy_torch(
-    predicts: torch.Tensor,
-    accept_index: torch.Tensor,
-    accept_token_num: torch.Tensor,
+    next_token_logits: torch.Tensor,
     candidates: torch.Tensor,
     retrieve_index: torch.Tensor,
-    target_predict: torch.Tensor,
-    topk: int,
+    topk: int = 1,
 ):
-    """TPU-specific greedy tree verification for EAGLE (topk=1 only)."""
+    """TPU greedy tree verification for EAGLE (topk=1).
+
+    Target argmax and verification are compiled into the same dispatch.
+    """
     assert (
         topk == 1
     ), f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
 
     bs, num_verify_tokens = candidates.shape
-    predicts[: bs * num_verify_tokens] = target_predict.flatten().to(predicts.dtype)
-
-    if num_verify_tokens > 1:
-        matches = target_predict[:, :-1] == candidates[:, 1:]
-    else:
-        matches = torch.empty((bs, 0), dtype=torch.bool, device=candidates.device)
+    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+        bs, num_verify_tokens
+    )
+    predicts = target_predict.flatten().to(torch.int32)
 
     # Vectorized accept-length computation (no Python loop, no .item()).
     # Step 1: find first mismatch per row.
-    all_match = matches.all(dim=1)  # (bs,)
-    # argmax on int32 of ~matches finds the first True (= first mismatch).
-    # If all match, argmax returns 0 but all_match guards that case.
-    first_mismatch = (~matches).to(torch.int32).argmax(dim=1)  # (bs,)
-    num_correct = torch.where(all_match, num_verify_tokens - 1, first_mismatch)  # (bs,)
+    if num_verify_tokens > 1:
+        matches = target_predict[:, :-1] == candidates[:, 1:]
+        all_match = matches.all(dim=1)  # (bs,)
+        # argmax on int32 of ~matches finds the first True (= first mismatch).
+        # If all match, argmax returns 0 but all_match guards that case.
+        first_mismatch = (~matches).to(torch.int32).argmax(dim=1)  # (bs,)
+        num_correct = torch.where(all_match, num_verify_tokens - 1, first_mismatch)
+    else:
+        # There are no drafts to check, only the bonus token.
+        num_correct = torch.zeros((bs,), dtype=torch.long, device=candidates.device)
     accept_len = num_correct + 1  # (bs,)
 
     # Step 2: clamp at first invalid (-1) retrieve_index entry.
-    # retrieve_index: (bs, num_verify_tokens).  Build a mask of valid
+    # retrieve_index: (bs, num_verify_tokens). Build a mask of valid
     # positions (not -1) and find the first invalid one per row.
     ri_valid = retrieve_index != -1  # (bs, num_verify_tokens)
     # For each row, check if any position up to accept_len is invalid.
@@ -358,17 +369,16 @@ def _verify_tree_greedy_torch(
     has_invalid = invalid_within.any(dim=1)  # (bs,)
     first_invalid = invalid_within.to(torch.int32).argmax(dim=1)  # (bs,)
     accept_len = torch.where(has_invalid, first_invalid, accept_len)  # (bs,)
-    num_correct = accept_len - 1  # (bs,)
 
-    # Step 3: build accept_index and accept_token_num.
+    # Step 3: build accept_index.
     # Copy retrieve_index values where col < accept_len.
     copy_mask = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)  # (bs, N)
-    accept_index[:bs] = torch.where(
+    accept_index = torch.where(
         copy_mask,
-        retrieve_index.to(accept_index.dtype),
-        torch.tensor(-1, dtype=accept_index.dtype, device=candidates.device),
+        retrieve_index.to(torch.int32),
+        torch.tensor(-1, dtype=torch.int32, device=candidates.device),
     )
-    accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
+    return predicts, accept_index, accept_len.to(torch.int32)
 
 
 def sgl_build_tree_kernel_triton(
@@ -461,8 +471,9 @@ def verify_tree_greedy_func(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
     topk: int = -1,
+    next_token_logits: Optional[torch.Tensor] = None,
 ):
     if _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
@@ -494,15 +505,14 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _use_torch_native:
-        _verify_tree_greedy_torch(
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrieve_index,
-            target_predict,
-            topk,
+        assert next_token_logits is not None
+        out_predicts, out_accept_index, accept_lens = _verify_tree_greedy_torch(
+            next_token_logits, candidates, retrieve_index, topk
         )
+        bs, num_verify_tokens = candidates.shape
+        predicts[: bs * num_verify_tokens] = out_predicts.to(predicts.dtype)
+        accept_index[:bs] = out_accept_index.to(accept_index.dtype)
+        accept_token_num[:bs] = (accept_lens - 1).to(accept_token_num.dtype)
     elif _is_xpu:
         verify_tree_greedy_triton(
             predicts=predicts,
@@ -515,6 +525,103 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num
+
+
+@compiled_op
+def fused_verify_post_func(
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_width: int,
+):
+    """Fused post-verify bookkeeping: new seq_lens + bonus-token gather."""
+    new_seq_lens = seq_lens + accept_lens
+    accept_tokens = predict[accept_index]
+    bs = accept_lens.shape[0]
+    idx = accept_width * torch.arange(bs, device=accept_lens.device) + accept_lens - 1
+    bonus_tokens = accept_tokens.reshape(-1)[idx].to(torch.int32)
+    return new_seq_lens, bonus_tokens
+
+
+@compiled_op
+def fused_draft_extend_select_argmax_func(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    select_index: torch.Tensor,
+):
+    """Fused draft-extend row select + greedy next-draft pick."""
+    sel_logits = next_token_logits[select_index]
+    sel_hidden = hidden_states[select_index] if hidden_states is not None else None
+    topk_index = torch.argmax(sel_logits, dim=-1, keepdim=True)
+    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+    return sel_logits, sel_hidden, topk_p, topk_index
+
+
+def verify_post_func(
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_width: int,
+    is_idle: bool,
+):
+    """Route post-verification bookkeeping to the platform implementation."""
+    if is_idle:
+        return seq_lens + accept_lens, torch.empty(
+            (0,), device=seq_lens.device, dtype=torch.int32
+        )
+    if _use_torch_native:
+        return fused_verify_post_func(
+            seq_lens, accept_lens, predict, accept_index, accept_width
+        )
+
+    new_seq_lens = seq_lens + accept_lens
+    accept_tokens = predict[accept_index]
+    bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+    fill_bonus_tokens_func(
+        accept_tokens,
+        accept_lens,
+        bonus_tokens,
+        accept_width,
+    )
+    return new_seq_lens, bonus_tokens
+
+
+def draft_extend_select_func(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    select_index: torch.Tensor,
+    sampling_info: Any,
+    topk: int,
+    use_rejection_sampling: bool,
+):
+    """Route draft-extend row selection and sampling by platform and mode."""
+    if _use_torch_native and topk == 1 and not use_rejection_sampling:
+        selected_logits, selected_hidden, topk_p, topk_index = (
+            fused_draft_extend_select_argmax_func(
+                next_token_logits, hidden_states, select_index
+            )
+        )
+        return selected_logits, selected_hidden, None, topk_p, topk_index
+
+    selected_logits = next_token_logits[select_index]
+    selected_hidden = hidden_states[select_index] if hidden_states is not None else None
+    if use_rejection_sampling:
+        draft_probs, topk_p, topk_index = sample_draft_proposal(
+            selected_logits, sampling_info.temperatures
+        )
+    elif topk == 1 and not _is_hip:
+        topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
+        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+        draft_probs = None
+    else:
+        probs = renorm_draft_probs(
+            selected_logits, sampling_info, use_rejection_sampling
+        )
+        topk_p, topk_index = fast_topk(probs, topk, dim=-1)
+        draft_probs = None
+    return selected_logits, selected_hidden, draft_probs, topk_p, topk_index
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
@@ -745,6 +852,7 @@ def eagle_sample(
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
             target_predict=target_predict,
             topk=verify_input.tree_topk,
+            next_token_logits=next_token_logits,
         )
     else:
         if _use_torch_native:

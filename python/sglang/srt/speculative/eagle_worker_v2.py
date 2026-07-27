@@ -70,18 +70,19 @@ from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     _eagle_prefill_tail_tokens,
     build_tree_kernel_efficient,
+    draft_extend_select_func,
     eagle_prepare_for_verify,
     eagle_sample,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    verify_post_func,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
-    fill_bonus_tokens_func,
     generate_token_bitmask,
     load_token_map,
     move_accept_tokens_to_target_kvcache,
@@ -106,12 +107,14 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
@@ -1003,40 +1006,43 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
-        if self.server_args.speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
-            )
-        elif self.topk == 1 and not _is_hip:
-            # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
-            # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
-        else:
-            probs = renorm_draft_probs(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                self.server_args.speculative_use_rejection_sampling,
-            )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
+        # The TPU greedy path fuses row selection and argmax; other platforms
+        # and sampling modes retain the original implementation.
+        (
+            draft_logits_output.next_token_logits,
+            draft_logits_output.hidden_states,
+            ret_draft_probs,
+            ret_topk_p,
+            ret_topk_index,
+        ) = draft_extend_select_func(
+            draft_logits_output.next_token_logits,
+            draft_logits_output.hidden_states,
+            select_index,
+            batch.sampling_info,
+            self.topk,
+            self.server_args.speculative_use_rejection_sampling,
+        )
         ret_hidden_states = draft_logits_output.hidden_states
 
-        # Construct the return values
+        return self._finish_draft_extend_for_decode(
+            batch_result,
+            ret_topk_p,
+            ret_topk_index,
+            ret_hidden_states,
+            ret_draft_probs,
+            dsa_seed_topk_indices,
+        )
+
+    def _finish_draft_extend_for_decode(
+        self,
+        batch_result,
+        ret_topk_p,
+        ret_topk_index,
+        ret_hidden_states,
+        ret_draft_probs,
+        dsa_seed_topk_indices,
+    ):
+        """Publish the draft-extend outputs onto the next iteration's input."""
         next_draft_input = batch_result.next_draft_input
         (
             next_draft_input.topk_p,
@@ -1682,7 +1688,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     logits_output, verify_forward_batch
                 )
         predict, accept_lens, accept_index = verify_result
-        new_seq_lens = batch.seq_lens + accept_lens
+        # Runs on the restored, logical-shaped batch.
+        new_seq_lens, bonus_tokens = verify_post_func(
+            batch.seq_lens,
+            accept_lens,
+            predict,
+            accept_index,
+            accept_index.shape[1],
+            batch.forward_mode.is_idle(),
+        )
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
             "clear_unaccepted_c128_draft_states",
@@ -1704,20 +1718,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
             self.speculative_num_draft_tokens,
         )
-
-        if not batch.forward_mode.is_idle():
-            accept_tokens = predict[accept_index]
-            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            # stride = accept_tokens per-req width = accept_index.shape[1]
-            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-            fill_bonus_tokens_func(
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                accept_index.shape[1],
-            )
-        else:
-            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(

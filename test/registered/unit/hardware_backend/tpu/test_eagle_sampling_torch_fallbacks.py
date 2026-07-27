@@ -5,6 +5,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -340,6 +342,286 @@ class TestEagleSamplingTorchFallbacks(unittest.TestCase):
         )
         expected = expected / expected.sum(dim=-1, keepdim=True)
         self.assertTrue(torch.allclose(out, expected, atol=1e-6))
+
+
+class TestGreedyVerifyTorchEquivalence(unittest.TestCase):
+    """The fused greedy verify must match the staged-buffer implementation."""
+
+    @staticmethod
+    def _reference(next_token_logits, candidates, retrieve_index):
+        # Independent staged-buffer oracle for the functional implementation.
+        bs, ntv = candidates.shape
+        predicts = torch.zeros((bs * ntv,), dtype=torch.int32)
+        accept_index = torch.full((bs, ntv), -1, dtype=torch.int32)
+        accept_token_num = torch.empty((bs,), dtype=torch.int32)
+        target_predict = torch.argmax(next_token_logits, dim=-1).reshape(bs, ntv)
+        predicts[: bs * ntv] = target_predict.flatten().to(predicts.dtype)
+
+        matches = target_predict[:, :-1] == candidates[:, 1:]
+        if matches.shape[1] > 0:
+            all_match = matches.all(dim=1)
+            first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
+            num_correct = torch.where(all_match, ntv - 1, first_mismatch)
+        else:
+            num_correct = torch.zeros((bs,), dtype=torch.long)
+        accept_len = num_correct + 1
+
+        ri_valid = retrieve_index != -1
+        col_idx = torch.arange(ntv, dtype=torch.long)
+        within_accept = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)
+        invalid_within = within_accept & ~ri_valid
+        has_invalid = invalid_within.any(dim=1)
+        first_invalid = invalid_within.to(torch.int32).argmax(dim=1)
+        accept_len = torch.where(has_invalid, first_invalid, accept_len)
+        num_correct = accept_len - 1
+
+        copy_mask = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)
+        accept_index[:bs] = torch.where(
+            copy_mask,
+            retrieve_index.to(accept_index.dtype),
+            torch.tensor(-1, dtype=accept_index.dtype),
+        )
+        accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
+        return predicts, accept_index, accept_token_num
+
+    def test_matches_reference_on_random_cases(self):
+        from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
+
+        torch.manual_seed(0)
+        vocab = 32
+        for bs, ntv in ((3, 1), (1, 4), (2, 4), (3, 2), (2, 8)):
+            for trial in range(8):
+                logits = torch.randn(bs * ntv, vocab)
+                candidates = torch.randint(0, vocab, (bs, ntv), dtype=torch.int32)
+                retrieve_index = torch.arange(bs * ntv, dtype=torch.int32).reshape(
+                    bs, ntv
+                )
+                if trial % 3 == 1 and ntv > 1:
+                    # Exercise the -1 clamp inside the accepted prefix.
+                    retrieve_index[:, -1] = -1
+
+                want_p, want_ai, want_n = self._reference(
+                    logits, candidates, retrieve_index
+                )
+                got_p, got_ai, got_lens = _verify_tree_greedy_torch(
+                    logits, candidates, retrieve_index
+                )
+
+                with self.subTest(bs=bs, ntv=ntv, trial=trial):
+                    self.assertTrue(torch.equal(got_p, want_p))
+                    self.assertTrue(torch.equal(got_ai, want_ai))
+                    # fused returns accept_len (incl. bonus); reference counts drafts
+                    self.assertTrue(torch.equal(got_lens - 1, want_n))
+
+    def test_handles_single_verify_token(self):
+        from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
+
+        logits = torch.randn(3, 16)
+        candidates = torch.randint(0, 16, (3, 1), dtype=torch.int32)
+        retrieve_index = torch.arange(3, dtype=torch.int32).reshape(3, 1)
+
+        predicts, accept_index, accept_lens = _verify_tree_greedy_torch(
+            logits, candidates, retrieve_index
+        )
+
+        self.assertEqual(predicts.shape, (3,))
+        self.assertEqual(accept_index.shape, (3, 1))
+        # Only the bonus token is ever accepted when there are no drafts.
+        self.assertEqual(accept_lens.tolist(), [1, 1, 1])
+
+
+class TestVerifyPostFusedEquivalence(unittest.TestCase):
+    """Fused post-verify must match seq-len add + gather + bonus fill."""
+
+    def test_matches_the_unfused_sequence(self):
+        from sglang.srt.speculative.eagle_utils import fused_verify_post_func
+
+        torch.manual_seed(1)
+        for bs, width, ndt in ((1, 4, 4), (3, 4, 4), (2, 3, 6)):
+            seq_lens = torch.randint(8, 64, (bs,), dtype=torch.int32)
+            accept_lens = torch.randint(1, width + 1, (bs,), dtype=torch.int32)
+            predict = torch.randint(0, 1000, (bs * ndt,), dtype=torch.int32)
+            accept_index = torch.randint(0, bs * ndt, (bs, width), dtype=torch.int32)
+
+            got_seq, got_bonus = fused_verify_post_func(
+                seq_lens, accept_lens, predict, accept_index, width
+            )
+
+            want_seq = seq_lens + accept_lens
+            accept_tokens = predict[accept_index]
+            want_bonus = torch.empty_like(accept_lens, dtype=torch.int32)
+            for i in range(bs):
+                want_bonus[i] = accept_tokens.reshape(-1)[
+                    width * i + int(accept_lens[i]) - 1
+                ]
+
+            with self.subTest(bs=bs, width=width):
+                self.assertTrue(torch.equal(got_seq, want_seq))
+                self.assertTrue(torch.equal(got_bonus, want_bonus))
+
+    def test_uses_accept_width_not_num_draft_tokens(self):
+        # For topk > 1 trees accept_index.shape[1] (spec_steps + 1) differs
+        # from num_draft_tokens; the stride must follow the former.
+        from sglang.srt.speculative.eagle_utils import fused_verify_post_func
+
+        bs, width, ndt = 2, 3, 6
+        seq_lens = torch.zeros(bs, dtype=torch.int32)
+        accept_lens = torch.tensor([3, 3], dtype=torch.int32)
+        predict = torch.arange(bs * ndt, dtype=torch.int32)
+        accept_index = torch.arange(bs * width, dtype=torch.int32).reshape(bs, width)
+
+        _, bonus = fused_verify_post_func(
+            seq_lens, accept_lens, predict, accept_index, width
+        )
+        # flat positions width*i + accept_lens[i]-1 = 2 and 5
+        self.assertEqual(bonus.tolist(), [2, 5])
+
+    def test_router_preserves_non_tpu_path(self):
+        import sglang.srt.speculative.eagle_utils as eagle_utils
+
+        seq_lens = torch.tensor([8, 12], dtype=torch.int32)
+        accept_lens = torch.tensor([2, 3], dtype=torch.int32)
+        predict = torch.arange(8, dtype=torch.int32)
+        accept_index = torch.tensor([[0, 1, -1], [3, 4, 5]], dtype=torch.int32)
+
+        def fill_bonus(accept_tokens, lens, output, width):
+            flat = accept_tokens.reshape(-1)
+            for i in range(lens.shape[0]):
+                output[i] = flat[width * i + int(lens[i]) - 1]
+
+        with (
+            patch.object(eagle_utils, "_use_torch_native", False),
+            patch.object(
+                eagle_utils, "fill_bonus_tokens_func", side_effect=fill_bonus
+            ) as fallback,
+        ):
+            new_seq_lens, bonus_tokens = eagle_utils.verify_post_func(
+                seq_lens,
+                accept_lens,
+                predict,
+                accept_index,
+                accept_index.shape[1],
+                is_idle=False,
+            )
+
+        fallback.assert_called_once()
+        self.assertEqual(new_seq_lens.tolist(), [10, 15])
+        self.assertEqual(bonus_tokens.tolist(), [1, 5])
+
+    def test_router_handles_idle_batch(self):
+        from sglang.srt.speculative.eagle_utils import verify_post_func
+
+        new_seq_lens, bonus_tokens = verify_post_func(
+            torch.empty((0,), dtype=torch.int32),
+            torch.empty((0,), dtype=torch.int32),
+            torch.empty((0,), dtype=torch.int32),
+            torch.empty((0, 4), dtype=torch.int32),
+            4,
+            is_idle=True,
+        )
+
+        self.assertEqual(new_seq_lens.numel(), 0)
+        self.assertEqual(bonus_tokens.numel(), 0)
+
+
+class TestDraftExtendSelectFused(unittest.TestCase):
+    """Fused draft-extend select must match the eager gather + argmax."""
+
+    def test_matches_eager_select_and_argmax(self):
+        from sglang.srt.speculative.eagle_utils import (
+            fused_draft_extend_select_argmax_func,
+        )
+
+        torch.manual_seed(3)
+        for bs, ndt, vocab, hdim in ((1, 4, 64, 8), (3, 4, 128, 16), (2, 6, 32, 4)):
+            logits = torch.randn(bs * ndt, vocab)
+            hidden = torch.randn(bs * ndt, hdim)
+            accept_lens = torch.randint(1, ndt + 1, (bs,), dtype=torch.int32)
+            select_index = (
+                torch.arange(0, bs * ndt, ndt, dtype=torch.int32) + accept_lens - 1
+            ).long()
+
+            sel_l, sel_h, tp, ti = fused_draft_extend_select_argmax_func(
+                logits, hidden, select_index
+            )
+
+            want_l = logits[select_index]
+            want_h = hidden[select_index]
+            want_ti = torch.argmax(want_l, dim=-1, keepdim=True)
+            with self.subTest(bs=bs, ndt=ndt):
+                self.assertTrue(torch.equal(sel_l, want_l))
+                self.assertTrue(torch.equal(sel_h, want_h))
+                self.assertTrue(torch.equal(ti, want_ti))
+                self.assertTrue(torch.all(tp == 1.0))
+                self.assertEqual(tp.shape, want_ti.shape)
+
+    def test_none_hidden_states_passes_through(self):
+        from sglang.srt.speculative.eagle_utils import (
+            fused_draft_extend_select_argmax_func,
+        )
+
+        logits = torch.randn(8, 16)
+        sel_l, sel_h, _, _ = fused_draft_extend_select_argmax_func(
+            logits, None, torch.tensor([1, 5])
+        )
+        self.assertIsNone(sel_h)
+        self.assertEqual(sel_l.shape, (2, 16))
+
+    def test_router_preserves_non_tpu_greedy_path(self):
+        import sglang.srt.speculative.eagle_utils as eagle_utils
+
+        logits = torch.randn(8, 16)
+        hidden = torch.randn(8, 4)
+        select_index = torch.tensor([1, 5])
+        sampling_info = SimpleNamespace(temperatures=torch.ones((2, 1)))
+
+        with patch.object(eagle_utils, "_use_torch_native", False):
+            sel_l, sel_h, draft_probs, topk_p, topk_index = (
+                eagle_utils.draft_extend_select_func(
+                    logits,
+                    hidden,
+                    select_index,
+                    sampling_info,
+                    topk=1,
+                    use_rejection_sampling=False,
+                )
+            )
+
+        self.assertTrue(torch.equal(sel_l, logits[select_index]))
+        self.assertTrue(torch.equal(sel_h, hidden[select_index]))
+        self.assertIsNone(draft_probs)
+        self.assertTrue(
+            torch.equal(topk_index, torch.argmax(sel_l, dim=-1, keepdim=True))
+        )
+        self.assertTrue(torch.all(topk_p == 1.0))
+
+    def test_router_selects_tpu_fused_path(self):
+        import sglang.srt.speculative.eagle_utils as eagle_utils
+
+        logits = torch.randn(8, 16)
+        hidden = torch.randn(8, 4)
+        select_index = torch.tensor([1, 5])
+        sampling_info = SimpleNamespace(temperatures=torch.ones((2, 1)))
+
+        with (
+            patch.object(eagle_utils, "_use_torch_native", True),
+            patch.object(
+                eagle_utils,
+                "fused_draft_extend_select_argmax_func",
+                wraps=eagle_utils.fused_draft_extend_select_argmax_func,
+            ) as fused,
+        ):
+            _, _, draft_probs, _, _ = eagle_utils.draft_extend_select_func(
+                logits,
+                hidden,
+                select_index,
+                sampling_info,
+                topk=1,
+                use_rejection_sampling=False,
+            )
+
+        fused.assert_called_once()
+        self.assertIsNone(draft_probs)
 
 
 if __name__ == "__main__":

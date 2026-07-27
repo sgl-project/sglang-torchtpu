@@ -343,8 +343,12 @@ class EagleVerifyInput(SpecInput):
             )
 
         if is_all_greedy or not tree_sample_available:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+            if _is_tpu:
+                target_predict = None
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
@@ -355,6 +359,7 @@ class EagleVerifyInput(SpecInput):
                 retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=self.topk,
+                next_token_logits=logits_output.next_token_logits,
             )
 
         else:
