@@ -1292,7 +1292,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
         if _is_tpu and self.global_num_tokens_for_logprob_gpu is not None:
             self.global_num_tokens_for_logprob_gpu.copy_(
-                self.global_num_tokens_for_logprob_cpu, non_blocking=True)
+                torch.tensor(
+                    self.global_num_tokens_for_logprob_cpu,
+                    dtype=self.global_num_tokens_for_logprob_gpu.dtype,
+                    pin_memory=True,
+                ),
+                non_blocking=True,
+            )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
