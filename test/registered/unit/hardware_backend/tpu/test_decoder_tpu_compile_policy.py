@@ -244,11 +244,15 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 1)
         self.assertEqual(mr.attn_backend.calls, [(64, 8)])
 
-    def test_extend_raises_when_no_token_bucket_can_hold_bs_cap(self):
+    def test_extend_batch_cap_clamped_to_token_bucket(self):
+        # The extend batch cap is clamped to the largest token bucket
+        # (_extend_batch_cap = min(token_max, bs_max)), so a lone small token
+        # bucket still yields a valid (t, t) shape instead of an empty set.
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(4,), bs_buckets=(8,))
-        with self.assertRaisesRegex(ValueError, "No TPU extend compile shapes"):
-            _run_cases(policy, ForwardMode.EXTEND)
+        _run_cases(policy, ForwardMode.EXTEND)
+        self.assertEqual(mr.model.forward.call_count, 1)
+        self.assertEqual(mr.attn_backend.calls, [(4, 4)])
 
     def test_decode_loop_iterates_bs(self):
         mr = _model_runner()

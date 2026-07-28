@@ -101,22 +101,41 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         backend_patcher.start()
         self.addCleanup(backend_patcher.stop)
+        # install() consults is_dp_attention_enabled() -> get_flags(), which
+        # needs global server args set. No DP in these unit tests, so stub it.
+        dp_patcher = patch(
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "decoder_compile_policy.is_dp_attention_enabled",
+            return_value=False,
+        )
+        dp_patcher.start()
+        self.addCleanup(dp_patcher.stop)
 
     def _runner_for(
         self, model: Any, enable_torch_compile: bool = True
     ) -> SimpleNamespace:
+        server_args = SimpleNamespace(
+            enable_torch_compile=enable_torch_compile,
+            tpu_compile_tokens=None,
+            tpu_compile_bs=None,
+            torch_compile_max_bs=8,
+            chunked_prefill_size=None,
+            max_prefill_tokens=2048,
+        )
+
+        # Mirror ServerArgs.override: the _can_torch_compile=False path calls it
+        # to flip enable_torch_compile off.
+        def _override(source: str, **fields: Any) -> None:
+            for k, v in fields.items():
+                setattr(server_args, k, v)
+
+        server_args.override = _override
         return SimpleNamespace(
             model=model,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            server_args=SimpleNamespace(
-                enable_torch_compile=enable_torch_compile,
-                tpu_compile_tokens=None,
-                tpu_compile_bs=None,
-                chunked_prefill_size=None,
-                max_prefill_tokens=2048,
-            ),
+            server_args=server_args,
         )
 
     def _annotate(self, model: Any) -> Any:
@@ -334,13 +353,13 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIs(getattr(modules[sampling_path], target), eager)
 
     def test_can_run_is_always_false(self):
-        # ModelRunner.forward branches on `graph_runner.can_run(...)`
+        # ModelRunner.forward branches on `graph_runner.can_run_graph(...)`
         # to decide whether to replay a captured graph. TPU has no
         # captured graph (PJRT caches HLO internally), so this must
         # be False for every forward mode so the replay path stays off.
         model = self._annotate(_model_with(forward=MagicMock()))
         runner = TpuGraphRunner(self._runner_for(model))
-        self.assertFalse(runner.can_run(MagicMock()))
+        self.assertFalse(runner.can_run_graph(MagicMock()))
 
 
 if __name__ == "__main__":
