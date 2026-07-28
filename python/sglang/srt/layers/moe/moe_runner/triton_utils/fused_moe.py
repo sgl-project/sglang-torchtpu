@@ -158,7 +158,45 @@ def inplace_fused_experts(
     )
 
 
-@register_custom_op(out_shape="hidden_states")
+def _outplace_fused_experts_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    b1: Optional[torch.Tensor] = None,
+    b2: Optional[torch.Tensor] = None,
+    activation: str = "silu",
+    is_gated: bool = True,
+    apply_router_weight_on_input: bool = False,
+    use_fp8_w8a8: bool = False,
+    use_int8_w8a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    per_channel_quant: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[List[int]] = None,
+    no_combine: bool = False,
+    routed_scaling_factor: Optional[float] = None,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
+    swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
+) -> torch.Tensor:
+    if no_combine:
+        return hidden_states.new_empty(
+            (hidden_states.shape[0], topk_ids.shape[1], w2.shape[1])
+        )
+    return torch.empty_like(hidden_states)
+
+
+@register_custom_op(fake_impl=_outplace_fused_experts_fake)
 def outplace_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
