@@ -63,6 +63,18 @@ ${WEIGHTS_VOLUME}
                 - name: test
                   image: ${IMAGE}
                   imagePullPolicy: IfNotPresent
+                  env:
+                    # HF token for gated datasets (GPQA in the gpt-oss lm-eval test).
+                    # One-time: kubectl -n tpu-ci create secret generic hf-token \
+                    #   --from-literal=token=hf_...   (fine-grained, read-only)
+                    # optional: pods must still start when the secret is absent --
+                    # only the gated-dataset eval needs it.
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
                   command: ["bash", "-lc"]
                   args:
                     - |
