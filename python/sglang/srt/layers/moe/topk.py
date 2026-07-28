@@ -114,6 +114,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
 )
 
@@ -131,6 +132,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+_is_tpu = is_tpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
@@ -1858,6 +1860,23 @@ def _post_process_topk_ids(
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
         # second zeroing here would be redundant (zeroing is idempotent).
+    elif _is_tpu:
+        # TPU has no logical->physical remap and no padded-region masking in the
+        # branches above (both are CUDA/HIP-only), and custom_routing_function is
+        # padding-unaware -- so its output on padded rows is garbage. Mask the
+        # padded region here: fill padded topk_ids with a valid expert id (0) and
+        # zero their weights, so padded tokens contribute nothing regardless of
+        # the routed id. Done in pure torch because the _mask/_zero helpers route
+        # through a Triton fast path (_can_fuse_padded_region -> _fill_padded_rows)
+        # that does not run on TPU. TPU skips the shared-expert append branches
+        # below (aiter/DeepEP-only), so zeroing here is complete.
+        if num_token_non_padded is not None:
+            padded_rows = (
+                torch.arange(topk_ids.shape[0], device=topk_ids.device)
+                >= num_token_non_padded
+            )
+            topk_ids[padded_rows, :] = 0
+            topk_weights[padded_rows, :] = 0.0
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids

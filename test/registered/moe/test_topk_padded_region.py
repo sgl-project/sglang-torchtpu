@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -12,11 +13,16 @@ from sglang.srt.layers.moe.topk import (
     _zero_topk_weights_padded_region,
 )
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _IS_HIP = is_hip()
 
@@ -188,6 +194,53 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
             self.assertTrue(torch.all(out[n_valid:] > 0.0))
         finally:
             topk_mod._skip_hip_pad_mask = orig
+
+
+class TestPostProcessPaddedMaskingTpu(CustomTestCase):
+    """TPU has no logical->physical remap or padded-region masking in the CUDA/HIP
+    branches of _post_process_topk_ids, and custom_routing_function is padding-
+    unaware. The TPU branch must therefore mask the padded region: fill padded
+    topk_ids with a valid expert id (0) and zero their weights. Device-independent
+    (pure-torch branch); platform flags are patched so it reaches the TPU path on
+    any runner."""
+
+    def _run(self, n=64, k=8, n_experts=64, num_token_non_padded=5):
+        with mock.patch.multiple(topk_mod, _is_cuda=False, _is_hip=False, _is_tpu=True):
+            # valid expert ids start at 1 so the padded fill value (0) is distinct.
+            topk_ids = torch.randint(1, n_experts, (n, k), dtype=torch.int32)
+            topk_weights = torch.rand((n, k), dtype=torch.float32) + 0.5
+            router_logits = torch.rand((n, n_experts), dtype=torch.float32)
+            pad = (
+                None
+                if num_token_non_padded is None
+                else torch.tensor(num_token_non_padded, dtype=torch.int32)
+            )
+            cfg = TopKConfig(top_k=k, num_fused_shared_experts=0)
+            out_ids, out_weights, _ = _post_process_topk_ids(
+                topk_ids,
+                topk_weights,
+                cfg,
+                router_logits,
+                layer_id=0,
+                num_token_non_padded=pad,
+            )
+        return out_ids, out_weights
+
+    def test_padded_rows_masked(self):
+        n_valid = 5
+        out_ids, out_weights = self._run(num_token_non_padded=n_valid)
+        # Padded rows: ids filled with 0, weights zeroed.
+        self.assertTrue(torch.all(out_ids[n_valid:] == 0))
+        self.assertTrue(torch.all(out_weights[n_valid:] == 0.0))
+        # Valid rows preserved (ids stay >= 1, weights stay > 0).
+        self.assertTrue(torch.all(out_ids[:n_valid] >= 1))
+        self.assertTrue(torch.all(out_weights[:n_valid] > 0.0))
+
+    def test_none_pad_count_is_noop(self):
+        # No padding -> masking is a no-op (nothing zeroed).
+        out_ids, out_weights = self._run(num_token_non_padded=None)
+        self.assertTrue(torch.all(out_ids >= 1))
+        self.assertTrue(torch.all(out_weights > 0.0))
 
 
 if __name__ == "__main__":
