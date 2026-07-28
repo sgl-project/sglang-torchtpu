@@ -69,6 +69,10 @@ from sglang.srt.disaggregation.tpu.host_staging import (
     StageBuf,
     default_pool_max_bytes,
 )
+from sglang.srt.disaggregation.tpu.profile_util import (
+    fmt_bytes,
+    perfetto_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,14 +116,6 @@ def _kv_channels() -> int:
         return max(1, int(os.environ.get("SGLANG_TPU_KV_CHANNELS", "2")))
     except (TypeError, ValueError):
         return 2
-
-
-# Emit one ``trace-event`` line to stdout per KV transfer phase (gather / push /
-# receive / scatter).
-from sglang.srt.disaggregation.tpu.profile_util import (  # noqa: E402
-    fmt_bytes,
-    perfetto_trace,
-)
 
 
 class _KvStats:
@@ -314,7 +310,6 @@ class TpuKVManager(TpuKVManagerBase):
         s = buf0.shape
         return f"{n_pages}x{int(s[1])}x{num_lanes}x{int(s[3])}x{int(s[4])}"
 
-
     def gather_and_push(
         self,
         room: int,
@@ -398,7 +393,7 @@ class TpuKVManager(TpuKVManagerBase):
                     layer_frames,
                     stages,
                     d2h_future,
-                    n_ch
+                    n_ch,
                 )
             else:
                 payload = (
@@ -420,7 +415,7 @@ class TpuKVManager(TpuKVManagerBase):
                     payload,
                     len(page_indices),
                     stages,
-                    d2h_future
+                    d2h_future,
                 )
         except Exception as e:
             logger.exception("KV gather failed for room %s", room)
@@ -506,7 +501,7 @@ class TpuKVManager(TpuKVManagerBase):
         layer_frames: List,
         stages,
         d2h_future,
-        n_ch: int
+        n_ch: int,
     ):
         """Background thread (#3): send the chunk as ``n_ch`` messages over
         ``n_ch`` parallel sockets, each carrying a contiguous layer slice. Aux
