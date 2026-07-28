@@ -104,6 +104,7 @@ test = [
   "expecttest",
   "gguf",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
   "peft>=0.18.0",

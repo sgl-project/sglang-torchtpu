@@ -1,0 +1,93 @@
+# One-time hydration for the MiMo-V2.5-Pro (1.02T-param, blockwise-fp8) ReadOnlyMany
+# weights (~1.0TB).
+#
+# Step 1 of the ROX flow: create a ReadWriteOnce Hyperdisk ML volume (mimo25pro-rwo)
+# and download the checkpoint into it, then follow pvc-mimo25pro-rox.yaml.
+#
+#   kubectl apply -f .github/tpu-ci/hydrate-mimo25pro.yaml   # SC is cluster-scoped
+#   # wait for the Job to Complete (~1TB; hours at HF speeds), then follow
+#   # pvc-mimo25pro-rox.yaml
+#
+# Unlike the smaller weight sets this does NOT use hyperdisk-ml-smoke (400Mi/s): the
+# 2-host slice reads ~1TB at serve time, which at 400Mi/s is ~45 min -- past the
+# JobSet's rank-0 health wait. hyperdisk-ml-fast (below) provisions 2400Mi/s
+# (~7 min full read). The SC is Retain, so deleting mimo25pro-rwo after hydration
+# keeps the disk.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hyperdisk-ml-fast
+provisioner: pd.csi.storage.gke.io
+parameters:
+  type: hyperdisk-ml
+  provisioned-throughput-on-create: "2400Mi"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mimo25pro-rwo
+  namespace: tpu-ci
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: hyperdisk-ml-fast
+  resources:
+    requests:
+      storage: 1200Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hydrate-mimo25pro
+  namespace: tpu-ci
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      # Run on a TPU node (spare CPU; the small CPU pools are full). No TPU chip is
+      # requested, so this consumes only CPU, not the reservation.
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        ci-tpu-pool: pr-gate
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: mimo25pro-rwo
+      containers:
+        - name: hydrate
+          image: python:3.12-slim
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir "huggingface_hub[hf_transfer]"
+              # Keep every byte on the Hyperdisk (not the node's ephemeral disk).
+              export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HOME=/weights/.hf-cache
+              python - <<'PY'
+              from huggingface_hub import snapshot_download
+              p = snapshot_download(
+                  "XiaomiMiMo/MiMo-V2.5-Pro",
+                  local_dir="/weights/MiMo-V2.5-Pro",
+                  # Keep the repo's *.py files: the config/tokenizer are custom code
+                  # (configuration_mimo_v2.py) loaded via --trust-remote-code.
+                  ignore_patterns=["original/*", "*.gguf", "*.pth"],
+              )
+              print("hydrated ->", p)
+              PY
+              echo "== contents =="; ls -la /weights/MiMo-V2.5-Pro
+              echo "== size =="; du -sh /weights/MiMo-V2.5-Pro
+          resources:
+            requests:
+              cpu: "4"        # hf_transfer parallelism for the ~1TB pull
+              memory: 8Gi
+          volumeMounts:
+            - name: weights
+              mountPath: /weights

@@ -1,0 +1,39 @@
+# Ground truth 0.671 = the gpt-oss model card's GPQA Diamond (no tools) at LOW
+# reasoning effort (per-effort: low 67.1 / medium 73.1 / high 80.1 -- the famous 71.5
+# is the 20b model). atol 0.03 is the agreed tolerance: pass = within 3 points
+# absolute (floor 0.641). If switching reasoning_effort, re-anchor value to the
+# matching card number.
+#
+# Full diamond set (198 questions, no limit) -- small enough to run whole, and whole
+# is what the card measured. Gated on the flexible-extract metric (last "(X)" in the
+# output): closest to the card's answer-extraction grading and robust to phrasing;
+# strict-match needs the literal "The answer is" wording.
+#
+# ⚠️ Idavidrein/gpqa is a GATED HF dataset: the CI pod needs an HF_TOKEN env (k8s
+# secret) from an account that accepted the GPQA terms, or lm-eval fails the
+# download with 401. This is a one-time owner action on the JobSet template.
+#
+# reasoning_effort "low" keeps the harmony analysis channel short; the server runs
+# --reasoning-parser gpt-oss (see benchmark/tpu/recipe/gpt_oss_120b_mh.sh) so only
+# final-channel text reaches answer extraction. max_gen_toks 4096 gives the
+# reasoning + answer headroom (lm-eval's task default truncates at 1024).
+model_name: "openai/gpt-oss-120b"
+backend: "local-chat-completions"
+api: "chat"
+tasks:
+- name: "gpqa_diamond_cot_zeroshot"
+  metrics:
+  - name: "exact_match,flexible-extract"
+    value: 0.671  # model card, GPQA Diamond no-tools, low reasoning effort
+num_concurrent: 32
+batch_size: "auto"
+apply_chat_template: true
+gen_kwargs:
+  max_gen_toks: 4096
+  chat_template_kwargs:
+    reasoning_effort: "low"
+  repetition_penalty: 1.0
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+atol: 0.03
+rtol: 0.0
