@@ -309,10 +309,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 param = getattr(layer, name)
                 old = param.data
                 new = old.transpose(1, 2).contiguous()
-                # Rebind (not copy_or_rebind_param): copy-in-place would leave a
-                # square expert (n == k) on `old`'s storage, which resize_(0)
-                # then frees -> 0-byte param. Identity stability isn't needed on
-                # TPU, so always rebind.
                 param.data = new
                 param.requires_grad_(False)
                 old.untyped_storage().resize_(0)
