@@ -38,6 +38,9 @@ jobs:
       image: ${{ needs.build.outputs.digest }}
       suite: nightly-tpu-4-v7
       nightly: true
+      # gpt-oss-120b lm-eval loads from the ROX weights disk at /weights
+      # (test_tpu_gpt_oss_120b.py); harmless for tests that don't use it.
+      weights_pvc: gptoss120b-rox
     permissions:
       contents: read
       id-token: write

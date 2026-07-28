@@ -14,9 +14,11 @@
 # download with 401. This is a one-time owner action on the JobSet template.
 #
 # reasoning_effort "low" keeps the harmony analysis channel short; the server runs
-# --reasoning-parser gpt-oss (see benchmark/tpu/recipe/gpt_oss_120b_mh.sh) so only
-# final-channel text reaches answer extraction. max_gen_toks 4096 gives the
-# reasoning + answer headroom (lm-eval's task default truncates at 1024).
+# --reasoning-parser gpt-oss (see test/registered/tpu/test_tpu_gpt_oss_120b.py) so
+# only final-channel text reaches answer extraction. max_gen_toks 32768 =
+# effectively uncapped, matching the card's unbounded CoT (lm-eval's task default
+# truncates at 1024); the test raises CONTEXT_LEN to fit. Typical low-effort
+# outputs stay short -- the cap only protects against runaway tails.
 model_name: "openai/gpt-oss-120b"
 backend: "local-chat-completions"
 api: "chat"
@@ -29,7 +31,7 @@ num_concurrent: 32
 batch_size: "auto"
 apply_chat_template: true
 gen_kwargs:
-  max_gen_toks: 4096
+  max_gen_toks: 32768
   chat_template_kwargs:
     reasoning_effort: "low"
   repetition_penalty: 1.0
