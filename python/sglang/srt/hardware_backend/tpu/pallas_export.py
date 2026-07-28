@@ -63,8 +63,7 @@ def configure_jax_export_env(world_size: int) -> None:
 
 
 def get_jax_export_devices(world_size: int):
-    """Return the distinct CPU devices used to describe global partitions."""
-    configure_jax_export_env(world_size)
+    """Return the preconfigured CPU devices used for global partitions."""
 
     import jax
 

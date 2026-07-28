@@ -122,6 +122,7 @@ class TestPallasExportEnvironment(CustomTestCase):
 
             from sglang.srt.hardware_backend.tpu import pallas_export
 
+            pallas_export.configure_jax_export_env(4)
             devices = pallas_export.get_jax_export_devices(4)
 
             import jax
@@ -274,6 +275,65 @@ class TestPallasExportEnvironment(CustomTestCase):
         self.assertEqual(result["pallas_nr_devices"], 4)
         self.assertTrue(result["has_enqueue_dma"])
         self.assertTrue(result["has_wait_dma"])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_cpu_export_jax_op_executes_registered_kernel(self):
+        script = textwrap.dedent("""
+            import json
+            import os
+
+            from sglang.srt.hardware_backend.tpu import pallas_export
+
+            pallas_export.configure_jax_export_env(1)
+
+            import jax
+            import torch
+            import torch_tpu  # noqa: F401
+
+            from sglang.srt.hardware_backend.tpu.pallas_jax_op import (
+                cpu_export_jax_op,
+            )
+
+            def add_one(x: jax.Array) -> jax.Array:
+                return x + 1
+
+            op = cpu_export_jax_op(
+                "sglang_tpu_test::cpu_export_add_one",
+                add_one,
+            )
+            x = torch.arange(8, dtype=torch.float32, device="tpu")
+            y = op(x)
+            torch.tpu.synchronize()
+            print(
+                json.dumps(
+                    {
+                        "jax_platforms": os.environ["JAX_PLATFORMS"],
+                        "result": y.cpu().tolist(),
+                    }
+                )
+            )
+            """)
+        env = os.environ.copy()
+        env.pop("JAX_PLATFORMS", None)
+        env.pop("XLA_FLAGS", None)
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            f"subprocess stderr:\n{completed.stderr}",
+        )
+        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["jax_platforms"], "cpu")
+        self.assertEqual(result["result"], [float(value) for value in range(1, 9)])
 
 
 if __name__ == "__main__":
