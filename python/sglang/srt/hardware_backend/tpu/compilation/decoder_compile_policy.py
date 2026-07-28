@@ -257,8 +257,12 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             # unpadded (garbage decode under DP attention).
             if (
                 forward_batch.forward_mode.is_idle()
-                and forward_batch.batch_size > 0
                 and is_dp_attention_enabled()
+                and (
+                    # This is necessary for preventing all Idle.
+                    max(forward_batch.global_num_tokens_cpu, default=0)
+                    > 0
+                )
             ):
                 forward_batch.forward_mode = ForwardMode.DECODE
             return orig_forward(forward_batch, *args, **kwargs)

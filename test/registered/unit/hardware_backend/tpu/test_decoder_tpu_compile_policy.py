@@ -4,8 +4,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -244,11 +245,15 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 1)
         self.assertEqual(mr.attn_backend.calls, [(64, 8)])
 
-    def test_extend_raises_when_no_token_bucket_can_hold_bs_cap(self):
+    def test_extend_batch_cap_clamped_to_token_bucket(self):
+        # The extend batch cap is clamped to the largest token bucket
+        # (_extend_batch_cap = min(token_max, bs_max)), so a lone small token
+        # bucket still yields a valid (t, t) shape instead of an empty set.
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(4,), bs_buckets=(8,))
-        with self.assertRaisesRegex(ValueError, "No TPU extend compile shapes"):
-            _run_cases(policy, ForwardMode.EXTEND)
+        _run_cases(policy, ForwardMode.EXTEND)
+        self.assertEqual(mr.model.forward.call_count, 1)
+        self.assertEqual(mr.attn_backend.calls, [(4, 4)])
 
     def test_decode_loop_iterates_bs(self):
         mr = _model_runner()
@@ -320,7 +325,24 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             attn_backend=SimpleNamespace(requires_kv_sync_after_compile=True),
             token_to_kv_pool=pool,
         )
-        with patch("torch_tpu._internal.sync.sync.synchronize") as sync:
+        # torch_tpu isn't installed on the CPU runners this suite targets; stub
+        # the module tree so _materialize_out's
+        # `from torch_tpu._internal.sync.sync import synchronize` resolves and is
+        # patchable (patch.dict also overrides a real torch_tpu on a TPU host).
+        tt = ModuleType("torch_tpu")
+        tt._internal = ModuleType("torch_tpu._internal")
+        tt._internal.sync = ModuleType("torch_tpu._internal.sync")
+        tt._internal.sync.sync = ModuleType("torch_tpu._internal.sync.sync")
+        tt._internal.sync.sync.synchronize = MagicMock()
+        stubs = {
+            "torch_tpu": tt,
+            "torch_tpu._internal": tt._internal,
+            "torch_tpu._internal.sync": tt._internal.sync,
+            "torch_tpu._internal.sync.sync": tt._internal.sync.sync,
+        }
+        with patch.dict(sys.modules, stubs), patch(
+            "torch_tpu._internal.sync.sync.synchronize"
+        ) as sync:
             _materialize_out(
                 SimpleNamespace(next_token_logits=logits),
                 forward_batch.attn_backend,

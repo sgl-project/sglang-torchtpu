@@ -60,60 +60,50 @@ class TestTpuPlatformIdentity(CustomTestCase):
 
 
 class TestTpuPlatformMemory(CustomTestCase):
-    """Device memory methods."""
+    """Device memory methods delegate to torch.accelerator.get_memory_info.
+
+    The per-process HBM limit is read from the runtime (``(free, limit)``), not
+    a static per-device-name table, so these mock get_memory_info + get_device
+    to run without a real TPU.
+    """
 
     def setUp(self):
         self.platform = TpuSRTPlatform()
 
-    def test_hbm_lookup_known_devices(self):
-        known = {
-            "TPU v4": 32 * (1 << 30),
-            "TPU v5p": 95 * (1 << 30),
-            "TPU v5e": 16 * (1 << 30),
-            "TPU v6e": 32 * (1 << 30),
-            "TPU v7": 192 * (1 << 30),
-        }
-        for name, expected_bytes in known.items():
-            with self.subTest(device=name):
-                with patch.object(self.platform, "get_device_name", return_value=name):
-                    self.assertEqual(
-                        self.platform.get_device_total_memory(), expected_bytes
-                    )
+    def _patch_mem(self, free, limit):
+        # get_device() builds torch.device("tpu", ...) which is invalid off-TPU;
+        # stub it, and stub the runtime memory query to (free, limit).
+        return (
+            patch.object(self.platform, "get_device", return_value=None),
+            patch("torch.accelerator.get_memory_info", return_value=(free, limit)),
+        )
 
-    def test_hbm_lookup_unknown_device_defaults(self):
-        with patch.object(self.platform, "get_device_name", return_value="TPU v99"):
-            self.assertEqual(self.platform.get_device_total_memory(), 32 * (1 << 30))
+    def test_total_memory_returns_reported_limit(self):
+        dev, mem = self._patch_mem(10 << 30, 96 << 30)
+        with dev, mem:
+            self.assertEqual(self.platform.get_device_total_memory(), 96 << 30)
 
-    def test_current_memory_usage_returns_zero(self):
-        self.assertEqual(self.platform.get_current_memory_usage(), 0.0)
+    def test_current_memory_usage_is_total_minus_free(self):
+        dev, mem = self._patch_mem(10 << 30, 96 << 30)
+        with dev, mem:
+            self.assertEqual(self.platform.get_current_memory_usage(), float(86 << 30))
 
-    def test_available_memory(self):
-        with patch.object(self.platform, "get_device_name", return_value="TPU v7"):
+    def test_available_memory_returns_free_and_total(self):
+        dev, mem = self._patch_mem(10 << 30, 96 << 30)
+        with dev, mem:
             free, total = self.platform.get_available_memory()
-            self.assertEqual(total, 192 * (1 << 30))
-            self.assertEqual(free, total)
+            self.assertEqual(total, 96 << 30)
+            self.assertEqual(free, 10 << 30)
 
 
 class TestTpuPlatformServerDefaults(CustomTestCase):
     """apply_server_args_defaults sets correct values."""
 
-    @patch(
-        "sglang.srt.hardware_backend.tpu.tpu_platform.TpuSRTPlatform.apply_server_args_defaults"
-    )
-    def _make_args(self, mock_apply):
-        return SimpleNamespace(
-            dtype=None,
-            attention_backend=None,
-            disable_cuda_graph=False,
-            disable_piecewise_cuda_graph=False,
-            enable_torch_compile=True,
-            disable_overlap_schedule=False,
-            mem_fraction_static=None,
-            tp_size=1,
-        )
-
-    def test_defaults_applied(self):
-        args = SimpleNamespace(
+    def _args(self, **overrides):
+        # Full set of fields apply_server_args_defaults reads, plus an
+        # override() shim mirroring ServerArgs.override (its audited mutation
+        # point, which the defaults now flow through).
+        defaults = dict(
             dtype=None,
             attention_backend=None,
             disable_cuda_graph=False,
@@ -122,10 +112,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             disable_overlap_schedule=False,
             mem_fraction_static=None,
             tp_size=1,
+            page_size=None,
+            use_ray=False,
+            hicache_io_backend=None,
+            speculative_algorithm=None,
+            speculative_eagle_topk=None,
+            speculative_use_rejection_sampling=False,
         )
+        defaults.update(overrides)
+        args = SimpleNamespace(**defaults)
+
+        def _override(source, **fields):
+            for k, v in fields.items():
+                setattr(args, k, v)
+
+        args.override = _override
+        return args
+
+    def _apply(self, args):
         platform = TpuSRTPlatform()
         with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
             platform.apply_server_args_defaults(args)
+
+    def test_defaults_applied(self):
+        args = self._args(enable_torch_compile=False)
+        self._apply(args)
 
         self.assertEqual(args.dtype, "bfloat16")
         self.assertEqual(args.attention_backend, "pallas_tpu_rpa_v3")
@@ -139,54 +150,18 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(args.mem_fraction_static, 0.40)
 
     def test_enable_torch_compile_preserved_when_opted_in(self):
-        args = SimpleNamespace(
-            dtype=None,
-            attention_backend=None,
-            disable_cuda_graph=False,
-            disable_piecewise_cuda_graph=False,
-            enable_torch_compile=True,
-            disable_overlap_schedule=False,
-            mem_fraction_static=None,
-            tp_size=1,
-        )
-        platform = TpuSRTPlatform()
-        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
-            platform.apply_server_args_defaults(args)
-
+        args = self._args(enable_torch_compile=True)
+        self._apply(args)
         self.assertTrue(args.enable_torch_compile)
 
     def test_explicit_dtype_not_overridden(self):
-        args = SimpleNamespace(
-            dtype="float32",
-            attention_backend=None,
-            disable_cuda_graph=False,
-            disable_piecewise_cuda_graph=False,
-            enable_torch_compile=True,
-            disable_overlap_schedule=False,
-            mem_fraction_static=None,
-            tp_size=1,
-        )
-        platform = TpuSRTPlatform()
-        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
-            platform.apply_server_args_defaults(args)
-
+        args = self._args(dtype="float32")
+        self._apply(args)
         self.assertEqual(args.dtype, "float32")
 
     def test_explicit_mem_fraction_not_overridden(self):
-        args = SimpleNamespace(
-            dtype=None,
-            attention_backend=None,
-            disable_cuda_graph=False,
-            disable_piecewise_cuda_graph=False,
-            enable_torch_compile=True,
-            disable_overlap_schedule=False,
-            mem_fraction_static=0.60,
-            tp_size=1,
-        )
-        platform = TpuSRTPlatform()
-        with patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"):
-            platform.apply_server_args_defaults(args)
-
+        args = self._args(mem_fraction_static=0.60)
+        self._apply(args)
         self.assertEqual(args.mem_fraction_static, 0.60)
 
 
@@ -205,7 +180,14 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
         self.assertEqual(cls.__name__, "TpuPagedTokenToKVPoolAllocator")
 
     def test_mha_kv_pool_cls(self):
-        cls = self.platform.get_mha_kv_pool_cls()
+        # get_mha_kv_pool_cls picks the pool by the resolved attention backend
+        # read off the global server args; a non-RPA backend yields the flat
+        # MHATokenToKVPool.
+        with patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=SimpleNamespace(attention_backend="torch_native"),
+        ):
+            cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "MHATokenToKVPool")
 
     def test_nsa_raises(self):

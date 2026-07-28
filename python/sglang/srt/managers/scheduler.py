@@ -976,6 +976,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        self.recompile_stance_set = False
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -3574,10 +3575,28 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _maybe_arm_fail_on_recompile(self) -> None:
+        """TPU-only: freeze torch.compile so serving-time recompiles raise."""
+        model_runner = self.tp_worker.model_runner
+        if model_runner.device != "tpu":
+            # Only enable this for tpu
+            return
+        if not model_runner.server_args.enable_torch_compile:
+            return
+        torch.compiler.set_stance("fail_on_recompile")
+        logger.info(
+            "[tpu] Warmup complete; froze torch.compile via "
+            "set_stance('fail_on_recompile')."
+        )
+
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
+
+        if self.forward_ct > 0 and not self.recompile_stance_set:
+            self.recompile_stance_set = True
+            self._maybe_arm_fail_on_recompile()
 
         if self.server_args.enable_unified_memory:
             try:

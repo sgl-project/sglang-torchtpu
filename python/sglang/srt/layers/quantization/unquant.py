@@ -309,7 +309,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 old = getattr(layer, name).data
                 new = old.transpose(1, 2).contiguous()
                 copy_or_rebind_param(layer, name, new)
-                old.untyped_storage().resize_(0)
+                # copy_or_rebind_param copies in place when the shape is
+                # unchanged, so a shape-preserving (square) transpose leaves the
+                # param pointing at `old`'s storage. Only free `old` when the
+                # param was actually rebound to a new storage; otherwise we would
+                # zero out the live weight (e.g. w2 when intermediate == hidden).
+                if (
+                    getattr(layer, name).data.untyped_storage().data_ptr()
+                    != old.untyped_storage().data_ptr()
+                ):
+                    old.untyped_storage().resize_(0)
             return
 
         _should_use_aiter_moe = (
