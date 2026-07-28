@@ -306,9 +306,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # to fused_moe_call with no per-step transpose.
         if _is_tpu:
             for name in ("w13_weight", "w2_weight"):
-                old = getattr(layer, name).data
+                param = getattr(layer, name)
+                old = param.data
                 new = old.transpose(1, 2).contiguous()
-                copy_or_rebind_param(layer, name, new)
+                # Rebind, not copy_or_rebind_param(): `new` always owns fresh
+                # storage (a transposed view is non-contiguous, so .contiguous()
+                # copies), and we free `old` right below. For a square expert
+                # matrix (n == k) the transpose is shape-preserving, so
+                # copy_or_rebind_param() takes its in-place copy branch and
+                # leaves the param pointing at `old`'s storage -- which
+                # resize_(0) then frees, producing a 0-byte parameter that fails
+                # at forward. Always rebinding keeps the param on `new`.
+                param.data = new
+                param.requires_grad_(False)
                 old.untyped_storage().resize_(0)
             return
 
