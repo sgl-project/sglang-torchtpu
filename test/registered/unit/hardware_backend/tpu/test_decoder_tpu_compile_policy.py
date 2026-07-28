@@ -4,8 +4,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -324,7 +325,24 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             attn_backend=SimpleNamespace(requires_kv_sync_after_compile=True),
             token_to_kv_pool=pool,
         )
-        with patch("torch_tpu._internal.sync.sync.synchronize") as sync:
+        # torch_tpu isn't installed on the CPU runners this suite targets; stub
+        # the module tree so _materialize_out's
+        # `from torch_tpu._internal.sync.sync import synchronize` resolves and is
+        # patchable (patch.dict also overrides a real torch_tpu on a TPU host).
+        tt = ModuleType("torch_tpu")
+        tt._internal = ModuleType("torch_tpu._internal")
+        tt._internal.sync = ModuleType("torch_tpu._internal.sync")
+        tt._internal.sync.sync = ModuleType("torch_tpu._internal.sync.sync")
+        tt._internal.sync.sync.synchronize = MagicMock()
+        stubs = {
+            "torch_tpu": tt,
+            "torch_tpu._internal": tt._internal,
+            "torch_tpu._internal.sync": tt._internal.sync,
+            "torch_tpu._internal.sync.sync": tt._internal.sync.sync,
+        }
+        with patch.dict(sys.modules, stubs), patch(
+            "torch_tpu._internal.sync.sync.synchronize"
+        ) as sync:
             _materialize_out(
                 SimpleNamespace(next_token_logits=logits),
                 forward_batch.attn_backend,
