@@ -50,6 +50,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import numpy as np
@@ -125,6 +126,8 @@ class TpuKVManagerBase(CommonKVManager):
         # Per-endpoint send locks (a single zmq PUSH socket must not be used
         # concurrently from multiple sender threads).
         self._endpoint_locks = defaultdict(threading.Lock)
+        self._transfer_infos_lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(thread_name_prefix=f"{self._name}-worker")
 
         # Process/track ID for tracing instrumentation
         self._initialize_trace_id()
@@ -190,13 +193,18 @@ class TpuKVManagerBase(CommonKVManager):
     def _serve(self, expected_tag: bytes, handler, copy: bool = True) -> None:
         """Start a daemon thread that pulls multipart messages off
         ``server_socket``, checks the leading tag, and dispatches to
-        ``handler``. Backend recv loops differ only in (tag, handler).
+        ``handler`` via ``_executor``. Backend recv loops differ only in (tag, handler).
 
         ``copy=False`` receives zero-copy ``zmq.Frame``s (memoryviews into ZMQ's
         own buffers) instead of materialising ``bytes`` — the handler then copies
-        each frame straight into its destination, saving one host copy. The tag
-        is read via ``bytes(msg[0])`` so the dispatch works for either form."""
+        each frame straight into its destination, saving one host copy."""
         name = self._name
+
+        def run_handler(msg):
+            try:
+                handler(msg)
+            except Exception:
+                logger.exception("%s: error handling %r message", name, expected_tag)
 
         def loop():
             while True:
@@ -211,46 +219,7 @@ class TpuKVManagerBase(CommonKVManager):
                 if not msg or bytes(msg[0]) != expected_tag:
                     logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
                     continue
-                try:
-                    handler(msg)
-                except Exception:
-                    logger.exception(
-                        "%s: error handling %r message", name, expected_tag
-                    )
-
-        threading.Thread(
-            target=loop,
-            name=f"{name}-{self.disaggregation_mode.value}",
-            daemon=True,
-        ).start()
-
-    def _serve_router(self, handlers: dict, copy: bool = True) -> None:
-        """Like :meth:`_serve` but dispatches by leading tag to one of several
-        handlers (``{tag: fn}``). Used when a role accepts more than one message
-        type on its socket (e.g. single- and multi-channel KV frames).
-
-        ``copy=False`` receives zero-copy ``zmq.Frame``s (see :meth:`_serve`);
-        the tag is read via ``bytes(msg[0])`` so dispatch works either way."""
-        name = self._name
-
-        def loop():
-            while True:
-                try:
-                    msg = self.server_socket.recv_multipart(copy=copy)
-                except zmq.ContextTerminated:
-                    logger.warning("%s recv loop ending: ZMQ context terminated", name)
-                    return
-                except Exception as e:  # pragma: no cover - socket teardown
-                    logger.exception("%s unexpected recv exception: %s", name, e)
-                    continue
-                handler = handlers.get(bytes(msg[0])) if msg else None
-                if handler is None:
-                    logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
-                    continue
-                try:
-                    handler(msg)
-                except Exception:
-                    logger.exception("%s: error handling %r", name, msg[0])
+                self._executor.submit(run_handler, msg)
 
         threading.Thread(
             target=loop,
@@ -292,13 +261,14 @@ class TpuKVManagerBase(CommonKVManager):
             decode_attn_tp_size,
         )
         endpoint = _tcp_endpoint(decode_ip, decode_port)
-        bucket = self.transfer_infos.setdefault(room, {})
-        bucket[endpoint] = self.record_decode_endpoint(
-            room, endpoint, num_pages, dst_tp_rank, decode_attn_tp_size
-        )
-        self.req_to_decode_prefix_len[room] = prefix_len
-        if len(bucket) >= required:
-            self.update_status(room, KVPoll.WaitingForInput)
+        with self._transfer_infos_lock:
+            bucket = self.transfer_infos.setdefault(room, {})
+            bucket[endpoint] = self.record_decode_endpoint(
+                room, endpoint, num_pages, dst_tp_rank, decode_attn_tp_size
+            )
+            self.req_to_decode_prefix_len[room] = prefix_len
+            if len(bucket) >= required:
+                self.update_status(room, KVPoll.WaitingForInput)
 
     def record_decode_endpoint(
         self,

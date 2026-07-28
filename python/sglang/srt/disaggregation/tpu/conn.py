@@ -420,15 +420,18 @@ class TpuKVManager(TpuKVManagerBase):
             return
         self._assert_layer_page_buffers()
         try:
-            bucket: Dict[str, _PrefillTransferInfo] = self.transfer_infos.get(room)
-            if not bucket:
+            with self._transfer_infos_lock:
+                infos: List[_PrefillTransferInfo] = list(
+                    self.transfer_infos.get(room, {}).values()
+                )
+            if not infos:
                 raise KVTransferError(room, "no decode endpoint registered")
 
             page_indices = np.asarray(page_indices, dtype=np.int64)
             n_pages = len(page_indices)
             plans = []  # (endpoint, lane_slice, dst_lane_start, num_lanes, sends_aux)
             total_lanes = 0
-            for info in bucket.values():
+            for info in infos:
                 spec = self._compute_kv_transfer_lane_spec(info)
                 lane_slice = (
                     None
@@ -614,22 +617,19 @@ class TpuKVManager(TpuKVManagerBase):
             self.record_failure(room, f"TPU KV channel push failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
-    def _recv_layers(self, frames: List[Union[zmq.Frame, bytes]]) -> List[StageBuf]:
-        """Background recv thread: turn the wire's per-layer frames into the
-        chunk's ``layer_blobs``, mirroring torchtpu-vllm's "unpack directly into
-        the staging slot". On the TPU path each frame's bytes are copied **once**
-        — straight from ZMQ's buffer into a pooled pinned+aligned ``StageBuf``
-        ready for H2D.
+    def _create_staging_buffer_for_chunks(
+        self, frames: List[zmq.Frame]
+    ) -> List[StageBuf]:
+        """Creates staging buffer from received chunks using shared executor."""
+        stage_pool = self._stage_pool
 
-        ``frames`` may be ``zmq.Frame``s (copy=False recv) or ``bytes`` (tests /
-        copy=True) — both are handled."""
-        stages = []
-        for f in frames:
-            mv = f.buffer if isinstance(f, zmq.Frame) else memoryview(f)
-            st = self._stage_pool.acquire(mv.nbytes)
-            st.copy_bytes(mv)  # the one and only host copy: wire -> staging
-            stages.append(st)
-        return stages
+        def _copy_frame_to_stage(frame: zmq.Frame) -> StageBuf:
+            mv = frame.buffer
+            st = stage_pool.acquire(mv.nbytes)
+            st.copy_bytes(mv)  # wire -> pinned staging (releases GIL)
+            return st
+
+        return list(self._executor.map(_copy_frame_to_stage, frames))
 
     @staticmethod
     def _release_staged(chunk: _PendingChunk) -> None:
@@ -676,7 +676,7 @@ class TpuKVManager(TpuKVManagerBase):
         num_aux = int(bytes(msg[10]).decode())
         aux_blobs = [bytes(f) for f in msg[11 : 11 + num_aux]]
         # One copy: wire -> pinned staging (or bytes on the CPU fallback path).
-        staged = self._recv_layers(msg[11 + num_aux :])
+        staged = self._create_staging_buffer_for_chunks(msg[11 + num_aux :])
         _nbytes = sum(b.nbytes if isinstance(b, StageBuf) else len(b) for b in staged)
         with perfetto_trace(
             self.trace_pid,

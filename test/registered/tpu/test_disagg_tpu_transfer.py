@@ -325,6 +325,8 @@ def _bare_manager(
     m.attn_tp_rank = 0
     m._initialize_trace_id()
     m._stage_pool = PinnedHostPool(max_bytes=m._stage_pool_budget())
+    m._executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tpu-kv-worker")
+    m._transfer_infos_lock = threading.Lock()
     m.request_status = {}
     m.failure_records = {}
     m.failure_lock = threading.Lock()
@@ -448,7 +450,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # gather (main thread) + push (bg); decode bg recv stashes; decode
         # main-thread process_decode_pending scatters.
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        msg = decode.server_socket.recv_multipart()
+        msg = decode.server_socket.recv_multipart(copy=False)
         decode._handle_kvdata_ch(msg)
         self.assertNotIn(room, decode.request_status)  # not scattered yet
         decode.process_decode_pending(room)
@@ -469,12 +471,12 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
         # chunk 0: pages [0:2], not last
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
         self.assertNotIn(room, decode.request_status)  # not Success yet
         # chunk 1: pages [2:4], last, carries aux
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
 
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
@@ -497,14 +499,14 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
         # Push chunk 1 (pages [2:4], IS last, carries aux) FIRST, deliver + scatter.
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
         # is_last scattered, but pages [0:2] have not arrived -> NOT Success yet.
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
 
         # Now the earlier chunk 0 (pages [0:2], not last) arrives.
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -562,7 +564,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=5)
         # 2 channels -> 2 messages; route each into the reassembly buffer.
         for _ in range(2):
-            decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+            decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
 
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
@@ -583,7 +585,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
         prefill.gather_and_push(room, np.array([2, 5, 9], dtype=np.int64), 0, True, 1)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
         self.assertEqual(decode.request_status[room], KVPoll.Failed)
 
@@ -665,11 +667,11 @@ class TestTpuReshardingProtocol(CustomTestCase):
 
         # Both prefill ranks pass aux_index; only rank0 should actually send it.
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)  # half
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart(copy=False))
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -735,8 +737,8 @@ class TestTpuReshardingProtocol(CustomTestCase):
         }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        d0._handle_kvdata_ch(d0.server_socket.recv_multipart())
-        d1._handle_kvdata_ch(d1.server_socket.recv_multipart())
+        d0._handle_kvdata_ch(d0.server_socket.recv_multipart(copy=False))
+        d1._handle_kvdata_ch(d1.server_socket.recv_multipart(copy=False))
         d0.process_decode_pending(room)
         d1.process_decode_pending(room)
 
@@ -1093,7 +1095,9 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     def _recv_and_scatter(self, decode, n_channels, room):
         if n_channels > 1:
             for _ in range(n_channels):
-                decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+                decode._handle_kvdata_ch(
+                    decode.server_socket.recv_multipart(copy=False)
+                )
         else:
             decode._handle_kvdata(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
