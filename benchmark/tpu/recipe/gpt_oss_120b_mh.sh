@@ -17,5 +17,6 @@ exec env \
   EP_SIZE="${EP_SIZE:-8}" \
   QUANTIZATION= \
   KV_CACHE_DTYPE= \
+  SGLANG_TPU_FUSED_MOE_SC_GATHER=0 \
   EXTRA_ARGS="${EXTRA_ARGS:---reasoning-parser gpt-oss}" \
   bash launch_server.sh
