@@ -518,6 +518,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        self.maybe_precompile_tpu_spec_ops()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1324,6 +1325,47 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def maybe_precompile_tpu_spec_ops(self) -> None:
+        if (
+            not current_platform.is_tpu()
+            or self.draft_worker is None
+            or not self.spec_algorithm.is_eagle3()
+            or not self.enable_overlap
+        ):
+            return
+
+        from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+            SpecDecodeCompilePolicyMixin,
+        )
+        from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
+            precompile_spec_v2_ops,
+        )
+
+        compile_policy = self.tp_worker.model_runner.compile_policy
+        if not isinstance(compile_policy, SpecDecodeCompilePolicyMixin):
+            return
+        assert compile_policy.b_bucketer is not None
+
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+            self.draft_worker.draft_worker.draft_runner
+        )
+        if hidden_size is None or hidden_dtype is None:
+            return
+
+        num_verify_tokens = self.server_args.speculative_num_draft_tokens
+        precompile_spec_v2_ops(
+            device=torch.device(self.device),
+            physical_batch_buckets=compile_policy.b_bucketer.buckets,
+            num_verify_tokens=num_verify_tokens,
+            vocab_size=self.model_config.vocab_size,
+            verify_logits_dtype=(
+                torch.float32 if self.ps.tp_size > 1 else self.model_config.dtype
+            ),
+            draft_logits_dtype=self.model_config.dtype,
+            hidden_size=hidden_size,
+            hidden_dtype=hidden_dtype,
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding

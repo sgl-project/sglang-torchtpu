@@ -15,6 +15,11 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+    generate_draft_extend_select_argmax_warmup,
+    generate_verify_post_warmup,
+    generate_verify_tree_greedy_warmup,
+)
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -321,7 +326,7 @@ def build_tree_kernel_efficient(
     )
 
 
-@compiled_op
+@compiled_op(warmup_data_generator=generate_verify_tree_greedy_warmup)
 def _verify_tree_greedy_torch(
     next_token_logits: torch.Tensor,
     candidates: torch.Tensor,
@@ -527,7 +532,7 @@ def verify_tree_greedy_func(
     return predicts, accept_index, accept_token_num
 
 
-@compiled_op
+@compiled_op(warmup_data_generator=generate_verify_post_warmup)
 def fused_verify_post_func(
     seq_lens: torch.Tensor,
     accept_lens: torch.Tensor,
@@ -544,7 +549,7 @@ def fused_verify_post_func(
     return new_seq_lens, bonus_tokens
 
 
-@compiled_op
+@compiled_op(warmup_data_generator=generate_draft_extend_select_argmax_warmup)
 def fused_draft_extend_select_argmax_func(
     next_token_logits: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
