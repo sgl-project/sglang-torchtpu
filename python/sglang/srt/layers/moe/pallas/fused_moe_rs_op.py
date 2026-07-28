@@ -75,8 +75,8 @@ def _build_fused_moe_rs_op():
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
 
-    from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
     from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+    from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
 
     mesh = _get_mesh()
 
