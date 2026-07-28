@@ -45,6 +45,7 @@ What a new backend implements (the seam)
 
 from __future__ import annotations
 
+import enum
 import logging
 import threading
 import time
@@ -72,7 +73,14 @@ logger = logging.getLogger(__name__)
 # The decode -> prefill "room R ready; pull from my zmq endpoint" notification.
 # Identical across backends (it is pure control), so it lives in the base; each
 # backend defines its own *data* tag (e.g. KVDATA / KVMETA) in its own module.
-TAG_TRSFR = b"TRSFR"
+
+
+class MessageTag(bytes, enum.Enum):
+    # Prefill side: a decode signalled it is ready for room R.
+    TAG_TRSFR = b"TRSFR"
+    # prefill -> decode, one frame per parallel channel (#3, opt-in). Each carries a
+    # contiguous slice of the layers; the decode reassembles across channels.
+    TAG_KVDATA_CH = b"KVDATAC"
 
 
 class KVTransferError(Exception):
@@ -260,7 +268,7 @@ class TpuKVManagerBase(CommonKVManager):
         #  dst_tp_rank, decode_attn_tp_size]
         if len(msg) != 10:
             raise ValueError(
-                f"Malformed {TAG_TRSFR.decode()} message. "
+                f"Malformed {MessageTag.TAG_TRSFR.decode()} message. "
                 f"Expected 10 frames, got {len(msg)}."
             )
         room = int(msg[1].decode())
@@ -423,7 +431,7 @@ class TpuKVReceiverBase(CommonKVReceiver):
             with lock:
                 sock.send_multipart(
                     [
-                        TAG_TRSFR,
+                        MessageTag.TAG_TRSFR,
                         str(self.bootstrap_room).encode(),
                         self.kv_mgr.local_ip.encode(),
                         str(self.kv_mgr.rank_port).encode(),

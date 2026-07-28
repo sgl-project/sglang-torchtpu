@@ -31,7 +31,7 @@ import ctypes
 import enum
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -296,46 +296,6 @@ def bytes_to_tensor(blob, dtype: torch.dtype, shape) -> torch.Tensor:
     return flat.view(dtype).reshape(shape)
 
 
-def gather_pages_to_host(
-    layer_buffers: Sequence[torch.Tensor],
-    page_indices: np.ndarray,
-    lane_slice: LaneSlice = None,
-) -> List[bytes]:
-    """D2H: gather ``page_indices`` (block ids) from every layer buffer and
-    return one raw-byte blob per layer. Runs on the prefill side.
-
-    On TPU the D2H of all layers is issued as a single batched
-    ``batch_transfer_d2h_sync`` (one dispatch, one device sync) instead of a
-    per-layer ``.cpu()`` loop (which syncs the device queue once per layer).
-    On CPU (unit tests) it falls back to the simple per-layer path.
-
-    ``lane_slice`` = ``(start, count)`` restricts the gather to a KV-head
-    sub-range on the packed-lane axis (dim 2) for MHA resharding; None gathers
-    the whole per-rank page (the equal-attn_tp path)."""
-    if len(layer_buffers) == 0:
-        return []
-    device = layer_buffers[0].device
-    idx = torch.as_tensor(np.asarray(page_indices), dtype=torch.long, device=device)
-
-    # Device-side gather is the same either way (index_select per layer); the
-    # optional dim-2 narrow selects the KV-head slice before the gather.
-    src_shards = [
-        _narrow_lanes(buf, lane_slice).index_select(0, idx) for buf in layer_buffers
-    ]
-
-    bt = _batch_transfer() if device.type != "cpu" else None
-    if bt is not None:
-        d2h_sync, _, _ = bt
-        host_dsts = [
-            torch.empty(s.shape, dtype=s.dtype, device="cpu") for s in src_shards
-        ]
-        d2h_sync(src_shards, host_dsts)  # single batched D2H, one sync
-        return [tensor_to_bytes(h) for h in host_dsts]
-
-    # Per-layer fallback (CPU / batch_transfer unavailable).
-    return [tensor_to_bytes(s.to("cpu")) for s in src_shards]
-
-
 def gather_pages_to_stage(
     layer_buffers: Sequence[torch.Tensor],
     page_indices: np.ndarray,
@@ -405,17 +365,15 @@ def gather_pages_to_stage_async(
 def scatter_stage_from_host(
     layer_buffers: Sequence[torch.Tensor],
     page_indices: np.ndarray,
-    layer_blobs: Sequence[Union[StageBuf, bytes]],
+    stages: Sequence[StageBuf],
     specs: Sequence[LayerPageSpec],
-    pool: PinnedHostPool,
     dst_lane_slice: LaneSlice = None,
 ) -> None:
     """H2D scatter via pooled pinned staging: batch_transfer_h2d into device
     shards, then index_copy_ into the KV pool block positions.
 
-    ``layer_blobs`` is either a list of :class:`StageBuf`s (pre-staged by the
-    recv thread — no copy here) or raw bytes/memoryviews (acquire staging and
-    copy). Staging buffers are released to the pool when done.
+    ``stages`` is a list of :class:`StageBuf`s pre-staged by the recv thread.
+    Staging buffers are released to the pool when done.
 
     ``dst_lane_slice`` = ``(start, count)`` writes the received KV-head slice
     into that dim-2 sub-range of each layer buffer (MHA resharding); None writes
@@ -431,13 +389,6 @@ def scatter_stage_from_host(
     device = layer_buffers[0].device
     n_pages = len(np.asarray(page_indices))
     idx = torch.as_tensor(np.asarray(page_indices), dtype=torch.long, device=device)
-    pre_staged = bool(layer_blobs) and isinstance(layer_blobs[0], StageBuf)
-    if pre_staged:
-        stages = layer_blobs  # recv thread already copied wire -> staging
-    else:
-        stages = [pool.acquire(len(blob)) for blob in layer_blobs]
-        for st, blob in zip(stages, layer_blobs):
-            st.copy_bytes(blob)
     try:
         host_srcs = [
             st.view(spec.dtype, (n_pages, *spec.page_block_shape))
@@ -457,58 +408,7 @@ def scatter_stage_from_host(
             st.release()
 
 
-def scatter_pages_from_host(
-    layer_buffers: Sequence[torch.Tensor],
-    page_indices: np.ndarray,
-    layer_blobs: Sequence[bytes],
-    specs: Sequence[LayerPageSpec],
-    dst_lane_slice: LaneSlice = None,
-) -> None:
-    """H2D: scatter per-layer byte blobs into ``page_indices`` (block ids) of
-    every layer buffer, writing onto whatever device the buffers live on.
-    Runs on the decode side.
-
-    ``dst_lane_slice`` = ``(start, count)`` writes the received KV-head slice
-    into that dim-2 sub-range of each layer buffer (MHA resharding); None writes
-    the whole page."""
-    if len(layer_buffers) == 0:
-        return
-    assert len(layer_blobs) == len(layer_buffers), (
-        f"layer count mismatch: {len(layer_blobs)} blobs vs "
-        f"{len(layer_buffers)} layer buffers"
-    )
-    specs = _adjust_layer_page_specs_lane_count(specs, dst_lane_slice)
-    device = layer_buffers[0].device
-    n_pages = len(np.asarray(page_indices))
-    idx = torch.as_tensor(np.asarray(page_indices), dtype=torch.long, device=device)
-    host_srcs = [
-        bytes_to_tensor(blob, spec.dtype, (n_pages, *spec.page_block_shape))
-        for blob, spec in zip(layer_blobs, specs)
-    ]
-    bt = _batch_transfer() if device.type != "cpu" else None
-    if bt is not None:
-        _, h2d_sync, _ = bt
-        # Batched H2D into contiguous device shards (one dispatch, one sync),
-        # then scatter each shard into its block positions on the main thread
-        # (index_copy_ touches the donated kv_buffer — must stay on this thread).
-        # batch_transfer requires >=32B-aligned host buffers; ``frombuffer`` over
-        # a bytearray is unaligned, so clone into the (64B-aligned) torch CPU
-        # allocator first. Phase 2's pinned aligned staging pool removes this copy.
-        aligned_srcs = [h.clone() for h in host_srcs]
-        dev_shards = [
-            torch.empty(
-                (n_pages, *spec.page_block_shape), dtype=spec.dtype, device=device
-            )
-            for spec in specs
-        ]
-        h2d_sync(aligned_srcs, dev_shards)
-        for buf, shard in zip(layer_buffers, dev_shards):
-            _index_copy_pages(_narrow_lanes(buf, dst_lane_slice), idx, shard)
-        return
-
-    # Per-layer fallback (CPU / batch_transfer unavailable).
-    for buf, host in zip(layer_buffers, host_srcs):
-        _index_copy_pages(_narrow_lanes(buf, dst_lane_slice), idx, host.to(device))
+scatter_to_device_via_pinned_staging_pool = scatter_stage_from_host
 
 
 def _index_copy_pages(buf: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -> None:

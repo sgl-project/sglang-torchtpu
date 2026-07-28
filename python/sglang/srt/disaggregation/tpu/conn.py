@@ -65,8 +65,8 @@ from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
 # Re-exported from base so existing imports (and a future raiden backend)
 # keep resolving ``from ...tpu.conn import KVTransferError, _tcp_endpoint``.
 from sglang.srt.disaggregation.tpu.base import (  # noqa: F401
-    TAG_TRSFR,
     KVTransferError,
+    MessageTag,
     TpuKVBootstrapServerBase,
     TpuKVManagerBase,
     TpuKVReceiverBase,
@@ -81,17 +81,10 @@ from sglang.srt.disaggregation.tpu.host_staging import (
 
 logger = logging.getLogger(__name__)
 
-# prefill -> decode: KV page bytes (+ aux on last chunk). The decode->prefill
-# ready notification (TAG_TRSFR) is shared and lives in base.
-TAG_KVDATA = b"KVDATA"
-# prefill -> decode, one frame per parallel channel (#3, opt-in). Each carries a
-# contiguous slice of the layers; the decode reassembles across channels.
-TAG_KVDATA_CH = b"KVDATAC"
-
 # Background threads per prefill rank for the (host-only) ZMQ push — i.e. how
 # many distinct transfers (rooms/chunks) a rank pushes concurrently. Orthogonal
 # to SGLANG_TPU_KV_CHANNELS (parallel streams *within* one transfer); the
-# effective stream count is this x channels. See _push / _push_channels.
+# effective stream count is this x channels. See _push_channels.
 _PUSH_POOL_WORKERS = 4
 
 
@@ -205,7 +198,7 @@ class _PendingChunk:
 
     index_start: int
     num_pages: int
-    layer_blobs: List[Union[StageBuf, bytes]]
+    layer_blobs: List[StageBuf]
     aux_blobs: List[bytes]
     dst_lane_start: int
     num_lanes: int
@@ -264,7 +257,7 @@ class TpuKVManager(TpuKVManagerBase):
         # total (not by an is_last push), mirroring the decode. See _note_push_*.
         self._push_progress: Dict[int, dict] = {}
         self._push_progress_lock = threading.Lock()
-        self._serve(TAG_TRSFR, self._handle_transfer)
+        self._serve(MessageTag.TAG_TRSFR, self._handle_transfer)
 
     def _init_decode(self) -> None:
         self.decode_states: Dict[int, _DecodeTransferState] = {}
@@ -279,17 +272,9 @@ class TpuKVManager(TpuKVManagerBase):
         # Multi-channel reassembly buffer (#3), keyed by (room, index_start).
         self._chan_reasm: Dict = {}
         self._chan_reasm_lock = threading.Lock()
-        # Accept both the single-message (TAG_KVDATA) and per-channel
-        # (TAG_KVDATA_CH) formats on the one PULL socket. copy=False so the recv
-        # thread can copy each layer frame *once*, straight into pinned staging
-        # (see _recv_layers), rather than wire -> bytes -> staging.
-        self._serve_router(
-            {
-                TAG_KVDATA: self._handle_kvdata,
-                TAG_KVDATA_CH: self._handle_kvdata_ch,
-            },
-            copy=False,
-        )
+        # copy=False so the recv thread can copy each layer frame *once*, straight
+        # into pinned staging (see _recv_layers), rather than wire -> bytes -> staging.
+        self._serve(MessageTag.TAG_KVDATA_CH, self._handle_kvdata_ch, copy=False)
 
     def _on_pool_attached(self) -> None:
         # Fused RPA v3 layer buffer: [num_blocks, page_size, kv_heads_packed,
@@ -401,34 +386,25 @@ class TpuKVManager(TpuKVManagerBase):
 
     def _gather_lanes(
         self, page_indices: np.ndarray, lane_slice: Optional[Tuple[int, int]]
-    ) -> Tuple[
-        List[Union[memoryview, bytes]], Optional[List[StageBuf]], Optional[Any], int
-    ]:
+    ) -> Tuple[List[memoryview], List[StageBuf], Optional[Any], int]:
         """Gathers lanes by lane slice and page indices, D2H."""
-        pool = getattr(self, "_stage_pool", None)
-        use_stage = (
-            pool is not None
-            and self.layer_buffers
-            and self.layer_buffers[0].device.type != "cpu"
-        )
         d2h_future = None
-        if use_stage:
-            if getattr(self, "_async_d2h", False):
-                d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
-                    self.layer_buffers, page_indices, pool, lane_slice=lane_slice
-                )
-            else:
-                stages = tpu_transfer.gather_pages_to_stage(
-                    self.layer_buffers, page_indices, pool, lane_slice=lane_slice
-                )
-            layer_frames = [st.mv() for st in stages]
-            nbytes = sum(st.nbytes for st in stages)
-        else:
-            stages = None
-            layer_frames = tpu_transfer.gather_pages_to_host(
-                self.layer_buffers, page_indices, lane_slice=lane_slice
+        if getattr(self, "_async_d2h", False):
+            d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
+                self.layer_buffers,
+                page_indices,
+                self._stage_pool,
+                lane_slice=lane_slice,
             )
-            nbytes = sum(len(b) for b in layer_frames)
+        else:
+            stages = tpu_transfer.gather_pages_to_stage(
+                self.layer_buffers,
+                page_indices,
+                self._stage_pool,
+                lane_slice=lane_slice,
+            )
+        layer_frames = [st.mv() for st in stages]
+        nbytes = sum(st.nbytes for st in stages)
         return layer_frames, stages, d2h_future, nbytes
 
     def gather_and_push(
@@ -519,47 +495,21 @@ class TpuKVManager(TpuKVManagerBase):
                     bool(aux_blobs),
                     nbytes,
                 )
-                if n_ch > 1:
-                    self._push_pool.submit(
-                        self._push_channels,
-                        room,
-                        endpoint,
-                        index_start,
-                        n_pages,
-                        dst_lane_start,
-                        num_lanes,
-                        units,
-                        aux_blobs,
-                        layer_frames,
-                        stages,
-                        d2h_future,
-                        n_ch,
-                    )
-                else:
-                    payload = (
-                        [
-                            TAG_KVDATA,
-                            str(room).encode(),
-                            str(index_start).encode(),
-                            str(n_pages).encode(),
-                            str(dst_lane_start).encode(),
-                            str(num_lanes).encode(),
-                            str(len(aux_blobs)).encode(),
-                        ]
-                        + aux_blobs
-                        + layer_frames
-                    )
-                    self._push_pool.submit(
-                        self._push,
-                        room,
-                        endpoint,
-                        index_start,
-                        payload,
-                        n_pages,
-                        units,
-                        stages,
-                        d2h_future,
-                    )
+                self._push_pool.submit(
+                    self._push_channels,
+                    room,
+                    endpoint,
+                    index_start,
+                    n_pages,
+                    dst_lane_start,
+                    num_lanes,
+                    units,
+                    aux_blobs,
+                    layer_frames,
+                    stages,
+                    d2h_future,
+                    n_ch,
+                )
         except Exception as e:
             self._note_push_failed(room)
             if isinstance(e, tpu_transfer.ReshardUnsupportedError):
@@ -570,61 +520,6 @@ class TpuKVManager(TpuKVManagerBase):
             else:
                 logger.exception("KV gather failed for room %s", room)
             self.record_failure(room, f"TPU KV gather failed: {e}")
-            self.update_status(room, KVPoll.Failed)
-
-    def _push(
-        self,
-        room: int,
-        endpoint: str,
-        index_start: int,
-        payload: List[Any],
-        n_pages: int,
-        units: int,
-        stages: Optional[List[StageBuf]] = None,
-        d2h_future: Optional[Any] = None,
-    ) -> None:
-        """Background thread: host-only ZMQ send of the gathered KV bytes.
-
-        With pooled staging (``stages`` set) the layer frames are the pinned
-        buffers' memoryviews, sent **zero-copy** (``copy=False``); the buffers
-        are returned to the pool only after the send has drained (tracked), so
-        a reused slot can never clobber an in-flight send. When the D2H was
-        issued async (#7), ``d2h_future`` is waited here — off the scheduler
-        thread — before the bytes are read for sending."""
-        n_layers = len(self.layer_buffers)
-        push_name = f"push/r{room}/i{index_start}"
-        wait_name = f"gatherwait/r{room}/i{index_start}"
-        try:
-            if d2h_future is not None:
-                with perfetto_trace(self.trace_pid, wait_name):
-                    d2h_future.wait()
-            with perfetto_trace(
-                self.trace_pid,
-                push_name,
-                shape=lambda: self._get_page_shape_str(n_pages),
-                layers=f"{n_layers}L",
-            ):
-                sock = self._connect(endpoint)
-                with self._endpoint_locks[endpoint]:
-                    if stages is not None:
-                        tracker = sock.send_multipart(payload, copy=False, track=True)
-                    else:
-                        tracker = None
-                        sock.send_multipart(payload)
-                if tracker is not None:
-                    tracker.wait()
-            if stages is not None:
-                for st in stages:
-                    st.release()
-            # Count this chunk's pages toward the room total; Success fires once
-            # every page has drained, regardless of push completion order.
-            self._note_push_done(room, units)
-        except Exception as e:
-            # On failure don't recycle the buffers: zmq (copy=False) may still
-            # hold them until its send drains — let GC reclaim them instead.
-            logger.exception("KV push failed for room %s", room)
-            self._note_push_failed(room)
-            self.record_failure(room, f"TPU KV push failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
     def _channel_sockets(self, endpoint: str, n: int) -> List[zmq.Socket]:
@@ -683,7 +578,7 @@ class TpuKVManager(TpuKVManagerBase):
                     aux = aux_blobs if ch == 0 else []
                     msg = (
                         [
-                            TAG_KVDATA_CH,
+                            MessageTag.TAG_KVDATA_CH,
                             str(room).encode(),
                             str(index_start).encode(),
                             str(num_pages).encode(),
@@ -719,36 +614,22 @@ class TpuKVManager(TpuKVManagerBase):
             self.record_failure(room, f"TPU KV channel push failed: {e}")
             self.update_status(room, KVPoll.Failed)
 
-    def _recv_layers(
-        self, frames: List[Union[zmq.Frame, bytes]]
-    ) -> List[Union[StageBuf, bytes]]:
+    def _recv_layers(self, frames: List[Union[zmq.Frame, bytes]]) -> List[StageBuf]:
         """Background recv thread: turn the wire's per-layer frames into the
         chunk's ``layer_blobs``, mirroring torchtpu-vllm's "unpack directly into
         the staging slot". On the TPU path each frame's bytes are copied **once**
         — straight from ZMQ's buffer into a pooled pinned+aligned ``StageBuf``
-        ready for H2D — instead of the old wire -> ``bytes`` -> ``StageBuf`` two
-        copies. The StageBufs are held until the main-thread scatter releases
-        them (the occupancy cost of dropping the extra copy). On the CPU
-        fallback path (no pool / cpu buffers / no batch_transfer) we materialise
-        plain ``bytes`` for ``scatter_pages_from_host``.
+        ready for H2D.
 
         ``frames`` may be ``zmq.Frame``s (copy=False recv) or ``bytes`` (tests /
         copy=True) — both are handled."""
-        pool = getattr(self, "_stage_pool", None)
-        if (
-            pool is not None
-            and self.layer_buffers
-            and self.layer_buffers[0].device.type != "cpu"
-        ):
-            stages = []
-            for f in frames:
-                mv = f.buffer if isinstance(f, zmq.Frame) else memoryview(f)
-                st = pool.acquire(mv.nbytes)
-                st.copy_bytes(mv)  # the one and only host copy: wire -> staging
-                stages.append(st)
-            return stages
-        # CPU fallback: keep raw bytes (scatter_pages_from_host re-aligns).
-        return [bytes(f) for f in frames]
+        stages = []
+        for f in frames:
+            mv = f.buffer if isinstance(f, zmq.Frame) else memoryview(f)
+            st = self._stage_pool.acquire(mv.nbytes)
+            st.copy_bytes(mv)  # the one and only host copy: wire -> staging
+            stages.append(st)
+        return stages
 
     @staticmethod
     def _release_staged(chunk: _PendingChunk) -> None:
@@ -775,46 +656,10 @@ class TpuKVManager(TpuKVManagerBase):
             state.dst_lanes_total,
         )
 
-    def _handle_kvdata(self, msg: List[zmq.Frame]) -> None:
-        """Background thread: parse a KVDATA frame and stash the chunk. The layer
-        bytes are copied once, straight into pinned staging (``_recv_layers``);
-        NO device ops here — the H2D scatter happens on the main thread in
-        process_decode_pending(). ``msg`` items are ``zmq.Frame``s (copy=False)."""
-        # [TAG, room, index_start, num_pages, dst_lane_start, num_lanes, num_aux]
-        #   + aux + layers
-        room = int(bytes(msg[1]).decode())
-        index_start = int(bytes(msg[2]).decode())
-        num_pages = int(bytes(msg[3]).decode())
-        dst_lane_start = int(bytes(msg[4]).decode())
-        num_lanes = int(bytes(msg[5]).decode())
-        num_aux = int(bytes(msg[6]).decode())
-        aux_blobs = [bytes(f) for f in msg[7 : 7 + num_aux]]
-        layer_blobs = self._recv_layers(msg[7 + num_aux :])
-        _nbytes = sum(
-            b.nbytes if isinstance(b, StageBuf) else len(b) for b in layer_blobs
-        )
-        with perfetto_trace(
-            self.trace_pid,
-            f"recv_{room}",
-            shape=lambda: self._get_page_shape_str(num_pages, num_lanes),
-            layers=f"{len(layer_blobs)}L",
-            size=lambda: fmt_bytes(_nbytes),
-        ):
-            chunk = _PendingChunk(
-                index_start,
-                num_pages,
-                layer_blobs,
-                aux_blobs,
-                dst_lane_start,
-                num_lanes,
-            )
-            with self.decode_pending_lock:
-                self.decode_pending[room].append(chunk)
-
     def _handle_kvdata_ch(self, msg: List[zmq.Frame]) -> None:
         """Background thread (#3): reassemble one channel's layer slice into the
         per-(room, index_start) buffer; once all channels have arrived, enqueue
-        the complete chunk for the main-thread scatter (same as _handle_kvdata).
+        the complete chunk for the main-thread scatter.
         Each channel's layer frames are copied once, straight into pinned staging
         (``_recv_layers``)."""
         # [TAG, room, index_start, num_pages, dst_lane_start, num_lanes,
@@ -931,10 +776,7 @@ class TpuKVManager(TpuKVManagerBase):
                 )
             # Validate stage buffer size match the chunk.
             else:
-                got = sum(
-                    b.nbytes if isinstance(b, StageBuf) else len(b)
-                    for b in chunk.layer_blobs
-                )
+                got = sum(b.nbytes for b in chunk.layer_blobs)
                 want = self._expected_chunk_bytes(chunk.num_pages, chunk.num_lanes)
                 if got != want:
                     fail_reason = (
@@ -958,10 +800,7 @@ class TpuKVManager(TpuKVManagerBase):
             )
             dst_lane_slice = None if full else (chunk.dst_lane_start, chunk.num_lanes)
 
-            _nbytes = sum(
-                b.nbytes if isinstance(b, StageBuf) else len(b)
-                for b in chunk.layer_blobs
-            )
+            _nbytes = sum(b.nbytes for b in chunk.layer_blobs)
             with perfetto_trace(
                 self.trace_pid,
                 f"scatter_{room}",
@@ -972,31 +811,15 @@ class TpuKVManager(TpuKVManagerBase):
                 size=lambda: fmt_bytes(_nbytes),
             ):
                 _t0 = time.perf_counter()
-                pool = getattr(self, "_stage_pool", None)
-                if (
-                    pool is not None
-                    and self.layer_buffers
-                    and self.layer_buffers[0].device.type != "cpu"
-                ):
-                    tpu_transfer.scatter_stage_from_host(
-                        self.layer_buffers,
-                        dst_pages,
-                        chunk.layer_blobs,
-                        self.layer_specs,
-                        pool,
-                        dst_lane_slice,
-                    )
-                else:
-                    tpu_transfer.scatter_pages_from_host(
-                        self.layer_buffers,
-                        dst_pages,
-                        chunk.layer_blobs,
-                        self.layer_specs,
-                        dst_lane_slice,
-                    )
-                stats = getattr(self, "_scatter_stats", None)
-                if stats is not None:
-                    stats.record(time.perf_counter() - _t0, _nbytes)
+                tpu_transfer.scatter_stage_from_host(
+                    self.layer_buffers,
+                    dst_pages,
+                    chunk.layer_blobs,
+                    self.layer_specs,
+                    dst_lane_slice,
+                )
+                if self._scatter_stats is not None:
+                    self._scatter_stats.record(time.perf_counter() - _t0, _nbytes)
 
             state.scattered += chunk.num_pages * chunk.num_lanes
             logger.info(

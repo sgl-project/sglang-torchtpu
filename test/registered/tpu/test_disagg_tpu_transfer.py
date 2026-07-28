@@ -31,6 +31,7 @@ import unittest
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -39,19 +40,50 @@ import zmq
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.tpu import transfer as T
 from sglang.srt.disaggregation.tpu.conn import (
-    TAG_KVDATA,
-    TAG_KVDATA_CH,
-    TAG_TRSFR,
+    MessageTag,
     TpuKVManager,
     _PrefillTransferInfo,
     _tcp_endpoint,
 )
+from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
 # Enable Perfetto tracing for tests to exercise tracing code paths
 envs.SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING.set(True)
+
+
+def _mock_d2h_sync(src_shards, dsts):
+    for s, d in zip(src_shards, dsts):
+        if hasattr(d, "copy_"):
+            d.copy_(s)
+        else:
+            d[...] = s
+
+
+def _mock_h2d_sync(host_srcs, dev_dsts):
+    for h, d in zip(host_srcs, dev_dsts):
+        d.copy_(h)
+
+
+def _mock_d2h_async(src_shards, dsts):
+    _mock_d2h_sync(src_shards, dsts)
+    fut = MagicMock()
+    fut.wait = lambda: None
+    return fut
+
+
+_MOCK_BATCH_TRANSFER = (_mock_d2h_sync, _mock_h2d_sync, _mock_d2h_async)
+
+
+def setUpModule():
+    if T._batch_transfer() is None:
+        patcher = patch(
+            "sglang.srt.disaggregation.tpu.transfer._batch_transfer",
+            return_value=_MOCK_BATCH_TRANSFER,
+        )
+        patcher.start()
 
 
 def _skip_if_no_tpu() -> bool:
@@ -94,9 +126,10 @@ class TestTpuTransferDataPlane(CustomTestCase):
 
         src_pages = np.array([1, 4, 6], dtype=np.int64)
         dst_pages = np.array([7, 0, 3], dtype=np.int64)  # deliberately remapped
-        blobs = T.gather_pages_to_host(sbufs, src_pages)
-        self.assertEqual(len(blobs), 3)
-        T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, dst_lane_slice=None)
+        pool = PinnedHostPool()
+        stages = T.gather_pages_to_stage(sbufs, src_pages, pool)
+        self.assertEqual(len(stages), 3)
+        T.scatter_stage_from_host(dbufs, dst_pages, stages, specs, dst_lane_slice=None)
 
         for li in range(3):
             for sp, dp in zip(src_pages, dst_pages):
@@ -214,8 +247,11 @@ class TestTpuTransferDataPlane(CustomTestCase):
         src_pages = np.array([1, 4, 6], dtype=np.int64)
         dst_pages = np.array([7, 0, 3], dtype=np.int64)
 
-        blobs = T.gather_pages_to_host(sbufs, src_pages, lane_slice=(0, 2))
-        T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, dst_lane_slice=(2, 2))
+        pool = PinnedHostPool()
+        stages = T.gather_pages_to_stage(sbufs, src_pages, pool, lane_slice=(0, 2))
+        T.scatter_stage_from_host(
+            dbufs, dst_pages, stages, specs, dst_lane_slice=(2, 2)
+        )
         for li in range(2):
             for sp, dp in zip(src_pages, dst_pages):
                 self.assertTrue(
@@ -288,6 +324,7 @@ def _bare_manager(
     m.attn_dp_rank = 0
     m.attn_tp_rank = 0
     m._initialize_trace_id()
+    m._stage_pool = PinnedHostPool(max_bytes=m._stage_pool_budget())
     m.request_status = {}
     m.failure_records = {}
     m.failure_lock = threading.Lock()
@@ -332,11 +369,16 @@ def _bare_manager(
         # mirror its opt-in-feature defaults: stats off, single push channel.
         m._gather_stats = None
         m._n_channels = 1
+        m._chan_socks = {}
+        m._chan_socks_lock = threading.Lock()
     else:
         m.decode_states = {}
         m.decode_states_lock = threading.Lock()
         m.decode_pending = defaultdict(deque)
         m.decode_pending_lock = threading.Lock()
+        m._chan_reasm = {}
+        m._chan_reasm_lock = threading.Lock()
+        m._scatter_stats = None
     m.attach_kv_pool(pool)
     return m
 
@@ -366,13 +408,13 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
     def test_trsfr_marks_waiting_for_input(self):
         prefill, decode, *_ = self._make_pair()
-        prefill._serve(TAG_TRSFR, prefill._handle_transfer)
+        prefill._serve(MessageTag.TAG_TRSFR, prefill._handle_transfer)
         room = 4242
         push = zmq.Context.instance().socket(zmq.PUSH)
         push.connect(_tcp_endpoint("127.0.0.1", prefill.rank_port))
         push.send_multipart(
             [
-                TAG_TRSFR,
+                MessageTag.TAG_TRSFR,
                 str(room).encode(),
                 b"127.0.0.1",
                 str(decode.rank_port).encode(),
@@ -407,7 +449,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # main-thread process_decode_pending scatters.
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
         msg = decode.server_socket.recv_multipart()
-        decode._handle_kvdata(msg)
+        decode._handle_kvdata_ch(msg)
         self.assertNotIn(room, decode.request_status)  # not scattered yet
         decode.process_decode_pending(room)
 
@@ -427,12 +469,12 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
         # chunk 0: pages [0:2], not last
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         self.assertNotIn(room, decode.request_status)  # not Success yet
         # chunk 1: pages [2:4], last, carries aux
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
@@ -455,14 +497,14 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
         # Push chunk 1 (pages [2:4], IS last, carries aux) FIRST, deliver + scatter.
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         # is_last scattered, but pages [0:2] have not arrived -> NOT Success yet.
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
 
         # Now the earlier chunk 0 (pages [0:2], not last) arrives.
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -541,7 +583,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
         prefill.gather_and_push(room, np.array([2, 5, 9], dtype=np.int64), 0, True, 1)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         self.assertEqual(decode.request_status[room], KVPoll.Failed)
 
@@ -550,13 +592,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         decode H2D scatter driven on the (test's) main thread like poll()."""
         prefill, decode, ppool, dpool, paux, daux = self._make_pair()
         # bg recv -> stashes host bytes only (inlined _init_decode recv loop).
-        decode._serve_router(
-            {
-                TAG_KVDATA: decode._handle_kvdata,
-                TAG_KVDATA_CH: decode._handle_kvdata_ch,
-            },
-            copy=False,
-        )
+        decode._serve(MessageTag.TAG_KVDATA_CH, decode._handle_kvdata_ch, copy=False)
         room = 555
         src_pages = np.array([1, 7, 12], dtype=np.int64)
         dst_pages = np.array([3, 9, 0], dtype=np.int64)
@@ -629,11 +665,11 @@ class TestTpuReshardingProtocol(CustomTestCase):
 
         # Both prefill ranks pass aux_index; only rank0 should actually send it.
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)  # half
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -699,8 +735,8 @@ class TestTpuReshardingProtocol(CustomTestCase):
         }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        d0._handle_kvdata(d0.server_socket.recv_multipart())
-        d1._handle_kvdata(d1.server_socket.recv_multipart())
+        d0._handle_kvdata_ch(d0.server_socket.recv_multipart())
+        d1._handle_kvdata_ch(d1.server_socket.recv_multipart())
         d0.process_decode_pending(room)
         d1.process_decode_pending(room)
 
@@ -887,8 +923,9 @@ class TestTpuTransferOnDevice(CustomTestCase):
         src_pages = np.array([0, 1], dtype=np.int64)
         dst_pages = np.array([1, 0], dtype=np.int64)
 
-        blobs = T.gather_pages_to_host(sbufs, src_pages)
-        T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, dst_lane_slice=None)
+        pool = PinnedHostPool()
+        stages = T.gather_pages_to_stage(sbufs, src_pages, pool)
+        T.scatter_stage_from_host(dbufs, dst_pages, stages, specs, dst_lane_slice=None)
 
         for li in range(2):
             for sp, dp in zip(src_pages, dst_pages):
@@ -927,12 +964,15 @@ class TestTpuTransferOnDevice(CustomTestCase):
 
         pool = PinnedHostPool()
         stages = T.gather_pages_to_stage(sbufs, src_pages, pool)
-        # Simulate the wire: copy the pinned memoryviews out to plain bytes.
+        # Simulate the wire: copy the pinned memoryviews out to plain bytes, then into StageBufs (mirroring _recv_layers).
         blobs = [bytes(st.mv()) for st in stages]
         for st in stages:
             st.release()
+        prestaged = [pool.acquire(len(b)) for b in blobs]
+        for st, b in zip(prestaged, blobs):
+            st.copy_bytes(b)
         T.scatter_stage_from_host(
-            dbufs, dst_pages, blobs, specs, pool, dst_lane_slice=None
+            dbufs, dst_pages, prestaged, specs, dst_lane_slice=None
         )
 
         for li in range(2):
@@ -983,7 +1023,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
         self.assertTrue(all(isinstance(st, StageBuf) for st in prestaged))
 
         T.scatter_stage_from_host(
-            dbufs, dst_pages, prestaged, specs, pool, dst_lane_slice=None
+            dbufs, dst_pages, prestaged, specs, dst_lane_slice=None
         )
 
         for li in range(2):
