@@ -2,11 +2,11 @@
 #
 # Step 1 of the ROX flow: create a ReadWriteOnce Hyperdisk ML volume (qwen30b-rwo) and
 # download the FP8 checkpoint into it. A hydrated RWO Hyperdisk is later re-referenced
-# by a ReadOnlyMany PV (pvc-qwen30b-rox.yaml); on GKE >=1.30.2 the disk auto-converts
+# by a ReadOnlyMany PV (pvc-qwen30b-rox.yaml.tmpl); on GKE >=1.30.2 the disk auto-converts
 # to READ_ONLY_MANY, so every host of the multi-host JobSet can mount it read-only.
 #
 #   kubectl -n tpu-ci apply -f .github/tpu-ci/hydrate-qwen30b.yaml
-#   # wait for the Job to Complete, then follow pvc-qwen30b-rox.yaml
+#   # wait for the Job to Complete, then follow pvc-qwen30b-rox.yaml.tmpl
 #
 # The SC is Retain, so deleting qwen30b-rwo after hydration keeps the underlying disk.
 apiVersion: v1
@@ -29,6 +29,9 @@ metadata:
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 3600
+  # Cap the run so a hung/stalled download is killed instead of pinning the TPU
+  # node indefinitely (a ~30GB FP8 pull over hf_transfer finishes in minutes).
+  activeDeadlineSeconds: 3600
   template:
     spec:
       restartPolicy: Never
@@ -53,18 +56,26 @@ spec:
             - |
               set -euo pipefail
               pip install --no-cache-dir "huggingface_hub[hf_transfer]"
+              # Pin the exact checkpoint so a re-hydrate can't silently pull a newer
+              # HF revision out from under the multi-host tests. Bump when intended.
+              export REV="d206ba732169f29bb77fbf80fc2c4b81d4d30782"   # Qwen3-30B-A3B-FP8 @ 2025-07-26
               # Keep every byte on the Hyperdisk (not the node's ephemeral disk).
               export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HOME=/weights/.hf-cache
               python - <<'PY'
+              import os
               from huggingface_hub import snapshot_download
               p = snapshot_download(
                   "Qwen/Qwen3-30B-A3B-FP8",
+                  revision=os.environ["REV"],
                   local_dir="/weights/Qwen3-30B-A3B-FP8",
                   # weights + config only; skip the duplicate .pth / originals if any
                   ignore_patterns=["*.pth", "original/*", "*.gguf"],
               )
               print("hydrated ->", p)
               PY
+              # Stamp the pinned revision next to the weights so the ROX volume is
+              # self-describing (compare against $REV before trusting a stale disk).
+              echo "$REV" > /weights/Qwen3-30B-A3B-FP8/.hydrated-revision
               echo "== contents =="; ls -la /weights/Qwen3-30B-A3B-FP8
               echo "== size =="; du -sh /weights/Qwen3-30B-A3B-FP8
           resources:
