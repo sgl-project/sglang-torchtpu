@@ -69,8 +69,6 @@ class TestTpuGptOss120BLMEval(LMEvalMixin, CustomTestCase):
         # answer extraction only sees final-channel text.
         env.setdefault("EXTRA_ARGS", "--reasoning-parser gpt-oss")
         env.setdefault("MEM_FRACTION_STATIC", "0.60")
-        # GPQA prompts are tiny but max_gen_toks=32768 (uncapped-CoT parity with
-        # the model card) must fit: 32768 + prompt + slack.
         env.setdefault("CONTEXT_LEN", "36864")
         env.setdefault("MAX_RUNNING", "32")
         env.setdefault("TORCH_COMPILE_MAX_BS", "32")
