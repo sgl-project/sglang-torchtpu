@@ -309,14 +309,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 param = getattr(layer, name)
                 old = param.data
                 new = old.transpose(1, 2).contiguous()
-                # Rebind, not copy_or_rebind_param(): `new` always owns fresh
-                # storage (a transposed view is non-contiguous, so .contiguous()
-                # copies), and we free `old` right below. For a square expert
-                # matrix (n == k) the transpose is shape-preserving, so
-                # copy_or_rebind_param() takes its in-place copy branch and
-                # leaves the param pointing at `old`'s storage -- which
-                # resize_(0) then frees, producing a 0-byte parameter that fails
-                # at forward. Always rebinding keeps the param on `new`.
+                # Rebind (not copy_or_rebind_param): copy-in-place would leave a
+                # square expert (n == k) on `old`'s storage, which resize_(0)
+                # then frees -> 0-byte param. Identity stability isn't needed on
+                # TPU, so always rebind.
                 param.data = new
                 param.requires_grad_(False)
                 old.untyped_storage().resize_(0)
