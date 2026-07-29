@@ -24,11 +24,14 @@ register_tpu_ci(est_time=600, suite="nightly-tpu-4-v7", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 
-# (prompt, expected substring) -- small factual smoke set.
+# (prompt, expected substring) -- small factual smoke set. Use only facts the
+# model completes greedily with a wide top-1 logit margin; near-tie probes flip
+# across backends (e.g. "The largest planet ... is" drifts into quiz format and
+# the model answers it wrong at any token budget).
 _FACTS = (
     ("The capital of France is", "Paris"),
     ("The capital of Japan is", "Tokyo"),
-    ("The largest planet in the solar system is", "Jupiter"),
+    ("The chemical symbol for water is", "H2O"),
 )
 
 
