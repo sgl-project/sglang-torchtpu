@@ -18,10 +18,6 @@ registration and the D2h/H2d), which faithfully exercises RaidenKVTransfer,
 page-id addressing, and poll-only completion.
 """
 
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
-
 import time
 
 import torch
