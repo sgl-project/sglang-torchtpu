@@ -371,12 +371,24 @@ class TpuPlatform(Platform):
 
     @classmethod
     def denoise_loop_context(cls) -> Any:
-        # DEFER_AND_FUSE batches the step's ops into fused programs. Scoped to
-        # the denoising loop: the VAE's feature-cache decode regresses under
-        # this mode.
+        # DEFER_AND_FUSE (default) batches the step's ops into fused programs.
+        # Scoped to the denoising loop: the VAE's feature-cache decode
+        # regresses under this mode. SGLANG_DIFFUSION_TPU_EAGER_MODE selects
+        # another torch_tpu EagerMode (e.g. DEFER_NEVER for op-by-op runs).
         from torch_tpu._internal.execution_mode import EagerMode, set_eager_mode
 
-        return set_eager_mode(EagerMode.DEFER_AND_FUSE)
+        from sglang.multimodal_gen import envs
+
+        mode_name = envs.SGLANG_DIFFUSION_TPU_EAGER_MODE
+        # EagerMode is a pybind11 enum: look up via __members__.
+        mode = EagerMode.__members__.get(mode_name)
+        if mode is None:
+            valid = ", ".join(EagerMode.__members__)
+            raise ValueError(
+                f"SGLANG_DIFFUSION_TPU_EAGER_MODE={mode_name!r} is not a "
+                f"torch_tpu EagerMode; valid values: {valid}."
+            )
+        return set_eager_mode(mode)
 
     @classmethod
     def on_denoise_step_end(cls) -> None:

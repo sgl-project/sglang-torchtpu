@@ -83,6 +83,35 @@ class TestTpuPlatformSurface(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")
+class TestDenoiseLoopEagerMode(unittest.TestCase):
+    def test_default_mode_is_defer_and_fuse(self):
+        from torch_tpu._internal import execution_mode
+
+        with TpuPlatform.denoise_loop_context():
+            self.assertIs(
+                execution_mode.eager_mode, execution_mode.EagerMode.DEFER_AND_FUSE
+            )
+
+    def test_env_selects_mode_and_rejects_invalid(self):
+        import os
+
+        from torch_tpu._internal import execution_mode
+
+        with patch.dict(
+            os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "DEFER_NEVER"}
+        ):
+            with TpuPlatform.denoise_loop_context():
+                self.assertIs(
+                    execution_mode.eager_mode, execution_mode.EagerMode.DEFER_NEVER
+                )
+        with patch.dict(
+            os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "NOT_A_MODE"}
+        ):
+            with self.assertRaises(ValueError):
+                TpuPlatform.denoise_loop_context()
+
+
+@unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")
 class TestNoDeviceInitFromQueries(unittest.TestCase):
     def test_identity_and_memory_queries_do_not_initialize_runtime(self):
         # server-args processing calls these in the PARENT process before

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
     SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     SGLANG_DIFFUSION_PLATFORM_OVERRIDE: str = ""
+    SGLANG_DIFFUSION_TPU_EAGER_MODE: str = "DEFER_AND_FUSE"
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
@@ -247,6 +248,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Empty means normal platform auto-detection.
     "SGLANG_DIFFUSION_PLATFORM_OVERRIDE": _lazy_str(
         "SGLANG_DIFFUSION_PLATFORM_OVERRIDE", ""
+    ),
+    # TPU: torch_tpu eager mode for the denoising loop (EagerMode member
+    # name, e.g. DEFER_AND_FUSE or DEFER_NEVER). Scoped to the loop; the
+    # fused default is the validated fast configuration.
+    "SGLANG_DIFFUSION_TPU_EAGER_MODE": _lazy_str(
+        "SGLANG_DIFFUSION_TPU_EAGER_MODE", "DEFER_AND_FUSE"
     ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
