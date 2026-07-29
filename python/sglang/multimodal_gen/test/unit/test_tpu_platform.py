@@ -82,5 +82,22 @@ class TestTpuPlatformSurface(unittest.TestCase):
             self.assertFalse(torch.is_grad_enabled())
 
 
+@unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")
+class TestNoDeviceInitFromQueries(unittest.TestCase):
+    def test_identity_and_memory_queries_do_not_initialize_runtime(self):
+        # server-args processing calls these in the PARENT process before
+        # workers spawn; initializing PJRT there steals the workers' chips
+        # (open(/dev/vfio/N): Device or resource busy at worker start).
+        if torch.tpu.is_initialized():
+            self.skipTest("TPU runtime already initialized in this process")
+        TpuPlatform.get_device_name(0)
+        TpuPlatform.get_device_total_memory()
+        TpuPlatform.get_available_gpu_memory()
+        TpuPlatform.get_current_memory_usage()
+        TpuPlatform.get_memory_snapshot()
+        TpuPlatform.reset_peak_memory_stats()
+        self.assertFalse(torch.tpu.is_initialized())
+
+
 if __name__ == "__main__":
     unittest.main()

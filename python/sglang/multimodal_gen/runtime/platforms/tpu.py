@@ -130,6 +130,11 @@ class TpuPlatform(Platform):
     # Device identity and memory
     # ------------------------------------------------------------------
 
+    # Identity and memory queries must NEVER initialize PJRT as a side
+    # effect: server-args processing calls them in the parent process before
+    # workers spawn, and the chips belong to the workers. Anything needing
+    # live allocator stats gates on torch.tpu.is_initialized().
+
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
         # One chip per process; the process-local index is always 0.
@@ -137,12 +142,18 @@ class TpuPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        return torch.tpu.get_device_name(device_id)
+        # Static: torch.tpu.get_device_name() would initialize the runtime.
+        return "tpu"
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        _free, total = torch.accelerator.get_memory_info()
-        return total
+        if torch.tpu.is_initialized():
+            _free, total = torch.accelerator.get_memory_info()
+            return total
+        # Pre-initialization estimate for server-args threshold checks.
+        # ponytail: static floor for current targets (tpu7x ~95 GiB); replace
+        # with a topology lookup if smaller-HBM TPUs are targeted.
+        return 90 * (1 << 30)
 
     @classmethod
     def get_available_gpu_memory(
@@ -152,6 +163,8 @@ class TpuPlatform(Platform):
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
+        if not torch.tpu.is_initialized():
+            return cls.get_device_total_memory() / (1 << 30)
         free, _total = torch.accelerator.get_memory_info()
         return free / (1 << 30)
 
@@ -159,7 +172,11 @@ class TpuPlatform(Platform):
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
-        return float(torch.accelerator.memory_stats().get("allocated_bytes.all.current", 0))
+        if not torch.tpu.is_initialized():
+            return 0.0
+        return float(
+            torch.accelerator.memory_stats().get("allocated_bytes.all.current", 0)
+        )
 
     @classmethod
     def empty_cache(cls) -> None:
@@ -167,12 +184,20 @@ class TpuPlatform(Platform):
 
     @classmethod
     def reset_peak_memory_stats(cls) -> None:
-        torch.accelerator.reset_peak_memory_stats()
+        if torch.tpu.is_initialized():
+            torch.accelerator.reset_peak_memory_stats()
 
     @classmethod
     def get_memory_snapshot(cls) -> MemorySnapshot:
         from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
 
+        if not torch.tpu.is_initialized():
+            return MemorySnapshot(
+                allocated_mb=0.0,
+                reserved_mb=0.0,
+                peak_allocated_mb=0.0,
+                peak_reserved_mb=0.0,
+            )
         stats = torch.accelerator.memory_stats()
         # PJRT reports allocated/peak-allocated; bytes_reserved is not
         # populated by the TPU client and reads as 0.
