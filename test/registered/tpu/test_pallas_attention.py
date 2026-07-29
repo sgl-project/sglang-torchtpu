@@ -10,8 +10,8 @@ silently regress:
   * _maybe_expand_kv_heads GQA expansion;
   * _patch_support_triton_for_tpu (else the Triton path crashes on TPU
     with "0 active drivers");
-  * _patch_req_to_token_pool_max_context_len (else paged decode gather
-    would right-pad with slot 0 — a live slot owned by another request);
+  * paged-decode slot padding stays local to pallas_tpu_flash and uses the
+    allocator's reserved physical KV slot 0;
   * Both Pallas backend names appear in the attention registry (else
     "pallas_tpu_flash" / "pallas_tpu_rpa_v3" are unknown).
 
@@ -110,62 +110,53 @@ class TestSupportTritonPatch(CustomTestCase):
         self.assertFalse(uc.support_triton("pallas_tpu_rpa_v3"))
 
 
-class TestReqToTokenPoolRoundingPatch(CustomTestCase):
-    """_patch_req_to_token_pool_max_context_len must round max_context_len
-    up to a power-of-two multiple of _PAGE_SIZE so the paged decode gather
-    is always within the per-request slot row (no fall-through to slot 0)."""
-
-    def test_rounding(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas import (
-            _PAGE_SIZE,
-            _bucket_kv_len,
-        )
-        from sglang.srt.hardware_backend.tpu.patches import (
-            _patch_req_to_token_pool_max_context_len,
-        )
+class TestPallasFlashTokenSlotPadding(CustomTestCase):
+    def test_pool_width_is_not_power_of_two_rounded(self):
         from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
-        _patch_req_to_token_pool_max_context_len()
-
-        # Non-aligned width rounds up; aligned width is unchanged.
-        for raw, expected in (
-            (1, 64),
-            (_PAGE_SIZE, _PAGE_SIZE),
-            (_PAGE_SIZE + 1, _PAGE_SIZE * 2),
-            (200, 256),
-            (4096, 4096),
-            (8193, 16384),
-        ):
-            pool = ReqToTokenPool(
-                size=2,
-                max_context_len=raw,
-                device="cpu",
-                enable_memory_saver=False,
-            )
-            self.assertEqual(pool.req_to_token.shape[1], expected)
-            self.assertEqual(pool.max_context_len, expected)
-
-        # Decode gather invariant: for any max_len <= pool width, the
-        # bucketed Lb fits inside the per-request slot row.
         pool = ReqToTokenPool(
             size=2,
-            max_context_len=8193,
+            max_context_len=16388,
             device="cpu",
             enable_memory_saver=False,
         )
-        width = pool.req_to_token.shape[1]
-        for max_len in (1, 64, 65, 4096, 8000, width):
-            self.assertLessEqual(_bucket_kv_len(max_len), width)
+        self.assertEqual(pool.req_to_token.shape[1], 16388)
+        self.assertEqual(pool.max_context_len, 16388)
 
-        # Idempotent.
-        _patch_req_to_token_pool_max_context_len()
-        pool = ReqToTokenPool(
-            size=2,
-            max_context_len=200,
-            device="cpu",
-            enable_memory_saver=False,
+    def test_padding_uses_reserved_slot_zero(self):
+        import torch
+
+        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+            _pad_token_slots,
         )
-        self.assertEqual(pool.req_to_token.shape[1], 256)
+        from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
+        allocator = TokenToKVPoolAllocator(
+            size=8,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        self.assertNotIn(0, allocator.free_pages.tolist())
+
+        slots = torch.tensor([[11, 12, 13], [21, 22, 23]], dtype=torch.int32)
+        padded = _pad_token_slots(slots, 8)
+        self.assertEqual(tuple(padded.shape), (2, 8))
+        self.assertTrue(torch.equal(padded[:, :3], slots))
+        self.assertTrue(
+            torch.equal(padded[:, 3:], torch.zeros((2, 5), dtype=torch.int32))
+        )
+
+    def test_padding_helper_also_slices(self):
+        import torch
+
+        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+            _pad_token_slots,
+        )
+
+        slots = torch.tensor([[11, 12, 13]], dtype=torch.int32)
+        self.assertTrue(torch.equal(_pad_token_slots(slots, 2), slots[:, :2]))
 
 
 class TestPallasRegistration(CustomTestCase):
@@ -278,6 +269,68 @@ class TestPagedKernelNumerics(CustomTestCase):
 
     def test_mha_page64(self):
         self._check(1, 8, 8, 128, 64, 1, [50])
+
+
+@unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
+class TestPallasFlashDecodePaddingNumerics(CustomTestCase):
+    def test_non_power_of_two_pool_width(self):
+        import numpy as np
+        import torch
+
+        from sglang.srt.hardware_backend.tpu.attention_pallas import (
+            TpuPallasAttnBackend,
+            _bucket_kv_len,
+        )
+
+        batch, hq, hkv, dim = 2, 8, 2, 128
+        pool_width = 69
+        lengths = np.array([65, 23], dtype=np.int32)
+        bucket_len = _bucket_kv_len(int(lengths.max()))
+        self.assertEqual(bucket_len, 128)
+        self.assertLess(pool_width, bucket_len)
+
+        slots = np.stack(
+            (
+                np.arange(1, pool_width + 1, dtype=np.int32),
+                np.arange(pool_width + 1, 2 * pool_width + 1, dtype=np.int32),
+            )
+        )
+        rng = np.random.default_rng(0)
+        query = rng.standard_normal((batch, hq, dim)).astype(np.float32)
+        k_cache = rng.standard_normal((2 * pool_width + 1, hkv, dim)).astype(np.float32)
+        v_cache = rng.standard_normal((2 * pool_width + 1, hkv, dim)).astype(np.float32)
+        # Padding must remain masked even when reserved slot 0 is conspicuous.
+        k_cache[0] = 1000
+        v_cache[0] = -1000
+        scale = 1.0 / math.sqrt(dim)
+
+        output = torch.empty((batch, hq, dim), dtype=torch.float32, device="tpu")
+        TpuPallasAttnBackend._run_paged_forward_decode(
+            None,
+            torch.from_numpy(query).to("tpu"),
+            output,
+            torch.from_numpy(k_cache).to("tpu"),
+            torch.from_numpy(v_cache).to("tpu"),
+            torch.from_numpy(slots).to("tpu"),
+            torch.arange(batch, dtype=torch.int32, device="tpu"),
+            torch.from_numpy(lengths).to("tpu"),
+            scaling=scale,
+        )
+        actual = output.cpu().numpy()
+
+        groups = hq // hkv
+        for b in range(batch):
+            for h in range(hq):
+                token_slots = slots[b, : lengths[b]]
+                kh = k_cache[token_slots, h // groups]
+                vh = v_cache[token_slots, h // groups]
+                scores = (query[b, h] @ kh.T) * scale
+                scores -= scores.max()
+                weights = np.exp(scores)
+                weights /= weights.sum()
+                expected = weights @ vh
+                diff = np.abs(actual[b, h] - expected).max()
+                self.assertLess(diff, 3e-2, f"b{b} h{h} diff={diff}")
 
 
 if __name__ == "__main__":

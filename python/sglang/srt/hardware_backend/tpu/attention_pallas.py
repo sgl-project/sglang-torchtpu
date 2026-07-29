@@ -142,6 +142,15 @@ def _bucket_kv_len(max_len: int) -> int:
     return n
 
 
+def _pad_token_slots(token_slots: torch.Tensor, length: int) -> torch.Tensor:
+    """Resize token-slot rows to ``length`` using reserved KV slot 0."""
+    width = token_slots.shape[1]
+    if width >= length:
+        return token_slots[:, :length]
+    padding = token_slots.new_zeros((token_slots.shape[0], length - width))
+    return torch.cat((token_slots, padding), dim=1)
+
+
 def _attend(op, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Call the Pallas flash op with q's seq dim padded up to block_q.
 
@@ -311,21 +320,11 @@ class TpuPallasAttnBackend(AttentionBackend):
         ppb = min(8, pps)
 
         # Vectorized gather of per-request token slots from the flat pool.
-        # Slots past the real length are stale but masked by `lengths`.
-        #
-        # Invariant: req_to_token.shape[1] >= Lb. `_bucket_kv_len` is monotone
-        # and maps any input to a power-of-two multiple of `_PAGE_SIZE`, so
-        # this holds whenever `req_to_token.shape[1]` is itself such a value.
-        # `_patch_req_to_token_pool_max_context_len` enforces that at pool
-        # allocation. Asserting here means any future regression surfaces
-        # loudly instead of right-padding with slot 0 — a live KV slot owned
-        # by another request, whose data would leak into attention if length
-        # masking ever drifted.
-        assert req_to_token.shape[1] >= Lb, (
-            f"req_to_token.shape[1] ({req_to_token.shape[1]}) must be >= Lb "
-            f"({Lb}); is _patch_req_to_token_pool_max_context_len applied?"
-        )
-        tok = req_to_token[req_pool_indices.long()][:, :Lb]  # [batch, Lb]
+        # The legacy Pallas kernel requires a power-of-two Lb. Keep that
+        # requirement local by padding with physical KV slot 0, which SGLang's
+        # allocators reserve as the dummy target. `lengths` masks the padding.
+        tok = req_to_token[req_pool_indices.long()]
+        tok = _pad_token_slots(tok, Lb)  # [batch, Lb]
 
         k_g = k_cache[tok.long()]  # [batch, Lb, Hkv, D]
         v_g = v_cache[tok.long()]  # [batch, Lb, Hkv, Dv]

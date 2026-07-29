@@ -653,64 +653,6 @@ def _patch_support_triton_for_tpu() -> None:
             mod.support_triton = support_triton
 
 
-_req_to_token_pool_patched = False
-
-
-def _patch_req_to_token_pool_max_context_len() -> None:
-    """Round `ReqToTokenPool`'s `max_context_len` up to a power-of-two
-    multiple of the Pallas paged_attention page size.
-
-    Why: `TpuPallasAttnBackend._run_paged_forward_decode` gathers per-request
-    KV slots as `req_to_token[:, :Lb]`, where `Lb = _bucket_kv_len(max_len)`
-    is a power-of-two multiple of `_PAGE_SIZE`. If `Lb` exceeds
-    `req_to_token.shape[1]` (i.e. when `max_context_len` is not itself such a
-    value), the gather would have to right-pad the slot tensor with slot 0
-    — a live slot owned by another request — which silently leaks that
-    request's KV into the attention math if the kernel's length mask ever
-    drifts. Rounding the pool width up here makes that branch unreachable.
-
-    Cost: at most ~2x the int32 footprint of `req_to_token` in the worst
-    case; for the common context_len values (4096 / 8192 / 16384 / …) the
-    width is already aligned and rounding is a no-op.
-
-    Inheritance: `HybridReqToTokenPool` calls `super().__init__(...)`, so
-    patching the base class catches it too.
-    """
-    global _req_to_token_pool_patched
-    if _req_to_token_pool_patched:
-        return
-    _req_to_token_pool_patched = True
-
-    from sglang.srt.hardware_backend.tpu.attention_pallas import (
-        _PAGE_SIZE,
-        _bucket_kv_len,
-    )
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-
-    orig_init = ReqToTokenPool.__init__
-
-    def wrapped_init(self, *args, **kwargs):
-        # All known call sites (model_runner_kv_cache_mixin,
-        # HybridReqToTokenPool.super().__init__) pass max_context_len as a
-        # keyword, so only handle that form.
-        if "max_context_len" in kwargs:
-            orig = int(kwargs["max_context_len"])
-            rounded = _bucket_kv_len(orig)
-            if rounded != orig:
-                logger.info(
-                    "TPU: rounded ReqToTokenPool.max_context_len %d -> %d "
-                    "(power-of-two * page_size=%d) so paged_attention slot "
-                    "gather stays within the per-request row.",
-                    orig,
-                    rounded,
-                    _PAGE_SIZE,
-                )
-                kwargs["max_context_len"] = rounded
-        return orig_init(self, *args, **kwargs)
-
-    ReqToTokenPool.__init__ = wrapped_init
-
-
 def _patch_tpu_torch_pallas_register_positional() -> None:
     """Let the torch_tpu bindings accept torch's inductor calling convention."""
     try:
@@ -760,6 +702,5 @@ def apply_tpu_patches() -> None:
     _patch_compute_position_torch()
     _patch_torch_native_attn_backend()
     _patch_support_triton_for_tpu()
-    _patch_req_to_token_pool_max_context_len()
     _register_aten_fallbacks()
     _patch_tpu_torch_pallas_register_positional()
