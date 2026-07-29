@@ -16,6 +16,13 @@ on:
         description: "Git ref to test"
         required: false
         default: main
+      # Scheduled runs (inputs empty) run everything.
+      only:
+        description: "Run only one part (combo = both combo layers)"
+        required: false
+        default: all
+        type: choice
+        options: [all, single-host, multihost, combo, singlehost-combo, multihost-combo]
 
 concurrency:
   group: tpu-slice-nightly
@@ -32,6 +39,7 @@ jobs:
 
   single-host:
     needs: build
+    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'single-host' }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -45,9 +53,52 @@ jobs:
       contents: read
       id-token: write
 
+  # Feature-combination layers: same exec-mode runs as the standalone
+  # combo-test-tpu.yml action; these jobs add nightly cadence.
+  singlehost-combo:
+    needs: build
+    if: ${{ contains(fromJSON('["all","combo","singlehost-combo"]'), inputs.only || 'all') }}
+    name: singlehost-combo-test
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 1
+      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
+      run_name: singlehost-combo-test
+    permissions:
+      contents: read
+      id-token: write
+
+  multihost-combo:
+    needs: build
+    if: ${{ contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        row: [pd, spec]
+    name: multihost-combo-test-${{ matrix.row }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 2
+      # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
+      # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
+      exec_cmd: >-
+        ${{ matrix.row == 'pd'
+            && 'env MODEL=/weights/Qwen3-30B-A3B-FP8 python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
+            || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
+      weights_pvc: model-weights-rox
+      run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
   # Discover multi-host launch groups from the test files (test-owned launch specs).
   discover:
     needs: build
+    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'multihost' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

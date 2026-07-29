@@ -43,6 +43,11 @@ on:
         required: false
         type: string
         default: ""
+      # --- exec mode: every host runs this command; pod exit codes gate the JobSet ---
+      exec_cmd:
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -90,6 +95,7 @@ jobs:
             --suite '${{ inputs.suite }}' \
             --launch-script '${{ inputs.launch_script }}' \
             --files '${{ inputs.files }}' \
+            --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
@@ -120,6 +126,8 @@ jobs:
           #     6000s = 5400 + streaming/scheduling margin.
           if [ -n "${{ inputs.launch_script }}" ]; then
             wait_s=6000
+          elif [ -n "${{ inputs.exec_cmd }}" ]; then
+            wait_s=7800   # outlast exec mode's activeDeadlineSeconds=7200 + margin
           else
             wait_s="$(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds)"
           fi
