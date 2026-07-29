@@ -1866,17 +1866,19 @@ def _post_process_topk_ids(
         # padding-unaware -- so its output on padded rows is garbage. Mask the
         # padded region here: fill padded topk_ids with a valid expert id (0) and
         # zero their weights, so padded tokens contribute nothing regardless of
-        # the routed id. Done in pure torch because the _mask/_zero helpers route
+        # the routed id. Use torch.where (elementwise, static-shape) rather than
+        # the _mask/_zero helpers or a boolean-index assignment: the helpers route
         # through a Triton fast path (_can_fuse_padded_region -> _fill_padded_rows)
-        # that does not run on TPU. TPU skips the shared-expert append branches
-        # below (aiter/DeepEP-only), so zeroing here is complete.
+        # that does not run on TPU, and a boolean-index assignment relies on the
+        # backend lowering it to a static-shape op. TPU skips the shared-expert
+        # append branches below (aiter/DeepEP-only), so zeroing here is complete.
         if num_token_non_padded is not None:
             padded_rows = (
                 torch.arange(topk_ids.shape[0], device=topk_ids.device)
                 >= num_token_non_padded
-            )
-            topk_ids[padded_rows, :] = 0
-            topk_weights[padded_rows, :] = 0.0
+            ).unsqueeze(1)
+            topk_ids = torch.where(padded_rows, 0, topk_ids)
+            topk_weights = torch.where(padded_rows, 0.0, topk_weights)
 
     if recorder_topk_ids is None:
         recorder_topk_ids = topk_ids
