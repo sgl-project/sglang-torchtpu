@@ -337,6 +337,21 @@ def fuse_scale_shift_kernel(
     block_l: int = 128,
     block_c: int = 128,
 ):
+    if not ((x.is_cuda and scale.is_cuda) or (x.is_xpu and scale.is_xpu)):
+        # torch-native fallback for backends without triton: same math as the
+        # fused kernel, relying on broadcasting.
+        B, L, C = x.shape
+
+        def _per_token(t: torch.Tensor) -> torch.Tensor:
+            if t.dim() == 4:  # [B, F, 1, C] per-frame -> [B, L, C] per-token
+                num_frames = t.shape[1]
+                return t.expand(B, num_frames, L // num_frames, C).reshape(B, L, C)
+            if t.dim() == 2:  # [B, C] -> [B, 1, C]
+                return t[:, None, :]
+            return t  # 0D/1D scalars and [B, L, C] broadcast natively
+
+        return x * (scale_constant + _per_token(scale)) + _per_token(shift)
+
     assert (x.is_cuda and scale.is_cuda) or (x.is_xpu and scale.is_xpu)
     assert x.is_contiguous()
 
