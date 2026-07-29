@@ -90,7 +90,12 @@ ${WEIGHTS_VOLUME}
                       # command; pod exit codes gate the JobSet. Empty unless --exec.
                       if [ -n "${EXEC_CMD}" ]; then
                         ${EXEC_CMD}
-                        exit $?
+                        rc=$?
+                        # Teardown SIGTERMs surviving workers; rank-0 gates real failures.
+                        if [ "$RANK" != "0" ] && [ "$rc" = 143 ]; then
+                          echo "worker rank=$RANK: SIGTERM during teardown; success"; rc=0
+                        fi
+                        exit $rc
                       fi
 
                       if [ "$NNODES" -le 1 ]; then

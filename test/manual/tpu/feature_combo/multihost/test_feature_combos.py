@@ -3,9 +3,10 @@
 Row 1 (``pd``):   prefix caching + KV offloading (HiCache) + P/D disaggregation
 Row 2 (``spec``): prefix caching + EAGLE3 speculative decoding + KV offloading
 
-Both tests drive a 2-pass probe (same long-shared-prefix prompts twice) and
-assert from ``meta_info`` that the features actually functioned, not merely
-that the servers stayed up — see ``run_probe`` for the exact oracle.
+Both tests drive a phased probe (populate -> warm hit -> shared-prefix ->
+churn -> host-reload -> concurrent wave -> flush/repopulate); greedy outputs
+must stay bit-equal to the populate baseline throughout — for pd that
+certifies the cross-host KV transfer. See ``run_probe`` for the exact oracle.
 
 Topology & roles (auto-detected from the GKE TPU env, override via NODE_RANK):
   pd:    host 0 = prefill engine (tp=8) + mini-LB + probe/asserts
@@ -56,6 +57,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.error
@@ -123,6 +125,29 @@ def _prompts():
     ]
 
 
+def _shared_prefix_prompts():
+    """Fresh questions on the SAME long prefix: partial-hit scenario."""
+    prefix = _PREFIX_SENTENCE * PREFIX_REPEATS
+    return [
+        f"{prefix}\nQuestion {q}: in one sentence, {what}?\nAnswer:"
+        for q, what in enumerate(
+            ("what bird appears", "what does the crow count", "where is the canyon")
+        )
+    ]
+
+
+def _churn_prompts():
+    """Distinct docs sized to overflow the device pool, evicting warm prefixes to host."""
+    doc_tokens = 18 * PREFIX_REPEATS  # rough tokens per doc
+    n = max(4, 3 * int(MAX_TOTAL_TOKENS) // (2 * doc_tokens) + 1)
+    return [
+        f"Churn document {i}. "
+        + (f"Unrelated filler sentence number {i} about weather patterns. ")
+        * PREFIX_REPEATS
+        for i in range(n)
+    ]
+
+
 def _generate(base_url, text, timeout=600):
     req = urllib.request.Request(
         base_url.rstrip("/") + "/generate",
@@ -144,54 +169,144 @@ def _generate(base_url, text, timeout=600):
     return body
 
 
-def run_probe(base_url, check_spec=False):
-    """Two identical passes; returns (records, failures)."""
+def _flush_cache(url):
+    with urllib.request.urlopen(url.rstrip("/") + "/flush_cache", timeout=60) as r:
+        r.read()
+
+
+def run_probe(base_url, check_spec=False, flush_url=None):
+    """Phased probe (see module docstring); returns (records, failures).
+
+    Greedy outputs must stay bit-equal to the populate baseline: for pd that
+    certifies the KV crossed hosts intact.
+    """
     records, failures = [], []
-    for pass_name in ("populate", "verify"):
-        for i, prompt in enumerate(_prompts()):
-            tag = f"{pass_name}[{i}]"
-            body = _generate(base_url, prompt)  # transport errors propagate
-            meta = body.get("meta_info", {})
-            rec = {
-                "pass": pass_name,
-                "i": i,
-                "elapsed_s": body.get("_elapsed_s"),
-                "cached_tokens": meta.get("cached_tokens"),
-                "prompt_tokens": meta.get("prompt_tokens"),
-                "completion_tokens": meta.get("completion_tokens"),
-                "spec_verify_ct": meta.get("spec_verify_ct"),
-                "text_head": (body.get("text") or "")[:80],
-            }
-            records.append(rec)
-            if not (body.get("text") or "").strip():
-                failures.append(f"{tag}: empty completion text")
+
+    def spec_checks(meta, tag, rec):
+        ct = meta.get("spec_verify_ct") or 0
+        if ct <= 0:
+            failures.append(
+                f"{tag}: spec_verify_ct={ct} — spec decoding did not run "
+                f"(meta keys: {sorted(meta)})"
+            )
+            return
+        accept_length = (meta.get("completion_tokens") or 0) / ct
+        rec["accept_length"] = round(accept_length, 3)
+        if accept_length <= MIN_ACCEPT_LENGTH:
+            failures.append(
+                f"{tag}: accept_length={accept_length:.2f} <= "
+                f"{MIN_ACCEPT_LENGTH} — drafts never accepted"
+            )
+
+    def probe(pass_name, i, prompt, check_cache=False, expect_text=None):
+        tag = f"{pass_name}[{i}]"
+        body = _generate(base_url, prompt)  # transport errors propagate
+        meta = body.get("meta_info", {})
+        text = body.get("text") or ""
+        details = meta.get("cached_tokens_details") or {}
+        rec = {
+            "pass": pass_name,
+            "i": i,
+            "elapsed_s": body.get("_elapsed_s"),
+            "cached_tokens": meta.get("cached_tokens"),
+            "cached_host": details.get("host"),
+            "prompt_tokens": meta.get("prompt_tokens"),
+            "completion_tokens": meta.get("completion_tokens"),
+            "spec_verify_ct": meta.get("spec_verify_ct"),
+            "text_head": text[:80],
+        }
+        records.append(rec)
+        if not text.strip():
+            failures.append(f"{tag}: empty completion text")
+        if expect_text is not None and text != expect_text:
+            failures.append(f"{tag}: greedy output diverged from populate baseline")
+        if check_cache:
             if meta.get("cached_tokens") is None:
                 failures.append(
                     f"{tag}: no cached_tokens in meta_info — server missing "
                     f"--enable-cache-report (meta keys: {sorted(meta)})"
                 )
-                continue
-            if pass_name == "verify":
-                if meta["cached_tokens"] < MIN_CACHED_TOKENS:
-                    failures.append(
-                        f"{tag}: cached_tokens={meta['cached_tokens']} < "
-                        f"{MIN_CACHED_TOKENS} — prefix cache MISS on repeat"
-                    )
-                if check_spec:
-                    ct = meta.get("spec_verify_ct") or 0
-                    if ct <= 0:
-                        failures.append(
-                            f"{tag}: spec_verify_ct={ct} — spec decoding "
-                            f"did not run (meta keys: {sorted(meta)})"
-                        )
-                    else:
-                        accept_length = (meta.get("completion_tokens") or 0) / ct
-                        rec["accept_length"] = round(accept_length, 3)
-                        if accept_length <= MIN_ACCEPT_LENGTH:
-                            failures.append(
-                                f"{tag}: accept_length={accept_length:.2f} <= "
-                                f"{MIN_ACCEPT_LENGTH} — drafts never accepted"
-                            )
+                return meta, text
+            if meta["cached_tokens"] < MIN_CACHED_TOKENS:
+                failures.append(
+                    f"{tag}: cached_tokens={meta['cached_tokens']} < "
+                    f"{MIN_CACHED_TOKENS} — prefix cache MISS"
+                )
+            if check_spec:
+                spec_checks(meta, tag, rec)
+        return meta, text
+
+    warm = _prompts()
+
+    baseline = {}
+    for i, p in enumerate(warm):  # 1. populate: greedy baseline
+        _, baseline[i] = probe("populate", i, p)
+
+    for i, p in enumerate(warm):  # 2. warm hit
+        probe("warm", i, p, check_cache=True, expect_text=baseline[i])
+
+    for i, p in enumerate(_shared_prefix_prompts()):  # 3. partial hit
+        probe("shared-prefix", i, p, check_cache=True)
+
+    for i, p in enumerate(_churn_prompts()):  # 4. evict warm set out of device
+        probe("churn", i, p)
+
+    # 5. reload from host: plain radix would MISS here; zero host tokens
+    # means offload never engaged.
+    host_total, details_missing = 0, True
+    for i, p in enumerate(warm):
+        meta, _ = probe(
+            "host-reload", i, p, check_cache=True, expect_text=baseline[i]
+        )
+        d = meta.get("cached_tokens_details") or {}
+        if d:
+            details_missing = False
+            host_total += d.get("host") or 0
+    if details_missing:
+        failures.append(
+            "host-reload: no cached_tokens_details in meta_info — cannot "
+            "prove the host tier engaged"
+        )
+    elif host_total <= 0:
+        failures.append(
+            "host-reload: cached_tokens_details.host == 0 across the pass — "
+            "offload/reload never engaged despite eviction"
+        )
+
+    # 6. concurrent wave: reloads race fresh prefills; warm hits must match baseline.
+    wave = (_churn_prompts()[:3] + [warm[0]]) * 2
+    outs = [None] * len(wave)
+
+    def wave_worker(k, p):
+        try:
+            outs[k] = _generate(base_url, p)
+        except Exception as exc:  # noqa: BLE001 - recorded as a failure below
+            outs[k] = exc
+
+    threads = [
+        threading.Thread(target=wave_worker, args=(k, p)) for k, p in enumerate(wave)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for k, out in enumerate(outs):
+        if isinstance(out, Exception):
+            failures.append(f"wave[{k}]: {out!r}")
+        elif wave[k] == warm[0] and (out.get("text") or "") != baseline[0]:
+            failures.append(f"wave[{k}]: warm hit under load diverged from baseline")
+
+    # 7. flush + repopulate (flush hits the cache owner; the LB doesn't route it).
+    if flush_url:
+        _flush_cache(flush_url)
+        meta, _ = probe("post-flush", 0, warm[0])
+        if (meta.get("cached_tokens") or 0) != 0:
+            failures.append(
+                f"post-flush: cached_tokens={meta.get('cached_tokens')} != 0 "
+                f"— flush did not clear the cache"
+            )
+        probe("repopulate", 0, warm[0], check_cache=True, expect_text=baseline[0])
+
     return records, failures
 
 
@@ -339,7 +454,10 @@ class TestPDPrefixKVOffload(_ComboBase):
             _kill(p)
 
     def test_prefix_cache_survives_pd_with_kv_offload(self):
-        records, failures = run_probe(f"http://127.0.0.1:{LB_PORT}")
+        records, failures = run_probe(
+            f"http://127.0.0.1:{LB_PORT}",
+            flush_url=f"http://127.0.0.1:{PREFILL_PORT}",
+        )
         self._assert_probe(records, failures)
 
 
@@ -388,15 +506,34 @@ class TestSpecPrefixKVOffload(_ComboBase):
             _kill(p)
 
     def test_prefix_cache_and_spec_with_kv_offload(self):
-        records, failures = run_probe(f"http://127.0.0.1:{PORT}", check_spec=True)
+        records, failures = run_probe(
+            f"http://127.0.0.1:{PORT}",
+            check_spec=True,
+            flush_url=f"http://127.0.0.1:{PORT}",
+        )
         self._assert_probe(records, failures)
 
 
 # ------------------------------ role dispatch --------------------------------
 
 
+def _http_ok(url, timeout=5):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return 200 <= r.status < 300
+    except Exception:  # noqa: BLE001 - any transport error means "not healthy"
+        return False
+
+
 def _serve_worker(combo):
-    """Rank >0: run this host's serving role in the foreground until killed."""
+    """Rank >0: run this host's serving role until the leader finishes.
+
+    No cross-host shutdown channel exists, so the worker watches the leader's
+    server: healthy once and then gone => rank-0's verdict is in; tear down and
+    exit 0. Real failures still gate: an engine that dies on its own returns
+    its rc, and rank 0 fails independently when a peer it needs is broken.
+    """
+    leader = HOSTNAMES[0] if HOSTNAMES else "127.0.0.1"
     if combo == "pd":
         model = E("MODEL", "Qwen/Qwen3-30B-A3B")
         env = {
@@ -412,13 +549,39 @@ def _serve_worker(combo):
             **_no_multihost_env(),
         }
         proc = _launch("launch_decode.sh", env, "/tmp/combo_decode.log")
-    else:  # spec: multihost worker shard, TPU_WORKER_* left intact
-        proc = _launch(
-            "launch_server.sh",
-            TestSpecPrefixKVOffload._combo_env(),
-            "/tmp/combo_spec_worker.log",
-        )
-    return proc.wait()
+        leader_url = f"http://{leader}:{PREFILL_PORT}/health"
+        leader_seen, misses, waited = False, 0, 0
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                return rc  # decode died on its own: its rc is the verdict
+            if _http_ok(leader_url):
+                leader_seen, misses = True, 0
+            elif leader_seen:
+                misses += 1
+                if misses >= 6:
+                    print("[worker] leader served and is gone; stopping decode")
+                    _kill(proc)
+                    return 0
+            elif waited > WAIT_SECS + 600:
+                print("[worker] leader never became healthy; deferring to rank 0")
+                _kill(proc)
+                return 0
+            time.sleep(10)
+            waited += 10
+
+    # spec: worker shard of the leader's ONE tp group; it dies with the
+    # leader's engine. A nonzero rc with the leader gone is normal teardown.
+    proc = _launch(
+        "launch_server.sh",
+        TestSpecPrefixKVOffload._combo_env(),
+        "/tmp/combo_spec_worker.log",
+    )
+    rc = proc.wait()
+    if rc != 0 and not _http_ok(f"http://{leader}:{PORT}/health"):
+        print(f"[worker] shard exited rc={rc} after leader teardown; success")
+        return 0
+    return rc
 
 
 if __name__ == "__main__":

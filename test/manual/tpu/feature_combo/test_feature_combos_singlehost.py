@@ -52,13 +52,12 @@ _BASE = dict(  # always on: prefix caching + KV offloading
     skip_server_warmup=True,
     enable_torch_compile=True,
 )
-_SPEC = dict(  # + EAGLE3 (spec-on-TPU recipe: overlap schedule off)
+_SPEC = dict(  # + EAGLE3
     speculative_algorithm="EAGLE3",
     speculative_draft_model_path=DRAFT,
     speculative_num_steps=3,
     speculative_eagle_topk=1,
     speculative_num_draft_tokens=4,
-    disable_overlap_schedule=True,
 )
 
 _DP = dict(tp_size=8, dp_size=2, enable_dp_attention=True)
@@ -281,6 +280,30 @@ class TestFeatureCombo(unittest.TestCase):
                 text, ref, f"repeat {k}: output after full-tier eviction diverged"
             )
             self._assert_spec(v, al, f"repeat {k} (post-overflow)")
+
+    def test_7_accept_length_on_par(self):
+        # ACCEPT_LENGTH_REF unset => calibration mode: print the measured mean
+        # under the weak >1.0 floor. Pin the reference after the first run;
+        # regressions then gate at 90% of it.
+        if not self.spec_on:
+            self.skipTest("combo has no spec decoding")
+        lengths = []
+        for q in QUESTIONS:
+            _, _, v, al = self._gen(SYSTEM + q)
+            if v:
+                lengths.append(al)
+        self.assertTrue(lengths, "no spec verifications recorded")
+        mean_al = sum(lengths) / len(lengths)
+        print(f"  mean accept_length={mean_al:.3f} over {len(lengths)} prompts")
+        ref = os.environ.get("ACCEPT_LENGTH_REF")
+        if ref is None:
+            self.assertGreater(mean_al, 1.0, "calibration run: drafts never accepted")
+        else:
+            self.assertGreaterEqual(
+                mean_al,
+                0.9 * float(ref),
+                f"mean accept_length {mean_al:.3f} < 90% of reference {ref}",
+            )
 
 
 def _run_all():
