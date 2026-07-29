@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-instance transfer manager for disaggregated diffusion roles."""
 
+# Defer annotation evaluation: signature annotations like
+# `torch.get_device_module().Event | None` would otherwise touch the
+# accelerator runtime at import time in every importing process.
+from __future__ import annotations
+
 import logging
 import threading
 from dataclasses import dataclass, field

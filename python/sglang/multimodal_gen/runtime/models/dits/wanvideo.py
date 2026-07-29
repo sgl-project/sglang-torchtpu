@@ -874,6 +874,10 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
+        # Resolved once here: the lru_cache-wrapped platform classmethod
+        # graph-breaks dynamo when called inside the traced forward.
+        self._amp_supported = current_platform.is_amp_supported()
+
         inner_dim = config.num_attention_heads * config.attention_head_dim
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
@@ -1003,15 +1007,14 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
-        if forward_batch is not None:
-            sequence_shard_enabled = (
-                forward_batch.enable_sequence_shard and self.sp_size > 1
-            )
-        else:
-            sequence_shard_enabled = False
-        self.enable_teacache = (
-            forward_batch is not None and forward_batch.enable_teacache
+        # Read through the concrete sampling_params field: attribute access on
+        # the Req.__getattr__ delegation graph-breaks dynamo, and the resulting
+        # break makes dynamo skip compiling this entire forward.
+        sp = forward_batch.sampling_params if forward_batch is not None else None
+        sequence_shard_enabled = (
+            sp is not None and bool(sp.enable_sequence_shard) and self.sp_size > 1
         )
+        self.enable_teacache = sp is not None and sp.enable_teacache
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -1138,7 +1141,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         encoder_hidden_states = (
             encoder_hidden_states.to(orig_dtype)
-            if not current_platform.is_amp_supported()
+            if not self._amp_supported
             else encoder_hidden_states
         )  # cast to orig_dtype if amp is not supported
 
