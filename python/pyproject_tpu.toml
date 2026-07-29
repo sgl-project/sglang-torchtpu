@@ -101,11 +101,13 @@ tracing = [
 
 test = [
   "accelerate",
+  "blobfile",
   "expecttest",
   "gguf",
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
+  "openai",
   "pandas",
   "peft>=0.18.0",
   "pytest",
