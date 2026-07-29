@@ -222,14 +222,7 @@ class TestGmmV2Dense(
 class TestGmmV2WeightQuantized(
     parameterized.TestCase if _HAS_PARAMETERIZED else unittest.TestCase
 ):
-    """gmm_v2 with quantised RHS (int8 / fp8) and per-channel scales.
-
-    Migrated from sglang-jax's ``test_gmm_weight_quantized``. V2 only
-    supports per-channel quantization (``is_supported_by_gmm_v2`` asserts
-    ``rhs_scale.shape[1] == 1``), so we restrict block_size = in_size --
-    a single quant block per channel -- which is the only configuration
-    gmm_v2 accepts.
-    """
+    """gmm_v2 with quantised RHS (int8 / fp8) and per-channel scales."""
 
     @parameterized.product(
         batch_size=[128],
@@ -250,12 +243,9 @@ class TestGmmV2WeightQuantized(
         weight_dtype,
         group_offset,
     ):
-        from sglang.srt.layers.moe.pallas.gmm_v2 import (
-            gmm_v2,
-            is_supported_by_gmm_v2,
-        )
+        from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
 
-        block_size = in_size  # gmm_v2: per-channel only
+        block_size = in_size
         num_local_groups = num_groups - group_offset
         key = jax.random.key(0)
 
@@ -285,9 +275,6 @@ class TestGmmV2WeightQuantized(
             rhs_bias=rhs_bias,
             group_offset=offset,
         )
-
-        if not is_supported_by_gmm_v2(rhs_scale):
-            self.skipTest("Configuration not supported by gmm_v2")
 
         actual = gmm_v2(
             lhs,
