@@ -46,6 +46,8 @@ jobs:
   discover:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       groups: ${{ steps.d.outputs.groups }}
     steps:

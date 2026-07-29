@@ -137,6 +137,8 @@ def main():
     slices = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["slices"]
 
     if a.launch_script:
+        if a.hosts < 1:
+            ap.error("--hosts must be a positive integer for multi-host mode")
         hosts = a.hosts
         run_name = dns_safe(a.name or a.launch_script)
         suite = ""
