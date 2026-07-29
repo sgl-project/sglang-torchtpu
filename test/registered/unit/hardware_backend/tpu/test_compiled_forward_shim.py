@@ -12,15 +12,17 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     PowerBucketer,
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    DEFAULT_TPU_COMPILE_MAX_BS,
     CompiledForwardShim,
     _dp_attn_apply_bucket_metadata,
     _dp_attn_select_bucket_shape,
+    _extend_batch_cap,
     _matches_default,
     _pad_forward_batch_inputs,
     _static_default_kwargs,
     _zero_pad_1d,
     build_bucketers,
-    resolve_compile_caps,
+    reconcile_tpu_batch_limits,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
@@ -63,10 +65,13 @@ class _ForwardModeMock:
     def is_target_verify(self):
         return self._mode == "target_verify"
 
+    def is_draft_extend_v2(self):
+        return self._mode == "draft_extend_v2"
+
 
 def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
     """Synthetic ForwardBatch carrying the fields the padder touches."""
-    extend = mode == "extend"
+    extend = mode in ("extend", "draft_extend_v2")
     return SimpleNamespace(
         input_ids=torch.arange(real_t, dtype=torch.int32),
         positions=torch.arange(real_t, dtype=torch.int32),
@@ -143,6 +148,16 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
         self.assertEqual(fb.batch_size, 4)
 
+    def test_extend_batch_cap_does_not_exceed_token_ceiling(self):
+        fb = _forward_batch(real_t=4, real_b=2, mode="extend")
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [4]),
+            b_bucketer=_bucketer("Bs", [1, 8]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 4)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+
     def test_target_verify_pins_token_dim_to_draft_token_num(self):
         # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:
         # the extend branch would over-pad it up to the nearest token bucket.
@@ -159,6 +174,35 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.positions.shape[0], 16)
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.batch_size, 4)
+
+    def test_draft_extend_v2_uses_forward_mode_api(self):
+        fb = _forward_batch(real_t=8, real_b=2, mode="draft_extend_v2")
+        fb.spec_info = SimpleNamespace(
+            num_tokens_per_req=4,
+            hidden_states=torch.zeros(8, 16),
+        )
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(fb.input_ids.shape[0], 16)
+        self.assertEqual(fb.out_cache_loc.shape[0], 16)
+        self.assertEqual(fb.seq_lens.shape[0], 4)
+        self.assertEqual(fb.extend_seq_lens.tolist(), [4, 4, 0, 0])
+        self.assertEqual(fb.extend_seq_lens_cpu, [4, 4, 0, 0])
+        self.assertEqual(fb.batch_size, 4)
+
+    def test_draft_extend_v2_rejects_unset_num_tokens_per_req(self):
+        fb = _forward_batch(real_t=8, real_b=2, mode="draft_extend_v2")
+        fb.spec_info = SimpleNamespace(num_tokens_per_req=-1)
+
+        with self.assertRaisesRegex(AssertionError, "num_tokens_per_req > 0"):
+            _pad_forward_batch_inputs(
+                fb,
+                t_bucketer=_bucketer("Token", [64]),
+                b_bucketer=_bucketer("Bs", [1, 4]),
+            )
 
     def test_decode_uses_bs_bucketer_for_tokens(self):
         # In DECODE, token-axis tensors share the bs bucketer
@@ -510,86 +554,87 @@ class TestBuildBucketers(CustomTestCase):
         self.assertEqual(t_b.buckets, [64, 2048])
         self.assertEqual(b_b.buckets, [1, 2, 4, 8])
 
-
-class TestResolveCompileCaps(CustomTestCase):
-    """``resolve_compile_caps`` picks the **min** of the set caps, not the
-    first one — so an over-large ``chunked_prefill_size`` doesn't
-    bucket past the actual per-forward cap."""
-
-    def test_min_of_chunked_and_max_prefill(self):
-        # chunked=8192 is bigger than max_prefill=2048, but the scheduler
-        # would still cap at 2048; bucketing up to 8192 would compile a
-        # shape that never runs.
-        max_t, max_b = resolve_compile_caps(
-            chunked_prefill_size=8192,
-            max_prefill_tokens=2048,
-            context_len=32000,
-            torch_compile_max_bs=8,
-            max_running_requests=8,
+    def test_extend_batch_cap_uses_reachable_minimum(self):
+        self.assertEqual(
+            _extend_batch_cap(
+                _bucketer("Token", [64, 4096]),
+                _bucketer("Bs", [1, 8192]),
+            ),
+            4096,
         )
-        self.assertEqual(max_t, 2048)
-        self.assertEqual(max_b, 8)
 
-    def test_skips_none_and_zero_candidates(self):
-        max_t, _ = resolve_compile_caps(
-            chunked_prefill_size=None,
-            max_prefill_tokens=0,  # treated as unset
-            context_len=4096,
-            torch_compile_max_bs=1,
-            max_running_requests=1,
+
+class TestReconcileTpuBatchLimits(CustomTestCase):
+    """The compiled grid covers scheduler concurrency without compiling past
+    explicit limits when no larger serving batch is reachable (Task #40)."""
+
+    def _r(
+        self, torch_compile_max_bs=None, tpu_compile_bs=None, max_running_requests=None
+    ):
+        return reconcile_tpu_batch_limits(
+            torch_compile_max_bs, tpu_compile_bs, max_running_requests
         )
-        self.assertEqual(max_t, 4096)
 
-    def test_max_b_falls_back_to_one(self):
-        _, max_b = resolve_compile_caps(
-            chunked_prefill_size=128,
-            max_prefill_tokens=None,
-            context_len=None,
-            torch_compile_max_bs=None,
-            max_running_requests=None,
+    def test_default_neither_set(self):
+        # Nothing requested -> ceiling and concurrency default to 64 (NOT the
+        # ~2048 memory estimate), no explicit bucket list.
+        self.assertEqual(
+            self._r(),
+            (DEFAULT_TPU_COMPILE_MAX_BS, None, DEFAULT_TPU_COMPILE_MAX_BS),
         )
-        self.assertEqual(max_b, 1)
 
-    def test_max_b_prefers_torch_compile_max_bs(self):
-        # The compile knob bounds the batch grid.
-        _, max_b = resolve_compile_caps(
-            chunked_prefill_size=2048,
-            max_prefill_tokens=2048,
-            context_len=32000,
-            torch_compile_max_bs=32,
-            max_running_requests=2048,
+    def test_explicit_torch_compile_max_bs_above_default_honored(self):
+        tcmb, _, mrr = self._r(torch_compile_max_bs=128)
+        self.assertEqual((tcmb, mrr), (128, 128))
+
+    def test_explicit_torch_compile_max_bs_below_default_avoids_dead_shapes(self):
+        self.assertEqual(self._r(torch_compile_max_bs=8), (8, None, 8))
+
+    def test_max_running_requests_grows_ceiling(self):
+        # --max-running-requests 128 -> grid ceiling 128, served (not clamped 64).
+        self.assertEqual(self._r(max_running_requests=128), (128, None, 128))
+
+    def test_tpu_compile_bs_sets_ceiling_and_concurrency(self):
+        tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8])
+        self.assertEqual((tcmb, mrr, bs), (8, 8, [1, 8]))
+
+    def test_both_set_and_agree(self):
+        tcmb, bs, mrr = self._r(
+            tpu_compile_bs=[1, 8, 64, 128], max_running_requests=128
         )
-        self.assertEqual(max_b, 64)
+        self.assertEqual((tcmb, mrr, max(bs)), (128, 128, 128))
 
-    def test_max_b_uses_sane_max_running_requests(self):
-        _, max_b = resolve_compile_caps(
-            chunked_prefill_size=2048,
-            max_prefill_tokens=2048,
-            context_len=32000,
-            torch_compile_max_bs=32,
-            max_running_requests=64,
-        )
-        self.assertEqual(max_b, 64)
+    def test_conflict_grows_bucket_list(self):
+        # Case E: pinned buckets top out at 64 but concurrency is 128 -> the list
+        # is grown to include 128 so build_bucketers covers the batch (no crash).
+        tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8, 64], max_running_requests=128)
+        self.assertEqual((tcmb, mrr), (128, 128))
+        self.assertIn(128, bs)
+        self.assertEqual(max(bs), 128)
 
-    def test_max_b_honors_larger_torch_compile_max_bs(self):
-        _, max_b = resolve_compile_caps(
-            chunked_prefill_size=2048,
-            max_prefill_tokens=2048,
-            context_len=32000,
+    def test_bucket_list_only_grows_to_scheduler_concurrency(self):
+        tcmb, bs, mrr = self._r(
             torch_compile_max_bs=128,
-            max_running_requests=64,
+            tpu_compile_bs=[1, 8],
+            max_running_requests=32,
         )
-        self.assertEqual(max_b, 128)
+        self.assertEqual((tcmb, bs, mrr), (128, [1, 8, 32], 32))
 
-    def test_raises_when_no_token_cap_set(self):
-        with self.assertRaisesRegex(ValueError, "Cannot determine max_t"):
-            resolve_compile_caps(
-                chunked_prefill_size=None,
-                max_prefill_tokens=None,
-                context_len=None,
-                torch_compile_max_bs=4,
-                max_running_requests=4,
-            )
+    def test_invariant_grid_always_covers_concurrency(self):
+        cases = [
+            (None, None, None),
+            (None, None, 200),
+            (None, [1, 8, 64], 256),
+            (None, [1, 8, 64, 512], None),
+            (256, None, 128),
+        ]
+        for tcmb_in, bs_in, mrr_in in cases:
+            tcmb, bs, mrr = self._r(tcmb_in, bs_in, mrr_in)
+            self.assertGreaterEqual(tcmb, mrr, f"ceiling < concurrency for {cases}")
+            if bs is not None:
+                self.assertGreaterEqual(
+                    max(bs), mrr, f"buckets don't cover concurrency for {cases}"
+                )
 
 
 class TestDpAttnSelectBucketShape(CustomTestCase):

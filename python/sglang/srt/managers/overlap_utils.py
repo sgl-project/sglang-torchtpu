@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.speculative.triton_ops.gather_spec_extras import gather_spec_extras
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.speculative.spec_utils import gather_spec_extras_func
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
+
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -56,7 +58,7 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu or _is_tpu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
@@ -275,7 +277,8 @@ class FutureMap:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
-        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        if not _is_tpu:
+            indices.record_stream(torch.get_device_module(self.device).current_stream())
         if self.need_topk:
             hidden_states_buf = (
                 self.hidden_states_buf if self.need_hidden_states else None
@@ -285,7 +288,7 @@ class FutureMap:
                 draft_input.topk_index,
                 bonus_tokens,
                 hidden_states,
-            ) = gather_spec_extras(
+            ) = gather_spec_extras_func(
                 indices,
                 self.topk_p_buf,
                 self.topk_index_buf,

@@ -10,7 +10,7 @@
 #       --speculative-num-steps 3 --speculative-eagle-topk 1 \
 #       --speculative-num-draft-tokens 4 \
 #       --device tpu --tp-size 4 --dtype bfloat16 \
-#       --disable-overlap-schedule --decode-log-interval 1 \
+#       --decode-log-interval 1 \
 #       --skip-server-warmup \
 #       --host 127.0.0.1 --port 30000 --watchdog-timeout 3600
 #

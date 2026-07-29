@@ -1,0 +1,88 @@
+# Nightly TPU e2e. Builds the image ONCE, then:
+#   * single-host  -> run_suite over the single-host suite (each test self-launches).
+#   * multi-host    -> discover_multihost.py finds multi-host test files (MULTIHOST_LAUNCH)
+#                      registered to nightly-tpu-multihost and GROUPS them by launch spec;
+#                      one JobSet per group (launch once, rank-0 runs the group's files).
+# Same-setup files share a server. Groups run on the single 2x2x2 slice, so _tpu-test
+# serializes them (concurrency by host count); single-host runs in parallel on pr-gate.
+name: Nightly Test (TPU)
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # 09:00 UTC daily (low-PR hour); adjust as needed
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+
+concurrency:
+  group: tpu-slice-nightly
+  cancel-in-progress: false   # let a running nightly finish; don't stack them
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  single-host:
+    needs: build
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: nightly-tpu-4-v7
+      nightly: true
+      # gpt-oss-120b lm-eval loads from the ROX weights disk at /weights
+      # (test_tpu_gpt_oss_120b.py); harmless for tests that don't use it.
+      weights_pvc: model-weights-rox
+    permissions:
+      contents: read
+      id-token: write
+
+  # Discover multi-host launch groups from the test files (test-owned launch specs).
+  discover:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.d.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: d
+        run: |
+          set -euo pipefail
+          groups="$(python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost)"
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
+          echo "discovered groups: $groups"
+
+  # One JobSet per launch group. matrix.group is a discovered object.
+  multi-host:
+    needs: [build, discover]
+    if: needs.discover.outputs.groups != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.discover.outputs.groups) }}
+    name: ${{ matrix.group.name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      nightly: true
+      launch_script: ${{ matrix.group.launch_script }}
+      files: ${{ matrix.group.files }}
+      hosts: ${{ matrix.group.hosts }}
+      weights_pvc: ${{ matrix.group.weights_pvc }}
+      run_name: ${{ matrix.group.name }}
+    permissions:
+      contents: read
+      id-token: write

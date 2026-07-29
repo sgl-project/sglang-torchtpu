@@ -49,12 +49,13 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_tpu
 from sglang.srt.utils.common import ceil_align, require_mlp_sync
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -173,7 +174,7 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or _is_tpu:
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:

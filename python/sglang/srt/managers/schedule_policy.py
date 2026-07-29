@@ -616,19 +616,19 @@ class PrefillAdder:
     ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
-        With chunked prefill + overlap scheduler, the peak SWA occupancy is:
-          chunk N (running, not yet in tree) + sliding window (locked in tree)
-          + chunk N+1 (new allocation)
-        Since chunk N and locked tokens are already excluded from
-        swa_available + swa_evictable, the budget only needs to cover the
-        chunk N+1 allocation. We floor at sliding_window_size to reserve
-        room for the decode phase.
+        With chunked prefill + overlap scheduling, reserve both the next chunk
+        and the request's retained sliding window. The allocator's evictable
+        count can still include that window until the overlap result commits,
+        so using only the larger value can over-admit and force retraction.
         """
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        if self.rem_chunk_tokens is not None:
+            budget = alloc + self.tree_cache.sliding_window_size + self.page_size
+        else:
+            budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
         if swa_host_hit_length > 0:
             budget += self.ceil_paged_tokens(swa_host_hit_length)
         return budget
@@ -800,10 +800,19 @@ class PrefillAdder:
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
-                # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM
+                # alloc_extend needs one extra page, and overlap scheduling can
+                # still have the retained SWA window in flight. Keep both out
+                # of the continuation chunk budget, then floor to allocator
+                # page granularity so budget charging cannot round up into OOM.
                 _rem_tokens = min(
-                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                    _rem_tokens,
+                    (
+                        int(self.rem_swa_tokens)
+                        - self.tree_cache.sliding_window_size
+                        - self.page_size
+                    )
+                    // self.page_size
+                    * self.page_size,
                 )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.

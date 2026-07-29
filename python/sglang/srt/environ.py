@@ -337,6 +337,9 @@ class Envs:
     SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX = EnvBool(True)
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    SGLANG_TPU_ENABLE_DISAGGREGATION_PERFETTO_TRACING = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_PERFETTO_TRACING"
+    )
 
     # Scheduler: others:
     # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -978,9 +981,22 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # MoE: offload the gather in permute and unpermute to SparseCore.
+    SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
+    # MoE: use onehot dense matmul for small permute and unpermute/combine
+    # paths instead of gather. When set to 0, this is disabled. When set
+    # to a positive integer, this is the threshold for tokens per rank below
+    # which the dense matmul path is taken. Suggset to start with 1024 or 2048
+    # and tune from there.
+    SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD = EnvInt(0)
+    # xprof scope per task. Values <= 0 trace all chips or SparseCores.
+    SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
+    SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_ASYNC_H2D = EnvBool(True)
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
+    # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
+    SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
 
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")

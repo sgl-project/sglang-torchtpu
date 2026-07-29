@@ -1546,10 +1546,6 @@ def get_default_block_sizes(
         16 * 1024 * 1024 * kv_packing // 4 // head_dim // num_kv_heads_x2
     )
 
-    # Cap bq_sz for non-decode to 32 to match v2 precision characteristics.
-    # Larger bq causes bf16 rounding divergence in flash attention accumulation.
-    MAX_BQ_SZ = 32
-
     match tpu_version:
         case 5 | 6:
             if case == RpaCase.DECODE:
@@ -1562,9 +1558,9 @@ def get_default_block_sizes(
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
-                bq_sz = min(MAX_BQ_SZ, max_q // 2)
+                bq_sz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(1024, max_kv)
-                bq_csz = min(MAX_BQ_SZ, min(512 // num_q_heads_per_kv_head, max_q))
+                bq_csz = min(512 // num_q_heads_per_kv_head, max_q)
                 bkv_csz = (
                     min(512, align_to(max_kv // 2, page_size))
                     if max_kv > 1
@@ -1581,11 +1577,11 @@ def get_default_block_sizes(
                 bq_csz = 1
                 bkv_csz = bkv_sz
             else:
-                bq_sz = min(MAX_BQ_SZ, max_q // 2)
+                bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_sz = min(2048, max_kv // 2)
-                bq_csz = min(MAX_BQ_SZ, min(1024 // num_q_heads_per_kv_head, max_q))
+                bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_csz = (
-                    min(1024, align_to(max_kv // 2, page_size))
+                    min(512, align_to(max_kv // 2, page_size))
                     if max_kv > 1
                     else page_size
                 )
@@ -1602,7 +1598,10 @@ def get_default_block_sizes(
     # Use 30% of vmem_limit to account for compiler overhead (intermediates,
     # stack, spills, f32 softmax pipeline) not captured by get_vmem_estimate_bytes.
     if vmem_limit_bytes is not None:
-        vmem_budget = int(vmem_limit_bytes * 0.30)
+        # Give higher vmem budget for prefill and mixed.
+        # TODO(wyzhang): Evaluate if we still need the capping.
+        _budget_frac = 0.30 if case == RpaCase.DECODE else 0.70
+        vmem_budget = int(vmem_limit_bytes * _budget_frac)
         while bq_sz > 1 or bkv_sz > bkv_alignment:
             vmem_est = get_vmem_estimate_bytes(
                 actual_num_kv_heads,

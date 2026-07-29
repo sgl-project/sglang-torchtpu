@@ -1,0 +1,18 @@
+# Hyperdisk ML StorageClass for CI weight volumes, at a cost-modest 400Mi/s provisioned
+# throughput. Retain keeps the underlying disk when a PVC is deleted, which the
+# ReadWriteOnce -> ReadOnlyMany conversion relies on (see
+# pvc-model-weights-rox.yaml.tmpl). Bump throughput for larger models if load time matters.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hyperdisk-ml-smoke
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+parameters:
+  type: hyperdisk-ml
+  provisioned-throughput-on-create: "400Mi"
+  # Label the underlying PD at creation so a Retain-orphaned disk is findable later:
+  #   gcloud compute disks list --filter="labels.purpose=tpu-ci-weights"
+  labels: "purpose=tpu-ci-weights"

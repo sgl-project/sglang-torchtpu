@@ -1,0 +1,43 @@
+# Ground truth 0.894 = the model card's official 5-shot MMLU (89.4). atol 0.03 is the
+# agreed tolerance for this test -- we gate on "within 3 points absolute", not strict
+# match (floor = 0.864). Note the card's harness may format prompts slightly
+# differently than lm-eval's mmlu_llama; if the first green runs sit consistently
+# offset, re-anchor value to the measured sglang-TPU number and keep atol 0.03.
+#
+# num_fewshot 5 matches the card; with fewshot_as_multiturn the 5 shots become chat
+# turns. 5-shot MMLU prompts run several k tokens -- the recipe's
+# CHUNKED_PREFILL_SIZE / MAX_PREFILL_TOKENS = 8192 (and its 8192 compile bucket)
+# exist to cover them in one prefill chunk.
+#
+# mmlu_llama ONLY (fast-config style): the validated serving config (PR #155 recipe:
+# mem_fraction 0.7, MAX_RUNNING=8 -- the KV pool left after ~64G/device of weights is
+# small) makes the mmlu_pro 2048-token CoT too slow for the JobSet
+# activeDeadlineSeconds (5400s) on top of the ~1TB weight load + compile. Add
+# mmlu_pro once first-run timings are known.
+#
+# num_concurrent=8 matches the recipe's MAX_RUNNING=8 -- more would just queue
+# server-side.
+model_name: "XiaomiMiMo/MiMo-V2.5-Pro"
+backend: "local-chat-completions"
+api: "chat"
+tasks:
+- name: "mmlu_llama"
+  metrics:
+  - name: "exact_match,strict_match"
+    value: 0.894  # model card, MMLU 5-shot
+num_fewshot: 5
+limit: 100
+num_concurrent: 8
+batch_size: "auto"
+apply_chat_template: true
+fewshot_as_multiturn: true
+gen_kwargs:
+  continue_final_message: true
+  add_generation_prompt: false
+  chat_template_kwargs:
+    enable_thinking: false
+  repetition_penalty: 1.0
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+atol: 0.03
+rtol: 0.0

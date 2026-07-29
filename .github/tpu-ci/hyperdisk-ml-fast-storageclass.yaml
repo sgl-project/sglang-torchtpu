@@ -1,0 +1,20 @@
+# Hyperdisk ML StorageClass for the shared model-weights volume, at 2400Mi/s
+# provisioned throughput: the multi-host slice reads ~1TB (MiMo-V2.5-Pro) at serve
+# time, which at the smoke class's 400Mi/s would take ~45 min -- past the JobSet's
+# rank-0 health wait. Retain keeps the underlying disk when a PVC is deleted, which
+# the ReadWriteOnce -> ReadOnlyMany conversion relies on (see
+# pvc-model-weights-rox.yaml.tmpl).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hyperdisk-ml-fast
+provisioner: pd.csi.storage.gke.io
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+parameters:
+  type: hyperdisk-ml
+  provisioned-throughput-on-create: "2400Mi"
+  # Label the underlying PD at creation so a Retain-orphaned disk is findable later:
+  #   gcloud compute disks list --filter="labels.purpose=tpu-ci-weights"
+  labels: "purpose=tpu-ci-weights"

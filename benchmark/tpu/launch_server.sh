@@ -92,6 +92,9 @@
 #   HLO_DUMP_DIR=./hlo_dump/<model-slug>-tpu/<timestamp>
 #   TORCH_COMPILE_DEBUG_DIR=$RUN_DIR/torch_compile_debug
 #   TORCH_TPU_TIER2_NAME=torchtpu_<model-slug>   # per-model compile cache name
+#   DUMP_META=1                    # 1 → write launch_meta.json (repro record
+#                                  # for the CI dashboard) into RUN_DIR; 0 skips
+#   META_FILE=$RUN_DIR/launch_meta.json  # override the launch_meta.json path
 #   PYTHON=python3                 # interpreter with torch_tpu + sglang installed
 #   JAX_BAZEL=                     # opt-in; only for a Bazel-built torch_tpu (see below)
 #   --- multihost (multi-node serving) ---
@@ -108,11 +111,17 @@
 #   CHIPS_PER_HOST=8               # tp-devices per host (v7x: 4 chips x 2 cores)
 #   RANK0_HOST=                    # rank-0 hostname; needed for node_rank>0 manual mode
 set -euo pipefail
-
 # Shared static TPU env (PYTHON, SGLANG_PLATFORM, HF cache, LIBTPU_INIT_ARGS,
 # TORCH_LOGS, ...) lives in common_env.sh next to this script — source it so
 # every caller gets the same environment. Per-launch config stays below.
 source "$(dirname "${BASH_SOURCE[0]}")/common_env.sh"
+
+# Resolve this script's dir so we can find dump_meta.py regardless of CWD.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# 1 (default) → write launch_meta.json (reproducibility record for the CI
+# dashboard). Set 0 to skip the dump entirely.
+DUMP_META=${DUMP_META:-1}
+
 
 MODEL=${MODEL:-}
 if [[ -z "$MODEL" ]]; then
@@ -403,5 +412,62 @@ fi
 EXTRA_ARGS=${EXTRA_ARGS:-}
 [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
 
+PYTHON=${PYTHON:-python3}
+
+# ===== reproducibility metadata dump =====
+# Emit launch_meta.json BEFORE exec (exec replaces this process). Captures the
+# resolved server config, the exact server_argv, the reproducibility-critical
+# env (LIBTPU_INIT_ARGS / XLA_FLAGS / topology / SGLANG_* / TORCH_TPU_*), plus
+# git commit + package versions. The CI dashboard joins this with the bench
+# side by (hostname, model, git commit). Never fatal: a dump failure must not
+# stop the server from launching.
+if [[ "$DUMP_META" == "1" ]]; then
+    META_FILE=${META_FILE:-$RUN_DIR/launch_meta.json}
+    # JSON-encode the full argv safely (handles spaces/quotes in flag values).
+    SERVER_ARGV_JSON=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${args[@]}")
+    "$PYTHON" "$SCRIPT_DIR/dump_meta.py" --kind launch --out "$META_FILE" \
+        --json server_argv="$SERVER_ARGV_JSON" \
+        --set model="$MODEL" \
+        --set model_slug="$MODEL_SLUG" \
+        --set dtype=bfloat16 \
+        --set device=tpu \
+        --set tp_size="$TP_SIZE" \
+        --set ep_size="${EP_SIZE:-}" \
+        --set host="$HOST" \
+        --set port="$PORT" \
+        --set conc="$CONC" \
+        --set max_running="$MAX_RUNNING" \
+        --set page_size="$PAGE_SIZE" \
+        --set isl="$ISL" \
+        --set osl="$OSL" \
+        --set context_len="$CONTEXT_LEN" \
+        --set attention_backend="$ATTENTION_BACKEND" \
+        --set chunked_prefill_size="$CHUNKED_PREFILL_SIZE" \
+        --set max_prefill_tokens="${MAX_PREFILL_TOKENS:-}" \
+        --set max_total_tokens="${MAX_TOTAL_TOKENS:-}" \
+        --set tpu_compile_tokens="${TPU_COMPILE_TOKENS:-}" \
+        --set tpu_compile_bs="${TPU_COMPILE_BS:-}" \
+        --set num_continuous_decode_steps="${NUM_CONTINUOUS_DECODE_STEPS:-}" \
+        --set mem_fraction_static="${MEM_FRACTION_STATIC:-}" \
+        --set quantization="${QUANTIZATION:-}" \
+        --set kv_cache_dtype="${KV_CACHE_DTYPE:-}" \
+        --set torch_compile_max_bs="$TORCH_COMPILE_MAX_BS" \
+        --set enable_torch_compile="$ENABLE_TORCH_COMPILE" \
+        --set disable_radix_cache="$DISABLE_RADIX_CACHE" \
+        --set disable_overlap_schedule="${DISABLE_OVERLAP_SCHEDULE:-0}" \
+        --set enable_compile_cache="$ENABLE_COMPILE_CACHE" \
+        --set torch_tpu_tier2_name="$TORCH_TPU_TIER2_NAME" \
+        --set multihost="$ENABLE_MULTIHOST" \
+        --set nnodes="$NNODES" \
+        --set node_rank="$NODE_RANK" \
+        --set chips_per_host="$CHIPS_PER_HOST" \
+        --env LIBTPU_INIT_ARGS --env XLA_FLAGS --env TORCH_LOGS \
+        --env HF_HUB_OFFLINE --env TRANSFORMERS_OFFLINE \
+        --env-prefix SGLANG_ --env-prefix TORCH_TPU_ --env-prefix TPU_ \
+        || echo "WARN: dump_meta failed; launching without launch_meta.json" >&2
+fi
+
 # PYTHON is exported by common_env.sh (default python3).
+set -x
 exec "$PYTHON" "${args[@]}" 2>&1
+set +x

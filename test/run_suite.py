@@ -176,6 +176,7 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.TPU: [
         "nightly-tpu-4-v7",
+        "nightly-tpu-multihost",
         "nightly-perf-tpu",
     ],
     HWBackend.XPU: [

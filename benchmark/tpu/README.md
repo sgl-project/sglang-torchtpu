@@ -148,3 +148,31 @@ MODEL=Qwen/Qwen3-32B ./warmup.sh
 - Every knob is an env var — see each script's header comment for the full list.
 - `bench_serving.sh` writes JSONL summaries under `./results/<model-slug>-tpu/`
   (gitignored).
+
+## Reproducibility metadata (for the CI dashboard)
+
+Both scripts emit a versioned JSON record (`dump_meta.py`) so every benchmark
+data point carries enough to reproduce it — no more "what commit / libtpu /
+flags was that run on?". Enabled by default; set `DUMP_META=0` to skip.
+
+- `launch_server.sh` → `$RUN_DIR/launch_meta.json` (`kind: "launch"`): resolved
+  server knobs, the exact `server_argv`, the repro-critical env
+  (`LIBTPU_INIT_ARGS`, `XLA_FLAGS`, topology, `SGLANG_*`, `TORCH_TPU_*`), git
+  commit/dirty of the repo + `torch_tpu`, and package versions.
+- `bench_serving.sh` → `$OUTPUT_DIR/<tag>.meta.json` (`kind: "bench"`), one per
+  sweep leg beside its metrics `<tag>.jsonl`: workload/bench args, git +
+  versions, and a **live pull of the server's `/server_info`** (the authoritative
+  running config, so launch and bench can't silently disagree).
+
+Every record has a top-level `schema_version` and a stable shape
+(`git` / `versions` / `config` / `env` [/ `server_info`]). A CI dashboard
+ingests the `*.meta.json` files plus the metrics `<tag>.jsonl` and joins them by
+`(hostname, model, git commit, timestamp)`.
+
+**Secrets are redacted.** The `env` capture is a blanket prefix match, and
+`/server_info` echoes the full server args, so a credential set in the
+environment (e.g. `SGLANG_BEARER_TOKEN`, `SGLANG_S3_SECRET_ACCESS_KEY`) or an
+`api_key` would otherwise land in the record and flow to the shared dashboard.
+Any field whose name reads as a credential (`*_token`, `*secret*`, `*password*`,
+`*_access_key`, `api_key`, …) has its value replaced with `***redacted***`
+before the record is written.

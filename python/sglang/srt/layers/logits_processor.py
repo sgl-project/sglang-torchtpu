@@ -968,6 +968,17 @@ class LogitsProcessor(nn.Module):
             and logits.dtype != torch.float32
         ):
             logits = logits.float()
+        # FIXME: Without this change, TPU v7 will crash at warming up:
+        # https://gist.github.com/junyanxu/164a6246b01253ad3bddbec724ad192e.
+        # Need to investigate exactly why. Disable the env var to debug.
+        # See this issue on DPA + TP.
+        if (
+            _is_tpu
+            and envs.SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS.get()
+            and get_parallel().tp_size > 1
+            and get_parallel().attn_dp_size > 1
+        ):
+            logits = logits.contiguous().float()
 
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
@@ -1100,7 +1111,6 @@ class LogitsProcessor(nn.Module):
         logits_buffer = logits_metadata.next_token_logits_buffer
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
-        logits_width = logits.shape[-1]
         # The shared logits buffer is keyed by vocab width and rows; skip it
         # when this batch has a different logits shape than the graph buffer.
         if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(

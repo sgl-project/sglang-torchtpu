@@ -115,6 +115,9 @@ class TpuKVManagerBase(CommonKVManager):
         # concurrently from multiple sender threads).
         self._endpoint_locks = defaultdict(threading.Lock)
 
+        # Process/track ID for tracing instrumentation
+        self._initialize_trace_id()
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # CommonKVManager.__init__ already created self.transfer_infos and
             # self.req_to_decode_prefix_len for the prefill role.
@@ -127,6 +130,15 @@ class TpuKVManagerBase(CommonKVManager):
                 f"{DisaggregationMode.PREFILL} or {DisaggregationMode.DECODE}, "
                 f"got {self.disaggregation_mode}"
             )
+
+    def _initialize_trace_id(self):
+        mode_str = self.disaggregation_mode.value
+        if self.attn_dp_size > 1:
+            self.trace_pid = (
+                f"tpu-kv-{mode_str}-dp{self.attn_dp_rank}" f"-tp{self.attn_tp_rank}"
+            )
+        else:
+            self.trace_pid = f"tpu-kv-{mode_str}{self.attn_tp_rank}"
 
     # ---- pool attachment (shared) ---------------------------------------
 

@@ -17,16 +17,19 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
     CompiledForwardShim,
+    _extend_batch_cap,
     _pad_forward_batch_inputs,
+    _restore_forward_batch_inputs,
     build_bucketers,
-    resolve_compile_caps,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
+from sglang.srt.platforms import current_platform
 
 logger = get_logger(__name__)
 
@@ -101,22 +104,18 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
     if hidden_states is not None and real_q < hidden_states.shape[0]:
         out.hidden_states = hidden_states[:real_q]
 
-    # Restore real batch_size and seq_lens so downstream consumers (sampler,
-    # logprob, scheduler hooks, the prefill-only dummy-token sizing in
-    # tp_worker) don't iterate over ghost slots.
-    forward_batch.batch_size = real_b
-    if forward_batch.seq_lens.shape[0] > real_b:
-        forward_batch.seq_lens = forward_batch.seq_lens[:real_b]
+    # Restore real token/batch metadata so eager outer-model processing and
+    # downstream consumers never observe static-shape ghost slots.
+    _restore_forward_batch_inputs(forward_batch, real_q, real_b)
     return out
 
 
 class DecoderTpuCompilePolicy(CompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
-    backend = "tpu"
+    platform = "tpu"
     fullgraph = True
     dynamic = False
-    should_precompile = True
 
     def __init__(
         self,
@@ -162,9 +161,10 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             return False
 
         signature = inspect.signature(fn)
+        backend = self.backend or current_platform.get_compile_backend()
         compiled = torch.compile(
             torch.no_grad()(fn),
-            backend=self.backend,
+            backend=backend,
             fullgraph=self.fullgraph,
             dynamic=self.dynamic,
         )
@@ -172,16 +172,30 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         setattr(self.owner, self.method_name, compiled)
 
         server_args = self.model_runner.server_args
-        max_t, max_b = resolve_compile_caps(
-            chunked_prefill_size=server_args.chunked_prefill_size,
-            max_prefill_tokens=server_args.max_prefill_tokens,
-            context_len=self.model_runner.model_config.context_len,
-            torch_compile_max_bs=getattr(server_args, "torch_compile_max_bs", None),
-            max_running_requests=self.model_runner.max_running_requests,
-        )
-        self.t_bucketer, self.b_bucketer = build_bucketers(
-            server_args, max_t=max_t, max_b=max_b
-        )
+        # max_t = smallest positive prefill/context limit (extend never runs
+        # longer). max_b = the reconciled compile-batch ceiling, already grown to
+        # cover the scheduler concurrency in ServerArgs.__post_init__ via
+        # reconcile_tpu_batch_limits, so the grid covers every decode batch the
+        # scheduler can form (Task #40).
+        t_candidates = [
+            c
+            for c in (
+                server_args.chunked_prefill_size,
+                server_args.max_prefill_tokens,
+                self.model_runner.model_config.context_len,
+            )
+            if c and c > 0
+        ]
+        if not t_candidates:
+            raise ValueError(
+                "Cannot determine max_t for TPU compile bucketing: "
+                "chunked_prefill_size, max_prefill_tokens, and context_len are all unset."
+            )
+        max_t = min(t_candidates)
+        max_b = server_args.torch_compile_max_bs
+        t_bucketer, b_bucketer = build_bucketers(server_args, max_t=max_t, max_b=max_b)
+        self.t_bucketer = t_bucketer
+        self.b_bucketer = b_bucketer
 
         outer_model = self.model_runner.model
         existing_prep = getattr(outer_model, "prepare_forward_batch", None)
@@ -189,10 +203,8 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         def _prepare(forward_batch: ForwardBatch) -> None:
             if existing_prep is not None:
                 existing_prep(forward_batch)
-            assert self.t_bucketer is not None
-            assert self.b_bucketer is not None
             real_q, real_b = _pad_forward_batch_inputs(
-                forward_batch, self.t_bucketer, self.b_bucketer
+                forward_batch, t_bucketer, b_bucketer
             )
             setattr(forward_batch, _REAL_Q_KEY, real_q)
             setattr(forward_batch, _REAL_B_KEY, real_b)
@@ -245,8 +257,12 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             # unpadded (garbage decode under DP attention).
             if (
                 forward_batch.forward_mode.is_idle()
-                and forward_batch.batch_size > 0
                 and is_dp_attention_enabled()
+                and (
+                    # This is necessary for preventing all Idle.
+                    max(forward_batch.global_num_tokens_cpu, default=0)
+                    > 0
+                )
             ):
                 forward_batch.forward_mode = ForwardMode.DECODE
             return orig_forward(forward_batch, *args, **kwargs)
@@ -275,7 +291,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self.b_bucketer.max_val
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(
@@ -477,7 +493,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
     ) -> ForwardBatch:
         """Construct a dummy ForwardBatch at the target bucket shape."""
         device = self.model_runner.device
-        is_extend = mode.is_extend()
+        is_extend = mode.is_extend(include_draft_extend_v2=True)
         slot = self._dummy_kv_slot()
 
         # Token-level inputs
@@ -552,6 +568,14 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
+    def install(self) -> bool:
+        if is_dp_attention_enabled():
+            raise NotImplementedError(
+                "Qwen3-VL TPU decoder compilation does not support DP attention; "
+                "disable --enable-torch-compile for this configuration."
+            )
+        return super().install()
+
     @property
     def _num_deepstack(self) -> int:
         model = getattr(self.model_runner, "model", None)
@@ -567,6 +591,30 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
+    def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
+        """Slice the inner VL decoder output before outer logits processing."""
+        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        out = super().unpad_outputs(out, forward_batch)
+        if real_q is None:
+            return out
+        if isinstance(out, torch.Tensor):
+            return out[:real_q]
+        if isinstance(out, PPProxyTensors):
+            # Intermediate pipeline stages must transmit the padded proxy. The
+            # next stage pads ForwardBatch again but consumes this proxy as-is.
+            return out
+        if isinstance(out, tuple) and len(out) == 2:
+            hidden_states, aux_hidden_states = out
+            if isinstance(hidden_states, torch.Tensor):
+                hidden_states = hidden_states[:real_q]
+            if isinstance(aux_hidden_states, (list, tuple)):
+                aux_hidden_states = type(aux_hidden_states)(
+                    value[:real_q] if isinstance(value, torch.Tensor) else value
+                    for value in aux_hidden_states
+                )
+            return hidden_states, aux_hidden_states
+        return out
+
     def _precompile_extend(self) -> None:
         if not self._uses_input_embeds(self.owner):
             return super()._precompile_extend()
@@ -574,7 +622,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self.b_bucketer.max_val
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         if not valid_shapes:
             raise ValueError(

@@ -1,0 +1,153 @@
+# Unified TPU test workload -- ONE JobSet for ANY host count. Rendered by
+# .github/tpu-ci/render_jobset.py. Render vars (do NOT write them as dollar-brace tokens
+# in these comments -- the renderer would substitute them here too):
+#   IMAGE         digest-pinned image
+#   HOSTS         completions/parallelism (single-host = 1)
+#   TOPOLOGY/POOL node labels (looked up by host count in topology.yaml)
+#   RUN_NAME      DNS-safe label for the JobSet (a suite name or a launch-group name)
+#   SUITE         single-host: the run_suite suite; NIGHTLY_FLAG: --nightly or empty
+#   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/)
+#   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
+#   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
+# The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
+# literal. Gating is handled by the kind-aware _tpu-test.
+#
+# Launch model (branch on NNODES, from GKE's TPU_WORKER_HOSTNAMES):
+#   * single-host (nnodes<=1) -> each registered test self-launches (popen_launch_server);
+#     run_suite runs the suite directly.
+#   * multi-host  (nnodes>1)  -> every host runs the launch GROUP's recipe (it owns the
+#     model + config); rank 0 runs each of the group's TEST_FILES in LIVE-SERVER mode
+#     against the one server; workers serve until the leader tears down, then exit 0.
+#     Files sharing an identical launch spec share this one server (grouping).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: tpu-ci-${RUN_NAME}-
+  namespace: tpu-ci
+spec:
+  ttlSecondsAfterFinished: 7200
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true       # stable pod DNS for multi-host rendezvous
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${HOSTS}
+          parallelism: ${HOSTS}
+          activeDeadlineSeconds: 5400
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
+                ci-tpu-pool: ${POOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+${WEIGHTS_VOLUME}
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    # HF token for gated datasets (GPQA in the gpt-oss lm-eval test).
+                    # One-time: kubectl -n tpu-ci create secret generic hf-token \
+                    #   --from-literal=token=hf_...   (fine-grained, read-only)
+                    # optional: pods must still start when the secret is absent --
+                    # only the gated-dataset eval needs it.
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
+                      RANK="${TPU_WORKER_ID:-0}"
+                      echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
+
+                      if [ "$NNODES" -le 1 ]; then
+                        # Single-host: each test self-launches its own server. 3600s/file:
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 3600
+                      fi
+
+                      # Multi-host: every host runs the launch group's recipe (owns model+config).
+                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                          bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
+                      spid=$!
+                      if [ "$RANK" = "0" ]; then
+                        ok=0
+                        for i in $(seq 1 300); do
+                          curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                          kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
+                          sleep 10
+                        done
+                        echo "== server.log tail =="; tail -n 60 /tmp/server.log
+                        [ "$ok" = 1 ] || { echo "FAIL: server never healthy"; exit 1; }
+                        # rank 0 runs every file in this launch group against the one server.
+                        rc=0
+                        for f in ${TEST_FILES}; do
+                          echo "== live-server test: $f =="
+                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 1800 python3 "$f" || rc=1
+                        done
+                        kill "$spid" 2>/dev/null || true
+                        exit $rc
+                      else
+                        # A worker is a shard of the same server as rank-0, so its crash
+                        # normally also fails rank-0's inference. But flag the unambiguous
+                        # local deaths -- OOM-kill (137) / SIGSEGV (139) -- so a worker
+                        # crash is never masked as success. This matters once independent
+                        # groups (e.g. P/D disaggregation) share one slice, where rank-0
+                        # may not exercise every group. NOTE: this JobSet runs ONE global
+                        # TP group (every host runs the same recipe; TP spans all hosts) --
+                        # true per-group gating for P/D is future work (needs role-aware
+                        # launch, which MULTIHOST_LAUNCH does not model yet). Teardown-
+                        # induced exits (leader gone -> peer disconnect / SIGTERM 143) pass.
+                        wait "$spid"; src=$?
+                        # 137 is ALSO how normal teardown manifests: rank-0 finishes its
+                        # test files and exits first, this worker's scheduler dies on the
+                        # severed request-broadcast socket ("Connection reset by peer"),
+                        # and sglang's crash handler SIGKILLs its own process tree.
+                        # Distinguish teardown from a real crash by that disconnect
+                        # signature; rank-0's exit code still gates every real failure,
+                        # so this can never mask a red run.
+                        if [ "$src" = 137 ] && grep -q "Connection reset by peer" /tmp/server.log; then
+                          echo "worker rank=$RANK: leader closed (teardown); success"; exit 0
+                        fi
+                        case "$src" in
+                          137|139) echo "worker rank=$RANK server crashed rc=$src"; exit 1 ;;
+                          *)       echo "worker rank=$RANK done (server rc=$src)"; exit 0 ;;
+                        esac
+                      fi
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+${WEIGHTS_MOUNT}
+                  securityContext:
+                    privileged: true

@@ -1,0 +1,78 @@
+# SHARED model-weights disk: ONE ReadOnlyMany Hyperdisk holding every CI model,
+# mounted at /weights by any pod that declares weights_pvc: model-weights-rox.
+# Contents (paths are what recipes/tests reference via MODEL=/weights/<dir>):
+#   /weights/Qwen3-30B-A3B-FP8   (~60GB)
+#   /weights/gpt-oss-120b        (~65GB, MXFP4)
+#   /weights/MiMo-V2.5-Pro       (~963GB, blockwise-fp8)
+#
+# Built 2026-07-29 by consolidating the former per-model disks (qwen30b-rox,
+# gptoss120b-rox, mimo25pro-rox) onto a 5Ti disk: RWO PVC model-weights-rwo +
+# a copy Job (three parallel disk-to-disk cp streams), then the ROX conversion:
+#
+#   HANDLE=$(kubectl -n tpu-ci get pv \
+#     "$(kubectl -n tpu-ci get pvc model-weights-rwo -o jsonpath='{.spec.volumeName}')" \
+#     -o jsonpath='{.spec.csi.volumeHandle}')
+#   kubectl -n tpu-ci delete pvc model-weights-rwo    # SC is Retain: disk survives
+#   sed "s#__VOLUME_HANDLE__#${HANDLE}#" pvc-model-weights-rox.yaml.tmpl | kubectl apply -f -
+#
+# ⚠️ ADDING A MODEL LATER: Hyperdisk ML's READ_ONLY_MANY conversion is ONE-WAY --
+# this disk cannot be made writable again. To append model N+1:
+#   1. snapshot the ROX disk; create a new RWO Hyperdisk (>= same size) from it
+#   2. hydrate the new model into it (HF download Job: RWO PVC + snapshot_download
+#      with HF_HOME on the disk -- see git history of hydrate-qwen30b.yaml)
+#   3. convert the new disk to ROX with the commands above; repoint this PV's
+#      volumeHandle (or bump a -v2 name and update weights_pvc references)
+#   4. delete the old disk once green
+#
+# The disk is zonal (us-central1-c) -- all CI pools are in that zone.
+#
+# Teardown (order matters -- the SC is Retain, so k8s never deletes the disk for you,
+# and `gcloud compute disks delete` FAILS while any PV/PVC still references it):
+#   kubectl -n tpu-ci delete pvc model-weights-rox     # 1. drop the ROX claim
+#   kubectl -n tpu-ci delete pv  model-weights-rox-pv  # 2. then the static PV
+#   kubectl -n tpu-ci delete pvc model-weights-rwo 2>/dev/null || true  # 3. if around
+#   # 4. ONLY now is the disk detached and deletable; find it by the SC label:
+#   DISK=$(gcloud compute disks list \
+#     --filter="labels.purpose=tpu-ci-weights" --format="value(name)")
+#   gcloud compute disks delete "$DISK" --zone us-central1-c
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: model-weights-rox-pv
+spec:
+  storageClassName: hyperdisk-ml-fast
+  capacity:
+    storage: 5Ti
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  claimRef:
+    namespace: tpu-ci
+    name: model-weights-rox
+  csi:
+    driver: pd.csi.storage.gke.io
+    volumeHandle: __VOLUME_HANDLE__
+    fsType: ext4
+    readOnly: true
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: topology.gke.io/zone
+              operator: In
+              values:
+                - us-central1-c
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-weights-rox
+  namespace: tpu-ci
+spec:
+  storageClassName: hyperdisk-ml-fast
+  volumeName: model-weights-rox-pv
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 5Ti

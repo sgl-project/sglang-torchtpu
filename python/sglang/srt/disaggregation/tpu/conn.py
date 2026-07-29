@@ -69,6 +69,10 @@ from sglang.srt.disaggregation.tpu.host_staging import (
     StageBuf,
     default_pool_max_bytes,
 )
+from sglang.srt.disaggregation.tpu.profile_util import (
+    fmt_bytes,
+    perfetto_trace,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +299,17 @@ class TpuKVManager(TpuKVManagerBase):
         with self._push_progress_lock:
             self._push_progress.pop(room, None)
 
+    def _get_page_shape_str(self, n_pages: int) -> str:
+        """Perfetto token shape string for layer page buffers."""
+        if not self.layer_buffers:
+            return f"{n_pages}x1"
+        buf0 = self.layer_buffers[0]
+        num_lanes = int(buf0.shape[2]) if buf0.dim() >= 4 else 1
+        if buf0.dim() < 5:
+            return f"{n_pages}x{num_lanes}"
+        s = buf0.shape
+        return f"{n_pages}x{int(s[1])}x{num_lanes}x{int(s[3])}x{int(s[4])}"
+
     def gather_and_push(
         self,
         room: int,
@@ -321,30 +336,40 @@ class TpuKVManager(TpuKVManagerBase):
                 and self.layer_buffers
                 and self.layer_buffers[0].device.type != "cpu"
             )
-            _t0 = time.perf_counter()
-            d2h_future = None
-            if use_stage:
-                # Zero-copy: D2H straight into pinned pooled buffers; the wire
-                # frames are their memoryviews (sent copy=False in _push).
-                if getattr(self, "_async_d2h", False):
-                    d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
-                        self.layer_buffers, page_indices, pool
-                    )
+            with perfetto_trace(
+                self.trace_pid, f"gather/r{room}/i{index_start}"
+            ) as _sp:
+                _t0 = time.perf_counter()
+                d2h_future = None
+                if use_stage:
+                    # Zero-copy: D2H straight into pinned pooled buffers; the wire
+                    # frames are their memoryviews (sent copy=False in _push).
+                    if getattr(self, "_async_d2h", False):
+                        d2h_future, stages = tpu_transfer.gather_pages_to_stage_async(
+                            self.layer_buffers, page_indices, pool
+                        )
+                    else:
+                        stages = tpu_transfer.gather_pages_to_stage(
+                            self.layer_buffers, page_indices, pool
+                        )
+                    layer_frames = [st.mv() for st in stages]
+                    nbytes = sum(st.nbytes for st in stages)
                 else:
-                    stages = tpu_transfer.gather_pages_to_stage(
-                        self.layer_buffers, page_indices, pool
+                    stages = None
+                    layer_frames = tpu_transfer.gather_pages_to_host(
+                        self.layer_buffers, page_indices
                     )
-                layer_frames = [st.mv() for st in stages]
-                nbytes = sum(st.nbytes for st in stages)
-            else:
-                stages = None
-                layer_frames = tpu_transfer.gather_pages_to_host(
-                    self.layer_buffers, page_indices
+                    nbytes = sum(len(b) for b in layer_frames)
+                stats = getattr(self, "_gather_stats", None)
+                if stats is not None:
+                    stats.record(time.perf_counter() - _t0, nbytes)
+                _sp.args.update(
+                    {
+                        "shape": lambda: self._get_page_shape_str(len(page_indices)),
+                        "layers": f"{len(self.layer_buffers)}L",
+                        "size": lambda: fmt_bytes(nbytes),
+                    }
                 )
-                nbytes = sum(len(b) for b in layer_frames)
-            stats = getattr(self, "_gather_stats", None)
-            if stats is not None:
-                stats.record(time.perf_counter() - _t0, nbytes)
 
             aux_blobs: List[bytes] = []
             if is_last_chunk and aux_index is not None:
@@ -386,6 +411,7 @@ class TpuKVManager(TpuKVManagerBase):
                     self._push,
                     room,
                     endpoints,
+                    index_start,
                     payload,
                     len(page_indices),
                     stages,
@@ -401,6 +427,7 @@ class TpuKVManager(TpuKVManagerBase):
         self,
         room: int,
         endpoints: List[str],
+        index_start: int,
         payload: List,
         n_pages: int,
         stages=None,
@@ -414,21 +441,31 @@ class TpuKVManager(TpuKVManagerBase):
         a reused slot can never clobber an in-flight send. When the D2H was
         issued async (#7), ``d2h_future`` is waited here — off the scheduler
         thread — before the bytes are read for sending."""
+        n_layers = len(self.layer_buffers)
+        push_name = f"push/r{room}/i{index_start}"
+        wait_name = f"gatherwait/r{room}/i{index_start}"
         try:
             if d2h_future is not None:
-                d2h_future.wait()
-            trackers = []
-            for endpoint in endpoints:
-                sock = self._connect(endpoint)
-                with self._endpoint_locks[endpoint]:
-                    if stages is not None:
-                        trackers.append(
-                            sock.send_multipart(payload, copy=False, track=True)
-                        )
-                    else:
-                        sock.send_multipart(payload)
-            for t in trackers:
-                t.wait()
+                with perfetto_trace(self.trace_pid, wait_name):
+                    d2h_future.wait()
+            with perfetto_trace(
+                self.trace_pid,
+                push_name,
+                shape=lambda: self._get_page_shape_str(n_pages),
+                layers=f"{n_layers}L",
+            ):
+                trackers = []
+                for endpoint in endpoints:
+                    sock = self._connect(endpoint)
+                    with self._endpoint_locks[endpoint]:
+                        if stages is not None:
+                            trackers.append(
+                                sock.send_multipart(payload, copy=False, track=True)
+                            )
+                        else:
+                            sock.send_multipart(payload)
+                for t in trackers:
+                    t.wait()
             if stages is not None:
                 for st in stages:
                     st.release()
@@ -470,43 +507,56 @@ class TpuKVManager(TpuKVManagerBase):
         ``n_ch`` parallel sockets, each carrying a contiguous layer slice. Aux
         rides channel 0. Frame: ``[TAG_KVDATA_CH, room, index_start, num_pages,
         ch, n_ch, layer_lo, num_layers, num_aux] + aux + layer_slice``."""
+
+        n_ch = getattr(self, "_n_channels", 1)
+        n_layers = len(layer_frames)
+        push_word = f"pushch{n_ch}" if n_ch > 1 else "push"
+        push_name = f"{push_word}/r{room}/i{index_start}"
+        wait_name = f"gatherwait/r{room}/i{index_start}"
         try:
             if d2h_future is not None:
-                d2h_future.wait()
-            n_layers = len(layer_frames)
-            bounds = [(c * n_layers) // n_ch for c in range(n_ch + 1)]
-            copy_false = stages is not None
-            trackers = []
-            for endpoint in endpoints:
-                socks = self._channel_sockets(endpoint, n_ch)
-                for ch in range(n_ch):
-                    lo, hi = bounds[ch], bounds[ch + 1]
-                    aux = aux_blobs if ch == 0 else []
-                    msg = (
-                        [
-                            TAG_KVDATA_CH,
-                            str(room).encode(),
-                            str(index_start).encode(),
-                            str(num_pages).encode(),
-                            str(ch).encode(),
-                            str(n_ch).encode(),
-                            str(lo).encode(),
-                            str(n_layers).encode(),
-                            str(len(aux)).encode(),
-                        ]
-                        + aux
-                        + layer_frames[lo:hi]
-                    )
-                    sock = socks[ch]
-                    with self._endpoint_locks[(endpoint, ch)]:
-                        if copy_false:
-                            trackers.append(
-                                sock.send_multipart(msg, copy=False, track=True)
-                            )
-                        else:
-                            sock.send_multipart(msg)
-            for t in trackers:
-                t.wait()
+                with perfetto_trace(self.trace_pid, wait_name):
+                    d2h_future.wait()
+            with perfetto_trace(
+                self.trace_pid,
+                push_name,
+                shape=lambda: self._get_page_shape_str(num_pages),
+                layers=f"{n_layers}L",
+            ):
+                n_layers = len(layer_frames)
+                bounds = [(c * n_layers) // n_ch for c in range(n_ch + 1)]
+                copy_false = stages is not None
+                trackers = []
+                for endpoint in endpoints:
+                    socks = self._channel_sockets(endpoint, n_ch)
+                    for ch in range(n_ch):
+                        lo, hi = bounds[ch], bounds[ch + 1]
+                        aux = aux_blobs if ch == 0 else []
+                        msg = (
+                            [
+                                TAG_KVDATA_CH,
+                                str(room).encode(),
+                                str(index_start).encode(),
+                                str(num_pages).encode(),
+                                str(ch).encode(),
+                                str(n_ch).encode(),
+                                str(lo).encode(),
+                                str(n_layers).encode(),
+                                str(len(aux)).encode(),
+                            ]
+                            + aux
+                            + layer_frames[lo:hi]
+                        )
+                        sock = socks[ch]
+                        with self._endpoint_locks[(endpoint, ch)]:
+                            if copy_false:
+                                trackers.append(
+                                    sock.send_multipart(msg, copy=False, track=True)
+                                )
+                            else:
+                                sock.send_multipart(msg)
+                for t in trackers:
+                    t.wait()
             if stages is not None:
                 for st in stages:
                     st.release()
@@ -585,14 +635,15 @@ class TpuKVManager(TpuKVManagerBase):
         process_decode_pending(). ``msg`` items are ``zmq.Frame``s (copy=False)."""
         # [TAG, room, index_start, num_pages, num_aux] + aux + layers
         room = int(bytes(msg[1]).decode())
-        index_start = int(bytes(msg[2]).decode())
-        num_pages = int(bytes(msg[3]).decode())
-        num_aux = int(bytes(msg[4]).decode())
-        aux_blobs = [bytes(f) for f in msg[5 : 5 + num_aux]]
-        layer_blobs = self._recv_layers(msg[5 + num_aux :])
-        chunk = _PendingChunk(index_start, num_pages, layer_blobs, aux_blobs)
-        with self.decode_pending_lock:
-            self.decode_pending[room].append(chunk)
+        with perfetto_trace(self.trace_pid, f"recv_{room}"):
+            index_start = int(bytes(msg[2]).decode())
+            num_pages = int(bytes(msg[3]).decode())
+            num_aux = int(bytes(msg[4]).decode())
+            aux_blobs = [bytes(f) for f in msg[5 : 5 + num_aux]]
+            layer_blobs = self._recv_layers(msg[5 + num_aux :])
+            chunk = _PendingChunk(index_start, num_pages, layer_blobs, aux_blobs)
+            with self.decode_pending_lock:
+                self.decode_pending[room].append(chunk)
 
     def _handle_kvdata_ch(self, msg: List):
         """Background thread (#3): reassemble one channel's layer slice into the
@@ -602,47 +653,48 @@ class TpuKVManager(TpuKVManagerBase):
         (``_recv_layers``)."""
         # [TAG, room, index_start, num_pages, ch, n_ch, lo, n_layers, num_aux]
         room = int(bytes(msg[1]).decode())
-        index_start = int(bytes(msg[2]).decode())
-        num_pages = int(bytes(msg[3]).decode())
         ch = int(bytes(msg[4]).decode())
-        n_ch = int(bytes(msg[5]).decode())
-        lo = int(bytes(msg[6]).decode())
-        n_layers = int(bytes(msg[7]).decode())
-        num_aux = int(bytes(msg[8]).decode())
-        aux_blobs = [bytes(f) for f in msg[9 : 9 + num_aux]]
-        # One copy: wire -> pinned staging (or bytes on the CPU fallback path).
-        staged = self._recv_layers(msg[9 + num_aux :])
+        with perfetto_trace(self.trace_pid, f"recv_{room}_{ch}"):
+            index_start = int(bytes(msg[2]).decode())
+            num_pages = int(bytes(msg[3]).decode())
+            n_ch = int(bytes(msg[5]).decode())
+            lo = int(bytes(msg[6]).decode())
+            n_layers = int(bytes(msg[7]).decode())
+            num_aux = int(bytes(msg[8]).decode())
+            aux_blobs = [bytes(f) for f in msg[9 : 9 + num_aux]]
+            # One copy: wire -> pinned staging (or bytes on the CPU fallback path).
+            staged = self._recv_layers(msg[9 + num_aux :])
 
-        key = (room, index_start)
-        complete = None
-        with self._chan_reasm_lock:
-            ent = self._chan_reasm.get(key)
-            if ent is None:
-                ent = {
-                    "layers": [None] * n_layers,
-                    "got": set(),
-                    "aux": [],
-                    "num_pages": num_pages,
-                }
-                self._chan_reasm[key] = ent
-            for i, st in enumerate(staged):
-                ent["layers"][lo + i] = st
-            if ch == 0 and aux_blobs:
-                ent["aux"] = aux_blobs
-            ent["got"].add(ch)
-            if len(ent["got"]) >= n_ch:
-                self._chan_reasm.pop(key, None)
-                complete = ent
+            key = (room, index_start)
+            complete = None
+            with self._chan_reasm_lock:
+                ent = self._chan_reasm.get(key)
+                if ent is None:
+                    ent = {
+                        "layers": [None] * n_layers,
+                        "got": set(),
+                        "aux": [],
+                        "num_pages": num_pages,
+                    }
+                    self._chan_reasm[key] = ent
+                for i, st in enumerate(staged):
+                    ent["layers"][lo + i] = st
+                if ch == 0 and aux_blobs:
+                    ent["aux"] = aux_blobs
+                ent["got"].add(ch)
+                if len(ent["got"]) >= n_ch:
+                    self._chan_reasm.pop(key, None)
+                    complete = ent
 
-        if complete is not None:
-            chunk = _PendingChunk(
-                index_start,
-                complete["num_pages"],
-                complete["layers"],
-                complete["aux"],
-            )
-            with self.decode_pending_lock:
-                self.decode_pending[room].append(chunk)
+            if complete is not None:
+                chunk = _PendingChunk(
+                    index_start,
+                    complete["num_pages"],
+                    complete["layers"],
+                    complete["aux"],
+                )
+                with self.decode_pending_lock:
+                    self.decode_pending[room].append(chunk)
 
     def process_decode_pending(self, room: int) -> None:
         """Runs on the scheduler MAIN thread (from TpuKVReceiver.poll): drain
@@ -680,40 +732,44 @@ class TpuKVManager(TpuKVManagerBase):
                 )
                 self.update_status(room, KVPoll.Failed)
                 return
-            _t0 = time.perf_counter()
-            pool = getattr(self, "_stage_pool", None)
-            if (
-                pool is not None
-                and self.layer_buffers
-                and self.layer_buffers[0].device.type != "cpu"
-            ):
-                tpu_transfer.scatter_stage_from_host(
-                    self.layer_buffers,
-                    dst_pages,
-                    chunk.layer_blobs,
-                    self.layer_specs,
-                    pool,
-                )
-            else:
-                tpu_transfer.scatter_pages_from_host(
-                    self.layer_buffers, dst_pages, chunk.layer_blobs, self.layer_specs
-                )
-            stats = getattr(self, "_scatter_stats", None)
-            if stats is not None:
-                stats.record(
-                    time.perf_counter() - _t0,
-                    sum(
-                        b.nbytes if isinstance(b, StageBuf) else len(b)
-                        for b in chunk.layer_blobs
-                    ),
-                )
-            state.scattered_pages += chunk.num_pages
-            # Aux rides the prefill's last chunk only, so its presence — not an
-            # is_last flag — is the signal to write it.
-            if chunk.aux_blobs and state.aux_index is not None:
-                tpu_transfer.write_aux_row(
-                    self.kv_args, state.aux_index, chunk.aux_blobs
-                )
+            with perfetto_trace(self.trace_pid, f"scatter_{room}"):
+                _t0 = time.perf_counter()
+                pool = getattr(self, "_stage_pool", None)
+                if (
+                    pool is not None
+                    and self.layer_buffers
+                    and self.layer_buffers[0].device.type != "cpu"
+                ):
+                    tpu_transfer.scatter_stage_from_host(
+                        self.layer_buffers,
+                        dst_pages,
+                        chunk.layer_blobs,
+                        self.layer_specs,
+                        pool,
+                    )
+                else:
+                    tpu_transfer.scatter_pages_from_host(
+                        self.layer_buffers,
+                        dst_pages,
+                        chunk.layer_blobs,
+                        self.layer_specs,
+                    )
+                stats = getattr(self, "_scatter_stats", None)
+                if stats is not None:
+                    stats.record(
+                        time.perf_counter() - _t0,
+                        sum(
+                            b.nbytes if isinstance(b, StageBuf) else len(b)
+                            for b in chunk.layer_blobs
+                        ),
+                    )
+                state.scattered_pages += chunk.num_pages
+                # Aux rides the prefill's last chunk only, so its presence — not an
+                # is_last flag — is the signal to write it.
+                if chunk.aux_blobs and state.aux_index is not None:
+                    tpu_transfer.write_aux_row(
+                        self.kv_args, state.aux_index, chunk.aux_blobs
+                    )
             # Conclude only once every page has landed. The full count is known
             # up front (the decode allocated exactly these pages and handshaked
             # the count to the prefill), so completion doesn't depend on chunk

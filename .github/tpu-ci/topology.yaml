@@ -1,0 +1,14 @@
+# Detection source of truth: the SLICE for a given host count. Both paths size ONE
+# JobSet template from this:
+#   * single-host suites (run_suite; each test self-launches) -> hosts = 1
+#   * multi-host launch groups (a shared launched server per group; see
+#     discover_multihost.py + MULTIHOST_LAUNCH in the test files) -> hosts from the group
+# A suite/group does NOT pick topology or pool -- it only needs a host count, and the
+# slice (topology + node pool) is looked up here. Keep host counts in sync with the TPU
+# suites in run_suite.py and the multi-host tests' MULTIHOST_LAUNCH.
+#
+#   topology : cloud.google.com/gke-tpu-topology node label
+#   pool     : ci-tpu-pool node label
+slices:
+  1: { topology: 2x2x1, pool: pr-gate }   # single-host: PR gate + single-host nightly
+  2: { topology: 2x2x2, pool: nightly }   # multi-host: tp = 2 x chips

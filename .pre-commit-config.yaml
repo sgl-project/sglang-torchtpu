@@ -11,10 +11,14 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]
-        # Helm chart templates embed Go template syntax ({{- ... -}})
-        # that is not valid YAML on its own; the rendered output is
-        # validated by `helm template` / `helm lint`.
-        exclude: ^experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)$
+        # Render templates that embed non-YAML placeholders and are validated
+        # only after substitution, so they don't parse as standalone YAML:
+        #   * Helm chart templates -- Go template syntax ({{- ... -}}); validated
+        #     by `helm template` / `helm lint`.
+        #   * .github/tpu-ci/jobset-tpu.yaml -- ${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT}
+        #     block placeholders substituted by render_jobset.py; validated when
+        #     `kubectl create` applies the rendered JobSet.
+        exclude: ^(experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)|\.github/tpu-ci/jobset-tpu\.yaml)$
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
