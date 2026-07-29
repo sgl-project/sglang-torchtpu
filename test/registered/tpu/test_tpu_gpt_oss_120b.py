@@ -7,7 +7,7 @@ of the card's 0.671 (floor 0.641). Single passes are too noisy on 198 questions 
 a 3pt gate -- do NOT go below n_repeats=4.
 
 Notes:
-- Weights: ROX PVC gptoss120b-rox at /weights (hydrate-gptoss120b.yaml).
+- Weights: shared ROX PVC model-weights-rox at /weights (pvc-model-weights-rox.yaml.tmpl).
 - gpt-oss is runtime-installed --no-deps so its pins never touch the pinned torch.
 - CONTEXT_LEN=16384: longest GPQA prompt (~2.9k tokens) + 8k completion budget.
 - SGLANG_TPU_FUSED_MOE_SC_GATHER=0: SC gather (PR #188) cannot lower gpt-oss's

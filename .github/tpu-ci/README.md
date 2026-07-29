@@ -51,7 +51,7 @@ own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "qwen30b-rox"}   # weights_pvc optional
+                    "weights_pvc": "model-weights-rox"}   # weights_pvc optional
 ```
 
 `launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
@@ -119,12 +119,13 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 - **PR gate (single-host, run_suite)** — validated GREEN on the 2x2x1 slice.
 - **Multi-host (2x2x2, tp=16)** — validated GREEN: Qwen3-30B-A3B-FP8 MoE (EP=8) serving
-  from the **ReadOnlyMany** Hyperdisk (`qwen30b-rox`, both hosts mounting concurrently),
+  from the **ReadOnlyMany** Hyperdisk (now the shared `model-weights-rox`; both hosts mount concurrently),
   rank-0 asserting on real inference.
-- **Hyperdisk ML weights** — `qwen30b-rox` is a hydrated RWO disk converted to
+- **Hyperdisk ML weights** — `model-weights-rox` is a hydrated RWO disk (all models on one 5Ti disk) converted to
   `READ_ONLY_MANY` (GKE ≥1.30.2 auto-converts on first ROX mount; cluster is 1.35.x).
-  Flow: `hydrate-qwen30b.yaml` (RWO + HF download) → delete RWO PVC (Retain keeps the
-  disk) → `pvc-qwen30b-rox.yaml` (static ROX PV/PVC, fill the disk handle).
+  Lifecycle (hydrate → convert → append-later) is documented in
+  `pvc-model-weights-rox.yaml.tmpl`; note ROX conversion is one-way, so adding a model
+  goes through a snapshot → new RWO disk → re-convert cycle.
 
 ### ⚠️ Model note: Qwen3-0.6B is single-host only
 

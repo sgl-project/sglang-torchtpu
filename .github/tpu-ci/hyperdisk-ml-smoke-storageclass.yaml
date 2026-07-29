@@ -1,7 +1,7 @@
 # Hyperdisk ML StorageClass for CI weight volumes, at a cost-modest 400Mi/s provisioned
 # throughput. Retain keeps the underlying disk when a PVC is deleted, which the
-# ReadWriteOnce -> ReadOnlyMany conversion relies on (see hydrate-qwen30b.yaml +
-# pvc-qwen30b-rox.yaml.tmpl). Bump throughput for larger models if load time matters.
+# ReadWriteOnce -> ReadOnlyMany conversion relies on (see
+# pvc-model-weights-rox.yaml.tmpl). Bump throughput for larger models if load time matters.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:

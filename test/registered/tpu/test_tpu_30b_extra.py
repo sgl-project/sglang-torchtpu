@@ -20,7 +20,7 @@ register_tpu_ci(est_time=300, suite="nightly-tpu-multihost", nightly=True)
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-    "weights_pvc": "qwen30b-rox",
+    "weights_pvc": "model-weights-rox",
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
