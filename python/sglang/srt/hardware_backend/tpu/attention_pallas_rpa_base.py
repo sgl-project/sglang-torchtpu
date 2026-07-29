@@ -54,6 +54,14 @@ def _get_pages_per_seq(max_context_len: int, page_size: int) -> int:
     return (max_context_len + page_size - 1) // page_size
 
 
+def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
+    if max_kv_len > capacity:
+        raise ValueError(
+            "RPA KV length exceeds the per-request page-table capacity: "
+            f"required={max_kv_len}, available={capacity}."
+        )
+
+
 @dataclass
 class PallasForwardMetadata:
     """Per-forward-pass metadata shared by every attention layer."""
@@ -498,12 +506,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # -------------------------------------------------------------- #
         # Speculative decoding: adjust seq_lens / extend metadata
         # -------------------------------------------------------------- #
+        kv_len_bump = 0
         if forward_batch.forward_mode.is_target_verify():
             # TARGET_VERIFY: the target model verifies draft_token_num
             # tokens per request.  The KV cache already includes the
             # draft tokens, so bump seq_lens accordingly.
             assert forward_batch.spec_info is not None
             draft_token_num = forward_batch.spec_info.draft_token_num
+            kv_len_bump = draft_token_num
             seq_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
             extend_seq_lens = torch.full(
                 (bs,), draft_token_num, dtype=torch.int32, device=device
@@ -531,8 +541,17 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # Multi-step draft decode: each step's backend has a
                 # different speculative_step_id.  Bump seq_lens so the
                 # kernel sees KV entries from prior draft steps.
-                seq_lens = seq_lens + self.speculative_step_id + 1
+                kv_len_bump = self.speculative_step_id + 1
+                seq_lens = seq_lens + kv_len_bump
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
+
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        if seq_lens_cpu is not None and bs > 0:
+            max_kv_len = int(seq_lens_cpu[:bs].max().item()) + kv_len_bump
+            _validate_kv_len_capacity(
+                max_kv_len,
+                pages_per_seq * page_size,
+            )
 
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
 
@@ -634,12 +653,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
             max_kv_len = int(seq_lens_cpu[:bs].max().item()) + kv_len_bump
-            capacity = pages_per_seq * page_size
-            if max_kv_len > capacity:
-                raise ValueError(
-                    "RPA KV length exceeds the per-request page-table capacity: "
-                    f"required={max_kv_len}, available={capacity}."
-                )
+            _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
 
         # Small per-batch tensors -> host.
         req_pool_indices = forward_batch.req_pool_indices.to("cpu", torch.int64)
