@@ -47,6 +47,11 @@ class FakeQwen3VLDecoderTpuCompilePolicy(CompilePolicy):
 
 
 def _stub_tpu_modules():
+    attention_module = types.ModuleType(
+        "sglang.srt.hardware_backend.tpu.attention_pallas"
+    )
+    attention_module._get_vision_flash_op = lambda: None
+
     vit_module = types.ModuleType(
         "sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner"
     )
@@ -62,6 +67,7 @@ def _stub_tpu_modules():
     )
 
     return {
+        attention_module.__name__: attention_module,
         vit_module.__name__: vit_module,
         decoder_policy_module.__name__: decoder_policy_module,
     }
@@ -104,7 +110,8 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
             common.is_tpu.cache_clear()
 
     def test_tpu_platform_selects_tpu_vision_backend(self):
-        import sglang.srt.layers.attention.vision as vision
+        with patch.dict(sys.modules, _stub_tpu_modules()):
+            import sglang.srt.layers.attention.vision as vision
 
         attention = object.__new__(vision.VisionAttention)
         with (
