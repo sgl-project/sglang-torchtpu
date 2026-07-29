@@ -75,7 +75,13 @@ dependencies = [
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
   "torch-tpu==0.1.1.dev20260707090224",
-  "libtpu==0.0.40",
+  # libtpu and jax/jaxlib must move in lockstep. Observed with libtpu==0.0.40 +
+  # jax 0.10.2 (nightly 2026-07-29, qwen3-30B multihost group, both ranks): server
+  # bring-up dies at the first Pallas fused-MoE compile with "Failed to parse the
+  # Mosaic module: unknown attribute code: 24 ... produced by: MLIR23.0.0git".
+  # The 0.6B PR gate did not catch it. libtpu 0.0.42.1 + jax 0.10.2 is the pairing
+  # inside the validated :manual image that the e2e bring-ups passed on.
+  "libtpu==0.0.42.1",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",

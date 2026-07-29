@@ -58,7 +58,12 @@ _is_npu = is_npu()
 _DEBUG_ASSERT = envs.SGLANG_IS_IN_CI.get()
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+# TPU: torch_tpu's compile backend is static-shapes-only and rejects the SymInt
+# inputs that dynamic=True produces once call sizes vary (nightly 2026-07-29,
+# gpt-oss-120b: extend=4096 -> decode=32 -> first live batch => scheduler dies
+# with "TPU backend: does not support dynamic shape"). Run eagerly there; the
+# assert semantics are unchanged, only the kernel fusion is lost.
+@torch.compile(dynamic=True, disable=_is_npu or _is_tpu)
 def _assert_nonneg_and_invalidate(
     values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
 ) -> None:
