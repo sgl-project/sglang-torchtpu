@@ -57,14 +57,29 @@ class TestTpuMiMoV25ProLMEval(LMEvalMixin, CustomTestCase):
     def setUpClass(cls):
         # The JobSet's rank-0 already gated on /health_generate; this recheck keeps
         # the file runnable by hand against any live server (BASE_URL=... HEALTH_TIMEOUT=...).
-        deadline = time.perf_counter() + HEALTH_TIMEOUT
+        start = time.perf_counter()
+        last_note = start
+        deadline = start + HEALTH_TIMEOUT
         while time.perf_counter() < deadline:
             try:
                 response = requests.get(cls.base_url + "/health", timeout=10)
                 if response.status_code == 200:
+                    print(
+                        f"[mimo-e2e] server healthy after "
+                        f"{time.perf_counter() - start:.0f}s; starting lm-eval "
+                        f"MMLU 5-shot (~5.7k requests)",
+                        flush=True,
+                    )
                     return
             except requests.RequestException:
                 pass
+            if time.perf_counter() - last_note >= 60:
+                last_note = time.perf_counter()
+                print(
+                    f"[mimo-e2e] waiting for live server at {cls.base_url} "
+                    f"({time.perf_counter() - start:.0f}s elapsed)",
+                    flush=True,
+                )
             time.sleep(5)
         raise TimeoutError(
             f"{cls.base_url}/health did not return 200 within {HEALTH_TIMEOUT}s"

@@ -25,6 +25,16 @@
 #   4. delete the old disk once green
 #
 # The disk is zonal (us-central1-c) -- all CI pools are in that zone.
+#
+# Teardown (order matters -- the SC is Retain, so k8s never deletes the disk for you,
+# and `gcloud compute disks delete` FAILS while any PV/PVC still references it):
+#   kubectl -n tpu-ci delete pvc model-weights-rox     # 1. drop the ROX claim
+#   kubectl -n tpu-ci delete pv  model-weights-rox-pv  # 2. then the static PV
+#   kubectl -n tpu-ci delete pvc model-weights-rwo 2>/dev/null || true  # 3. if around
+#   # 4. ONLY now is the disk detached and deletable; find it by the SC label:
+#   DISK=$(gcloud compute disks list \
+#     --filter="labels.purpose=tpu-ci-weights" --format="value(name)")
+#   gcloud compute disks delete "$DISK" --zone us-central1-c
 apiVersion: v1
 kind: PersistentVolume
 metadata:
