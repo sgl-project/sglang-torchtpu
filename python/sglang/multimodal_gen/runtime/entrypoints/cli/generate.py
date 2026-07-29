@@ -105,6 +105,29 @@ def _apply_output_file_path_override(
     sampling_params_kwargs["output_file_name"] = os.path.basename(output_file_path)
 
 
+def verify_generation_output(
+    *,
+    results,
+    output_file_path: str | None,
+    num_outputs: int = 1,
+) -> None:
+    """Exit nonzero when the request produced no output artifact.
+
+    Worker-side failures surface as an empty result while the worker process
+    itself exits cleanly; without this check the CLI reports success for a
+    failed generation.
+    """
+    if results is None or (isinstance(results, list) and not results):
+        raise SystemExit("generation produced no result")
+    # With a single requested output the exact path must exist; multi-output
+    # runs derive per-sample names, so only the single-output contract is
+    # checked here.
+    if output_file_path and num_outputs == 1 and not os.path.exists(output_file_path):
+        raise SystemExit(
+            f"generation finished without writing {output_file_path}"
+        )
+
+
 def maybe_dump_performance(
     args: argparse.Namespace,
     server_args,
@@ -202,6 +225,11 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
 
     prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
+    verify_generation_output(
+        results=results,
+        output_file_path=args.output_file_path,
+        num_outputs=sampling_params_kwargs.get("num_outputs_per_prompt") or 1,
+    )
 
 
 class GenerateSubcommand(CLISubcommand):
