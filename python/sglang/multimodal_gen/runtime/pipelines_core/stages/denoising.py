@@ -402,7 +402,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
             compile_kwargs = build_torch_compile_kwargs(mode=mode)
             logger.info(f"Compiling transformer with mode: {mode}")
-            module.forward = current_platform.wrap_forward_for_compile(module.forward)
 
         if self._needs_nvfp4_jit_prewarm(module):
             logger.info(

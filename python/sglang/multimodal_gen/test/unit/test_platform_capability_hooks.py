@@ -21,12 +21,6 @@ class TestCapabilityHookDefaults(unittest.TestCase):
             pass
         self.assertIsNone(Platform.on_denoise_step_end())
 
-    def test_wrap_forward_for_compile_is_identity(self):
-        def forward():
-            return 7
-
-        self.assertIs(Platform.wrap_forward_for_compile(forward), forward)
-
     def test_aux_profiler_and_spawn_env_defaults(self):
         self.assertIsNone(Platform.create_aux_profiler("/tmp/logs"))
         self.assertIsNone(Platform.prepare_server_environment(world_size=8))

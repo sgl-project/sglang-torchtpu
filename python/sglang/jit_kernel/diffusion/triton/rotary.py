@@ -84,7 +84,7 @@ def _rotary_embedding_kernel(
 def apply_rotary_embedding(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
-    if not (x.is_cuda or x.is_xpu):
+    if not (x.is_cuda or x.is_xpu or x.device.type == "musa"):
         # torch-native fallback for backends without triton: mirrors
         # _rotary_embedding_kernel -- interleaved pairs rotated in fp32.
         head_size = x.shape[-1]

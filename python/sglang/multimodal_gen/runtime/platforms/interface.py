@@ -477,12 +477,6 @@ class Platform:
         work on deferred-execution platforms). Default: no-op."""
 
     @classmethod
-    def wrap_forward_for_compile(cls, forward: Callable[..., Any]) -> Callable[..., Any]:
-        """Wrap a module forward before torch.compile is applied to it
-        (e.g. to keep collectives traceable). Default: identity."""
-        return forward
-
-    @classmethod
     def use_functional_seq_all_to_all(cls) -> bool:
         """Whether sequence-parallel attention should use the synchronous
         functional-collectives all-to-all instead of the stream-overlapped
