@@ -172,7 +172,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
     def test_silu_aligned_shape_matches_reference(self):
         """m*topk already a multiple of 32 — no padding code path hit."""
         # m=32, topk=2 -> m*topk = 64.
-        m, k, n, g, topk = 32, 64, 64, 4, 2
+        m, k, n, g, topk = 32, 128, 128, 4, 2
         hidden, w1, w2, w_tk, ids = _make_inputs(
             m, k, n, g, topk, self.device, self.dtype, seed=0
         )
@@ -202,7 +202,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
         loudly if that padding is ever removed.
         """
         # m=3, topk=8 -> m*topk = 24.
-        m, k, n, g, topk = 3, 64, 64, 4, 8
+        m, k, n, g, topk = 3, 128, 128, 4, 8
         hidden, w1, w2, w_tk, ids = _make_inputs(
             m, k, n, g, topk, self.device, self.dtype, seed=1
         )
@@ -223,7 +223,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
 
     def test_gelu_activation_matches_reference(self):
         """Gated GeLU is the other supported in-tree activation (for mxfp4 path parity)."""
-        m, k, n, g, topk = 16, 64, 64, 4, 2
+        m, k, n, g, topk = 16, 128, 128, 4, 2
         hidden, w1, w2, w_tk, ids = _make_inputs(
             m, k, n, g, topk, self.device, self.dtype, seed=2
         )
@@ -266,7 +266,7 @@ class TestPallasFusedMoEEager(unittest.TestCase):
             UnquantizedFusedMoEMethod,
         )
 
-        m, k, n, g, topk = 32, 64, 64, 4, 2
+        m, k, n, g, topk = 32, 128, 128, 4, 2
 
         torch.manual_seed(7)
         hidden = (torch.randn(m, k, dtype=self.dtype) * 0.5).to(self.device)
@@ -378,7 +378,7 @@ class TestPallasFusedMoETorchCompile(unittest.TestCase):
         """Compiled path is bit-stable vs eager and matches the CPU reference."""
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
-        m, k, n, g, topk = 32, 64, 64, 4, 2
+        m, k, n, g, topk = 32, 128, 128, 4, 2
         hidden, w1, w2, w_tk, ids = _make_inputs(
             m, k, n, g, topk, self.device, self.dtype, seed=3
         )
