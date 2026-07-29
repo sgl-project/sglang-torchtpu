@@ -123,6 +123,16 @@ ${WEIGHTS_VOLUME}
                         # launch, which MULTIHOST_LAUNCH does not model yet). Teardown-
                         # induced exits (leader gone -> peer disconnect / SIGTERM 143) pass.
                         wait "$spid"; src=$?
+                        # 137 is ALSO how normal teardown manifests: rank-0 finishes its
+                        # test files and exits first, this worker's scheduler dies on the
+                        # severed request-broadcast socket ("Connection reset by peer"),
+                        # and sglang's crash handler SIGKILLs its own process tree.
+                        # Distinguish teardown from a real crash by that disconnect
+                        # signature; rank-0's exit code still gates every real failure,
+                        # so this can never mask a red run.
+                        if [ "$src" = 137 ] && grep -q "Connection reset by peer" /tmp/server.log; then
+                          echo "worker rank=$RANK: leader closed (teardown); success"; exit 0
+                        fi
                         case "$src" in
                           137|139) echo "worker rank=$RANK server crashed rc=$src"; exit 1 ;;
                           *)       echo "worker rank=$RANK done (server rc=$src)"; exit 0 ;;
