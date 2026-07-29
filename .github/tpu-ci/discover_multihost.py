@@ -11,6 +11,7 @@ are identical into ONE launch group -- so same-setup files share one launched se
 Prints a JSON array for the CI matrix:
     [{"name","launch_script","weights_pvc","hosts","files"}]   (files = space-separated)
 """
+
 import argparse
 import ast
 import glob
@@ -36,7 +37,10 @@ def _scan(root, suite, nightly_only):
             continue
         launch, registered = None, False
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "register_tpu_ci":
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") == "register_tpu_ci"
+            ):
                 kw = {k.arg: k.value for k in node.keywords}
                 s = _literal(kw["suite"]) if "suite" in kw else None
                 n = _literal(kw["nightly"]) if "nightly" in kw else False
@@ -71,7 +75,9 @@ def main():
 
     out = []
     for (ls, wp, hosts), files in groups.items():
-        slug = re.sub(r"[^a-z0-9]+", "-", os.path.basename(ls).lower().removesuffix(".sh")).strip("-")
+        slug = re.sub(
+            r"[^a-z0-9]+", "-", os.path.basename(ls).lower().removesuffix(".sh")
+        ).strip("-")
         out.append(
             {
                 "name": f"mh-{slug}",

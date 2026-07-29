@@ -112,12 +112,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image")
     ap.add_argument("--nightly", action="store_true")
-    ap.add_argument("--suite", default="")            # single-host mode
-    ap.add_argument("--launch-script", default="")    # multi-host mode
-    ap.add_argument("--files", default="")            # multi-host: space-separated
+    ap.add_argument("--suite", default="")  # single-host mode
+    ap.add_argument("--launch-script", default="")  # multi-host mode
+    ap.add_argument("--files", default="")  # multi-host: space-separated
     ap.add_argument("--hosts", type=int, default=1)
     ap.add_argument("--weights-pvc", default="")
-    ap.add_argument("--name", default="")             # multi-host run label
+    ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
     ap.add_argument(
