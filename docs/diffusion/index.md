@@ -41,6 +41,7 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - [Post-Processing](api/post_processing.md): frame interpolation and upscaling
 - [Performance Overview](performance/index.md): overview of attention, caching, and profiling
 - [Environment Variables](environment_variables.md): platform, caching, storage, and debugging configuration
+- [TPU Support](tpu.md): run the diffusion engine on Google TPU via torch_tpu
 - [Support New Models](support_new_models.md): implementation guide for new diffusion pipelines
 - [CI Performance](ci_perf.md): performance baseline generation
 
