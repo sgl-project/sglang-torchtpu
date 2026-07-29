@@ -282,9 +282,8 @@ class TestFeatureCombo(unittest.TestCase):
             self._assert_spec(v, al, f"repeat {k} (post-overflow)")
 
     def test_7_accept_length_on_par(self):
-        # ACCEPT_LENGTH_REF unset => calibration mode: print the measured mean
-        # under the weak >1.0 floor. Pin the reference after the first run;
-        # regressions then gate at 90% of it.
+        # Regression gate: mean accept_length must stay >= 90% of the pinned
+        # reference (override via ACCEPT_LENGTH_REF).
         if not self.spec_on:
             self.skipTest("combo has no spec decoding")
         lengths = []
@@ -295,15 +294,14 @@ class TestFeatureCombo(unittest.TestCase):
         self.assertTrue(lengths, "no spec verifications recorded")
         mean_al = sum(lengths) / len(lengths)
         print(f"  mean accept_length={mean_al:.3f} over {len(lengths)} prompts")
-        ref = os.environ.get("ACCEPT_LENGTH_REF")
-        if ref is None:
-            self.assertGreater(mean_al, 1.0, "calibration run: drafts never accepted")
-        else:
-            self.assertGreaterEqual(
-                mean_al,
-                0.9 * float(ref),
-                f"mean accept_length {mean_al:.3f} < 90% of reference {ref}",
-            )
+        # Reference measured on v7x, combo 1 (Qwen3-1.7B + AngelSlim EAGLE3,
+        # greedy, this exact prompt set), 2026-07-29.
+        ref = os.environ.get("ACCEPT_LENGTH_REF", "1.275")
+        self.assertGreaterEqual(
+            mean_al,
+            0.9 * float(ref),
+            f"mean accept_length {mean_al:.3f} < 90% of reference {ref}",
+        )
 
 
 def _run_all():

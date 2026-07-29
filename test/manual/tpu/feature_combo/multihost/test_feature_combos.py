@@ -45,7 +45,7 @@ Env knobs (defaults shown; every knob of the underlying launchers also works):
   PREFILL_PORT=30000 DECODE_PORT=30000 LB_PORT=8000 BOOTSTRAP_PORT=8998 PORT=30000
   SPEC_STEPS=3 SPEC_TOPK=1 SPEC_DRAFT_TOKENS=4 CONTEXT_LEN=4096 (spec)
   NUM_PROMPTS=4  PREFIX_REPEATS=96  MAX_NEW_TOKENS=32
-  MIN_CACHED_TOKENS=64  MIN_ACCEPT_LENGTH=1.0
+  MIN_CACHED_TOKENS=64  MIN_ACCEPT_LENGTH=1.0  ACCEPT_LENGTH_REF (mean gate)
   WAIT_SECS=2400     KEEP_UP=0 (1 => leave servers running after the verdict)
   PYTHON=python3     (interpreter passed through to the launchers)
 
@@ -64,7 +64,7 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+REPO = os.path.abspath(os.path.join(HERE, *[".."] * 5))  # test/manual/tpu/feature_combo/multihost
 BENCH = os.path.join(REPO, "benchmark", "tpu")
 
 # ---- knobs (mirror the launcher contract; every one overridable via env) ----
@@ -87,6 +87,7 @@ PREFIX_REPEATS = int(E("PREFIX_REPEATS", "96"))
 MAX_NEW_TOKENS = int(E("MAX_NEW_TOKENS", "32"))
 MIN_CACHED_TOKENS = int(E("MIN_CACHED_TOKENS", "64"))
 MIN_ACCEPT_LENGTH = float(E("MIN_ACCEPT_LENGTH", "1.0"))
+ACCEPT_LENGTH_REF = E("ACCEPT_LENGTH_REF", "")  # empty => calibration (report-only)
 KEEP_UP = E("KEEP_UP", "0") == "1"
 
 RANK = int(E("NODE_RANK", E("TPU_WORKER_ID", "0")))
@@ -306,6 +307,21 @@ def run_probe(base_url, check_spec=False, flush_url=None):
                 f"— flush did not clear the cache"
             )
         probe("repopulate", 0, warm[0], check_cache=True, expect_text=baseline[0])
+
+    # 8. accept-length on par (spec rows): gate the MEAN at 90% of the pinned
+    # reference; per-request floors above only catch total draft rejection.
+    if check_spec:
+        lengths = [r["accept_length"] for r in records if "accept_length" in r]
+        if not lengths:
+            failures.append("accept-length: no spec-checked probes recorded")
+        else:
+            mean_al = sum(lengths) / len(lengths)
+            print(f"mean accept_length={mean_al:.3f} over {len(lengths)} probes")
+            if ACCEPT_LENGTH_REF and mean_al < 0.9 * float(ACCEPT_LENGTH_REF):
+                failures.append(
+                    f"mean accept_length {mean_al:.3f} < 90% of "
+                    f"reference {ACCEPT_LENGTH_REF}"
+                )
 
     return records, failures
 
