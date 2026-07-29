@@ -119,6 +119,22 @@ def npu_platform_plugin() -> str | None:
     )
 
 
+def tpu_platform_plugin() -> str | None:
+    """Detect if a TPU with the torch_tpu backend is available."""
+    # Deliberately find_spec, not import: importing torch_tpu registers the
+    # PJRT plugin and reserves the libtpu lockfile, and this probe runs in
+    # every spawned process.
+    from importlib.util import find_spec
+
+    try:
+        if find_spec("torch_tpu") is not None:
+            logger.debug("torch_tpu is installed; selecting TPU platform")
+            return "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform"
+    except (ImportError, ValueError) as e:
+        logger.debug("TPU detection failed: %s", e)
+    return None
+
+
 def musa_platform_plugin() -> str | None:
     is_musa = False
 
@@ -167,6 +183,7 @@ builtin_platform_plugins = {
     "cpu": cpu_platform_plugin,
     "npu": npu_platform_plugin,
     "musa": musa_platform_plugin,
+    "tpu": tpu_platform_plugin,
 }
 
 
@@ -180,6 +197,7 @@ def resolve_current_platform_cls_qualname() -> str:
             "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
             "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
             "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+            "tpu": "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform",
         }
         qualname = forced_map.get(forced_platform.lower())
         if qualname is None:
@@ -218,6 +236,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to MUSA
     platform_cls_qualname = musa_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to TPU (torch_tpu installed)
+    platform_cls_qualname = tpu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

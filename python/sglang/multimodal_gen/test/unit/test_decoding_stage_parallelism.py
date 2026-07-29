@@ -49,10 +49,17 @@ class TestDecodingStageParallelism(unittest.TestCase):
         stage = DecodingStage(vae)
         server_args = SimpleNamespace(enable_torch_compile=True)
 
-        with patch(
-            "torch.compile",
-            side_effect=lambda fn, **_: fn,
-        ) as compile_fn:
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding."
+                "current_platform.supports_vae_decode_torch_compile",
+                return_value=True,
+            ),
+            patch(
+                "torch.compile",
+                side_effect=lambda fn, **_: fn,
+            ) as compile_fn,
+        ):
             compiled_vae_decode = stage._get_vae_decode_fn(vae, server_args)
             self.assertIs(
                 stage._get_vae_decode_fn(vae, server_args), compiled_vae_decode
