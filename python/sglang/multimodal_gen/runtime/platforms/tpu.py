@@ -326,13 +326,13 @@ class TpuPlatform(Platform):
         # validated path.
         return False
 
-    @classmethod
-    def wrap_forward_for_compile(cls, forward: Callable[..., Any]) -> Callable[..., Any]:
-        # Keeps collectives inside the captured graph so torch_tpu's
-        # SplitCompiler can partition compute+collective+compute as designed.
-        from torch_tpu._internal.distributed.spmd_util import spmd_safe
-
-        return spmd_safe(forward)
+    # wrap_forward_for_compile deliberately stays the identity default:
+    # wrapping the whole forward in torch_tpu's spmd_safe marks it as a
+    # no-split region for SplitCompiler (split_compiler.py:363), forcing one
+    # program whose argument set (all weights) exceeds HBM at compile time
+    # (observed: CompileTimeHbmOom, arguments 282G vs 94.75G). The default
+    # materialize-collectives behavior partitions at collectives instead,
+    # which is the supported compiled-mode shape for large models.
 
     # ------------------------------------------------------------------
     # Distributed capabilities
