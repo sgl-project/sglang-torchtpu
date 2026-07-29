@@ -65,12 +65,15 @@ from head `3597f02f`. Cold 4-step runs; the 4-step average is dominated by
 first-step warmup (lazy trace for eager, dynamo + XLA compile storm for
 compiled), so it measures warmup cost rather than steady throughput.
 
-| Mode | Avg s/step (cold, 4 steps) | VAE decode | Status |
-|---|---|---|---|
-| Eager op-by-op (`DEFER_NEVER`) | 39.9 | 74.3 s | works |
-| Eager fused (`DEFER_AND_FUSE`, default) | 40.6 | 74.3 s | works — reference output |
-| `--enable-torch-compile` (serialization off, in-tree default) | 74.6 | 42.2 s | works — DiT partitions into 323 subprograms/rank at collective boundaries; decode ~1.8× faster after a compiled denoise |
-| Compiled with torch_tpu stock serialization | — | — | **crashes** (`e0102: RuntimeProgramInputMismatch`) — see limitations |
+| Mode | First step | Steady s/step (post-warmup) | VAE decode | Status |
+|---|---|---|---|---|
+| Eager op-by-op (`DEFER_NEVER`) | 118 s | 13.5 | 73 s | works |
+| Eager fused (`DEFER_AND_FUSE`, default) | 120 s | **10.5** | 78 s | works — reference output |
+| `--enable-torch-compile` (serialization off, in-tree default) | 167 s (+63 s step 2) | **10.4–12.5** | **44 s** | works — DiT partitions into 323 subprograms/rank at collective boundaries; decode ~1.8× faster |
+| Compiled with torch_tpu stock serialization | — | — | — | **crashes** (`e0102: RuntimeProgramInputMismatch`) — see limitations |
+
+Guidance: fused eager for cold one-shot generation; compiled for warm/long
+serving (warmup amortizes, decode is faster).
 
 Output parity: all green modes produce frame-statistics-identical videos
 (compiled numerics differ within tolerance).
