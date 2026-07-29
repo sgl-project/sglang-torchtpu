@@ -271,7 +271,14 @@ def _pad_forward_batch_inputs(
         pad_b = b_bucketer.next_bucket(real_b)
         real_q_out, real_b_out = real_q, real_b
     elif forward_batch.forward_mode.is_mixed():
-        pad_b = b_bucketer.next_bucket(real_b)
+        extend_cap = _extend_batch_cap(t_bucketer, b_bucketer, extend_bs)
+        mixed_cap = _extend_batch_cap(t_bucketer, b_bucketer, b_bucketer.max_val)
+        pad_b = extend_cap if real_b <= extend_cap else mixed_cap
+        if real_b > pad_b:
+            raise ValueError(
+                f"TPU mixed batch size {real_b} exceeds its compile cap {pad_b}. "
+                "Increase --torch-compile-max-bs to cover the largest mixed batch."
+            )
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
     elif (

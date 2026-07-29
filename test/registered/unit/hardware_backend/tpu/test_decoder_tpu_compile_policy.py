@@ -88,6 +88,60 @@ def _run_cases(policy, mode):
             policy._precompile_decode()
 
 
+class TestInstallExtendCap(CustomTestCase):
+    def _install_policy(self, *, prefill_max_requests, dp_attention):
+        model = SimpleNamespace(
+            forward=MagicMock(),
+            prepare_forward_batch=MagicMock(),
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+                torch_compile_max_bs=64,
+                prefill_max_requests=prefill_max_requests,
+            ),
+        )
+        t_bucketer = Bucketer(name="Token", buckets=[64, 2048])
+        b_bucketer = Bucketer(name="Bs", buckets=[16, 32, 64])
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(t_bucketer, b_bucketer),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=dp_attention,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "torch.compile",
+            return_value=MagicMock(),
+        ), patch.object(
+            policy, "_install_dp_idle_as_decode"
+        ):
+            self.assertTrue(policy.install())
+
+        return policy
+
+    def test_non_dp_uses_configured_prefill_cap(self):
+        policy = self._install_policy(prefill_max_requests=16, dp_attention=False)
+        self.assertEqual(policy.extend_bs, 16)
+
+    def test_non_dp_without_prefill_cap_uses_decode_max(self):
+        policy = self._install_policy(prefill_max_requests=None, dp_attention=False)
+        self.assertEqual(policy.extend_bs, 64)
+
+    def test_dp_attention_uses_decode_max(self):
+        policy = self._install_policy(prefill_max_requests=16, dp_attention=True)
+        self.assertEqual(policy.extend_bs, 64)
+
+
 class TestQwen3VLDecoderUnpadding(CustomTestCase):
     def _forward_batch(self):
         return SimpleNamespace(
@@ -235,6 +289,50 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(
             mr.attn_backend.calls,
             [(8, 4), (64, 4), (256, 4)],
+        )
+
+    def test_mixed_chunk_adds_fixed_decode_max_column(self):
+        mr = _model_runner()
+        mr.server_args = SimpleNamespace(enable_mixed_chunk=True)
+        policy = _make_policy(
+            mr,
+            token_buckets=(16, 64, 128),
+            bs_buckets=(16, 32, 64),
+        )
+        policy.extend_bs = 16
+
+        _run_cases(policy, ForwardMode.EXTEND)
+
+        self.assertEqual(
+            mr.attn_backend.calls,
+            [(16, 16), (64, 16), (128, 16), (64, 64), (128, 64)],
+        )
+
+    def test_qwen3_vl_extend_uses_configured_prefill_cap(self):
+        mr = _model_runner()
+        mr.server_args = SimpleNamespace(enable_mixed_chunk=False)
+        mr.model.get_image_feature = MagicMock()
+        mr.model.get_input_embeddings = MagicMock()
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=mr,
+            t_bucketer=Bucketer(name="Token", buckets=[64, 256]),
+            b_bucketer=Bucketer(name="Bs", buckets=[16, 32, 64]),
+            owner=mr.model,
+        )
+        policy.extend_bs = 16
+        policy._run_one = MagicMock()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "get_tensor_model_parallel_rank",
+            return_value=1,
+        ):
+            policy._precompile_extend()
+
+        self.assertEqual(policy._run_one.call_count, 2)
+        self.assertEqual(
+            {call.kwargs["bs"] for call in policy._run_one.call_args_list},
+            {16},
         )
 
     def test_extend_skips_token_bucket_below_bs(self):

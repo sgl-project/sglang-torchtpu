@@ -147,6 +147,28 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.b_bucketer is not None
         return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
 
+    def _extend_compile_shapes(self) -> list[tuple[int, int]]:
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+
+        batch_caps = [self._extend_compile_cap()]
+        server_args = getattr(self.model_runner, "server_args", None)
+        if getattr(server_args, "enable_mixed_chunk", False):
+            batch_caps.append(
+                _extend_batch_cap(
+                    self.t_bucketer,
+                    self.b_bucketer,
+                    self.b_bucketer.max_val,
+                )
+            )
+
+        return [
+            (num_tokens, batch_size)
+            for batch_size in dict.fromkeys(batch_caps)
+            for num_tokens in self.t_bucketer.buckets
+            if num_tokens >= batch_size
+        ]
+
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
         if self.model_runner is None or self.owner is None or self.method_name is None:
@@ -307,19 +329,19 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self._extend_compile_cap()
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        valid_shapes = self._extend_compile_shapes()
         if not valid_shapes:
             raise ValueError(
                 "No TPU extend compile shapes are valid: token buckets "
                 f"{list(self.t_bucketer.buckets)} are all smaller than the "
-                f"extend batch cap {bs}."
+                f"extend batch cap {self._extend_compile_cap()}."
             )
 
         logger.info(
-            "[decoder compile policy] EXTEND: %d shapes (bs=%d, token_buckets=%s)",
+            "[decoder compile policy] EXTEND: %d shapes "
+            "(batch_caps=%s, token_buckets=%s)",
             len(valid_shapes),
-            bs,
+            sorted({batch_size for _, batch_size in valid_shapes}),
             list(self.t_bucketer.buckets),
         )
         compile_range = (
@@ -638,13 +660,12 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
 
-        bs = self._extend_compile_cap()
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        valid_shapes = self._extend_compile_shapes()
         if not valid_shapes:
             raise ValueError(
                 "No TPU extend compile shapes are valid: token buckets "
                 f"{list(self.t_bucketer.buckets)} are all smaller than the "
-                f"extend batch cap {bs}."
+                f"extend batch cap {self._extend_compile_cap()}."
             )
 
         variants = ["text_only"]
@@ -653,10 +674,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         logger.info(
             "[decoder compile policy] VL EXTEND: %d shapes x %d variants "
-            "(bs=%d, token_buckets=%s)",
+            "(batch_caps=%s, token_buckets=%s)",
             len(valid_shapes),
             len(variants),
-            bs,
+            sorted({batch_size for _, batch_size in valid_shapes}),
             list(self.t_bucketer.buckets),
         )
         compile_items = [

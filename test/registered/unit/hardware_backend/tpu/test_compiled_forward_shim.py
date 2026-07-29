@@ -197,6 +197,35 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens.shape[0], 64)
         self.assertEqual(fb.batch_size, 64)
 
+    def test_mixed_batch_shapes_are_all_precompiled(self):
+        t_bucketer = _bucketer("Token", [16, 64, 128])
+        b_bucketer = _bucketer("Bs", [16, 32, 64])
+        policy = DecoderTpuCompilePolicy(
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(enable_mixed_chunk=True)
+            ),
+            t_bucketer=t_bucketer,
+            b_bucketer=b_bucketer,
+        )
+        policy.extend_bs = 16
+        precompiled_shapes = set(policy._extend_compile_shapes())
+
+        for real_q in (1, 16, 17, 64, 65, 128):
+            for real_b in (1, 16, 17, 32, 33, 64):
+                with self.subTest(real_q=real_q, real_b=real_b):
+                    fb = _forward_batch(real_t=real_q, real_b=real_b, mode="mixed")
+                    _pad_forward_batch_inputs(
+                        fb,
+                        t_bucketer=t_bucketer,
+                        b_bucketer=b_bucketer,
+                        extend_bs=policy.extend_bs,
+                    )
+                    padded_shape = (
+                        fb.input_ids.shape[0],
+                        fb.seq_lens.shape[0],
+                    )
+                    self.assertIn(padded_shape, precompiled_shapes)
+
     def test_target_verify_pins_token_dim_to_draft_token_num(self):
         # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:
         # the extend branch would over-pad it up to the nearest token bucket.
