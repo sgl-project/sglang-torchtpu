@@ -1,9 +1,5 @@
 """Manual TPU tests for FP8 fused MoE experts."""
 
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,13 +8,17 @@ import torch
 import torch.nn.functional as F
 
 import sglang.srt.hardware_backend.tpu.fp8_moe as tpu_fp8_moe
+import sglang.srt.layers.moe.pallas.fused_moe_op as fused_moe_op_module
 import sglang.srt.layers.quantization.fp8 as fp8_mod
 from sglang.srt.layers.moe.pallas.fused_moe_op import (
     _build_fused_moe_op,
     fused_moe_call,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
+
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 
 def _quantize_per_expert(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -101,6 +101,17 @@ def _reference_moe(
 
 
 class TestTpuFp8MoE(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        with patch.object(
+            fused_moe_op_module,
+            "cpu_export_jax_op",
+            wraps=fused_moe_op_module.cpu_export_jax_op,
+        ) as cpu_export_jax_op:
+            _build_fused_moe_op()
+        cls.cpu_export_registration_calls = cpu_export_jax_op.call_count
+
     def test_fp8_moe_method_routes_to_tpu_fused_moe_call(self):
         method = object.__new__(Fp8MoEMethod)
         method.moe_runner_config = SimpleNamespace(
@@ -222,8 +233,8 @@ class TestTpuFp8MoE(CustomTestCase):
             torch.tensor([[4, 5], [0, 7]], dtype=torch.int32),
         )
 
-    def test_fp8_moe_runs_eager_and_compiled(self):
-        _build_fused_moe_op()
+    def test_fp8_moe_runs_through_cpu_export_jax_op_eager_and_compiled(self):
+        self.assertEqual(self.cpu_export_registration_calls, 1)
 
         device = torch.device("tpu")
         num_tokens = 8
