@@ -8,10 +8,10 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     get_torch_compile_policy,
 )
-from sglang.test.ci.ci_register import register_tpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class FakeTpuPlatform:
