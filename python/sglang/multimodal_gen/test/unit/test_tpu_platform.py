@@ -82,6 +82,31 @@ class TestTpuPlatformSurface(unittest.TestCase):
             self.assertFalse(torch.is_grad_enabled())
 
 
+class TestDitEvictionContext(unittest.TestCase):
+    def test_evicts_all_dit_components_model_agnostically(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.multimodal_gen.runtime.platforms import tpu as tpu_module
+
+        dit = torch.nn.Linear(2, 2)
+        video_dit = torch.nn.Linear(2, 2)
+        vae = torch.nn.Linear(2, 2)
+        pipeline = SimpleNamespace(
+            modules={"transformer": dit, "video_dit": video_dit, "vae": vae}
+        )
+        ctx = tpu_module._DitEvictionContext(pipeline)
+        with patch.object(tpu_module.torch, "tpu", create=True) as tpu_mock:
+            with patch.object(
+                tpu_module.TpuPlatform,
+                "get_local_torch_device",
+                return_value=torch.device("cpu"),
+            ):
+                with ctx:
+                    self.assertEqual(len(ctx._evicted), 2)  # both DiTs, not the VAE
+        self.assertEqual(tpu_mock.synchronize.call_count, 2)  # enter + exit
+
+
 @unittest.skipUnless(hasattr(torch, "tpu"), "requires torch_tpu")
 class TestDenoiseLoopEagerMode(unittest.TestCase):
     def test_default_mode_is_defer_and_fuse(self):

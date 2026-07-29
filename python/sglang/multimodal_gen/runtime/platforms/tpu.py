@@ -36,11 +36,6 @@ logger = init_logger(__name__)
 
 _MIB = 1024**2
 
-# DiT modules evicted to host while the VAE decodes. Wan names its (optionally
-# two-expert) transformer this way; extend when other pipelines are validated
-# on TPU.
-_VAE_DECODE_EVICT_MODULES = ("transformer", "transformer_2")
-
 # Env set by jax when it loads first (it is pulled in transitively by the
 # pallas custom-op path). libtpu then initializes in JAX mode and torch_tpu's
 # multi-process PJRT init fails on the libtpu lockfile.
@@ -67,9 +62,14 @@ class _DitEvictionContext:
     def __enter__(self) -> "_DitEvictionContext":
         if self._pipeline is None:
             return self
-        for name in _VAE_DECODE_EVICT_MODULES:
-            module = self._pipeline.get_module(name)
-            if isinstance(module, torch.nn.Module):
+        # Evict every DiT-class component (model-agnostic: covers Wan's
+        # transformer/transformer_2, video_dit, audio_dit, ...).
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+            is_dit_component_name,
+        )
+
+        for name, module in self._pipeline.modules.items():
+            if is_dit_component_name(name) and isinstance(module, torch.nn.Module):
                 module.cpu()
                 self._evicted.append(module)
         if self._evicted:
