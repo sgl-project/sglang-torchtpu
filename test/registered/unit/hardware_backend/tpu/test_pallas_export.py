@@ -129,8 +129,7 @@ class TestPallasExportEnvironment(CustomTestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_distinct_mesh_exports_collective_with_world_size_partitions(self):
-        script = textwrap.dedent(
-            """
+        script = textwrap.dedent("""
             import base64
             import inspect
             import json
@@ -298,8 +297,7 @@ class TestPallasExportEnvironment(CustomTestCase):
                     }
                 )
             )
-            """
-        )
+            """)
         env = os.environ.copy()
         env.pop("JAX_PLATFORMS", None)
         env.pop("XLA_FLAGS", None)
@@ -332,8 +330,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         "requires JAX and TorchTPU",
     )
     def test_cpu_export_jax_op_executes_registered_kernel(self):
-        script = textwrap.dedent(
-            """
+        script = textwrap.dedent("""
             import json
             import os
 
@@ -367,8 +364,7 @@ class TestPallasExportEnvironment(CustomTestCase):
                     }
                 )
             )
-            """
-        )
+            """)
         env = os.environ.copy()
         env.pop("JAX_PLATFORMS", None)
         env.pop("XLA_FLAGS", None)
