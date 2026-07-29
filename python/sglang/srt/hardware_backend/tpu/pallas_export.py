@@ -8,6 +8,10 @@ from contextlib import contextmanager
 
 _CPU_DEVICE_COUNT_FLAG = "--xla_force_host_platform_device_count"
 _TPU_INFO_PATCH_LOCK = threading.RLock()
+_PALLAS_DEVICE_KIND_BY_TORCHTPU = {
+    "TPU v6e": "TPU v6 lite",
+    "TPU v7": "TPU7x",
+}
 
 
 def configure_jax_export_platform() -> None:
@@ -88,7 +92,7 @@ def get_torch_tpu_device_kind() -> str:
 def get_pallas_tpu_device_kind() -> str:
     """Return the physical device spelling expected by JAX Pallas."""
     device_kind = get_torch_tpu_device_kind()
-    return "TPU7x" if device_kind == "TPU v7" else device_kind
+    return _PALLAS_DEVICE_KIND_BY_TORCHTPU.get(device_kind, device_kind)
 
 
 @contextmanager

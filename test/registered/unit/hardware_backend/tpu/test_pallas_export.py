@@ -87,6 +87,22 @@ class TestPallasExportEnvironment(CustomTestCase):
             "--xla_force_host_platform_device_count=8", os.environ["XLA_FLAGS"]
         )
 
+    def test_maps_torchtpu_device_kind_to_pallas_spelling(self):
+        cases = (
+            ("TPU v6e", "TPU v6 lite"),
+            ("TPU v7", "TPU7x"),
+            ("TPU v5e", "TPU v5e"),
+        )
+        for torch_device_kind, pallas_device_kind in cases:
+            with self.subTest(torch_device_kind=torch_device_kind), patch.object(
+                pallas_export,
+                "get_torch_tpu_device_kind",
+                return_value=torch_device_kind,
+            ):
+                self.assertEqual(
+                    pallas_export.get_pallas_tpu_device_kind(), pallas_device_kind
+                )
+
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_cpu_export_context_reports_and_restores_tpu_target(self):
         from jax._src.pallas.mosaic import tpu_info
@@ -113,7 +129,8 @@ class TestPallasExportEnvironment(CustomTestCase):
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_distinct_mesh_exports_collective_with_world_size_partitions(self):
-        script = textwrap.dedent("""
+        script = textwrap.dedent(
+            """
             import base64
             import inspect
             import json
@@ -128,10 +145,12 @@ class TestPallasExportEnvironment(CustomTestCase):
             import jax
             import jax.numpy as jnp
             from jax import lax
+            from jax._src.interpreters import mlir as jax_mlir
             from jax.experimental import pallas as pl
             from jax.experimental.pallas import tpu as pltpu
             from jax.sharding import Mesh, PartitionSpec as P
             from jaxlib.mlir import ir
+            from jaxlib.mlir.dialects import sdy, stablehlo
             from jaxlib.mosaic.python import tpu as mosaic_tpu
 
             mesh = Mesh(np.asarray(devices).reshape(1, 4), ("data", "model"))
@@ -216,12 +235,43 @@ class TestPallasExportEnvironment(CustomTestCase):
                     jax.ShapeDtypeStruct((32,), jnp.float32)
                 )
 
-            pallas_module = pallas_exported.mlir_module()
-            body_start = pallas_module.index("TUzvUg")
-            body_end = pallas_module.index(chr(92), body_start)
-            mosaic_bytecode = base64.b64decode(
-                pallas_module[body_start:body_end]
+            outer_context = ir.Context()
+            outer_context.allow_unregistered_dialects = True
+            outer_context.append_dialect_registry(jax_mlir.upstream_dialects)
+            sdy.register_dialect(outer_context)
+            stablehlo.register_dialect(outer_context)
+            outer_context.load_all_available_dialects()
+            outer_module = ir.Module.parse(
+                pallas_exported.mlir_module(), outer_context
             )
+
+            def walk_operations(operation):
+                yield operation
+                for region in operation.regions:
+                    for block in region.blocks:
+                        for child in block.operations:
+                            yield from walk_operations(child.operation)
+
+            mosaic_bodies = []
+            for operation in walk_operations(outer_module.operation):
+                if operation.name != "stablehlo.custom_call":
+                    continue
+                try:
+                    backend_config = ir.StringAttr(
+                        operation.attributes["backend_config"]
+                    ).value
+                except KeyError:
+                    continue
+                config = json.loads(backend_config)
+                body = config.get("custom_call_config", {}).get("body")
+                if body is not None:
+                    mosaic_bodies.append(body)
+
+            if len(mosaic_bodies) != 1:
+                raise AssertionError(
+                    f"Expected one serialized Mosaic body, got {len(mosaic_bodies)}"
+                )
+            mosaic_bytecode = base64.b64decode(mosaic_bodies[0], validate=True)
             context = ir.Context()
             context.allow_unregistered_dialects = True
             mosaic_tpu.register_dialect(context)
@@ -248,7 +298,8 @@ class TestPallasExportEnvironment(CustomTestCase):
                     }
                 )
             )
-            """)
+            """
+        )
         env = os.environ.copy()
         env.pop("JAX_PLATFORMS", None)
         env.pop("XLA_FLAGS", None)
@@ -281,7 +332,8 @@ class TestPallasExportEnvironment(CustomTestCase):
         "requires JAX and TorchTPU",
     )
     def test_cpu_export_jax_op_executes_registered_kernel(self):
-        script = textwrap.dedent("""
+        script = textwrap.dedent(
+            """
             import json
             import os
 
@@ -315,7 +367,8 @@ class TestPallasExportEnvironment(CustomTestCase):
                     }
                 )
             )
-            """)
+            """
+        )
         env = os.environ.copy()
         env.pop("JAX_PLATFORMS", None)
         env.pop("XLA_FLAGS", None)
