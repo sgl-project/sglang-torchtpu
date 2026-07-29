@@ -126,25 +126,7 @@ def get_git_commit_hash() -> str:
 
 
 def capture_memory_snapshot() -> MemorySnapshot:
-    if not torch.get_device_module().is_available():
-        return MemorySnapshot(
-            allocated_mb=0.0,
-            reserved_mb=0.0,
-            peak_allocated_mb=0.0,
-            peak_reserved_mb=0.0,
-        )
-
-    allocated = torch.get_device_module().memory_allocated()
-    reserved = torch.get_device_module().memory_reserved()
-    peak_allocated = torch.get_device_module().max_memory_allocated()
-    peak_reserved = torch.get_device_module().max_memory_reserved()
-
-    return MemorySnapshot(
-        allocated_mb=allocated / (1024**2),
-        reserved_mb=reserved / (1024**2),
-        peak_allocated_mb=peak_allocated / (1024**2),
-        peak_reserved_mb=peak_reserved / (1024**2),
-    )
+    return current_platform.get_memory_snapshot()
 
 
 @dataclasses.dataclass

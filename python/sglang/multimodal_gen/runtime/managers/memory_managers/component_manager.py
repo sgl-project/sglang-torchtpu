@@ -596,7 +596,7 @@ class ComponentResidencyManager:
             return
         if not torch.get_device_module().is_available():
             return
-        torch.get_device_module().empty_cache()
+        current_platform.empty_cache()
 
 
 _GLOBAL_COMPONENT_RESIDENCY_MANAGER: ComponentResidencyManager | None = None

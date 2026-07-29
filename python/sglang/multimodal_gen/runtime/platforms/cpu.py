@@ -32,6 +32,26 @@ class CpuPlatform(Platform):
         return torch.device("cpu")
 
     @classmethod
+    def empty_cache(cls) -> None:
+        pass  # no device allocator on CPU
+
+    @classmethod
+    def reset_peak_memory_stats(cls) -> None:
+        pass  # torch.cpu has no peak-memory counters
+
+    @classmethod
+    def get_memory_snapshot(cls):
+        # torch.cpu.is_available() is True but torch.cpu has no memory stats.
+        from sglang.multimodal_gen.runtime.utils.perf_logger import MemorySnapshot
+
+        return MemorySnapshot(
+            allocated_mb=0.0,
+            reserved_mb=0.0,
+            peak_allocated_mb=0.0,
+            peak_reserved_mb=0.0,
+        )
+
+    @classmethod
     def get_torch_distributed_backend_str(cls) -> str:
         return "gloo"
 
