@@ -86,8 +86,8 @@ ${WEIGHTS_VOLUME}
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
 
                       if [ "$NNODES" -le 1 ]; then
-                        # Single-host: each test self-launches its own server.
-                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 1800
+                        # Single-host: each test self-launches its own server. 3600s/file:
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 3600
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).

@@ -74,6 +74,11 @@ class TestTpuGptOss120BGpqa(CustomTestCase):
         env.setdefault("ENABLE_PROFILER_ENDPOINT", "0")
         env.setdefault("PYTHON", "python3")
 
+        print(
+            f"[gpqa-e2e] launching TPU server: MODEL={env['MODEL']} "
+            f"TP_SIZE={env['TP_SIZE']} CONTEXT_LEN={env['CONTEXT_LEN']}",
+            flush=True,
+        )
         cls.process = subprocess.Popen(
             ["bash", str(TPU_BENCH_DIR / "launch_server.sh")],
             cwd=TPU_BENCH_DIR,
@@ -90,6 +95,7 @@ class TestTpuGptOss120BGpqa(CustomTestCase):
     @classmethod
     def _wait_for_health(cls):
         start = time.perf_counter()
+        last_note = start
         while time.perf_counter() - start < cls.health_timeout:
             if cls.process is not None and cls.process.poll() is not None:
                 raise RuntimeError(
@@ -98,9 +104,22 @@ class TestTpuGptOss120BGpqa(CustomTestCase):
             try:
                 response = requests.get(cls.base_url + "/health", timeout=10)
                 if response.status_code == 200:
+                    print(
+                        f"[gpqa-e2e] server healthy after "
+                        f"{time.perf_counter() - start:.0f}s",
+                        flush=True,
+                    )
                     return
             except requests.RequestException:
                 pass
+            if time.perf_counter() - last_note >= 60:
+                last_note = time.perf_counter()
+                print(
+                    f"[gpqa-e2e] waiting for server health "
+                    f"({time.perf_counter() - start:.0f}s elapsed; weight load + "
+                    f"compile typically ~10 min)",
+                    flush=True,
+                )
             time.sleep(5)
         raise TimeoutError(
             f"{cls.base_url}/health did not return 200 within {cls.health_timeout}s"
@@ -109,6 +128,7 @@ class TestTpuGptOss120BGpqa(CustomTestCase):
     def test_gpqa_openai_harness(self):
         # Pure-python eval code; --no-deps so its pins never touch the pinned
         # TPU torch stack. openai/pandas/blobfile are image deps (test extra).
+        print("[gpqa-e2e] installing gpt-oss eval harness (pip --no-deps)", flush=True)
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
             check=True,
@@ -119,6 +139,12 @@ class TestTpuGptOss120BGpqa(CustomTestCase):
         from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
         from gpt_oss.evals.gpqa_eval import GPQAEval
 
+        print(
+            f"[gpqa-e2e] starting GPQA eval: n_repeats={GPQA_N_REPEATS} "
+            f"(198 x {GPQA_N_REPEATS} sampled requests, 32 threads)",
+            flush=True,
+        )
+        eval_start = time.perf_counter()
         sampler = ChatCompletionsSampler(
             model="gpt-oss-120b",
             reasoning_model=True,
@@ -135,7 +161,9 @@ class TestTpuGptOss120BGpqa(CustomTestCase):
         print(
             f"gpqa_diamond (openai harness, n_repeats={GPQA_N_REPEATS}): "
             f"measured={result.score:.4f} | ground_truth={GPQA_GROUND_TRUTH} | "
-            f"floor={floor:.3f} | metrics={result.metrics}"
+            f"floor={floor:.3f} | eval_time={time.perf_counter() - eval_start:.0f}s | "
+            f"metrics={result.metrics}",
+            flush=True,
         )
         dump_metric(
             "gpqa_diamond_openai_harness",
