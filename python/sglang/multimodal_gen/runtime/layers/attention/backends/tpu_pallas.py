@@ -22,9 +22,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 # Registered torch custom-op overloads, keyed by (sm_scale, block_q, block_kv).
 # One op per configuration: the pallas kernel bakes the scale and block sizes
@@ -154,10 +151,6 @@ def _tpu_flash_sdpa(
 class TpuPallasAttentionBackend(AttentionBackend):
 
     accept_output_buffer: bool = True
-
-    @staticmethod
-    def get_supported_head_sizes() -> list[int]:
-        return [64, 128, 256]
 
     @staticmethod
     def get_enum() -> AttentionBackendEnum:

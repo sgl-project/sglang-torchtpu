@@ -140,10 +140,6 @@ class TpuPlatform(Platform):
         return torch.tpu.get_device_name(device_id)
 
     @classmethod
-    def get_device_uuid(cls, device_id: int = 0) -> str:
-        return f"tpu:{device_id}"
-
-    @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         _free, total = torch.accelerator.get_memory_info()
         return total
