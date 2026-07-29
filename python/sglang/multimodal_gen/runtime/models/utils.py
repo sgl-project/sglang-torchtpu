@@ -48,21 +48,7 @@ def set_weight_attrs(
         # tensor, which is param.data, leading to the redundant memory usage.
         # This sometimes causes OOM errors during model loading. To avoid this,
         # we sync the param tensor after its weight loader is called.
-        # TODO(woosuk): Remove this hack once we have a better solution.
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
-        if current_platform.is_tpu() and key == "weight_loader":
-            value = _make_synced_weight_loader(value)
         setattr(weight, key, value)
-
-
-def _make_synced_weight_loader(original_weight_loader) -> Any:
-
-    def _synced_weight_loader(param, *args, **kwargs):
-        original_weight_loader(param, *args, **kwargs)
-        torch._sync(param)
-
-    return _synced_weight_loader
 
 
 def extract_layer_index(layer_name: str) -> int:
