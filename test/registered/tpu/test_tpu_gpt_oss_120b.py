@@ -1,10 +1,10 @@
 """gpt-oss-120b single-host e2e accuracy: GPQA Diamond via OpenAI's own eval harness.
 
 Self-launches a tp=8 server, then runs gpt_oss.evals with the model card's
-methodology (n_repeats=8, permuted choices, temperature 1.0, their prompt + grader)
-and asserts the mean score is within 3 points of the card's 0.671 (floor 0.641).
-Single passes are too noisy on 198 questions for a 3pt gate -- do NOT reduce
-n_repeats.
+methodology (permuted choices, temperature 1.0, their prompt + grader; n_repeats=4
+vs the card's 8, halved for CI time) and asserts the mean score is within 3 points
+of the card's 0.671 (floor 0.641). Single passes are too noisy on 198 questions for
+a 3pt gate -- do NOT go below n_repeats=4.
 
 Notes:
 - Weights: ROX PVC gptoss120b-rox at /weights (hydrate-gptoss120b.yaml).
@@ -34,7 +34,7 @@ TPU_BENCH_DIR = REPO_ROOT / "benchmark" / "tpu"
 
 GPQA_GROUND_TRUTH = 0.671  # model card: low effort, no tools, mean of 8 sampled passes
 GPQA_ATOL = 0.03  # agreed tolerance -> floor 0.641
-GPQA_N_REPEATS = 8  # card methodology; keeps the sampled-eval SE at ~1.2pts
+GPQA_N_REPEATS = 4  # card uses 8; 4 halves CI time and keeps the mean's SE ~1.7pts
 
 
 class TestTpuGptOss120BGpqa(CustomTestCase):
