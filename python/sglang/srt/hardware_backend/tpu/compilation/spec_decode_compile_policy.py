@@ -322,6 +322,9 @@ class SpecDecodeCompilePolicyMixin:
             return
 
         forward_batch.seq_lens = _pad_first_dim(forward_batch.seq_lens, pad_b)
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if isinstance(seq_lens_cpu, torch.Tensor):
+            forward_batch.seq_lens_cpu = _pad_first_dim(seq_lens_cpu, pad_b)
         forward_batch.req_pool_indices = _pad_first_dim(
             forward_batch.req_pool_indices, pad_b
         )
@@ -329,6 +332,21 @@ class SpecDecodeCompilePolicyMixin:
             forward_batch.positions,
             forward_batch.positions.shape[0] // real_bs * pad_b,
         )
+        mrope_positions = forward_batch.mrope_positions
+        if (
+            mrope_positions is not None
+            and mrope_positions.shape[-1] < forward_batch.positions.shape[0]
+        ):
+            pad_tokens = forward_batch.positions.shape[0] - mrope_positions.shape[-1]
+            forward_batch.mrope_positions = torch.cat(
+                [
+                    mrope_positions,
+                    mrope_positions.new_zeros(
+                        (*mrope_positions.shape[:-1], pad_tokens)
+                    ),
+                ],
+                dim=-1,
+            )
         forward_batch.out_cache_loc = _pad_first_dim(
             forward_batch.out_cache_loc,
             forward_batch.out_cache_loc.shape[0] // real_bs * pad_b,

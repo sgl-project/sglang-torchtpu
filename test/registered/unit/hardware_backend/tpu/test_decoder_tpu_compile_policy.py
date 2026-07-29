@@ -481,6 +481,42 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         self.assertIsNotNone(fb.spec_info)
 
 
+class TestSpecDraftDecodePadding(CustomTestCase):
+    def test_pads_mrope_and_cpu_seq_lens_from_three_to_four(self):
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        forward_batch = SimpleNamespace(
+            spec_info=SimpleNamespace(
+                topk_p=torch.zeros((3, 1)),
+                topk_index=torch.zeros((3, 1), dtype=torch.int64),
+                hidden_states=torch.zeros((3, 16)),
+            ),
+            seq_lens=torch.tensor([8, 7, 6], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([8, 7, 6], dtype=torch.int32),
+            req_pool_indices=torch.tensor([0, 1, 2]),
+            positions=torch.arange(3),
+            mrope_positions=torch.arange(9).reshape(3, 3),
+            out_cache_loc=torch.arange(3),
+            mm_inputs=None,
+            batch_size=3,
+        )
+
+        policy.pad_draft_decode(forward_batch)
+
+        self.assertEqual(forward_batch.batch_size, 4)
+        self.assertEqual(forward_batch._tpu_real_b, 3)
+        self.assertEqual(forward_batch.seq_lens.shape, (4,))
+        self.assertEqual(forward_batch.seq_lens_cpu.tolist(), [8, 7, 6, 0])
+        self.assertEqual(forward_batch.mrope_positions.shape, (3, 4))
+        self.assertTrue(
+            torch.equal(
+                forward_batch.mrope_positions[:, :3],
+                torch.arange(9).reshape(3, 3),
+            )
+        )
+        self.assertTrue(torch.all(forward_batch.mrope_positions[:, 3:] == 0))
+        self.assertEqual(forward_batch.spec_info.topk_p.shape, (4, 1))
+
+
 class TestSpecUnpadOutputs(CustomTestCase):
     """Spec output slicing: TARGET_VERIFY logits use real_q; capture-LAST hidden
     uses real_b; everything else matches the base decoder policy."""
