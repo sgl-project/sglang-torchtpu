@@ -165,6 +165,8 @@ class DecodingStage(PipelineStage):
     def _get_vae_decode_fn(self, vae, server_args: ServerArgs):
         if not server_args.enable_torch_compile or not isinstance(vae, nn.Module):
             return vae.decode
+        if not current_platform.supports_vae_decode_torch_compile():
+            return vae.decode
 
         will_compile = (
             self._compiled_vae_decode.target_id != id(vae)
@@ -210,6 +212,7 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
+        pipeline = self.pipeline() if self.pipeline else None
         latents = latents.to(get_local_torch_device())
         # Setup VAE precision from user policy.
         vae_dtype = resolve_precision(
@@ -225,10 +228,13 @@ class DecodingStage(PipelineStage):
         )
 
         # Decode latents
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
+        with (
+            current_platform.vae_decode_context(pipeline),
+            torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ),
         ):
             try:
                 # TODO: make it more specific

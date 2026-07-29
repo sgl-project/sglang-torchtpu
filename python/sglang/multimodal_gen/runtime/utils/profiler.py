@@ -73,6 +73,14 @@ class SGLDiffusionProfiler:
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             activities.append(torch.profiler.ProfilerActivity.XPU)
 
+        # Platform-native device tracing (e.g. accelerators invisible to
+        # torch.profiler); entered/exited alongside the torch profiler.
+        self.aux_profiler = (
+            current_platform.create_aux_profiler(self.log_dir)
+            if self.rank == 0
+            else None
+        )
+
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
@@ -114,6 +122,8 @@ class SGLDiffusionProfiler:
     def start(self):
         logger.info("Starting Profiler...")
         self.profiler.start()
+        if self.aux_profiler is not None:
+            self.aux_profiler.__enter__()
 
     def _step(self):
         self.profiler.step()
@@ -147,6 +157,9 @@ class SGLDiffusionProfiler:
         if current_platform.is_npu():
             torch.npu.synchronize()
             export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
+        if self.aux_profiler is not None:
+            self.aux_profiler.__exit__(None, None, None)
+            self.aux_profiler = None
         self.profiler.stop()
 
         if export_trace:

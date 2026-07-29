@@ -4,6 +4,7 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/interface.py
 from __future__ import annotations
 
+import contextlib
 import enum
 import os
 import random
@@ -440,6 +441,71 @@ class Platform:
         os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
+
+    @classmethod
+    def supports_op_level_torch_compile(cls) -> bool:
+        """Whether op-level @torch.compile decorations (inductor) are usable."""
+        return True
+
+    @classmethod
+    def supports_p2p_communication(cls) -> bool:
+        """Whether the distributed backend implements point-to-point
+        send/recv (required e.g. for spatial-parallel VAE halo exchange)."""
+        return True
+
+    @classmethod
+    def supports_vae_decode_torch_compile(cls) -> bool:
+        """Whether the VAE decode path may be wrapped in torch.compile."""
+        return True
+
+    @classmethod
+    def vae_decode_context(cls, pipeline: Any) -> Any:
+        """Context manager scoping the VAE decode (e.g. to free device memory
+        for decode on memory-constrained platforms). Default: no-op."""
+        return contextlib.nullcontext()
+
+    @classmethod
+    def denoise_loop_context(cls) -> Any:
+        """Context manager wrapping the denoising loop (e.g. to select a
+        platform execution mode for the loop). Default: no-op."""
+        return contextlib.nullcontext()
+
+    @classmethod
+    def on_denoise_step_end(cls) -> None:
+        """Called after each denoising step (e.g. to bound in-flight lazy
+        work on deferred-execution platforms). Default: no-op."""
+
+    @classmethod
+    def wrap_forward_for_compile(cls, forward: Callable[..., Any]) -> Callable[..., Any]:
+        """Wrap a module forward before torch.compile is applied to it
+        (e.g. to keep collectives traceable). Default: identity."""
+        return forward
+
+    @classmethod
+    def use_functional_seq_all_to_all(cls) -> bool:
+        """Whether sequence-parallel attention should use the synchronous
+        functional-collectives all-to-all instead of the stream-overlapped
+        autograd path (which requires CUDA-style streams and async_op)."""
+        return False
+
+    @classmethod
+    def create_aux_profiler(cls, log_dir: str) -> Any | None:
+        """Return a context manager capturing platform-native device traces
+        alongside torch.profiler, or None if torch.profiler suffices."""
+        return None
+
+    @classmethod
+    def prepare_server_environment(cls, *, world_size: int) -> None:
+        """One-time parent-process environment preparation before workers
+        are spawned. Default: no-op."""
+
+    @classmethod
+    def worker_spawn_env(
+        cls, *, rank: int, world_size: int, master_port: int
+    ) -> dict[str, str]:
+        """Environment variables that must be present at worker-process birth
+        (for runtimes that latch env vars during import). Default: none."""
+        return {}
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

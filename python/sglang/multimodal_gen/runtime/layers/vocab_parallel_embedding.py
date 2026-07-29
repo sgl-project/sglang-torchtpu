@@ -148,7 +148,8 @@ class VocabParallelEmbeddingShardIndices:
 @torch.compile(
     dynamic=True,
     backend=current_platform.simple_compile_backend,
-    disable=current_platform.is_npu(),
+    disable=current_platform.is_npu()
+    or not current_platform.supports_op_level_torch_compile(),
 )
 def get_masked_input_and_mask(
     input_: torch.Tensor,

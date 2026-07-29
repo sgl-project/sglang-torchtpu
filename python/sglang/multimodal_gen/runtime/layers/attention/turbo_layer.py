@@ -1,5 +1,10 @@
 # copy and modify from https://github.com/thu-ml/TurboDiffusion/blob/main/turbodiffusion/rcm/utils/a2a_cp.py and https://github.com/thu-ml/TurboDiffusion/blob/main/turbodiffusion/SLA/core.py
 
+# Defer annotation evaluation: the `cp_stream: torch.get_device_module().Stream`
+# signature annotations below would otherwise touch the accelerator runtime at
+# import time in every importing process.
+from __future__ import annotations
+
 from typing import Any, Callable, List, Tuple, Type, Union
 
 import torch
@@ -17,6 +22,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     ForwardContext,
     get_forward_context,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -172,6 +178,32 @@ def async_a2a_communicate(
     return a2a_outputs[0] if len(a2a_inputs) == 1 else a2a_outputs
 
 
+def _functional_seq_all_to_all(
+    input: Tensor, local_seq_2_local_head: bool, group: dist.ProcessGroup
+) -> Tensor:
+    """Sequence-parallel all-to-all via functional collectives.
+
+    Inference-only alternative to the stream-overlapped autograd path below:
+    synchronous, stream-free, and traceable by dynamo (the collective stays in
+    the captured graph instead of graph-breaking on async_op + stream calls).
+    Selected via Platform.use_functional_seq_all_to_all().
+    """
+    import torch.distributed._functional_collectives as funcol
+
+    seq_world_size = dist.get_world_size(group)
+    if local_seq_2_local_head:
+        input_t = rearrange(
+            input, "bs seq_len (w h) d -> w bs seq_len h d", w=seq_world_size
+        ).contiguous()
+    else:
+        input_t = rearrange(
+            input, "bs (w s) h d -> w bs s h d", w=seq_world_size
+        ).contiguous()
+    output = funcol.all_to_all_single(input_t, None, None, group)
+    output = funcol.wait_tensor(output)
+    return post_all2all(local_seq_2_local_head, seq_world_size)(output)
+
+
 class _SeqAllToAll(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -258,6 +290,15 @@ class DistributedAttention(torch.nn.Module):
         pg_size = dist.get_world_size(self.pg)
         if pg_size < 2:
             return self.local_attn(query, key, value, ctx_attn_metadata)
+
+        if current_platform.use_functional_seq_all_to_all():
+            query_layer = _functional_seq_all_to_all(query, True, self.pg)
+            key_layer = _functional_seq_all_to_all(key, True, self.pg)
+            value_layer = _functional_seq_all_to_all(value, True, self.pg)
+            context_layer = self.local_attn(
+                query_layer, key_layer, value_layer, ctx_attn_metadata
+            )
+            return _functional_seq_all_to_all(context_layer, False, self.pg)
 
         query_layer, key_layer, value_layer = _SeqAllToAllQKV.apply(
             self.pg, query, key, value, pg_size, self.stream, True

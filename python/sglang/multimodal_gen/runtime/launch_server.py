@@ -181,6 +181,10 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     num_gpus = server_args.num_gpus
     processes = []
 
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    current_platform.prepare_server_environment(world_size=num_gpus)
+
     # Pipes for master to talk to slaves
     task_pipes_to_slaves_w = []
     task_pipes_to_slaves_r = []
@@ -203,6 +207,14 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_pipe_writers = []
 
     for i in range(num_gpus):
+        # Exported before each spawn: the child snapshots os.environ at
+        # start(), and some runtimes latch these variables during import,
+        # before the worker's own env setup runs.
+        os.environ.update(
+            current_platform.worker_spawn_env(
+                rank=i, world_size=num_gpus, master_port=master_port
+            )
+        )
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
         if i == 0:  # Master worker

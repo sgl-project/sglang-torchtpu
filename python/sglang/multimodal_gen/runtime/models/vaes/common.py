@@ -69,6 +69,11 @@ def can_install_spatial_shard_parallel_decode(config: VAEConfig | None) -> bool:
 def should_run_spatial_shard_parallel_decode(
     config: VAEConfig, z: torch.Tensor
 ) -> bool:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    if not current_platform.supports_p2p_communication():
+        # Spatial-parallel decode exchanges conv halos via send/recv.
+        return False
     world_size = _decode_parallel_world_size()
     return world_size > 1 and should_use_spatial_shard_parallel_decode(
         config, z, world_size
