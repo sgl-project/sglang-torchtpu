@@ -88,7 +88,8 @@ class TestDenoiseLoopEagerMode(unittest.TestCase):
         from torch_tpu._internal import execution_mode
 
         with TpuPlatform.denoise_loop_context():
-            self.assertIs(
+            # pybind11 enum members are not identity-stable; compare equality.
+            self.assertEqual(
                 execution_mode.eager_mode, execution_mode.EagerMode.DEFER_AND_FUSE
             )
 
@@ -101,7 +102,7 @@ class TestDenoiseLoopEagerMode(unittest.TestCase):
             os.environ, {"SGLANG_DIFFUSION_TPU_EAGER_MODE": "DEFER_NEVER"}
         ):
             with TpuPlatform.denoise_loop_context():
-                self.assertIs(
+                self.assertEqual(
                     execution_mode.eager_mode, execution_mode.EagerMode.DEFER_NEVER
                 )
         with patch.dict(
