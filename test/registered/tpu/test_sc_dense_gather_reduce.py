@@ -7,12 +7,13 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
 import itertools
 import types
+import unittest
 from unittest import mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from absl.testing import absltest, parameterized
+from absl.testing import parameterized
 from jax._src import test_util as jtu
 from jax.experimental.pallas import tpu as pltpu
 
@@ -21,8 +22,6 @@ from sglang.srt.layers.moe.pallas.sparse_core.dense_gather_reduce import (
     dense_gather_reduce,
     is_compatible,
 )
-
-jax.config.parse_flags_with_absl()
 
 
 def reference_dense_gather_reduce(
@@ -282,4 +281,4 @@ class IsCompatibleTest(parameterized.TestCase):
 
 
 if __name__ == "__main__":
-    absltest.main(testLoader=jtu.JaxTestLoader())
+    unittest.main(testLoader=jtu.JaxTestLoader())

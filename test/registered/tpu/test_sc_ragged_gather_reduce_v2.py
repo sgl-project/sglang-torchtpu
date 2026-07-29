@@ -7,18 +7,17 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 # test.
 
 import itertools
+import unittest
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from absl.testing import absltest, parameterized
+from absl.testing import parameterized
 from jax._src import test_util as jtu
 
 from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_reduce_v2 import (
     ragged_gather_reduce as ragged_gather_reduce_v2,
 )
-
-jax.config.parse_flags_with_absl()
 
 
 def reference_ragged_gather_reduce(
@@ -114,4 +113,4 @@ class ScatterTest(jtu.JaxTestCase):
 
 
 if __name__ == "__main__":
-    absltest.main(testLoader=jtu.JaxTestLoader())
+    unittest.main(testLoader=jtu.JaxTestLoader())

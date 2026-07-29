@@ -6,16 +6,15 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 # Local adaptations: import paths.
 
 import time
+import unittest
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from absl.testing import absltest, parameterized
+from absl.testing import parameterized
 from jax._src import test_util as jtu
 
 from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import ragged_gather_v2
-
-jax.config.parse_flags_with_absl()
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
@@ -129,4 +128,4 @@ class GatherTest(jtu.JaxTestCase):
 
 
 if __name__ == "__main__":
-    absltest.main(testLoader=jtu.JaxTestLoader())
+    unittest.main(testLoader=jtu.JaxTestLoader())
