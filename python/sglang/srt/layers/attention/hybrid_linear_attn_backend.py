@@ -169,8 +169,16 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
                 )
-                query_start_loc[:bs] = forward_batch.extend_start_loc
-                query_start_loc[bs] = (
+                # `bs` is the (possibly TPU-padded) batch size, but
+                # extend_start_loc only covers the real requests -- assigning it
+                # into [:bs] raises "expanded size of the tensor (8) must match
+                # the existing size (2)". Fill the real prefix, then flat-fill
+                # the padded tail with the running token total so padded rows
+                # describe zero-length queries. Backends that never pad have
+                # real_bs == bs, leaving behavior unchanged.
+                real_bs = forward_batch.extend_start_loc.shape[0]
+                query_start_loc[:real_bs] = forward_batch.extend_start_loc
+                query_start_loc[real_bs:] = (
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )

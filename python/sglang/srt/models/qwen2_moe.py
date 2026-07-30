@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_tpu,
     make_layers,
     use_intel_amx_backend,
 )
@@ -557,10 +558,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
+        # fused_gate_sigmoid_mul_add goes through the CUDA JIT kernel helper
+        # (jit_kernel.utils.is_arch_support_pdl -> torch.cuda.current_device()),
+        # which asserts "Torch not compiled with CUDA enabled" on TPU. Fall back
+        # to the plain `final_hidden_states += shared_output` path there.
         use_fused_gate = (
             self.shared_expert_gate is not None
             and not use_intel_amx_backend(self.shared_expert_gate)
             and not is_npu()
+            and not is_tpu()
         )
 
         if hidden_states.shape[0] == 0:

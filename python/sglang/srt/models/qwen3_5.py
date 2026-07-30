@@ -30,6 +30,7 @@ from sglang.jit_kernel.triton.gdn_fused_proj import (
 from sglang.srt.configs.qwen3_5 import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5MoeTextConfig,
     Qwen3_5TextConfig,
 )
 
@@ -39,7 +40,6 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
-from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -62,12 +62,16 @@ from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -104,6 +108,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_tpu,
     is_xpu,
     make_layers,
     set_weight_attrs,
@@ -114,6 +119,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
@@ -153,7 +159,15 @@ if _is_npu:
         split_qkvgate_gemma_rmsnorm_rope,
     )
 
-
+# FLA's gated RMSNorm is a CUDA/Triton kernel (it calls
+# torch.cuda.get_device_properties), so TPU uses the pure-torch equivalent.
+# NOTE: these must be module-level imports -- doing them inside a function
+# binds the name in that function's local scope only, leaving RMSNormGated
+# undefined at the call sites below.
+if _is_tpu:
+    from sglang.srt.layers.attention.native_torch.layernorm_gated import RMSNormGated
+else:
+    from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -275,19 +289,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
         )
 
-        self.norm = RMSNormGated(
-            self.head_v_dim,
-            eps=self.layer_norm_epsilon,
-            group_size=None,
-            norm_before_gate=True,
-            device=torch.get_device_module().current_device(),
-            dtype=config.torch_dtype,
-            **(
-                {"activation": self.output_gate_type}
-                if self.output_gate_type is not None
-                else {}
-            ),
+        _gate_act = (
+            {"activation": self.output_gate_type}
+            if self.output_gate_type is not None
+            else {}
         )
+        if _is_tpu:
+            # The pure-torch norm is always norm-before-gate and ungrouped, and
+            # takes no device arg (torch.get_device_module() has no TPU
+            # current_device), so those FLA-only kwargs are dropped here.
+            self.norm = RMSNormGated(
+                self.head_v_dim,
+                eps=self.layer_norm_epsilon,
+                dtype=config.torch_dtype,
+                **_gate_act,
+            )
+        else:
+            self.norm = RMSNormGated(
+                self.head_v_dim,
+                eps=self.layer_norm_epsilon,
+                group_size=None,
+                norm_before_gate=True,
+                device=torch.get_device_module().current_device(),
+                dtype=config.torch_dtype,
+                **_gate_act,
+            )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -516,6 +542,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.num_v_heads // self.num_k_heads in [1, 2, 4]
             and not _is_cpu
             and not _is_npu
+            # TPU has no Triton; fall through to the pure-torch split below.
+            and not _is_tpu
         ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
@@ -1029,9 +1057,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if not _is_npu:
+            if not _is_npu and not _is_tpu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
+                # NPU / TPU have no Triton fused_sigmoid_mul; apply the sigmoid
+                # output gate in pure torch.
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output.mul_(torch.sigmoid(gate_val))
 
@@ -2175,5 +2205,123 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
+# TODO: Remove this class entrypoint
+# This class is temporary text-only qwen3_5 class which is for
+# splitting the qwen3_5 on TPU into text-only and text + vision
+# Text-only E2E validation can be run with this class.
+class Qwen3_5TextForCausalLM(nn.Module):
+    """Text-only Qwen3.5 causal LM (no vision tower / image processor).
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+    Wraps the ``Qwen3_5ForCausalLM`` hybrid GDN backbone (which returns hidden
+    states) with an ``lm_head`` + ``LogitsProcessor`` so it can be served
+    directly as a text model, instead of going through the multimodal
+    ``Qwen3_5ForConditionalGeneration`` wrapper. Handles both the dense
+    (model_type "qwen3_5_text") and MoE ("qwen3_5_moe_text") text configs.
+    """
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.quant_config = quant_config
+        # MoE text config (model_type "qwen3_5_moe_text") needs the MoE backbone
+        # whose loader handles the pre-fused expert weights; dense uses the base.
+        # Match the config class (Qwen3_5MoeTextConfig subclasses Qwen3_5TextConfig)
+        # rather than a substring of model_type.
+        is_moe = isinstance(config, Qwen3_5MoeTextConfig)
+        backbone_cls = Qwen3_5MoeForCausalLM if is_moe else Qwen3_5ForCausalLM
+        self.model = backbone_cls(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            org_num_embeddings=config.vocab_size,
+            prefix=add_prefix("lm_head", prefix),
+        )
+        self.logits_processor = LogitsProcessor(config)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds
+        )
+        # The backbone returns a bare tensor normally, but a
+        # (hidden_states, aux_hidden_states) tuple when aux/EAGLE capture is on.
+        # Spec/EAGLE is rejected up the stack today, but unpack defensively so a
+        # future enablement doesn't silently feed a tuple to the logits step.
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.model.embed_tokens
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # The Qwen3.5 checkpoints ship as the multimodal VL model, so the text
+        # weights live under ``model.language_model.*``; the vision tower
+        # (``model.visual.*``) and the MTP head (``mtp.*``) are unused for
+        # text-only serving. Remap language-model names onto the backbone's
+        # namespace and delegate (the backbone loader fuses q/k/v and the GDN
+        # in-projections via its stacked_params_mapping).
+        lm_prefix = "model.language_model."
+
+        # Remap lazily. Buffering into a list would drain the incoming stream
+        # before a single parameter is copied, which defeats the platform's
+        # periodic load-time drain (see TpuSRTPlatform._sync_weight_stream) --
+        # every copy then lands in one deferred program. On the 397B MoE that is
+        # 23k+ parameters per EP rank and libtpu aborts with
+        # "Parameter number N causes underflow" once it passes its limit.
+        def _remapped() -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, w in weights:
+                if (
+                    name.startswith("model.visual")
+                    or name.startswith("visual")
+                    or name.startswith("mtp.")
+                ):
+                    continue
+                if name.startswith("lm_head."):
+                    param = self.lm_head.weight
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, w)
+                elif name.startswith(lm_prefix):
+                    yield name[len(lm_prefix) :], w
+                elif name.startswith("model."):
+                    yield name[len("model.") :], w
+                else:
+                    yield name, w
+
+        self.model.load_weights(_remapped())
+        # Tied embeddings: no lm_head weight in the checkpoint.
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight.data.copy_(self.model.embed_tokens.weight.data)
+
+
+EntryClass = [
+    Qwen3_5MoeForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    # Text-only entry (no vision tower / image processor) for the hybrid GDN
+    # backbone. arch name "Qwen3_5TextForCausalLM".
+    Qwen3_5TextForCausalLM,
+]
