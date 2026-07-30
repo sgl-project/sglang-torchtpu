@@ -1,6 +1,6 @@
 """Unit test for the native MXFP4 fused-MoE path.
 
-Verifies that running through ``process_gpt_oss_mxfp4_weights_native`` +
+Verifies that running through ``process_mxfp4_moe_weights_native`` +
 ``fused_moe_call`` (which unpacks FP4 + applies block scales inside the
 kernel) produces the same MoE output as running ``fused_moe_call``
 directly on the BF16-dequantized weights with no scales. Both should
@@ -224,16 +224,17 @@ class TestNativeMxfp4FusedMoE(unittest.TestCase):
         """Run the native MXFP4 fused MoE call (uint8 packed + fp32 scales)."""
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.quantization.mxfp4_tpu_util import (
-            process_gpt_oss_mxfp4_weights_native,
+            process_mxfp4_moe_weights_native,
         )
 
-        w13, w13_s, w13_b, w2, w2_s, w2_b = process_gpt_oss_mxfp4_weights_native(
+        w13, w13_s, w13_b, w2, w2_s, w2_b = process_mxfp4_moe_weights_native(
             layer["gate_up_proj_blocks"],
             layer["gate_up_proj_scales"],
             layer["gate_up_proj_bias"],
             layer["down_proj_blocks"],
             layer["down_proj_scales"],
             layer["down_proj_bias"],
+            w13_interleaved=True,
         )
         out = fused_moe_call(
             hidden_states=hs.to(self.device),
