@@ -87,7 +87,9 @@ PREFIX_REPEATS = int(E("PREFIX_REPEATS", "96"))
 MAX_NEW_TOKENS = int(E("MAX_NEW_TOKENS", "32"))
 MIN_CACHED_TOKENS = int(E("MIN_CACHED_TOKENS", "64"))
 MIN_ACCEPT_LENGTH = float(E("MIN_ACCEPT_LENGTH", "1.0"))
-ACCEPT_LENGTH_REF = E("ACCEPT_LENGTH_REF", "")  # empty => calibration (report-only)
+# v7x, tp=16 Llama-3.1-8B-Instruct + SpecForge EAGLE3, greedy, 2026-07-30.
+# Set ACCEPT_LENGTH_REF="" to fall back to calibration (report-only).
+ACCEPT_LENGTH_REF = E("ACCEPT_LENGTH_REF", "2.810")
 KEEP_UP = E("KEEP_UP", "0") == "1"
 
 RANK = int(E("NODE_RANK", E("TPU_WORKER_ID", "0")))
