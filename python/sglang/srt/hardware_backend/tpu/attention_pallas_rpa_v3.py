@@ -274,7 +274,18 @@ class TpuPallasRpaV3AttnBackend(AttentionBackend):
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the
         # wrapped JAX function. The forward path then just looks the op up.
-        self._op = _build_pallas_kernel_op()
+        # Built via ``_build_kernel_op`` so subclasses (e.g. the MLA backend)
+        # register their own kernel op here instead of building an unused RPA
+        # op and overwriting it afterwards.
+        self._op = self._build_kernel_op()
+
+    def _build_kernel_op(self):
+        """Build/register the Pallas kernel custom op stored as ``self._op``.
+
+        Overridable hook: MLA-style subclasses return a different kernel op so
+        the parent ``__init__`` never builds the RPA v3 op they don't call.
+        """
+        return _build_pallas_kernel_op()
 
     # ------------------------------------------------------------------ #
     # Metadata

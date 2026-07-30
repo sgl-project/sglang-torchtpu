@@ -553,6 +553,43 @@ class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     # ------------------------------------------------------------------ #
+    # CPU offload / restore — unsupported on the paged MLA layout
+    # ------------------------------------------------------------------ #
+
+    def get_cpu_copy(self, *args, **kwargs):
+        raise NotImplementedError(
+            "CPU offloading / HiCache is unsupported on the paged TPU fused MLA "
+            "layout: the base MLATokenToKVPool implementation indexes the KV "
+            "buffer by token id, which assumes the flat [size, 1, kv_cache_dim] "
+            "layout, not this pool's [num_pages, page_size // kv_packing, "
+            "kv_packing, dim] paged buffer. TODO: map token id -> (page, slot) "
+            "for the 4-D index before enabling offload with pallas_tpu_mla."
+        )
+
+    def load_cpu_copy(self, *args, **kwargs):
+        raise NotImplementedError(
+            "CPU offloading / HiCache is unsupported on the paged TPU fused MLA "
+            "layout (see TpuFusedMLATokenToKVPool.get_cpu_copy)."
+        )
+
+    def get_mla_kv_buffer(self, *args, **kwargs):
+        raise NotImplementedError(
+            "get_mla_kv_buffer is unsupported on the paged TPU fused MLA pool: "
+            "the base implementation both indexes the KV buffer by token id "
+            "(wrong for the paged layout) and calls a Triton kernel that is "
+            "unavailable on TPU."
+        )
+
+    def move_kv_cache(self, *args, **kwargs):
+        raise NotImplementedError(
+            "move_kv_cache is unsupported on the paged TPU fused MLA layout: the "
+            "base implementation relocates rows via token-id indexing "
+            "(kv_cache[loc]), which addresses the num_pages axis on this paged "
+            "buffer. TODO: map token id -> (page, slot) before enabling the "
+            "spec-decode accept path with pallas_tpu_mla."
+        )
+
+    # ------------------------------------------------------------------ #
     # Writes
     # ------------------------------------------------------------------ #
 

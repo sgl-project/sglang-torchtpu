@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 _PALLAS_MLA_OP = None
 
+_MLA_DECODE_BATCH_SIZE = 4
+
 
 def _build_pallas_mla_kernel_op():
     """Lazily register the MLA v2 kernel as a torch custom op.
@@ -103,7 +105,7 @@ def _build_pallas_mla_kernel_op():
             cu_kv_lens,
             distribution,
             sm_scale=sm_scale,
-            decode_batch_size=4,
+            decode_batch_size=_MLA_DECODE_BATCH_SIZE,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -179,10 +181,12 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
                 "fp8 KV cache is not supported by the pallas_tpu_mla backend "
                 "yet; run with --kv-cache-dtype auto (bf16)."
             )
-        # Replace the parent's RPA op with the MLA op (the attribute is only
-        # read by our _forward override, but keep the name distinct for
-        # clarity while both classes are in play).
-        self._mla_op = _build_pallas_mla_kernel_op()
+
+    def _build_kernel_op(self):
+        # Hook called by ``super().__init__()`` to populate ``self._op``. Both
+        # forward modes go through ``_forward_mla``, so register the MLA v2
+        # kernel op here — the parent never builds the unused RPA v3 op.
+        return _build_pallas_mla_kernel_op()
 
     # ------------------------------------------------------------------ #
     # Metadata
@@ -274,7 +278,7 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
 
         kv_cache = forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
-        out = self._mla_op(
+        out = self._op(
             ql_nope,
             q_pe,
             new_kv_c,
