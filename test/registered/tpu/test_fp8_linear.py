@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_linear import (
+    _pad_rows_to_scaled_mm_alignment,
     apply_tpu_fp8_linear,
     tpu_w8a8_block_fp8_linear,
 )
@@ -33,6 +34,27 @@ class TestTpuFp8Linear(CustomTestCase):
         set_global_server_args_for_scheduler(
             SimpleNamespace(tpu_fp8_runtime="blockwise")
         )
+
+    def test_row_padding_uses_one_dynamic_graph(self):
+        torch._dynamo.reset()
+        graphs = []
+
+        def backend(graph, _inputs):
+            graphs.append(graph)
+            return graph.forward
+
+        compiled = torch.compile(
+            _pad_rows_to_scaled_mm_alignment,
+            backend=backend,
+            fullgraph=True,
+            dynamic=False,
+        )
+        for rows, padded_rows in ((15, 16), (16, 16), (17, 32)):
+            value = torch.randn(rows, 8)
+            torch._dynamo.mark_dynamic(value, 0)
+            self.assertEqual(compiled(value).shape, (padded_rows, 8))
+
+        self.assertEqual(len(graphs), 1)
 
     def test_fp8_linear_runs_eager_and_compiled(self):
         device = torch.device("tpu")

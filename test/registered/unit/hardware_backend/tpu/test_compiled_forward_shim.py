@@ -376,6 +376,20 @@ class TestCompiledForwardShim(CustomTestCase):
         shim("ids", "pos", fb, "extra1", kw="extra2")
         compiled.assert_called_once_with("ids", "pos", fb, "extra1", kw="extra2")
 
+    def test_passes_extra_inputs_to_dynamic_marking(self):
+        compiled = MagicMock(return_value=SimpleNamespace())
+        policy = MagicMock()
+        policy.unpad_outputs.side_effect = lambda out, _forward_batch: out
+        shim = CompiledForwardShim(compiled, policy=policy)
+        fb = SimpleNamespace(is_prefill_only=False)
+        input_embeds = torch.zeros(4, 8)
+
+        shim("ids", "pos", fb, "extra", input_embeds=input_embeds)
+
+        policy.mark_dynamic_inputs.assert_called_once_with(
+            "ids", "pos", fb, "extra", input_embeds=input_embeds
+        )
+
     def test_preserves_compiled_signature_for_later_inspection(self):
         def forward(input_ids, positions, forward_batch, pp_proxy_tensors=None):
             pass

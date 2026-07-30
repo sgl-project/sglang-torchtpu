@@ -1,10 +1,10 @@
 """TPU "graph runner": orchestrates annotated torch.compile boundaries.
 
-Unlike CudaGraphRunner / NPUGraphRunner there is no graph capture or
-replay here — PJRT (libtpu) caches HLO compilations internally, keyed
-by tensor shape, so we get "compile once, dispatch by shape" behavior
-without an explicit capture step. This class exists so the
-torch.compile orchestration hangs off the same factory hook
+Unlike CudaGraphRunner / NPUGraphRunner there is no graph capture or replay
+step here. Decoder policies capture dynamic Dynamo/AOTAutograd graphs and
+dispatch padded runtime shapes to explicitly precompiled static TPU artifacts.
+Other annotated boundaries delegate compilation to their own policies. This
+class exists so the torch.compile orchestration hangs off the same factory hook
 (``current_platform.get_graph_runner_cls()``) as the in-tree runners,
 matching the pattern used by ``CPUGraphRunner`` which is also just a
 torch.compile wrapper.
@@ -109,14 +109,11 @@ class TpuGraphRunner:
             )
             return
 
-        # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph
-        # per distinct input shape, and the TPU backbone is hit with many: one
-        # per configured prefill token bucket plus the decode batch-size
-        # buckets. dynamo's default cache_size_limit=8 is far too low — under
-        # fullgraph=True it trips FailOnRecompileLimitHit (killing the
-        # scheduler) as soon as warmup or a multi-shape benchmark walks past
-        # ~8 shapes. Match the CUDA / CPU / piecewise graph runners, which all
-        # set 1024 (see cuda_graph_runner.set_torch_compile_config).
+        # Raise Dynamo's recompile ceiling. Shape-specialized decoders share
+        # graphs across buckets, but modes, keyword variants, and other
+        # annotated boundaries can still create multiple frontend graphs.
+        # Match the CUDA / CPU / piecewise graph runners, which all set 1024
+        # (see cuda_graph_runner.set_torch_compile_config).
         torch._dynamo.config.accumulated_cache_size_limit = 1024
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
@@ -233,12 +230,10 @@ class TpuGraphRunner:
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
 
-        PJRT/libtpu caches HLO compilations internally and dispatches
-        on tensor shape, so the compiled forward is reached through the
-        normal ``self.model.forward(...)`` call path, not through a
-        replay step. This method exists because ModelRunner.forward
-        gates the replay branch on
-        ``self.<decode|prefill>_cuda_graph_runner.can_run_graph(...)`` —
-        returning False keeps that branch off on TPU.
+        TPU compile policies dispatch their compiled artifacts through the
+        normal ``self.model.forward(...)`` call path, not through a replay
+        step. This method exists because ModelRunner.forward gates that branch
+        on ``self.<decode|prefill>_cuda_graph_runner.can_run_graph(...)`` —
+        returning False keeps it off on TPU.
         """
         return False

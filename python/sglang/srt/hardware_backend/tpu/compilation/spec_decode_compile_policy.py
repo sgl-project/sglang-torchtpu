@@ -7,9 +7,13 @@ from typing import Any
 
 import torch
 import tqdm
+from torch.fx.experimental import _config as symbolic_shapes_config
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.backend_shape_specialization import (
+    delay_aot_cache_writes,
+)
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
@@ -96,18 +100,21 @@ class SpecDecodeCompilePolicyMixin:
                 "(startup server warmup compiles draft shapes before readiness)."
             )
             return
-        # Run the base policy's own warmup first (base decoder EXTEND/DECODE, or a
-        # model-specific policy's variants when this mixin is composed over one),
-        # then layer the spec-only forward modes on top.
         super().precompile()
-        self._precompile_target_verify()
-        self._precompile_extend_full()
+        # Each spec mode shares one dynamic frontend graph across its buckets.
+        # Serialize those dispatchers only after every static artifact is added.
+        with (
+            symbolic_shapes_config.patch(backed_size_oblivious=True),
+            delay_aot_cache_writes(),
+        ):
+            self._precompile_target_verify()
+            self._precompile_extend_full()
 
     def _precompile_target_verify(self) -> None:
         """Compile TARGET_VERIFY across the batch-size buckets."""
         assert self.b_bucketer is not None
         draft_token_num = self.draft_token_num
-        bs_buckets = list(self.b_bucketer.buckets)
+        bs_buckets = list(reversed(self.b_bucketer.buckets))
         logger.info(
             "[spec compile policy] TARGET_VERIFY: %d shapes "
             "(bs=%s, draft_token_num=%d)",
@@ -152,7 +159,7 @@ class SpecDecodeCompilePolicyMixin:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        valid_shapes = [(t, bs) for t in reversed(self.t_bucketer.buckets) if t >= bs]
         logger.info(
             "[spec compile policy] EXTEND(FULL): %d shapes "
             "(bs=%d, token_buckets=%s)",

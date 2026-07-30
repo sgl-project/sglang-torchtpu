@@ -18,6 +18,9 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
+from sglang.srt.hardware_backend.tpu.compilation.backend_shape_specialization import (
+    shape_specialization_backend,
+)
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -134,6 +137,7 @@ class TestTpuGraphRunner(CustomTestCase):
             model=model,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
+            is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             server_args=server_args,
         )
@@ -161,11 +165,9 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
         self.mock_compile.assert_called_once()
         _, kwargs = self.mock_compile.call_args
-        # Pinned compile kwargs — these are correctness-critical for the
-        # TPU backend (dynamic=True triggers recompiles per shape;
-        # fullgraph=False allows torch.compile to fall back to eager on
-        # unsupported ops, which silently breaks the XLA pipeline).
-        self.assertEqual(kwargs["backend"], "tpu")
+        # Pinned compile kwargs: automatic dynamic shapes stay disabled because
+        # the policy marks its axes explicitly; fullgraph prevents eager fallback.
+        self.assertIs(kwargs["backend"], shape_specialization_backend)
         self.assertTrue(kwargs["fullgraph"])
         self.assertFalse(kwargs["dynamic"])
         self.mock_register.assert_called_once()
@@ -187,6 +189,9 @@ class TestTpuGraphRunner(CustomTestCase):
         model = _model_with(forward=original)
         model._can_torch_compile = False
         runner = self._runner_for(model)
+        runner.server_args.override = lambda _source, **kwargs: vars(
+            runner.server_args
+        ).update(kwargs)
         TpuGraphRunner(runner)
         # forward was not replaced; torch.compile and registration both skipped.
         self.assertIs(model.forward, original)
@@ -355,8 +360,8 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_can_run_is_always_false(self):
         # ModelRunner.forward branches on `graph_runner.can_run_graph(...)`
         # to decide whether to replay a captured graph. TPU has no
-        # captured graph (PJRT caches HLO internally), so this must
-        # be False for every forward mode so the replay path stays off.
+        # captured graph to replay, so this must be False for every forward
+        # mode and the normal compiled-forward path remains active.
         model = self._annotate(_model_with(forward=MagicMock()))
         runner = TpuGraphRunner(self._runner_for(model))
         self.assertFalse(runner.can_run_graph(MagicMock()))

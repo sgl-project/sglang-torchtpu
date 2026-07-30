@@ -505,6 +505,9 @@ class CompiledForwardShim:
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
         try:
+            self.policy.mark_dynamic_inputs(
+                input_ids, positions, forward_batch, *args, **kwargs
+            )
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only

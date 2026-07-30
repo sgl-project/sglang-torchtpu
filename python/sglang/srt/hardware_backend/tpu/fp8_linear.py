@@ -6,11 +6,9 @@
 import torch
 
 
-def _pad_rows_to_scaled_mm_alignment(x: torch.Tensor) -> tuple[torch.Tensor, int]:
+def _pad_rows_to_scaled_mm_alignment(x: torch.Tensor) -> torch.Tensor:
     pad = (16 - (x.shape[0] % 16)) % 16
-    if pad == 0:
-        return x, 0
-    return torch.nn.functional.pad(x, (0, 0, 0, pad)), pad
+    return torch.nn.functional.pad(x, (0, 0, 0, pad))
 
 
 def _quantize_activation_per_row(
@@ -60,7 +58,7 @@ def apply_tpu_fp8_linear(
     out_shape = (*x.shape[:-1], weight.shape[1])
     x_2d = x.reshape(-1, x.shape[-1])
     num_tokens = x_2d.shape[0]
-    x_2d, pad = _pad_rows_to_scaled_mm_alignment(x_2d)
+    x_2d = _pad_rows_to_scaled_mm_alignment(x_2d)
     x_q, x_scale = _quantize_activation_per_row(x_2d, weight.dtype)
 
     # TODO(torch_tpu#1820): pass rowwise x_scale and channelwise weight_scale
@@ -78,8 +76,7 @@ def apply_tpu_fp8_linear(
         out_dtype=torch.float32,
     )
     out = out * x_scale * weight_scale.reshape(1, -1).float()
-    if pad:
-        out = torch.narrow(out, 0, 0, num_tokens)
+    out = torch.narrow(out, 0, 0, num_tokens)
     out = out.to(x.dtype).reshape(out_shape)
     if bias is not None:
         out = out + bias

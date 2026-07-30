@@ -4,18 +4,17 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch.fx.experimental import _config as symbolic_shapes_config
 
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
-    _materialize_out,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     SpecDecodeCompilePolicyMixin,
@@ -81,6 +80,10 @@ def _run_cases(policy, mode):
         "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
         "get_tensor_model_parallel_rank",
         return_value=1,
+    ), patch(
+        "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+        "_get_hbm_usage_mb",
+        return_value=None,
     ):
         if mode == ForwardMode.EXTEND:
             policy._precompile_extend()
@@ -114,6 +117,38 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
             return_value=True,
         ), self.assertRaisesRegex(NotImplementedError, "does not support DP attention"):
             policy.install()
+
+    def test_marks_direct_embedding_inputs_dynamic(self):
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        policy.shape_specialization = True
+        forward_batch = MagicMock()
+        input_embeds = torch.zeros(8, 16)
+        input_deepstack_embeds = torch.zeros(8, 48)
+
+        with patch.object(
+            DecoderTpuCompilePolicy, "mark_dynamic_inputs"
+        ) as mark_base, patch("torch._dynamo.mark_dynamic") as mark_dynamic:
+            policy.mark_dynamic_inputs(
+                None,
+                None,
+                forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=input_deepstack_embeds,
+            )
+
+        mark_base.assert_called_once_with(
+            None,
+            None,
+            forward_batch,
+            input_embeds=input_embeds,
+            input_deepstack_embeds=input_deepstack_embeds,
+        )
+        self.assertEqual(mark_dynamic.call_count, 2)
+        self.assertIs(mark_dynamic.call_args_list[0].args[0], input_embeds)
+        self.assertIs(mark_dynamic.call_args_list[1].args[0], input_deepstack_embeds)
+        self.assertEqual(
+            [item.args[1] for item in mark_dynamic.call_args_list], [0, 0]
+        )
 
     def test_restores_extend_metadata_before_logits_processing(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
@@ -234,7 +269,7 @@ class TestPrecompileLoops(CustomTestCase):
         self.assertEqual(mr.model.forward.call_count, 3)
         self.assertEqual(
             mr.attn_backend.calls,
-            [(8, 4), (64, 4), (256, 4)],
+            [(256, 4), (64, 4), (8, 4)],
         )
 
     def test_extend_skips_token_bucket_below_bs(self):
@@ -261,7 +296,7 @@ class TestPrecompileLoops(CustomTestCase):
         _run_cases(policy, ForwardMode.DECODE)
         self.assertEqual(mr.model.forward.call_count, 3)
         # Decode: tokens == bs for each call.
-        self.assertEqual(mr.attn_backend.calls, [(1, 1), (4, 4), (8, 8)])
+        self.assertEqual(mr.attn_backend.calls, [(8, 8), (4, 4), (1, 1)])
 
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
@@ -270,10 +305,32 @@ class TestPrecompileLoops(CustomTestCase):
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
             "get_tensor_model_parallel_rank",
             return_value=1,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "_get_hbm_usage_mb",
+            return_value=None,
         ):
             policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
+
+    def test_shape_config_is_scoped_to_precompile(self):
+        policy = _make_policy()
+        policy.shape_specialization = True
+        observed = []
+
+        def record_config():
+            observed.append(symbolic_shapes_config.backed_size_oblivious)
+
+        with (
+            symbolic_shapes_config.patch(backed_size_oblivious=False),
+            patch.object(policy, "_precompile_extend", side_effect=record_config),
+            patch.object(policy, "_precompile_decode", side_effect=record_config),
+        ):
+            policy.precompile()
+            self.assertFalse(symbolic_shapes_config.backed_size_oblivious)
+
+        self.assertEqual(observed, [True, True])
 
 
 class TestRunOneCallsCompiledForward(CustomTestCase):
@@ -311,49 +368,6 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         no_grad.assert_called_once_with()
         cm.__enter__.assert_called_once()
-
-    def test_materialize_out_syncs_logits_and_flagged_kv_side_effects(self):
-        logits = torch.zeros(1)
-        kv0 = torch.ones(1)
-        kv1 = torch.ones(1) * 2
-        pool = SimpleNamespace(
-            start_layer=2,
-            layer_num=2,
-            get_fused_kv_buffer=MagicMock(side_effect=[kv0, kv1]),
-        )
-        forward_batch = SimpleNamespace(
-            attn_backend=SimpleNamespace(requires_kv_sync_after_compile=True),
-            token_to_kv_pool=pool,
-        )
-        # torch_tpu isn't installed on the CPU runners this suite targets; stub
-        # the module tree so _materialize_out's
-        # `from torch_tpu._internal.sync.sync import synchronize` resolves and is
-        # patchable (patch.dict also overrides a real torch_tpu on a TPU host).
-        tt = ModuleType("torch_tpu")
-        tt._internal = ModuleType("torch_tpu._internal")
-        tt._internal.sync = ModuleType("torch_tpu._internal.sync")
-        tt._internal.sync.sync = ModuleType("torch_tpu._internal.sync.sync")
-        tt._internal.sync.sync.synchronize = MagicMock()
-        stubs = {
-            "torch_tpu": tt,
-            "torch_tpu._internal": tt._internal,
-            "torch_tpu._internal.sync": tt._internal.sync,
-            "torch_tpu._internal.sync.sync": tt._internal.sync.sync,
-        }
-        with patch.dict(sys.modules, stubs), patch(
-            "torch_tpu._internal.sync.sync.synchronize"
-        ) as sync:
-            _materialize_out(
-                SimpleNamespace(next_token_logits=logits),
-                forward_batch.attn_backend,
-                forward_batch.token_to_kv_pool,
-            )
-        sync.assert_called_once()
-        tensors, kwargs = sync.call_args
-        self.assertEqual(tensors[0], [logits, kv0, kv1])
-        self.assertEqual(kwargs, {"wait": True})
-        self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
-        self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
 
 
 def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
@@ -413,6 +427,14 @@ class TestSpecPrecompileLoops(CustomTestCase):
             "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
             "get_tensor_model_parallel_rank",
             return_value=1,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "_get_hbm_usage_mb",
+            return_value=None,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
+            "_get_hbm_usage_mb",
+            return_value=None,
         ):
             policy.precompile()
         # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2

@@ -34,7 +34,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
+from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip, is_tpu
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
@@ -437,6 +438,10 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
         and get_global_server_args().cuda_graph_config.prefill.tc_compiler == "inductor"
     ):
         return x.view(*x.shape[:-1], -1, head_dim)
+    if _is_tpu and get_global_server_args().enable_torch_compile:
+        # QKV splits are non-contiguous except when a leading dimension is 1.
+        # Always copying gives Dynamo one reshape graph for every batch size.
+        return x.clone(memory_format=torch.contiguous_format).view(-1, head_dim)
     return x.reshape(-1, head_dim)
 
 

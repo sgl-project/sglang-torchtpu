@@ -8,10 +8,18 @@ from typing import Any, Callable, Optional
 
 import torch
 import tqdm
+from torch.fx.experimental import _config as symbolic_shapes_config
 
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.backend_shape_specialization import (
+    _DoneCompiling,
+    _compile_context,
+    delay_aot_cache_writes,
+    mark_dynamic_size,
+    shape_specialization_backend,
+)
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
@@ -39,32 +47,6 @@ _COMPILE_BAR_FORMAT = (
     "{desc}: {percentage:3.0f}% Completed | "
     "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
 )
-
-
-def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
-    """Sync returned tensors and backend-marked KV side effects.
-
-    attn_backend / token_to_kv_pool come from the model_runner: upstream moved
-    both off ForwardBatch (attn_backend now flows through ForwardContext, and the
-    KV pool is held by the attention backend / model_runner), so warmup reads them
-    from the runner rather than the batch.
-    """
-    tensors: list[torch.Tensor] = []
-
-    next_token_logits = getattr(out, "next_token_logits", None)
-    if isinstance(next_token_logits, torch.Tensor):
-        tensors.append(next_token_logits)
-
-    if getattr(attn_backend, "requires_kv_sync_after_compile", False):
-        pool = token_to_kv_pool
-        for layer_id in range(pool.start_layer, pool.start_layer + pool.layer_num):
-            tensors.append(pool.get_fused_kv_buffer(layer_id))
-
-    if not tensors:
-        return
-    from torch_tpu._internal.sync.sync import synchronize as tpu_sync
-
-    tpu_sync(tensors, wait=True)
 
 
 def _get_hbm_usage_mb() -> Optional[tuple[float, float]]:
@@ -140,6 +122,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
         self._logged_vl_warmup_variants: set[str] = set()
+        self.shape_specialization = False
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
@@ -162,11 +145,19 @@ class DecoderTpuCompilePolicy(CompilePolicy):
 
         signature = inspect.signature(fn)
         backend = self.backend or current_platform.get_compile_backend()
+        compile_dynamic = self.dynamic
+        self.shape_specialization = not self.model_runner.is_draft_worker
+        if self.shape_specialization:
+            backend = shape_specialization_backend
+            # Only dimensions explicitly marked by the compiled-forward shim
+            # become symbolic. Disable Dynamo's automatic dynamic shapes for
+            # unrelated axes and Python integers.
+            compile_dynamic = False
         compiled = torch.compile(
             torch.no_grad()(fn),
             backend=backend,
             fullgraph=self.fullgraph,
-            dynamic=self.dynamic,
+            dynamic=compile_dynamic,
         )
         compiled.__signature__ = signature
         setattr(self.owner, self.method_name, compiled)
@@ -279,12 +270,123 @@ class DecoderTpuCompilePolicy(CompilePolicy):
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
-        self._precompile_extend()
-        self._precompile_decode()
+        if self.shape_specialization:
+            # Preserve size-one symbols only while capturing specialization
+            # graphs. Cache writes must include every warmed static artifact.
+            with (
+                symbolic_shapes_config.patch(backed_size_oblivious=True),
+                delay_aot_cache_writes(),
+            ):
+                self._precompile_extend()
+                self._precompile_decode()
+        else:
+            self._precompile_extend()
+            self._precompile_decode()
+
         logger.info(
             "[decoder compile policy] precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
+
+    def mark_dynamic_inputs(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: ForwardBatch,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        """Mark decoder axes as dynamic for Dynamo dynamic-shape graph capture."""
+        if not self.shape_specialization:
+            return
+
+        current_num_tokens = forward_batch.input_ids.shape[0]
+        current_bs = forward_batch.seq_lens.shape[0]
+
+        token_axes = [
+            (input_ids, 0),
+            (forward_batch.input_ids, 0),
+            (forward_batch.out_cache_loc, 0),
+            (getattr(forward_batch, "mm_input_embeds", None), 0),
+        ]
+        position_tensors = (
+            positions,
+            forward_batch.positions,
+            getattr(forward_batch, "mrope_positions", None),
+        )
+        # Text positions are [num_tokens]; MRoPE positions are [3, num_tokens].
+        token_axes.extend(
+            (tensor, tensor.ndim - 1)
+            for tensor in position_tensors
+            if isinstance(tensor, torch.Tensor)
+        )
+        hidden_states = getattr(forward_batch.spec_info, "hidden_states", None)
+        if isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] in (
+            current_num_tokens,
+            current_bs,
+        ):
+            # A hidden-state axis may mean either size when num_tokens == bs.
+            torch._dynamo.mark_dynamic(hidden_states, 0)
+        for tensor, dim in token_axes:
+            if isinstance(tensor, torch.Tensor):
+                torch._dynamo.mark_dynamic(tensor, dim)
+        token_size_source = next(
+            (
+                (tensor, tensor.ndim - 1)
+                for tensor in position_tensors
+                if isinstance(tensor, torch.Tensor)
+            ),
+            None,
+        )
+        if token_size_source is None:
+            token_size_source = next(
+                (
+                    (tensor, dim)
+                    for tensor, dim in token_axes
+                    if isinstance(tensor, torch.Tensor)
+                ),
+                None,
+            )
+        if token_size_source is not None:
+            mark_dynamic_size(*token_size_source, "num_tokens")
+
+        batch_axes = [
+            (getattr(forward_batch, field, None), 0)
+            for field in (
+                "seq_lens",
+                "orig_seq_lens",
+                "req_pool_indices",
+                "req_pool_indices_cpu",
+                "extend_seq_lens",
+                "extend_prefix_lens",
+                "extend_start_loc",
+                "encoder_lens",
+            )
+        ]
+        metadata = self.model_runner.attn_backend.forward_metadata
+        kv_lens = getattr(metadata, "kv_lens", None)
+        if metadata is not None:
+            batch_axes.append((kv_lens, 0))
+        for tensor, dim in batch_axes:
+            if isinstance(tensor, torch.Tensor):
+                torch._dynamo.mark_dynamic(tensor, dim)
+        batch_size_source = (
+            kv_lens if isinstance(kv_lens, torch.Tensor) else forward_batch.seq_lens
+        )
+        mark_dynamic_size(batch_size_source, 0, "bs")
+        if metadata is None:
+            return
+
+        cu_lens = [
+            (getattr(metadata, field, None), 0) for field in ("cu_q_lens", "cu_kv_lens")
+        ]
+        for tensor, dim in cu_lens:
+            if isinstance(tensor, torch.Tensor):
+                torch._dynamo.mark_dynamic(tensor, dim)
+        for field in ("page_indices", "swa_page_indices"):
+            tensor = getattr(metadata, field, None)
+            if isinstance(tensor, torch.Tensor) and tensor.shape[0] > 0:
+                torch._dynamo.mark_dynamic(tensor, 0)
 
     def _precompile_extend(self) -> None:
         """Compile extend at each token bucket and the fixed batch cap."""
@@ -292,7 +394,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         assert self.b_bucketer is not None
 
         bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        valid_shapes = [(t, bs) for t in reversed(self.t_bucketer.buckets) if t >= bs]
         if not valid_shapes:
             raise ValueError(
                 "No TPU extend compile shapes are valid: token buckets "
@@ -332,7 +434,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         """Compile decode mode: vary batch size (tokens == batch size)."""
         assert self.b_bucketer is not None
 
-        bs_buckets = list(self.b_bucketer.buckets)
+        bs_buckets = list(reversed(self.b_bucketer.buckets))
         logger.info(
             "[decoder compile policy] DECODE: %d shapes (bs=%s)",
             len(bs_buckets),
@@ -389,7 +491,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Any | None = None,
     ) -> None:
-        """Build and execute one dummy forward pass for compilation."""
+        """Build inputs and compile one static shape without executing it."""
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
             bs=bs,
@@ -423,12 +525,24 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ), torch.no_grad():
-            out = self.owner.forward(*args, **kwargs)
-            # Materialize lazy outputs and backend-marked side effects.
-            _materialize_out(
-                out,
-                self.model_runner.attn_backend,
-                self.model_runner.token_to_kv_pool,
+            if not self.shape_specialization:
+                self.owner.forward(*args, **kwargs)
+                return
+
+            token = _compile_context.set(
+                {
+                    "num_tokens": int(forward_batch.input_ids.shape[0]),
+                    "bs": int(forward_batch.seq_lens.shape[0]),
+                }
+            )
+            try:
+                self.owner.forward(*args, **kwargs)
+            except _DoneCompiling:
+                return
+            finally:
+                _compile_context.reset(token)
+            raise RuntimeError(
+                "Shape-specialization warmup unexpectedly executed an artifact"
             )
 
     def unpad_outputs(self, out: Any, forward_batch: Any) -> Any:
@@ -576,6 +690,31 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             )
         return super().install()
 
+    def mark_dynamic_inputs(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: ForwardBatch,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Also mark token axes passed directly to the VL decoder."""
+        super().mark_dynamic_inputs(
+            input_ids, positions, forward_batch, *args, **kwargs
+        )
+        if not self.shape_specialization:
+            return
+
+        # These follow the three required decoder arguments in Qwen3-VL's
+        # forward signature, but callers may supply either one by keyword.
+        input_embeds = kwargs.get("input_embeds", args[0] if args else None)
+        input_deepstack_embeds = kwargs.get(
+            "input_deepstack_embeds", args[2] if len(args) > 2 else None
+        )
+        for tensor in (input_embeds, input_deepstack_embeds):
+            if isinstance(tensor, torch.Tensor):
+                torch._dynamo.mark_dynamic(tensor, 0)
+
     @property
     def _num_deepstack(self) -> int:
         model = getattr(self.model_runner, "model", None)
@@ -623,7 +762,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         assert self.b_bucketer is not None
 
         bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        valid_shapes = [(t, bs) for t in reversed(self.t_bucketer.buckets) if t >= bs]
         if not valid_shapes:
             raise ValueError(
                 "No TPU extend compile shapes are valid: token buckets "
@@ -681,7 +820,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         assert self.b_bucketer is not None
 
-        bs_buckets = list(self.b_bucketer.buckets)
+        bs_buckets = list(reversed(self.b_bucketer.buckets))
         logger.info(
             "[decoder compile policy] VL DECODE: %d shapes (bs=%s)",
             len(bs_buckets),
