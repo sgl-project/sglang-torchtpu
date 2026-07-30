@@ -307,6 +307,16 @@ class TestPrecompileLoops(CustomTestCase):
             mr.attn_backend.calls,
             [(16, 16), (64, 16), (128, 16), (64, 64), (128, 64)],
         )
+        self.assertEqual(
+            [call.args[2].forward_mode for call in mr.model.forward.call_args_list],
+            [
+                ForwardMode.EXTEND,
+                ForwardMode.EXTEND,
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.MIXED,
+            ],
+        )
 
     def test_qwen3_vl_extend_uses_configured_prefill_cap(self):
         mr = _model_runner()
