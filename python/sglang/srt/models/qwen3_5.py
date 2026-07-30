@@ -57,12 +57,12 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -168,6 +168,8 @@ if _is_tpu:
     from sglang.srt.layers.attention.native_torch.layernorm_gated import RMSNormGated
 else:
     from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -2205,6 +2207,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
+
 # TODO: Remove this class entrypoint
 # This class is temporary text-only qwen3_5 class which is for
 # splitting the qwen3_5 on TPU into text-only and text + vision
@@ -2260,9 +2263,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds
-        )
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         # The backbone returns a bare tensor normally, but a
         # (hidden_states, aux_hidden_states) tuple when aux/EAGLE capture is on.
         # Spec/EAGLE is rejected up the stack today, but unpack defensively so a

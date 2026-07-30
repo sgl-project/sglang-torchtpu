@@ -248,8 +248,7 @@ class StateBufferedRef(BaseBufferedRef):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size = jnp.where(should_read, 1, 0)
 
@@ -271,8 +270,7 @@ class StateBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
@@ -332,12 +330,12 @@ def create_allocs(
     recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[
-        InBufferedRef,
-        InBufferedRef,
-        InBufferedRef,
-        StateBufferedRef,
-        StateBufferedRef,
-        OutBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    StateBufferedRef,
+    StateBufferedRef,
+    OutBufferedRef,
 ]:
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -356,13 +354,12 @@ def create_allocs(
         cfg.v_head_dim,
     )
 
-    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers,
-                                use_lookahead=False)
+    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
 
     block_spec_partial = functools.partial(
         pl.BlockSpec,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
+        index_map=lambda i: (i,),
         pipeline_mode=pipeline_mode,
     )
 
@@ -397,9 +394,9 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    conv_alloc = state_buffered_partial(spec=conv_spec,
-                                        dtype_or_type=conv_state_ref)
-    recurrent_alloc = state_buffered_partial(spec=recurrent_spec,
-                                             dtype_or_type=recurrent_state_ref)
+    conv_alloc = state_buffered_partial(spec=conv_spec, dtype_or_type=conv_state_ref)
+    recurrent_alloc = state_buffered_partial(
+        spec=recurrent_spec, dtype_or_type=recurrent_state_ref
+    )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

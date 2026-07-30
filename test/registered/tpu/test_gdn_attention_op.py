@@ -106,13 +106,24 @@ class TestGDNAttentionOp(CustomTestCase):
 
         # Reference: run the JAX kernel directly.
         (conv_ref, rec_ref), out_ref = fused_conv1d_gdn(
-            jnp.asarray(qkv), jnp.asarray(b), jnp.asarray(a),
-            jnp.asarray(conv_state), jnp.asarray(recurrent_state),
-            jnp.asarray(conv_weight), jnp.asarray(conv_bias),
-            jnp.asarray(a_log), jnp.asarray(dt_bias),
-            jnp.asarray(query_start_loc), jnp.asarray(state_indices),
-            jnp.asarray(distribution_np), jnp.asarray(seq_lens),
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=K,
+            jnp.asarray(qkv),
+            jnp.asarray(b),
+            jnp.asarray(a),
+            jnp.asarray(conv_state),
+            jnp.asarray(recurrent_state),
+            jnp.asarray(conv_weight),
+            jnp.asarray(conv_bias),
+            jnp.asarray(a_log),
+            jnp.asarray(dt_bias),
+            jnp.asarray(query_start_loc),
+            jnp.asarray(state_indices),
+            jnp.asarray(distribution_np),
+            jnp.asarray(seq_lens),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=K,
         )
 
         # Bridge: run the torch custom op on TPU tensors.
@@ -125,22 +136,36 @@ class TestGDNAttentionOp(CustomTestCase):
         conv_t = tt(conv_state)
         rec_t = tt(recurrent_state)
         out_t = op(
-            tt(qkv), tt(b), tt(a), conv_t, rec_t, tt(conv_weight),
-            tt(conv_bias), tt(a_log), tt(dt_bias),
+            tt(qkv),
+            tt(b),
+            tt(a),
+            conv_t,
+            rec_t,
+            tt(conv_weight),
+            tt(conv_bias),
+            tt(a_log),
+            tt(dt_bias),
             torch.from_numpy(query_start_loc).to(dev),
             torch.from_numpy(state_indices).to(dev),
             torch.from_numpy(distribution_np).to(dev),
             torch.from_numpy(seq_lens).to(dev),
-            n_kq, n_v, d_k, d_v, K,
+            n_kq,
+            n_v,
+            d_k,
+            d_v,
+            K,
         )
 
         np.testing.assert_allclose(
-            out_t.cpu().numpy(), np.asarray(out_ref), rtol=2e-2, atol=2e-2)
+            out_t.cpu().numpy(), np.asarray(out_ref), rtol=2e-2, atol=2e-2
+        )
         # conv_state / recurrent_state were donated + aliased => mutated.
         np.testing.assert_allclose(
-            conv_t.cpu().numpy(), np.asarray(conv_ref), rtol=2e-2, atol=2e-2)
+            conv_t.cpu().numpy(), np.asarray(conv_ref), rtol=2e-2, atol=2e-2
+        )
         np.testing.assert_allclose(
-            rec_t.cpu().numpy(), np.asarray(rec_ref), rtol=2e-2, atol=2e-2)
+            rec_t.cpu().numpy(), np.asarray(rec_ref), rtol=2e-2, atol=2e-2
+        )
 
 
 if __name__ == "__main__":

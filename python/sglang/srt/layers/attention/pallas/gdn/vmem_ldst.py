@@ -25,8 +25,8 @@ from sglang.srt.layers.attention.pallas.gdn import config, memory_ref
 
 
 def load_as_qkv_large(
-        qkv_vmem_ref: jax.Ref,
-        cfgs: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    qkv_vmem_ref: jax.Ref, cfgs: config.GDNConfig
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Split qkv and transpose by performing 1 load per chunk for large layout.
 
     Args:
@@ -78,8 +78,8 @@ def load_as_qkv_large(
 
 
 def load_as_qkv_compact(
-        qkv_vmem_ref: jax.Ref,
-        cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    qkv_vmem_ref: jax.Ref, cfg: config.GDNConfig
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Split qkv and transpose by performing 1 load per head for compact layout.
 
     Args:
@@ -126,7 +126,7 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     assert vmem_ref.dtype.itemsize == 4
     assert vmem_ref.shape[-2] == 1
     col_size = vmem_ref.shape[-1]
-    new_shape = vmem_ref.shape[:-2] + (col_size, )
+    new_shape = vmem_ref.shape[:-2] + (col_size,)
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
 
@@ -192,18 +192,16 @@ def load_and_select_states(
 
         if carry_conv_scratch_ref is not None:
             prev_tile_conv = carry_conv_scratch_ref[idx]
-            prev_conv_state = jnp.where(is_first_tile, prev_conv_state,
-                                        prev_tile_conv)
+            prev_conv_state = jnp.where(is_first_tile, prev_conv_state, prev_tile_conv)
 
         hbm_recurrent_state = recurrent_slot_ref[idx]
-        prev_recurrent_state = jnp.where(has_initial_state,
-                                         hbm_recurrent_state, 0)
+        prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
 
         if carry_recurrent_scratch_ref is not None:
             prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
-            prev_recurrent_state = jnp.where(is_first_tile,
-                                             prev_recurrent_state,
-                                             prev_tile_recurrent_scratch)
+            prev_recurrent_state = jnp.where(
+                is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
+            )
 
         real_sizes_list.append(real_sizes)
         prev_conv_state_list.append(prev_conv_state)
@@ -247,8 +245,7 @@ def load_activation_as_large(
     k_large_list = []
     v_large_list = []
     for idx in range(cfgs.seq_tile_size):
-        q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx],
-                                                      cfgs)
+        q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx], cfgs)
         q_large_list.append(q_large)
         k_large_list.append(k_large)
         v_large_list.append(v_large)
