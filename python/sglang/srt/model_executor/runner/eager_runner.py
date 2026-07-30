@@ -57,6 +57,58 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_tpu = is_tpu()
 
+
+def _reset_cp_v2_state(forward_batch: ForwardBatch) -> None:
+    """Clear all CP-v2 mirrors on a ForwardBatch that isn't CP-v2 active.
+
+    ForwardBatch instances are pooled/reused across forwards; leaving stale
+    CP-v2 mirrors here (msgspec metadata + plain-scalar Dynamo-safe copies)
+    lets the next non-CP forward wrongly enter the ``moe_cp_allgather``
+    branch or the PCP attention dispatch. All 6 fields must be reset — the
+    2 msgspec/optional objects PLUS the 4 plain-scalar defaults.
+    """
+    forward_batch.attn_cp_metadata = None
+    forward_batch.pcp_layout_plan = None
+    forward_batch.pcp_attn_active = False
+    forward_batch.moe_cp_active = False
+    forward_batch.moe_cp_pad_max_tokens = 0
+    forward_batch.moe_cp_local_tokens = 0
+
+
+def _pcp_dump_hs_slot0(*, tag: str, hidden_states: Any) -> None:
+    """Diagnostic hook — call after CP-v2 model.model() and before cp_gather.
+
+    Delegates to :func:`sglang.srt.hardware_backend.tpu.pcp_debug.
+    log_hidden_states_slot0`. No-op unless ``SGLANG_TPU_PCP_DUMP_HS=1``. The
+    import is lazy so non-TPU platforms don't pull in torch_tpu bindings.
+    """
+    try:
+        from sglang.srt.hardware_backend.tpu import pcp_debug
+    except ImportError:
+        return
+    if not pcp_debug.dump_hs_active():
+        return
+    if not isinstance(hidden_states, torch.Tensor):
+        return
+    pcp_debug.log_hidden_states_slot0(tag=tag, hidden_states=hidden_states)
+
+
+def _pcp_dump_kv_slot0(*, model_runner: Any, forward_batch: Any) -> None:
+    """Diagnostic hook — dump per-rank layer-0 KV cache values at slot 0's
+    paged location after a forward completes. No-op unless the env is set.
+    """
+    try:
+        from sglang.srt.hardware_backend.tpu import pcp_debug
+    except ImportError:
+        return
+    if not pcp_debug.dump_kv_slot_active():
+        return
+    pcp_debug.log_kv_slot0(
+        token_to_kv_pool=model_runner.token_to_kv_pool,
+        forward_batch=forward_batch,
+    )
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -242,6 +294,27 @@ class EagerRunner(BaseRunner):
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
+        # PCP streaming shards KV by page (i % cp == rank), so a non-CP decode
+        # forward would only see 1/cp_size of the cache — must route through
+        # the CP split/gather even at decode. Other CP-v2 strategies
+        # (Zigzag/Interleave) reject decode via ``is_cp_v2_active`` and fall
+        # through to the plain model.forward path below.
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        forward_positions = forward_batch.positions
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+            embed_layer = model_runner.model.get_input_embeddings()
+            complete_hidden_states = embed_layer(forward_batch.input_ids)
+            sharded_hidden_states, sharded_positions = cp_split_before_forward(
+                complete_hidden_states,
+                forward_batch.positions,
+                forward_batch,
+            )
+            kwargs["input_embeds"] = sharded_hidden_states
+            forward_positions = sharded_positions
+        else:
+            _reset_cp_v2_state(forward_batch)
+
         ctx = (
             model_runner.device_timer.wrap(metadata={"category": "decode"})
             if model_runner.device_timer
@@ -249,6 +322,50 @@ class EagerRunner(BaseRunner):
         )
 
         with ctx, pdmux_ctx:
+            if cp_v2_active:
+                _pcp_dump_hs_slot0(
+                    tag="pre_model", hidden_states=kwargs.get("input_embeds")
+                )
+                hidden_states = model_runner.model.model(
+                    forward_batch.input_ids,
+                    forward_positions,
+                    forward_batch,
+                    input_embeds=kwargs.get("input_embeds"),
+                    pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
+                )
+                aux_hidden_states = None
+                capture_aux_hidden_states = getattr(
+                    model_runner.model, "capture_aux_hidden_states", False
+                )
+                if capture_aux_hidden_states:
+                    hidden_states, aux_hidden_states = hidden_states
+                _pcp_dump_hs_slot0(tag="post_model", hidden_states=hidden_states)
+                _pcp_dump_kv_slot0(
+                    model_runner=model_runner, forward_batch=forward_batch
+                )
+                if model_runner.model.pp_group.is_last_rank:
+                    gather_stream = (
+                        torch.cuda.current_stream()
+                        if torch.cuda.is_available()
+                        else None
+                    )
+                    hidden_states = cp_gather_after_forward(
+                        hidden_states,
+                        forward_batch,
+                        gather_stream,
+                    )
+                    _pcp_dump_hs_slot0(tag="post_gather", hidden_states=hidden_states)
+                    ret = model_runner.model.logits_processor(
+                        forward_batch.input_ids,
+                        hidden_states,
+                        model_runner.model.lm_head,
+                        forward_batch,
+                        aux_hidden_states,
+                    )
+                    return model_runner.compile_policy.unpad_outputs(ret, forward_batch)
+                if capture_aux_hidden_states:
+                    return hidden_states, aux_hidden_states
+                return hidden_states
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -307,7 +424,7 @@ class EagerRunner(BaseRunner):
             kwargs["input_embeds"] = sharded_hidden_states
             forward_positions = sharded_positions
         else:
-            forward_batch.attn_cp_metadata = None
+            _reset_cp_v2_state(forward_batch)
 
         category = (
             "target_verify"
@@ -347,6 +464,9 @@ class EagerRunner(BaseRunner):
                         **kwargs,
                     )
             elif cp_v2_active:
+                _pcp_dump_hs_slot0(
+                    tag="pre_model", hidden_states=kwargs.get("input_embeds")
+                )
                 # CP-V2: drive .model directly to gather across CP ranks before logits.
                 hidden_states = model_runner.model.model(
                     forward_batch.input_ids,
@@ -361,12 +481,26 @@ class EagerRunner(BaseRunner):
                 )
                 if capture_aux_hidden_states:
                     hidden_states, aux_hidden_states = hidden_states
+                _pcp_dump_hs_slot0(tag="post_model", hidden_states=hidden_states)
+                _pcp_dump_kv_slot0(
+                    model_runner=model_runner, forward_batch=forward_batch
+                )
                 if model_runner.model.pp_group.is_last_rank:
+                    # Non-CUDA backends (TPU/PCP) raise from
+                    # ``torch.cuda.current_stream()`` because CUDA isn't
+                    # compiled in; the strategy either uses the stream
+                    # (Zigzag/Interleave on CUDA) or ignores it (PCP).
+                    gather_stream = (
+                        torch.cuda.current_stream()
+                        if torch.cuda.is_available()
+                        else None
+                    )
                     hidden_states = cp_gather_after_forward(
                         hidden_states,
                         forward_batch,
-                        torch.cuda.current_stream(),
+                        gather_stream,
                     )
+                    _pcp_dump_hs_slot0(tag="post_gather", hidden_states=hidden_states)
                     ret = model_runner.model.logits_processor(
                         forward_batch.input_ids,
                         hidden_states,
@@ -374,6 +508,11 @@ class EagerRunner(BaseRunner):
                         forward_batch,
                         aux_hidden_states,
                     )
+                    # Compile shim's pad-slice: without this, padded ghost
+                    # slots leak into the sampler / future_map on the next
+                    # concurrent batch (IndexError on N>1 batches). No-op
+                    # if no compile policy is installed.
+                    ret = model_runner.compile_policy.unpad_outputs(ret, forward_batch)
                 elif capture_aux_hidden_states:
                     ret = hidden_states, aux_hidden_states
                 else:
@@ -399,6 +538,13 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
+
+        # Idle forwards are never CP-v2 (no attention over KV). Clear the
+        # CP-v2 plain-scalar mirrors so a stale ``pcp_attn_active=True`` /
+        # ``moe_cp_active=True`` from a prior CP-v2 forward doesn't leak
+        # into the compiled model.forward (which would re-enter _forward_pcp
+        # without a valid pcp_op / layout plan).
+        _reset_cp_v2_state(forward_batch)
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         ctx = (

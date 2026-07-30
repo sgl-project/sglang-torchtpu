@@ -1224,7 +1224,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # Early return on empty tensor is safe for MOE_CP because:
         # - During CP extend: zigzag split guarantees all CP ranks have non-zero tokens,
         #   so no rank hits this path while others proceed to the allgather.
-        # - During decode: moe_cp allgather is skipped (guarded by is_context_parallel_extend).
+        # - During decode: Zigzag/Interleave skip (they only apply to extend); PCP
+        #   allgathers at decode too, but pads to a non-zero per-rank count via
+        #   ``local_padded_num_tokens`` so no rank enters with shape[0] == 0.
         # - CUDA graph warmup: not applicable when --disable-piecewise-cuda-graph is used.
         if hidden_states.shape[0] == 0:
             return hidden_states, residual
@@ -1242,27 +1244,49 @@ class CommunicateWithAllReduceAndLayerNormFn:
         )
 
         # Step 2: moe_cp allgather — gather across cp_per_moe CP ranks.
-        # Only active during prefill (context-parallel extend); decode keeps existing path.
+        # PCP fires this at BOTH prefill and decode (hidden states are always
+        # rank-major-sharded under PCP so MoE routing needs the full width);
+        # Zigzag/Interleave gate to prefill only via ``moe_cp_active``.
         moe_cp_size = get_moe_cp_size()
+        # Prefer the plain-int ``moe_cp_pad_max_tokens`` populated by the CP-v2
+        # strategy in eager (see :func:`sglang.srt.layers.cp.utils._build_pcp_layout_plan`).
+        # Reading ``forward_batch.attn_cp_metadata.per_rank_actual_token`` — a
+        # msgspec.Struct field — inside the compiled forward silently corrupts
+        # the trace on torch_tpu (M5 investigation: wrong output tokens under
+        # support_torch_compile(Qwen3MoeModel) on the PCP path). The plain-int
+        # attribute is Dynamo-safe.
+        max_tokens_pad = forward_batch.moe_cp_pad_max_tokens
+        moe_cp_active = forward_batch.moe_cp_active
+        # Zigzag/Interleave strategies don't populate the plain-int mirror;
+        # fall back to the msgspec read but ONLY in eager (msgspec attribute
+        # access + IntEnum method calls under Dynamo silently corrupt the
+        # trace on TPU — see cp/utils.py::_build_pcp_layout_plan for the
+        # plain-scalar mirrors the compiled path relies on).
+        if (
+            max_tokens_pad == 0
+            and not torch.compiler.is_compiling()
+            and forward_batch.attn_cp_metadata is not None
+        ):
+            per_rank = forward_batch.attn_cp_metadata.per_rank_actual_token
+            max_tokens_pad = max(per_rank) if per_rank else 0
+            moe_cp_active = forward_batch.forward_mode.is_context_parallel_extend()
         if (
             moe_cp_size > 1
             and hidden_states.shape[0] > 0
-            and forward_batch.forward_mode.is_context_parallel_extend()
-            and forward_batch.attn_cp_metadata is not None
+            and max_tokens_pad > 0
+            and moe_cp_active
         ):
             # Zigzag split can produce unequal token counts across CP ranks
             # (when seq_len % (cp_size * 2) != 0). NCCL allgather requires
             # equal input sizes, so pad to the max per-rank token count.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens = max(per_rank_tokens)
-            pad_size = max_tokens - hidden_states.shape[0]
+            pad_size = max_tokens_pad - hidden_states.shape[0]
             if pad_size > 0:
                 hidden_states = torch.nn.functional.pad(
                     hidden_states, [0, 0, 0, pad_size]
                 )
 
             output = torch.empty(
-                (max_tokens * moe_cp_size, hidden_states.shape[1]),
+                (max_tokens_pad * moe_cp_size, hidden_states.shape[1]),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
@@ -1433,19 +1457,29 @@ class CommunicateSummableTensorPairFn:
         # Safe w.r.t. empty tensors: same reasoning as _gather_hidden_states_and_residual_moe
         # — CP extend always has non-zero tokens per rank, and decode skips this path.
         moe_cp_size = get_moe_cp_size()
+        # Plain-scalar mirrors populated by the CP-v2 strategy in eager (see
+        # :func:`sglang.srt.layers.cp.utils._build_pcp_layout_plan`). Both
+        # a msgspec.Struct field read AND an IntEnum method call on the pinned
+        # torch's Dynamo produce silently wrong compiled output on the PCP path.
+        max_tokens_pad = forward_batch.moe_cp_pad_max_tokens
+        local_tokens_pad = forward_batch.moe_cp_local_tokens
+        moe_cp_active = forward_batch.moe_cp_active
         if (
-            moe_cp_size > 1
-            and forward_batch.forward_mode.is_context_parallel_extend()
+            max_tokens_pad == 0
+            and not torch.compiler.is_compiling()
             and forward_batch.attn_cp_metadata is not None
         ):
+            per_rank = forward_batch.attn_cp_metadata.per_rank_actual_token
+            if per_rank:
+                max_tokens_pad = max(per_rank)
+                local_tokens_pad = per_rank[get_moe_cp_rank()]
+                moe_cp_active = forward_batch.forward_mode.is_context_parallel_extend()
+        if moe_cp_size > 1 and max_tokens_pad > 0 and moe_cp_active:
             moe_cp_rank = get_moe_cp_rank()
             # The allgather was padded to max_tokens_per_rank (equal chunks).
             # Extract this rank's actual (non-padded) tokens from its chunk.
-            per_rank_tokens = forward_batch.attn_cp_metadata.per_rank_actual_token
-            max_tokens_per_rank = max(per_rank_tokens)
-            actual_local_tokens = per_rank_tokens[moe_cp_rank]
             hidden_states = hidden_states.narrow(
-                0, moe_cp_rank * max_tokens_per_rank, actual_local_tokens
+                0, moe_cp_rank * max_tokens_pad, local_tokens_pad
             ).contiguous()
 
         # DP scatter (if DP attention is enabled)

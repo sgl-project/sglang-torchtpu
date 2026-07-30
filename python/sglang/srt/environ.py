@@ -1003,6 +1003,14 @@ class Envs:
     #     TpuPcpFusedMHATokenToKVPool). Larger values keep more Q-locality
     #     but need a coarser KV shard granularity.
     SGLANG_TPU_PCP_INTERLEAVE_SIZE = EnvInt(1)
+    #   SGLANG_TPU_PCP_KEEP_NONCP_COMPILE: retain the non-CP extend/decode
+    #     precompile passes even when PCP is active. Under
+    #     ``--enable-prefill-cp`` every forward routes through the CP-v2
+    #     branch, so the non-CP graphs are unreachable and their compiles
+    #     (30-60s each on 30B, minutes on 480B) are wasted warm cost.
+    #     Default False. Set to 1 for mixed workloads that also serve
+    #     non-CP traffic through the same policy.
+    SGLANG_TPU_PCP_KEEP_NONCP_COMPILE = EnvBool(False)
     #   SGLANG_TPU_PCP_LOCAL_RANK_REMAP: enable the parent-side subprocess
     #     probe that remaps ``LOCAL_RANK`` so ``native_local_rank=k`` binds
     #     to ``jax.devices()[k]``. Default False

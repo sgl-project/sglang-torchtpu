@@ -575,6 +575,7 @@ _support_triton_patched = False
 _PALLAS_TPU_BACKENDS = (
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_v3_cp",
     "pallas_tpu_rpa_batched",
 )
 
