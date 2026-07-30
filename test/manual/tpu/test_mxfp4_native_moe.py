@@ -1,17 +1,13 @@
-"""Unit test for the native MXFP4 fused-MoE path.
+"""Experimental scaffold for the unwired native MXFP4 fused-MoE path.
 
-Verifies that running through ``process_mxfp4_moe_weights_native`` +
-``fused_moe_call`` (which unpacks FP4 + applies block scales inside the
-kernel) produces the same MoE output as running ``fused_moe_call``
-directly on the BF16-dequantized weights with no scales. Both should
-match within bf16 matmul tolerance.
+``process_mxfp4_moe_weights_native`` creates packed FP4 weights and block
+scales, but ``fused_moe_call`` does not yet expand the packed weights to their
+logical K dimension. This test therefore currently fails during GMM input
+validation before reaching its numerical comparison. Production uses BF16
+dequantization through ``prepare_tpu_mxfp4_moe_weights`` instead.
 
-Lossless claim verified: the kernel's block-wise dequant in VMEM is
-mathematically equivalent to dequantizing in HBM first, so any
-discrepancy is purely from accumulation order / MXU rounding, not the
-quantization itself.
-
-Requires torch_tpu + a TPU device.
+Keep this test manual until the packed path is wired into the fused kernel.
+It requires torch_tpu and a TPU device.
 """
 
 from __future__ import annotations

@@ -1,5 +1,4 @@
-"""Repro: the GPT-OSS MXFP4 fused-MoE kernel produces NaN under torch.compile
-at the real decode shape, while eager is finite.
+"""Legacy repro for GPT-OSS MXFP4 fused-MoE NaNs under torch.compile.
 
 Background
 ----------
@@ -7,11 +6,13 @@ gpt-oss-20b decode under ``torch.compile(backend="tpu", fullgraph=True)`` emits
 all-NaN logits (→ token 0), while eager decode is correct. Bisection (disabling
 sliding-window, attention sinks, the cache, precompile; and a Qwen3 control)
 localized the NaN to the fused-MoE path at the *decode* token shape, and only
-under the compiled (XLA) execution — eager never NaNs. This test reproduces it
-in isolation: run ``fused_moe_call`` eager vs ``torch.compile(backend="tpu")``
-at the **real** gpt-oss-20b MoE dims (hidden=2880, intermediate=2880, E=32) and
-at the decode token counts (m=1 and m=16), and assert the compiled output is
-NaN-free (it currently is NOT).
+under the compiled (XLA) execution — eager never NaNs.
+
+This repro is currently blocked before that comparison: it uses the native
+packed-MXFP4 path, which ``fused_moe_call`` does not yet expand to its logical
+K dimension. Current production dequantizes MXFP4 weights to BF16 instead, so
+this test does not represent the active production path until the packed path
+is wired into the fused kernel.
 
 Run:
   python -m pytest test/manual/tpu/test_fused_moe_compile_nan.py -x -s
