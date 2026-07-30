@@ -1,3 +1,10 @@
+import os
+
+# This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
+# Override the CPU export platform inherited from the SGLang CI test runner so
+# JAX executes the SparseCore kernel on the physical TPU.
+os.environ["JAX_PLATFORMS"] = "tpu"
+
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
