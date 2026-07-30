@@ -262,10 +262,10 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
 class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
     """Layout invariants that are easy to break under refactors."""
 
-    def test_max_context_len_not_multiple_of_page_size_is_trimmed(self):
+    def test_max_context_len_not_multiple_of_page_size_is_rounded_up(self):
         # If max_context_len isn't an exact multiple of page_size, the
-        # rectangular layout uses pages_per_seq = floor(max_ctx / page_size)
-        # and the slicing must produce exactly that many entries per row.
+        # rectangular layout reserves the final partial page so its capacity
+        # still covers max_context_len.
         page_size = 16
         max_ctx_raw = 16 * 4 + 5  # 69 — not a multiple of page_size.
         req_to_token = _build_req_to_token(num_reqs=2, max_context_len=max_ctx_raw)
@@ -280,10 +280,10 @@ class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
 
         meta = _build_meta(backend, fb)
 
-        expected_pages_per_seq = max_ctx_raw // page_size  # 4
+        expected_pages_per_seq = (max_ctx_raw + page_size - 1) // page_size  # 5
         self.assertEqual(tuple(meta.page_indices.shape), (bs * expected_pages_per_seq,))
-        # cu_kv_lens stride must match the trimmed pages_per_seq, not the raw
-        # max_ctx — otherwise the kernel's page-index addressing skews.
+        # cu_kv_lens stride must match the rounded-up pages_per_seq, not the
+        # raw max_ctx — otherwise the kernel's page-index addressing skews.
         stride = expected_pages_per_seq * page_size
         expected_cu_kv = (torch.arange(bs + 1) * stride).to(torch.int32)
         self.assertTrue(torch.equal(meta.cu_kv_lens, expected_cu_kv))
