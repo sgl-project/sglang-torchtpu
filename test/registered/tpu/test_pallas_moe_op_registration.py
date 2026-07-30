@@ -112,6 +112,11 @@ class TestPallasMoeCallContract(CustomTestCase):
                 "get",
                 return_value=True,
             ),
+            patch.object(
+                fused_moe_op.envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD,
+                "get",
+                return_value=128,
+            ),
         ):
             actual = fused_moe_op.fused_moe_call(
                 hidden_states=hidden_states,
@@ -144,6 +149,7 @@ class TestPallasMoeCallContract(CustomTestCase):
             8,  # global_num_experts
             4,  # expert_group_offset
             1,  # use_sc_gather (int(True))
+            128,  # permute_dense_threshold
         )
 
 
