@@ -42,18 +42,49 @@ _COMPILE_BAR_FORMAT = (
 
 
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
-    """Sync returned tensors and backend-marked KV side effects.
+    """Wait for the precompile forward's PJRT execution to finish.
 
     attn_backend / token_to_kv_pool come from the model_runner: upstream moved
     both off ForwardBatch (attn_backend now flows through ForwardContext, and the
     KV pool is held by the attention backend / model_runner), so warmup reads them
     from the runner rather than the batch.
+
+    Under torch.compile the XLA compile itself is synchronous — AOTAutograd's
+    SerializableAOTDispatchCompiler runs the backend during graph tracing and
+    writes the compiled PjRtLoadedExecutable into the Dynamo cache. What is
+    async is the PJRT execution the compiled graph dispatches when invoked:
+    ``TorchTpuCompiledExecutable.__call__`` just enqueues the execution and
+    returns handles. Without a ``synchronize(wait=True)`` here the precompile
+    loop would keep launching bucket-N+1's forward before bucket-N's PJRT
+    execution completes, which (a) inflates peak HBM (multiple in-flight
+    graphs holding activation buffers) and (b) makes the per-bucket tqdm
+    timings meaningless. This applies whether ``out`` is a raw ``torch.Tensor``
+    (CP-v2 precompile calls ``model.model(...)`` and gets back the inner
+    hidden_states directly) or a ``LogitsProcessorOutput`` (non-CP path
+    through ``Qwen3MoeForCausalLM.forward``).
     """
     tensors: list[torch.Tensor] = []
 
-    next_token_logits = getattr(out, "next_token_logits", None)
-    if isinstance(next_token_logits, torch.Tensor):
-        tensors.append(next_token_logits)
+    if isinstance(out, torch.Tensor):
+        tensors.append(out)
+    elif isinstance(out, PPProxyTensors):
+        # Non-last PP rank: out is a proxy holding the pipeline stage's
+        # tensor payload. Sync every constituent so peak HBM stays bounded
+        # (same accounting reason as the LogitsProcessorOutput branch).
+        for t in out.tensors.values():
+            if isinstance(t, torch.Tensor):
+                tensors.append(t)
+    else:
+        # LogitsProcessorOutput path. Optional fields access via getattr
+        # to accommodate SimpleNamespace stubs in unit tests that mock a
+        # partial output — real LogitsProcessorOutput declares both fields
+        # as Optional[torch.Tensor].
+        next_token_logits = getattr(out, "next_token_logits", None)
+        if isinstance(next_token_logits, torch.Tensor):
+            tensors.append(next_token_logits)
+        hidden_states = getattr(out, "hidden_states", None)
+        if isinstance(hidden_states, torch.Tensor):
+            tensors.append(hidden_states)
 
     if getattr(attn_backend, "requires_kv_sync_after_compile", False):
         pool = token_to_kv_pool
@@ -83,10 +114,25 @@ def _hbm_delta_str(
     before: Optional[tuple[float, float]],
     after: Optional[tuple[float, float]],
 ) -> str:
-    """Format HBM delta + total as a suffix string, or empty if unavailable."""
+    """Format HBM delta + total as a suffix string, or empty if unavailable.
+
+    Also emits a WARNING when the after-bucket HBM usage exceeds 90% of
+    total — PCP precompile bakes many shapes and a runaway warmup would
+    otherwise OOM mid-loop without an actionable message.
+    """
     if before is None or after is None:
         return " HBM: N/A"
     delta = after[0] - before[0]
+    used_pct = after[0] / max(after[1], 1.0)
+    if used_pct > 0.9:
+        logger.warning(
+            "[decoder compile policy] HBM usage %.1f%% (%.0f/%.0f MB) — "
+            "warmup nearing OOM. Consider SGLANG_TPU_PCP_KEEP_NONCP_COMPILE=0 "
+            "if it's set, or reducing --mem-fraction-static.",
+            100.0 * used_pct,
+            after[0],
+            after[1],
+        )
     return f" HBM: +{delta:.0f} MB ({after[0]:.0f}/{after[1]:.0f} MB)"
 
 
@@ -94,6 +140,30 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
     real_q = getattr(forward_batch, _REAL_Q_KEY, None)
     real_b = getattr(forward_batch, _REAL_B_KEY, None)
     if real_q is None or real_b is None:
+        return out
+
+    # Handle raw Tensor return (from ``Qwen3MoeModel.forward`` when a
+    # compile boundary is installed on it — e.g. under PCP CP-v2, where
+    # the eager runner calls ``model.model(...)`` directly). Without this
+    # branch the padded ghost slots leak past the shim into the CP-gather.
+    if isinstance(out, torch.Tensor):
+        # Under PCP CP-v2 the compiled model.model returns a per-rank
+        # rank-major-packed tensor of shape ``(local_padded_num_tokens,
+        # hidden_dim)``. Real tokens and padding are interleaved per the
+        # ``PcpSequenceLayoutPlan.token_order`` reorder (rank r owns positions
+        # ``[k*cycle + r*interleave, k*cycle + (r+1)*interleave)``), so the
+        # padding is NOT contiguous at the tail. ``out[:real_q]`` would blindly
+        # take the first ``real_q`` rows, mixing padding into the sample and
+        # violating the ``pcp_size * local_padded_num_tokens`` invariant that
+        # :func:`sglang.srt.layers.cp.pcp_sequence_layout.gather_and_unpack_pcp`
+        # relies on to reverse the pack (via ``inverse_order``). Skip the
+        # tensor-level unpad in that case — the downstream cp_gather does the
+        # real unpacking. Other CP-v2 strategies (Zigzag/Interleave) do not
+        # set ``pcp_attn_active``, so they keep the original truncation.
+        is_pcp_active = forward_batch.pcp_attn_active
+        if not is_pcp_active and real_q < out.shape[0]:
+            out = out[:real_q]
+        _restore_forward_batch_inputs(forward_batch, real_q, real_b)
         return out
 
     next_token_logits = getattr(out, "next_token_logits", None)
@@ -277,14 +347,260 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         )
 
     def precompile(self) -> None:
-        """Warm decoder graphs for this policy's bucket grid."""
+        """Warm decoder graphs for this policy's bucket grid.
+
+        Under ``--enable-prefill-cp`` with the PCP strategy every extend /
+        decode routes through ``eager_runner``'s CP-v2 branch, which
+        dispatches ``model.model(input_ids, positions, forward_batch,
+        input_embeds=<sharded>, ...)``. The non-CP entry point uses
+        ``input_embeds=None``; Dynamo caches on that type mismatch so the
+        non-CP graphs are unreachable at serve time. Skip them — each
+        compile is 30-60s on 30B / minutes on 480B and leaves dead XLA
+        program cache behind. Set ``SGLANG_TPU_PCP_KEEP_NONCP_COMPILE=1``
+        to retain them (mixed workloads that route some traffic through
+        the non-CP path).
+        """
+        from sglang.srt.environ import envs
+
         overall = time.perf_counter()
-        self._precompile_extend()
-        self._precompile_decode()
+        pcp_active = self._pcp_streaming_enabled()
+        keep_noncp = bool(envs.SGLANG_TPU_PCP_KEEP_NONCP_COMPILE.get())
+        if not pcp_active or keep_noncp:
+            self._precompile_extend()
+            self._precompile_decode()
+        if pcp_active:
+            self._precompile_extend_pcp()
+            self._precompile_decode_pcp()
         logger.info(
             "[decoder compile policy] precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
+
+    def _pcp_streaming_enabled(self) -> bool:
+        """True iff the CP-v2 PCP streaming branch will fire at serve time."""
+        from sglang.srt.layers.cp.base import is_pcp
+        from sglang.srt.layers.cp.utils import enable_cp_v2
+
+        sa = self.model_runner.server_args
+        return enable_cp_v2() and (sa.attn_cp_size or 1) > 1 and is_pcp()
+
+    def _precompile_extend_pcp(self) -> None:
+        """Compile extend at each PCP-aligned token bucket + the extend cap."""
+        assert self.t_bucketer is not None and self.b_bucketer is not None
+        pcp_size = int(self.model_runner.server_args.attn_cp_size or 1)
+        bs = _extend_batch_cap(self.t_bucketer, self.b_bucketer)
+        # PCP kernel requires ``padded_num_tokens % (pcp_size * q_block_size)
+        # == 0`` (per-rank shard must be a multiple of the kernel's lockstep
+        # floor). Rounding only to ``pcp_size`` here would let a bucket like
+        # 1032 (=8*129) pass and blow up at Pallas trace time. Filter with a
+        # visible log line rather than silently dropping shapes.
+        from sglang.srt.layers.cp.base import get_cp_strategy
+
+        strategy = get_cp_strategy()
+        kernel_bucket = pcp_size * int(strategy.local_compile_token_multiple)
+        # Also require num_tokens % bs == 0 — the dummy CP forward splits
+        # tokens equally across the ``bs`` dummy requests and any leftover
+        # produces a shape mismatch between ``extend_num_tokens`` (bs*floor)
+        # and ``input_ids.shape[0]`` (num_tokens). Drop mis-aligned buckets
+        # here with a visible log line so we never dispatch one.
+        valid_shapes = [
+            (t, bs)
+            for t in self.t_bucketer.buckets
+            if t >= bs and t % kernel_bucket == 0 and t % bs == 0
+        ]
+        dropped = [
+            t
+            for t in self.t_bucketer.buckets
+            if t >= bs and not (t % kernel_bucket == 0 and t % bs == 0)
+        ]
+        if dropped:
+            # WARNING (not INFO) because dropped buckets = ignored
+            # user-configured shapes. Operators should see this by default.
+            logger.warning(
+                "[decoder compile policy] EXTEND-PCP: dropping %d buckets "
+                "not aligned to pcp_size*q_block_size=%d or bs=%d: %s",
+                len(dropped),
+                kernel_bucket,
+                bs,
+                dropped,
+            )
+        if not valid_shapes:
+            raise ValueError(
+                "No PCP-aligned extend buckets: token buckets "
+                f"{list(self.t_bucketer.buckets)} yield no shape with "
+                f"t>={bs}, t%{kernel_bucket}==0, and t%{bs}==0."
+            )
+        logger.info(
+            "[decoder compile policy] EXTEND-PCP: %d shapes (bs=%d, pcp=%d)",
+            len(valid_shapes),
+            bs,
+            pcp_size,
+        )
+        compile_range = (
+            tqdm.tqdm(
+                valid_shapes,
+                desc="Compiling EXTEND-PCP",
+                bar_format=_COMPILE_BAR_FORMAT,
+            )
+            if get_tensor_model_parallel_rank() == 0
+            else valid_shapes
+        )
+        for num_tokens, bs in compile_range:
+            hbm_before = _get_hbm_usage_mb()
+            start = time.perf_counter()
+            self._run_one_pcp(num_tokens=num_tokens, bs=bs)
+            if get_tensor_model_parallel_rank() == 0:
+                elapsed = time.perf_counter() - start
+                hbm_after = _get_hbm_usage_mb()
+                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                compile_range.set_description(
+                    f"Compiled EXTEND-PCP (tokens={num_tokens}, bs={bs}) "
+                    f"in {elapsed:.1f}s{hbm_str}"
+                )
+
+    def _run_one_pcp(
+        self, *, num_tokens: int, bs: int, mode: ForwardMode = ForwardMode.EXTEND
+    ) -> None:
+        """One dummy CP-v2 forward, mirroring eager_runner's CP branch.
+
+        The eager CP branch calls ``model_runner.model.model(...)`` with
+        rank-sharded ``input_embeds`` and ``positions`` — not
+        ``Qwen3MoeForCausalLM.forward``. The compile policy still installs
+        the shim on ``Qwen3MoeModel.forward`` (models/qwen3_moe.py), so
+        ``self.owner.forward`` (owner is ``Qwen3MoeModel``) enters the same
+        compiled graph the eager CP path hits at serve time.
+
+        Handles both extend (``mode=EXTEND``) and decode (``mode=DECODE``);
+        decode reuses the same rank-sharded dispatch since PCP now routes
+        decode through the streaming kernel too (see is_cp_v2_active in
+        layers/cp/utils.py).
+        """
+        from sglang.srt.layers.cp.utils import (
+            cp_split_before_forward,
+            is_cp_v2_active,
+            prepare_cp_forward,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        args, _ = self._make_warmup_inputs(num_tokens=num_tokens, bs=bs, mode=mode)
+        forward_batch = args[2]
+        # For EXTEND: rewrite the dummy batch's extend_* fields so the
+        # per-req length reflects num_tokens // bs (rather than the base
+        # 1-token-per-req dummy). Without this, ``_build_pcp_layout_plan``
+        # sizes ``plan.inverse_order`` at (bs,) and torch_tpu re-JITs the
+        # cp_gather + logits_processor + argmax paths at (num_tokens,) on
+        # the first real request.
+        # For DECODE: extend_* fields stay None (that's how the base
+        # dummy factory constructs them); ``_build_pcp_layout_plan``
+        # branches on ``extend_lens_cpu is None`` and takes the pure-
+        # decode path with scheduled=ones(bs), which is what serve time
+        # decodes look like — so no rewrite is needed.
+        if mode.is_extend(include_draft_extend_v2=True):
+            if num_tokens % bs != 0:
+                # Splitting num_tokens into equal per-req lengths requires
+                # exact divisibility — otherwise ``extend_num_tokens`` (=
+                # bs*floor) would not equal input_ids.shape[0], producing a
+                # shape mismatch inside the model that shows up as either a
+                # Pallas trace assert or (worse) a silently wrong compiled
+                # graph shape. Filter buckets in _precompile_extend_pcp.
+                raise ValueError(
+                    "_run_one_pcp: num_tokens must be divisible by bs "
+                    f"(got num_tokens={num_tokens}, bs={bs}). Filter the "
+                    "bucket at _precompile_extend_pcp before dispatch."
+                )
+            _tokens_per_req = num_tokens // bs
+            _dev = forward_batch.input_ids.device
+            forward_batch.extend_seq_lens = torch.full(
+                (bs,), _tokens_per_req, dtype=torch.int32, device=_dev
+            )
+            forward_batch.extend_num_tokens = int(bs * _tokens_per_req)
+            forward_batch.extend_seq_lens_cpu = [_tokens_per_req] * bs
+            forward_batch.extend_start_loc = torch.arange(
+                0,
+                bs * _tokens_per_req,
+                _tokens_per_req,
+                dtype=torch.int32,
+                device=_dev,
+            )
+        self._seed_dummy_req_to_token(num_tokens)
+        if is_dp_attention_enabled():
+            self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
+        self.model_runner.model.prepare_forward_batch(forward_batch)
+        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        assert is_cp_v2_active(forward_batch), (
+            f"PCP precompile: is_cp_v2_active(dummy_batch) is False; check "
+            f"SGLANG_ENABLE_CP_V2, cp_strategy=='pcp', attn_cp_size>1, and "
+            f"that the current mode ({mode.name}) satisfies "
+            f"is_context_parallel_extend() or is_decode()."
+        )
+        prepare_cp_forward(forward_batch)
+        embed_layer = self.model_runner.model.get_input_embeddings()
+        complete_hidden = embed_layer(forward_batch.input_ids)
+        sharded_hidden, sharded_positions = cp_split_before_forward(
+            complete_hidden,
+            forward_batch.positions,
+            forward_batch,
+        )
+        from sglang.srt.layers.cp.utils import cp_gather_after_forward
+
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ), torch.no_grad():
+            hidden_states = self.owner.forward(
+                forward_batch.input_ids,
+                sharded_positions,
+                forward_batch,
+                input_embeds=sharded_hidden,
+                pp_proxy_tensors=None,
+            )
+            # Warm the post-forward pipeline (cp_gather + logits_processor +
+            # final norm + LM head projection + argmax). Without this, the
+            # first CP serve request pays ~1.8s of TPU-idle time while the
+            # host JIT-compiles these eager-mode kernels
+            # (``tt_jit_argmax``, ``tt_jit_layernorm_L527C0``,
+            # ``tt_jit_all``, ``tt_jit_index``, etc. — verified via TPU
+            # profile diff).
+            model = self.model_runner.model
+            # capture_aux_hidden_states=True (EAGLE-3): the model forward
+            # returns (hidden_states, aux_hidden_states) tuple instead of
+            # a single tensor. Mirror the eager_runner CP-v2 branch unpack
+            # so the precompile shape matches serve time.
+            aux_hidden_states = None
+            if model.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+            if model.pp_group.is_last_rank:
+                gathered = cp_gather_after_forward(
+                    hidden_states,
+                    forward_batch,
+                    stream=None,
+                )
+                out = model.logits_processor(
+                    forward_batch.input_ids,
+                    gathered,
+                    model.lm_head,
+                    forward_batch,
+                    aux_hidden_states,
+                )
+                # Warm the sampler-side kernels (argmax + validity check)
+                # that fire in every serve request but aren't triggered
+                # by the model forward chain. Without this, the first
+                # serve pays ~185ms of ``tt_jit_argmax`` JIT compile.
+                # LogitsProcessorOutput.next_token_logits is Optional; the
+                # isinstance narrows the None branch (LM head can return
+                # None when spec-decode is off; see logits_processor.py).
+                if isinstance(out.next_token_logits, torch.Tensor):
+                    _ = torch.argmax(out.next_token_logits, dim=-1)
+                    _ = torch.all(torch.isfinite(out.next_token_logits))
+            else:
+                out = hidden_states
+            _materialize_out(
+                out,
+                self.model_runner.attn_backend,
+                self.model_runner.token_to_kv_pool,
+            )
 
     def _precompile_extend(self) -> None:
         """Compile extend at each token bucket and the fixed batch cap."""
@@ -328,6 +644,43 @@ class DecoderTpuCompilePolicy(CompilePolicy):
                     f"in {elapsed:.1f}s{hbm_str}"
                 )
 
+    def _precompile_decode_pcp(self) -> None:
+        """Warm decode on the PCP CP-v2 path (mirrors _precompile_extend_pcp).
+
+        For decode, num_tokens == bs (one token per request). PCP requires
+        the global bucket to be a multiple of pcp_size * q_block_size, so
+        the effective PCP dispatch pads up to that minimum regardless of
+        the caller-visible bucket. Warming at each configured decode bs
+        ensures the first served decode step doesn't retrace.
+        """
+        assert self.b_bucketer is not None
+        bs_buckets = list(self.b_bucketer.buckets)
+        logger.info(
+            "[decoder compile policy] DECODE-PCP: %d shapes (bs=%s)",
+            len(bs_buckets),
+            bs_buckets,
+        )
+        compile_range = (
+            tqdm.tqdm(
+                bs_buckets,
+                desc="Compiling DECODE-PCP",
+                bar_format=_COMPILE_BAR_FORMAT,
+            )
+            if get_tensor_model_parallel_rank() == 0
+            else bs_buckets
+        )
+        for bs in compile_range:
+            hbm_before = _get_hbm_usage_mb()
+            start = time.perf_counter()
+            self._run_one_pcp(num_tokens=bs, bs=bs, mode=ForwardMode.DECODE)
+            if get_tensor_model_parallel_rank() == 0:
+                elapsed = time.perf_counter() - start
+                hbm_after = _get_hbm_usage_mb()
+                hbm_str = _hbm_delta_str(hbm_before, hbm_after)
+                compile_range.set_description(
+                    f"Compiled DECODE-PCP (bs={bs}) in {elapsed:.1f}s{hbm_str}"
+                )
+
     def _precompile_decode(self) -> None:
         """Compile decode mode: vary batch size (tokens == batch size)."""
         assert self.b_bucketer is not None
@@ -369,7 +722,18 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Any | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        """Build generic text decoder warmup inputs."""
+        """Build generic text decoder warmup inputs.
+
+        The 4-positional + ``pp_proxy_tensors=None`` kwarg shape matches
+        the dispatch that ``Qwen2/3MoeForCausalLM.forward`` produces when
+        it calls ``self.model(input_ids, positions, forward_batch,
+        input_embeds, pp_proxy_tensors=pp_proxy_tensors)``. The compile
+        shim is installed on the INNER model (``Qwen3MoeModel.forward``),
+        so serve-time non-CP dispatch enters the shim with ``len(args)
+        == 4`` and ``pp_proxy_tensors`` as the only kwarg. Precompiling
+        the same shape prevents a serve-time recompile (Dynamo guards
+        on len(args) and on the kwarg dict identity).
+        """
         forward_batch = self._make_dummy_forward_batch(
             num_tokens=num_tokens,
             bs=bs,
@@ -377,7 +741,12 @@ class DecoderTpuCompilePolicy(CompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
-        return (forward_batch.input_ids, forward_batch.positions, forward_batch), {}
+        return (
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            None,  # input_embeds — positional (None for non-CP)
+        ), {"pp_proxy_tensors": None}
 
     def _run_one(
         self,
@@ -507,7 +876,7 @@ class DecoderTpuCompilePolicy(CompilePolicy):
         # MROPE runtime positions are real [3, num_tokens] tensors. Keep strides
         # identical here so Dynamo does not guard-miss after precompile.
         mrope_positions = None
-        if getattr(self.model_runner, "model_is_mrope", False):
+        if self.model_runner.model_is_mrope:
             mrope_positions = positions.unsqueeze(0).expand(3, -1).contiguous()
 
         # Batch-level inputs
