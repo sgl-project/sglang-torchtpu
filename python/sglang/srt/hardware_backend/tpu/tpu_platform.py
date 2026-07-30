@@ -31,6 +31,44 @@ _LOAD_WEIGHT_SYNC_BYTES = 2 << 30  # 2 GiB
 _LOAD_WEIGHT_SYNC_TENSORS = 64
 
 
+def _validate_pcp_platform_config(server_args) -> None:
+    """Reject PCP-incompatible server-arg combinations up front.
+
+    Catches misconfigurations at server start so serving-time failures
+    don't strand live requests.
+    """
+    from sglang.srt.environ import envs
+
+    if server_args.pp_size and server_args.pp_size > 1:
+        raise NotImplementedError(
+            "PCP streaming (--cp-strategy pcp) does not support pipeline "
+            f"parallelism (--pp-size={server_args.pp_size}). Drop --pp-size."
+        )
+    interleave = int(envs.SGLANG_TPU_PCP_INTERLEAVE_SIZE.get())
+    if interleave <= 0:
+        raise ValueError(
+            f"SGLANG_TPU_PCP_INTERLEAVE_SIZE must be > 0 for PCP streaming, "
+            f"got {interleave}."
+        )
+    # The PCP kernel's wrapper asserts ``interleave_size <= page_size and
+    # page_size % interleave_size == 0`` at trace time (see
+    # layers/attention/pallas/pcp_streaming_rpa/wrapper.py). Catching this at
+    # server start replaces a cryptic Mosaic error deep inside torch.compile.
+    page_size = int(server_args.page_size)
+    if interleave > page_size or page_size % interleave != 0:
+        raise ValueError(
+            f"SGLANG_TPU_PCP_INTERLEAVE_SIZE={interleave} must be <= "
+            f"page_size={page_size} and divide it evenly."
+        )
+    # Disaggregated prefill on the D-node makes no sense with PCP prefill.
+    if server_args.disaggregation_mode != "null":
+        raise NotImplementedError(
+            f"PCP streaming does not support disaggregation_mode="
+            f"{server_args.disaggregation_mode!r}. Run the prefill node "
+            "without --disaggregation-mode."
+        )
+
+
 def _sync_weight_stream(weights):
     """Yield weights and periodically drain torch_tpu pending work.
 
@@ -166,6 +204,60 @@ class TpuSRTPlatform(SRTPlatform):
         if server_args.page_size is None:
             server_args.override("tpu.apply_server_args_defaults", page_size=64)
 
+        # Context parallelism auto-swap: with --attn-cp-size N (N > 1) the
+        # attention backend must be the CP-aware subclass. Explicit
+        # ``pallas_tpu_rpa_batched`` + CP is rejected — batched has no CP
+        # kernel wiring. Explicit spec-decode + CP is rejected — the
+        # PCP kernel doesn't cover the spec paths yet.
+        if server_args.attn_cp_size and server_args.attn_cp_size > 1:
+            if server_args.attention_backend == "pallas_tpu_rpa_batched":
+                raise NotImplementedError(
+                    "--attention-backend pallas_tpu_rpa_batched does not "
+                    "support context parallelism. Use --attention-backend "
+                    "pallas_tpu_rpa_v3_cp (or pallas_tpu_rpa_v3 which is "
+                    "auto-swapped to _cp)."
+                )
+            if server_args.cp_strategy is None:
+                server_args.override(
+                    "tpu.apply_server_args_defaults", cp_strategy="pcp"
+                )
+            # ``pallas_tpu_rpa_v3_cp`` is the PCP-streaming backend; only
+            # auto-swap to it when the strategy is (or was just defaulted
+            # to) ``pcp``. Other strategies (zigzag, interleave) have no
+            # ``_cp`` backend on TPU and silently pairing them would
+            # produce mismatched attention math at serve time.
+            if server_args.attention_backend == "pallas_tpu_rpa_v3":
+                if server_args.cp_strategy == "pcp":
+                    server_args.override(
+                        "tpu.apply_server_args_defaults(cp-swap)",
+                        attention_backend="pallas_tpu_rpa_v3_cp",
+                    )
+                else:
+                    raise NotImplementedError(
+                        f"--cp-strategy={server_args.cp_strategy!r} does not "
+                        "have a TPU attention-backend implementation. Only "
+                        "``pcp`` is supported on TPU today; use "
+                        "--cp-strategy pcp or drop --attn-cp-size."
+                    )
+            if not server_args.enable_prefill_cp:
+                server_args.override(
+                    "tpu.apply_server_args_defaults", enable_prefill_cp=True
+                )
+            if spec_algo is not None:
+                raise NotImplementedError(
+                    "Speculative decoding is not yet supported with context "
+                    "parallelism (--attn-cp-size > 1). Drop --attn-cp-size "
+                    "or --speculative-algorithm."
+                )
+            if server_args.cp_strategy == "pcp":
+                _validate_pcp_platform_config(server_args)
+        elif server_args.cp_strategy is not None:
+            raise ValueError(
+                f"--cp-strategy={server_args.cp_strategy!r} requires "
+                "--attn-cp-size > 1. Set --attn-cp-size (e.g. 2 or 4) or "
+                "drop --cp-strategy."
+            )
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
@@ -197,16 +289,31 @@ class TpuSRTPlatform(SRTPlatform):
         return TpuGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
-        # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
-        # read the flat MHATokenToKVPool. Pick per the resolved attention backend
-        # — it's on the (scheduler-child) global server args by pool-creation
-        # time (set in ModelRunner.__init__, before _init_pools).
+        # RPA v3 / batched / _cp all use the fused 5D KV layout;
+        # pallas_tpu_flash and torch_native read the flat MHATokenToKVPool.
+        # Under PCP (``pallas_tpu_rpa_v3_cp`` + ``cp_strategy=pcp`` +
+        # ``attn_cp_size > 1``) each rank stores only 1/cp_group_size of
+        # the paged KV (page-striped ownership i%cp==rank); the kernel's
+        # local KV update writes to per-rank slots. Non-CP
+        # configurations use the standard fused pool.
         from sglang.srt.server_args import get_global_server_args
 
-        if get_global_server_args().attention_backend in (
+        sa = get_global_server_args()
+        if sa.attention_backend in (
             "pallas_tpu_rpa_v3",
+            "pallas_tpu_rpa_v3_cp",
             "pallas_tpu_rpa_batched",
         ):
+            if (
+                sa.attention_backend == "pallas_tpu_rpa_v3_cp"
+                and sa.cp_strategy == "pcp"
+                and (sa.attn_cp_size or 1) > 1
+            ):
+                from sglang.srt.hardware_backend.tpu.kv_pool_pcp import (
+                    TpuPcpFusedMHATokenToKVPool,
+                )
+
+                return TpuPcpFusedMHATokenToKVPool
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMHATokenToKVPool,
             )
@@ -216,6 +323,55 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         return MHATokenToKVPool
+
+    def get_mha_kv_pool_extra_kwargs(self, server_args) -> dict:
+        # Under PCP the ``TpuPcpFusedMHATokenToKVPool`` subclass takes an
+        # extra ``cp_group_size`` kwarg that drives per-rank strided page
+        # ownership. Without threading this through, the subclass would
+        # default to cp_group_size=1 and allocate the full (non-sharded)
+        # size on every rank.
+        if (
+            server_args.attention_backend == "pallas_tpu_rpa_v3_cp"
+            and (server_args.attn_cp_size or 1) > 1
+            and server_args.cp_strategy == "pcp"
+        ):
+            return {"cp_group_size": int(server_args.attn_cp_size)}
+        return {}
+
+    def supports_attn_cp(self) -> bool:
+        # Wired via PCP streaming — see sglang.srt.layers.cp.pcp_streaming.
+        return True
+
+    def build_gpu_id_remap(self, server_args, tp_size_per_node):
+        """PCP LOCAL_RANK remap when SGLANG_TPU_PCP_LOCAL_RANK_REMAP=1.
+
+        Only fires when PCP is active. Returns None (identity map) when
+        the remap env isn't set. Raises when a non-identity spawn (
+        base_gpu_id != 0 or gpu_id_step != 1) is combined with the remap,
+        since the caller indexes ``remap[gpu_id]`` directly with gpu_ids
+        in ``[0, tp_size_per_node)``.
+        """
+        if not ((server_args.attn_cp_size or 1) > 1):
+            return None
+        from sglang.srt.hardware_backend.tpu.pcp_rank_binding import (
+            ensure_pcp_local_rank_remap,
+            get_default_tpu_topology,
+            pcp_local_rank_remap_enabled,
+        )
+
+        if not pcp_local_rank_remap_enabled():
+            return None
+        if server_args.base_gpu_id != 0 or server_args.gpu_id_step != 1:
+            raise ValueError(
+                "SGLANG_TPU_PCP_LOCAL_RANK_REMAP=1 requires base_gpu_id=0 "
+                "and gpu_id_step=1 (the remap is indexed by the local "
+                f"gpu_id in [0, {tp_size_per_node})); got "
+                f"base_gpu_id={server_args.base_gpu_id}, "
+                f"gpu_id_step={server_args.gpu_id_step}."
+            )
+        return ensure_pcp_local_rank_remap(
+            tp_size_per_node, get_topology=get_default_tpu_topology
+        )
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool

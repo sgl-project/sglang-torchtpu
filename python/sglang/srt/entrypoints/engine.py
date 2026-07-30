@@ -620,6 +620,12 @@ class Engine(EngineScoreMixin, EngineBase):
                 )
             )
 
+            from sglang.srt.platforms import current_platform
+
+            pcp_gpu_id_remap = current_platform.build_gpu_id_remap(
+                server_args, tp_size_per_node
+            )
+
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=False)
@@ -628,6 +634,8 @@ class Engine(EngineScoreMixin, EngineBase):
                         + ((pp_rank % pp_size_per_node) * tp_size_per_node)
                         + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                     )
+                    if pcp_gpu_id_remap is not None:
+                        gpu_id = pcp_gpu_id_remap[gpu_id]
                     attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
                         server_args, tp_rank
                     )

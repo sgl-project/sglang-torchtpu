@@ -216,6 +216,7 @@ ATTENTION_BACKEND_CHOICES = [
     # TPU specific
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_v3_cp",
     "pallas_tpu_rpa_batched",
     # Other platforms
     "intel_amx",
@@ -918,8 +919,16 @@ class ServerArgs:
     cp_strategy: A[
         Optional[str],
         Arg(
-            help="Sharding strategy for prefill CP. 'zigzag' is the former in-seq-split mode; 'interleave' is the former round-robin-split mode.",
-            choices=("zigzag", "interleave"),
+            help=(
+                "Sharding strategy for prefill CP. 'zigzag' is the former "
+                "in-seq-split mode (Q-sharded, KV replicated). 'interleave' "
+                "is the former round-robin-split mode. 'pcp' is TPU "
+                "Prefill-Context-Parallel via the PCP streaming "
+                "kernel (single Pallas call per attention layer with "
+                "in-kernel ring-permute of KV pages; KV sharded page-wise "
+                "across CP ranks). See sglang.srt.layers.cp.pcp_streaming."
+            ),
+            choices=("zigzag", "interleave", "pcp"),
         ),
     ] = None
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
@@ -4305,6 +4314,7 @@ class ServerArgs:
                 "aiter",
                 # TPU
                 "pallas_tpu_rpa_v3",
+                "pallas_tpu_rpa_v3_cp",
                 "pallas_tpu_rpa_batched",
             ]
             prefill_attn_backend, decode_attn_backend = (
@@ -5092,6 +5102,11 @@ class ServerArgs:
         if not self.enable_prefill_cp or self.cp_strategy is None:
             return
 
+        # PCP is a fresh CP-v2 strategy with no legacy alias — skip the
+        # legacy-flag propagation entirely.
+        if self.cp_strategy not in strategy_to_legacy_mode:
+            return
+
         mode = strategy_to_legacy_mode[self.cp_strategy]
         use_dsa_legacy_aliases = self.enable_dsa_prefill_context_parallel or getattr(
             self, "attention_backend", None
@@ -5147,6 +5162,18 @@ class ServerArgs:
             assert (
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
+
+            # Gate on platform: attn_cp_size > 1 requires the platform to have
+            # wired up the CP-v2 strategy + collective helpers.
+            from sglang.srt.platforms import current_platform
+
+            if not current_platform.supports_attn_cp():
+                raise ValueError(
+                    f"--attn-cp-size={view.attn_cp_size} is not supported on "
+                    f"platform {current_platform.__class__.__name__}. "
+                    f"Currently only TPU (via --cp-strategy pcp) supports "
+                    f"attention context parallel."
+                )
 
         if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size

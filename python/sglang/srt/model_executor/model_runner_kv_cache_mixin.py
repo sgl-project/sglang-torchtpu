@@ -957,6 +957,15 @@ class ModelRunnerKVCacheMixin:
             # TPU MLA models fall through to the shared MLA branch below — their
             # pool is the generic MLATokenToKVPool, so no TPU-specific class.
             PoolCls = current_platform.get_mha_kv_pool_cls()
+            # Under CP + hybrid-SWA, ``TpuPcpFusedMHATokenToKVPool`` needs
+            # its ``cp_group_size`` kwarg to size each rank's shard to
+            # ``size / cp_group_size``; ``SWAKVPool`` forwards ``**kwargs``
+            # into both the full and SWA sub-pools. Without threading it
+            # through, both sub-pools would default to ``cp_group_size=1``
+            # and allocate the full (non-sharded) size on every rank.
+            extra_kwargs = current_platform.get_mha_kv_pool_extra_kwargs(
+                self.server_args
+            )
             if self.is_hybrid_swa:
                 # ``head_num`` sizes the FULL-attention sub-pool. When the SWA
                 # layers have a different KV-head count (e.g. MiMo:
@@ -991,6 +1000,7 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     device=self.device,
                     token_to_kv_pool_class=PoolCls,
+                    **extra_kwargs,
                 )
             else:
                 self.token_to_kv_pool = PoolCls(
@@ -1006,6 +1016,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    **extra_kwargs,
                 )
         elif self.use_mla_backend and is_dsa_model:
             PoolCls = (

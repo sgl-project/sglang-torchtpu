@@ -992,6 +992,77 @@ class Envs:
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.
     SGLANG_TPU_ENABLE_CONTIGUOUS_FLOAT_LOGITS = EnvBool(True)
 
+    # Prefill-Context-Parallel (PCP) streaming — TPU CP-v2. See
+    # sglang.srt.layers.cp.pcp_streaming and the kernel at
+    # sglang.srt.layers.attention.pallas.pcp_streaming_rpa.
+    #   SGLANG_TPU_PCP_INTERLEAVE_SIZE: page-ownership interleave granularity
+    #     across CP ranks. Rank r owns positions
+    #     [k*cycle + r*interleave, k*cycle + (r+1)*interleave) where
+    #     cycle = pcp_size * interleave_size. Must divide page_size.
+    #     Default 1 = page-granular striping (matches the KV pool subclass
+    #     TpuPcpFusedMHATokenToKVPool). Larger values keep more Q-locality
+    #     but need a coarser KV shard granularity.
+    SGLANG_TPU_PCP_INTERLEAVE_SIZE = EnvInt(1)
+    #   SGLANG_TPU_PCP_LOCAL_RANK_REMAP: enable the parent-side subprocess
+    #     probe that remaps ``LOCAL_RANK`` so ``native_local_rank=k`` binds
+    #     to ``jax.devices()[k]``. Default False
+    #     — on single-host v7 slices the remap is a no-op because JAX
+    #     device enumeration already matches process rank order, and the
+    #     probe adds ~1-2s startup cost. Enable on multi-slice / older
+    #     TPU generations where JAX device order does not match torch_tpu
+    #     bind order (verify with SGLANG_TPU_PCP_DEBUG_MESH=1 —
+    #     ``cp_device_ids_by_tp`` should be physically-adjacent chips).
+    SGLANG_TPU_PCP_LOCAL_RANK_REMAP = EnvBool(False)
+
+    # PCP debug hooks (M10). All default-off; each has zero cost when unset.
+    # Read once at import in sglang.srt.hardware_backend.tpu.pcp_debug so the
+    # gating conditions are eligible for constant-folding under torch.compile.
+    #   SGLANG_TPU_PCP_DUMP_INPUTS: directory. When set, torch-save each PCP
+    #     op's inputs + post-op state per layer per forward.
+    SGLANG_TPU_PCP_DUMP_INPUTS = EnvStr(None)
+    #   SGLANG_TPU_PCP_LAYER_TRACE: file path. When set, append one hash line
+    #     per PCP layer per forward (q/k/v/kv_pre/kv_post/output).
+    SGLANG_TPU_PCP_LAYER_TRACE = EnvStr(None)
+    #   SGLANG_TPU_PCP_LAYERS: comma-separated layer ids. When set, only the
+    #     listed layers run the real PCP kernel; excluded layers return
+    #     zeros. Diagnostic-only (contaminates output tokens).
+    SGLANG_TPU_PCP_LAYERS = EnvStr(None)
+    #   SGLANG_TPU_PCP_FORCE_SERIAL: force ordering between PCP layers via a
+    #     data-dependency barrier (out += kv_cache.sum() * 0), turning any
+    #     inter-layer async race into serialisation. Compile-safe. Diagnostic
+    #     only — adds a small stall per layer. Default off.
+    SGLANG_TPU_PCP_FORCE_SERIAL = EnvBool(False)
+    #   SGLANG_TPU_PCP_STUB_ATTN: replace every PCP attention call with a
+    #     zero output tensor. Used to test whether flakiness lives in the
+    #     attention kernel vs the rest of the model. Contaminates output
+    #     tokens. Default off.
+    SGLANG_TPU_PCP_STUB_ATTN = EnvBool(False)
+    #   SGLANG_TPU_PCP_JIT_TRACE_HASH: file path. When set, monkey-patch
+    #     torch_tpu JaxCallable to log the first invocation of each kernel
+    #     hash with argument shapes + Python traceback. Enumerates cold-only
+    #     JIT compiles missed by the precompile pass. Read once at import;
+    #     must be set before Python starts, else no-op.
+    SGLANG_TPU_PCP_JIT_TRACE_HASH = EnvStr(None)
+    #   SGLANG_TPU_PCP_DUMP_HS: log to server stderr the per-rank hidden-state
+    #     norm + first 8 fp32 elements at slots 0..3 right after the CP-v2
+    #     model.model() call and before cp_gather. Diagnostic tag [HS_LOCAL_S].
+    #     ~4ms overhead per forward. Default off.
+    SGLANG_TPU_PCP_DUMP_HS = EnvBool(False)
+    #   SGLANG_TPU_PCP_DUMP_KV_SLOT: log per-rank layer-0 KV-cache values at
+    #     the first 4 out_cache_loc slots after each forward. Diagnostic tag
+    #     [KV_SLOT]. Reads from the eager runner post-forward — no
+    #     torch.compile interaction. Default off.
+    SGLANG_TPU_PCP_DUMP_KV_SLOT = EnvBool(False)
+    #   SGLANG_TPU_PCP_DEBUG_MESH: log the (attn_tp, pcp) TPU device_id layout
+    #     resolved by ``get_or_create_pcp_mesh``. Diagnostic tag
+    #     [PCP MESH DEBUG]. Default off.
+    SGLANG_TPU_PCP_DEBUG_MESH = EnvBool(False)
+    #   SGLANG_TPU_PCP_DUMP_MLIR: directory. When set, the PCP streaming op's
+    #     custom-op adapter writes the lowered MLIR module (serialized +
+    #     text) for each unique kernel invocation. Diagnostic-only. Default
+    #     unset.
+    SGLANG_TPU_PCP_DUMP_MLIR = EnvStr(None)
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
