@@ -64,7 +64,9 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, *[".."] * 5))  # test/manual/tpu/feature_combo/multihost
+REPO = os.path.abspath(
+    os.path.join(HERE, *[".."] * 5)
+)  # test/manual/tpu/feature_combo/multihost
 BENCH = os.path.join(REPO, "benchmark", "tpu")
 
 # ---- knobs (mirror the launcher contract; every one overridable via env) ----
@@ -258,9 +260,7 @@ def run_probe(base_url, check_spec=False, flush_url=None):
     # means offload never engaged.
     host_total, details_missing = 0, True
     for i, p in enumerate(warm):
-        meta, _ = probe(
-            "host-reload", i, p, check_cache=True, expect_text=baseline[i]
-        )
+        meta, _ = probe("host-reload", i, p, check_cache=True, expect_text=baseline[i])
         d = meta.get("cached_tokens_details") or {}
         if d:
             details_missing = False
