@@ -43,7 +43,7 @@ def causal_conv1d(
         start_idx = 1 + end_idx - cfg.kernel_size
         for k in range(cfg.kernel_size):
             lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k:k + 1]
+            out += lhs_curr * conv_weight[k : k + 1]
 
         if conv_bias is not None:
             out += conv_bias.reshape(1, 1, -1)
@@ -52,11 +52,11 @@ def causal_conv1d(
 
     # Last prev_kernel_size elements needs to be returned as conv_state. However,
     # real_sizes may be smaller than chunk_size. Therefore, slicing last
-    # prev_kernel_size elements does not gurantee numeric correctness. Instead,
+    # prev_kernel_size elements does not guarantee numeric correctness. Instead,
     # kernel iterate each rows and perform masking to fetch correct values.
     # NOTE: lhs[:, : prev_kernel_size] can be skipped since they were loaded from
     # previous conv states.
-    new_conv_state = lhs[:, 1:cfg.kernel_size]
+    new_conv_state = lhs[:, 1 : cfg.kernel_size]
     real_sizes = real_sizes.reshape(-1, 1, 1, 1)
     # NOTE: Even though for loop is invoked twice, since they are static loops,
     # compiler will perform loop fusion.

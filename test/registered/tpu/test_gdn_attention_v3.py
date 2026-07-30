@@ -114,18 +114,21 @@ def _gdn_attention_ref(
         else:
             c_state = jnp.zeros_like(new_conv_state[s])
             new_recurrent_state = new_recurrent_state.at[s].set(
-                jnp.zeros_like(new_recurrent_state[s]))
+                jnp.zeros_like(new_recurrent_state[s])
+            )
 
         X = qkv[start:end]
         x_full = jnp.concatenate([c_state, X], axis=0)
         acc = jnp.zeros((query_len, qkv.shape[-1]), dtype=jnp.float32)
         for k in range(kernel_size):
-            acc += (x_full[k:k + query_len].astype(jnp.float32) *
-                    conv_weight[:, 0, k].astype(jnp.float32)[None, :])
+            acc += (
+                x_full[k : k + query_len].astype(jnp.float32)
+                * conv_weight[:, 0, k].astype(jnp.float32)[None, :]
+            )
         if conv_bias is not None:
             acc += conv_bias.astype(jnp.float32)[None, :]
         conv_out = acc.astype(qkv.dtype)
-        new_conv_state = new_conv_state.at[s].set(x_full[-(kernel_size - 1):])
+        new_conv_state = new_conv_state.at[s].set(x_full[-(kernel_size - 1) :])
         out_mixed_qkv = out_mixed_qkv.at[start:end].set(conv_out)
 
     out_mixed_qkv = jax.nn.silu(out_mixed_qkv)
@@ -143,8 +146,8 @@ def _gdn_attention_ref(
         qkv_seq = out_mixed_qkv[start:end]
         key_dim = n_kq * d_k
         q_seq = qkv_seq[:, :key_dim].reshape(query_len, n_kq, d_k)
-        k_seq = qkv_seq[:, key_dim:key_dim * 2].reshape(query_len, n_kq, d_k)
-        v_seq = qkv_seq[:, key_dim * 2:].reshape(query_len, n_v, d_v)
+        k_seq = qkv_seq[:, key_dim : key_dim * 2].reshape(query_len, n_kq, d_k)
+        v_seq = qkv_seq[:, key_dim * 2 :].reshape(query_len, n_v, d_v)
 
         repeat_factor = n_v // n_kq
         if repeat_factor > 1:
@@ -160,7 +163,8 @@ def _gdn_attention_ref(
 
         beta_seq = jax.nn.sigmoid(b_seq.astype(jnp.float32))
         g_seq = -jnp.exp(a_log.astype(jnp.float32))[None, :] * jax.nn.softplus(
-            a_seq.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :])
+            a_seq.astype(jnp.float32) + dt_bias.astype(jnp.float32)[None, :]
+        )
 
         def step_fn(carry_state, xs):
             q_t, k_t, v_t, beta_t, g_t = xs
@@ -178,14 +182,13 @@ def _gdn_attention_ref(
             k_v_new = jnp.einsum("hd, hm -> hdm", k_t, v_new)
             new_state = carry_state * exp_g[:, None, None] + k_v_new
 
-            return (new_state.astype(recurrent_state.dtype),
-                    out_step.astype(qkv.dtype))
+            return (new_state.astype(recurrent_state.dtype), out_step.astype(qkv.dtype))
 
         final_r_state, out_seq = jax.lax.scan(
-            step_fn, r_state, (q_seq, k_seq, v_seq, beta_seq, g_seq))
+            step_fn, r_state, (q_seq, k_seq, v_seq, beta_seq, g_seq)
+        )
         new_recurrent_state = new_recurrent_state.at[s].set(final_r_state)
-        output = output.at[start:end].set(
-            out_seq.reshape(query_len, n_v * d_v))
+        output = output.at[start:end].set(out_seq.reshape(query_len, n_v * d_v))
 
     return (new_conv_state, new_recurrent_state), output
 
@@ -275,25 +278,36 @@ class TestGDNAttentionV3(CustomTestCase):
                 mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
                 # Fresh slots: seq_lens == query_lens (context_len == 0).
                 seq_lens = jnp.asarray(
-                    q_loc[1:max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32)
+                    q_loc[1 : max_reqs + 1] - q_loc[:max_reqs], dtype=jnp.int32
+                )
 
                 kwargs = dict(
-                    qkv=mixed_qkv, b=b, a=a, conv_state=conv_state,
-                    recurrent_state=recurrent_state, conv_weight=conv_weight,
-                    conv_bias=conv_bias, a_log=a_log, dt_bias=dt_bias,
-                    query_start_loc=q_loc, state_indices=state_indices,
-                    distribution=distribution, seq_lens=seq_lens,
-                    n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=K,
+                    qkv=mixed_qkv,
+                    b=b,
+                    a=a,
+                    conv_state=conv_state,
+                    recurrent_state=recurrent_state,
+                    conv_weight=conv_weight,
+                    conv_bias=conv_bias,
+                    a_log=a_log,
+                    dt_bias=dt_bias,
+                    query_start_loc=q_loc,
+                    state_indices=state_indices,
+                    distribution=distribution,
+                    seq_lens=seq_lens,
+                    n_kq=n_kq,
+                    n_v=n_v,
+                    d_k=d_k,
+                    d_v=d_v,
+                    kernel_size=K,
                 )
 
                 ref_states, ref_out = _gdn_attention_ref(**kwargs)
                 (conv_k, rec_k), out_k = kernel(**kwargs)
 
                 np.testing.assert_allclose(out_k, ref_out, rtol=2e-2, atol=2e-2)
-                np.testing.assert_allclose(
-                    conv_k, ref_states[0], rtol=2e-2, atol=2e-2)
-                np.testing.assert_allclose(
-                    rec_k, ref_states[1], rtol=2e-2, atol=2e-2)
+                np.testing.assert_allclose(conv_k, ref_states[0], rtol=2e-2, atol=2e-2)
+                np.testing.assert_allclose(rec_k, ref_states[1], rtol=2e-2, atol=2e-2)
 
     def test_has_initial_state_zeros_stale_slot(self):
         """A fresh prefill on a stale (non-zero) slot must match a fresh-zero slot."""
@@ -333,23 +347,38 @@ class TestGDNAttentionV3(CustomTestCase):
         seq_lens = jnp.asarray(lengths, dtype=jnp.int32)  # context_len == 0
 
         common = dict(
-            qkv=mixed_qkv, b=b, a=a, conv_weight=conv_weight,
-            conv_bias=conv_bias, a_log=a_log, dt_bias=dt_bias,
-            query_start_loc=q_loc, state_indices=state_indices,
-            distribution=distribution, seq_lens=seq_lens,
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=K,
+            qkv=mixed_qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=q_loc,
+            state_indices=state_indices,
+            distribution=distribution,
+            seq_lens=seq_lens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=K,
         )
 
         (conv_f, rec_f), out_f = kernel(
-            conv_state=conv_zero, recurrent_state=rec_zero, **common)
+            conv_state=conv_zero, recurrent_state=rec_zero, **common
+        )
         (conv_s, rec_s), out_s = kernel(
-            conv_state=conv_stale, recurrent_state=rec_stale, **common)
+            conv_state=conv_stale, recurrent_state=rec_stale, **common
+        )
 
         np.testing.assert_allclose(out_f, out_s, rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(
-            conv_f[1:max_reqs + 1], conv_s[1:max_reqs + 1], rtol=1e-5, atol=1e-5)
+            conv_f[1 : max_reqs + 1], conv_s[1 : max_reqs + 1], rtol=1e-5, atol=1e-5
+        )
         np.testing.assert_allclose(
-            rec_f[1:max_reqs + 1], rec_s[1:max_reqs + 1], rtol=1e-5, atol=1e-5)
+            rec_f[1 : max_reqs + 1], rec_s[1 : max_reqs + 1], rtol=1e-5, atol=1e-5
+        )
 
     def test_has_initial_state_preserves_continuation(self):
         """Chunked prefill continued from a slot must match the single-shot prefill."""
@@ -379,29 +408,54 @@ class TestGDNAttentionV3(CustomTestCase):
         rec_zero = jnp.zeros((num_blocks, n_v, d_k, d_v))
 
         static = dict(
-            conv_weight=conv_weight, conv_bias=conv_bias, a_log=a_log,
-            dt_bias=dt_bias, state_indices=state_indices,
-            n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=K,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            state_indices=state_indices,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=K,
         )
 
         (_, _), out_ref = kernel(
-            qkv=mixed, b=b, a=a, conv_state=conv_zero,
-            recurrent_state=rec_zero, query_start_loc=jnp.array([0, full]),
+            qkv=mixed,
+            b=b,
+            a=a,
+            conv_state=conv_zero,
+            recurrent_state=rec_zero,
+            query_start_loc=jnp.array([0, full]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-            seq_lens=jnp.array([full], dtype=jnp.int32), **static)
+            seq_lens=jnp.array([full], dtype=jnp.int32),
+            **static,
+        )
 
         (conv_a, rec_a), out_a = kernel(
-            qkv=mixed[:half], b=b[:half], a=a[:half], conv_state=conv_zero,
-            recurrent_state=rec_zero, query_start_loc=jnp.array([0, half]),
+            qkv=mixed[:half],
+            b=b[:half],
+            a=a[:half],
+            conv_state=conv_zero,
+            recurrent_state=rec_zero,
+            query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-            seq_lens=jnp.array([half], dtype=jnp.int32), **static)
+            seq_lens=jnp.array([half], dtype=jnp.int32),
+            **static,
+        )
 
         # context_len = full - half > 0 => has_initial_state = True.
         (_, _), out_b = kernel(
-            qkv=mixed[half:], b=b[half:], a=a[half:], conv_state=conv_a,
-            recurrent_state=rec_a, query_start_loc=jnp.array([0, half]),
+            qkv=mixed[half:],
+            b=b[half:],
+            a=a[half:],
+            conv_state=conv_a,
+            recurrent_state=rec_a,
+            query_start_loc=jnp.array([0, half]),
             distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
-            seq_lens=jnp.array([full], dtype=jnp.int32), **static)
+            seq_lens=jnp.array([full], dtype=jnp.int32),
+            **static,
+        )
 
         np.testing.assert_allclose(out_a, out_ref[:half], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(out_b, out_ref[half:], rtol=2e-2, atol=2e-2)

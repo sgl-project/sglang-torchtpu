@@ -82,9 +82,7 @@ class TestTpuMambaPool(CustomTestCase):
         conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
         # dense layer index 0 corresponds to global layer id LAYERS[0].
         per = pool.mamba2_layer_cache(0)
-        self.assertEqual(
-            list(per.conv[0].shape), [self.SIZE + 1, self.K - 1, conv_dim]
-        )
+        self.assertEqual(list(per.conv[0].shape), [self.SIZE + 1, self.K - 1, conv_dim])
         self.assertEqual(
             list(per.temporal.shape), [self.SIZE + 1, self.N_V, self.D_K, self.D_V]
         )
