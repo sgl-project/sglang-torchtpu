@@ -1,15 +1,21 @@
+"""Qwen3-Coder-30B-A3B-Instruct-FP8 single-host e2e accuracy via lm-eval.
+
+Converted to the run_combined_tests shape: this file declares config and gates only.
+
+The gate is unchanged. Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml remains the single
+source of truth for the mmlu_llama / mmlu_pro ground truths and tolerances, and stays
+on lm-eval because mmlu_pro has no simple-evals equivalent and mmlu_llama's few-shot
+protocol is what the reference values were measured with.
+"""
+
 import os
-import subprocess
-import time
 import unittest
 from pathlib import Path
 
-import requests
-
-from sglang.srt.utils import kill_process_tree
+from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.kits.lm_eval_kit import LMEvalMixin
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.run_combined_tests import run_combined_tests
+from sglang.test.tpu import RecipeLauncher, TpuModelLaunchSettings, lm_eval_runner
 
 register_tpu_ci(
     est_time=3600,
@@ -19,66 +25,53 @@ register_tpu_ci(
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TPU_BENCH_DIR = REPO_ROOT / "benchmark" / "tpu"
+LAUNCH_SCRIPT = TPU_BENCH_DIR / "launch_server.sh"
+
+MODEL_PATH = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
+LM_EVAL_CONFIG = "test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml"
+BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
+HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
+
+LAUNCH_ENV = {
+    "MODEL": MODEL_PATH,
+    "TP_SIZE": "8",
+    "EP_SIZE": "8",
+    "PAGE_SIZE": "128",
+    "CONTEXT_LEN": "8192",
+    "CHUNKED_PREFILL_SIZE": "4096",
+    "MAX_PREFILL_TOKENS": "4096",
+    "MAX_TOTAL_TOKENS": "262144",
+    "MEM_FRACTION_STATIC": "0.30",
+    "MAX_RUNNING": "64",
+    "TORCH_COMPILE_MAX_BS": "64",
+    "ENABLE_PROFILER_ENDPOINT": "0",
+    "PYTHON": "python3",
+}
 
 
-class TestQwen3CoderFP8TPULMEval(LMEvalMixin, CustomTestCase):
-    model = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"
-    model_config_name = "test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml"
-    base_url = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
-    health_timeout = int(os.environ.get("HEALTH_TIMEOUT", "1800"))
-    process = None
-
-    @classmethod
-    def setUpClass(cls):
-        if os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1":
-            cls._wait_for_health()
-            return
-
-        env = os.environ.copy()
-        env.setdefault("MODEL", cls.model)
-        env.setdefault("TP_SIZE", "8")
-        env.setdefault("EP_SIZE", "8")
-        env.setdefault("PAGE_SIZE", "128")
-        env.setdefault("CONTEXT_LEN", "8192")
-        env.setdefault("CHUNKED_PREFILL_SIZE", "4096")
-        env.setdefault("MAX_PREFILL_TOKENS", "4096")
-        env.setdefault("MAX_TOTAL_TOKENS", "262144")
-        env.setdefault("MEM_FRACTION_STATIC", "0.30")
-        env.setdefault("MAX_RUNNING", "64")
-        env.setdefault("TORCH_COMPILE_MAX_BS", "64")
-        env.setdefault("ENABLE_PROFILER_ENDPOINT", "0")
-        env.setdefault("PYTHON", "python3")
-
-        cls.process = subprocess.Popen(
-            ["bash", str(TPU_BENCH_DIR / "launch_server.sh")],
-            cwd=TPU_BENCH_DIR,
-            env=env,
+class TestQwen3CoderFP8TPULMEval(unittest.TestCase):
+    def test_qwen3_coder_fp8_accuracy(self):
+        model = TpuModelLaunchSettings(
+            MODEL_PATH,
+            launcher=RecipeLauncher(
+                str(LAUNCH_SCRIPT),
+                env=LAUNCH_ENV,
+                cwd=str(TPU_BENCH_DIR),
+                health_timeout=HEALTH_TIMEOUT,
+            ),
+            tp_size=8,
+            variant="TP8+EP8",
         )
-        cls._wait_for_health()
 
-    @classmethod
-    def tearDownClass(cls):
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid, wait_timeout=60)
-            cls.process = None
-
-    @classmethod
-    def _wait_for_health(cls):
-        start = time.perf_counter()
-        while time.perf_counter() - start < cls.health_timeout:
-            if cls.process is not None and cls.process.poll() is not None:
-                raise RuntimeError(
-                    f"TPU server exited with code {cls.process.returncode}"
-                )
-            try:
-                response = requests.get(cls.base_url + "/health", timeout=10)
-                if response.status_code == 200:
-                    return
-            except requests.RequestException:
-                pass
-            time.sleep(5)
-        raise TimeoutError(
-            f"{cls.base_url}/health did not return 200 within " f"{cls.health_timeout}s"
+        run_combined_tests(
+            models=[model],
+            test_name="Qwen3-Coder-30B-A3B-Instruct-FP8",
+            base_url=BASE_URL,
+            accuracy_params=AccuracyTestParams(
+                dataset="mmlu_llama+mmlu_pro",
+                label="lm_eval",
+                runner=lm_eval_runner(LM_EVAL_CONFIG),
+            ),
         )
 
 

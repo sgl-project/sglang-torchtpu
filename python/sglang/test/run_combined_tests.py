@@ -1,5 +1,5 @@
 import time
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from sglang.test.accuracy_test_runner import (
     AccuracyTestParams,
@@ -26,7 +26,9 @@ def run_combined_tests(
     test_name: str = "NightlyTest",
     base_url: Optional[str] = None,
     is_vlm: bool = False,
-    accuracy_params: Optional[AccuracyTestParams] = None,
+    accuracy_params: Optional[
+        Union[AccuracyTestParams, List[AccuracyTestParams]]
+    ] = None,
     performance_params: Optional[PerformanceTestParams] = None,
     tool_call_params: Optional[ToolCallTestParams] = None,
 ) -> dict:
@@ -37,7 +39,9 @@ def run_combined_tests(
         test_name: Name for the test (used in reports)
         base_url: Server base URL (default: DEFAULT_URL_FOR_TEST)
         is_vlm: Whether these are VLM models (affects defaults)
-        accuracy_params: Parameters for accuracy tests (None to skip accuracy)
+        accuracy_params: Parameters for accuracy tests -- one AccuracyTestParams,
+            or a list to gate several datasets against the same server. None to
+            skip accuracy.
         performance_params: Parameters for performance tests (None to skip perf)
         tool_call_params: Parameters for tool call tests (None to skip tool call)
 
@@ -49,7 +53,7 @@ def run_combined_tests(
                 {
                     "model": str,
                     "perf_result": PerformanceTestResult/None,
-                    "accuracy_result": AccuracyTestResult/None,
+                    "accuracy_results": [AccuracyTestResult, ...],
                     "errors": list,
                 },
                 ...
@@ -61,12 +65,20 @@ def run_combined_tests(
     run_accuracy = accuracy_params is not None
     run_tool_call = tool_call_params is not None
 
+    accuracy_param_list: List[AccuracyTestParams] = []
+    if run_accuracy:
+        accuracy_param_list = (
+            [accuracy_params]
+            if isinstance(accuracy_params, AccuracyTestParams)
+            else list(accuracy_params)
+        )
+
     # Print test header
     print("\n" + "=" * 80)
     print(f"RUNNING: {test_name}")
     print(f"  Models: {len(models)}")
     if run_accuracy:
-        print(f"  Accuracy dataset: {accuracy_params.dataset}")
+        print(f"  Accuracy evals: {', '.join(p.name for p in accuracy_param_list)}")
     if run_perf:
         print(f"  Performance batches: {performance_params.batch_sizes}")
     if run_tool_call:
@@ -106,7 +118,7 @@ def run_combined_tests(
             "model": model.model_path,
             "variant": model.variant,
             "perf_result": None,
-            "accuracy_result": None,
+            "accuracy_results": [],
             "tool_call_result": None,
             "errors": [],
         }
@@ -132,17 +144,19 @@ def run_combined_tests(
             print("\nWaiting 20 seconds for resource cleanup...")
             time.sleep(20)
 
-        # Run accuracy test
+        # Run accuracy tests. Each call brings the server up; a model config
+        # supplying a keep-alive launcher pays that cost only once.
         if run_accuracy:
-            acc_result: AccuracyTestResult = run_accuracy_test(
-                model=model,
-                params=accuracy_params,
-                base_url=base_url,
-            )
-            model_result["accuracy_result"] = acc_result
-            if not acc_result.passed:
-                all_passed = False
-                model_result["errors"].append(acc_result.error)
+            for acc_params in accuracy_param_list:
+                acc_result: AccuracyTestResult = run_accuracy_test(
+                    model=model,
+                    params=acc_params,
+                    base_url=base_url,
+                )
+                model_result["accuracy_results"].append(acc_result)
+                if not acc_result.passed:
+                    all_passed = False
+                    model_result["errors"].append(acc_result.error)
 
             # Wait for GPU memory and port cleanup
             print("\nWaiting 20 seconds for resource cleanup...")
@@ -171,19 +185,26 @@ def run_combined_tests(
 
     # Write accuracy results to GitHub summary if in CI
     if run_accuracy and is_in_ci():
-        accuracy_results = [
-            r["accuracy_result"] for r in all_results if r["accuracy_result"]
-        ]
-        write_accuracy_github_summary(
-            test_name, accuracy_params.dataset, accuracy_results
-        )
+        # One table per eval, so a multi-dataset gate stays readable.
+        for acc_params in accuracy_param_list:
+            per_eval = [
+                acc
+                for r in all_results
+                for acc in r["accuracy_results"]
+                if acc.dataset == acc_params.name
+            ]
+            if per_eval:
+                write_accuracy_github_summary(test_name, acc_params.name, per_eval)
 
     # Print summary
     print("\n" + "=" * 60)
     print(f"{test_name} Results Summary")
-    if run_accuracy:
-        print(f"Dataset: {accuracy_params.dataset}")
-        print(f"Baseline: {accuracy_params.baseline_accuracy}")
+    for acc_params in accuracy_param_list:
+        floor = acc_params.floor
+        print(
+            f"Eval {acc_params.name}: "
+            + ("gated by its runner" if floor is None else f"floor {floor:.4f}")
+        )
     print("=" * 60)
     for i, model_result in enumerate(all_results):
         print(f"\nModel {i + 1}: {model_result['model']}")
@@ -202,11 +223,12 @@ def run_combined_tests(
             print(
                 f"  Performance: {'PASS' if perf.passed else 'FAIL'}{throughput_str}{accept_str}"
             )
-        if run_accuracy and model_result["accuracy_result"]:
-            acc = model_result["accuracy_result"]
-            print(f"  Accuracy: {'PASS' if acc.passed else 'FAIL'}")
-            if acc.score is not None:
-                print(f"  Score: {acc.score:.3f}")
+        for acc in model_result["accuracy_results"]:
+            score_str = f"  score: {acc.score:.4f}" if acc.score is not None else ""
+            print(
+                f"  Accuracy [{acc.dataset}]: "
+                f"{'PASS' if acc.passed else 'FAIL'}{score_str}"
+            )
         if run_tool_call and model_result["tool_call_result"]:
             tc = model_result["tool_call_result"]
             print(
@@ -226,9 +248,12 @@ def run_combined_tests(
         for i, r in enumerate(all_results):
             # Check for errors OR any failed test result (handles edge case where
             # a test fails but error is None/empty)
+            failed_accuracy = [
+                acc for acc in r.get("accuracy_results") or [] if not acc.passed
+            ]
             has_failed_test = (
                 (r.get("perf_result") and not r["perf_result"].passed)
-                or (r.get("accuracy_result") and not r["accuracy_result"].passed)
+                or bool(failed_accuracy)
                 or (r.get("tool_call_result") and not r["tool_call_result"].passed)
             )
             if r["errors"] or has_failed_test:
@@ -236,8 +261,8 @@ def run_combined_tests(
                 failed_tests = []
                 if r.get("perf_result") and not r["perf_result"].passed:
                     failed_tests.append("performance")
-                if r.get("accuracy_result") and not r["accuracy_result"].passed:
-                    failed_tests.append("accuracy")
+                for acc in failed_accuracy:
+                    failed_tests.append(f"accuracy ({acc.dataset})")
                 if r.get("tool_call_result") and not r["tool_call_result"].passed:
                     tc = r["tool_call_result"]
                     failed_tests.append(f"tool_call ({tc.num_passed}/{tc.num_total})")

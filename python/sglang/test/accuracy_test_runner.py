@@ -1,6 +1,7 @@
+import contextlib
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -19,7 +20,7 @@ class AccuracyTestParams:
     """Parameters for accuracy testing."""
 
     dataset: str  # e.g., "mgsm_en", "gsm8k", "mmmu", "gpqa"
-    baseline_accuracy: float  # Required: minimum accuracy threshold
+    baseline_accuracy: Optional[float] = None  # None only if `runner` self-gates
     num_examples: Optional[int] = None
     num_threads: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -31,6 +32,23 @@ class AccuracyTestParams:
     top_k: Optional[int] = None
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
+    atol: float = 0.0  # floor = baseline_accuracy - atol
+    # Replaces the dataset dispatch, so a caller can plug in a harness this module
+    # has no dependency on. Returning "_passed" means it gated itself and
+    # baseline_accuracy/atol are ignored.
+    runner: Optional[Callable[[str], dict]] = None
+    extra_eval_args: Optional[dict] = None  # merged into run_eval's namespace
+    label: Optional[str] = None  # display/metric name; defaults to `dataset`
+
+    @property
+    def name(self) -> str:
+        return self.label or self.dataset
+
+    @property
+    def floor(self) -> Optional[float]:
+        if self.baseline_accuracy is None:
+            return None
+        return self.baseline_accuracy - self.atol
 
 
 @dataclass
@@ -41,7 +59,7 @@ class AccuracyTestResult:
     dataset: str
     passed: bool
     score: Optional[float]
-    baseline_accuracy: float
+    baseline_accuracy: Optional[float]
     error: Optional[str]
     latency: Optional[float] = None
     variant: Optional[str] = None
@@ -66,13 +84,45 @@ def write_accuracy_github_summary(
     for result in results:
         status_emoji = "✅" if result.passed else "❌"
         score_str = f"{result.score:.4f}" if result.score is not None else "N/A"
-        baseline_str = f"{result.baseline_accuracy:.4f}"
+        baseline_str = (
+            f"{result.baseline_accuracy:.4f}"
+            if result.baseline_accuracy is not None
+            else "from config"
+        )
         error_str = result.error if result.error else "-"
         # Use variant name if available, otherwise use model path
         config_name = result.variant if result.variant else result.model
         summary += f"| {config_name} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
 
     write_github_step_summary(summary)
+
+
+@contextlib.contextmanager
+def served(model: ModelLaunchSettings, base_url: str):
+    """Bring up the server for `model`, yield, then tear it down.
+
+    A model config may supply a `launcher` attribute -- a callable returning a
+    context manager -- to take over bring-up, for servers that a plain
+    `popen_launch_server` argv cannot start (a shell script that must export
+    environment before exec, or one an external orchestrator already started).
+    """
+    launcher = getattr(model, "launcher", None)
+    if launcher is not None:
+        with launcher(base_url):
+            yield
+        return
+
+    process = popen_launch_server(
+        model.model_path,
+        base_url,
+        other_args=model.extra_args,
+        timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        env=model.env,
+    )
+    try:
+        yield
+    finally:
+        kill_process_tree(process.pid)
 
 
 def _run_simple_eval(
@@ -89,22 +139,14 @@ def _run_simple_eval(
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
     api: Optional[str] = None,
+    extra_eval_args: Optional[dict] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
     Returns:
         Tuple of (success, error_message, metrics_dict)
     """
-    process = None
     try:
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
-
         args = SimpleNamespace(
             base_url=base_url,
             model=model.model_path,
@@ -137,6 +179,9 @@ def _run_simple_eval(
         if repeat is not None:
             args.repeat = repeat
 
+        for key, value in (extra_eval_args or {}).items():
+            setattr(args, key, value)
+
         result = run_eval(args)
 
         # Handle result format (run_eval can return metrics or (metrics, latency))
@@ -150,10 +195,6 @@ def _run_simple_eval(
 
     except Exception as e:
         return False, f"Accuracy test exception: {str(e)}", None
-
-    finally:
-        if process:
-            kill_process_tree(process.pid)
 
 
 # Cached uv venv for NeMo Skills (persists across variants within a process).
@@ -270,7 +311,6 @@ def _run_nemo_skills_eval(
     import subprocess
     import tempfile
 
-    process = None
     try:
         # Get or create the shared venv (once per process)
         venv_python, env = _get_nemo_venv()
@@ -279,14 +319,6 @@ def _run_nemo_skills_eval(
         ok, err = _ensure_nemo_data_prepared(venv_python, env, dataset)
         if not ok:
             return False, err, None
-
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
 
         port = int(base_url.split(":")[-1])
         server_address = f"http://127.0.0.1:{port}/v1"
@@ -442,9 +474,57 @@ def _run_nemo_skills_eval(
         return False, "NeMo Skills eval timed out", None
     except Exception as e:
         return False, f"NeMo Skills eval exception: {str(e)}", None
-    finally:
-        if process:
-            kill_process_tree(process.pid)
+
+
+def _dispatch_eval(
+    model: ModelLaunchSettings,
+    params: AccuracyTestParams,
+    base_url: str,
+) -> Tuple[bool, Optional[str], Optional[dict]]:
+    """Pick the evaluation backend for `params` and run it against a live server.
+
+    - caller-supplied runner: takes over completely (see AccuracyTestParams.runner)
+    - NeMo Skills: mmmu-pro (and other VLM evals needing ns eval)
+    - simple_eval: everything else (gsm8k, gpqa, mmlu, mmmu, etc.)
+    """
+    if params.runner is not None:
+        try:
+            metrics = params.runner(base_url)
+            # Returning a bare score is the obvious thing to write, and treating it
+            # as a dict fails much later with a confusing AttributeError.
+            if isinstance(metrics, (int, float)):
+                metrics = {"score": float(metrics)}
+            return True, None, metrics
+        except Exception as e:
+            return False, f"Runner exception: {str(e)}", None
+
+    if params.dataset in ("mmmu-pro", "mmmu_pro"):
+        return _run_nemo_skills_eval(
+            model=model,
+            base_url=base_url,
+            dataset="mmmu-pro",
+            max_tokens=params.max_tokens,
+            repeat=params.repeat or 1,
+            temperature=params.temperature,
+            top_p=params.top_p,
+        )
+
+    return _run_simple_eval(
+        model=model,
+        base_url=base_url,
+        dataset=params.dataset,
+        num_examples=params.num_examples,
+        num_threads=params.num_threads,
+        max_tokens=params.max_tokens,
+        return_latency=params.return_latency,
+        thinking_mode=params.thinking_mode,
+        temperature=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        repeat=params.repeat,
+        api=params.api,
+        extra_eval_args=params.extra_eval_args,
+    )
 
 
 def run_accuracy_test(
@@ -466,45 +546,19 @@ def run_accuracy_test(
 
     print(f"\n{'='*60}")
     print(f"Running ACCURACY test for {model.model_path}")
-    print(f"  Dataset: {params.dataset}")
-    print(f"  Baseline: {params.baseline_accuracy}")
+    print(f"  Eval: {params.name}")
+    if params.floor is not None:
+        print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
     print(f"{'='*60}\n")
 
-    # Run evaluation based on dataset type
-    # - NeMo Skills: mmmu-pro (and other VLM evals needing ns eval)
-    # - simple_eval: everything else (gsm8k, gpqa, mmlu, mmmu, etc.)
-    if params.dataset in ("mmmu-pro", "mmmu_pro"):
-        success, error, metrics = _run_nemo_skills_eval(
-            model=model,
-            base_url=base_url,
-            dataset="mmmu-pro",
-            max_tokens=params.max_tokens,
-            repeat=params.repeat or 1,
-            temperature=params.temperature,
-            top_p=params.top_p,
-        )
-    else:
-        success, error, metrics = _run_simple_eval(
-            model=model,
-            base_url=base_url,
-            dataset=params.dataset,
-            num_examples=params.num_examples,
-            num_threads=params.num_threads,
-            max_tokens=params.max_tokens,
-            return_latency=params.return_latency,
-            thinking_mode=params.thinking_mode,
-            temperature=params.temperature,
-            top_p=params.top_p,
-            top_k=params.top_k,
-            repeat=params.repeat,
-            api=params.api,
-        )
+    with served(model, base_url):
+        success, error, metrics = _dispatch_eval(model, params, base_url)
 
     if not success:
         print(f"✗ Accuracy test failed for {model.model_path}: {error}")
         return AccuracyTestResult(
             model=model.model_path,
-            dataset=params.dataset,
+            dataset=params.name,
             passed=False,
             score=None,
             baseline_accuracy=params.baseline_accuracy,
@@ -512,25 +566,35 @@ def run_accuracy_test(
             variant=model.variant,
         )
 
-    # Validate against baseline
-    # Handle different metric key names: "score", "mean_score" (for GPQA with repeat), "accuracy"
-    score = (
-        metrics.get("score")
-        or metrics.get("mean_score")
-        or metrics.get("accuracy", 0.0)
-    )
-    passed = score >= params.baseline_accuracy
+    # Handle different metric key names: "score", "mean_score" (for GPQA with
+    # repeat), "accuracy". `is not None` so a legitimate 0.0 is not skipped.
+    score = metrics.get("score")
+    if score is None:
+        score = metrics.get("mean_score")
+    if score is None:
+        score = metrics.get("accuracy", 0.0)
     latency = metrics.get("latency")
 
-    if passed:
-        print(f"✓ Accuracy {score:.3f} >= baseline {params.baseline_accuracy:.3f}")
+    if "_passed" in metrics:
+        # The runner gated itself (it owns thresholds we cannot see from here).
+        passed = metrics["_passed"]
+        error = None if passed else "; ".join(metrics.get("_failures") or [])
+        print(f"{'✓' if passed else '✗'} {params.name}: {error or 'all floors met'}")
     else:
-        error = f"Accuracy {score:.3f} below baseline {params.baseline_accuracy:.3f}"
-        print(f"✗ {error}")
+        floor = params.floor
+        passed = score >= floor
+        if passed:
+            print(f"✓ {params.name}: {score:.4f} >= floor {floor:.4f}")
+        else:
+            error = (
+                f"{params.name}: {score:.4f} below floor {floor:.4f} "
+                f"(baseline {params.baseline_accuracy} - atol {params.atol})"
+            )
+            print(f"✗ {error}")
 
     return AccuracyTestResult(
         model=model.model_path,
-        dataset=params.dataset,
+        dataset=params.name,
         passed=passed,
         score=score,
         baseline_accuracy=params.baseline_accuracy,

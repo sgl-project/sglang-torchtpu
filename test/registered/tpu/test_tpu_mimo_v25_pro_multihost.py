@@ -1,5 +1,9 @@
 """MiMo-V2.5-Pro (1T MoE, blockwise-fp8) multi-host e2e lm-eval (live-server mode).
 
+Converted to the run_combined_tests shape. Because the JobSet -- not this file --
+brings the server up, the model config supplies an ExternalServerLauncher, so the
+shared runner waits for /health_generate and never launches or kills anything.
+
 Its MULTIHOST_LAUNCH forms its own launch group: recipe/mimo_v25_pro_mh.sh on 2 hosts.
 The recipe mirrors the E2E-validated DP-attention config from
 recipe/mimo/launch_mimo_25_pro_multihost.sh (PR #155): tp=16, ep=16, dp=2 ->
@@ -16,18 +20,22 @@ attn_tp=8, validated in PR #155).
 
 Asserts real accuracy: lm-eval mmlu_llama 5-shot (limit=100) against
 test/lm_eval_configs/MiMo-V2.5-Pro-TPU.yaml -- ground truth is the model card's
-official 5-shot MMLU (89.4) with the agreed 3-point absolute tolerance.
+official 5-shot MMLU (89.4) with the agreed 3-point absolute tolerance, and the YAML
+stays the only place those numbers live.
 """
 
 import os
-import time
 import unittest
 
-import requests
-
+from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.kits.lm_eval_kit import LMEvalMixin
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
+from sglang.test.run_combined_tests import run_combined_tests
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
+from sglang.test.tpu import (
+    ExternalServerLauncher,
+    TpuModelLaunchSettings,
+    lm_eval_runner,
+)
 
 register_tpu_ci(est_time=5400, suite="nightly-tpu-multihost", nightly=True)
 
@@ -38,51 +46,42 @@ MULTIHOST_LAUNCH = {
     "weights_pvc": "model-weights-rox",
 }
 
+MODEL_PATH = "XiaomiMiMo/MiMo-V2.5-Pro"
+LM_EVAL_CONFIG = "test/lm_eval_configs/MiMo-V2.5-Pro-TPU.yaml"
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
-HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
+# The JobSet's rank-0 already gated on /health_generate; this recheck keeps the file
+# runnable by hand against any live server (BASE_URL=... HEALTH_TIMEOUT=...).
+HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "600"))
 
 
 @unittest.skipUnless(
     os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
     "multi-host live-server not provided (the JobSet launches the server)",
 )
-class TestTpuMiMoV25ProLMEval(LMEvalMixin, CustomTestCase):
+class TestTpuMiMoV25ProLMEval(unittest.TestCase):
     """lm-eval accuracy against the 2-host DP-attention MiMo-V2.5-Pro server."""
 
-    model = "XiaomiMiMo/MiMo-V2.5-Pro"
-    model_config_name = "test/lm_eval_configs/MiMo-V2.5-Pro-TPU.yaml"
-    base_url = BASE_URL
+    def test_mimo_v25_pro_accuracy(self):
+        model = TpuModelLaunchSettings(
+            MODEL_PATH,
+            launcher=ExternalServerLauncher(
+                health_timeout=HEALTH_TIMEOUT, tag="mimo-e2e"
+            ),
+            # tp=16 across 2 hosts, but the JobSet owns the launch, so this is
+            # recorded for reporting only -- no flags are derived from it here.
+            tp_size=16,
+            variant="2host-TP16+EP16+DP2",
+        )
 
-    @classmethod
-    def setUpClass(cls):
-        # The JobSet's rank-0 already gated on /health_generate; this recheck keeps
-        # the file runnable by hand against any live server (BASE_URL=... HEALTH_TIMEOUT=...).
-        start = time.perf_counter()
-        last_note = start
-        deadline = start + HEALTH_TIMEOUT
-        while time.perf_counter() < deadline:
-            try:
-                response = requests.get(cls.base_url + "/health", timeout=10)
-                if response.status_code == 200:
-                    print(
-                        f"[mimo-e2e] server healthy after "
-                        f"{time.perf_counter() - start:.0f}s; starting lm-eval "
-                        f"MMLU 5-shot (~5.7k requests)",
-                        flush=True,
-                    )
-                    return
-            except requests.RequestException:
-                pass
-            if time.perf_counter() - last_note >= 60:
-                last_note = time.perf_counter()
-                print(
-                    f"[mimo-e2e] waiting for live server at {cls.base_url} "
-                    f"({time.perf_counter() - start:.0f}s elapsed)",
-                    flush=True,
-                )
-            time.sleep(5)
-        raise TimeoutError(
-            f"{cls.base_url}/health did not return 200 within {HEALTH_TIMEOUT}s"
+        run_combined_tests(
+            models=[model],
+            test_name="MiMo-V2.5-Pro-multihost",
+            base_url=BASE_URL,
+            accuracy_params=AccuracyTestParams(
+                dataset="mmlu_llama",
+                label="lm_eval",
+                runner=lm_eval_runner(LM_EVAL_CONFIG),
+            ),
         )
 
 
