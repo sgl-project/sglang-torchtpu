@@ -116,6 +116,7 @@ def cpu_export_jax_op(
         function,
         static_argnums=static_argnums,
         donate_argnums=donate_argnums_tuple,
+        keep_unused=True,
         **jit_kwargs,
     )
     trace_key = pallas_impl._get_kernel_invocation_key(

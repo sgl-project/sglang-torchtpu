@@ -329,7 +329,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
         "requires JAX and TorchTPU",
     )
-    def test_cpu_export_jax_op_executes_registered_kernel(self):
+    def test_cpu_export_jax_op_preserves_unused_input(self):
         script = textwrap.dedent("""
             import json
             import os
@@ -346,7 +346,7 @@ class TestPallasExportEnvironment(CustomTestCase):
                 cpu_export_jax_op,
             )
 
-            def add_one(x: jax.Array) -> jax.Array:
+            def add_one(x: jax.Array, unused: jax.Array) -> jax.Array:
                 return x + 1
 
             op = cpu_export_jax_op(
@@ -354,7 +354,9 @@ class TestPallasExportEnvironment(CustomTestCase):
                 add_one,
             )
             x = torch.arange(8, dtype=torch.float32, device="tpu")
-            y = op(x)
+            # Torch keeps both operands, so JAX must not remove this one.
+            unused = torch.zeros(8, dtype=torch.float32, device="tpu")
+            y = op(x, unused)
             torch.tpu.synchronize()
             print(
                 json.dumps(
