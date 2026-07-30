@@ -175,6 +175,20 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
+    # TPU has no recurrent-state copy-on-write (TpuMambaPool.copy_from raises),
+    # so the mamba radix cache's prefix-branch copy would crash mid-request.
+    # Disable radix cache for hybrid SSM/GDN models on TPU up front rather than
+    # relying on the operator to pass --disable-radix-cache.
+    from sglang.srt.platforms import current_platform
+
+    if is_hybrid_ssm and current_platform.is_tpu() and not disable_radix_cache:
+        logger.warning(
+            "Radix cache is disabled for hybrid SSM/GDN models on TPU: "
+            "recurrent (conv/ssm) state cannot be copy-on-written for prefix "
+            "caching yet."
+        )
+        disable_radix_cache = True
+
     # Decode radix cache is unsupported with hybrid SWA/SSM models —
     # these use specialized memory pools incompatible with the
     # prefix-match-and-lock allocation path.

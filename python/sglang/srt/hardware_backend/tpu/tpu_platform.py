@@ -217,6 +217,13 @@ class TpuSRTPlatform(SRTPlatform):
 
         return MHATokenToKVPool
 
+    def get_mamba_pool_cls(self) -> type:
+        # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
+        # in a TPU-native, Pallas-kernel-layout pool.
+        from sglang.srt.hardware_backend.tpu.mamba_pool import TpuMambaPool
+
+        return TpuMambaPool
+
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
         from sglang.srt.mem_cache.memory_pool_host import (

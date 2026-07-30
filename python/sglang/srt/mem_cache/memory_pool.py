@@ -910,7 +910,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
     ):
-        self.mamba_pool = MambaPool(
+        mamba_pool_cls = current_platform.get_mamba_pool_cls()
+        self.mamba_pool = mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
@@ -2543,7 +2544,9 @@ class HybridLinearKVPool(KVCache):
         elif not use_mla:
             TokenToKVPoolClass = MHATokenToKVPool
 
-            if current_platform.is_out_of_tree():
+            # TPU is a known-enum platform (is_out_of_tree() is False) but still
+            # overrides the MHA pool class (fused RPA-v3 layout), so include it.
+            if current_platform.is_out_of_tree() or current_platform.is_tpu():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
             elif _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -2666,6 +2669,12 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_kv_buffer(layer_id)
+
+    def get_fused_kv_buffer(self, layer_id: int):
+        # TPU fused-KV layout (TpuFusedMHATokenToKVPool + RPA v3 backend).
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_fused_kv_buffer(layer_id)
 
     @contextmanager
     def _transfer_id_context(self, layer: RadixAttention):
