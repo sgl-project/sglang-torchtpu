@@ -33,6 +33,7 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self.device = req_to_token.device
         self.page_size = page_size
         self.speculative_step_id = speculative_step_id
+        self.max_context_len = req_to_token.shape[1]
         self.req_to_token_pool = types.SimpleNamespace(req_to_token=req_to_token)
         self.forward_metadata = None
         self._op = None
