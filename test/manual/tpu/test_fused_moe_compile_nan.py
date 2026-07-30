@@ -19,10 +19,6 @@ Run:
 
 from __future__ import annotations
 
-from sglang.test.ci.ci_register import register_tpu_ci
-
-register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
-
 import importlib.util
 import os
 import unittest
@@ -70,19 +66,20 @@ class TestFusedMoeCompileNaN(unittest.TestCase):
 
     def _weights(self):
         from sglang.srt.layers.quantization.mxfp4_tpu_util import (
-            process_gpt_oss_mxfp4_weights_native,
+            process_mxfp4_moe_weights_native,
         )
 
         layer = _mxfp4_native._build_synthetic_hf_gpt_oss_layer(
             E, HIDDEN, INTERMEDIATE, seed=0
         )
-        w = process_gpt_oss_mxfp4_weights_native(
+        w = process_mxfp4_moe_weights_native(
             layer["gate_up_proj_blocks"],
             layer["gate_up_proj_scales"],
             layer["gate_up_proj_bias"],
             layer["down_proj_blocks"],
             layer["down_proj_scales"],
             layer["down_proj_bias"],
+            w13_interleaved=True,
         )
         return [t.to("tpu") for t in w]
 
