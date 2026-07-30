@@ -1,0 +1,76 @@
+# TPU feature-combination e2e -- both layers of test/manual/tpu/feature_combo/,
+# via _tpu-test's exec mode:
+#   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, pr-gate host)
+#   multihost-combo-test-{pd,spec}: P/D and spec rows across the 2x2x2 slice
+# The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
+# trigger:
+#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] [-f ref=<branch>]
+name: Combo Test (TPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      target:
+        description: "Which combo layer/row to run"
+        required: false
+        default: all
+        type: choice
+        options: [all, singlehost, multihost, pd, spec]
+
+concurrency:
+  group: tpu-combo
+  cancel-in-progress: false   # let a running combo finish; don't stack them
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  singlehost-combo:
+    needs: build
+    if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
+    name: singlehost-combo-test
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 1
+      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
+      run_name: singlehost-combo-test
+    permissions:
+      contents: read
+      id-token: write
+
+  multihost-combo:
+    needs: build
+    if: ${{ contains(fromJSON('["all","multihost","pd","spec"]'), inputs.target || 'all') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # matrix context is unavailable in job-level `if`; selection shapes the matrix.
+        row: ${{ (inputs.target == 'pd' && fromJSON('["pd"]')) || (inputs.target == 'spec' && fromJSON('["spec"]')) || fromJSON('["pd","spec"]') }}
+    name: multihost-combo-test-${{ matrix.row }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 2
+      # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
+      # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
+      exec_cmd: >-
+        ${{ matrix.row == 'pd'
+            && 'env MODEL=/weights/Qwen3-30B-A3B-FP8 python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
+            || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
+      weights_pvc: model-weights-rox
+      run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write

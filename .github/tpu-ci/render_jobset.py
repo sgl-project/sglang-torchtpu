@@ -115,6 +115,9 @@ def main():
     ap.add_argument("--suite", default="")  # single-host mode
     ap.add_argument("--launch-script", default="")  # multi-host mode
     ap.add_argument("--files", default="")  # multi-host: space-separated
+    # Exec mode: every host runs this command; pod exit codes gate the JobSet.
+    # Plain words only -- the command is inlined into the pod script unquoted.
+    ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--name", default="")  # multi-host run label
@@ -144,9 +147,17 @@ def main():
         suite = ""
         if not a.files:
             sys.exit("multi-host mode needs --files")
+    elif a.exec_cmd:
+        if a.hosts < 1:
+            ap.error("--hosts must be a positive integer for exec mode")
+        hosts = a.hosts
+        run_name = dns_safe(a.name or "exec")
+        suite = ""
     else:
         if not a.suite:
-            sys.exit("need --suite (single-host) or --launch-script (multi-host)")
+            sys.exit(
+                "need --suite (single-host), --launch-script (multi-host) or --exec"
+            )
         hosts = 1
         run_name = dns_safe(a.suite)
         suite = a.suite
@@ -155,9 +166,22 @@ def main():
     if not sl:
         sys.exit(f"no slice for hosts={hosts} in topology.yaml")
 
+    # Suite mode runs every registered file sequentially, so its deadline scales
+    # with the suite (same est_time formula as _tpu-test's poll budget, keeping the
+    # two in agreement). Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
+    # engine bring-up alone.
+    if suite:
+        active_deadline = suite_wait_seconds(suite, a.tests_dir)
+    elif a.exec_cmd:
+        active_deadline = 7200
+    else:
+        active_deadline = 5400
+
     pvc = a.weights_pvc
     vals = {
         "IMAGE": a.image,
+        "ACTIVE_DEADLINE": str(active_deadline),
+        "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
         "POOL": sl["pool"],

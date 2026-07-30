@@ -112,6 +112,8 @@ test = [
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
+  # mini-LB for the P/D feature-combo row (sglang_router.launch_router --mini-lb).
+  "sglang-router",
   "tabulate",
 ]
 
