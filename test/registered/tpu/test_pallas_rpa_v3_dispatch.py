@@ -13,11 +13,8 @@ Two TPU attention backends share the ``pallas_tpu_*`` namespace:
 The behaviour being guarded here:
 
   * Both names are registered with the right factory class.
-  * ``set_active_attention_backend("pallas_tpu_rpa_v3")`` +
-    ``_patch_mha_kv_pool_for_rpa_v3()`` swaps the pool class in
-    ``model_runner_kv_cache_mixin`` to :class:`TpuFusedMHATokenToKVPool`.
-  * Same patch with the flash backend active is a no-op — the flash
-    backend would mis-read the fused layout, so the swap must NOT fire.
+  * The TPU platform selects :class:`TpuFusedMHATokenToKVPool` for the RPA
+    backends and the standard pool for flash and torch-native attention.
 
 These tests run on CPU (no torch_tpu / JAX needed) — they only exercise
 the patch-and-dispatch glue.
@@ -27,17 +24,11 @@ from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
-import importlib
+import types
 import unittest
+from unittest.mock import patch
 
 from sglang.test.test_utils import CustomTestCase
-
-
-def _reload_patches_module():
-    """Reload the patches module so module-level state resets between tests."""
-    import sglang.srt.hardware_backend.tpu.patches as patches_mod
-
-    return importlib.reload(patches_mod)
 
 
 class TestPallasBackendRegistration(CustomTestCase):
@@ -62,63 +53,31 @@ class TestPallasBackendRegistration(CustomTestCase):
         )
 
 
-class TestMHAKVPoolSwapForRpaV3(CustomTestCase):
-    """``_patch_mha_kv_pool_for_rpa_v3`` must swap ``MHATokenToKVPool`` in
-    the mixin's namespace iff the active backend is the RPA v3 one. Any
-    other backend (flash, torch_native) needs the original flat pool."""
+class TestMHAKVPoolSelection(CustomTestCase):
+    def _pool_cls_for(self, attention_backend):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 
-    def setUp(self):
-        # Reload patches so its ``_active_attention_backend`` /
-        # ``_mha_kv_pool_patched`` module globals reset between tests.
-        self.patches_mod = _reload_patches_module()
+        with patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=types.SimpleNamespace(attention_backend=attention_backend),
+        ):
+            return TpuSRTPlatform().get_mha_kv_pool_cls()
 
-        import sglang.srt.model_executor.model_runner_kv_cache_mixin as mix
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
-        # Restore the stock pool symbol if a prior test left it swapped.
-        mix.MHATokenToKVPool = MHATokenToKVPool
-        self.mix = mix
-        self.original_pool_cls = MHATokenToKVPool
-
-    def test_swap_when_active_backend_is_rpa_v3(self):
+    def test_fused_pool_for_rpa_backends(self):
         from sglang.srt.hardware_backend.tpu.kv_pool import (
             TpuFusedMHATokenToKVPool,
         )
 
-        self.patches_mod.set_active_attention_backend("pallas_tpu_rpa_v3")
-        self.patches_mod._patch_mha_kv_pool_for_rpa_v3()
+        for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
+            with self.subTest(backend=backend):
+                self.assertIs(self._pool_cls_for(backend), TpuFusedMHATokenToKVPool)
 
-        self.assertIs(self.mix.MHATokenToKVPool, TpuFusedMHATokenToKVPool)
+    def test_flat_pool_for_non_rpa_backends(self):
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
-        # Idempotent: a second call must not undo the swap or raise.
-        self.patches_mod._patch_mha_kv_pool_for_rpa_v3()
-        self.assertIs(self.mix.MHATokenToKVPool, TpuFusedMHATokenToKVPool)
-
-    def test_no_swap_when_active_backend_is_flash(self):
-        self.patches_mod.set_active_attention_backend("pallas_tpu_flash")
-        self.patches_mod._patch_mha_kv_pool_for_rpa_v3()
-
-        # The flash backend reads K and V via the flat layout; the fused
-        # pool would silently mis-feed it. The patch must leave the symbol
-        # as the upstream class.
-        self.assertIs(self.mix.MHATokenToKVPool, self.original_pool_cls)
-
-    def test_no_swap_when_active_backend_is_torch_native(self):
-        self.patches_mod.set_active_attention_backend("torch_native")
-        self.patches_mod._patch_mha_kv_pool_for_rpa_v3()
-
-        self.assertIs(self.mix.MHATokenToKVPool, self.original_pool_cls)
-
-    def test_no_swap_when_active_backend_unset(self):
-        # ``apply_server_args_defaults`` is the only thing that populates
-        # the active-backend flag. If a code path imports patches without
-        # going through the platform (e.g. a unit test that skips the
-        # platform's startup hook), the swap must default to no-op so
-        # nothing silently breaks for non-RPA-v3 users.
-        # The reload in setUp already cleared the flag back to None.
-        self.assertIsNone(self.patches_mod._active_attention_backend)
-        self.patches_mod._patch_mha_kv_pool_for_rpa_v3()
-        self.assertIs(self.mix.MHATokenToKVPool, self.original_pool_cls)
+        for backend in ("pallas_tpu_flash", "torch_native"):
+            with self.subTest(backend=backend):
+                self.assertIs(self._pool_cls_for(backend), MHATokenToKVPool)
 
 
 if __name__ == "__main__":
