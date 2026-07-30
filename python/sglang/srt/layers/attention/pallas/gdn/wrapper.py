@@ -143,7 +143,8 @@ def inner_kernel(
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
-            ))
+            )
+        )
 
         out, new_recurrent_state = compute_gdn.recurrent_gdn(
             q_compact=q_compact,
@@ -166,7 +167,8 @@ def inner_kernel(
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
-            ))
+            )
+        )
 
         out, new_recurrent_state = compute_gdn.chunked_gdn(
             q_large=q_large,
@@ -183,8 +185,7 @@ def inner_kernel(
 
     # Store output and recurrent to vmem.
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    recurrent_slot_ref[...] = new_recurrent_state.astype(
-        recurrent_slot_ref.dtype)
+    recurrent_slot_ref[...] = new_recurrent_state.astype(recurrent_slot_ref.dtype)
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state
@@ -223,7 +224,8 @@ def outer_kernel(
             conv_state_ref=conv_state_ref,
             recurrent_state_ref=recurrent_state_ref,
             cfg=cfg,
-        ))
+        )
+    )
 
     num_tiles = metadata_ref.num_tiles[...]
 
@@ -232,7 +234,7 @@ def outer_kernel(
             inner_kernel,
             cfg=cfg,
         ),
-        grid=(num_tiles, ),
+        grid=(num_tiles,),
         in_specs=(
             qkv_alloc.spec,
             b_alloc.spec,
@@ -240,17 +242,19 @@ def outer_kernel(
             conv_alloc.spec,
             recurrent_alloc.spec,
         ),
-        out_specs=(out_alloc.spec, ),
+        out_specs=(out_alloc.spec,),
     )
 
-    @pl.with_scoped(allocations=(
-        qkv_alloc,
-        b_alloc,
-        a_alloc,
-        conv_alloc,
-        recurrent_alloc,
-        out_alloc,
-    ), )
+    @pl.with_scoped(
+        allocations=(
+            qkv_alloc,
+            b_alloc,
+            a_alloc,
+            conv_alloc,
+            recurrent_alloc,
+            out_alloc,
+        ),
+    )
     def _run(allocations):
         pipeline_func(
             qkv_ref,
@@ -369,10 +373,10 @@ def fused_conv1d_gdn(
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
-        assert conv_bias.shape == (dim, )
-    assert query_start_loc.shape == (num_seqs + 1, )
-    assert state_indices.shape == (num_seqs, )
-    assert distribution.shape == (3, )
+        assert conv_bias.shape == (dim,)
+    assert query_start_loc.shape == (num_seqs + 1,)
+    assert state_indices.shape == (num_seqs,)
+    assert distribution.shape == (3,)
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
@@ -386,8 +390,10 @@ def fused_conv1d_gdn(
     # whose token count is not a multiple of the block (e.g. a small mixed
     # prefill+decode batch) makes ``invert_triangular_matrix`` silently truncate
     # the chunk and the downstream split fails.
-    batch_align = packing * compute_gdn.INVERT_BLOCK // math.gcd(
-        packing, compute_gdn.INVERT_BLOCK
+    batch_align = (
+        packing
+        * compute_gdn.INVERT_BLOCK
+        // math.gcd(packing, compute_gdn.INVERT_BLOCK)
     )
     padded_batch_size = pl.cdiv(batch_size, batch_align) * batch_align
     decode_tile_size = min(decode_tile_size, batch_size)
@@ -410,12 +416,10 @@ def fused_conv1d_gdn(
     conv_state_shape = conv_state.shape
     conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
-    conv_bias = conv_bias.astype(
-        jnp.float32) if conv_bias is not None else None
+    conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
     # Step 4: Wrap inputs for the kernel.
-    conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight,
-                                             bias=conv_bias)
+    conv_weights = memory_ref.ConvWeightsRef(weight=conv_weight, bias=conv_bias)
     gdn_weights = memory_ref.GDNWeightsRef(a_log=a_log, dt_bias=dt_bias)
     weights = memory_ref.WeightRefs(conv=conv_weights, gdn=gdn_weights)
 
@@ -479,10 +483,7 @@ def fused_conv1d_gdn(
 
         # Step 7: Handle case where write needs to be done in existing out.
         in_out_spec = None
-        input_output_aliases = {
-            len(metadata_obj) + 3: 1,
-            len(metadata_obj) + 4: 2
-        }
+        input_output_aliases = {len(metadata_obj) + 3: 1, len(metadata_obj) + 4: 2}
         out_shape = cfg.get_out_shape()
 
         if in_act is None and zero_initialize_out:
@@ -526,9 +527,11 @@ def fused_conv1d_gdn(
         )
 
     out_act, out_conv_state, out_recurrent_state = call_kernel(
-        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
+        conv_state, recurrent_state, None, config.GDNMode.BATCHED
+    )
     out_act, out_conv_state, out_recurrent_state = call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
+    )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)
