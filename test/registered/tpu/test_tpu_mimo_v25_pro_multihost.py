@@ -1,8 +1,8 @@
 """MiMo-V2.5-Pro (1T MoE, blockwise-fp8) multi-host e2e lm-eval (live-server mode).
 
-Converted to the run_combined_tests shape. Because the JobSet -- not this file --
-brings the server up, the model config supplies an ExternalServerLauncher, so the
-shared runner waits for /health_generate and never launches or kills anything.
+The JobSet -- not this file -- brings the server up, so the model config supplies an
+ExternalServerLauncher: the shared runner waits for /health_generate and never
+launches or kills anything.
 
 Its MULTIHOST_LAUNCH forms its own launch group: recipe/mimo_v25_pro_mh.sh on 2 hosts.
 The recipe mirrors the E2E-validated DP-attention config from

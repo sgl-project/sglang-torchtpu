@@ -9,8 +9,11 @@ vs 0.504) -- this server executes no tools.
 
 GPQA uses OpenAI's own gpt_oss.evals because 0.671 is only reproducible with their
 permuted-choice prompt and grader; MMLU and AIME use run_eval, itself adapted from
-OpenAI's simple-evals. Tolerances follow from sample count -- see each constant, and
-do not lower the repeat counts without redoing that arithmetic.
+OpenAI's simple-evals.
+
+All three gate at atol 0.03, capped by the tolerance contract. Headroom differs by
+sample count: MMLU ~3.7 sigma, GPQA ~1.8, AIME only ~0.9 -- 30 questions at p=0.5 is
+the noisiest case there is, so AIME trips ~18% of runs on sampling noise alone.
 
 Notes:
 - Weights: shared ROX PVC model-weights-rox at /weights (pvc-model-weights-rox.yaml.tmpl).
@@ -32,8 +35,11 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import dump_metric
 from sglang.test.tpu import RecipeLauncher, TpuModelLaunchSettings
 
-# Raised from 3600s: three evals now share the boot, and AIME runs 8 repeats.
-register_tpu_ci(est_time=5400, suite="nightly-tpu-4-v7", nightly=True)
+# est_time drives the JobSet deadline (render_jobset.py: max(sum(est_time)*1.5, 360s)),
+# so an under-estimate kills the run. The workload is ~3000 generations on one boot
+# (GPQA 4x198, MMLU 2000, AIME 8x30), much of it low-effort reasoning up to 8k tokens.
+# weekly-update-est-time.yml refreshes this from the p90 of real runs.
+register_tpu_ci(est_time=10800, suite="nightly-tpu-4-v7", nightly=True)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TPU_BENCH_DIR = REPO_ROOT / "benchmark" / "tpu"
@@ -61,15 +67,18 @@ GPQA_N_REPEATS = 4
 MMLU_ATOL = 0.03
 MMLU_NUM_EXAMPLES = 2000
 
-# Only 30 questions (AIME2025-I + II) -> single-pass sigma 9.1pts. Even at 8 repeats
-# the mean's SE is ~3.2pts, so a 3pt tolerance would be ~0.9 sigma and fail a third
-# of nights; 3pts here would need ~37 repeats. 8 repeats at 10pts is ~3.1 sigma.
-# If still flaky, widen the tolerance -- 30 questions caps the achievable precision.
-AIME25_ATOL = 0.10
+# The noisiest gate here: 30 questions (AIME2025-I + II) at p=0.504, which is the
+# worst case for binomial noise since p(1-p) peaks at 0.5. Single-pass sigma is
+# 9.1pts; at 8 repeats the mean's SE is 3.2pts, putting the 3pt floor 0.9 sigma below
+# the reference, so it trips ~18% of runs on sampling noise alone. Reaching 2 sigma
+# takes 37 repeats and 3 sigma takes 83. atol is capped at 3pts by the tolerance
+# contract, so repeats are the only lever -- a red run here warrants a re-run before
+# investigation.
+AIME25_ATOL = 0.03
 AIME25_REPEAT = 8
 
-# Unchanged from the pre-conversion version. The launcher owns flag derivation, so
-# no CLI flags appear in this file.
+# The recipe derives every server flag from this environment, so no CLI flags appear
+# in this file.
 LAUNCH_ENV = {
     "MODEL": MODEL_PATH,
     "TP_SIZE": "8",
@@ -127,8 +136,8 @@ def _gpqa_via_openai_harness(base_url: str) -> dict:
         f"gpqa_diamond (openai harness, n_repeats={GPQA_N_REPEATS}): "
         f"score={result.score:.4f} metrics={result.metrics}"
     )
-    # The built-in backends dump their own metrics; a runner has to do it itself or
-    # the score never reaches the trend dashboards.
+    # Built-in backends dump their own metrics; a runner must do it itself to reach
+    # the trend dashboards.
     dump_metric(
         "gpqa_diamond_openai_harness",
         result.score,

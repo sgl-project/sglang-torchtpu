@@ -1,11 +1,9 @@
 """Qwen3-Coder-30B-A3B-Instruct-FP8 single-host e2e accuracy via lm-eval.
 
-Converted to the run_combined_tests shape: this file declares config and gates only.
-
-The gate is unchanged. Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml remains the single
-source of truth for the mmlu_llama / mmlu_pro ground truths and tolerances, and stays
-on lm-eval because mmlu_pro has no simple-evals equivalent and mmlu_llama's few-shot
-protocol is what the reference values were measured with.
+Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml is the single source of truth for the
+mmlu_llama / mmlu_pro ground truths and tolerances. The gate runs on lm-eval because
+mmlu_pro has no simple-evals equivalent, and mmlu_llama's few-shot protocol is what
+the reference values were measured with.
 """
 
 import os

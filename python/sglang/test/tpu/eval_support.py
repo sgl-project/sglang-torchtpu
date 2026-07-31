@@ -2,7 +2,7 @@
 
 Plugs into the two extension points on the shared accuracy runner:
 
-* ``TpuModelLaunchSettings.launcher`` -- a TPU server cannot be started from a bare
+* ``ModelLaunchSettings.launcher`` -- a TPU server cannot be started from a bare
   argv, because chiplet visibility, the torch_tpu compile cache and the multi-host
   topology must all be exported before exec, and only ``launch_server.sh`` (plus its
   recipe wrappers) knows how.
@@ -38,9 +38,8 @@ def wait_for_health(
     ``/health_generate`` rather than ``/health``: on TPU a server binds its port long
     before the last shape finishes compiling, and only the former runs a generation.
 
-    Notes progress every 60s. Weight load plus compile runs ~10 min and can reach
-    the better part of an hour multi-host, so a silent wait is indistinguishable
-    from a hang in CI logs.
+    Notes progress every 60s: weight load plus compile takes ~10 min single-host and
+    longer multi-host, and a silent wait is indistinguishable from a hang in CI logs.
     """
     start = time.perf_counter()
     deadline = start + timeout
@@ -78,12 +77,11 @@ class RecipeLauncher:
     """Launch a TPU server from a shell recipe, and keep it up across evals.
 
     The shared runner brings the server up once per evaluation, but a TPU boot costs
-    tens of minutes (weight load plus per-shape compile). So this boots on first
-    entry, attaches on later ones, and tears down at process exit -- which is what
-    makes a three-dataset gate cost one boot with no upstream involvement.
+    tens of minutes (weight load plus per-shape compile). This boots on first entry,
+    attaches on later ones, and tears down at process exit, so N gates cost one boot.
 
-    Assumes one model config per test process, true of every TPU nightly. Two configs
-    would contend for the port; call ``shutdown()`` between them if that changes.
+    Assumes one model config per test process. Two configs would contend for the
+    port; call ``shutdown()`` between them.
     """
 
     def __init__(
@@ -115,7 +113,12 @@ class RecipeLauncher:
             # The recipe and launch_server.sh both `exec`, so this pid IS the
             # server process -- kill_process_tree on it does the right thing.
             atexit.register(self.shutdown)
-            wait_for_health(base_url, self.health_timeout, self._process, tag=self.tag)
+            wait_for_health(
+                base_url,
+                timeout=self.health_timeout,
+                process=self._process,
+                tag=self.tag,
+            )
         else:
             if self._process.poll() is not None:
                 raise RuntimeError(
@@ -152,7 +155,7 @@ class ExternalServerLauncher:
     def __call__(self, base_url: str):
         if not self._checked:
             print(f"[ExternalServerLauncher] attaching to {base_url}")
-            wait_for_health(base_url, self.health_timeout, tag=self.tag)
+            wait_for_health(base_url, timeout=self.health_timeout, tag=self.tag)
             self._checked = True
         yield None
 
@@ -160,14 +163,14 @@ class ExternalServerLauncher:
 class TpuModelLaunchSettings(ModelLaunchSettings):
     """ModelLaunchSettings that delegates bring-up to a ``launcher``.
 
-    Subclassed rather than adding fields upstream. Clears ``extra_args`` because the
-    base class synthesises ``--tp`` / ``--enable-multimodal``, dead config here (the
-    recipe derives every flag from environment) that would mislead in reports.
+    ``launcher`` itself is a plain ModelLaunchSettings field; this subclass exists
+    only to clear ``extra_args``, because the base class synthesises ``--tp`` /
+    ``--enable-multimodal`` -- dead config here (the recipe derives every flag from
+    environment) that would mislead in reports.
     """
 
-    def __init__(self, model_path: str, launcher, **kwargs):
+    def __init__(self, model_path: str, **kwargs):
         super().__init__(model_path, **kwargs)
-        self.launcher = launcher
         self.extra_args = []
 
 

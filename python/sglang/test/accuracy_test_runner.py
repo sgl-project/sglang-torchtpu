@@ -101,14 +101,11 @@ def write_accuracy_github_summary(
 def served(model: ModelLaunchSettings, base_url: str):
     """Bring up the server for `model`, yield, then tear it down.
 
-    A model config may supply a `launcher` attribute -- a callable returning a
-    context manager -- to take over bring-up, for servers that a plain
-    `popen_launch_server` argv cannot start (a shell script that must export
-    environment before exec, or one an external orchestrator already started).
+    `model.launcher`, when set, takes over bring-up entirely; see
+    ModelLaunchSettings.launcher.
     """
-    launcher = getattr(model, "launcher", None)
-    if launcher is not None:
-        with launcher(base_url):
+    if model.launcher is not None:
+        with model.launcher(base_url):
             yield
         return
 
@@ -490,8 +487,8 @@ def _dispatch_eval(
     if params.runner is not None:
         try:
             metrics = params.runner(base_url)
-            # Returning a bare score is the obvious thing to write, and treating it
-            # as a dict fails much later with a confusing AttributeError.
+            # A bare score is the natural thing to return; accept it rather than
+            # failing later on a dict lookup.
             if isinstance(metrics, (int, float)):
                 metrics = {"score": float(metrics)}
             return True, None, metrics

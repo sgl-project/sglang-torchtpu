@@ -2263,6 +2263,7 @@ class ModelLaunchSettings:
         env: Optional[dict] = None,
         variant: Optional[str] = None,
         launch_timeout: Optional[float] = None,
+        launcher: Optional[Callable[[str], Any]] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
@@ -2270,6 +2271,11 @@ class ModelLaunchSettings:
         self.env = env
         self.variant = variant
         self.launch_timeout = launch_timeout
+        # Optional override for server bring-up: a callable returning a context
+        # manager, for servers a plain popen_launch_server argv cannot start (a
+        # shell script that must export environment before exec, or one an external
+        # orchestrator already brought up). None -> the default launch path.
+        self.launcher = launcher
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
