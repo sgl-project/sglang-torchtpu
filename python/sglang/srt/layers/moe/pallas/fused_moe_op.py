@@ -473,14 +473,15 @@ def _fused_moe_jax(
     unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
     if no_combine:
-        # Zero the rows this rank did not compute, so it is safe for the
-        # caller to later run the weighted sum.
+        # Zero the rows this rank did not compute, so later post-norm + combine
+        # cannot consume expert-0 placeholder outputs with original router weights.
         if use_group_offset:
             valid_rows_mask = _valid_rows_mask(
                 group_sizes, expert_group_offset, num_experts, unsort_idx
             )[: m_orig * topk].reshape(m_orig, topk, 1)
-            return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
-        return unsorted
+        else:
+            valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
+        return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
 
     weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
     out = (unsorted * weights).sum(axis=1).astype(out_dtype)

@@ -1,5 +1,6 @@
 """CPU tests for the TPU block-512 NVFP4 MoE weight contract."""
 
+import pathlib
 import sys
 import types
 import unittest
@@ -250,6 +251,44 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 )
             )
 
+    def test_non_rs_no_combine_passes_masked_routing_to_pallas(self):
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+
+        hidden_states = torch.randn(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        topk_weights = torch.tensor([[0.75, 0.25], [0.60, 0.40]], dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 2], [3, 1]], dtype=torch.int64)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+        layer.num_local_experts = 2
+        layer.moe_ep_rank = 0
+        fused_moe_call = mock.Mock(
+            return_value=torch.empty(2, 2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        )
+
+        with mock.patch.object(fp4_moe, "fused_moe_call", fused_moe_call):
+            result = fp4_moe.apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                no_combine=True,
+            )
+
+        call = fused_moe_call.call_args.kwargs
+        self.assertTrue(call["no_combine"])
+        torch.testing.assert_close(
+            call["topk_weights"],
+            torch.tensor([[0.75, 0.0], [0.0, 0.40]], dtype=torch.bfloat16),
+        )
+        torch.testing.assert_close(
+            call["topk_ids"],
+            torch.tensor([[0, 0], [0, 1]], dtype=torch.int32),
+        )
+        self.assertEqual(tuple(result.hidden_states.shape), (2, 2, HIDDEN_SIZE))
+
     def test_fused_backend_prepares_layer_eagerly(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
@@ -493,6 +532,18 @@ class TestNvfp4Block512Contract(CustomTestCase):
             self.assertRaisesRegex(TypeError, "post-expert norm requires"),
         ):
             fp4_moe.prepare_tpu_nvfp4_moe_weights(layer, use_fused_rs=True)
+
+    def test_fused_rs_group_offset_stays_model_sharded(self):
+        package_root = pathlib.Path(__file__).resolve().parents[5] / "python"
+        wrapper = (
+            package_root / "sglang/srt/layers/moe/pallas/fused_moe_rs_op.py"
+        ).read_text()
+        body = (
+            package_root / "sglang/srt/layers/moe/pallas/fused_rs/fused_moe.py"
+        ).read_text()
+
+        self.assertIn('P("model"),\n            None,', wrapper)
+        self.assertIn("ep_p_spec,  # group_offset", body)
 
     def test_fused_packed_transpose_preserves_codes(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (

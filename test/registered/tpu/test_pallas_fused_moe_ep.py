@@ -200,6 +200,56 @@ class TestFusedMoEExpertParallel(CustomTestCase):
             context="no_combine local slots",
         )
 
+    def test_no_combine_zeroes_weight_masked_slots_without_group_offset(self):
+        """The TPU FP4 path remaps non-local slots to expert 0 and zeros their
+        kernel weights before calling the local Pallas kernel. no_combine must
+        return zeros for those weight-masked slots because Llama4x applies the
+        original router weights later during post-expert norm finalize.
+        """
+        x, w1, w2, topk_weights, topk_ids = self.make_inputs(tokens=128, seed=2)
+        masked_weights = topk_weights.at[:, 1::2].set(0)
+        local_ids = jnp.where(masked_weights == 0, 0, topk_ids % self.GLOBAL_EXPERTS)
+        out = self.run_kernel(
+            x=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=masked_weights,
+            topk_ids=local_ids,
+            use_sc_gather=1,
+            no_combine=True,
+        )
+        masked = jnp.where(masked_weights[:, :, None] == 0, out.astype(jnp.float32), 0)
+        self.assertEqual(float(jnp.max(jnp.abs(masked))), 0.0)
+
+        # The old bug returned the remapped expert-0 placeholder output for
+        # masked slots. Prove those placeholders are nonzero and would pollute
+        # the caller's later combine with the original router weights.
+        placeholder_out = self.run_kernel(
+            x=x,
+            w1=w1,
+            w2=w2,
+            topk_weights=topk_weights,
+            topk_ids=local_ids,
+            use_sc_gather=1,
+            no_combine=True,
+        ).astype(jnp.float32)
+        masked_placeholder = jnp.where(
+            masked_weights[:, :, None] == 0, placeholder_out, 0
+        )
+        self.assertGreater(float(jnp.max(jnp.abs(masked_placeholder))), 1e-6)
+
+        original_weights = topk_weights[:, :, None].astype(jnp.float32)
+        expected_final = (
+            jnp.where(masked_weights[:, :, None] != 0, out.astype(jnp.float32), 0)
+            * original_weights
+        ).sum(axis=1)
+        actual_final = (out.astype(jnp.float32) * original_weights).sum(axis=1)
+        contaminated_final = (placeholder_out * original_weights).sum(axis=1)
+        self.assertEqual(float(jnp.max(jnp.abs(actual_final - expected_final))), 0.0)
+        self.assertGreater(
+            float(jnp.max(jnp.abs(contaminated_final - expected_final))), 1e-6
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
