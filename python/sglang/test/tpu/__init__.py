@@ -1,5 +1,4 @@
-"""TPU-specific test support for this fork.
-"""
+"""TPU-specific test support for this fork."""
 
 from sglang.test.tpu.eval_support import (
     ExternalServerLauncher,
