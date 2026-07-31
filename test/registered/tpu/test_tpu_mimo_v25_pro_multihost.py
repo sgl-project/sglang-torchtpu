@@ -25,17 +25,10 @@ stays the only place those numbers live.
 """
 
 import os
-import unittest
 
-from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
-from sglang.test.tpu import (
-    ExternalServerLauncher,
-    TpuModelLaunchSettings,
-    lm_eval_runner,
-)
+from sglang.test.tpu import model_config_main
 
 register_tpu_ci(est_time=5400, suite="nightly-tpu-multihost", nightly=True)
 
@@ -54,36 +47,20 @@ BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "600"))
 
 
-@unittest.skipUnless(
-    os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
-    "multi-host live-server not provided (the JobSet launches the server)",
-)
-class TestTpuMiMoV25ProLMEval(unittest.TestCase):
-    """lm-eval accuracy against the 2-host DP-attention MiMo-V2.5-Pro server."""
-
-    def test_mimo_v25_pro_accuracy(self):
-        model = TpuModelLaunchSettings(
-            MODEL_PATH,
-            launcher=ExternalServerLauncher(
-                health_timeout=HEALTH_TIMEOUT, tag="mimo-e2e"
-            ),
-            # tp=16 across 2 hosts, but the JobSet owns the launch, so this is
-            # recorded for reporting only -- no flags are derived from it here.
-            tp_size=16,
-            variant="2host-TP16+EP16+DP2",
-        )
-
-        run_combined_tests(
-            models=[model],
-            test_name="MiMo-V2.5-Pro-multihost",
-            base_url=BASE_URL,
-            accuracy_params=AccuracyTestParams(
-                dataset="mmlu_llama",
-                label="lm_eval",
-                runner=lm_eval_runner(LM_EVAL_CONFIG),
-            ),
-        )
+MODEL_CONFIG = {
+    "model": MODEL_PATH,
+    "test_name": "MiMo-V2.5-Pro-multihost",
+    "variant": "2host-TP16+EP16+DP2",
+    "launch": {"external": True, "health_timeout": HEALTH_TIMEOUT, "tag": "mimo-e2e"},
+    "skip_unless": (
+        os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
+        "multi-host live-server not provided (the JobSet launches the server)",
+    ),
+    "gates": [
+        {"dataset": "mmlu_llama", "label": "lm_eval", "lm_eval_config": LM_EVAL_CONFIG},
+    ],
+}
 
 
 if __name__ == "__main__":
-    unittest.main()
+    model_config_main(MODEL_CONFIG, base_url=BASE_URL)

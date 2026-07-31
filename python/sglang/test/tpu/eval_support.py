@@ -73,6 +73,11 @@ def wait_for_health(
     )
 
 
+# One server per base_url. Teardown is deferred to keep gates cheap, so a second
+# launch config wanting the same URL must evict the incumbent or find the port taken.
+_HOLDERS: Dict[str, "RecipeLauncher"] = {}
+
+
 class RecipeLauncher:
     """Launch a TPU server from a shell recipe, and keep it up across evals.
 
@@ -80,8 +85,8 @@ class RecipeLauncher:
     tens of minutes (weight load plus per-shape compile). This boots on first entry,
     attaches on later ones, and tears down at process exit, so N gates cost one boot.
 
-    Assumes one model config per test process. Two configs would contend for the
-    port; call ``shutdown()`` between them.
+    When several variants of a model run in sequence, each has its own launcher and
+    they share a base_url; booting one evicts whoever currently holds that URL.
     """
 
     def __init__(
@@ -100,18 +105,30 @@ class RecipeLauncher:
         self.health_timeout = health_timeout
         self.tag = tag
         self._process: Optional[subprocess.Popen] = None
+        self._base_url: Optional[str] = None
 
     @contextlib.contextmanager
     def __call__(self, base_url: str):
         if self._process is None:
+            incumbent = _HOLDERS.get(base_url)
+            if incumbent is not None and incumbent is not self:
+                print(
+                    f"[{self.tag}] evicting the previous server on {base_url} "
+                    f"({os.path.basename(incumbent.script)})",
+                    flush=True,
+                )
+                incumbent.shutdown()
+
             env = os.environ.copy()
             env.update(self.env)
-            print(f"[RecipeLauncher] boot: bash {self.script} (cwd={self.cwd})")
+            print(f"[{self.tag}] boot: bash {self.script} (cwd={self.cwd})", flush=True)
             self._process = subprocess.Popen(
                 ["bash", self.script], cwd=self.cwd, env=env
             )
             # The recipe and launch_server.sh both `exec`, so this pid IS the
             # server process -- kill_process_tree on it does the right thing.
+            _HOLDERS[base_url] = self
+            self._base_url = base_url
             atexit.register(self.shutdown)
             wait_for_health(
                 base_url,
@@ -124,15 +141,18 @@ class RecipeLauncher:
                 raise RuntimeError(
                     f"server died between evals (code {self._process.returncode})"
                 )
-            print(f"[RecipeLauncher] reusing live server at {base_url}")
+            print(f"[{self.tag}] reusing live server at {base_url}", flush=True)
         yield self._process
-        # Deliberately not torn down here: see the class docstring.
+        # Not torn down here -- see the class docstring.
 
     def shutdown(self) -> None:
         if self._process is not None and self._process.poll() is None:
-            print("[RecipeLauncher] shutting down server")
+            print(f"[{self.tag}] shutting down server", flush=True)
             kill_process_tree(self._process.pid, wait_timeout=60)
         self._process = None
+        if self._base_url is not None and _HOLDERS.get(self._base_url) is self:
+            del _HOLDERS[self._base_url]
+        self._base_url = None
 
 
 class ExternalServerLauncher:
@@ -154,7 +174,7 @@ class ExternalServerLauncher:
     @contextlib.contextmanager
     def __call__(self, base_url: str):
         if not self._checked:
-            print(f"[ExternalServerLauncher] attaching to {base_url}")
+            print(f"[{self.tag}] attaching to {base_url}", flush=True)
             wait_for_health(base_url, timeout=self.health_timeout, tag=self.tag)
             self._checked = True
         yield None
