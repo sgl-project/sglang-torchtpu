@@ -37,7 +37,6 @@ import logging
 import os
 import threading
 from collections import defaultdict
-from typing import Dict, List, Optional
 
 import torch
 
@@ -83,13 +82,16 @@ class StageBuf:
     tracks this buffer's own mlock state (so eviction can munlock exactly the
     pages it locked — no global pointer set that breaks under address reuse)."""
 
-    __slots__ = ("nbytes", "_t", "_pool", "_locked")
+    __slots__ = ("_locked", "_pool", "_t", "nbytes")
 
-    def __init__(self, nbytes: int, pool: Optional[PinnedHostPool]):
+    def __init__(self, nbytes: int, pool: PinnedHostPool | None):
         self.nbytes = nbytes
         self._t = torch.empty(nbytes, dtype=torch.uint8)  # 64B-aligned (torch CPU)
         self._pool = pool
         self._locked = False
+
+    def __len__(self) -> int:
+        return self.nbytes
 
     def view(self, dtype: torch.dtype, shape) -> torch.Tensor:
         return self._t.view(dtype).reshape(shape)
@@ -115,8 +117,8 @@ class PinnedHostPool:
     total pooled bytes stay within ``max_bytes``; otherwise it is munlock'd and
     dropped. ``max_bytes`` defaults to a fraction of host RAM."""
 
-    def __init__(self, max_bytes: Optional[int] = None):
-        self._free: Dict[int, List[StageBuf]] = defaultdict(list)
+    def __init__(self, max_bytes: int | None = None):
+        self._free: dict[int, list[StageBuf]] = defaultdict(list)
         self._lock = threading.Lock()
         self._max_bytes = (
             max_bytes if max_bytes is not None else default_pool_max_bytes()

@@ -7,7 +7,7 @@ Two layers of coverage:
 
 2. **Control + data protocol** (``conn.py``) — drives ``TpuKVManager``'s real
    ZMQ message paths (``_handle_trsfr``, ``gather_and_push``,
-   ``_handle_kvdata``, ``process_decode_pending``) over a localhost ZMQ
+   ``_handle_kvdata_ch``, ``process_decode_pending``) over a localhost ZMQ
    loopback, asserting the KV bytes land in the right decode pages, aux is
    written on the last chunk only, and the ``KVPoll`` status machine advances
    correctly. Managers are built with ``object.__new__`` + the minimal
@@ -44,11 +44,12 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.tpu import transfer as T
 from sglang.srt.disaggregation.tpu.conn import (
-    TAG_KVDATA,
-    TAG_KVDATA_CH,
-    TAG_TRSFR,
+    MessageTag,
+    PendingChunk,
+    PinnedHostPool,
+    PrefillTransferInfo,
     TpuKVManager,
-    _PrefillTransferInfo,
+    _KvStats,
     _tcp_endpoint,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -98,13 +99,12 @@ class TestTpuTransferDataPlane(CustomTestCase):
         _fill_random(src)
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
-        specs = T.extract_layer_page_specs(sbufs)
 
         src_pages = np.array([1, 4, 6], dtype=np.int64)
         dst_pages = np.array([7, 0, 3], dtype=np.int64)  # deliberately remapped
         blobs = T.gather_pages_to_host(sbufs, src_pages)
         self.assertEqual(len(blobs), 3)
-        T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, dst_lane_slice=None)
+        T.scatter_pages_from_host(dbufs, dst_pages, blobs, dst_lane_slice=None)
 
         for li in range(3):
             for sp, dp in zip(src_pages, dst_pages):
@@ -124,55 +124,89 @@ class TestTpuTransferDataPlane(CustomTestCase):
 
     # ---- MHA resharding: lane-slice math + sliced gather/scatter -----------
 
+    def _make_info(
+        self,
+        src_tp: int,
+        dst_tp: int,
+        engine_rank: int,
+        dst_rank: int,
+        total_heads: int,
+        kvp: int,
+        n_layers: int = 2,
+    ) -> PrefillTransferInfo:
+        return PrefillTransferInfo(
+            room=0,
+            decode_endpoint="",
+            num_pages=0,
+            src_tp_rank=engine_rank,
+            dst_tp_rank=dst_rank,
+            src_attn_tp_size=src_tp,
+            dst_attn_tp_size=dst_tp,
+            total_num_head=total_heads,
+            kv_packing=kvp,
+            n_layers=n_layers,
+        )
+
     def test_compute_lane_slice_directions(self):
         # total_kv_heads=4, kv_packing=2 (bf16): 1 KV head == 1 packed lane.
         kvp, total = 2, 4
         # equal 2->2: whole per-rank head set at offset 0.
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 2, 0, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 2, 0, 2, True),
-        )
+        info = self._make_info(2, 2, 0, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 2)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_send_aux_data)
+
         # fan-in 4->2: rank0 -> dst lane 0, rank1 -> dst lane 1 (each sends 1 lane).
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(4, 2, 0, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 0, 1, True),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(4, 2, 1, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 1, 1, False),
-        )
+        info = self._make_info(4, 2, 0, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
+
+        info = self._make_info(4, 2, 1, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 1)
+        self.assertFalse(info.if_send_aux_data)
+
         # fan-out 2->4: one prefill rank feeds decode rank0 (src lane0) and
         # rank1 (src lane1), both landing at dst offset 0.
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 4, 0, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 0, 1, True),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 4, 0, 1, total, kvp),
-            T.KvTransferLaneSpec(1, 1, 0, 1, True),
-        )
+        info = self._make_info(2, 4, 0, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
+
+        info = self._make_info(2, 4, 0, 1, total, kvp)
+        self.assertEqual(info.src_lane_idx, 1)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
 
     def test_compute_lane_slice_gqa_prefill_replication(self):
-        # total_kv_heads=2 < prefill_tp=4: src_replication=2, so ranks 0/1 are
-        # replicas of head 0 and ranks 2/3 of head 1. Only primary replicas
-        # (ranks 0 and 2) send data; secondary replicas (ranks 1 and 3) skip.
+        # total_kv_heads=2 < prefill_tp=4: src_replication=2. Under always-send, all ranks send.
         kvp, total = 2, 2
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(4, 2, 0, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 0, 1, True),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(4, 2, 1, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 0, 0, 0, False),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(4, 2, 2, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 0, 1, True),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(4, 2, 3, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 0, 0, 0, False),
-        )
+        info = self._make_info(4, 2, 0, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_send_aux_data)
+
+        info = self._make_info(4, 2, 1, 0, total, kvp)
+        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_send_aux_data)
+
+        info = self._make_info(4, 2, 2, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_send_aux_data)
+
+        info = self._make_info(4, 2, 3, 0, total, kvp)
+        self.assertFalse(info.if_skip_sending)
+        self.assertTrue(info.if_send_aux_data)
 
     def test_compute_lane_slice_gqa_decode_replication(self):
         # total_kv_heads=4 < decode_tp=8: dst_heads=1, decode_replication=2.
@@ -180,35 +214,57 @@ class TestTpuTransferDataPlane(CustomTestCase):
         # prefill_tp=2: prefill rank 0 has heads 0 and 1 (lanes 0 and 1).
         kvp, total = 2, 4
         # Prefill rank 0 sends head 0 (lane 0) to decode ranks 0 and 1
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 8, 0, 0, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 0, 1, True),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 8, 0, 1, total, kvp),
-            T.KvTransferLaneSpec(0, 1, 0, 1, True),
-        )
+        info = self._make_info(2, 8, 0, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
+
+        info = self._make_info(2, 8, 0, 1, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
+
         # Prefill rank 0 sends head 1 (lane 1) to decode ranks 2 and 3
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 8, 0, 2, total, kvp),
-            T.KvTransferLaneSpec(1, 1, 0, 1, True),
-        )
-        self.assertEqual(
-            T.compute_kv_transfer_lane_spec(2, 8, 0, 3, total, kvp),
-            T.KvTransferLaneSpec(1, 1, 0, 1, True),
-        )
+        info = self._make_info(2, 8, 0, 2, total, kvp)
+        self.assertEqual(info.src_lane_idx, 1)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
 
-    def test_compute_lane_slice_fp8_odd_head_raises(self):
-        # fp8 kv_packing=4: 1 lane holds 2 KV heads, so an odd head boundary is
-        # not packing-aligned and must be rejected.
-        with self.assertRaises(ValueError):
-            T.compute_kv_transfer_lane_spec(4, 2, 0, 0, total_kv_heads=3, kv_packing=4)
+        info = self._make_info(2, 8, 0, 3, total, kvp)
+        self.assertEqual(info.src_lane_idx, 1)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.dst_head_start, 0)
+        self.assertTrue(info.if_send_aux_data)
 
-    def test_compute_lane_slice_zero_total_raises(self):
-        # total_kv_heads=0 means the decode side never advertised its KV-head
-        # count. Fail loud rather than divide by zero or guess a fallback.
-        with self.assertRaises(ValueError):
-            T.compute_kv_transfer_lane_spec(4, 2, 0, 0, total_kv_heads=0, kv_packing=2)
+    def test_compute_lane_slice_gqa_fan_out_prefill_replication(self):
+        # prefill_tp=4, decode_tp=8, total_kv_heads=2:
+        # Under always-send strategy, all ranks send and none skip.
+        kvp, total = 2, 2
+        # Rank 0 (primary for head 0) sends to decode rank 0
+        info = self._make_info(4, 8, 0, 0, total, kvp)
+        self.assertEqual(info.src_lane_idx, 0)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertFalse(info.if_skip_sending)
+
+        # Rank 1 also sends
+        info = self._make_info(4, 8, 1, 0, total, kvp)
+        self.assertFalse(info.if_skip_sending)
+
+    def test_compute_lane_slice_fp8_odd_head_fan_out(self):
+        # FP8 (kv_packing=4), total_num_head=4, src_tp=2, dst_tp=4.
+        # Each prefill rank has 2 heads, each decode rank has 1 head.
+        # n_head_to_send = 1, so 2 sub-heads < kv_packing=4.
+        # n_lane_to_send must be at least 1 lane (ceiling division).
+        kvp, total = 4, 4
+        info = self._make_info(2, 4, 1, 3, total, kvp)
+        self.assertEqual(info.src_heads, 2)
+        self.assertEqual(info.dst_heads, 1)
+        self.assertEqual(info.n_head_to_send, 1)
+        self.assertEqual(info.n_lane_to_send, 1)
+        self.assertEqual(info.src_lane_idx, 0)
 
     def test_lane_slice_gather_scatter_roundtrip(self):
         # 5D fused layout [nb, ps, lanes, kv_packing, head_dim]; send src lanes
@@ -218,12 +274,11 @@ class TestTpuTransferDataPlane(CustomTestCase):
         _fill_random(src)
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
-        specs = T.extract_layer_page_specs(dbufs)
         src_pages = np.array([1, 4, 6], dtype=np.int64)
         dst_pages = np.array([7, 0, 3], dtype=np.int64)
 
         blobs = T.gather_pages_to_host(sbufs, src_pages, lane_slice=(0, 2))
-        T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, dst_lane_slice=(2, 2))
+        T.scatter_pages_from_host(dbufs, dst_pages, blobs, dst_lane_slice=(2, 2))
         for li in range(2):
             for sp, dp in zip(src_pages, dst_pages):
                 self.assertTrue(
@@ -342,11 +397,20 @@ def _bare_manager(
         # mirror its opt-in-feature defaults: stats off, single push channel.
         m._gather_stats = None
         m._n_channels = 1
+        m._chan_socks = {}
+        m._chan_socks_lock = threading.Lock()
     else:
         m.decode_states = {}
         m.decode_states_lock = threading.Lock()
         m.decode_pending = defaultdict(deque)
+        m.reasm_pending = defaultdict(lambda: defaultdict(list))
         m.decode_pending_lock = threading.Lock()
+        m._chan_reasm = {}
+        m._chan_reasm_lock = threading.Lock()
+        m._stage_pool = PinnedHostPool(max_bytes=m._stage_pool_budget())
+        m._scatter_stats = _KvStats("scatter", 0)
+        m._assemble_stats = _KvStats("assemble", 0)
+        m._push_to_recv_stats = _KvStats("push_to_recv", 0)
     m.attach_kv_pool(pool)
     return m
 
@@ -376,13 +440,13 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
     def test_trsfr_marks_waiting_for_input(self):
         prefill, decode, *_ = self._make_pair()
-        prefill._serve(TAG_TRSFR, prefill._handle_transfer)
+        prefill._serve(MessageTag.TRSFR, prefill._handle_transfer)
         room = 4242
         push = zmq.Context.instance().socket(zmq.PUSH)
         push.connect(_tcp_endpoint("127.0.0.1", prefill.rank_port))
         push.send_multipart(
             [
-                TAG_TRSFR,
+                MessageTag.TRSFR,
                 str(room).encode(),
                 b"127.0.0.1",
                 str(decode.rank_port).encode(),
@@ -410,14 +474,14 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([0, 11, 4], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=3)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
+        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
 
         # prefill aux row 6 should land in decode aux row 3.
         # gather (main thread) + push (bg); decode bg recv stashes; decode
         # main-thread process_decode_pending scatters.
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
         msg = decode.server_socket.recv_multipart()
-        decode._handle_kvdata(msg)
+        decode._handle_kvdata_ch(msg)
         self.assertNotIn(room, decode.request_status)  # not scattered yet
         decode.process_decode_pending(room)
 
@@ -433,16 +497,16 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([10, 0, 6, 2], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=2)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 4)}
+        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 4)}
 
         # chunk 0: pages [0:2], not last
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         self.assertNotIn(room, decode.request_status)  # not Success yet
         # chunk 1: pages [2:4], last, carries aux
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
         self._assert_pages_equal(ppool, dpool, src_pages, dst_pages)
@@ -461,18 +525,18 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([10, 0, 6, 2], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=2)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 4)}
+        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 4)}
 
         # Push chunk 1 (pages [2:4], IS last, carries aux) FIRST, deliver + scatter.
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         # is_last scattered, but pages [0:2] have not arrived -> NOT Success yet.
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
 
         # Now the earlier chunk 0 (pages [0:2], not last) arrives.
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -525,7 +589,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([0, 2, 4], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=2)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
+        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=5)
         # 2 channels -> 2 messages; route each into the reassembly buffer.
@@ -549,9 +613,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
             room, np.array([0, 1], dtype=np.int64), aux_index=0
         )
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
+        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
         prefill.gather_and_push(room, np.array([2, 5, 9], dtype=np.int64), 0, True, 1)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         self.assertEqual(decode.request_status[room], KVPoll.Failed)
 
@@ -562,8 +626,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # bg recv -> stashes host bytes only (inlined _init_decode recv loop).
         decode._serve_router(
             {
-                TAG_KVDATA: decode._handle_kvdata,
-                TAG_KVDATA_CH: decode._handle_kvdata_ch,
+                MessageTag.KVDATA_CH: decode._handle_kvdata_ch,
             },
             copy=False,
         )
@@ -572,7 +635,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([3, 9, 0], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=4)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3)}
+        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=2)
 
         deadline = time.time() + 5
@@ -592,7 +655,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
 
 class TestTpuReshardingProtocol(CustomTestCase):
-    """Drive the real gather_and_push / _handle_kvdata / process_decode_pending
+    """Drive the real gather_and_push / _handle_kvdata_ch / process_decode_pending
     paths across heterogeneous attn_tp, asserting each prefill rank's KV-head
     slice lands in the right decode lanes, aux is written exactly once, and the
     KVPoll status machine reaches Success. ``kv_packing=2`` (bf16) so 1 KV head
@@ -634,16 +697,20 @@ class TestTpuReshardingProtocol(CustomTestCase):
         decode.register_decode_state(room, dst_pages, aux_index=3)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         info_kw = dict(dst_tp_rank=0, decode_attn_tp_size=1)
-        p0.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3, **info_kw)}
-        p1.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3, **info_kw)}
+        p0.transfer_infos[room] = {
+            ep: p0.record_decode_endpoint(room, ep, 3, **info_kw)
+        }
+        p1.transfer_infos[room] = {
+            ep: p1.record_decode_endpoint(room, ep, 3, **info_kw)
+        }
 
         # Both prefill ranks pass aux_index; only rank0 should actually send it.
         p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
         self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)  # half
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata(decode.server_socket.recv_multipart())
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
         self.assertEqual(decode.request_status[room], KVPoll.Success)
@@ -692,14 +759,14 @@ class TestTpuReshardingProtocol(CustomTestCase):
         ep0 = _tcp_endpoint("127.0.0.1", d0.rank_port)
         ep1 = _tcp_endpoint("127.0.0.1", d1.rank_port)
         prefill.transfer_infos[room] = {
-            ep0: _PrefillTransferInfo(
+            ep0: prefill.record_decode_endpoint(
                 room,
                 ep0,
                 3,
                 dst_tp_rank=0,
                 decode_attn_tp_size=2,
             ),
-            ep1: _PrefillTransferInfo(
+            ep1: prefill.record_decode_endpoint(
                 room,
                 ep1,
                 3,
@@ -709,8 +776,8 @@ class TestTpuReshardingProtocol(CustomTestCase):
         }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        d0._handle_kvdata(d0.server_socket.recv_multipart())
-        d1._handle_kvdata(d1.server_socket.recv_multipart())
+        d0._handle_kvdata_ch(d0.server_socket.recv_multipart())
+        d1._handle_kvdata_ch(d1.server_socket.recv_multipart())
         d0.process_decode_pending(room)
         d1.process_decode_pending(room)
 
@@ -768,7 +835,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
         # The handshake just records the endpoint (no pre-flight); the reshard
         # compatibility is only exercised when gather_and_push resolves the slice.
         ep = _tcp_endpoint("127.0.0.1", m.rank_port)
-        m.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, 3, **info_kw)}
+        m.transfer_infos[room] = {ep: m.record_decode_endpoint(room, ep, 3, **info_kw)}
         # The sender advances this room to WaitingForInput before send() calls
         # gather; seed it so the terminal Failed lands (update_status won't
         # create a fresh entry for Failed — the anti-resurrection guard). The
@@ -788,17 +855,12 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
         self.assertNotIn(room, m.failure_records)
         self.assertNotIn(room, m.request_status)
 
-    def test_fp8_odd_head_fails_cleanly_at_transfer(self):
-        # The reported config: fp8, prefill_tp=4 -> decode_tp=8, total=8 -> each
-        # decode rank wants 1 (odd) KV head == half a lane, which the packed-lane
-        # layout can't slice. gather_and_push fails the room cleanly, landing a
-        # terminal Failed that poll() can read.
+    def test_fp8_odd_head_supported_at_transfer(self):
+        # FP8 odd-head (1 head) resharding is supported via PendingChunk reassembly.
         m = self._prefill(attn_tp_size=4, lanes=1, engine_rank=0)
         room = 4242
         self._record_and_gather(m, room, dst_tp_rank=0, decode_attn_tp_size=8)
-        self.assertEqual(m.check_status(room), KVPoll.Failed)
-        self.assertIn(room, m.failure_records)
-        self.assertIn("packing-aligned", m.failure_records[room])
+        self.assertIn(m.check_status(room), (KVPoll.WaitingForInput, KVPoll.Success))
 
     def test_zero_total_fails_cleanly_at_transfer(self):
         # kv_args.total_kv_head_num=0: also an unsupported reshard, failed cleanly.
@@ -893,12 +955,11 @@ class TestTpuTransferOnDevice(CustomTestCase):
 
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
-        specs = T.extract_layer_page_specs(sbufs)
         src_pages = np.array([0, 1], dtype=np.int64)
         dst_pages = np.array([1, 0], dtype=np.int64)
 
         blobs = T.gather_pages_to_host(sbufs, src_pages)
-        T.scatter_pages_from_host(dbufs, dst_pages, blobs, specs, dst_lane_slice=None)
+        T.scatter_pages_from_host(dbufs, dst_pages, blobs, dst_lane_slice=None)
 
         for li in range(2):
             for sp, dp in zip(src_pages, dst_pages):
@@ -931,7 +992,6 @@ class TestTpuTransferOnDevice(CustomTestCase):
 
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
-        specs = T.extract_layer_page_specs(sbufs)
         src_pages = np.array([0, 1], dtype=np.int64)
         dst_pages = np.array([1, 0], dtype=np.int64)
 
@@ -941,9 +1001,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
         blobs = [bytes(st.mv()) for st in stages]
         for st in stages:
             st.release()
-        T.scatter_stage_from_host(
-            dbufs, dst_pages, blobs, specs, pool, dst_lane_slice=None
-        )
+        T.scatter_stage_from_host(dbufs, dst_pages, blobs, pool, dst_lane_slice=None)
 
         for li in range(2):
             for sp, dp in zip(src_pages, dst_pages):
@@ -978,7 +1036,6 @@ class TestTpuTransferOnDevice(CustomTestCase):
 
         sbufs = T.get_layer_page_buffers(src)
         dbufs = T.get_layer_page_buffers(dst)
-        specs = T.extract_layer_page_specs(sbufs)
         src_pages = np.array([0, 1], dtype=np.int64)
         dst_pages = np.array([1, 0], dtype=np.int64)
 
@@ -993,7 +1050,7 @@ class TestTpuTransferOnDevice(CustomTestCase):
         self.assertTrue(all(isinstance(st, StageBuf) for st in prestaged))
 
         T.scatter_stage_from_host(
-            dbufs, dst_pages, prestaged, specs, pool, dst_lane_slice=None
+            dbufs, dst_pages, prestaged, pool, dst_lane_slice=None
         )
 
         for li in range(2):
@@ -1063,9 +1120,9 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     def _recv_and_scatter(self, decode, n_channels, room):
         if n_channels > 1:
             for _ in range(n_channels):
-                decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+                decode._handle_kvdata_ch_ch(decode.server_socket.recv_multipart())
         else:
-            decode._handle_kvdata(decode.server_socket.recv_multipart())
+            decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
 
     def _run(self, async_d2h, n_channels):
@@ -1078,7 +1135,9 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
         decode.register_decode_state(room, dst_pages, aux_index=3)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         n_pages = len(src_pages)
-        prefill.transfer_infos[room] = {ep: _PrefillTransferInfo(room, ep, n_pages)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.record_decode_endpoint(room, ep, n_pages)
+        }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
         self._recv_and_scatter(decode, n_channels, room)
@@ -1225,6 +1284,304 @@ class TestDecodeReqToTokenPoolTpuHostResident(CustomTestCase):
         )
         self.assertTrue(pool.host_resident)
         self.assertEqual(pool.req_to_token.device.type, "cpu")
+
+
+class TestPendingChunkReassembly(CustomTestCase):
+    def test_process_incoming_chunk_no_reassemble(self):
+        pending_queue = deque()
+        reasm_dict = defaultdict(list)
+
+        info = PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=2,
+            kv_packing=4,
+            src_tp_rank=0,
+            dst_tp_rank=0,
+            src_attn_tp_size=1,
+            dst_attn_tp_size=1,
+            total_num_head=2,
+            n_layers=2,
+        )
+        chunk = PendingChunk(
+            index_start=0,
+            num_pages=2,
+            layer_blobs=[b"data1", b"data2"],
+            aux_blobs=[],
+            prefill_transfer_info=info,
+            from_assemble=False,
+        )
+
+        PendingChunk.process_incoming_chunk(pending_queue, reasm_dict, chunk)
+
+        self.assertEqual(len(pending_queue), 1)
+        self.assertIs(pending_queue[0], chunk)
+        self.assertEqual(len(reasm_dict), 0)
+
+    def test_process_incoming_chunk_fan_in_reassemble(self):
+        pending_queue = deque()
+        reasm_dict = defaultdict(list)
+
+        # FAN-IN 2 prefill ranks -> 1 decode rank (each prefill rank has 1 head)
+        info0 = PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=2,
+            kv_packing=4,
+            src_tp_rank=0,
+            dst_tp_rank=0,
+            src_attn_tp_size=2,
+            dst_attn_tp_size=1,
+            total_num_head=2,
+            n_layers=1,
+        )
+        info1 = PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=2,
+            kv_packing=4,
+            src_tp_rank=1,
+            dst_tp_rank=0,
+            src_attn_tp_size=2,
+            dst_attn_tp_size=1,
+            total_num_head=2,
+            n_layers=1,
+        )
+
+        # 2 pages, 1 lane (valid + dummy = 2 halves), each half = 16 bytes
+        data0 = b"\x01" * (2 * 2 * 16)
+        data1 = b"\x02" * (2 * 2 * 16)
+
+        chunk0 = PendingChunk(
+            index_start=0,
+            num_pages=2,
+            layer_blobs=[data0],
+            aux_blobs=[],
+            prefill_transfer_info=info0,
+        )
+        chunk1 = PendingChunk(
+            index_start=0,
+            num_pages=2,
+            layer_blobs=[data1],
+            aux_blobs=[],
+            prefill_transfer_info=info1,
+        )
+
+        stats = _KvStats("assemble", 0)
+
+        # Step 1: Push chunk0 from rank 0
+        PendingChunk.process_incoming_chunk(
+            pending_queue, reasm_dict, chunk0, stats=stats
+        )
+        self.assertEqual(len(pending_queue), 0)
+        self.assertEqual(len(reasm_dict[chunk0.assemble_key]), 1)
+        self.assertEqual(stats.n, 0)
+
+        # Step 2: Duplicate push chunk0 from rank 0 (should be ignored for reasm bucket)
+        PendingChunk.process_incoming_chunk(
+            pending_queue, reasm_dict, chunk0, stats=stats
+        )
+        self.assertEqual(len(pending_queue), 0)
+        self.assertEqual(len(reasm_dict[chunk0.assemble_key]), 1)
+        self.assertEqual(stats.n, 0)
+
+        # Step 3: Push chunk1 from rank 1 -> triggers reassembly
+        PendingChunk.process_incoming_chunk(
+            pending_queue, reasm_dict, chunk1, stats=stats
+        )
+        self.assertEqual(len(pending_queue), 1)
+        self.assertNotIn(chunk0.assemble_key, reasm_dict)
+        self.assertEqual(stats.n, 1)
+        self.assertGreater(stats.nbytes, 0)
+
+        merged = pending_queue.popleft()
+        self.assertTrue(merged.from_assemble)
+        self.assertEqual(merged.prefill_transfer_info.src_attn_tp_size, 1)
+
+    def test_stage_buf_fan_in_reassemble(self):
+        pool = PinnedHostPool(max_bytes=10 * 1024 * 1024)
+        pending_queue = deque()
+        reasm_dict = defaultdict(list)
+
+        info0 = PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=2,
+            kv_packing=4,
+            src_tp_rank=0,
+            dst_tp_rank=0,
+            src_attn_tp_size=2,
+            dst_attn_tp_size=1,
+            total_num_head=2,
+            n_layers=1,
+        )
+        info1 = PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=2,
+            kv_packing=4,
+            src_tp_rank=1,
+            dst_tp_rank=0,
+            src_attn_tp_size=2,
+            dst_attn_tp_size=1,
+            total_num_head=2,
+            n_layers=1,
+        )
+
+        nbytes = 2 * 2 * 16
+        data0 = b"\x01" * nbytes
+        data1 = b"\x02" * nbytes
+
+        sb0 = pool.acquire(nbytes)
+        sb0.copy_bytes(data0)
+        sb1 = pool.acquire(nbytes)
+        sb1.copy_bytes(data1)
+
+        chunk0 = PendingChunk(
+            index_start=0,
+            num_pages=2,
+            layer_blobs=[sb0],
+            aux_blobs=[],
+            prefill_transfer_info=info0,
+        )
+        chunk1 = PendingChunk(
+            index_start=0,
+            num_pages=2,
+            layer_blobs=[sb1],
+            aux_blobs=[],
+            prefill_transfer_info=info1,
+        )
+
+        PendingChunk.process_incoming_chunk(pending_queue, reasm_dict, chunk0)
+        PendingChunk.process_incoming_chunk(pending_queue, reasm_dict, chunk1)
+
+        self.assertEqual(len(pending_queue), 1)
+        merged = pending_queue.popleft()
+        self.assertTrue(merged.from_assemble)
+        self.assertIsInstance(merged.layer_blobs[0], bytes)
+
+    def test_stage_buf_fan_out_reassemble(self):
+        pool = PinnedHostPool(max_bytes=10 * 1024 * 1024)
+        pending_queue = deque()
+        reasm_dict = defaultdict(list)
+
+        info = PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=2,
+            kv_packing=4,
+            src_tp_rank=0,
+            dst_tp_rank=1,
+            src_attn_tp_size=1,
+            dst_attn_tp_size=2,
+            total_num_head=2,
+            n_layers=1,
+        )
+
+        nbytes = 2 * 2 * 16
+        data = b"\x03" * nbytes
+        sb = pool.acquire(nbytes)
+        sb.copy_bytes(data)
+
+        chunk = PendingChunk(
+            index_start=0,
+            num_pages=2,
+            layer_blobs=[sb],
+            aux_blobs=[],
+            prefill_transfer_info=info,
+        )
+
+        PendingChunk.process_incoming_chunk(pending_queue, reasm_dict, chunk)
+
+        self.assertEqual(len(pending_queue), 1)
+        merged = pending_queue.popleft()
+        self.assertTrue(merged.from_assemble)
+        self.assertIsInstance(merged.layer_blobs[0], bytes)
+
+    def test_reassemble_chunks_benchmark(self):
+        """Benchmark reassemble_chunks for 0.1GB, 0.5GB, and 1GB chunk sizes."""
+        # Sizes in GB to test: 0.1GB (100MB), 0.5GB (500MB), 1.0GB (1000MB)
+        sizes_gb = [0.1, 0.5, 1.0]
+
+        print("\n" + "=" * 80)
+        print(" [Benchmark] PendingChunk.reassemble_chunks Performance ")
+        print("=" * 80)
+
+        for size_gb in sizes_gb:
+            size_bytes = int(size_gb * 1024 * 1024 * 1024)
+            # FP8 RPA v3 layout: reshape(-1, 2, half_lane_bytes)
+            # Ensure size_bytes is divisible by 2
+            half_lane_bytes = 1024 * 64
+            num_pages = size_bytes // (2 * half_lane_bytes)
+            actual_bytes = num_pages * 2 * half_lane_bytes
+
+            info0 = PrefillTransferInfo(
+                room=100,
+                decode_endpoint="127.0.0.1:10000",
+                num_pages=num_pages,
+                kv_packing=4,
+                src_tp_rank=0,
+                dst_tp_rank=0,
+                src_attn_tp_size=2,
+                dst_attn_tp_size=1,
+                total_num_head=2,
+                n_layers=1,
+            )
+            info1 = PrefillTransferInfo(
+                room=100,
+                decode_endpoint="127.0.0.1:10000",
+                num_pages=num_pages,
+                kv_packing=4,
+                src_tp_rank=1,
+                dst_tp_rank=0,
+                src_attn_tp_size=2,
+                dst_attn_tp_size=1,
+                total_num_head=2,
+                n_layers=1,
+            )
+
+            # Generate dummy bytes array for layer blob
+            blob0 = np.ones(actual_bytes, dtype=np.uint8).tobytes()
+            blob1 = np.full(actual_bytes, 2, dtype=np.uint8).tobytes()
+
+            c0 = PendingChunk(
+                index_start=0,
+                num_pages=num_pages,
+                layer_blobs=[blob0],
+                aux_blobs=[],
+                prefill_transfer_info=info0,
+            )
+            c1 = PendingChunk(
+                index_start=0,
+                num_pages=num_pages,
+                layer_blobs=[blob1],
+                aux_blobs=[],
+                prefill_transfer_info=info1,
+            )
+
+            # Warmup
+            _ = PendingChunk.reassemble_chunks([c0, c1])
+
+            # Measure timing
+            t0 = time.perf_counter()
+            out_chunk = PendingChunk.reassemble_chunks([c0, c1])
+            t1 = time.perf_counter()
+
+            cost_sec = t1 - t0
+            cost_ms = cost_sec * 1000.0
+            total_input_bytes = actual_bytes * 2
+            gbps = (total_input_bytes / (1024**3)) / cost_sec if cost_sec > 0 else 0.0
+
+            print(
+                f" Single Chunk Input: {size_gb:.1f} GB ({actual_bytes / 1e6:.1f} MB) | "
+                f"Total Input Processed: {total_input_bytes / 1e6:.1f} MB | "
+                f"Time: {cost_ms:8.2f} ms | "
+                f"Throughput: {gbps:6.2f} GB/s"
+            )
+            self.assertTrue(out_chunk.from_assemble)
+            self.assertEqual(len(out_chunk.layer_blobs[0]), actual_bytes)
+
+        print("=" * 80 + "\n")
 
 
 if __name__ == "__main__":

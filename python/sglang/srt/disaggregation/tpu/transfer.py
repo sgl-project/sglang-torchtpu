@@ -28,23 +28,40 @@ between treated as an opaque dtype-tagged blob.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import enum
+import json
 import logging
-from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple, Union
+import time
+from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base.conn import KVArgs
 from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
 
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _ch = logging.StreamHandler()
+    _ch.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(_ch)
+
+
+def _blob_to_tensor(blob: StageBuf | bytes) -> torch.Tensor:
+    if isinstance(blob, StageBuf):
+        return blob._t
+    return torch.frombuffer(blob, dtype=torch.uint8)
+
 
 # ``(start, count)`` on the fused buffer's packed-lane axis (dim 2), or None for
 # a whole-page transfer (the equal-attn_tp path). Used by the resharding gather
 # /scatter helpers.
-LaneSlice = Optional[Tuple[int, int]]
+LaneSlice = Optional[tuple[int, int]]
 
 
 class ReshardUnsupportedError(ValueError):
@@ -52,16 +69,407 @@ class ReshardUnsupportedError(ValueError):
 
 
 class ReshardDirection(enum.Enum):
-    """Which way KV heads are redistributed between prefill and decode attn_tp.
+    """Describe how do we do resharding, standing from decoder's view.
 
-    * ``EQUAL``   — same attn_tp: whole per-rank head set, 1:1 (no resharding).
-    * ``FAN_IN``  — prefill_tp > decode_tp: many prefill ranks -> one decode rank.
-    * ``FAN_OUT`` — prefill_tp < decode_tp: one prefill rank -> many decode ranks.
+    If one decoder has smaller attention tp, i.e each decoder TP's head
+    will be not less than each prefiller TP's head, then it's FAN-IN.
+    If one decoder has larger attention tp, i.e each prefiller TP's head will
+    not be less thanthan each decoder TP's head, then it's FAN-OUT.
+
+    Current implementation does prune any traffic. So each prefiller TP will
+    send it's data to decoder TP even if there are two TP under same DP group
+    which happend to have duplicate heads."""
+
+    UNSPECIFIED = "unspecified"
+    # Prefill attention tp == Decode attention tp.
+    EQUAL = "equal"
+    # Prefill attention tp > Decode attention tp.
+    FAN_IN = "fan-in"
+    # Prefill attention tp < Decode attention tp.
+    FAN_OUT = "fan-out"
+
+
+@dataclass
+class PrefillTransferInfo:
+    """Prefill-side record for target decode endpoint and resharding state.
+
+    The dataclass will infer exact data spec to start data push. For case like
+    FP8 src_attn_tp_size = 1 (Not enough heads for kv packing), minimum 1 lane
+    will be sent.
+
+    Attributes:
+      room: Disagg transfer room ID.
+      decode_endpoint: Destination socket endpoint address.
+      num_pages: Total page count to transfer.
+      src_tp_rank: Prefiller tensor parallel rank.
+      dst_tp_rank: Decoder tensor parallel rank.
+      src_attn_tp_size: Attention TP size of prefill engine.
+      dst_attn_tp_size: Attention TP size of decode engine.
+      total_num_head: Total attention head count.
+      kv_packing: Kv packing number, for FP8 it's 4.
+      n_layers: Number of model layers.
+      gather_time_ms: Total D2H gather duration in milliseconds.
+      push_time_ms: Total socket push duration in milliseconds.
+      push_start_time: Monotonic start timestamp of push.
     """
 
-    EQUAL = "equal"
-    FAN_IN = "fan-in"
-    FAN_OUT = "fan-out"
+    room: int
+    decode_endpoint: str
+    num_pages: int
+    kv_packing: int
+    src_tp_rank: int
+    dst_tp_rank: int
+    src_attn_tp_size: int
+    dst_attn_tp_size: int
+    total_num_head: int
+    n_layers: int
+    gather_time_ms: float = 0.0
+    push_time_ms: float = 0.0
+    push_start_time: float = 0.0
+
+    def __post_init__(self) -> None:
+        self._reshard_error: str | None = None
+        if self.total_num_head <= 0:
+            self._reshard_error = (
+                f"total_num_head must be > 0, got {self.total_num_head}"
+            )
+            return
+
+        self.src_attn_tp_rank = self.src_tp_rank % self.src_attn_tp_size
+        self.dst_attn_tp_rank = self.dst_tp_rank % self.dst_attn_tp_size
+        self.src_heads = max(1, self.total_num_head // self.src_attn_tp_size)
+        self.dst_heads = max(1, self.total_num_head // self.dst_attn_tp_size)
+        self.src_replication = max(1, self.src_attn_tp_size // self.total_num_head)
+        self.dst_replication = max(1, self.dst_attn_tp_size // self.total_num_head)
+        self.resharding_direction = ReshardDirection.UNSPECIFIED
+        self.is_src_replica = self.src_tp_rank % self.src_replication != 0
+        self.is_dst_replica = self.dst_tp_rank % self.dst_replication != 0
+
+        if self.src_attn_tp_size > self.dst_attn_tp_size:
+            if self.src_attn_tp_size % self.dst_attn_tp_size != 0:
+                raise ReshardUnsupportedError()
+            self.resharding_direction = ReshardDirection.FAN_IN
+            self.src_head_start = 0
+            self.dst_head_start = (
+                self.src_attn_tp_rank // self.src_replication * self.src_heads
+            ) % self.dst_heads
+            self.n_head_to_send = self.src_heads
+        elif self.src_attn_tp_size < self.dst_attn_tp_size:
+            if self.dst_attn_tp_size % self.src_attn_tp_size != 0:
+                raise ReshardUnsupportedError()
+            self.resharding_direction = ReshardDirection.FAN_OUT
+            self.src_head_start = (
+                self.dst_attn_tp_rank // self.dst_replication * self.dst_heads
+            ) % self.src_heads
+            self.dst_head_start = 0
+            self.n_head_to_send = self.dst_heads
+        else:
+            self.resharding_direction = ReshardDirection.EQUAL
+            self.src_head_start = 0
+            self.dst_head_start = 0
+            self.n_head_to_send = self.src_heads
+
+        self.src_lane_idx = self.src_head_start * 2 // self.kv_packing
+        self.dst_lane_idx = self.dst_head_start * 2 // self.kv_packing
+        self.n_lane_to_send = (
+            self.n_head_to_send * 2 + self.kv_packing - 1
+        ) // self.kv_packing
+
+    @property
+    def if_skip_sending(self) -> bool:
+        # FIXME: Always send and always wait across all TP ranks.
+        return False
+
+    @property
+    def if_send_aux_data(self) -> bool:
+        # Why dst_head_start == 0:
+        # 1. Single receive: Each decode rank has exactly one prefill source mapped
+        #    to dst_head_start == 0, ensuring each decode rank receives aux_data once.
+        # 2. Idempotent: Aux metadata is written via C-memcpy to ptr + len*aux_index,
+        #    so duplicate writes to the same row are completely safe and idempotent.
+        return self.dst_head_start == 0
+
+    @property
+    def total_lanes(self) -> int:
+        return max(self.src_heads * 2, self.kv_packing) // self.kv_packing
+
+    @property
+    def require_slicing(self) -> bool:
+        return self.n_lane_to_send != self.total_lanes
+
+    def to_json(self) -> str:
+        return json.dumps(dataclasses.asdict(self))
+
+    @staticmethod
+    def from_json(obj: str) -> PrefillTransferInfo:
+        return PrefillTransferInfo(**json.loads(obj))
+
+
+@dataclass
+class DecodeTransferState:
+    """Decode-side per-request transfer bookkeeping.
+
+    Attributes:
+      dst_page_indices: Block IDs on this process.
+      aux_index: Aux state slot index.
+      dst_lane_per_page_block: Number of lanes per block.
+      num_pages: Total transfer page count.
+      dst_lanes_total: Total expected lanes to scatter.
+      scattered: Number of lanes scattered so far.
+    """
+
+    dst_page_indices: np.ndarray
+    aux_index: int | None
+    dst_lane_per_page_block: int
+    num_pages: int = field(init=False)
+    dst_lanes_total: int = field(init=False)
+    scattered: int = 0
+
+    def __post_init__(self) -> None:
+        self.num_pages = len(self.dst_page_indices)
+        self.dst_lanes_total = self.num_pages * self.dst_lane_per_page_block
+
+
+@dataclass
+class PendingChunk:
+    """Received KVDATA chunk awaiting main-thread scatter.
+
+    Attributes:
+      index_start: Starting page index for the chunk.
+      num_pages: Number of pages in the chunk.
+      layer_blobs: Per-layer KV buffers; StageBuf for pinned DMA pool or bytes
+        for fallback/reassembled.
+      aux_blobs: Aux state byte payloads.
+      prefill_transfer_info: Prefill transfer info.
+      from_assemble: Whether this chunk was produced by reassembly.
+    """
+
+    index_start: int
+    num_pages: int
+    layer_blobs: list[StageBuf | bytes]
+    aux_blobs: list[bytes]
+    prefill_transfer_info: PrefillTransferInfo
+    from_assemble: bool = False
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes carried by layer_blobs."""
+        return sum(
+            b.nbytes if hasattr(b, "nbytes") else len(b) for b in self.layer_blobs
+        )
+
+    @property
+    def require_reassemble(self) -> bool:
+        """Returns True if the prefill or decode kv head * 2 < kv_packing and
+        we need resharding."""
+        info = self.prefill_transfer_info
+        if self.from_assemble:
+            return False
+        if not (
+            2 * info.src_heads < info.kv_packing or 2 * info.dst_heads < info.kv_packing
+        ):
+            return False
+        if info.resharding_direction == ReshardDirection.EQUAL:
+            return False
+        return not (info.src_heads > info.dst_heads and info.src_head_start == 0)
+
+    @property
+    def assemble_key(self) -> tuple[str]:
+        """key used for assemble."""
+        return self.index_start
+
+    @property
+    def assemble_min_chunks(self) -> int:
+        """How much chunks will collapse to a new chunk."""
+        return (
+            self.prefill_transfer_info.dst_heads // self.prefill_transfer_info.src_heads
+        )
+
+    @staticmethod
+    def reassemble_chunks(chunks: list[PendingChunk]) -> PendingChunk:
+        """Merges/extracts chunks based on each chunks's prefill_transfer_chunk.
+
+        For FP8 cases, if prefill rank only has 1 head, it will still sends
+        decoder 1 lane with half of slots dummy. On the other hand, if decode
+        only has 1 head, its final data will be 1 lane with half of slots dummy.
+
+        We only consider 1:2 and 2:1 odd head case here.
+
+        3 cases to be considered here:
+        1. FAN-IN (prefill data have 1 heads), we will combine 2 prefill chunks
+            into a single contiguous chunk (strip out dummy data) and then
+            scatter.
+        2. FAN-OUT (Decode data have 1 heads):
+           2.1 need first 2 slots from prefill, then directly use
+           original chunk.
+           2.2 need second half slots from prefill, then we create a new chunk
+           on host where first 2 slots are the copied from the prefill chunks
+        3. EQUAL (Both sides only have 1 heads):
+            No change.
+
+        Args:
+            chunks: List of chunks to be assemble to 1 chunk.
+        Returns:
+            Assembled pending chunk.
+        """
+        if not chunks:
+            raise ValueError("chunks list cannot be empty")
+
+        first_chunk = chunks[0]
+        info = first_chunk.prefill_transfer_info
+        direction = info.resharding_direction
+
+        # Case 1: FAN-IN (Prefill has 1 head -> Decode has 2 heads)
+        if direction == ReshardDirection.FAN_IN:
+            sorted_chunks = sorted(
+                chunks, key=lambda c: c.prefill_transfer_info.dst_head_start
+            )
+            num_layers = len(first_chunk.layer_blobs)
+            new_layer_blobs: list[bytes] = []
+
+            for layer_idx in range(num_layers):
+                parts = []
+                for c in sorted_chunks:
+                    blob = c.layer_blobs[layer_idx]
+                    half_lane_bytes = len(blob) // (first_chunk.num_pages * 2)
+                    t = _blob_to_tensor(blob).view(
+                        first_chunk.num_pages, 2, half_lane_bytes
+                    )
+                    parts.append(t[:, 0, :])
+                merged = torch.stack(parts, dim=1)
+                new_layer_blobs.append(merged.numpy().tobytes())
+
+            for c in sorted_chunks:
+                for b in c.layer_blobs:
+                    if isinstance(b, StageBuf):
+                        b.release()
+
+            aux_blobs = []
+            for c in sorted_chunks:
+                if c.aux_blobs:
+                    aux_blobs = c.aux_blobs
+                    break
+
+            new_info = PrefillTransferInfo(
+                room=info.room,
+                decode_endpoint=info.decode_endpoint,
+                num_pages=info.num_pages,
+                kv_packing=info.kv_packing,
+                src_tp_rank=info.dst_tp_rank,
+                dst_tp_rank=info.dst_tp_rank,
+                src_attn_tp_size=info.dst_attn_tp_size,
+                dst_attn_tp_size=info.dst_attn_tp_size,
+                total_num_head=info.total_num_head,
+                n_layers=info.n_layers,
+            )
+
+            new_chunk = PendingChunk(
+                index_start=first_chunk.index_start,
+                num_pages=first_chunk.num_pages,
+                layer_blobs=new_layer_blobs,
+                aux_blobs=aux_blobs,
+                prefill_transfer_info=new_info,
+                from_assemble=True,
+            )
+            return new_chunk
+
+        # Case 2: FAN-OUT (Decode has 1 head -> Prefill sent 2-head full lane)
+        elif direction == ReshardDirection.FAN_OUT:
+            # Case 2.1: Head 0 is needed -> original chunk already has valid Head 0 in front
+            if info.src_head_start == 0:
+                return first_chunk
+
+            # Case 2.2: Head 1 is needed -> extract second half slots and move to front
+            num_layers = len(first_chunk.layer_blobs)
+            new_layer_blobs: list[bytes] = []
+
+            for layer_idx in range(num_layers):
+                blob = first_chunk.layer_blobs[layer_idx]
+                half_lane_bytes = len(blob) // (first_chunk.num_pages * 2)
+                t = _blob_to_tensor(blob).view(
+                    first_chunk.num_pages, 2, half_lane_bytes
+                )
+                h1 = t[:, 1, :]
+                dummy = torch.zeros_like(h1)
+                merged = torch.stack([h1, dummy], dim=1)
+                new_layer_blobs.append(merged.numpy().tobytes())
+
+            for b in first_chunk.layer_blobs:
+                if isinstance(b, StageBuf):
+                    b.release()
+
+            new_info = PrefillTransferInfo(
+                room=info.room,
+                decode_endpoint=info.decode_endpoint,
+                num_pages=info.num_pages,
+                kv_packing=info.kv_packing,
+                src_tp_rank=info.dst_tp_rank,
+                dst_tp_rank=info.dst_tp_rank,
+                src_attn_tp_size=info.dst_attn_tp_size,
+                dst_attn_tp_size=info.dst_attn_tp_size,
+                total_num_head=info.total_num_head,
+                n_layers=info.n_layers,
+            )
+
+            new_chunk = PendingChunk(
+                index_start=first_chunk.index_start,
+                num_pages=first_chunk.num_pages,
+                layer_blobs=new_layer_blobs,
+                aux_blobs=first_chunk.aux_blobs,
+                prefill_transfer_info=new_info,
+                from_assemble=True,
+            )
+            return new_chunk
+
+        # Case 3: EQUAL
+        else:
+            return first_chunk
+
+    @staticmethod
+    def process_incoming_chunk(
+        pending_queue: deque[PendingChunk],
+        reasm_dict: dict[tuple, list[PendingChunk]],
+        chunk: PendingChunk,
+        stats: Any | None = None,
+    ) -> None:
+        """Enqueues or merges an incoming pending chunk into the queue.
+
+        Args:
+            pending_queue: Queue of ready chunks for scatter.
+            reasm_dict: Dictionary mapping assemble_key to pending un-assembled chunks.
+            chunk: Newly received chunk awaiting scatter or reassembly.
+            stats: Optional stats recorder for measuring assemble duration.
+        """
+        if not chunk.require_reassemble:
+            pending_queue.append(chunk)
+            return
+
+        min_chunks = chunk.assemble_min_chunks
+        if min_chunks <= 1:
+            _t0 = time.perf_counter()
+            merged_chunk = PendingChunk.reassemble_chunks([chunk])
+            if stats is not None:
+                stats.record(time.perf_counter() - _t0, merged_chunk.nbytes)
+            pending_queue.append(merged_chunk)
+            return
+
+        key = chunk.assemble_key
+        bucket = reasm_dict[key]
+
+        if not any(
+            c.prefill_transfer_info.src_tp_rank
+            == chunk.prefill_transfer_info.src_tp_rank
+            for c in bucket
+        ):
+            bucket.append(chunk)
+
+        if len(bucket) >= min_chunks:
+            reasm_dict.pop(key, None)
+            _t0 = time.perf_counter()
+            merged_chunk = PendingChunk.reassemble_chunks(bucket[:min_chunks])
+            if stats is not None:
+                stats.record(time.perf_counter() - _t0, merged_chunk.nbytes)
+            pending_queue.append(merged_chunk)
 
 
 # torch_tpu's batched host<->device DMA primitive. One call moves *all* layers'
@@ -69,7 +477,7 @@ class ReshardDirection(enum.Enum):
 # ``index_select``/``.cpu()`` loop that pays a full device-queue sync per layer
 # (48 syncs for a 48-layer model). Loaded lazily + cached; absent on plain CPU
 # (the unit tests), where we fall back to the per-layer path.
-_BATCH_TRANSFER: Optional[Tuple] = None  # (d2h_sync, h2d_sync, d2h_async) or False
+_BATCH_TRANSFER: tuple | None = None  # (d2h_sync, h2d_sync, d2h_async) or False
 
 
 def _batch_transfer():
@@ -96,7 +504,7 @@ def _batch_transfer():
     return _BATCH_TRANSFER or None
 
 
-def get_layer_page_buffers(kv_pool) -> List[torch.Tensor]:
+def get_layer_page_buffers(kv_pool) -> list[torch.Tensor]:
     """Return the per-layer KV buffers whose dim 0 is block-indexed.
 
     Supports the fused RPA v3 pool (``kv_pool.kv_buffer`` — a list of 5D
@@ -113,158 +521,6 @@ def get_layer_page_buffers(kv_pool) -> List[torch.Tensor]:
         "(TpuFusedMHATokenToKVPool, attention backend 'pallas_tpu_rpa_v3'); "
         f"got pool {type(kv_pool).__name__} without a `kv_buffer` list. "
         "The token-indexed flash KV layout is not yet supported."
-    )
-
-
-@dataclass
-class LayerPageSpec:
-    """Specification of a single KV page's layout for a specific layer.
-
-    Attributes:
-        dtype: The PyTorch data type of the KV tensor for this layer.
-        page_block_shape: The shape of a single page tensor. Match
-            ``[page_size, lane_count, kv_packing, head_dim]``.
-    """
-
-    dtype: torch.dtype
-    page_block_shape: Tuple[int, ...]
-
-
-def extract_layer_page_specs(
-    layer_buffers: Sequence[torch.Tensor],
-) -> List[LayerPageSpec]:
-    """Extracts layer page spec."""
-    return [
-        LayerPageSpec(dtype=buf.dtype, page_block_shape=tuple(buf.shape[1:]))
-        for buf in layer_buffers
-    ]
-
-
-def _adjust_layer_page_specs_lane_count(
-    specs: Sequence[LayerPageSpec], dst_lane_slice: LaneSlice
-) -> List[LayerPageSpec]:
-    """Rebuild each spec so the lane axis reflects the sliced ``count``.
-    ``page_block_shape`` == ``(page_size, lanes, kv_packing, head_dim)``, so the
-    lane axis is index 1. No-op when ``dst_lane_slice`` is None (whole page)."""
-    if dst_lane_slice is None:
-        return list(specs)
-    _, count = dst_lane_slice
-    return [
-        LayerPageSpec(
-            dtype=s.dtype,
-            page_block_shape=(s.page_block_shape[0], count, *s.page_block_shape[2:]),
-        )
-        for s in specs
-    ]
-
-
-def _head_to_lane(head: int, kv_packing: int) -> int:
-    """Converts a KV-head boundary to a packed-lane index on the interleaved
-    (x2) head axis. Raises when the boundary is not packing-aligned (only
-    possible for fp8, ``kv_packing==4``, with an odd head count)."""
-    elem = head * 2  # interleaved K,V per head
-    if elem % kv_packing != 0:
-        raise ReshardUnsupportedError(
-            f"[pd_kv_resharding] head boundary {head} is not packing-aligned "
-            f"(kv_packing={kv_packing}); fp8 resharding needs even head counts"
-        )
-    return elem // kv_packing
-
-
-@dataclass
-class KvTransferLaneSpec:
-    """Lane slice specification for a (prefill rank -> decode rank) KV transfer.
-
-    Attributes:
-        src_lane_start: Start lane index on the source prefill rank.
-        lane_count: Number of packed lanes to transfer.
-        dst_lane_start: Start lane index on the destination decode rank.
-        num_heads: Number of KV heads being transferred.
-        sends_aux: Whether this transfer includes the auxiliary metadata row.
-    """
-
-    src_lane_start: int
-    lane_count: int
-    dst_lane_start: int
-    num_heads: int
-    sends_aux: bool
-
-
-def compute_kv_transfer_lane_spec(
-    prefill_tp: int,
-    decode_tp: int,
-    engine_rank: int,
-    dst_tp_rank: int,
-    total_kv_heads: int,
-    kv_packing: int,
-) -> KvTransferLaneSpec:
-    """Computes kv transfer lane spec."""
-    if total_kv_heads <= 0:
-        # A 0 here means the decode side never advertised its KV-head count
-        # (see DecodePreallocQueue._init_kv_manager). Fail loud instead of
-        # guessing a fallback: a wrong total would silently transfer the wrong
-        # KV-head slice, which is far worse than a crash.
-        raise ReshardUnsupportedError(
-            f"[pd_kv_resharding] total_kv_heads={total_kv_heads} is invalid "
-            f"(prefill_tp={prefill_tp}, decode_tp={decode_tp}); the decode side "
-            "must set kv_args.total_kv_head_num / kv_head_num before resharding."
-        )
-    src_heads = max(1, total_kv_heads // prefill_tp)
-    dst_heads = max(1, total_kv_heads // decode_tp)
-    src_replication = max(1, prefill_tp // total_kv_heads)
-    dst_replication = max(1, decode_tp // total_kv_heads)
-    local_tp_rank = engine_rank % prefill_tp
-    dst_in = dst_tp_rank % decode_tp
-
-    if prefill_tp > decode_tp:
-        direction = ReshardDirection.FAN_IN
-        src_head_start = 0
-        is_replica = (local_tp_rank % src_replication) != 0
-        num_heads = 0 if is_replica else src_heads
-        unique_head_idx = local_tp_rank // src_replication
-        dst_head_start = (unique_head_idx * src_heads) % dst_heads
-    elif prefill_tp < decode_tp:
-        direction = ReshardDirection.FAN_OUT
-        unique_dst_head_idx = dst_in // dst_replication
-        src_head_start = (unique_dst_head_idx * dst_heads) % src_heads
-        num_heads = dst_heads
-        dst_head_start = 0
-    else:
-        direction = ReshardDirection.EQUAL
-        src_head_start = 0
-        num_heads = src_heads
-        dst_head_start = 0
-
-    src_lane_start = _head_to_lane(src_head_start, kv_packing)
-    lane_count = _head_to_lane(src_head_start + num_heads, kv_packing) - src_lane_start
-    dst_lane_start = _head_to_lane(dst_head_start, kv_packing)
-    sends_aux = (dst_head_start == 0) and (num_heads > 0)
-
-    logger.debug(
-        "[pd_kv_resharding] compute_lane_slice %s prefill_tp=%d decode_tp=%d "
-        "local=%d dst=%d total_heads=%d src_heads=%d dst_heads=%d repl=%d -> "
-        "src_lane=%d count=%d dst_lane=%d num_heads=%d aux=%s",
-        direction.value,
-        prefill_tp,
-        decode_tp,
-        local_tp_rank,
-        dst_in,
-        total_kv_heads,
-        src_heads,
-        dst_heads,
-        src_replication,
-        src_lane_start,
-        lane_count,
-        dst_lane_start,
-        num_heads,
-        sends_aux,
-    )
-    return KvTransferLaneSpec(
-        src_lane_start=src_lane_start,
-        lane_count=lane_count,
-        dst_lane_start=dst_lane_start,
-        num_heads=num_heads,
-        sends_aux=sends_aux,
     )
 
 
@@ -300,7 +556,7 @@ def gather_pages_to_host(
     layer_buffers: Sequence[torch.Tensor],
     page_indices: np.ndarray,
     lane_slice: LaneSlice = None,
-) -> List[bytes]:
+) -> list[bytes]:
     """D2H: gather ``page_indices`` (block ids) from every layer buffer and
     return one raw-byte blob per layer. Runs on the prefill side.
 
@@ -341,7 +597,7 @@ def gather_pages_to_stage(
     page_indices: np.ndarray,
     pool: PinnedHostPool,
     lane_slice: LaneSlice = None,
-) -> List[StageBuf]:
+) -> list[StageBuf]:
     """TPU zero-copy D2H (#1/#4): gather each layer's pages directly into pooled
     pinned+aligned host buffers via one batched ``batch_transfer_d2h``. Returns
     the list of ``StageBuf``s; the caller sends their ``.mv()`` memoryviews with
@@ -371,7 +627,7 @@ def gather_pages_to_stage_async(
     page_indices: np.ndarray,
     pool: PinnedHostPool,
     lane_slice: LaneSlice = None,
-) -> Tuple[Optional[Any], List[StageBuf]]:
+) -> tuple[Any | None, list[StageBuf]]:
     """Async variant of :func:`gather_pages_to_stage` (#7). Issues the batched
     D2H without blocking and returns ``(future, stages)``; the caller waits the
     future (off the scheduler thread) before sending.
@@ -405,29 +661,32 @@ def gather_pages_to_stage_async(
 def scatter_stage_from_host(
     layer_buffers: Sequence[torch.Tensor],
     page_indices: np.ndarray,
-    layer_blobs: Sequence[Union[StageBuf, bytes]],
-    specs: Sequence[LayerPageSpec],
+    layer_blobs: Sequence[StageBuf | bytes],
     pool: PinnedHostPool,
     dst_lane_slice: LaneSlice = None,
 ) -> None:
-    """H2D scatter via pooled pinned staging: batch_transfer_h2d into device
-    shards, then index_copy_ into the KV pool block positions.
+    """H2D scatter via pooled pinned staging: batched H2D into device shards,
+    then ``index_copy_`` into the KV pool block positions. Decode side.
 
-    ``layer_blobs`` is either a list of :class:`StageBuf`s (pre-staged by the
-    recv thread — no copy here) or raw bytes/memoryviews (acquire staging and
-    copy). Staging buffers are released to the pool when done.
-
-    ``dst_lane_slice`` = ``(start, count)`` writes the received KV-head slice
-    into that dim-2 sub-range of each layer buffer (MHA resharding); None writes
-    the whole page. The blob shapes are rebuilt from ``count`` so an fp8/bf16
-    slice reshapes correctly."""
+    Args:
+        layer_buffers: Per-layer block-indexed KV tensors to scatter into.
+        page_indices: Destination block ids, one per page.
+        layer_blobs: Per-layer payload, either pre-staged ``StageBuf``s (recv
+            thread already copied the wire — no copy here) or raw bytes /
+            memoryviews (staged and copied here). Released to ``pool`` when done.
+        pool: Pinned host staging pool to acquire/release staging buffers.
+        dst_lane_slice: ``(start, count)`` writing the KV-head slice into that
+            dim-2 sub-range of each buffer (MHA resharding); None writes the
+            whole page. dtype/shape come from the lane-narrowed targets, so an
+            fp8/bf16 slice reshapes correctly.
+    """
     if len(layer_buffers) == 0:
         return
     bt = _batch_transfer()
     if bt is None:
         raise RuntimeError("scatter_stage_from_host requires torch_tpu batch_transfer")
     _, h2d_sync, _ = bt
-    specs = _adjust_layer_page_specs_lane_count(specs, dst_lane_slice)
+    dsts = [_narrow_lanes(buf, dst_lane_slice) for buf in layer_buffers]
     device = layer_buffers[0].device
     n_pages = len(np.asarray(page_indices))
     idx = torch.as_tensor(np.asarray(page_indices), dtype=torch.long, device=device)
@@ -440,18 +699,16 @@ def scatter_stage_from_host(
             st.copy_bytes(blob)
     try:
         host_srcs = [
-            st.view(spec.dtype, (n_pages, *spec.page_block_shape))
-            for st, spec in zip(stages, specs)
+            st.view(dst.dtype, (n_pages, *dst.shape[1:]))
+            for st, dst in zip(stages, dsts)
         ]
         dev_shards = [
-            torch.empty(
-                (n_pages, *spec.page_block_shape), dtype=spec.dtype, device=device
-            )
-            for spec in specs
+            torch.empty((n_pages, *dst.shape[1:]), dtype=dst.dtype, device=device)
+            for dst in dsts
         ]
         h2d_sync(host_srcs, dev_shards)
-        for buf, shard in zip(layer_buffers, dev_shards):
-            _index_copy_pages(_narrow_lanes(buf, dst_lane_slice), idx, shard)
+        for dst, shard in zip(dsts, dev_shards):
+            _index_copy_pages(dst, idx, shard)
     finally:
         for st in stages:
             st.release()
@@ -461,29 +718,32 @@ def scatter_pages_from_host(
     layer_buffers: Sequence[torch.Tensor],
     page_indices: np.ndarray,
     layer_blobs: Sequence[bytes],
-    specs: Sequence[LayerPageSpec],
     dst_lane_slice: LaneSlice = None,
 ) -> None:
-    """H2D: scatter per-layer byte blobs into ``page_indices`` (block ids) of
-    every layer buffer, writing onto whatever device the buffers live on.
-    Runs on the decode side.
+    """H2D scatter of per-layer byte blobs into ``page_indices`` (block ids) of
+    every layer buffer, onto whatever device the buffers live on. Decode side.
 
-    ``dst_lane_slice`` = ``(start, count)`` writes the received KV-head slice
-    into that dim-2 sub-range of each layer buffer (MHA resharding); None writes
-    the whole page."""
+    Args:
+        layer_buffers: Per-layer block-indexed KV tensors to scatter into.
+        page_indices: Destination block ids, one per page.
+        layer_blobs: Per-layer raw byte payloads, one per layer buffer.
+        dst_lane_slice: ``(start, count)`` writing the KV-head slice into that
+            dim-2 sub-range of each buffer (MHA resharding); None writes the
+            whole page. dtype/shape come from the lane-narrowed targets.
+    """
     if len(layer_buffers) == 0:
         return
     assert len(layer_blobs) == len(layer_buffers), (
         f"layer count mismatch: {len(layer_blobs)} blobs vs "
         f"{len(layer_buffers)} layer buffers"
     )
-    specs = _adjust_layer_page_specs_lane_count(specs, dst_lane_slice)
+    dsts = [_narrow_lanes(buf, dst_lane_slice) for buf in layer_buffers]
     device = layer_buffers[0].device
     n_pages = len(np.asarray(page_indices))
     idx = torch.as_tensor(np.asarray(page_indices), dtype=torch.long, device=device)
     host_srcs = [
-        bytes_to_tensor(blob, spec.dtype, (n_pages, *spec.page_block_shape))
-        for blob, spec in zip(layer_blobs, specs)
+        bytes_to_tensor(blob, dst.dtype, (n_pages, *dst.shape[1:]))
+        for blob, dst in zip(layer_blobs, dsts)
     ]
     bt = _batch_transfer() if device.type != "cpu" else None
     if bt is not None:
@@ -496,19 +756,17 @@ def scatter_pages_from_host(
         # allocator first. Phase 2's pinned aligned staging pool removes this copy.
         aligned_srcs = [h.clone() for h in host_srcs]
         dev_shards = [
-            torch.empty(
-                (n_pages, *spec.page_block_shape), dtype=spec.dtype, device=device
-            )
-            for spec in specs
+            torch.empty((n_pages, *dst.shape[1:]), dtype=dst.dtype, device=device)
+            for dst in dsts
         ]
         h2d_sync(aligned_srcs, dev_shards)
-        for buf, shard in zip(layer_buffers, dev_shards):
-            _index_copy_pages(_narrow_lanes(buf, dst_lane_slice), idx, shard)
+        for dst, shard in zip(dsts, dev_shards):
+            _index_copy_pages(dst, idx, shard)
         return
 
     # Per-layer fallback (CPU / batch_transfer unavailable).
-    for buf, host in zip(layer_buffers, host_srcs):
-        _index_copy_pages(_narrow_lanes(buf, dst_lane_slice), idx, host.to(device))
+    for dst, host in zip(dsts, host_srcs):
+        _index_copy_pages(dst, idx, host.to(device))
 
 
 def _index_copy_pages(buf: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -> None:
@@ -535,9 +793,9 @@ def _index_copy_pages(buf: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -
 # --------------------------------------------------------------------------
 
 
-def read_aux_row(kv_args: KVArgs, aux_index: int) -> List[bytes]:
+def read_aux_row(kv_args: KVArgs, aux_index: int) -> list[bytes]:
     """Read aux buffer row ``aux_index`` from the prefill MetadataBuffers."""
-    blobs: List[bytes] = []
+    blobs: list[bytes] = []
     for ptr, item_len in zip(kv_args.aux_data_ptrs, kv_args.aux_item_lens):
         src = ptr + item_len * aux_index
         buf = (ctypes.c_byte * item_len).from_address(src)
