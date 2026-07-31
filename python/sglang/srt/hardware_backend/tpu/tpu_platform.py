@@ -280,16 +280,6 @@ class TpuSRTPlatform(SRTPlatform):
         # Registered algorithms own their validation and backend integration.
         spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if cfg.attention_backend == "pallas_tpu_rpa_batched":
-                # It has no draft-backend wiring in speculative.draft_utils,
-                # so reject here with a clear message rather than failing later
-                # during draft-backend creation.
-                raise NotImplementedError(
-                    "Speculative decoding is not supported with "
-                    "--attention-backend pallas_tpu_rpa_batched yet. "
-                    "Use --attention-backend pallas_tpu_rpa_v3 for speculative "
-                    "decoding."
-                )
             if spec_algo == "EAGLE3":
                 if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
@@ -338,7 +328,8 @@ class TpuSRTPlatform(SRTPlatform):
         #   - "pallas_tpu_rpa_batched": the batched RPA kernel in
         #     `pallas/batched_rpa`, a thin subclass of the same shared base as
         #     v3 (see `attention_pallas_rpa_base`). Same fused KV cache, batches
-        #     sequences for higher throughput. No speculative decoding.
+        #     sequences for higher throughput. Supports EAGLE3 speculative
+        #     decoding through the shared RPA draft-backend implementation.
         #   - "pallas_tpu_flash": flash_attention for prefill/extend +
         #     `jax.experimental.pallas.ops.tpu.paged_attention` for decode.
         #     Original implementation from PR #5, works against the flat

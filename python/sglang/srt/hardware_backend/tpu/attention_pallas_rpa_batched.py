@@ -122,8 +122,8 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=False,
+    uses_cu_kv_lens=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
-    uses_draft_extend_v2=False,
     min_page_size=_MIN_PAGE_SIZE,
 )
 
