@@ -19,18 +19,40 @@ decode runs on `done_recving`. Cross-rank gating is the framework's existing
 `poll_and_all_reduce` (min over ranks); no worker-side barrier. Page ids come
 from `kv_to_page_indices` in token order and are raiden block ids directly.
 
+## Asymmetric attention TP (strided push-resharding)
+
+When decode TP < prefill TP (e.g. 8TP (P) -> 4TP2DP (D)), a decode rank
+holds a wider kv-head slice than any single prefill rank, so the whole-block pull
+cannot place it. That case uses raiden's push-resharding (on by default; set
+`SGLANG_RAIDEN_RESHARD=0` to disable): decode rank `r` is fed by prefill ranks
+`r*ratio`(`ratio = src_tp // dst_tp`). The strided interleave lands on the decode
+receiver, which then auto-H2Ds the assembled host staging into HBM.
+
+Handshake (decode-initiated, data flows prefill→decode): `RESHARD_REQ` (decode
+endpoint + blocks + tp) → `RESHARD_BLOCKS` (prefill blocks) → decode registers its
+receiver plan → `RESHARD_READY` → prefill `d2h`-stages and `push_registered_plan`.
+Schedules are built in `reshard_schedule.py` (unit-tested in
+`test/manual/kv_transfer/test_reshard_schedule.py`). Requires `ratio` to divide
+the total kv-head count evenly; the byte granule is one kv-head's contiguous K+V.
+
+DP-attention replicas that co-locate on a decode host get distinct raiden control
+ports via `base + 2*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to
+`base + 2*attn_tp_rank` when `attn_dp_size == 1`).
+
 ## Scope (v1)
 
-Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models, **equal prefill/decode attn
-TP**, decode in chunk-cache mode. Needs `tpu_raiden` built against the same
-`torch_tpu` as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP,
-Mamba/SWA/NSA, speculative draft KV, decode prefix-cache reuse.
+Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models, decode in chunk-cache mode.
+Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
+push-resharding path above. Needs `tpu_raiden` built against the same `torch_tpu`
+as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP, Mamba/SWA/NSA,
+speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; rank *r* uses `base + 2r` (data = `+1`) |
+| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 2*(dp_rank*tp_size + tp_rank)` (data = `+1`) |
+| `SGLANG_RAIDEN_RESHARD` | `1` | on by default; activates only for asymmetric attn TP (`dst_tp < src_tp`) — symmetric traffic is unaffected. Set `0` to disable (asymmetric TP then raises) and keep the multi-slot host pool instead of the reshard device-shadow sizing. |
 | `SGLANG_RAIDEN_NUM_SLOTS` | `16` | raiden host-pool transfer slots |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
@@ -57,5 +79,7 @@ Drive both through the standard SGLang PD router, same as mooncake.
 
 - Wire format / page mapping (host-only):
   `python -m pytest test/manual/kv_transfer/test_raiden_serde.py`
+- Resharding schedule byte-math (host-only, proto mocked):
+  `python -m pytest test/manual/kv_transfer/test_reshard_schedule.py`
 - End-to-end correctness + throughput: TPU VM only (via the team cdk flow);
   compare decode output token-for-token against a single-instance run.

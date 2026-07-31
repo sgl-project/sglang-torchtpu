@@ -13,8 +13,7 @@ import unittest
 import numpy as np
 
 from sglang.srt.disaggregation.raiden.serde import (
-    BLOCKS,
-    PULL_REQ,
+    MessageTag,
     pack_blocks,
     read_aux_blob,
     unpack_blocks,
@@ -31,7 +30,7 @@ def kv_to_page_indices(kv_indices, page_size):
 
 class TestRaidenSerde(unittest.TestCase):
     def test_headers_distinct(self):
-        self.assertNotEqual(PULL_REQ, BLOCKS)
+        self.assertNotEqual(MessageTag.PULL_REQ, MessageTag.BLOCKS)
 
     def test_block_pack_roundtrip(self):
         for blocks in ([], [0], [20, 8, 2], list(range(1000))):

@@ -7,14 +7,37 @@ tested in isolation.
 from __future__ import annotations
 
 import ctypes
+import enum
 import struct
 from typing import List
 
 import numpy as np
 
-# ZMQ multipart headers exchanged over the existing per-rank PULL sockets.
-PULL_REQ = b"RAIDEN_PULL_REQ"  # decode -> prefill: "send me room R's blocks"
-BLOCKS = b"RAIDEN_BLOCKS"  # prefill -> decode: block-ids + endpoint + aux
+
+class MessageTag(bytes, enum.Enum):
+    """First frame of every ZMQ multipart header on the per-rank PULL sockets.
+
+    A ``bytes`` enum so members compare and serialize as their raw wire value:
+    ``msg[0] == MessageTag.PULL_REQ`` matches the bytes read off the socket, and
+    a member can be placed directly into a ``send_multipart`` frame list.
+    """
+
+    # Symmetric-TP pull path (decode TP == prefill TP).
+    PULL_REQ = b"RAIDEN_PULL_REQ"  # decode -> prefill: "send me room R's blocks"
+    BLOCKS = b"RAIDEN_BLOCKS"  # prefill -> decode: block-ids + endpoint + aux
+
+    # Asymmetric-TP push-resharding path (decode TP < prefill TP).
+    RESHARD_REQ = b"RAIDEN_RESHARD_REQ"  # decode -> prefill: endpoint + blocks + tp
+    RESHARD_BLOCKS = b"RAIDEN_RESHARD_BLOCKS"  # prefill -> decode: blocks + rank + aux
+    RESHARD_READY = b"RAIDEN_RESHARD_READY"  # decode -> prefill: registered, push now
+
+
+def pack_ints(values: List[int]) -> bytes:
+    return np.asarray(values, dtype=np.int64).tobytes()
+
+
+def unpack_ints(buf: bytes) -> List[int]:
+    return np.frombuffer(buf, dtype=np.int64).tolist()
 
 
 def pack_blocks(block_ids: List[int]) -> bytes:
