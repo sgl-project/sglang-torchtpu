@@ -455,6 +455,17 @@ class SpecDecodeCompilePolicyMixin:
         # Text-only spec requests produce mm_inputs=[None]*bs at runtime.
         return [None] * bs
 
+    def _dummy_out_cache_loc_dtype(self, mode: ForwardMode) -> torch.dtype:
+        # Spec V2 explicitly creates int64 locations for verify, draft decode,
+        # and draft extend. Prefill-shaped EXTEND still uses the live allocator.
+        if (
+            mode.is_target_verify()
+            or mode.is_draft_extend_v2()
+            or (self.is_draft_worker and mode.is_decode())
+        ):
+            return torch.int64
+        return super()._dummy_out_cache_loc_dtype(mode)
+
     def _seed_dummy_req_to_token(self, forward_batch: ForwardBatch) -> None:
         # Seed the page table so attention reads valid, in-range KV token indices.
         req_to_token = self.model_runner.req_to_token_pool.req_to_token

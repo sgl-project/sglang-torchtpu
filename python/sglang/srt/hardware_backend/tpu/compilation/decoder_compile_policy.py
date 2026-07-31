@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import time
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, Callable, Optional
 
 import msgspec
 import torch
@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     build_bucketers,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -115,10 +116,6 @@ def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
 class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
     """Mode-specific fields used to construct a dummy precompile ForwardBatch."""
 
-    # TPU Spec V2 uses int64 for every out_cache_loc; match it during warmup to
-    # avoid a compiled-graph guard miss.
-    _OUT_CACHE_LOC_DTYPE: ClassVar[torch.dtype] = torch.int64
-
     input_ids: torch.Tensor
     positions: torch.Tensor
     out_cache_loc: torch.Tensor
@@ -179,6 +176,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         *,
         device: str | torch.device,
         slot: int,
+        out_cache_loc_dtype: torch.dtype,
     ) -> _DummyForwardBatchFields:
         """Reserved-slot layout for DECODE / EXTEND / TARGET_VERIFY."""
         input_ids = torch.zeros(num_tokens, dtype=torch.int64, device=device)
@@ -188,7 +186,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
             input_ids=input_ids,
             positions=torch.zeros(num_tokens, dtype=torch.int64, device=device),
             out_cache_loc=torch.full(
-                (num_tokens,), slot, dtype=cls._OUT_CACHE_LOC_DTYPE, device=device
+                (num_tokens,), slot, dtype=out_cache_loc_dtype, device=device
             ),
             seq_lens=seq_lens,
             orig_seq_lens=seq_lens,
@@ -207,6 +205,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         *,
         device: str | torch.device,
         page_size: int,
+        out_cache_loc_dtype: torch.dtype,
     ) -> _DummyForwardBatchFields:
         """Realistic per-request layout for DRAFT_EXTEND_V2."""
         de_ctx = int(page_size)  # 1 page of context
@@ -225,7 +224,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
         out_cache_loc = (
             (base + torch.arange(tokens_per_req, device=device).view(1, -1))
             .reshape(-1)
-            .to(cls._OUT_CACHE_LOC_DTYPE)
+            .to(out_cache_loc_dtype)
         )
         return cls(
             input_ids=input_ids,
@@ -665,6 +664,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """``mm_inputs`` field for the dummy batch (``None`` for plain decoders)."""
         return None
 
+    def _dummy_out_cache_loc_dtype(self, mode: ForwardMode) -> torch.dtype:
+        """Match cache-location indices produced by the live allocator."""
+        allocator = self.model_runner.token_to_kv_pool_allocator
+        if isinstance(allocator, SWATokenToKVPoolAllocator):
+            allocator = allocator.full_attn_allocator
+        if not isinstance(allocator.free_pages, torch.Tensor):
+            raise RuntimeError(
+                "The live KV allocator must be initialized before TPU precompile."
+            )
+        return allocator.free_pages.dtype
+
     def _seed_dummy_req_to_token(self, forward_batch: ForwardBatch) -> None:
         """Seed req_to_token rows for the dummy batch.
 
@@ -736,6 +746,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 tokens_per_req,
                 device=device,
                 page_size=self.model_runner.server_args.page_size,
+                out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(mode),
             )
         return _DummyForwardBatchFields.default(
             num_tokens,
@@ -744,6 +755,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             tokens_per_req,
             device=device,
             slot=self._dummy_kv_slot(),
+            out_cache_loc_dtype=self._dummy_out_cache_loc_dtype(mode),
         )
 
 

@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
     SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -56,6 +57,9 @@ def _model_runner(device="cpu"):
         attn_backend=_FakeAttnBackend(),
         req_to_token_pool=SimpleNamespace(),
         token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free_pages=torch.arange(4, dtype=torch.int32)
+        ),
         server_args=SimpleNamespace(page_size=1, dp_size=1),
     )
 
@@ -251,6 +255,7 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertEqual(fb.input_ids[4:].sum().item(), 0)
         self.assertEqual(fb.input_ids.dtype, torch.int64)
         self.assertEqual(fb.positions.dtype, torch.int64)
+        self.assertEqual(fb.out_cache_loc.dtype, torch.int32)
         # Per-request tensors at bs.
         self.assertEqual(fb.seq_lens.shape[0], 4)
         self.assertEqual(fb.seq_lens.dtype, torch.int64)
@@ -259,6 +264,21 @@ class TestMakeDummyForwardBatch(CustomTestCase):
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0, 0, 0, 0])
         # KV writes go to dummy slot 0 across the whole token range.
         self.assertEqual(fb.out_cache_loc.sum().item(), 0)
+
+    def test_hybrid_swa_uses_full_attention_allocator_dtype(self):
+        mr = _model_runner()
+        allocator = object.__new__(SWATokenToKVPoolAllocator)
+        allocator.full_attn_allocator = SimpleNamespace(
+            free_pages=torch.arange(4, dtype=torch.int32)
+        )
+        mr.token_to_kv_pool_allocator = allocator
+        policy = _make_policy(mr)
+
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=8, bs=8, mode=ForwardMode.DECODE
+        )
+
+        self.assertEqual(fb.out_cache_loc.dtype, torch.int32)
 
     def test_decode_has_no_extend_fields(self):
         mr = _model_runner()
@@ -480,6 +500,9 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
             req_to_token=torch.zeros(16, 4096, dtype=torch.int64)
         ),
         token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(
+            free_pages=torch.arange(4, dtype=torch.int32)
+        ),
         model_config=SimpleNamespace(hidden_size=16),
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
@@ -621,6 +644,7 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         self.assertIsNone(fb.extend_num_tokens)
         # Slot-1 KV seeding (avoids draft/target pool conflicts): not slot 0.
         self.assertEqual(fb.out_cache_loc.tolist(), [1] * 16)
+        self.assertEqual(fb.out_cache_loc.dtype, torch.int64)
         self.assertEqual(fb.req_pool_indices.tolist(), [1, 1, 1, 1])
         # Text-only mm_inputs is [None]*bs, not None (Dynamo guard parity).
         self.assertEqual(fb.mm_inputs, [None] * 4)
@@ -636,6 +660,19 @@ class TestSpecDummyForwardBatch(CustomTestCase):
             spec_info=policy._make_null_spec_info(),
         )
         self.assertIsNotNone(fb.spec_info)
+        self.assertEqual(fb.out_cache_loc.dtype, torch.int32)
+
+    def test_draft_decode_uses_spec_v2_int64_cache_locations(self):
+        policy = _make_spec_policy(is_draft_worker=True)
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=4,
+            bs=4,
+            mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+            spec_info=policy._make_draft_decode_spec_info(),
+        )
+
+        self.assertEqual(fb.out_cache_loc.dtype, torch.int64)
 
     def test_draft_extend_uses_per_request_kv_pages(self):
         mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
