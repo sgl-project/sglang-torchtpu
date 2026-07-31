@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 
@@ -295,6 +296,7 @@ class BenchArgs:
 
 
 def load_model(server_args, port_args, gpu_id, tp_rank):
+    initialize_torch_tpu_worker(server_args, tp_rank)
     suppress_other_loggers()
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
     moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)

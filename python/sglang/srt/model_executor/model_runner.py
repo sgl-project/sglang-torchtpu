@@ -255,8 +255,6 @@ if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
     init_npu_backend()
-elif _is_tpu:
-    current_platform.init_backend()
 elif current_platform.is_out_of_tree():
     current_platform.init_backend()
 
@@ -522,9 +520,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Chunked prefix caching requires an MLA model on a backend whose
         # kernels read that layout. This is a load-time gate, not a
-        # resolution-time one: out-of-tree platforms register their supported
-        # backends in init_backend(), which runs when this module is imported
-        # — after ServerArgs.__post_init__. Target runner only: a draft
+        # resolution-time one: TPU registers its supported backends during
+        # worker bootstrap, while other out-of-tree platforms may do so when
+        # this module is imported. Both occur after ServerArgs.__post_init__.
+        # Target runner only: a draft
         # model's (often non-MLA) config must not flip the shared setting.
         if not self.is_draft_worker and (
             not self.use_mla_backend

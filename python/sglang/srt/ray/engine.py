@@ -232,7 +232,7 @@ class RayEngine(Engine):
                     # Force TPU_WORKER_HOSTNAMES="" into every actor. On a
                     # multi-host GKE slice each pod inherits the slice-wide
                     # value from `ray start`; without overriding it, the actor's
-                    # _prepare_tpu_env / monkey_patch_torch_tpu_env would see
+                    # worker environment preparation would see
                     # len(hosts) > 1, take the multihost branch, discard the
                     # injected single-host slicebuilder, and hang at rendezvous.
                     tpu_worker_hostnames="",

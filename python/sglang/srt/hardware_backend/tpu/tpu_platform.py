@@ -295,6 +295,16 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def init_backend(self) -> None:
+        if getattr(self, "_backend_initialized", False):
+            return
+
+        world_size = os.environ.get("WORLD_SIZE")
+        if world_size is None:
+            raise RuntimeError(
+                "TorchTPU backend initialization requires worker WORLD_SIZE. "
+                "Initialize it from the scheduler worker bootstrap."
+            )
+
         # Keep c10d_functional collectives inside the compiled graph. torch_tpu
         # defaults to materializing collective tensors by forcing graph breaks, which
         # crashes under torch.compile(fullgraph=True) at TP>1. Setting this to 0/false
@@ -317,11 +327,20 @@ class TpuSRTPlatform(SRTPlatform):
             premapped_bytes,
         )
 
+        from sglang.srt.hardware_backend.tpu.patches import (
+            _prepare_tpu_env,
+            apply_tpu_patches,
+        )
+
+        # WORLD_SIZE is authoritative only inside a scheduler worker. Validate
+        # the inherited launch environment here; any TorchTPU-dependent
+        # topology discovery is therefore confined to the worker.
+        _prepare_tpu_env(int(world_size), resolve_single_host_topology=True)
+
         import torch_tpu  # noqa: F401
 
-        from sglang.srt.hardware_backend.tpu.patches import apply_tpu_patches
-
-        apply_tpu_patches(int(os.environ.get("WORLD_SIZE", "1")))
+        apply_tpu_patches()
+        self._backend_initialized = True
 
     # ------------------------------------------------------------------
     # MultiPlatformOp integration

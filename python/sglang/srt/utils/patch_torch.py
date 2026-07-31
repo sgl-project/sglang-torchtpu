@@ -104,8 +104,7 @@ def _modify_tuple(t, index: int, modifier: Callable):
 
 
 def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
-    """TPU-only per-child-process startup work, called from
-    ``run_scheduler_process`` before ``Scheduler`` is constructed.
+    """Set TorchTPU's per-worker distributed environment.
 
     Sets torchrun-style env vars for torch_tpu's PJRT slicebuilder
     (RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT). PJRT lazy-init
@@ -140,6 +139,17 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
             "MASTER_ADDR", hosts[0] if len(hosts) > 1 else "127.0.0.1"
         )
     os.environ.setdefault("MASTER_PORT", "29500")
+
+
+def initialize_torch_tpu_worker(server_args, tp_rank: int):
+    """Configure and initialize TorchTPU in a scheduler worker."""
+    monkey_patch_torch_tpu_env(server_args, tp_rank)
+    if server_args.device != "tpu":
+        return
+
+    from sglang.srt.platforms import current_platform
+
+    current_platform.init_backend()
 
 
 def monkey_patch_torch_compile():

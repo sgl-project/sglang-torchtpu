@@ -314,6 +314,7 @@ class TestComputeSingleHostTpuEnv(CustomTestCase):
         addrs = env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")
         self.assertEqual(len(addrs), 4)
         self.assertTrue(all(a.startswith("localhost:") for a in addrs))
+        self.assertNotIn("TORCH_TPU_TOPOLOGY", env)
 
     def test_world_size_one_topology(self):
         env = compute_single_host_tpu_env(1)
@@ -327,6 +328,31 @@ class TestComputeSingleHostTpuEnv(CustomTestCase):
         ]
         self.assertEqual(len(set(ports)), len(ports))
 
+    @mock.patch.dict(
+        os.environ,
+        {"TORCH_TPU_SLICEBUILDER_ADDRESSES": "localhost:1,localhost:2"},
+        clear=True,
+    )
+    def test_worker_resolves_missing_topology(self):
+        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+
+        with (
+            mock.patch(
+                "sglang.srt.hardware_backend.tpu.pallas_export.configure_jax_export_env"
+            ),
+            mock.patch(
+                "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
+            ),
+            mock.patch(
+                "sglang.srt.hardware_backend.tpu.patches._resolve_single_host_tpu_topology",
+                return_value="1,1,1,2",
+            ) as resolve_topology,
+        ):
+            _prepare_tpu_env(2, resolve_single_host_topology=True)
+
+        resolve_topology.assert_called_once_with(2)
+        self.assertEqual(os.environ["TORCH_TPU_TOPOLOGY"], "1,1,1,2")
+
 
 class TestActorOptions(CustomTestCase):
     """_actor_options composes num_cpus + accelerator reservation, adding the TPU
@@ -335,9 +361,9 @@ class TestActorOptions(CustomTestCase):
     package (import is lazy + gated on device).
 
     The injected runtime_env only *delivers* the launcher-computed TPU env vars
-    into the actor's os.environ; they are actually *applied* later inside the
-    actor -- monkey_patch_torch_tpu_env / _prepare_tpu_env run after
-    apply_tpu_patches and read them straight from os.environ.
+    into the actor's os.environ. Worker bootstrap then reads them while setting
+    rank state, preparing the remaining TPU environment, and applying the
+    process-local runtime patches.
     """
 
     def test_gpu_options_byte_identical(self):

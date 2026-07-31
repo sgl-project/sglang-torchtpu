@@ -51,12 +51,11 @@ class SchedulerActor:
         import dataclasses
 
         from sglang.srt.environ import envs
-        from sglang.srt.managers.scheduler import Scheduler, configure_scheduler_process
         from sglang.srt.utils.numa_utils import (
             get_numa_node_if_available,
             numa_bind_to_node,
         )
-        from sglang.srt.utils.patch_torch import monkey_patch_torch_tpu_env
+        from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
         # Override dist_init_addr if provided (for multi-node)
         if dist_init_addr:
@@ -66,14 +65,19 @@ class SchedulerActor:
 
         # The Ray-discovered, physically-ordered TPU host list is injected into
         # this actor's environment as TPU_WORKER_HOSTNAMES via runtime_env at
-        # launch (see ray_utils.tpu_actor_runtime_env), so the TPU env bootstrap
-        # below (_prepare_tpu_env) reads it straight from os.environ.
+        # launch (see ray_utils.tpu_actor_runtime_env), so worker bootstrap reads
+        # it straight from os.environ.
 
         # TPU: replay run_scheduler_process's per-process env bootstrap (RANK/
-        # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder + RPA-v3 pool
-        # swap) before Scheduler triggers PJRT init. Ray actors skip that mp
-        # entry point. No-op for non-TPU.
-        monkey_patch_torch_tpu_env(server_args, tp_rank)
+        # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder), then initialize
+        # the backend before importing Scheduler. Ray actors skip the mp entry
+        # point that normally performs this work. No-op for non-TPU.
+        initialize_torch_tpu_worker(server_args, tp_rank)
+
+        from sglang.srt.managers.scheduler import (
+            Scheduler,
+            configure_scheduler_process,
+        )
 
         # Get actual GPU IDs from Ray runtime context
         accelerator_ids = ray.get_runtime_context().get_accelerator_ids()

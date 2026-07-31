@@ -3,8 +3,11 @@
 These tests mock torch_tpu so they can run on any machine without TPU hardware.
 """
 
+import builtins
+import os
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
@@ -56,6 +59,60 @@ class TestTpuPlatformIdentity(CustomTestCase):
     def test_default_attention_backend(self):
         self.assertEqual(
             self.platform.get_default_attention_backend(), "pallas_tpu_rpa_v3"
+        )
+
+
+class TestTpuPlatformInitialization(CustomTestCase):
+    def setUp(self):
+        self.platform = TpuSRTPlatform()
+
+    def test_rejects_backend_initialization_without_worker_world_size(self):
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch(
+                "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+            ) as prepare_tpu_env,
+            patch(
+                "sglang.srt.hardware_backend.tpu.patches.apply_tpu_patches"
+            ) as apply_tpu_patches,
+        ):
+            os.environ.pop("WORLD_SIZE", None)
+            with self.assertRaisesRegex(RuntimeError, "requires worker WORLD_SIZE"):
+                self.platform.init_backend()
+
+        prepare_tpu_env.assert_not_called()
+        apply_tpu_patches.assert_not_called()
+
+    def test_worker_world_size_prepares_environment_before_runtime_patches(self):
+        calls = []
+        fake_torch_tpu = ModuleType("torch_tpu")
+
+        with (
+            patch.dict(os.environ, {"WORLD_SIZE": "16"}, clear=False),
+            patch.dict(sys.modules, {"torch_tpu": fake_torch_tpu}),
+            patch(
+                "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env",
+                side_effect=lambda world_size, **kwargs: calls.append(
+                    ("prepare", world_size, kwargs)
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.patches.apply_tpu_patches",
+                side_effect=lambda: calls.append(("patch", None)),
+            ),
+        ):
+            self.platform.init_backend()
+
+        self.assertEqual(
+            calls,
+            [
+                (
+                    "prepare",
+                    16,
+                    {"resolve_single_host_topology": True},
+                ),
+                ("patch", None),
+            ],
         )
 
 
@@ -153,6 +210,46 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(enable_torch_compile=True)
         self._apply(args)
         self.assertTrue(args.enable_torch_compile)
+
+    def test_configures_export_mesh_from_tp_size(self):
+        args = self._args(tp_size=16)
+        platform = TpuSRTPlatform()
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
+        ) as prepare_tpu_env:
+            platform.apply_server_args_defaults(args)
+
+        prepare_tpu_env.assert_called_once_with(16, setup_slicebuilder=True)
+
+    def test_parent_defaults_do_not_import_torch_tpu(self):
+        args = self._args(tp_size=8)
+        platform = TpuSRTPlatform()
+        imported_modules = []
+        real_import = builtins.__import__
+
+        def track_import(name, *args, **kwargs):
+            imported_modules.append(name)
+            return real_import(name, *args, **kwargs)
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.pallas_export.configure_jax_export_env"
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
+            ),
+            patch("builtins.__import__", side_effect=track_import),
+        ):
+            platform.apply_server_args_defaults(args)
+
+        self.assertFalse(
+            any(
+                name == "torch_tpu" or name.startswith("torch_tpu.")
+                for name in imported_modules
+            )
+        )
 
     def test_explicit_dtype_not_overridden(self):
         args = self._args(dtype="float32")

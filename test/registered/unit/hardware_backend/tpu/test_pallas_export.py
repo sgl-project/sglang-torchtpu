@@ -87,6 +87,12 @@ class TestPallasExportEnvironment(CustomTestCase):
             "--xla_force_host_platform_device_count=8", os.environ["XLA_FLAGS"]
         )
 
+    def test_rejects_pre_distributed_world_size_fallback(self):
+        pallas_export.configure_jax_export_env(16)
+
+        with self.assertRaisesRegex(RuntimeError, "must equal WORLD_SIZE=1"):
+            pallas_export.configure_jax_export_env(1)
+
     def test_maps_torchtpu_device_kind_to_pallas_spelling(self):
         cases = (
             ("TPU v6e", "TPU v6 lite"),

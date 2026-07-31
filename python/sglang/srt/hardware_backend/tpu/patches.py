@@ -127,14 +127,12 @@ def _set_torch_tpu_topology_env_multihost(
 
 
 def compute_single_host_tpu_env(world_size: int) -> dict:
-    """Compute the single-host slicebuilder + topology env WITHOUT mutating
-    ``os.environ``.
+    """Compute parent-safe single-host slicebuilder env without mutating
+    ``os.environ`` or importing TorchTPU.
 
     Picks ``world_size`` free localhost ports for the per-rank slicebuilder
-    endpoints; topology is ``1,1,1`` for ``world_size == 1``, else the
-    torch_tpu-derived grid when one is available. Returns a dict with
-    ``TORCH_TPU_SLICEBUILDER_ADDRESSES`` (always) and ``TORCH_TPU_TOPOLOGY``
-    (when known).
+    endpoints. The trivial single-rank topology is known without hardware
+    discovery; multi-rank topology is resolved later inside each worker.
 
     Returning the values (rather than writing them) lets the Ray driver compute
     the shared port list once and inject it into every same-host actor via
@@ -165,24 +163,23 @@ def compute_single_host_tpu_env(world_size: int) -> dict:
 
     if world_size == 1:
         env["TORCH_TPU_TOPOLOGY"] = "1,1,1"
-    else:
-        try:
-            from torch_tpu._internal.utils import hardware
-
-            topo = hardware.get_tpu_topology(world_size)
-            if topo:
-                env["TORCH_TPU_TOPOLOGY"] = topo
-        except Exception:
-            pass
 
     return env
+
+
+def _resolve_single_host_tpu_topology(world_size: int) -> str | None:
+    """Resolve topology inside a worker, where importing TorchTPU is allowed."""
+    from torch_tpu._internal.utils import hardware
+
+    return hardware.get_tpu_topology(world_size)
 
 
 def _set_torch_tpu_topology_env_single(world_size: int) -> None:
     """Set the slicebuilder + topology env for a single-host process group.
 
     Thin wrapper over ``compute_single_host_tpu_env`` for the non-Ray / in-process
-    path: addresses are always written; topology is only filled when unset.
+    path. Addresses are always written; the trivial single-rank topology is
+    filled when unset. Multi-rank topology requires worker-side resolution.
     """
     env = compute_single_host_tpu_env(world_size)
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = env[
@@ -193,12 +190,15 @@ def _set_torch_tpu_topology_env_single(world_size: int) -> None:
 
 
 def _prepare_tpu_env(
-    world_size: int | None = None, setup_slicebuilder: bool = True
+    world_size: int | None = None,
+    setup_slicebuilder: bool = True,
+    resolve_single_host_topology: bool = False,
 ) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
 
-    Applies LIBTPU_INIT_ARGS overrides, then dispatches to the multi-host or
-    single-host helper, which write the slicebuilder + topology env directly.
+    Applies LIBTPU_INIT_ARGS overrides, then prepares the slicebuilder
+    rendezvous. Multi-host topology comes from launcher metadata; single-host
+    hardware topology can be resolved later inside a worker.
 
     ``setup_slicebuilder=False`` applies only the libtpu/env overrides and
     returns without touching the slicebuilder/topology (or logging it). Used by
@@ -206,6 +206,10 @@ def _prepare_tpu_env(
     before ``import torch_tpu``), but the slicebuilder is built per-rank after
     node discovery, so building it here would emit a bogus single-host
     (localhost) env that never applies to the real ranks.
+
+    ``resolve_single_host_topology=True`` is worker-only. Parent and Ray driver
+    setup deliberately leave multi-rank hardware discovery to the workers so
+    they never import the ``torch_tpu`` package.
     """
     if world_size is None:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -258,6 +262,15 @@ def _prepare_tpu_env(
         # Single-host picks random free ports, so it must be computed once and
         # inherited by child ranks -- don't clobber an already-set value.
         _set_torch_tpu_topology_env_single(world_size)
+
+    if (
+        len(hosts) <= 1
+        and resolve_single_host_topology
+        and "TORCH_TPU_TOPOLOGY" not in os.environ
+    ):
+        topology = _resolve_single_host_tpu_topology(world_size)
+        if topology:
+            os.environ["TORCH_TPU_TOPOLOGY"] = topology
 
     # Only vars that are actually set are printed to keep the output focused.
     logger.info(
@@ -734,8 +747,12 @@ def _patch_tpu_torch_pallas_register_positional() -> None:
     tpu_torch_pallas.call_custom_kernel = call_custom_kernel
 
 
-def apply_tpu_patches(world_size: int | None = None) -> None:
-    _prepare_tpu_env(world_size)
+def apply_tpu_patches() -> None:
+    """Install process-local TorchTPU runtime patches.
+
+    Distributed environment preparation is a separate launch step and must
+    complete before this function imports JAX- or TorchTPU-backed modules.
+    """
     _configure_eager_mode()
     _register_tpu_compile_backend()
     _unwrap_dynamic_compile_fns()

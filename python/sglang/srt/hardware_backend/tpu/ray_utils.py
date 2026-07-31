@@ -120,7 +120,7 @@ def _resolve_bundle_order_from_probes(
     is the bundle index whose physical ``TPU_WORKER_ID == k``, so scheduler node
     ``k`` lands on physical worker ``k`` -- matching the slicebuilder endpoint
     list and ``MASTER_ADDR`` (both ordered by ``TPU_WORKER_ID``; see
-    ``discover_tpu_worker_hostnames`` / ``monkey_patch_torch_tpu_env``). Ray does
+    ``discover_tpu_worker_hostnames`` / ``initialize_torch_tpu_worker``). Ray does
     not guarantee bundle indices follow ``TPU_WORKER_ID`` order, so relying on
     numeric bundle order silently misplaces ranks for nnodes >= 3.
 
