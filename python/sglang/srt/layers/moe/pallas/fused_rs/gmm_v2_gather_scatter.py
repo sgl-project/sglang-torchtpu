@@ -1236,7 +1236,7 @@ def inner_kernel_scatter(
                         pnw = pnw_raw.flatten()[:row_size].reshape(new_r_f32.shape)
                     new_r_f32 = new_r_f32 * pnw
                     variance = jnp.sum(new_r_f32 * new_r_f32) / jnp.float32(norm_size)
-                    new_r_f32 = new_r_f32 * jax.lax.rsqrt(variance + jnp.float32(1e-5))
+                    new_r_f32 = new_r_f32 * jax.lax.rsqrt(variance + jnp.float32(1e-8))
                 result = old_r[...].astype(jnp.float32) + new_r_f32 * w
                 output_gather_ref.at[pl.ds(row_idx, 1), :, :][...] = result.astype(
                     out_dtype
@@ -2906,7 +2906,7 @@ def kernel_main_fused(
                         pnw = pnw_raw.flatten()[:row_size].reshape(new_r_f32.shape)
                     new_r_f32 = new_r_f32 * pnw
                     variance = jnp.sum(new_r_f32 * new_r_f32) / jnp.float32(norm_size)
-                    new_r_f32 = new_r_f32 * jax.lax.rsqrt(variance + jnp.float32(1e-5))
+                    new_r_f32 = new_r_f32 * jax.lax.rsqrt(variance + jnp.float32(1e-8))
                 result = old_r[...].astype(jnp.float32) + new_r_f32 * w
                 gathered_lhs_2x_ref.at[sem_id].at[pl.ds(row_idx, 1), :, :][...] = (
                     result.astype(out_dtype)

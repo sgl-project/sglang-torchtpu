@@ -4,12 +4,17 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import torch
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+    _prepare_post_expert_norm_contract,
+    apply_fp8_fused_rs,
     should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     should_skip_post_experts_all_reduce,
@@ -38,6 +43,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             "activation": "silu",
             "apply_router_weight_on_input": False,
             "no_combine": False,
+            "has_compatible_post_expert_norm": False,
             "has_fused_shared_experts": False,
             "standard_dispatcher": True,
             "enable_dp_attention": False,
@@ -48,6 +54,28 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def test_accepts_validated_ep_equals_tp_layout(self):
         self.assertTrue(self._supported())
+
+    def test_accepts_compatible_post_expert_norm_contract(self):
+        self.assertTrue(
+            self._supported(
+                no_combine=True,
+                has_compatible_post_expert_norm=True,
+            )
+        )
+
+    def test_rejects_inconsistent_post_expert_norm_contract(self):
+        self.assertFalse(
+            self._supported(
+                no_combine=False,
+                has_compatible_post_expert_norm=True,
+            )
+        )
+        self.assertFalse(
+            self._supported(
+                no_combine=True,
+                has_compatible_post_expert_norm=False,
+            )
+        )
 
     def test_rejects_unvalidated_layouts_and_runner_modes(self):
         unsupported = (
@@ -61,6 +89,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             {"activation": "gelu"},
             {"apply_router_weight_on_input": True},
             {"no_combine": True},
+            {"has_compatible_post_expert_norm": True},
             {"has_fused_shared_experts": True},
             {"standard_dispatcher": False},
             {"enable_dp_attention": True},
@@ -70,10 +99,86 @@ class TestFp8MoeFusedRs(CustomTestCase):
             with self.subTest(overrides=overrides):
                 self.assertFalse(self._supported(**overrides))
 
+    def test_prepares_model_owned_post_expert_norm_contract(self):
+        weight = torch.ones(4)
+        layer = SimpleNamespace(
+            supports_tpu_fused_rs_post_expert_norm=True,
+            hidden_size=4,
+            w2_weight=torch.empty(1, 1, 4),
+            tpu_fused_rs_post_expert_norm_weight=lambda: weight,
+            finalize_tpu_fused_rs_fallback=lambda output, dispatch: output,
+        )
+
+        _prepare_post_expert_norm_contract(layer)
+
+        self.assertTrue(layer._tpu_fused_rs_has_post_expert_norm)
+        self.assertIs(layer._tpu_fused_rs_post_expert_norm_weight, weight)
+
+    def test_rejects_incomplete_post_expert_norm_contract(self):
+        layer = SimpleNamespace(
+            supports_tpu_fused_rs_post_expert_norm=True,
+            hidden_size=4,
+            w2_weight=torch.empty(1, 1, 4),
+            tpu_fused_rs_post_expert_norm_weight=lambda: torch.ones(4),
+        )
+
+        with self.assertRaisesRegex(TypeError, "model-provided"):
+            _prepare_post_expert_norm_contract(layer)
+
+    def test_large_prefill_finalizes_then_reduces_once(self):
+        tokens, topk, hidden = 129, 2, 4
+        x = torch.zeros(tokens, hidden)
+        raw = torch.arange(tokens * topk * hidden, dtype=torch.float32).reshape(
+            tokens, topk, hidden
+        )
+        weights = torch.tensor([[0.25, 0.75]]).expand(tokens, -1)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(weights, torch.zeros(tokens, topk), None),
+        )
+        finalizer_calls = 0
+
+        def finalize(output, dispatch):
+            nonlocal finalizer_calls
+            finalizer_calls += 1
+            combined = (output.hidden_states * weights[..., None]).sum(dim=1)
+            return StandardCombineInput(hidden_states=combined)
+
+        layer = SimpleNamespace(
+            _tpu_fused_rs_has_post_expert_norm=True,
+            moe_runner_config=SimpleNamespace(
+                apply_router_weight_on_input=False,
+                no_combine=True,
+            ),
+            finalize_tpu_fused_rs_fallback=finalize,
+        )
+        expected = (raw * weights[..., None]).sum(dim=1) + 1
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.fp8_moe.apply_tpu_fp8_moe",
+                return_value=StandardCombineInput(hidden_states=raw),
+            ) as stock_moe,
+            patch(
+                "sglang.srt.distributed.moe_expert_parallel_all_reduce",
+                side_effect=lambda value: value + 1,
+            ) as all_reduce,
+        ):
+            actual = apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+
+        torch.testing.assert_close(actual.hidden_states, expected)
+        self.assertEqual(finalizer_calls, 1)
+        self.assertEqual(all_reduce.call_count, 1)
+        self.assertTrue(stock_moe.call_args.kwargs["no_combine"])
+
     def test_uses_fused_rs_only_through_small_prefill_boundary(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
-        self.assertTrue(should_use_fp8_fused_rs(256))
-        self.assertFalse(should_use_fp8_fused_rs(257))
+        self.assertTrue(should_use_fp8_fused_rs(128))
+        self.assertFalse(should_use_fp8_fused_rs(129))
         self.assertFalse(should_use_fp8_fused_rs(8192))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
