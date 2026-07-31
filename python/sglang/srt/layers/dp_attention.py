@@ -7,7 +7,6 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -528,19 +527,20 @@ def _dp_gather_tpu_all_reduce(
     """
     if not is_partial:
         local_tokens = local_tokens * attn_rank0_scale(local_tokens)
-    expected_rows = global_tokens.shape[0] // get_attention_dp_size()
+    dp_size = get_attention_dp_size()
+    expected_rows = global_tokens.shape[0] // dp_size
     if local_tokens.shape[0] != expected_rows:
         raise ValueError(
             f"dp gather: local contribution has {local_tokens.shape[0]} rows "
             f"but the global buffer slot holds {expected_rows}."
         )
-    # Rows and offsets are Python ints (constant per compiled bucket), so the
-    # slot placement is a single statically-shaped pad.
-    start = get_attention_dp_rank() * expected_rows
-    contrib = F.pad(
-        local_tokens,
-        (0, 0, start, global_tokens.shape[0] - start - local_tokens.shape[0]),
-    )
+
+    zeros = local_tokens.new_zeros(local_tokens.shape)
+    contrib = torch.zeros_like(global_tokens)
+    for r in range(dp_size):
+        parts = [local_tokens if i == r else zeros for i in range(dp_size)]
+        contrib = contrib + torch.cat(parts, dim=0) * dp_rank_scale(r, local_tokens)
+
     contrib = get_tp_group().all_reduce(contrib)
     global_tokens.copy_(contrib)
 
@@ -717,10 +717,12 @@ def dp_scatter(
         )
         n = local_tokens.shape[0]
         if n > 0:
-            # MAX_LEN gives equal-length per-rank blocks, so this rank's rows
-            # are the contiguous range [dp_rank * n, (dp_rank + 1) * n).
-            start = get_attention_dp_rank() * n
-            local_tokens.copy_(global_tokens[start : start + n])
+            dp_size = get_attention_dp_size()
+            res = torch.zeros_like(local_tokens)
+            for r in range(dp_size):
+                part = global_tokens[r * n : (r + 1) * n]
+                res = res + part * dp_rank_scale(r, global_tokens)
+            local_tokens.copy_(res)
         return
 
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
@@ -931,3 +933,22 @@ def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
     TODO: remove once torch_tpu keeps rank-divergent in-graph collectives.
     """
     return _attn_rank0_scale_cached_impl(ref.device, ref.dtype)
+
+
+@functools.lru_cache(maxsize=None)
+def _dp_rank_scale_cached_impl(
+    rank_id: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    return torch.tensor(
+        1.0 if get_attention_dp_rank() == rank_id else 0.0, device=device, dtype=dtype
+    )
+
+
+def dp_rank_scale(rank_id: int, ref: torch.Tensor) -> torch.Tensor:
+    """0/1 device scalar: 1 on DP rank_id, 0 elsewhere.
+
+    A cached 0-D device scalar (not a Python bool/float) so torch.compile lifts
+    it as a runtime graph input placeholder without creating unbacked SymInts
+    or baking rank-divergent constant attributes into HLO graphs.
+    """
+    return _dp_rank_scale_cached_impl(rank_id, ref.device, ref.dtype)

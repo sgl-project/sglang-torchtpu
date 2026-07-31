@@ -34,8 +34,9 @@ Design notes
 # explicit string literals (e.g. ``"RadixAttention"``).
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Protocol
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
@@ -78,7 +79,7 @@ class PallasForwardMetadata:
     # i32[3]  (decode_end, prefill_end, mixed_end) sequence-index ranges
     distribution: torch.Tensor
     # i32[max_num_seqs * pages_per_seq]  page indices
-    swa_page_indices: Optional[torch.Tensor] = None
+    swa_page_indices: torch.Tensor | None = None
 
 
 class InvokeKernelFn(Protocol):
@@ -141,7 +142,7 @@ class RpaKernelSpec:
     uses_draft_extend_v2: bool
     # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
     # the TPU platform's page-size defaulting, not by this module.
-    min_page_size: Optional[int] = None
+    min_page_size: int | None = None
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -181,7 +182,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
     if cached is not None:
         return cached
 
-    import jax  # noqa: F401  (force loud failure if JAX is missing)
+    import jax
     from torch_tpu._internal import pallas as _torch_pallas
 
     _jax_rpa = spec.import_kernel()
@@ -197,12 +198,12 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         cu_q_lens: jax.Array,
         cu_kv_lens: jax.Array,
         distribution: jax.Array,
-        attention_sink: Optional[jax.Array] = None,
+        attention_sink: jax.Array | None = None,
         sm_scale: float = 1.0,
-        sliding_window: Optional[int] = None,
-        soft_cap: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -255,12 +256,12 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         cu_q_lens: torch.Tensor,
         cu_kv_lens: torch.Tensor,
         distribution: torch.Tensor,
-        attention_sink: Optional[torch.Tensor] = None,
+        attention_sink: torch.Tensor | None = None,
         sm_scale: float = 1.0,
-        sliding_window: Optional[int] = None,
-        soft_cap: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -309,7 +310,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     """
 
     # Set by each subclass to select the kernel variant; None on the base only.
-    kernel_spec: ClassVar[Optional[RpaKernelSpec]] = None
+    kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
@@ -353,11 +354,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # mantissa bit gives better KV-cache accuracy.
         kv_cache_dtype = getattr(model_runner, "kv_cache_dtype", None)
         fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-        self.kv_cache_quant_dtype: Optional[torch.dtype] = (
+        self.kv_cache_quant_dtype: torch.dtype | None = (
             kv_cache_dtype if kv_cache_dtype in fp8_dtypes else None
         )
 
-        self.forward_metadata: Optional[PallasForwardMetadata] = None
+        self.forward_metadata: PallasForwardMetadata | None = None
         # Cached ``distribution`` tensors on TPU, keyed by
         # (is_decode, real_batch, device) -- it depends only on those, so a
         # cached buffer is reused every step (see init_forward_metadata).
@@ -578,7 +579,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         ).to(torch.int32)
         page_indices = page_indices.reshape(bs * pages_per_seq).contiguous()
 
-        swa_page_indices: Optional[torch.Tensor] = None
+        swa_page_indices: torch.Tensor | None = None
         if self._is_hybrid_swa:
             # ``page_indices`` are page-level indices into the full pool. To get
             # the SWA-pool variant, look up the full→swa token mapping at the
@@ -654,8 +655,20 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
         if seq_lens_cpu is not None and bs > 0:
-            max_kv_len = int(seq_lens_cpu[:bs].max().item()) + kv_len_bump
-            _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
+            if isinstance(seq_lens_cpu, list):
+                slice_cpu = seq_lens_cpu[:bs]
+                if slice_cpu:
+                    max_kv_len = max(slice_cpu) + kv_len_bump
+                    _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
+            elif isinstance(seq_lens_cpu, torch.Tensor) and seq_lens_cpu.numel() > 0:
+                slice_cpu = seq_lens_cpu[:bs]
+                if slice_cpu.numel() > 0:
+                    max_kv_len = int(slice_cpu.max().item()) + kv_len_bump
+                    _validate_kv_len_capacity(max_kv_len, pages_per_seq * page_size)
+            else:
+                # Empty seq_lens_cpu (e.g. idle rank forced into decode for DP
+                # collectives) or unhandled type.
+                pass
 
         # Small per-batch tensors -> host.
         req_pool_indices = forward_batch.req_pool_indices.to("cpu", torch.int64)
@@ -685,7 +698,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # full_to_swa_index_mapping is host-resident (CPU) on TPU, so do the
         # lookup here on the CPU page_indices and H2D the result once — keeping
         # this builder free of on-device gathers.
-        swa_page_indices: Optional[torch.Tensor] = None
+        swa_page_indices: torch.Tensor | None = None
         if self._is_hybrid_swa:
             full_to_swa = self.token_to_kv_pool.full_to_swa_index_mapping
             assert full_to_swa is not None, (
@@ -752,7 +765,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         v: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: ForwardBatch,
-        sinks: Optional[torch.Tensor] = None,
+        sinks: torch.Tensor | None = None,
     ) -> torch.Tensor:
         assert self.forward_metadata is not None, (
             "Pallas attention backend was not initialised for this forward pass; "
@@ -857,7 +870,7 @@ class BaseTpuPallasRpaMultiStepDraftBackend:
     """
 
     # Set by each subclass to the concrete per-step attention backend class.
-    attn_backend_cls: ClassVar[Optional[type]] = None
+    attn_backend_cls: ClassVar[type | None] = None
 
     def __init__(
         self,

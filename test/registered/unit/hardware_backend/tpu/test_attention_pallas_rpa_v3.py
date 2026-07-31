@@ -143,6 +143,46 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
                         seq_len=131130,
                     )
 
+    def test_seq_lens_cpu_list_and_empty_inputs(self):
+        backend = self._make_backend()
+        distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
+
+        # 1. seq_lens_cpu as a Python list
+        fb_list = SimpleNamespace(
+            seq_lens=torch.tensor([100], dtype=torch.int32),
+            seq_lens_cpu=[100],
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            spec_info=None,
+        )
+        meta_list = backend._build_metadata(fb_list, distribution)
+        self.assertIsNotNone(meta_list)
+
+        # 2. seq_lens_cpu as empty Tensor (e.g. idle rank forced into decode for DP collectives)
+        fb_empty_tensor = SimpleNamespace(
+            seq_lens=torch.empty(0, dtype=torch.int32),
+            seq_lens_cpu=torch.empty(0, dtype=torch.int64),
+            req_pool_indices=torch.empty(0, dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            spec_info=None,
+        )
+        meta_empty_tensor = backend._build_metadata(fb_empty_tensor, distribution)
+        self.assertIsNotNone(meta_empty_tensor)
+
+        # 3. seq_lens_cpu as an empty list
+        fb_empty_list = SimpleNamespace(
+            seq_lens=torch.empty(0, dtype=torch.int32),
+            seq_lens_cpu=[],
+            req_pool_indices=torch.empty(0, dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            spec_info=None,
+        )
+        meta_empty_list = backend._build_metadata(fb_empty_list, distribution)
+        self.assertIsNotNone(meta_empty_list)
+
 
 if __name__ == "__main__":
     unittest.main()
