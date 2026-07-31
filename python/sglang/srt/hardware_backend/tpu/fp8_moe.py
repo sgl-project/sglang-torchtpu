@@ -278,9 +278,7 @@ def prepare_tpu_fp8_moe_weights(
     # as [expert, N, K], so make the TPU runtime layout explicit at load time.
     for name in ("w13_weight", "w2_weight"):
         param = getattr(layer, name)
-        new_cpu = param.data.detach().cpu().transpose(1, 2).contiguous()
-        _replace_tpu_param_from_cpu(param, new_cpu)
-        del new_cpu
+        param.data = param.data.transpose(1, 2).contiguous()
 
     if block_quant:
         old_w13_scale = layer.w13_weight_scale_inv.data

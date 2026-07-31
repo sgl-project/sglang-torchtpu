@@ -112,6 +112,34 @@ class TestTpuFp8MoE(CustomTestCase):
             _build_fused_moe_op()
         cls.cpu_export_registration_calls = cpu_export_jax_op.call_count
 
+    def test_prepare_weights_transposes_on_device_by_default(self):
+        w13 = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+        w2 = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+        layer = SimpleNamespace(
+            w13_weight=torch.nn.Parameter(w13.clone(), requires_grad=False),
+            w2_weight=torch.nn.Parameter(w2.clone(), requires_grad=False),
+            w13_weight_scale=torch.nn.Parameter(torch.tensor([1.0, 2.0])),
+            w2_weight_scale=torch.nn.Parameter(torch.tensor([3.0, 4.0])),
+        )
+
+        with patch.object(
+            tpu_fp8_moe,
+            "_replace_tpu_param_from_cpu",
+            side_effect=AssertionError("unexpected host roundtrip"),
+        ):
+            tpu_fp8_moe.prepare_tpu_fp8_moe_weights(
+                layer,
+                block_quant=False,
+                weight_block_size=None,
+                use_mxfp8=False,
+                is_fp4_expert=False,
+            )
+
+        self.assertTrue(torch.equal(layer.w13_weight, w13.transpose(1, 2).contiguous()))
+        self.assertTrue(torch.equal(layer.w2_weight, w2.transpose(1, 2).contiguous()))
+        self.assertEqual(tuple(layer.w13_weight_scale.shape), (2, 1, 1, 3))
+        self.assertEqual(tuple(layer.w2_weight_scale.shape), (2, 1, 1, 4))
+
     def test_fp8_moe_method_routes_to_tpu_fused_moe_call(self):
         method = object.__new__(Fp8MoEMethod)
         method.moe_runner_config = SimpleNamespace(
