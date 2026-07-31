@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     _prepare_post_expert_norm_contract,
     apply_fp8_fused_rs,
