@@ -1,13 +1,15 @@
 import os
-
-# This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
-# Override the CPU export platform inherited from the SGLang CI test runner so
-# JAX executes the SparseCore kernel on the physical TPU.
-os.environ["JAX_PLATFORMS"] = "tpu"
+import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+
+# This is a standalone raw-JAX kernel test, not a TorchTPU runtime process.
+# Platform discovery above enforces CPU-only JAX for SGLang, but does not import
+# JAX. Select the physical backend before the first JAX import below.
+assert "jax" not in sys.modules
+os.environ["JAX_PLATFORMS"] = "tpu"
 # Ported from tpu-inference (https://github.com/vllm-project/tpu-inference)
 #   tests/kernels/ragged_gather_v2_test.py @ 4367dcff1 (2026-07-19).
 # Local adaptations: import paths.
