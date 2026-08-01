@@ -60,6 +60,12 @@
 #                                  # tensor-parallel within the TP group). For a
 #                                  # MoE model set EP to a divisor of TP_SIZE and
 #                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
+#   DP_SIZE=                       # >1 passes --dp-size N --enable-dp-attention,
+#                                  # giving attention TP = TP_SIZE/DP_SIZE
+#                                  # ("attn_tp"). NOTE sglang then divides
+#                                  # --chunked-prefill-size by DP_SIZE, so pass
+#                                  # CHUNKED_PREFILL_SIZE = per-rank budget x
+#                                  # DP_SIZE to get the per-rank chunk you want.
 #   CONC=64                        # bench concurrency this server is sized for
 #   MAX_RUNNING=$CONC              # in-flight request cap (InferenceX parity:
 #                                  # exactly the bench concurrency)
@@ -83,6 +89,22 @@
 #   QUANTIZATION=fp8               # --quantization. Set empty to disable
 #                                  # (e.g. for bf16 checkpoints)
 #   KV_CACHE_DTYPE=fp8_e4m3        # fp8 KV
+#   ENABLE_METRICS=0               # 1 → --enable-metrics (Prometheus /metrics;
+#                                  # needed to observe cache-hit / hicache /
+#                                  # retraction counters from a bench harness)
+#   ENABLE_CACHE_REPORT=0          # 1 → --enable-cache-report (per-request
+#                                  # cached_tokens in the response usage block)
+#   --- KV offload (HiCache: device KV pool mirrored into host RAM) ---
+#   KV_OFFLOAD=0                   # 1 → --enable-hierarchical-cache (+ knobs below)
+#   HICACHE_RATIO=2.0              # host pool size / device pool size
+#   HICACHE_SIZE=                  # absolute host pool GB; overrides HICACHE_RATIO
+#   HICACHE_IO_BACKEND=torch_tpu   # TPU host<->HBM transfer path. torch_tpu
+#                                  # REQUIRES ATTENTION_BACKEND=pallas_tpu_rpa_v3
+#                                  # and mem-layout page_first_fused (server_args
+#                                  # rejects other combinations).
+#   HICACHE_MEM_LAYOUT=page_first_fused
+#   HICACHE_WRITE_POLICY=          # write_through | write_through_selective |
+#                                  # write_back; unset → sglang default
 #   ENABLE_HLO_DUMP=0              # 1 → dump HLO modules to $HLO_DUMP_DIR
 #   ENABLE_TORCH_COMPILE_DEBUG=0   # 1 → dump FX/lowered to $TORCH_COMPILE_DEBUG_DIR
 #   ENABLE_PROFILER_ENDPOINT=1     # 1 → set SGLANG_TORCH_PROFILER_DIR so
@@ -98,6 +120,11 @@
 #   PYTHON=python3                 # interpreter with torch_tpu + sglang installed
 #   JAX_BAZEL=                     # opt-in; only for a Bazel-built torch_tpu (see below)
 #   --- multihost (multi-node serving) ---
+#   FORCE_SINGLE_HOST=0            # 1 → ignore the GKE multi-host auto-detection
+#                                  # and serve from this host alone. Use when the
+#                                  # host is part of a multi-host slice but this
+#                                  # engine must not span it (e.g. a P/D prefill
+#                                  # or decode engine at tp=CHIPS_PER_HOST).
 #   SGLANG_USE_RAY=                # 1 → Ray mode: run only on the head; nnodes +
 #                                  #   peer hostnames auto-discovered from the Ray
 #                                  #   cluster. Supply only NNODES.
@@ -135,7 +162,14 @@ MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' 
 : "${DIST_PORT:=10011}"        # torch.distributed rendezvous port (NOT the HTTP PORT)
 : "${CHIPS_PER_HOST:=8}"       # tp-devices per host (v7x: 4 chips x 2 cores)
 USE_RAY=${SGLANG_USE_RAY:-0}
-if [[ "$USE_RAY" == "1" ]]; then
+# FORCE_SINGLE_HOST=1 suppresses the GKE auto-detection below. Needed when this
+# host is part of a multi-host TPU slice (so TPU_WORKER_ID / TPU_WORKER_HOSTNAMES
+# are set) but THIS engine is meant to occupy only this host -- e.g. a P/D
+# prefill or decode engine at tp=CHIPS_PER_HOST, where the peer host runs the
+# other engine, not another rank of this one.
+if [[ "${FORCE_SINGLE_HOST:-0}" == "1" ]]; then
+    ENABLE_MULTIHOST=0; NNODES=1; NODE_RANK=0
+elif [[ "$USE_RAY" == "1" ]]; then
     # Ray mode: only the HEAD runs this script. The head Engine discovers the
     # peer hostnames + slice topology straight from the live Ray cluster
     # (ray.nodes() + a SPREAD placement group that probes every node's
@@ -179,6 +213,18 @@ fi
 
 TP_SIZE=${TP_SIZE:-$DEFAULT_TP}
 EP_SIZE=${EP_SIZE:-}
+# DP attention: attention runs data-parallel across DP_SIZE groups of
+# TP_SIZE/DP_SIZE ranks each ("attn_tp"), while the MoE stays TP/EP-sharded.
+DP_SIZE=${DP_SIZE:-}
+if [[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]]; then
+    if (( TP_SIZE % DP_SIZE != 0 )); then
+        echo "ERROR: TP_SIZE=$TP_SIZE is not divisible by DP_SIZE=$DP_SIZE" >&2
+        exit 2
+    fi
+    ATTN_TP_SIZE=$((TP_SIZE / DP_SIZE))
+else
+    ATTN_TP_SIZE=$TP_SIZE
+fi
 
 TS=$(date +%Y%m%d_%H%M%S)
 RUN_DIR=${RUN_DIR:-./profile/${MODEL_SLUG}-tpu/$TS}
@@ -321,6 +367,35 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
 # prefills and inflate results (it also hides larger-bucket compiles when
 # validating warmup scripts).
 DISABLE_RADIX_CACHE=${DISABLE_RADIX_CACHE:-1}
+# Observability. Off by default (a Prometheus registry + per-request cache
+# accounting is pure overhead for a plain throughput run); benchmarks that need
+# to *prove* prefix-caching / KV-offload actually fired turn both on.
+ENABLE_METRICS=${ENABLE_METRICS:-0}
+ENABLE_CACHE_REPORT=${ENABLE_CACHE_REPORT:-0}
+# ===== KV offload (HiCache) =====
+# The device KV pool is mirrored into host RAM, so evicted prefixes reload over
+# DMA instead of being recomputed. torch_tpu is the TPU io backend; server_args
+# requires it to pair with page_first_fused + pallas_tpu_rpa_v3.
+KV_OFFLOAD=${KV_OFFLOAD:-0}
+HICACHE_RATIO=${HICACHE_RATIO:-2.0}
+HICACHE_SIZE=${HICACHE_SIZE:-}
+HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-torch_tpu}
+HICACHE_MEM_LAYOUT=${HICACHE_MEM_LAYOUT:-page_first_fused}
+HICACHE_WRITE_POLICY=${HICACHE_WRITE_POLICY:-}
+if [[ "$KV_OFFLOAD" == "1" ]]; then
+    # Fail here rather than 10 minutes into weight loading: the server_args
+    # validator raises the same error, but only after the engine has started.
+    if [[ "$HICACHE_IO_BACKEND" == "torch_tpu" && "$ATTENTION_BACKEND" != "pallas_tpu_rpa_v3" ]]; then
+        echo "ERROR: KV_OFFLOAD=1 with HICACHE_IO_BACKEND=torch_tpu requires" \
+             "ATTENTION_BACKEND=pallas_tpu_rpa_v3, got '$ATTENTION_BACKEND'." >&2
+        exit 2
+    fi
+    if [[ "$DISABLE_RADIX_CACHE" == "1" ]]; then
+        echo "WARN: KV_OFFLOAD=1 with DISABLE_RADIX_CACHE=1 — HiCache is built on" \
+             "the radix tree, so nothing will ever be offloaded. Set" \
+             "DISABLE_RADIX_CACHE=0." >&2
+    fi
+fi
 
 echo "==== launch config ===="
 echo "  model              = $MODEL"
@@ -334,6 +409,7 @@ if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
   fi
 fi
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
+echo "  dp_size            = ${DP_SIZE:-<unset>}  (attn_tp=$ATTN_TP_SIZE)"
 echo "  host:port          = $HOST:$PORT"
 echo "  max_running        = $MAX_RUNNING  (CONC=$CONC)"
 echo "  page_size          = $PAGE_SIZE"
@@ -349,7 +425,16 @@ echo "  mem_fraction_static= ${MEM_FRACTION_STATIC:-<sglang default>}"
 echo "  quantization       = ${QUANTIZATION:-<sglang default>}"
 echo "  kv_cache_dtype     = ${KV_CACHE_DTYPE:-<sglang default (auto)>}"
 echo "  torch_compile_max_bs = $TORCH_COMPILE_MAX_BS"
-echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE"
+echo "  disable_radix_cache  = $DISABLE_RADIX_CACHE  (prefix_caching=$([[ "$DISABLE_RADIX_CACHE" == "1" ]] && echo off || echo on))"
+echo "  enable_metrics       = $ENABLE_METRICS"
+echo "  enable_cache_report  = $ENABLE_CACHE_REPORT"
+if [[ "$KV_OFFLOAD" == "1" ]]; then
+    echo "  kv_offload           = on  (io=$HICACHE_IO_BACKEND layout=$HICACHE_MEM_LAYOUT" \
+         "$([[ -n "$HICACHE_SIZE" ]] && echo "host_size=${HICACHE_SIZE}GB" || echo "ratio=$HICACHE_RATIO")" \
+         "write_policy=${HICACHE_WRITE_POLICY:-<sglang default>})"
+else
+    echo "  kv_offload           = off"
+fi
 echo "  disable_overlap_schedule = ${DISABLE_OVERLAP_SCHEDULE:-<platform default>}"
 echo "  tpu_decode_process_interval = ${SGLANG_TPU_DECODE_PROCESS_INTERVAL:-<unset>}"
 echo "  compile_cache        = $ENABLE_COMPILE_CACHE  (tier2=${TORCH_TPU_TIER2_NAME}, tier3=${TORCH_TPU_TIER3_ROOT})"
@@ -379,6 +464,7 @@ args=(
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
+[[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]] && args+=(--dp-size "$DP_SIZE" --enable-dp-attention)
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
@@ -388,6 +474,8 @@ args=(
 [[ -n "$MAX_TOTAL_TOKENS" ]] && args+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
 [[ "$DISABLE_RADIX_CACHE" == "1" ]] && args+=(--disable-radix-cache)
 [[ "$ENABLE_TORCH_COMPILE" == "1" ]] && args+=(--enable-torch-compile)
+[[ "$ENABLE_METRICS" == "1" ]] && args+=(--enable-metrics)
+[[ "$ENABLE_CACHE_REPORT" == "1" ]] && args+=(--enable-cache-report)
 [[ -n "${JSON_MODEL_OVERRIDE:-}" ]] && args+=(--json-model-override-args "$JSON_MODEL_OVERRIDE")
 [[ "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]] && args+=(--disable-overlap-schedule)
 # Rendezvous flags. In Ray mode NNODES is the source of truth (default 1; an
@@ -402,7 +490,19 @@ elif [[ "$ENABLE_MULTIHOST" == "1" ]]; then
     args+=(--nnodes "$NNODES" --node-rank "$NODE_RANK" --dist-init-addr "$DIST_INIT_ADDR")
 fi
 # KV offloading to host RAM (hierarchical cache); orthogonal to multihost.
-[[ "${KV_OFFLOAD:-0}" == "1" ]] && args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO:-2.0}")
+# --hicache-size (absolute GB) overrides --hicache-ratio in sglang, so pass only
+# one of them and let the resolved value show up in launch_meta.json.
+if [[ "$KV_OFFLOAD" == "1" ]]; then
+    args+=(--enable-hierarchical-cache
+           --hicache-io-backend "$HICACHE_IO_BACKEND"
+           --hicache-mem-layout "$HICACHE_MEM_LAYOUT")
+    if [[ -n "$HICACHE_SIZE" ]]; then
+        args+=(--hicache-size "$HICACHE_SIZE")
+    else
+        args+=(--hicache-ratio "$HICACHE_RATIO")
+    fi
+    [[ -n "$HICACHE_WRITE_POLICY" ]] && args+=(--hicache-write-policy "$HICACHE_WRITE_POLICY")
+fi
 
 # Escape hatch for any launch_server flag not surfaced above, e.g.
 #   EXTRA_ARGS="--weight-loader-disable-mmap" MODEL=... ./launch_server.sh
@@ -433,6 +533,8 @@ if [[ "$DUMP_META" == "1" ]]; then
         --set device=tpu \
         --set tp_size="$TP_SIZE" \
         --set ep_size="${EP_SIZE:-}" \
+        --set dp_size="${DP_SIZE:-}" \
+        --set attn_tp_size="$ATTN_TP_SIZE" \
         --set host="$HOST" \
         --set port="$PORT" \
         --set conc="$CONC" \
@@ -454,6 +556,14 @@ if [[ "$DUMP_META" == "1" ]]; then
         --set torch_compile_max_bs="$TORCH_COMPILE_MAX_BS" \
         --set enable_torch_compile="$ENABLE_TORCH_COMPILE" \
         --set disable_radix_cache="$DISABLE_RADIX_CACHE" \
+        --set enable_metrics="$ENABLE_METRICS" \
+        --set enable_cache_report="$ENABLE_CACHE_REPORT" \
+        --set kv_offload="$KV_OFFLOAD" \
+        --set hicache_ratio="$([[ "$KV_OFFLOAD" == "1" && -z "$HICACHE_SIZE" ]] && echo "$HICACHE_RATIO")" \
+        --set hicache_size="$([[ "$KV_OFFLOAD" == "1" ]] && echo "$HICACHE_SIZE")" \
+        --set hicache_io_backend="$([[ "$KV_OFFLOAD" == "1" ]] && echo "$HICACHE_IO_BACKEND")" \
+        --set hicache_mem_layout="$([[ "$KV_OFFLOAD" == "1" ]] && echo "$HICACHE_MEM_LAYOUT")" \
+        --set hicache_write_policy="$([[ "$KV_OFFLOAD" == "1" ]] && echo "$HICACHE_WRITE_POLICY")" \
         --set disable_overlap_schedule="${DISABLE_OVERLAP_SCHEDULE:-0}" \
         --set enable_compile_cache="$ENABLE_COMPILE_CACHE" \
         --set torch_tpu_tier2_name="$TORCH_TPU_TIER2_NAME" \

@@ -1,0 +1,170 @@
+# Add Qwen3-Coder-480B-A35B-Instruct-FP8 (~480GB fp8) to the shared CI weights disk,
+# for benchmark/tpu/recipe/qwen3_coder_480b_agentic_mh.sh
+# (test/registered/tpu/test_tpu_qwen3_coder_480b_agentic.py).
+#
+# WHY THIS COPIES INSTEAD OF APPENDING: model-weights-rox is already converted to
+# READ_ONLY_MANY and that conversion is ONE-WAY (see pvc-model-weights-rox.yaml.tmpl),
+# so the live disk cannot be written to. This Job builds the NEXT generation of the
+# disk: it mounts the live one read-only, copies the three existing models across,
+# downloads the new one, and leaves a writable disk ready for the ROX conversion.
+# Same shape as the copy Job that consolidated the former per-model disks.
+#
+#   # 1. run it (~1.09TB disk-to-disk copy + ~480GB HF pull; budget ~2h):
+#   kubectl -n tpu-ci apply -f .github/tpu-ci/hydrate-qwen3-coder-480b.yaml
+#   kubectl -n tpu-ci logs -f job/hydrate-qwen3-coder-480b
+#   kubectl -n tpu-ci wait --for=condition=complete job/hydrate-qwen3-coder-480b \
+#     --timeout=3h
+#
+#   # 2. convert the hydrated RWO disk to ROX and repoint the shared claim, exactly
+#   #    as pvc-model-weights-rox.yaml.tmpl documents, but reading the handle from
+#   #    the v2 claim:
+#   HANDLE=$(kubectl -n tpu-ci get pv \
+#     "$(kubectl -n tpu-ci get pvc model-weights-rwo-v2 -o jsonpath='{.spec.volumeName}')" \
+#     -o jsonpath='{.spec.csi.volumeHandle}')
+#   kubectl -n tpu-ci delete pvc model-weights-rwo-v2     # SC is Retain: disk survives
+#   kubectl -n tpu-ci delete pvc model-weights-rox        # drop the old claim
+#   kubectl -n tpu-ci delete pv  model-weights-rox-pv     # and its static PV
+#   sed "s#__VOLUME_HANDLE__#${HANDLE}#" .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl \
+#     | kubectl apply -f -
+#
+#   # 3. once a nightly is green, delete the OLD disk (find it by label; the new one
+#   #    carries the same label, so match on name from step 2's handle first).
+#
+# Sizing: the live disk holds ~1.09TB (Qwen3-30B-A3B-FP8 60GB + gpt-oss-120b 65GB +
+# MiMo-V2.5-Pro 963GB); +480GB lands at ~1.57TB, so 5Ti still fits with room for the
+# next model. Update the contents list in pvc-model-weights-rox.yaml.tmpl after step 2.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-weights-rwo-v2
+  namespace: tpu-ci
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # Same class as the live disk: this one becomes the live disk after step 2.
+  storageClassName: hyperdisk-ml-fast
+  resources:
+    requests:
+      storage: 5Ti
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hydrate-qwen3-coder-480b
+  namespace: tpu-ci
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  # ~1.09TB disk-to-disk copy plus a ~480GB HF pull. hf_transfer sustains a few
+  # hundred MiB/s in this zone, so this is roughly 1-1.5h; 3h leaves room for a slow
+  # mirror without letting a stalled download pin the node forever. (The 30B Job used
+  # 3600s for ~30GB and no copy.)
+  activeDeadlineSeconds: 10800
+  template:
+    spec:
+      restartPolicy: Never
+      # Run on a TPU node (spare CPU; the small CPU pools are full). No TPU chip is
+      # requested, so this consumes only CPU, not the reservation.
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        ci-tpu-pool: pr-gate
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: src
+          persistentVolumeClaim:
+            claimName: model-weights-rox     # live disk, ReadOnlyMany
+            readOnly: true
+        - name: dst
+          persistentVolumeClaim:
+            claimName: model-weights-rwo-v2
+      containers:
+        - name: hydrate
+          image: python:3.12-slim
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir "huggingface_hub[hf_transfer]"
+              # Pin the exact checkpoint so a re-hydrate cannot silently pull a newer
+              # HF revision out from under the nightly. Bump when intended.
+              #   Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 @ 2025-08-21
+              export REV="003f183a92fbe5b9a8325aaa8b2ae797c91dd90f"
+              export DEST=/weights/Qwen3-Coder-480B-A35B-Instruct-FP8
+
+              echo "== source disk =="; ls /src; df -h /src
+              echo "== target disk =="; df -h /weights
+
+              # Carry the existing models over. Skipping this would silently drop the
+              # other three multi-host tests when the PV is repointed in step 2.
+              # NOTE: bare `wait` returns 0 even when a child failed, so each copy is
+              # waited on by pid. Without that, a failed cp would leave a model
+              # missing, the Job would report success, and the three other multi-host
+              # nightlies would break only after the ROX repoint.
+              pids=""
+              for m in Qwen3-30B-A3B-FP8 gpt-oss-120b MiMo-V2.5-Pro; do
+                [ -d "/src/$m" ] || { echo "FAIL: /src/$m missing"; exit 1; }
+                if [ -d "/weights/$m" ]; then
+                  echo "== $m already present, skipping copy =="
+                else
+                  echo "== copying $m =="
+                  cp -a "/src/$m" /weights/ &
+                  pids="$pids $!"
+                fi
+              done
+              copy_rc=0
+              for p in $pids; do wait "$p" || copy_rc=1; done
+              [ "$copy_rc" = 0 ] || { echo "FAIL: a model copy failed"; exit 1; }
+              # Byte-for-byte size check per model: cp can exit 0 on a short write
+              # to a full disk in some kernels, and a truncated shard is far worse
+              # than a missing one (the loader fails deep in weight loading).
+              for m in Qwen3-30B-A3B-FP8 gpt-oss-120b MiMo-V2.5-Pro; do
+                a=$(du -sb "/src/$m" | cut -f1); b=$(du -sb "/weights/$m" | cut -f1)
+                [ "$a" = "$b" ] || { echo "FAIL: $m size $b != source $a"; exit 1; }
+                echo "== verified $m ($b bytes) =="
+              done
+              echo "== after copy =="; ls /weights; df -h /weights
+
+              # Keep every byte on the Hyperdisk: 480GB would blow the node's boot disk.
+              export HF_HUB_ENABLE_HF_TRANSFER=1 HF_HOME=/weights/.hf-cache
+              avail=$(df -BG --output=avail /weights | tail -1 | tr -dc '0-9')
+              echo "free on /weights before download: ${avail}Gi (need ~500Gi)"
+              [ "$avail" -ge 520 ] || { echo "FAIL: not enough free space"; exit 1; }
+
+              python - <<'PY'
+              import os
+              from huggingface_hub import snapshot_download
+              p = snapshot_download(
+                  "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+                  revision=os.environ["REV"],
+                  local_dir=os.environ["DEST"],
+                  # weights + config + tokenizer only.
+                  ignore_patterns=["*.pth", "original/*", "*.gguf", "*.md"],
+                  max_workers=16,
+              )
+              print("hydrated ->", p)
+              PY
+
+              # Stamp the pinned revision next to the weights so the disk is
+              # self-describing (compare against $REV before trusting a stale disk).
+              echo "$REV" > "$DEST/.hydrated-revision"
+              # 49 safetensors shards at this revision; a short count means a partial
+              # pull that would fail the nightly with a confusing loader error.
+              shards=$(ls "$DEST"/*.safetensors | wc -l)
+              echo "== safetensors shards: $shards =="
+              [ "$shards" -eq 49 ] || { echo "FAIL: expected 49 shards"; exit 1; }
+              # snapshot_download keeps only small resume metadata under local_dir, but
+              # HF_HOME may still hold blobs; drop it so the ROX disk ships weights only.
+              rm -rf /weights/.hf-cache
+              echo "== final =="; du -sh /weights/*; df -h /weights
+          resources:
+            requests:
+              cpu: "8"
+              memory: 32Gi
+          volumeMounts:
+            - name: src
+              mountPath: /src
+              readOnly: true
+            - name: dst
+              mountPath: /weights

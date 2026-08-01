@@ -221,8 +221,11 @@ jobs:
           kubectl -n tpu-ci get pods -l "$sel" -o wide || true
 
           # Stream logs from every host (best effort; may restart while pods come up).
+          # Tee'd because the pod log is the ONLY egress from a JobSet: a benchmark
+          # test emits its results JSON into it, and the next step lifts that out.
           kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
-            --max-log-requests=10 --pod-running-timeout=15m --tail=-1 || true
+            --max-log-requests=10 --pod-running-timeout=15m --tail=-1 \
+            2>&1 | tee "$RUNNER_TEMP/tpu-pod-logs.txt" || true
 
           # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
@@ -264,3 +267,65 @@ jobs:
           kubectl -n tpu-ci get pods -l "$sel" -o wide || true
           kubectl -n tpu-ci describe "$name" | tail -n 120 || true
           exit 1
+
+      # A benchmark test prints its results JSON between markers, because the pod
+      # log is the only thing that leaves a JobSet. Lift it into a downloadable
+      # artifact + the run summary so a result is findable in the GitHub UI without
+      # scrolling a multi-host log. No-op (and non-fatal) for tests that emit
+      # nothing, which is every functional test.
+      - name: Publish benchmark results
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/tpu-pod-logs.txt"
+          out="$RUNNER_TEMP/bench-result.json"
+          [ -f "$log" ] || { echo "no pod log captured"; exit 0; }
+          # Take the LAST marker block, not a sed range over all of them: a launch
+          # group can run several test files against one server (the 30B group
+          # already runs two), and a sed range would splice every block into one
+          # invalid document -- dropping every result instead of one.
+          # The pod log is prefixed per container by --prefix=true; strip that too.
+          awk '/TPU_BENCH_RESULT_JSON BEGIN/ {buf=""; inblk=1; next}
+               /TPU_BENCH_RESULT_JSON END/   {last=buf; inblk=0; next}
+               inblk                          {buf = buf $0 "\n"}
+               END                            {printf "%s", last}' "$log" \
+            | sed -e 's/^\[[^]]*\] //' | tr -d '\r' > "$out" || true
+          if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$out" 2>/dev/null; then
+            echo "no benchmark results in this run's log"
+            rm -f "$out"
+            exit 0
+          fi
+          echo "extracted results -> $out ($(wc -c <"$out") bytes)"
+          python3 - "$out" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          run, totals = s.get("run", {}), s.get("totals", {})
+          print(f"## {run.get('benchmark', 'TPU benchmark')} — {run.get('mode', '?')}")
+          print()
+          print(f"- model `{run.get('model')}`  profile `{run.get('profile')}`  "
+                f"commit `{(run.get('git', {}).get('commit') or '')[:12]}`")
+          print(f"- {totals.get('legs_ok', 0)}/{totals.get('legs_total', 0)} legs ok, "
+                f"{totals.get('warnings', 0)} warning(s)")
+          print()
+          print("| leg | status | out tok/s | prompt tok/s | TTFT p50 ms | ITL p50 ms | prefix hit |")
+          print("|---|---|---:|---:|---:|---:|---:|")
+          for leg in s.get("legs", []):
+              m, d = leg.get("metrics") or {}, leg.get("derived") or {}
+              hit = (leg.get("feature_derived") or {}).get("prefix_cache_hit_rate")
+              f = lambda v, spec=".1f": format(v, spec) if isinstance(v, (int, float)) else "-"
+              print(f"| {leg.get('mode')}/{leg.get('tag')} | {leg.get('status')} "
+                    f"| {f(m.get('output_throughput'))} | {f(d.get('prompt_throughput'))} "
+                    f"| {f(m.get('median_ttft_ms'), '.0f')} | {f(m.get('median_itl_ms'))} "
+                    f"| {(format(hit, '.1%') if isinstance(hit, float) else '-')} |")
+          PY
+
+      - name: Upload benchmark results
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu-bench-result-${{ inputs.run_name || inputs.suite }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench-result.json
+          if-no-files-found: ignore
+          retention-days: 30

@@ -133,6 +133,18 @@ BATCH_SIZE=64 NUM_PROMPTS=64 ISL=1024 OSL=1024 \
 ./bench_serving.sh
 ```
 
+Qwen3-Coder-480B FP8 **standard agentic benchmark** (the team's fixed contract:
+multi-turn 4k-per-round workload accumulating to 16k / 256k, tp=16 dp=4 colocated
+and tp=8 dp=2 P/D, prefix caching + KV offload, one results JSON, wired to a
+nightly workflow) — see
+[`recipe/qwen3_coder_480b/nightly/`](recipe/qwen3_coder_480b/nightly/README.md):
+
+```bash
+cd recipe/qwen3_coder_480b/nightly
+PROFILE=smoke MODE=colocated ./run_nightly.sh     # plumbing check
+SGLANG_USE_RAY=1 NNODES=2 MODE=colocated ./run_nightly.sh
+```
+
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
 
