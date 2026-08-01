@@ -118,6 +118,17 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
 
     import os
 
+    from sglang.srt.hardware_backend.tpu.env_override import (
+        apply_tpu_env_overrides,
+    )
+
+    apply_tpu_env_overrides(
+        enable_dp_attention=getattr(server_args, "enable_dp_attention", False),
+        tp_size=getattr(server_args, "tp_size", 1),
+        dp_size=getattr(server_args, "dp_size", 1),
+        attn_cp_size=getattr(server_args, "attn_cp_size", 1),
+    )
+
     world_size = server_args.tp_size
     local_world_size = max(world_size // server_args.nnodes, 1)
     os.environ["RANK"] = str(tp_rank)

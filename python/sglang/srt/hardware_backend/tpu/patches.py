@@ -193,6 +193,9 @@ def _prepare_tpu_env(
     world_size: int | None = None,
     setup_slicebuilder: bool = True,
     resolve_single_host_topology: bool = False,
+    enable_dp_attention: bool = False,
+    dp_size: int = 1,
+    attn_cp_size: int = 1,
 ) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
 
@@ -228,7 +231,12 @@ def _prepare_tpu_env(
         apply_tpu_env_overrides,
     )
 
-    apply_tpu_env_overrides()
+    apply_tpu_env_overrides(
+        enable_dp_attention=enable_dp_attention,
+        tp_size=world_size,
+        dp_size=dp_size,
+        attn_cp_size=attn_cp_size,
+    )
 
     # Speculative decoding enables KV-cache moves. The generic fast path is a
     # Triton kernel, which has no active driver on TPU; use the existing native

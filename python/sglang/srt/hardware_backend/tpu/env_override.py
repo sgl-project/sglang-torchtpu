@@ -23,6 +23,12 @@ _SPARSE_CORE_OFFLOAD_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
 )
 
+# From https://github.com/sgl-project/sglang-torchtpu/pull/146
+_SPARSE_CORE_ATTN_DP_OFFLOAD_OVERRIDES = (
+    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
+)
+
 
 def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     existing = os.environ.get(_LIBTPU_INIT_ARGS, "")
@@ -35,9 +41,20 @@ def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     return to_append
 
 
-def apply_tpu_env_overrides() -> None:
+def apply_tpu_env_overrides(
+    enable_dp_attention: bool = False,
+    tp_size: int = 1,
+    dp_size: int = 1,
+    attn_cp_size: int = 1,
+) -> None:
     """Apply TPU env overrides."""
-    appended = _override_libtpu_flags(_SPARSE_CORE_OFFLOAD_OVERRIDES)
+    flags = list(_SPARSE_CORE_OFFLOAD_OVERRIDES)
+    attn_dp_size = dp_size if enable_dp_attention else 1
+    cp_size = max(1, attn_cp_size)
+    attn_tp_size = tp_size // (attn_dp_size * cp_size)
+    if enable_dp_attention and attn_tp_size > 1:
+        flags.extend(_SPARSE_CORE_ATTN_DP_OFFLOAD_OVERRIDES)
+    appended = _override_libtpu_flags(tuple(flags))
     if appended:
         logger.info(
             "TPU env_override appended %d LIBTPU_INIT_ARGS flag(s): %s",
