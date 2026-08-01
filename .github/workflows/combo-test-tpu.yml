@@ -20,6 +20,12 @@ on:
         default: all
         type: choice
         options: [all, singlehost, multihost, pd, spec]
+      singlehost_combo:
+        description: "Which singlehost combo to run (1|2|3|all)"
+        required: false
+        default: all
+        type: choice
+        options: [all, "1", "2", "3"]
 
 concurrency:
   group: tpu-combo
@@ -37,14 +43,14 @@ jobs:
   singlehost-combo:
     needs: build
     if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
-    name: singlehost-combo-test
+    name: singlehost-combo-${{ inputs.singlehost_combo || 'all' }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       hosts: 1
-      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-      run_name: singlehost-combo-test
+      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py ${{ inputs.singlehost_combo || 'all' }}
+      run_name: singlehost-combo-${{ inputs.singlehost_combo || 'all' }}
     permissions:
       contents: read
       id-token: write

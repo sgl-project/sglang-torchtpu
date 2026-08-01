@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
 )
 from sglang.srt.utils.offloader import get_offloader
 
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
@@ -63,7 +65,7 @@ _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
 # `fill_gateup_input_triton_kernel` to directly generate e8m0 scale.
-@torch.compile(disable=_is_hip or _is_npu)
+@torch.compile(disable=_is_hip or _is_npu or _is_tpu)
 def _cast_to_e8m0_with_rounding_up(x: torch.Tensor) -> torch.Tensor:
     temp = x.to(torch.float32).view(torch.int32)
     exp = torch.bitwise_right_shift(temp, 23)
