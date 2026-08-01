@@ -323,6 +323,7 @@ def initialize_dp_attention(
         dtype=model_config.dtype,
         device=torch.device(server_args.device),
     )
+    _init_rank_tensors(torch.device(server_args.device))
 
 
 def is_dp_attention_enabled() -> bool:
@@ -518,9 +519,9 @@ def _dp_gather_tpu_all_reduce(
     fill_(0) + reduce-scatter + all-gather — which on hybrid shapes would need
     a per-rank fill_(0) conditional (divergent graphs the in-graph collectives
     can't tolerate) and each rank's local rows divisible by the attention-TP
-    size (they aren't). The all-reduce runs on the fresh padded ``contrib``
-    (not the persistent ``global_tokens`` buffer) via the registered
-    GroupCoordinator op.
+    size (they aren't). The all-reduce runs on the freshly assembled
+    ``contrib`` (not the persistent ``global_tokens`` buffer) via the
+    registered GroupCoordinator op.
 
     MAX_LEN: every slot holds global_rows / dp_size rows; a different count is
     a buffer-sizing bug and fails loud.
@@ -535,12 +536,9 @@ def _dp_gather_tpu_all_reduce(
             f"but the global buffer slot holds {expected_rows}."
         )
 
-    zeros = local_tokens.new_zeros(local_tokens.shape)
+    idx = _dp_rank_slot_rows(num_rows=expected_rows, device=local_tokens.device)
     contrib = torch.zeros_like(global_tokens)
-    for r in range(dp_size):
-        parts = [local_tokens if i == r else zeros for i in range(dp_size)]
-        contrib = contrib + torch.cat(parts, dim=0) * dp_rank_scale(r, local_tokens)
-
+    contrib[idx] = local_tokens
     contrib = get_tp_group().all_reduce(contrib)
     global_tokens.copy_(contrib)
 
@@ -717,12 +715,8 @@ def dp_scatter(
         )
         n = local_tokens.shape[0]
         if n > 0:
-            dp_size = get_attention_dp_size()
-            res = torch.zeros_like(local_tokens)
-            for r in range(dp_size):
-                part = global_tokens[r * n : (r + 1) * n]
-                res = res + part * dp_rank_scale(r, global_tokens)
-            local_tokens.copy_(res)
+            idx = _dp_rank_slot_rows(num_rows=n, device=global_tokens.device)
+            local_tokens.copy_(global_tokens.index_select(0, idx))
         return
 
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
@@ -912,43 +906,64 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
 
-@functools.lru_cache(maxsize=None)
-def _attn_rank0_scale_cached_impl(
-    device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    return torch.tensor(
-        1.0 if get_attention_tp_rank() == 0 else 0.0, device=device, dtype=dtype
+# Per-device 0-D int64 tensors holding this process's rank ids, keyed by
+# (rank axis, device). Populated eagerly OUTSIDE any compiled region so the
+# dict lookup inside torch.compile returns a preexisting tensor, which Dynamo
+# lifts as a runtime graph input. Creating the tensor inside a traced region
+# instead inlines the Python rank as a baked graph constant (Dynamo traces
+# through caching wrappers), and after constant folding the per-rank offsets
+# become static — rank-divergent executables the in-graph collectives cannot
+# tolerate.
+_RANK_TENSORS: dict = {}
+
+
+def _init_rank_tensors(device: torch.device) -> None:
+    for axis, rank in (
+        ("attn_tp", get_attention_tp_rank()),
+        ("attn_dp", get_attention_dp_rank()),
+    ):
+        t = torch.tensor(rank, device=device, dtype=torch.int64)
+        _RANK_TENSORS[(axis, device)] = t
+        # A device without index (e.g. "tpu") resolves to the current core;
+        # register the resolved device too so runtime tensors' .device hits.
+        _RANK_TENSORS[(axis, t.device)] = t
+
+
+def _rank_tensor(axis: str, device: torch.device) -> torch.Tensor:
+    t = _RANK_TENSORS.get((axis, device))
+    if t is None:
+        if torch.compiler.is_compiling():
+            raise RuntimeError(
+                f"rank tensor ({axis}, {device}) first requested inside a "
+                "compiled region; it must be created eagerly (see "
+                "initialize_dp_attention) so torch.compile lifts it as a "
+                "runtime graph input instead of baking the rank constant."
+            )
+        _init_rank_tensors(device)
+        t = _RANK_TENSORS[(axis, device)]
+    return t
+
+
+def _dp_rank_slot_rows(num_rows: int, device: torch.device) -> torch.Tensor:
+    """Global-buffer row indices of this rank's MAX_LEN slot:
+    [dp_rank * num_rows, (dp_rank + 1) * num_rows).
+
+    Computed on device from the rank tensor plus a constant arange, so the
+    slot offset reaches the compiled graph as a runtime gather/scatter operand
+    rather than a per-rank constant baked into the HLO — baked offsets compile
+    rank-divergent executables that deadlock the in-graph collectives.
+    """
+    return _rank_tensor("attn_dp", device) * num_rows + torch.arange(
+        num_rows, device=device
     )
 
 
 def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
     """0/1 device scalar: 1 on attn-TP rank 0, 0 elsewhere.
 
-    A cached device tensor (not a Python float) so torch.compile lifts it as
-    a runtime graph input rather than folding the per-rank value — folding
-    would diverge each rank's graph, the collective drop this avoids. The
-    multiply also keeps the residual consumer (and its upstream collective)
+    Derived in-graph from the rank tensor (compare + dtype convert), so every
+    rank traces the identical graph and the rank enters only as runtime data.
+    The multiply keeps the residual consumer (and its upstream collective)
     live on the zero ranks.
-
-    TODO: remove once torch_tpu keeps rank-divergent in-graph collectives.
     """
-    return _attn_rank0_scale_cached_impl(ref.device, ref.dtype)
-
-
-@functools.lru_cache(maxsize=None)
-def _dp_rank_scale_cached_impl(
-    rank_id: int, device: torch.device, dtype: torch.dtype
-) -> torch.Tensor:
-    return torch.tensor(
-        1.0 if get_attention_dp_rank() == rank_id else 0.0, device=device, dtype=dtype
-    )
-
-
-def dp_rank_scale(rank_id: int, ref: torch.Tensor) -> torch.Tensor:
-    """0/1 device scalar: 1 on DP rank_id, 0 elsewhere.
-
-    A cached 0-D device scalar (not a Python bool/float) so torch.compile lifts
-    it as a runtime graph input placeholder without creating unbacked SymInts
-    or baking rank-divergent constant attributes into HLO graphs.
-    """
-    return _dp_rank_scale_cached_impl(rank_id, ref.device, ref.dtype)
+    return (_rank_tensor("attn_tp", ref.device) == 0).to(ref.dtype)
