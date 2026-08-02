@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 
 import torch
-
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 # Qwen3's 256-token (M=2048, 16-local-expert) specialization can leave a DMA
@@ -91,8 +90,9 @@ def supports_fp8_fused_rs(
         and gated
         and activation == "silu"
         and not apply_router_weight_on_input
-        # Qwen is already combined; Tier5 requests per-expert output so its
-        # compatible post-norm can run before the weighted combination.
+        # The standard path is already combined. A compatible post-expert norm
+        # contract requests per-expert output so normalization can run before
+        # the weighted combination.
         and no_combine == has_compatible_post_expert_norm
         and not has_fused_shared_experts
         and standard_dispatcher
