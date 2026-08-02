@@ -17,8 +17,8 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# Qwen3's 256-token (M=2048, 16-local-expert) specialization can leave a DMA
-# semaphore charged. Keep larger prefills on the stock path until it is fixed.
+# The 256-token Qwen3 specialization caused a TPU core halt during integration
+# testing. Keep larger prefills on the stock path pending root-cause analysis.
 _FUSED_RS_MAX_TOKENS = 128
 _POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
 _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"

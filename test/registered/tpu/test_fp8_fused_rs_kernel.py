@@ -30,6 +30,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         for name in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
             env.pop(name, None)
         env["SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM"] = str(int(post_expert_norm))
+        env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = "128"
 
         try:
             result = subprocess.run(
