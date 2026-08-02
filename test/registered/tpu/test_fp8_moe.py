@@ -457,7 +457,11 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(eager_out.shape, (num_tokens, hidden_size))
         self.assertEqual(eager_out.dtype, torch.bfloat16)
         torch.testing.assert_close(eager_out.cpu(), ref, atol=0.1, rtol=0.1)
-        torch.testing.assert_close(compiled_out.cpu(), eager_out.cpu())
+        # Eager and compiled kernels may use different BF16 accumulation orders.
+        # Keep this substantially tighter than the FP8 reference comparison.
+        torch.testing.assert_close(
+            compiled_out.cpu(), eager_out.cpu(), atol=5e-4, rtol=0.02
+        )
 
 
 if __name__ == "__main__":
