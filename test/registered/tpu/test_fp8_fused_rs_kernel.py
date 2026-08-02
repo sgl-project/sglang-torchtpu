@@ -11,11 +11,11 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=360, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit")
 
 
 class TestFp8FusedRsKernel(CustomTestCase):
-    def test_compiled_tp8_kernel_matches_reference(self):
+    def _run_compiled_tp8_kernel(self, *, post_expert_norm: bool):
         repo_root = Path(__file__).resolve().parents[3]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
         wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
@@ -29,6 +29,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         env = os.environ.copy()
         for name in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
             env.pop(name, None)
+        env["SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM"] = str(int(post_expert_norm))
 
         try:
             result = subprocess.run(
@@ -50,6 +51,15 @@ class TestFp8FusedRsKernel(CustomTestCase):
             f"FP8 fused-RS TP8 test failed:\n{result.stdout}",
         )
         self.assertEqual(result.stdout.count("FP8_FUSED_RS_KERNEL_PASS"), 8)
+        self.assertEqual(
+            result.stdout.count(f"post_norm={post_expert_norm}"),
+            8,
+        )
+
+    def test_compiled_tp8_kernel_matches_reference(self):
+        for post_expert_norm in (False, True):
+            with self.subTest(post_expert_norm=post_expert_norm):
+                self._run_compiled_tp8_kernel(post_expert_norm=post_expert_norm)
 
 
 if __name__ == "__main__":
