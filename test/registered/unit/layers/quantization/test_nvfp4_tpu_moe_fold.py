@@ -1,5 +1,11 @@
-"""CPU tests for the TPU block-512 NVFP4 MoE weight contract."""
+"""Tests for the TPU block-512 NVFP4 MoE weight contract.
 
+The assertions are pure torch, but importing `fp4_moe` pulls in the Pallas MoE
+package, which imports JAX eagerly. Register both lanes and skip on hosts
+without JAX, matching `test_pallas_export.py`.
+"""
+
+import importlib.util
 import pathlib
 import sys
 import types
@@ -8,10 +14,11 @@ from unittest import mock
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 
 BLOCK_SIZE = 512
 EXPERTS = 2
@@ -84,6 +91,7 @@ def _make_block512_layer(include_unused_params: bool = True) -> torch.nn.Module:
     return layer
 
 
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestNvfp4Block512Contract(CustomTestCase):
     def test_block512_layout_and_cleanup(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
@@ -558,6 +566,12 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
 
         torch.testing.assert_close(unpacked, codes.transpose(1, 2))
+
+
+class TestNvfp4ModelOptTpuGuard(CustomTestCase):
+    """The block-16 rejection is reachable without JAX: `modelopt_quant` only
+    imports `fp4_moe` lazily, and `create_weights` raises before any such call.
+    """
 
     def test_modelopt_rejects_block16_on_tpu(self):
         from sglang.srt.layers.quantization import modelopt_quant
