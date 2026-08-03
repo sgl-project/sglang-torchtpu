@@ -28,7 +28,16 @@ addressing bug that a contiguous layout would hide still shows up.
 
 ``distribution`` follows the MLA backend's override, not RPA v3's: decode is
 ``[N, N, N]`` and extend is ``[0, 0, N]`` (the kernel's PREFILL slot is dead
-code, so extend must route through MIXED).
+code, so extend must route through MIXED). Block-size tuples use that same slot
+order, ``(decode, prefill, mixed)``, and carry the kernel's hardcoded fallbacks
+so a growing tuned table cannot quietly change what these tests measure.
+``_DECODE_BATCH_SIZE`` is what ``TpuPallasMlaAttnBackend`` passes in production.
+
+Geometry is DeepSeek V2/V3 MLA — 512 latent + 64 rope, both padded to 128 lanes
+by the kernel — at 8 q heads per shard, which is DeepSeek-V3 at attention_tp=16
+and Ling-2.6 at attention_tp=8, the shape the v7 tuned table targets.
+
+Runtime is ~50 s for the 21 cases on one v7x host, dominated by pallas compiles.
 
 Usage:
     python test/registered/unit/layers/attention/pallas/test_mla_rpa_v2_kernel.py
@@ -36,68 +45,35 @@ Usage:
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-# Measured: 21 cases in ~50 s on one v7x host (pallas compiles dominate).
 register_tpu_ci(est_time=240, suite="stage-b-test-tpu-4-v7")
 
 import unittest
 from types import SimpleNamespace
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
+from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
+    DEFAULT_MASK_VALUE,
+    align_to,
+    cdiv,
+    get_dtype_packing,
+    get_kv_cache_shape,
+    mla_ragged_paged_attention,
+)
 from sglang.test.test_utils import CustomTestCase
 
-try:
-    import jax
-    import jax.numpy as jnp
-
-    from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
-        DEFAULT_MASK_VALUE,
-        align_to,
-        cdiv,
-        get_dtype_packing,
-        get_kv_cache_shape,
-        mla_ragged_paged_attention,
-    )
-
-    _IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - depends on JAX availability
-    _IMPORT_ERROR = exc
-
-
-def _tpu_skip_reason():
-    """Return None when the kernel can run here, else why it cannot."""
-    if _IMPORT_ERROR is not None:
-        return f"JAX / pallas import chain unavailable ({_IMPORT_ERROR})"
-    try:
-        devices = jax.devices()
-    except Exception as exc:  # no backend at all
-        return f"no JAX backend ({exc})"
-    if not any(d.platform == "tpu" for d in devices):
-        return f"needs a TPU device, got {[d.platform for d in devices]}"
-    return None
-
-
-_SKIP_REASON = _tpu_skip_reason()
-
-# DeepSeek V2/V3 MLA latent geometry (model constants; the kernel's 128-lane
-# alignment applies to both).
 _KV_LORA_RANK = 512
+_QK_NOPE_HEAD_DIM = 128
 _QK_ROPE_HEAD_DIM = 64
-# Per-shard q head count: 8 is DeepSeek-V3 at attention_tp=16 and Ling-2.6 at
-# attention_tp=8 (the shape the v7 table is tuned for).
 _NUM_Q_HEADS = 8
-# Absorbed MLA scale: 1/sqrt(qk_nope_head_dim + qk_rope_head_dim).
-_SM_SCALE = float((128 + 64) ** -0.5)
+_SM_SCALE = float((_QK_NOPE_HEAD_DIM + _QK_ROPE_HEAD_DIM) ** -0.5)
 
-# Block sizes: the kernel's hardcoded fallbacks, passed explicitly so the tests
-# do not silently change behaviour when the tuned table gains entries.
-# Slot order is (decode, prefill, mixed); slot[1] is the kernel's dead PREFILL.
 _NUM_KV_PAGES_PER_BLOCK = (3, 1, 1)
 _NUM_QUERIES_PER_BLOCK = (1, 1, 16)
-# What TpuPallasMlaAttnBackend passes in production.
 _DECODE_BATCH_SIZE = 4
 
-# bf16 output tolerances, same as the sglang-jax MLA accuracy test.
 _RTOL, _ATOL = 2e-2, 1e-2
 
 
@@ -122,9 +98,14 @@ def _build_case(lens, *, page_size, num_heads, dtype, seed):
       dtype: latent KV / Q dtype.
       seed: RNG seed.
 
+    Eight pages past what the batch needs are left unallocated, and the unused
+    tail of each sequence's ``page_indices`` row points back at a page that
+    sequence already owns, so neither a stray write nor a stray fetch can
+    involve another sequence's KV without the assertions noticing.
+
     Returns a SimpleNamespace holding the kernel arguments, the logical
-    per-sequence tensors the reference consumes, and ``cache_after`` — the cache
-    the kernel is expected to produce.
+    per-sequence tensors the reference consumes, ``cache_before`` (prefix tokens
+    only) and ``cache_after`` — the cache the kernel is expected to produce.
     """
     np_dtype = jnp.dtype(dtype)
     kv_packing = get_dtype_packing(dtype)
@@ -139,10 +120,7 @@ def _build_case(lens, *, page_size, num_heads, dtype, seed):
 
     pages_per_seq_list = [cdiv(int(kv), page_size) for kv in kv_lens]
     pages_per_seq = max(pages_per_seq_list)
-    # Spare pages beyond what the batch needs: the kernel must not touch them.
     total_num_pages = sum(pages_per_seq_list) + 8
-    # Shuffled page assignment (a real allocator hands out non-contiguous
-    # pages); a sequential layout would mask off-by-one addressing bugs.
     page_pool = rng.permutation(total_num_pages).astype(np.int32)
 
     cache_shape = get_kv_cache_shape(
@@ -163,9 +141,6 @@ def _build_case(lens, *, page_size, num_heads, dtype, seed):
 
         row = page_indices[i * pages_per_seq : (i + 1) * pages_per_seq]
         row[:num_pages] = seq_pages
-        # Slots past the sequence's own pages are never read for real data
-        # (kv_lens bounds the loop); point them at a page this sequence owns so
-        # a stray fetch cannot pull another sequence's KV in unnoticed.
         row[num_pages:] = seq_pages[-1]
 
         kv_c = rng.standard_normal((kv_len, _KV_LORA_RANK)).astype(np_dtype)
@@ -180,8 +155,6 @@ def _build_case(lens, *, page_size, num_heads, dtype, seed):
             SimpleNamespace(ql_nope=ql_nope, q_pe=q_pe, kv_c=kv_c, k_pe=k_pe)
         )
 
-        # cache_before holds the prefix only; cache_after also holds the new
-        # tokens, which is what the kernel must write.
         for cache, num_tokens in (
             (cache_before, kv_len - q_len),
             (cache_after, kv_len),
@@ -198,8 +171,6 @@ def _build_case(lens, *, page_size, num_heads, dtype, seed):
 
     cu_q_lens = np.zeros(bs + 1, dtype=np.int32)
     cu_q_lens[1:] = np.cumsum(q_lens)
-    # The kernel only uses cu_kv_lens to locate a sequence's page-indices row:
-    # start_kv_page_idx = cdiv(cu_kv_lens[i], page_size) = i * pages_per_seq.
     cu_kv_lens = np.arange(bs + 1, dtype=np.int32) * np.int32(pages_per_seq * page_size)
 
     return SimpleNamespace(
@@ -244,11 +215,11 @@ def _ref_attention(case, *, sm_scale, sliding_window, soft_cap, mask_value):
     for (q_len, kv_len), seq in zip(case.lens, case.per_seq):
         q = np.concatenate(
             [seq.ql_nope.astype(np.float32), seq.q_pe.astype(np.float32)], axis=-1
-        )  # [q_len, num_heads, kv_lora_rank + rope]
+        )
         k = np.concatenate(
             [seq.kv_c.astype(np.float32), seq.k_pe.astype(np.float32)], axis=-1
-        )  # [kv_len, kv_lora_rank + rope]
-        v = seq.kv_c.astype(np.float32)  # [kv_len, kv_lora_rank]
+        )
+        v = seq.kv_c.astype(np.float32)
 
         attn = np.einsum("qnh,kh->nqk", q, k, optimize=True) * sm_scale
         if soft_cap is not None:
@@ -264,8 +235,6 @@ def _ref_attention(case, *, sm_scale, sliding_window, soft_cap, mask_value):
         attn = attn - attn.max(axis=-1, keepdims=True)
         probs = np.exp(attn)
         probs /= probs.sum(axis=-1, keepdims=True)
-        # sglang-jax's reference rounds the probabilities to the KV dtype before
-        # the PV matmul; keep that so its tolerances carry over unchanged.
         probs = probs.astype(case.np_dtype).astype(np.float32)
 
         out = np.einsum("nqk,kl->qnl", probs, v, optimize=True)
@@ -273,18 +242,28 @@ def _ref_attention(case, *, sm_scale, sliding_window, soft_cap, mask_value):
     return np.concatenate(outputs, axis=0)
 
 
-@unittest.skipIf(_SKIP_REASON is not None, str(_SKIP_REASON))
+@unittest.skipUnless(
+    any(d.platform == "tpu" for d in jax.devices()), "needs a TPU device"
+)
 class TestMlaRaggedPagedAttentionV2(CustomTestCase):
-    """Kernel-level accuracy for ``mla_ragged_paged_attention``."""
+    """Kernel-level accuracy for ``mla_ragged_paged_attention``.
 
-    # Mixed extend batch: pure prefill (q_len == kv_len), extend with a prefix
-    # (q_len < kv_len) and single-token extends, with kv_lens that both do and
-    # do not fill their last page.
+    ``EXTEND_LENS`` mixes pure prefill (``q_len == kv_len``), extend with a
+    prefix and single-token extend, at ``kv_len`` values that both do and do not
+    fill their last page. ``DECODE_LENS`` is single-token decodes straddling page
+    boundaries (127/128/129, 1023/1024/1025); 9 sequences at
+    ``decode_batch_size=4`` exercises the batched pass (8 seqs) and the residual
+    DECODE-tail pass (1 seq) in the same call.
+
+    The ``SWA_*`` lists straddle a 128-token window, so both the in-window and
+    the dropped ranges are covered: ``sliding_window`` bounds the causal span to
+    ``(p - sliding_window, p]`` for a query at absolute position ``p``.
+    ``soft_cap`` applies ``s <- soft_cap * tanh(s / soft_cap)`` to the logits
+    before masking; 30.0 is the Gemma-2 / DeepSeek-style magnitude.
+    """
+
     EXTEND_LENS = [(1, 128), (125, 125), (123, 522), (1, 511), (256, 512)]
 
-    # Single-token decodes straddling page boundaries (127/128/129 etc.).
-    # 9 sequences with decode_batch_size=4 exercises the batched pass (8 seqs)
-    # and the residual DECODE-tail pass (1 seq) in the same call.
     DECODE_LENS = [
         (1, 119),
         (1, 127),
@@ -296,6 +275,9 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         (1, 1024),
         (1, 1025),
     ]
+
+    SWA_EXTEND_LENS = [(1, 128), (64, 64), (128, 256), (100, 300), (1, 400)]
+    SWA_DECODE_LENS = [(1, 256), (1, 400), (1, 512), (1, 1024)]
 
     def _run(
         self,
@@ -320,11 +302,8 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
 
         if mode == "decode":
             assert all(q == 1 for q, _ in lens), "decode expects q_len == 1"
-            # All sequences decode-only.
             distribution = np.array([bs, bs, bs], dtype=np.int32)
         else:
-            # PREFILL (slot[1]) is dead code upstream; extend routes through
-            # MIXED, matching TpuPallasMlaAttnBackend.
             distribution = np.array([0, 0, bs], dtype=np.int32)
 
         block_kwargs = {}
@@ -424,13 +403,8 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
                 ] = True
         return mask
 
-    # ---------------------------------------------------------------- #
-    # Mixed extend (MIXED pass)
-    # ---------------------------------------------------------------- #
-
     def test_extend_page_size_8(self):
-        # page_size 8 with bf16 packing 2 -> 4 rows per page, the tightest
-        # packing layout the cache addressing has to handle.
+        """page_size 8 at bf16 packing 2 -> 4 rows per page, the tightest layout."""
         self._run("extend", self.EXTEND_LENS, page_size=8)
 
     def test_extend_page_size_16(self):
@@ -440,21 +414,19 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         self._run("extend", self.EXTEND_LENS, page_size=32)
 
     def test_extend_page_size_64(self):
-        # 64 is the TPU backend's production page size.
+        """64 is the TPU backend's production page size."""
         self._run("extend", self.EXTEND_LENS, page_size=64)
 
     def test_extend_single_long_seq(self):
-        # One pure-prefill sequence spanning many pages and many query blocks.
+        """One pure-prefill sequence spanning many pages and many query blocks."""
         self._run("extend", [(1024, 1024)], page_size=64)
 
     def test_extend_odd_num_q_heads(self):
-        # 3 heads is not a multiple of the bf16 q packing (2), so the kernel
-        # pads the head axis and slices the padding back off.
-        self._run("extend", self.EXTEND_LENS, page_size=64, num_heads=3)
+        """3 heads is not a multiple of the bf16 q packing (2).
 
-    # ---------------------------------------------------------------- #
-    # Decode (BATCHED_DECODE + DECODE-tail passes)
-    # ---------------------------------------------------------------- #
+        The kernel pads the head axis and slices the padding back off.
+        """
+        self._run("extend", self.EXTEND_LENS, page_size=64, num_heads=3)
 
     def test_decode_page_size_8(self):
         self._run("decode", self.DECODE_LENS, page_size=8)
@@ -469,8 +441,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         self._run("decode", self.DECODE_LENS, page_size=64)
 
     def test_decode_batched_pass_only(self):
-        # bs == decode_batch_size -> everything goes through BATCHED_DECODE and
-        # the DECODE-tail pass gets an empty grid.
+        """bs == decode_batch_size: the DECODE-tail pass gets an empty grid."""
         self._run(
             "decode",
             [(1, 64), (1, 128), (1, 192), (1, 256)],
@@ -479,8 +450,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         )
 
     def test_decode_tail_pass_only(self):
-        # bs < decode_batch_size -> the BATCHED_DECODE grid is empty and every
-        # sequence falls to the tail pass.
+        """bs < decode_batch_size: the BATCHED_DECODE grid is empty instead."""
         self._run(
             "decode",
             [(1, 64), (1, 130), (1, 257)],
@@ -489,7 +459,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         )
 
     def test_decode_batch_size_one(self):
-        # decode_batch_size=1 (the kernel default) -> tail pass for all.
+        """decode_batch_size=1 (the kernel default): tail pass for all."""
         self._run(
             "decode",
             [(1, 129), (1, 512)],
@@ -497,24 +467,12 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             decode_batch_size=1,
         )
 
-    # ---------------------------------------------------------------- #
-    # Masking variants
-    # ---------------------------------------------------------------- #
-
-    # sliding_window bounds the causal span: a query at absolute position p
-    # attends to (p - sliding_window, p]. kv_lens straddle the window so both
-    # in-window and dropped ranges are exercised.
-    SWA_EXTEND_LENS = [(1, 128), (64, 64), (128, 256), (100, 300), (1, 400)]
-    SWA_DECODE_LENS = [(1, 256), (1, 400), (1, 512), (1, 1024)]
-
     def test_extend_sliding_window(self):
         self._run("extend", self.SWA_EXTEND_LENS, page_size=16, sliding_window=128)
 
     def test_decode_sliding_window(self):
         self._run("decode", self.SWA_DECODE_LENS, page_size=16, sliding_window=128)
 
-    # soft_cap applies s <- soft_cap * tanh(s / soft_cap) to the logits before
-    # masking, bounding their magnitude smoothly (Gemma-2 / DeepSeek style ~30).
     def test_extend_soft_cap(self):
         self._run("extend", self.SWA_EXTEND_LENS, page_size=16, soft_cap=30.0)
 
@@ -539,15 +497,13 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             soft_cap=30.0,
         )
 
-    # ---------------------------------------------------------------- #
-    # Tuned-block-size lookup path
-    # ---------------------------------------------------------------- #
-
     def test_extend_with_tuned_block_sizes(self):
-        # Block sizes left unset -> the kernel consults
-        # tuned_block_sizes_mla.get_tuned_block_sizes_mla and falls back to its
-        # hardcoded defaults on a miss. Guards the lookup wiring (a wrong
-        # slot order or a bad tuple unpack would fail here, not in numerics).
+        """Block sizes left unset -> the kernel consults the tuned table.
+
+        ``get_tuned_block_sizes_mla`` falls back to the hardcoded defaults on a
+        miss, so this guards the lookup wiring: a wrong slot order or a bad
+        tuple unpack fails here, not in numerics.
+        """
         self._run("extend", self.EXTEND_LENS, page_size=64, tuned_blocks=True)
 
     def test_decode_with_tuned_block_sizes(self):

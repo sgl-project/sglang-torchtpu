@@ -15,6 +15,11 @@ upstream test does not have:
 Pure lookup logic: no TPU and no pallas compile. ``get_tpu_version`` /
 ``get_device_name`` both read ``jax.devices()[0]``, so they are patched out and
 the whole file runs on a CPU-only host as long as JAX imports.
+
+``_DECODE_ARGS`` / ``_MIXED_ARGS`` are deliberately a shape that is *not* in the
+shipped table for any device, so the "miss" assertions stay valid as the table
+grows: 8 q heads exists only at page_size 256 on v7, and mnt=128 is a decode
+bucket there, so this key is only ever a hit when a test inserts it.
 """
 
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -24,36 +29,28 @@ register_tpu_ci(est_time=20, suite="stage-a-test-tpu-unit")
 import unittest
 from unittest import mock
 
+import jax.numpy as jnp
+
+from sglang.srt.layers.attention.pallas import tuned_block_sizes_mla as tbs
+from sglang.srt.layers.attention.pallas.tuned_block_sizes_mla import (
+    get_tuned_block_sizes_mla,
+)
+from sglang.srt.layers.attention.pallas.util import next_power_of_2
 from sglang.test.test_utils import CustomTestCase
 
-try:
-    import jax.numpy as jnp
-
-    from sglang.srt.layers.attention.pallas import tuned_block_sizes_mla as tbs
-    from sglang.srt.layers.attention.pallas.tuned_block_sizes_mla import (
-        get_tuned_block_sizes_mla,
-    )
-    from sglang.srt.layers.attention.pallas.util import next_power_of_2
-
-    _HAS_JAX = True
-except Exception:  # pragma: no cover - depends on JAX availability
-    _HAS_JAX = False
-
-_SKIP_REASON = "Requires JAX + the pallas import chain"
-
-# A shape that is *not* in the shipped table for any device, so the "miss"
-# assertions below stay valid as the table grows: 8 q heads exists only at
-# page_size 256 on v7, and mnt=128 is a decode bucket there, so this key is
-# only ever a hit when a test inserts it.
 _DECODE_ARGS = ("decode", "bfloat16", "bfloat16", 8, 512, 64, 256, 128)
 _MIXED_ARGS = ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 512)
 
 
-@unittest.skipUnless(_HAS_JAX, _SKIP_REASON)
 class _TunedTableTestBase(CustomTestCase):
-    """Snapshot/restore the module-level table and warned-misses set."""
+    """Snapshot/restore the module-level table and warned-misses set.
 
-    # Pretend we are on a v7 host; both helpers would otherwise touch a device.
+    ``TPU_VERSION`` / ``DEVICE_NAME`` pretend we are on a v7 host, since both
+    lookup helpers would otherwise touch a device. The warned-misses set starts
+    clean because a miss only logs once per key per process — otherwise the log
+    assertions would depend on test execution order.
+    """
+
     TPU_VERSION = 7
     DEVICE_NAME = "TPU v7"
 
@@ -69,8 +66,6 @@ class _TunedTableTestBase(CustomTestCase):
             tbs._WARNED_MISSES.update(warned_snapshot)
 
         self.addCleanup(_restore)
-        # A miss only logs once per key per process; start from a clean set so
-        # the log assertions do not depend on test execution order.
         tbs._WARNED_MISSES.clear()
         self.patch_env()
 
@@ -88,12 +83,14 @@ class _TunedTableTestBase(CustomTestCase):
 
 
 class TestTunedBlockSizesMlaLookup(_TunedTableTestBase):
-    """Lookup semantics, against a table emptied of shipped entries."""
+    """Lookup semantics, against a table emptied of shipped entries.
+
+    Hermetic by construction: every assertion runs against entries this class
+    inserts, never against whatever happens to be tuned for v7 today.
+    """
 
     def setUp(self):
         super().setUp()
-        # Hermetic: the lookup logic is tested against entries this class
-        # inserts, never against whatever happens to be tuned for v7 today.
         tbs.TUNED_BLOCK_SIZES_MLA[self.DEVICE_NAME] = {}
 
     def _put(self, key, value):
@@ -120,17 +117,18 @@ class TestTunedBlockSizesMlaLookup(_TunedTableTestBase):
         """
         self._put(_DECODE_ARGS, (3, 2, 8))
         self.assertEqual(get_tuned_block_sizes_mla(*_DECODE_ARGS), (3, 2, 8))
-        # "mixed" at the identical shape has no entry -> miss.
         self.assertIsNone(get_tuned_block_sizes_mla("mixed", *_DECODE_ARGS[1:]))
 
     def test_key_normalization_pow2_buckets(self):
-        """num_q_heads, page_size and max_num_tokens bucket by next_power_of_2."""
+        """num_q_heads, page_size and max_num_tokens bucket by next_power_of_2.
+
+        mnt=100 rounds up to the stored 128 bucket and hits; mnt=200 rounds to
+        256, a different bucket, and misses. num_q_heads=5 -> 8 together with
+        page_size=200 -> 256 land back on the stored key.
+        """
         self._put(_DECODE_ARGS, (3, 2, 8))
-        # mnt=100 -> next_pow2 = 128 -> hits the stored 128 bucket.
         self.assertEqual(get_tuned_block_sizes_mla(*_DECODE_ARGS[:-1], 100), (3, 2, 8))
-        # mnt=200 -> next_pow2 = 256 -> different bucket -> miss.
         self.assertIsNone(get_tuned_block_sizes_mla(*_DECODE_ARGS[:-1], 200))
-        # num_q_heads=5 -> 8, page_size=200 -> 256: both land on the same key.
         self.assertEqual(
             get_tuned_block_sizes_mla(
                 "decode", "bfloat16", "bfloat16", 5, 512, 64, 200, 128
@@ -139,7 +137,10 @@ class TestTunedBlockSizesMlaLookup(_TunedTableTestBase):
         )
 
     def test_dtype_objects_and_names_are_equivalent_keys(self):
-        """Callers pass jnp dtypes; the table stores dtype *names*."""
+        """Callers pass jnp dtypes; the table stores dtype *names*.
+
+        A different dtype is a different key — fp8 KV would need its own tune.
+        """
         self._put(_DECODE_ARGS, (3, 2, 8))
         self.assertEqual(
             get_tuned_block_sizes_mla(
@@ -147,7 +148,6 @@ class TestTunedBlockSizesMlaLookup(_TunedTableTestBase):
             ),
             (3, 2, 8),
         )
-        # A different dtype is a different key (fp8 KV would need its own tune).
         self.assertIsNone(
             get_tuned_block_sizes_mla(
                 "decode", jnp.float32, jnp.bfloat16, 8, 512, 64, 256, 128
@@ -155,8 +155,10 @@ class TestTunedBlockSizesMlaLookup(_TunedTableTestBase):
         )
 
     def test_invalid_case_label_raises(self):
-        # "prefill" is the kernel's dead slot[1]; accepting it would hand the
-        # caller a config that is never applied.
+        """``prefill`` is the kernel's dead slot[1].
+
+        Accepting it would hand the caller a config that is never applied.
+        """
         with self.assertRaises(ValueError):
             get_tuned_block_sizes_mla("prefill", *_DECODE_ARGS[1:])
 
@@ -181,7 +183,6 @@ class TestTunedBlockSizesMlaLookup(_TunedTableTestBase):
                 get_tuned_block_sizes_mla(*_DECODE_ARGS)
         self.assertEqual(len(self._miss_records(ctx)), 1)
 
-        # A different key logs again.
         with self.assertLogs(tbs.logger.name, level="INFO") as ctx:
             get_tuned_block_sizes_mla(*_MIXED_ARGS)
         self.assertEqual(len(self._miss_records(ctx)), 1)
@@ -213,10 +214,13 @@ class TestShippedTunedTable(_TunedTableTestBase):
                     case_label, q_dtype, kv_dtype, heads, lkv, rope, page, mnt = key
 
                     self.assertIn(case_label, ("decode", "mixed"))
-                    # Stored dtypes must be canonical names, or the lookup's
-                    # jnp.dtype(...).name will never match them.
                     for dtype_name in (q_dtype, kv_dtype):
-                        self.assertEqual(jnp.dtype(dtype_name).name, dtype_name)
+                        self.assertEqual(
+                            jnp.dtype(dtype_name).name,
+                            dtype_name,
+                            f"{dtype_name!r} is not the canonical dtype name, so "
+                            "the lookup's jnp.dtype(...).name can never match it",
+                        )
 
                     for field, value in zip(self._POW2_FIELDS, (heads, page, mnt)):
                         self.assertEqual(
@@ -225,22 +229,24 @@ class TestShippedTunedTable(_TunedTableTestBase):
                             f"{field}={value} is not a power of two; the lookup "
                             "normalizes it, so this entry can never be hit",
                         )
-                    # Model constants, passed through unchanged.
-                    self.assertGreater(lkv, 0)
-                    self.assertGreater(rope, 0)
+                    self.assertGreater(lkv, 0, "kv_lora_rank is a model constant")
+                    self.assertGreater(rope, 0, "qk_rope_head_dim is a model constant")
 
-                    # decode carries decode_batch_size, mixed does not.
-                    self.assertEqual(len(cfg), 3 if case_label == "decode" else 2)
+                    self.assertEqual(
+                        len(cfg),
+                        3 if case_label == "decode" else 2,
+                        "decode carries decode_batch_size, mixed does not",
+                    )
                     for value in cfg:
                         self.assertIsInstance(value, int)
                         self.assertGreater(value, 0)
 
     def test_entries_are_reachable_through_the_public_lookup(self):
+        """The key tuple is exactly the lookup's argument order."""
         for device, table in tbs.TUNED_BLOCK_SIZES_MLA.items():
             with mock.patch.object(tbs, "get_device_name", lambda _d=device: _d):
                 for key, cfg in table.items():
                     with self.subTest(device=device, key=key):
-                        # The key tuple is exactly the lookup's argument order.
                         self.assertEqual(get_tuned_block_sizes_mla(*key), cfg)
 
 
