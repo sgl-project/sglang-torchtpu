@@ -725,3 +725,44 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
             group_list,
             output_dtype,
         )
+
+
+class TpuCompressedTensorsWNA16MoE(CompressedTensorsWNA16MoE):
+    """TPU W4A16 MoE via the Pallas fused grouped-GEMM (gmm_v2) backend.
+
+    Inherits pack-quantized weight creation (packed int32 + group scales)
+    from CompressedTensorsWNA16MoE; replaces the Marlin repack with the TPU
+    relayout (nibble sign flip + scale reshape) and dispatches apply
+    straight to the Pallas bridge — same idiom as the fp8 TPU MoE path.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        prepare_tpu_w4a16_moe_weights(layer, group_size=self.group_size)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        # No MoeRunner backend: apply_weights dispatches directly to the
+        # Pallas fused grouped-GEMM bridge.
+        self.moe_runner_config = moe_runner_config
+        self.runner = None
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import apply_tpu_w4a16_moe
+
+        cfg = self.moe_runner_config
+        return apply_tpu_w4a16_moe(
+            layer=layer,
+            dispatch_output=dispatch_output,
+            activation=cfg.activation,
+            apply_router_weight_on_input=cfg.apply_router_weight_on_input,
+            no_combine=cfg.no_combine,
+        )

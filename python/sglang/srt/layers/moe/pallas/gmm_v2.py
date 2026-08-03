@@ -446,7 +446,12 @@ def inner_kernel(
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
         if cfgs.lhs_cfgs.quant_dtype is None:
-            # Unquantized matmul path.
+            # Unquantized matmul path. A quantized rhs (weight-only, e.g.
+            # W4A16) is upcast to the lhs dtype in VMEM so the MXU runs a
+            # plain full-precision matmul; the per-block rhs scale below
+            # completes the dequantization.
+            if cfgs.rhs_cfgs.quant_dtype is not None:
+                tiled_rhs = tiled_rhs.astype(tiled_lhs.dtype)
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
@@ -1072,16 +1077,22 @@ def validate_inputs(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
     size_group, size_k, size_n = rhs.shape
+    if rhs_quant_dtype is not None and rhs.dtype in (jnp.uint32, jnp.int32):
+        # rhs arrives pre-packed along K as 32-bit words ([G, K//packing, N],
+        # e.g. int4 weights packed by the checkpoint). All dimension math
+        # below uses the unpacked K; kernel_main's uint32 bitcast is a no-op
+        # reinterpret for a same-width input.
+        size_k *= 32 // jax.dtypes.itemsize_bits(rhs_quant_dtype)
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1176,16 +1187,29 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(
-        lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, fuse_act
+        lhs,
+        rhs,
+        rhs_scale,
+        rhs_bias,
+        group_sizes,
+        group_offset,
+        fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
     if rhs_scale is not None:
         has_scale = True
-        rhs_quant_dtype = rhs.dtype
+        # An explicit rhs_quant_dtype marks a pre-packed rhs ([G, K//packing,
+        # N] 32-bit words, e.g. checkpoint-packed int4): treat every config
+        # decision as if the rhs were an unpacked array of that dtype, so the
+        # cfgs are identical to the pack-in-kernel path.
+        if rhs_quant_dtype is None:
+            rhs_quant_dtype = rhs.dtype
         num_blocks = rhs_scale.shape[1]
         scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
@@ -1202,8 +1226,9 @@ def make_gmm_configs(
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via
-        # pltpu.bitcast.
-        rhs_packing = 32 // jax.dtypes.itemsize_bits(rhs.dtype)
+        # pltpu.bitcast. (For a pre-packed rhs the bitcast is a same-width
+        # reinterpret and the shapes already match.)
+        rhs_packing = 32 // jax.dtypes.itemsize_bits(rhs_quant_dtype)
     else:
         has_scale = False
         rhs_quant_dtype = None
@@ -1216,7 +1241,7 @@ def make_gmm_configs(
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
-        dtype=rhs.dtype,
+        dtype=rhs_quant_dtype if rhs_quant_dtype is not None else rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
         packing=rhs_packing,
@@ -1346,6 +1371,7 @@ def get_metadata(cfgs: GmmConfigs):
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "rhs_quant_dtype",
     ]
 )
 def gmm_v2(
@@ -1364,6 +1390,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1416,6 +1443,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

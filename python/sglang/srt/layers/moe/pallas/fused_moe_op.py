@@ -141,8 +141,8 @@ def _fuse_act_name(activation_name):
 
 def _fused_moe_jax(
     hidden_states,  # [m, k]
-    w1,  # [g, k, 2 * n_intermediate]  bf16, OR [g, k/2, 2*n] uint8 (packed FP4)
-    w2,  # [g, n_intermediate, k]      bf16, OR [g, n/2, k]    uint8 (packed FP4)
+    w1,  # [g,k,2*n] bf16 | [g,k/2,2*n] uint8 (packed FP4) | [g,k/8,2*n] int32 (packed int4)
+    w2,  # [g,n,k]   bf16 | [g,n/2,k]   uint8 (packed FP4) | [g,n/8,k]   int32 (packed int4)
     topk_weights,  # [m, topk]
     topk_ids,  # i32[m, topk]
     w1_scale,  # Optional[g, 1, 1, 2 * n_intermediate] f32
@@ -155,6 +155,7 @@ def _fused_moe_jax(
     global_num_experts=0,
     expert_group_offset=0,
     use_sc_gather=0,
+    w_quant_bits=0,  # 4 => w1/w2 are checkpoint-packed int4 words (W4A16)
     permute_dense_threshold=0,
 ):
     """Production fused-MoE kernel body. Exported by ``_build_fused_moe_op``.
@@ -177,6 +178,16 @@ def _fused_moe_jax(
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
+
+    rhs_quant_dtype = None
+    maybe_quantize_lhs = True
+    if w_quant_bits:
+        assert w_quant_bits == 4, f"unsupported w_quant_bits={w_quant_bits}"
+        # Checkpoint-packed int4 weights (8 K-values per int32 word).
+        # Weight-only W4A16: activations stay bf16; gmm_v2 unpacks the int4
+        # tiles in VMEM, upcasts, and applies the per-group scale.
+        rhs_quant_dtype = jnp.int4
+        maybe_quantize_lhs = False
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a
     # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
@@ -243,7 +254,12 @@ def _fused_moe_jax(
     # halves, so run an unfused GMM1 and apply the activation in JAX for
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
+    # W4A16 also runs GMM1 unfused: the kernel's fused gate/up split
+    # mis-applies multi-block (group) rhs scales (verified vs the unfused
+    # path); the activation is applied in JAX below, same as the compact
+    # block-FP8 path.
+    unfused_gmm1 = compact_block_scales or bool(w_quant_bits)
+    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
     if compact_block_scales:
@@ -305,8 +321,10 @@ def _fused_moe_jax(
         # when fused); compact FP8 pins an unfused tile.
         tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
-    if compact_block_scales:
+    if unfused_gmm1:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
         )
@@ -333,6 +351,8 @@ def _fused_moe_jax(
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
+        maybe_quantize_lhs=maybe_quantize_lhs,
+        rhs_quant_dtype=rhs_quant_dtype,
     )[
         :,
         :hidden_size,
@@ -461,6 +481,7 @@ def _build_fused_moe_op():
         global_num_experts: int = 0,
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
+        w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
     ) -> jax.Array:
         return _fused_moe_jax(
@@ -479,6 +500,7 @@ def _build_fused_moe_op():
             global_num_experts,
             expert_group_offset,
             use_sc_gather,
+            w_quant_bits,
             permute_dense_threshold,
         )
 
@@ -500,6 +522,7 @@ def _build_fused_moe_op():
         global_num_experts: int = 0,
         expert_group_offset: int = 0,
         use_sc_gather: int = 0,
+        w_quant_bits: int = 0,
         permute_dense_threshold: int = 0,
     ):
         if no_combine:
@@ -533,6 +556,7 @@ def fused_moe_call(
     no_combine: bool = False,
     global_num_experts: int = 0,
     expert_group_offset: int = 0,
+    w_quant_bits: int = 0,
 ) -> torch.Tensor:
     """Invoke the Pallas fused-MoE op.
 
@@ -564,5 +588,6 @@ def fused_moe_call(
         global_num_experts,
         expert_group_offset,
         int(envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get()),
+        w_quant_bits,
         int(envs.SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD.get()),
     )
