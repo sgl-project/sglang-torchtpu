@@ -32,26 +32,68 @@ from sglang.srt.models.kimi_vl_moonvit import MLP2
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_npu, is_tpu
 
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+
+def freqs_cis_to_cos_sin(
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a complex64 ``freqs_cis`` [..., head_dim/2] into real ``(cos, sin)``.
+
+    Lets the RoPE rotation run as real arithmetic (see ``apply_rope``), which the
+    TPU torch.compile backend can lower — unlike ``torch.view_as_complex`` /
+    complex multiply. Intended for the eager preamble before the compiled ViT.
+    """
+    return freqs_cis.real.contiguous(), freqs_cis.imag.contiguous()
+
+
+def _rotate_interleaved(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Real-arithmetic equivalent of the complex ``apply_rope`` multiply.
+
+    Interleaved convention: adjacent pairs (x[2i], x[2i+1]) rotate by angle i.
+    Exactly matches ``view_as_real((x[2i]+i*x[2i+1]) * (cos+i*sin))``.
+
+    Args:
+        x: (..., num_heads, head_dim)
+        cos, sin: (..., head_dim/2)
+    """
+    cos = cos.unsqueeze(-2)  # (..., 1, head_dim/2)
+    sin = sin.unsqueeze(-2)
+    x_ = x.float().view(*x.shape[:-1], -1, 2)  # (..., num_heads, head_dim/2, 2)
+    x_even = x_[..., 0]
+    x_odd = x_[..., 1]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    out = torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+    return out.type_as(x)
 
 
 def apply_rope(
-    xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
+    xq: torch.Tensor, xk: torch.Tensor, freqs_cis, x_shape=None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: tensor of shape (..., head_dim/2), dtype=torch.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
+        freqs_cis: either a complex64 tensor of shape (..., head_dim/2) with the
+            precomputed cis(freqs) (eager path), or a real ``(cos, sin)`` tuple of
+            tensors each shaped (..., head_dim/2) (compiled TPU path). Both encode
+            the same rotation; the tuple form avoids complex ops in the graph.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
+    if isinstance(freqs_cis, tuple):
+        cos, sin = freqs_cis
+        return _rotate_interleaved(xq, cos, sin), _rotate_interleaved(xk, cos, sin)
 
     freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2
     # ..., num_heads, head_dim/2
@@ -141,15 +183,21 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rope_freqs_cis: torch.Tensor | None = None,
+        rope_freqs_cis=None,
+        segment_ids: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
+        # rope_freqs_cis is a complex64 tensor (eager) or a real (cos, sin) tuple
+        # (compiled TPU path). segment_ids, when supplied, bypasses cu_seqlens in
+        # the TPU attention backend (fixed-shape input for torch.compile); when
+        # None the backend derives segment ids from cu_seqlens as before.
         hidden_states = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=rope_freqs_cis,
+            segment_ids=segment_ids,
         )
 
         hidden_states = residual + hidden_states
@@ -213,6 +261,79 @@ def get_rope_shape(org, interpolation_mode, shape):
     )
 
 
+def _bicubic_interp_axis(in_size: int, out_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """PyTorch-compatible 1D bicubic taps + coefficients (align_corners=False).
+
+    Reproduces the per-axis sampling of
+    ``F.interpolate(..., mode="bicubic", align_corners=False)``: the half-pixel
+    source-coordinate mapping, the 4-tap cubic-convolution kernel (A=-0.75), and
+    the clamped boundary access. Runs on the host in numpy — no torch op sees the
+    data-dependent ``out_size``.
+
+    Returns ``(taps, coeffs)``, each ``[out_size, 4]``: the 4 clamped source
+    indices per output position and their cubic weights.
+    """
+    A = -0.75
+    scale = in_size / out_size
+    # Half-pixel mapping; NOT clamped to >= 0 for cubic (matches aten's `cubic`
+    # branch of area_pixel_compute_source_index).
+    src = (np.arange(out_size, dtype=np.float64) + 0.5) * scale - 0.5
+    floor = np.floor(src).astype(np.int64)
+    t = src - floor  # fractional offset in [0, 1)
+
+    def cc1(x):  # cubic_convolution1: |x| <= 1
+        return ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+
+    def cc2(x):  # cubic_convolution2: 1 < |x| < 2
+        return ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+
+    # Coefficients for taps at offsets [-1, 0, 1, 2] relative to `floor`.
+    coeffs = np.stack([cc2(t + 1.0), cc1(t), cc1(1.0 - t), cc2(2.0 - t)], axis=1)
+
+    offsets = np.array([-1, 0, 1, 2], dtype=np.int64)
+    taps = np.clip(floor[:, None] + offsets[None, :], 0, in_size - 1)
+    return taps, coeffs
+
+
+def _bicubic_pos_embed_interpolate(
+    weight: torch.Tensor, out_h: int, out_w: int
+) -> torch.Tensor:
+    """Bicubic-interpolate a ``[H, W, D]`` pos-embed grid to ``[out_h*out_w, D]``.
+
+    Numerically matches
+    ``get_rope_shape(weight, "bicubic", (out_h, out_w))`` (i.e.
+    ``F.interpolate(mode="bicubic", align_corners=False)``), but computes the
+    data-dependent taps/weights on the host and leaves only a static gather +
+    weighted sum on device — the same structure Qwen3-VL uses for its (bilinear)
+    pos-embed interpolation, so it carries no dynamic-shape `F.interpolate` op.
+    """
+    src_h, src_w, dim = weight.shape
+
+    taps_h, coeffs_h = _bicubic_interp_axis(src_h, out_h)  # [out_h, 4]
+    taps_w, coeffs_w = _bicubic_interp_axis(src_w, out_w)  # [out_w, 4]
+
+    # 16 separable (kh, kw) tap combos over the flattened out_h*out_w output grid.
+    # Flattened source index = tap_h * src_w + tap_w; weight = coeff_h * coeff_w.
+    th = taps_h[:, None, :, None]  # [out_h, 1, 4, 1]
+    tw = taps_w[None, :, None, :]  # [1, out_w, 1, 4]
+    flat_idx = (th * src_w + tw).reshape(out_h * out_w, 16)
+
+    ch = coeffs_h[:, None, :, None]
+    cw = coeffs_w[None, :, None, :]
+    flat_wt = (ch * cw).reshape(out_h * out_w, 16)
+
+    device = weight.device
+    idx = torch.from_numpy(np.ascontiguousarray(flat_idx)).to(device=device)
+    wt = torch.from_numpy(np.ascontiguousarray(flat_wt)).to(
+        device=device, dtype=torch.float32
+    )
+
+    flat_weight = weight.reshape(src_h * src_w, dim)
+    gathered = flat_weight[idx.reshape(-1)].reshape(out_h * out_w, 16, dim)
+    out = (gathered.to(torch.float32) * wt.unsqueeze(-1)).sum(dim=1)
+    return out.to(weight.dtype)
+
+
 def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
     """
     t_size: int of the temporal size
@@ -262,6 +383,19 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
+            elif _is_tpu:
+                # Bicubic via host-indices + device gather (same math as the
+                # F.interpolate path, no dynamic-shape op). Only bicubic is
+                # reproduced; guard so a config change can't silently regress.
+                # This branch is also the *only* thing keeping TPU out of
+                # `get_rope_shape`, whose `@torch.compile(dynamic=True)` the TPU
+                # backend cannot lower. Relax the assert into a fallthrough and
+                # you must add `_is_tpu` to that decorator's `disable=`.
+                assert self.interpolation_mode == "bicubic", (
+                    "TPU pos-embed interpolation only implements bicubic; got "
+                    f"{self.interpolation_mode!r}."
+                )
+                pos_emb_2d = _bicubic_pos_embed_interpolate(self.weight, h, w)
             else:
                 pos_emb_2d = get_rope_shape(
                     self.weight,
@@ -453,6 +587,18 @@ class MoonViT3dEncoder(nn.Module):
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
+        # TPU: route the block loop + final_layernorm through a torch.compile
+        # runner (eager until --enable-torch-compile installs the compiled fn).
+        # Preamble (rope, cu_seqlens) and postamble (tpool_patch_merger) stay
+        # eager. Other backends keep the plain eager loop below.
+        self.graph_runners = None
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.graph_runner.moonvit_tpu_compile_runner import (
+                MoonVitTpuCompileRunner,
+            )
+
+            self.graph_runners = MoonVitTpuCompileRunner(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -472,6 +618,21 @@ class MoonViT3dEncoder(nn.Module):
         max_seqlen = lengths.max()
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
+        if self.graph_runners is not None:
+            # Compiled/segment-id TPU path: real (cos, sin) rope, no complex ops.
+            # The segment-id builder requires cu_seqlens on CPU (it maps per-image
+            # boundaries + padding into a fixed-shape segment_ids on the host).
+            cos, sin = freqs_cis_to_cos_sin(rope_freqs_cis)
+            cu_seqlens_cpu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32),
+                    (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
+                        device="cpu", dtype=torch.int32
+                    ),
+                )
+            ).cumsum(dim=0, dtype=torch.int32)
+            return self.graph_runners.run(hidden_states, cos, sin, cu_seqlens_cpu)
+
         for block in self.blocks:
             hidden_states = block(
                 hidden_states, cu_seqlens, max_seqlen, rope_freqs_cis=rope_freqs_cis
@@ -480,6 +641,17 @@ class MoonViT3dEncoder(nn.Module):
         hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
+
+
+if _is_tpu:
+    # Register MoonViT's encoder as a torch.compile boundary for the TPU graph
+    # runner to discover (inert unless --enable-torch-compile).
+    from sglang.srt.compilation.support_torch_compile import support_torch_compile
+    from sglang.srt.hardware_backend.tpu.graph_runner.moonvit_tpu_compile_runner import (
+        MoonVitTpuCompilePolicy,
+    )
+
+    support_torch_compile(MoonViT3dEncoder, policy=MoonVitTpuCompilePolicy)
 
 
 class MoonViT3dPretrainedModel(nn.Module):
@@ -664,6 +836,26 @@ class KimiK25ForConditionalGeneration(nn.Module):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+
+        # TPU: make the inner DeepSeek-V3 decoder its own torch.compile boundary
+        # (mirrors Qwen3-VL). general_mm_embed_routine calls
+        # DeepseekV3ForCausalLM, whose forward runs self.model (the decoder,
+        # input_embeds -> hidden_states) then logits eagerly. Annotating the
+        # inner .model keeps the data-dependent multimodal merge and logits out
+        # of the compiled graph. Inert unless --enable-torch-compile is set (the
+        # TpuGraphRunner only discovers/installs policies in that case).
+        if _is_tpu and self.language_model is not None:
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(
+                self.language_model.model,
+                policy=Qwen3VLDecoderTpuCompilePolicy,
+            )
 
     @property
     def model(self):

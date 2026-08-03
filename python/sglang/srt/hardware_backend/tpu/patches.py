@@ -324,9 +324,23 @@ def _register_aten_fallbacks() -> None:
         self.copy_(out)
         return self
 
+    # aten::upsample_bicubic2d -- no TPU kernel; run the CPU kernel and copy
+    # back. Vision towers use it to resize position embeddings per image grid
+    # (MoonViT's Learnable2DInterpPosEmb in Kimi-VL), so inputs are small (tens
+    # of MB at most) and the round-trip is cheap. CPU bicubic has no bf16
+    # kernel, so compute in fp32 and cast back.
+    @torch.library.register_kernel("aten::upsample_bicubic2d", "PrivateUse1")
+    def _upsample_bicubic2d(
+        self, output_size, align_corners, scales_h=None, scales_w=None
+    ):
+        out = torch._C._nn.upsample_bicubic2d(
+            self.detach().cpu().float(), output_size, align_corners, scales_h, scales_w
+        )
+        return out.to(device=self.device, dtype=self.dtype)
+
     logger.info(
         "Registered torch_tpu ATen fallbacks: count_nonzero.dim_IntList, "
-        "masked_scatter_"
+        "masked_scatter_, upsample_bicubic2d"
     )
 
 
