@@ -906,30 +906,54 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
 
 
-# Per-device 0-D int64 tensors holding this process's rank ids, keyed by
-# (rank axis, device). Populated eagerly OUTSIDE any compiled region so the
-# dict lookup inside torch.compile returns a preexisting tensor, which Dynamo
-# lifts as a runtime graph input. Creating the tensor inside a traced region
-# instead inlines the Python rank as a baked graph constant (Dynamo traces
-# through caching wrappers), and after constant folding the per-rank offsets
-# become static — rank-divergent executables the in-graph collectives cannot
-# tolerate.
+# 0-D int64 rank-id tensors, keyed by (axis, device); axis is "attn_tp" or
+# "attn_dp". Created eagerly OUTSIDE compiled regions (initialize_dp_attention):
+# pre-existing tensors are lifted as runtime graph inputs, so every rank traces
+# one identical program. A tensor created inside a traced region — lru_cache
+# factories included, Dynamo traces through them — bakes the rank as a graph
+# constant, and the resulting rank-divergent executables deadlock the in-graph
+# collectives.
 _RANK_TENSORS: dict = {}
 
 
 def _init_rank_tensors(device: torch.device) -> None:
+    """Create the attn_tp and attn_dp rank tensors for a device.
+
+    Args:
+        device: Device to create the tensors on. An index-less device such
+            as "tpu" resolves to the current core; the resolved device is
+            registered as an extra key so lookups via a runtime tensor's
+            .device attribute also hit.
+    """
     for axis, rank in (
         ("attn_tp", get_attention_tp_rank()),
         ("attn_dp", get_attention_dp_rank()),
     ):
         t = torch.tensor(rank, device=device, dtype=torch.int64)
         _RANK_TENSORS[(axis, device)] = t
-        # A device without index (e.g. "tpu") resolves to the current core;
-        # register the resolved device too so runtime tensors' .device hits.
+        # An index-less device ("tpu") resolves to the current core; register
+        # the resolved device too so lookups via a runtime tensor's .device hit.
         _RANK_TENSORS[(axis, t.device)] = t
 
 
 def _rank_tensor(axis: str, device: torch.device) -> torch.Tensor:
+    """Return this process's rank id as a 0-D int64 tensor.
+
+    Args:
+        axis: Which rank to return: "attn_tp" (attention tensor-parallel
+            rank) or "attn_dp" (attention data-parallel rank).
+        device: Device of the returned tensor.
+
+    Returns:
+        0-D int64 tensor holding the rank id. A tensor rather than a Python
+        int so derived values stay in-graph and the rank enters compiled
+        programs as runtime data.
+
+    Raises:
+        RuntimeError: If first requested inside a compiled region; creating
+            the tensor there would bake the rank as a graph constant (see
+            _RANK_TENSORS above).
+    """
     t = _RANK_TENSORS.get((axis, device))
     if t is None:
         if torch.compiler.is_compiling():
@@ -945,13 +969,17 @@ def _rank_tensor(axis: str, device: torch.device) -> torch.Tensor:
 
 
 def _dp_rank_slot_rows(num_rows: int, device: torch.device) -> torch.Tensor:
-    """Global-buffer row indices of this rank's MAX_LEN slot:
-    [dp_rank * num_rows, (dp_rank + 1) * num_rows).
+    """Row indices of this rank's slot in the MAX_LEN global DP buffer.
 
-    Computed on device from the rank tensor plus a constant arange, so the
-    slot offset reaches the compiled graph as a runtime gather/scatter operand
-    rather than a per-rank constant baked into the HLO — baked offsets compile
-    rank-divergent executables that deadlock the in-graph collectives.
+    Args:
+        num_rows: Rows per DP slot (the per-rank padded token count); the
+            global buffer holds dp_size such slots.
+        device: Device of the returned tensor.
+
+    Returns:
+        1-D int64 tensor of num_rows consecutive row numbers starting at
+        dp_rank * num_rows (e.g. rank 1 with 128 rows -> [128, ..., 255]),
+        computed in-graph so the offset stays a runtime operand.
     """
     return _rank_tensor("attn_dp", device) * num_rows + torch.arange(
         num_rows, device=device
@@ -959,11 +987,15 @@ def _dp_rank_slot_rows(num_rows: int, device: torch.device) -> torch.Tensor:
 
 
 def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
-    """0/1 device scalar: 1 on attn-TP rank 0, 0 elsewhere.
+    """0/1 scale that keeps only attention-TP rank 0's contribution.
 
-    Derived in-graph from the rank tensor (compare + dtype convert), so every
-    rank traces the identical graph and the rank enters only as runtime data.
-    The multiply keeps the residual consumer (and its upstream collective)
-    live on the zero ranks.
+    Args:
+        ref: Tensor supplying the device and dtype of the returned scale.
+
+    Returns:
+        0-D tensor of ref's dtype: 1 on attention-TP rank 0, 0 on all other
+        ranks. Computed in-graph; multiplying by it (rather than branching
+        on the rank) keeps the consumer and its upstream collective live on
+        the zero ranks.
     """
     return (_rank_tensor("attn_tp", ref.device) == 0).to(ref.dtype)
