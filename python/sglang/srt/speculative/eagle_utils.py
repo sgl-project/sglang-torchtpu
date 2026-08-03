@@ -872,9 +872,14 @@ def eagle_sample(
 
             # Use target argmax as the synthetic bonus for non-greedy requests.
             if target_predict is None:
-                target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
-                    bs, verify_input.draft_token_num
-                )
+                num_active_tokens = bs * verify_input.draft_token_num
+                target_predict = torch.argmax(next_token_logits, dim=-1)
+                if target_predict.shape != (bs, verify_input.draft_token_num):
+                    # Execution padding retains inactive token rows in logits;
+                    # trim them before restoring the active batch/token shape.
+                    target_predict = target_predict[:num_active_tokens].reshape(
+                        bs, verify_input.draft_token_num
+                    )
         accept_index = generate_simulated_accept_index(
             accept_index=accept_index,
             predict=predict,  # mutable
