@@ -52,15 +52,7 @@ jobs:
           tokfile="${RUNNER_TEMP}/tpu-ci.token"
           printf '%s' "$CI_ACCESS_TOKEN" > "$tokfile"
           trap 'rm -f "$tokfile"' EXIT
-          # Docker tags allow only [A-Za-z0-9_.-], so slugify the ref before using
-          # it. Dispatching on a branch with a slash (e.g. feat/tpu-kimi-vl) built
-          # the tag "...-feat/tpu-kim-..." and Cloud Build rejected it:
-          #   builds.create failed: HTTP 400
-          #   invalid build: invalid image name "...:20260803-feat/tpu-kim-..."
-          #   could not parse reference
-          # which made this workflow dispatchable only on slash-free refs like
-          # main. Slugify before truncating so the 12-char window can never end
-          # mid-escape.
+          # Docker tags allow only [A-Za-z0-9_.-], so slugify the ref before using it.
           safe_ref="$(printf '%s' "$INPUT_REF" | tr -c 'A-Za-z0-9_.-' '-')"
           tag="$(date -u +%Y%m%d)-${safe_ref:0:12}-${{ github.run_id }}"
           bucket="${GCP_PROJECT}_cloudbuild"
