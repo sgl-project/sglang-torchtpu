@@ -1,14 +1,11 @@
 name: Bot Sync From Upstream sglang
 
-# Periodically merges sgl-project/sglang `main` into this fork and opens a PR.
+# Manually merges sgl-project/sglang `main` into this fork and opens a PR.
 # Preserves upstream git history (real `git merge`), unlike the rsync-based
 # "Open A PR to Copy Code From OSS" workflow.
 
 on:
   workflow_dispatch:
-  schedule:
-    # Every 2 days at 10:00 UTC.
-    - cron: '0 10 */2 * *'
 
 permissions:
   contents: write
