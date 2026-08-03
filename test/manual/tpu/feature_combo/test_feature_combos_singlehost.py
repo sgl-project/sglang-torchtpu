@@ -60,13 +60,24 @@ _SPEC = dict(  # + EAGLE3
     speculative_num_draft_tokens=4,
 )
 
-_DP = dict(tp_size=8, dp_size=2, enable_dp_attention=True)
+_DP = dict(tp_size=8, dp_size=2, enable_dp_attention=True, enable_dp_lm_head=True)
 
 COMBOS = {
     # Default = the full-host serving shape (v7x host = 8 devices): real TP
     # sharding (per-rank KV pools, sharded draft), the shape that ships.
     "1": dict(name="prefix+spec+kvoffload", engine={**_BASE, "tp_size": 8, **_SPEC}),
-    "2": dict(name="prefix+dp+kvoffload", engine={**_BASE, **_DP}),
+    # Combo 2: DP attention with prefix caching and KV offloading.
+    # QUANTIZATION and FP8 KV cache are explicitly disabled (run in native BF16)
+    # to avoid FP8 precision quantization artifacts and ULP rounding shifts across DP ranks.
+    "2": dict(
+        name="prefix+dp+kvoffload",
+        engine={
+            **_BASE,
+            **_DP,
+            "quantization": None,
+            "kv_cache_dtype": "bf16",
+        },
+    ),
     "3": dict(name="prefix+dp+kvoffload+spec (quad)", engine={**_BASE, **_DP, **_SPEC}),
 }
 COMBO = os.environ.get("COMBO", "1")  # set by __main__ dispatch
