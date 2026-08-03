@@ -163,12 +163,12 @@ class TpuSRTPlatform(SRTPlatform):
                     "yet (only EAGLE3)."
                 )
 
-        if server_args.enable_dp_attention:
-            attn_tp_size = server_args.tp_size // server_args.dp_size
-            if attn_tp_size > 1 and not server_args.enable_dp_lm_head:
+        if getattr(server_args, "enable_dp_attention", False):
+            attn_tp_size = getattr(server_args, "tp_size", 1) // getattr(server_args, "dp_size", 1)
+            if attn_tp_size > 1 and not getattr(server_args, "enable_dp_lm_head", False):
                 raise ValueError(
                     f"When attention TP > 1 under DP attention on TPU (attn_tp_size={attn_tp_size} "
-                    f"from tp_size={server_args.tp_size} and dp_size={server_args.dp_size}), "
+                    f"from tp_size={getattr(server_args, 'tp_size', 1)} and dp_size={getattr(server_args, 'dp_size', 1)}), "
                     "--enable-dp-lm-head must be enabled."
                 )
 

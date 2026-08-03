@@ -169,6 +169,9 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             disable_overlap_schedule=False,
             mem_fraction_static=None,
             tp_size=1,
+            dp_size=1,
+            enable_dp_attention=False,
+            enable_dp_lm_head=False,
             page_size=None,
             use_ray=False,
             hicache_io_backend=None,
@@ -210,6 +213,37 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(enable_torch_compile=True)
         self._apply(args)
         self.assertTrue(args.enable_torch_compile)
+
+    def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
+        args = self._args(
+            enable_dp_attention=True,
+            tp_size=8,
+            dp_size=2,
+            enable_dp_lm_head=False,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "When attention TP > 1 under DP attention on TPU"
+        ):
+            self._apply(args)
+
+    def test_dp_attention_allows_valid_dp_lm_head_combos(self):
+        # attn_tp_size > 1 with enable_dp_lm_head=True
+        args = self._args(
+            enable_dp_attention=True,
+            tp_size=8,
+            dp_size=2,
+            enable_dp_lm_head=True,
+        )
+        self._apply(args)
+
+        # attn_tp_size == 1 with enable_dp_lm_head=False
+        args = self._args(
+            enable_dp_attention=True,
+            tp_size=8,
+            dp_size=8,
+            enable_dp_lm_head=False,
+        )
+        self._apply(args)
 
     def test_configures_export_mesh_from_tp_size(self):
         args = self._args(tp_size=16)
