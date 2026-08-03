@@ -335,7 +335,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return False
 
         server_args = self.model_runner.server_args
-        signature = inspect.signature(fn)
+        is_draft_worker = bool(getattr(self.model_runner, "is_draft_worker", False))
+        compile_owner = self.owner.model if is_draft_worker else self.owner
+        compile_fn = compile_owner.forward if is_draft_worker else fn
+
         backend = self.backend or current_platform.get_compile_backend()
         use_bundle = (
             server_args.unsafe_save_torch_compile_bundle is not None
@@ -343,14 +346,27 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
         compiled = compiler(
-            torch.no_grad()(fn),
+            torch.no_grad()(compile_fn),
             backend=backend,
             fullgraph=self.fullgraph,
             dynamic=self.dynamic,
         )
-        compiled.__signature__ = signature
-        setattr(self.owner, self.method_name, compiled)
-
+        compiled.__signature__ = inspect.signature(compile_fn)
+        setattr(
+            compile_owner,
+            "forward" if is_draft_worker else self.method_name,
+            compiled,
+        )
+        if is_draft_worker:
+            logits_fn = self.owner.logits_processor.forward
+            compiled_logits = torch.compile(
+                torch.no_grad()(logits_fn),
+                backend=backend,
+                fullgraph=self.fullgraph,
+                dynamic=self.dynamic,
+            )
+            compiled_logits.__signature__ = inspect.signature(logits_fn)
+            self.owner.logits_processor.forward = compiled_logits
         # max_t = smallest positive prefill/context limit (extend never runs
         # longer). max_b = the reconciled compile-batch ceiling, already grown to
         # cover the scheduler concurrency in ServerArgs.__post_init__ via
@@ -393,7 +409,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         outer_model.prepare_forward_batch = _prepare
 
-        self.compiled_forward_shim = CompiledForwardShim(compiled, policy=self)
+        # Keep draft logits out of the compiled model-forward graph. The outer
+        # forward calls the backbone and logits processor as independent
+        # compiled regions.
+        shim_target = fn if is_draft_worker else compiled
+        self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
         self.model_runner.compile_policy = self
 

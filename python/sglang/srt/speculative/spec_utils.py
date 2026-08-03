@@ -1141,7 +1141,10 @@ def generate_simulated_accept_index(
 
     accept_indx_first_col = accept_index[:, 0].view(-1, 1)
     sim_accept_index = torch.full(
-        (bs, spec_steps + 1), -1, dtype=torch.int32, device="cuda"
+        (bs, spec_steps + 1),
+        -1,
+        dtype=torch.int32,
+        device=accept_index.device,
     )
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device

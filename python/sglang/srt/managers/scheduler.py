@@ -3594,12 +3594,20 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def _maybe_arm_fail_on_recompile(self) -> None:
-        """TPU-only: freeze torch.compile so serving-time recompiles raise."""
+        """TPU-only: freeze non-spec torch.compile so recompiles raise."""
         model_runner = self.tp_worker.model_runner
         if model_runner.device != "tpu":
             # Only enable this for tpu
             return
         if not model_runner.server_args.enable_torch_compile:
+            return
+        if model_runner.server_args.speculative_algorithm is not None:
+            # TODO: Re-enable fail_on_recompile for speculative decoding once
+            # startup prewarm covers every serving-time helper shape.
+            logger.info(
+                "[tpu] Warmup complete; leaving torch.compile recompiles enabled "
+                "for speculative decoding."
+            )
             return
         torch.compiler.set_stance("fail_on_recompile")
         logger.info(

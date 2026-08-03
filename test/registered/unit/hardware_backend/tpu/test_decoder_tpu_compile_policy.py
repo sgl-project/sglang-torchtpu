@@ -148,6 +148,108 @@ class TestInstallExtendCap(CustomTestCase):
         policy = self._install_policy(prefill_max_requests=16, dp_attention=True)
         self.assertEqual(policy.extend_bs, 64)
 
+    def test_target_model_keeps_outer_compile_boundary(self):
+        original_outer = MagicMock(name="outer_forward")
+        original_backbone = MagicMock(name="backbone_forward")
+        model = SimpleNamespace(
+            forward=original_outer,
+            model=SimpleNamespace(forward=original_backbone),
+            prepare_forward_batch=MagicMock(),
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            is_draft_worker=False,
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+                torch_compile_max_bs=64,
+                prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+        compiled_outer = MagicMock(name="compiled_outer")
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(
+                Bucketer(name="Token", buckets=[64, 2048]),
+                Bucketer(name="Bs", buckets=[16, 32, 64]),
+            ),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=False,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "torch.compile",
+            return_value=compiled_outer,
+        ) as compile_mock:
+            self.assertTrue(policy.install())
+
+        self.assertIs(model.model.forward, original_backbone)
+        self.assertIs(policy.compiled_forward_shim.fn, compiled_outer)
+        compile_mock.assert_called_once()
+        self.assertIs(compile_mock.call_args.args[0].__wrapped__, original_outer)
+
+    def test_draft_compiles_backbone_and_logits_as_separate_regions(self):
+        original_outer = MagicMock(name="outer_forward")
+        original_backbone = MagicMock(name="backbone_forward")
+        original_logits = MagicMock(name="logits_forward")
+        logits_processor = SimpleNamespace(forward=original_logits)
+        model = SimpleNamespace(
+            forward=original_outer,
+            model=SimpleNamespace(forward=original_backbone),
+            logits_processor=logits_processor,
+            prepare_forward_batch=MagicMock(),
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            is_draft_worker=True,
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+                torch_compile_max_bs=64,
+                prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+        compiled_backbone = MagicMock(name="compiled_backbone")
+        compiled_logits = MagicMock(name="compiled_logits")
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(
+                Bucketer(name="Token", buckets=[64, 2048]),
+                Bucketer(name="Bs", buckets=[16, 32, 64]),
+            ),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=False,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "torch.compile",
+            side_effect=[compiled_backbone, compiled_logits],
+        ) as compile_mock:
+            self.assertTrue(policy.install())
+
+        self.assertEqual(compile_mock.call_count, 2)
+        self.assertIs(model.model.forward, compiled_backbone)
+        self.assertIs(logits_processor.forward, compiled_logits)
+        self.assertIs(policy.compiled_forward_shim.fn, original_outer)
+
 
 class TestQwen3VLDecoderUnpadding(CustomTestCase):
     def _forward_batch(self):
