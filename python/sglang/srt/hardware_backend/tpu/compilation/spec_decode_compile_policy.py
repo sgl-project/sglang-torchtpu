@@ -213,12 +213,15 @@ class SpecDecodeCompilePolicyMixin:
 
         Invoked by the EAGLE worker after its custom draft attention backends
         are wired, which don't exist yet when the graph runner calls
-        ``precompile()``, so the draft precompile is deferred to here. Covers
-        the three families the draft model runs at serving:
+        ``precompile()``, so the draft precompile is deferred to here. It covers
+        the three forward-mode families the draft model runs at serving:
 
         * ``EXTEND(LAST)`` -- draft prefill right after target prefill
         * ``DECODE(LAST)`` -- the multi-step draft loop (per step backend)
-        * ``DRAFT_EXTEND_V2(LAST)`` -- post-verify draft extend
+        * ``DRAFT_EXTEND_V2(FULL)`` -- post-verify draft extend
+
+        Each warmup runs the outer draft forward, exercising both independently
+        compiled regions: the draft backbone and the draft logits processor.
         """
         if not self.is_draft_worker or self.b_bucketer is None:
             return
@@ -320,12 +323,12 @@ class SpecDecodeCompilePolicyMixin:
         self._precompile_shapes("DRAFT DECODE", shapes, run)
 
     def _precompile_draft_extend(self, attn_backend: Any) -> None:
-        """Compile DRAFT_EXTEND_V2(LAST) across the bs buckets."""
+        """Compile DRAFT_EXTEND_V2(FULL) across the bs buckets."""
         assert self.b_bucketer is not None
         bs_buckets = list(self.b_bucketer.buckets)
         tokens_per_req = self.draft_token_num
         logger.info(
-            "[spec compile policy] DRAFT_EXTEND_V2(LAST): %d shapes "
+            "[spec compile policy] DRAFT_EXTEND_V2(FULL): %d shapes "
             "(bs=%s, tokens_per_req=%d)",
             len(bs_buckets),
             bs_buckets,
@@ -338,13 +341,13 @@ class SpecDecodeCompilePolicyMixin:
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.DRAFT_EXTEND_V2,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self._make_draft_extend_spec_info(),
                 attn_backend=attn_backend,
             )
             return f"bs={bs}, tokens={num_tokens}"
 
-        self._precompile_shapes("DRAFT_EXTEND_V2(LAST)", bs_buckets, run)
+        self._precompile_shapes("DRAFT_EXTEND_V2(FULL)", bs_buckets, run)
 
     def _make_draft_prefill_spec_info(self) -> EagleDraftExtendInput:
         """``EagleDraftExtendInput`` stub for draft prefill EXTEND(LAST)."""
@@ -378,6 +381,9 @@ class SpecDecodeCompilePolicyMixin:
             device=self.model_runner.device,
             hidden_size=self.eagle_hidden_size or 1,
             dtype=self.model_runner.dtype,
+            # Runtime ``prepare_for_draft_extend`` sets FULL on ForwardBatch,
+            # but the EagleDraftExtendInput itself keeps its LAST default.
+            # Dynamo guards both fields independently, so preserve that split.
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
         # Draft extend fills the whole tree width per request; mirror what
@@ -615,21 +621,40 @@ class SpecDecodeCompilePolicyMixin:
         real_bs = int(forward_batch.seq_lens.shape[0])
         real_tokens = int(forward_batch.input_ids.shape[0])
         pad_b = self.b_bucketer.next_bucket(real_bs)
-        if pad_b == real_bs:
-            return
         pad_tokens = pad_b * self.draft_token_num
-        # Draft extend has a fixed width, so it needs no token bucket.
-        # This also grows its owned token- and request-axis tensors.
-        forward_batch._pad_inputs_to_size(
-            model_runner=self.model_runner,
-            num_tokens=pad_tokens,
-            bs=pad_b,
-        )
-        forward_batch.batch_size = pad_b
-        # Intentionally leave _REAL_Q_KEY unset. draft extend consumes the
-        # output later using its own select-index gather instead of generic
-        # prefix unpadding.
-        setattr(forward_batch, _REAL_B_KEY, real_bs)
+        if pad_b != real_bs:
+            # Draft extend has a fixed width, so it needs no token bucket.
+            # This also grows its owned token- and request-axis tensors.
+            forward_batch._pad_inputs_to_size(
+                model_runner=self.model_runner,
+                num_tokens=pad_tokens,
+                bs=pad_b,
+            )
+            forward_batch.batch_size = pad_b
+            # Intentionally leave _REAL_Q_KEY unset. draft extend consumes the
+            # output later using its own select-index gather instead of generic
+            # prefix unpadding.
+            setattr(forward_batch, _REAL_B_KEY, real_bs)
+
+        # ForwardBatch.init_new may carry CPU extend metadata padded for the
+        # previous prefill cap. Draft extend bypasses model.prepare_forward_batch
+        # after attention metadata is marked ready, so normalize it here even
+        # when the live batch already lands exactly on a batch bucket.
+        for field in (
+            "extend_seq_lens_cpu",
+            "extend_prefix_lens_cpu",
+            "extend_logprob_start_lens_cpu",
+        ):
+            value = getattr(forward_batch, field, None)
+            if value is None:
+                value = []
+            elif isinstance(value, torch.Tensor):
+                value = value.tolist()
+            setattr(forward_batch, field, (value + [0] * pad_b)[:pad_b])
+
+        mm_inputs = getattr(forward_batch, "mm_inputs", None)
+        if isinstance(mm_inputs, list):
+            forward_batch.mm_inputs = (mm_inputs + [None] * pad_b)[:pad_b]
 
         if isinstance(draft_extend_input, EagleDraftExtendInput):
             draft_extend_input.record_padding(

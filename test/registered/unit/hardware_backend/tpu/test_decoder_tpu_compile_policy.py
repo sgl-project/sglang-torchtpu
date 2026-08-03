@@ -717,6 +717,13 @@ class TestSpecPrecompileLoops(CustomTestCase):
             + [ForwardMode.DECODE] * 4
             + [ForwardMode.DRAFT_EXTEND_V2] * 2,
         )
+        capture_modes = [
+            call.args[2].capture_hidden_mode for call in mr.model.forward.call_args_list
+        ]
+        self.assertEqual(
+            capture_modes,
+            [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
+        )
 
     def test_non_eagle3_algorithm_raises(self):
         # The spec policy enforces the supported algorithm at construction (only
@@ -787,10 +794,12 @@ class TestSpecDummyForwardBatch(CustomTestCase):
             num_tokens=16,
             bs=4,
             mode=ForwardMode.DRAFT_EXTEND_V2,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
             spec_info=policy._make_draft_extend_spec_info(),
         )
 
+        self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertEqual(fb.spec_info.capture_hidden_mode, CaptureHiddenMode.LAST)
         self.assertEqual(fb.positions.tolist(), [4, 5, 6, 7] * 4)
         self.assertEqual(
             fb.out_cache_loc.tolist(),
@@ -889,6 +898,27 @@ class TestSpecDraftDecodePadding(CustomTestCase):
         policy.prepare_spec_forward_batch(forward_batch)
 
         self.assertFalse(spec_info.keep_outputs_padded)
+
+
+class TestSpecDraftExtendPadding(CustomTestCase):
+    def test_normalizes_stale_cpu_lists_at_exact_bucket(self):
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        forward_batch = SimpleNamespace(
+            input_ids=torch.ones(16, dtype=torch.int32),
+            seq_lens=torch.ones(4, dtype=torch.int32),
+            spec_info=None,
+            extend_seq_lens_cpu=[4] * 64,
+            extend_prefix_lens_cpu=torch.arange(64),
+            extend_logprob_start_lens_cpu=[0] * 64,
+            mm_inputs=[None] * 64,
+        )
+
+        policy._pad_draft_extend(forward_batch)
+
+        self.assertEqual(forward_batch.extend_seq_lens_cpu, [4] * 4)
+        self.assertEqual(forward_batch.extend_prefix_lens_cpu, [0, 1, 2, 3])
+        self.assertEqual(forward_batch.extend_logprob_start_lens_cpu, [0] * 4)
+        self.assertEqual(forward_batch.mm_inputs, [None] * 4)
 
 
 class TestSpecUnpadOutputs(CustomTestCase):
