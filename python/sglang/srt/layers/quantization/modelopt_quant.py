@@ -2523,20 +2523,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             import os
 
             from sglang.srt.hardware_backend.tpu.fp4_moe import (
-                can_use_tpu_nvfp4_fused_rs,
+                unmet_tpu_nvfp4_fused_rs_requirements,
             )
 
             fused_rs_setting = os.environ.get("SGLANG_TPU_FP4_FUSED_RS", "auto")
-            self.handles_moe_reduction = (
-                fused_rs_setting != "0"
-                and can_use_tpu_nvfp4_fused_rs(
+            unmet_requirements = (
+                ["SGLANG_TPU_FP4_FUSED_RS=0"]
+                if fused_rs_setting == "0"
+                else unmet_tpu_nvfp4_fused_rs_requirements(
                     layer,
                     group_size=self.quant_config.group_size,
                     no_combine=moe_runner_config.no_combine,
                 )
             )
+            self.handles_moe_reduction = not unmet_requirements
             if self.handles_moe_reduction:
                 logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
+            elif fused_rs_setting == "1":
+                # An explicit opt-in that silently serves the stock path hides a
+                # whole class of misconfiguration, so name the unmet contract.
+                logger.warning(
+                    "SGLANG_TPU_FP4_FUSED_RS=1 requested but fused-RS cannot "
+                    "honor this layer; serving the stock TPU NVFP4 MoE path "
+                    "instead. Unmet requirements: %s",
+                    ", ".join(unmet_requirements),
+                )
             # TPU bypasses MoeRunner entirely; apply() dispatches straight to the
             # Pallas fused grouped-GEMM. --moe-runner-backend is a no-op here.
             return

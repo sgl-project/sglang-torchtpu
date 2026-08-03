@@ -161,13 +161,13 @@ def _fold_w13_global_scale(
     return scale
 
 
-def can_use_tpu_nvfp4_fused_rs(
+def unmet_tpu_nvfp4_fused_rs_requirements(
     layer: torch.nn.Module,
     *,
     group_size: int,
     no_combine: bool,
-) -> bool:
-    """Return whether fused-RS can honor this layer's MoE contract."""
+) -> list[str]:
+    """Return the fused-RS contract requirements this layer does not meet."""
     from sglang.srt.distributed import get_tp_group, get_world_group
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_parallel, get_server_args
@@ -175,26 +175,51 @@ def can_use_tpu_nvfp4_fused_rs(
     parallel = get_parallel()
     server_args = get_server_args()
     runner_config = layer.moe_runner_config
-    return (
-        group_size == TPU_NVFP4_GROUP_SIZE
-        and layer.moe_ep_size > 1
-        and layer.moe_ep_size
-        == get_tp_group().world_size
-        == get_world_group().world_size
-        and layer.allow_backend_reduction
-        and parallel.attn_dp_size == 1
-        and runner_config.is_gated
-        and runner_config.activation == "silu"
-        and not runner_config.apply_router_weight_on_input
+    requirements = (
+        (f"group_size == {TPU_NVFP4_GROUP_SIZE}", group_size == TPU_NVFP4_GROUP_SIZE),
+        ("expert parallelism enabled", layer.moe_ep_size > 1),
+        (
+            "moe_ep_size == tp_size == world_size",
+            layer.moe_ep_size
+            == get_tp_group().world_size
+            == get_world_group().world_size,
+        ),
+        ("layer allows backend reduction", layer.allow_backend_reduction),
+        ("attn_dp_size == 1", parallel.attn_dp_size == 1),
+        ("gated MoE", runner_config.is_gated),
+        ("silu activation", runner_config.activation == "silu"),
+        (
+            "router weight not applied on input",
+            not runner_config.apply_router_weight_on_input,
+        ),
         # Same contract as the shared FP8 fused-RS path: the standard path is
         # already combined, while a model that declares a compatible
         # post-expert norm asks for per-expert output so the norm can run
         # before the weighted combination.
-        and no_combine == has_tpu_fused_rs_post_expert_norm(layer)
-        and not layer.num_fused_shared_experts
-        and get_moe_a2a_backend().is_none()
-        and not server_args.enable_dp_attention
-        and not server_args.enable_fused_moe_sum_all_reduce
+        (
+            "no_combine matches the model's post-expert-norm contract",
+            no_combine == has_tpu_fused_rs_post_expert_norm(layer),
+        ),
+        ("no fused shared experts", not layer.num_fused_shared_experts),
+        ("standard token dispatcher", get_moe_a2a_backend().is_none()),
+        ("dp attention disabled", not server_args.enable_dp_attention),
+        (
+            "fused MoE sum all-reduce disabled",
+            not server_args.enable_fused_moe_sum_all_reduce,
+        ),
+    )
+    return [name for name, met in requirements if not met]
+
+
+def can_use_tpu_nvfp4_fused_rs(
+    layer: torch.nn.Module,
+    *,
+    group_size: int,
+    no_combine: bool,
+) -> bool:
+    """Return whether fused-RS can honor this layer's MoE contract."""
+    return not unmet_tpu_nvfp4_fused_rs_requirements(
+        layer, group_size=group_size, no_combine=no_combine
     )
 
 

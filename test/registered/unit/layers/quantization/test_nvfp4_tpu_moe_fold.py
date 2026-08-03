@@ -259,6 +259,76 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 )
             )
 
+    def test_unmet_requirements_name_the_failing_contract(self):
+        """A rejected opt-in must say why, not silently serve the stock path.
+
+        The no_combine mismatch below is the shape a model hits when it asks for
+        per-expert output without declaring the post-expert-norm contract.
+        """
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            TPU_NVFP4_GROUP_SIZE,
+            unmet_tpu_nvfp4_fused_rs_requirements,
+        )
+
+        layer = types.SimpleNamespace(
+            moe_ep_size=4,
+            allow_backend_reduction=True,
+            num_fused_shared_experts=0,
+            moe_runner_config=types.SimpleNamespace(
+                is_gated=True,
+                activation="silu",
+                apply_router_weight_on_input=False,
+            ),
+        )
+        tp_group = types.SimpleNamespace(world_size=4)
+        world_group = types.SimpleNamespace(world_size=4)
+        parallel = types.SimpleNamespace(attn_dp_size=1)
+        server_args = types.SimpleNamespace(
+            enable_dp_attention=False,
+            enable_fused_moe_sum_all_reduce=False,
+        )
+        a2a_backend = types.SimpleNamespace(is_none=lambda: True)
+        with (
+            mock.patch(
+                "sglang.srt.distributed.get_world_group", return_value=world_group
+            ),
+            mock.patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel", return_value=parallel
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args", return_value=server_args
+            ),
+            mock.patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=a2a_backend,
+            ),
+        ):
+            self.assertEqual(
+                unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                ),
+                [],
+            )
+            self.assertEqual(
+                unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=BLOCK_SIZE, no_combine=True
+                ),
+                ["no_combine matches the model's post-expert-norm contract"],
+            )
+            # Every unmet requirement is reported, not just the first.
+            layer.allow_backend_reduction = False
+            self.assertEqual(
+                unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=16, no_combine=True
+                ),
+                [
+                    f"group_size == {TPU_NVFP4_GROUP_SIZE}",
+                    "layer allows backend reduction",
+                    "no_combine matches the model's post-expert-norm contract",
+                ],
+            )
+
     def test_non_rs_no_combine_passes_masked_routing_to_pallas(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
