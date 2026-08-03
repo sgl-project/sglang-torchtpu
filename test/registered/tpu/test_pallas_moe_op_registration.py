@@ -149,6 +149,7 @@ class TestPallasMoeCallContract(CustomTestCase):
             8,  # global_num_experts
             4,  # expert_group_offset
             1,  # use_sc_gather (int(True))
+            0,  # w_quant_bits (0 => not weight-only quantized)
             128,  # permute_dense_threshold
         )
 

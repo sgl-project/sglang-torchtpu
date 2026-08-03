@@ -457,7 +457,10 @@ def inner_kernel(
             tiled_rhs = jnp.where(mask_rhs, tiled_rhs, 0)
 
         if cfgs.lhs_cfgs.quant_dtype is None:
-            # Unquantized matmul path.
+            # Weight-only (W4A16): upcast the rhs in VMEM and let the MXU run
+            # a full-precision matmul; the rhs scale below dequantizes.
+            if cfgs.rhs_cfgs.quant_dtype is not None:
+                tiled_rhs = tiled_rhs.astype(tiled_lhs.dtype)
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
@@ -1084,14 +1087,20 @@ def validate_inputs(
     group_offset: jax.Array,
     fuse_act: str | None = None,
     packed_fp4: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
     size_group, size_k_raw, size_n = rhs.shape
-    # Packed FP4 (NVFP4 / MXFP4-native): rhs is uint8 packed (2 float4 per byte),
-    # so real K = shape[1] * 2.
-    size_k = size_k_raw * 2 if packed_fp4 else size_k_raw
+    if packed_fp4:
+        # uint8-packed float4: 2 codes per byte, so real K = shape[1] * 2.
+        size_k = size_k_raw * 2
+    elif rhs_quant_dtype is not None and rhs.dtype in (jnp.uint32, jnp.int32):
+        # Pre-packed 32-bit words [G, K//packing, N]: recover the unpacked K.
+        size_k = size_k_raw * (32 // jax.dtypes.itemsize_bits(rhs_quant_dtype))
+    else:
+        size_k = size_k_raw
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
@@ -1195,6 +1204,7 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     packed_fp4: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,
 ):
     """Fills the GMM config for the GMM kernel."""
 
@@ -1207,12 +1217,16 @@ def make_gmm_configs(
         group_offset,
         fuse_act,
         packed_fp4=packed_fp4,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
 
     if rhs_scale is not None:
         has_scale = True
-        # Packed FP4: uint8-packed float4, unpacked to float4_e2m1fn in-kernel.
-        rhs_quant_dtype = jnp.float4_e2m1fn.dtype if packed_fp4 else rhs.dtype
+        # Logical rhs dtype: config decisions treat the rhs as unpacked in it.
+        if packed_fp4:
+            rhs_quant_dtype = jnp.float4_e2m1fn.dtype
+        elif rhs_quant_dtype is None:
+            rhs_quant_dtype = rhs.dtype
         num_blocks = rhs_scale.shape[1]
         scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
@@ -1229,8 +1243,8 @@ def make_gmm_configs(
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via
-        # pltpu.bitcast. Packed FP4 stores 8 float4 codes per uint32.
-        rhs_packing = 8 if packed_fp4 else 32 // jax.dtypes.itemsize_bits(rhs.dtype)
+        # pltpu.bitcast. Elements per uint32 follows from the logical dtype.
+        rhs_packing = 32 // jax.dtypes.itemsize_bits(rhs_quant_dtype)
     else:
         has_scale = False
         rhs_quant_dtype = None
@@ -1243,7 +1257,7 @@ def make_gmm_configs(
     rhs_cfgs = InputConfigs(
         quant_dtype=rhs_quant_dtype,
         quant_block_size=block_size,
-        dtype=rhs.dtype,
+        dtype=rhs_quant_dtype if rhs_quant_dtype is not None else rhs.dtype,
         has_bias=rhs_bias is not None,
         has_scale=has_scale,
         packing=rhs_packing,
@@ -1385,6 +1399,7 @@ def get_metadata(cfgs: GmmConfigs):
         "zero_initialize",
         "fuse_act",
         "packed_fp4",
+        "rhs_quant_dtype",
     ]
 )
 def gmm_v2(
@@ -1404,6 +1419,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     packed_fp4: bool = False,
+    rhs_quant_dtype: jnp.dtype | None = None,  # set when rhs is pre-packed
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1457,6 +1473,7 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         packed_fp4=packed_fp4,
+        rhs_quant_dtype=rhs_quant_dtype,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles

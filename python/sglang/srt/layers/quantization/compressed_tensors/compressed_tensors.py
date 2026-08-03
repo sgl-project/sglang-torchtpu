@@ -56,6 +56,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    TpuCompressedTensorsWNA16MoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -67,11 +68,12 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -557,6 +559,18 @@ class CompressedTensorsConfig(QuantizationConfig):
         # checkpoints carry a weight zero-point.
         return is_channel_group and input_quant_none and is_static
 
+    def _is_tpu_w4a16_moe(self, weight_quant: BaseModel) -> bool:
+        """Symmetric 4-bit group-quantized: the only WNA16 shape the TPU Pallas
+        gmm_v2 path implements. It reads no zero points and drops g_idx, so
+        asymmetric or act-order checkpoints would silently decode wrong.
+        """
+        return (
+            weight_quant.num_bits == 4
+            and weight_quant.symmetric
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and not weight_quant.actorder
+        )
+
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
         is_symmetric = weight_quant.symmetric
@@ -754,6 +768,20 @@ class CompressedTensorsConfig(QuantizationConfig):
         input_quant = scheme_dict.get("input_activations")
 
         if self._is_wNa16_group_channel(weight_quant, input_quant):
+            if _is_tpu:
+                if not self._is_tpu_w4a16_moe(weight_quant):
+                    raise ValueError(
+                        "TPU W4A16 MoE supports only symmetric 4-bit "
+                        "group-quantized checkpoints without act-order; got "
+                        f"num_bits={weight_quant.num_bits} "
+                        f"symmetric={weight_quant.symmetric} "
+                        f"strategy={weight_quant.strategy} "
+                        f"actorder={weight_quant.actorder}"
+                    )
+                logger.info_once(
+                    "Using TpuCompressedTensorsWNA16MoE (Pallas gmm_v2 W4A16)"
+                )
+                return TpuCompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             if not _is_npu:
                 if (
                     self._is_mxint4a16(weight_quant, input_quant)
