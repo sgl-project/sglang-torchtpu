@@ -69,7 +69,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -105,6 +105,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
+
+from sglang.srt.environ import envs
+from sglang.srt.server_args import get_global_server_args
 
 # Utils
 from sglang.srt.utils import (
@@ -865,6 +868,39 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _rope_cache_positions(max_position_embeddings: int) -> int:
+    """Rows to build the RoPE cos/sin cache with.
+
+    That is correct only where positions are token indices, which this layer
+    cannot tell: the ``*ForConditionalGeneration`` classes below drive it with
+    ``forward_batch.mrope_positions``, and the text checkpoint carries
+    ``mrope_section`` too, so the config is not the discriminator. Slice
+    unconditionally and let ``_restore_full_rope_cache`` put the rows back.
+    """
+    if not envs.SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE.get():
+        return max_position_embeddings
+    context_length = get_global_server_args().context_length
+    if not context_length:
+        return max_position_embeddings
+    return min(max_position_embeddings, context_length)
+
+
+def _restore_full_rope_cache(*, model: nn.Module, max_position_embeddings: int) -> None:
+    """Undo the RoPE cache slice for a model driven by MRoPE positions.
+
+    MRoPE ids are structural (t/h/w section coordinates), so a video prompt can
+    address rows past the context length, and the forward path is an unchecked
+    gather -- XLA clamps the index rather than faulting, silently returning the
+    last row's cos/sin. Runs before graph capture, so restoring the rows costs a
+    one-time regrow rather than a serving-time recompile.
+    """
+    if not envs.SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE.get():
+        return
+    for module in model.modules():
+        if isinstance(module, RotaryEmbedding):
+            module._ensure_cos_sin_cache_length(max_position_embeddings - 1)
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -917,7 +953,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
+            max_position=_rope_cache_positions(self.max_position_embeddings),
             rope_scaling=rope_scaling,
             base=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,
@@ -1816,6 +1852,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = (
             not self.language_model_only and "mrope_section" in rope_config
         )
+        if self.is_mrope_enabled:
+            # self.model, not self: the vision tower's own rope cache was never
+            # sliced. self.config is already the text config here.
+            _restore_full_rope_cache(
+                model=self.model,
+                max_position_embeddings=self.config.max_position_embeddings,
+            )
 
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
@@ -1978,6 +2021,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = (
             not self.language_model_only and "mrope_section" in rope_config
         )
+        if self.is_mrope_enabled:
+            # self.model, not self: the vision tower's own rope cache was never
+            # sliced. self.config is already the text config here.
+            _restore_full_rope_cache(
+                model=self.model,
+                max_position_embeddings=self.config.max_position_embeddings,
+            )
 
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []

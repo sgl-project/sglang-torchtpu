@@ -1366,6 +1366,14 @@ class Envs:
     # TPU
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
+
+    # Build the RoPE cos/sin cache at the served context length instead of the
+    # checkpoint's max_position_embeddings: Qwen3.5 declares 262144 positions
+    # against a 2068-token context, ~33 MB of HBM that every step gathers a few
+    # rows from. Safe only where positions are token indices; MRoPE ids are
+    # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
+    # (the config cannot tell -- the text checkpoint carries mrope_section too).
+    SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
