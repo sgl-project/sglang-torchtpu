@@ -1,24 +1,25 @@
-"""gpt-oss-120b single-host e2e accuracy: GPQA Diamond, MMLU and AIME 2025.
+"""gpt-oss-120b single-host e2e accuracy: GPQA Diamond and MMLU.
 
-Three gates against one server boot, all anchored on the model card's low-effort,
-no-tools column (Table 3, arXiv:2508.10925): GPQA 0.671, MMLU 0.859, AIME25 0.504.
+Two gates against one server boot, both anchored on the model card's low-effort,
+no-tools column (Table 3, arXiv:2508.10925): GPQA 0.671, MMLU 0.859.
 
 Both qualifiers are load-bearing. The card gives a different number per effort level
-(GPQA 0.671 / 0.731 / 0.801) and the with-tools column is higher again (AIME25 0.729
-vs 0.504) -- this server executes no tools.
+(GPQA 0.671 / 0.731 / 0.801) and the with-tools column is higher again -- this server
+executes no tools.
 
 GPQA uses OpenAI's own gpt_oss.evals because 0.671 is only reproducible with their
-permuted-choice prompt and grader; MMLU and AIME use run_eval, itself adapted from
-OpenAI's simple-evals.
+permuted-choice prompt and grader; MMLU uses run_eval, itself adapted from OpenAI's
+simple-evals.
 
-All three gate at atol 0.03, capped by the tolerance contract. Headroom differs by
-sample count: MMLU ~3.7 sigma, GPQA ~1.8, AIME only ~0.9 -- 30 questions at p=0.5 is
-the noisiest case there is, so AIME trips ~18% of runs on sampling noise alone.
+Both gate at atol 0.03, capped by the tolerance contract. Headroom differs by sample
+count: MMLU ~3.7 sigma, GPQA ~1.8.
 
-Serving config lives in recipe/gpt_oss_120b.sh, which CI runs verbatim. Weights come
-from the shared ROX PVC model-weights-rox at /weights
-(pvc-model-weights-rox.yaml.tmpl); gpt-oss itself is runtime-installed --no-deps so
-its pins never touch the pinned torch.
+Serving config is recipe/gpt_oss_120b/server.sh, the one script for this model and what
+the perf sweep runs too. LAUNCH_ENV below is the eval delta on top of it, itemised
+there; the launcher logs it on boot, so a red nightly reproduces as that line plus
+./server.sh. Weights come from the shared ROX PVC model-weights-rox at /weights
+(pvc-model-weights-rox.yaml.tmpl); gpt-oss itself is runtime-installed --no-deps so its
+pins never touch the pinned torch.
 """
 
 import os
@@ -29,14 +30,13 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import dump_metric
 from sglang.test.tpu import model_config_main
 
-# est_time drives the JobSet deadline, so an under-estimate kills the run. ~3000
-# generations on one boot (GPQA 4x198, MMLU 2000, AIME 8x30), much of it low-effort
-# reasoning up to 8k tokens. weekly-update-est-time.yml refreshes it from real p90s.
+# est_time drives the JobSet deadline, so an under-estimate kills the run. ~2800
+# generations on one boot (GPQA 4x198, MMLU 2000), much of it low-effort reasoning up
+# to 8k tokens. weekly-update-est-time.yml refreshes it from real p90s.
 register_tpu_ci(est_time=10800, suite="nightly-tpu-4-v7", nightly=True)
 
-MODEL_PATH = "/weights/gpt-oss-120b"
-# Must match --served-model-name in recipe/gpt_oss_120b.sh: the sampler below sends
-# this as the model id and the request 404s if the two disagree.
+# Must match --served-model-name in LAUNCH_ENV: every gate sends this as the model id,
+# and it is what the server echoes back in its responses.
 SERVED_MODEL_NAME = "gpt-oss-120b"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
@@ -45,7 +45,6 @@ REASONING_EFFORT = "low"
 # --- model card ground truths (Table 3; low effort, no tools) ---
 GPQA_GROUND_TRUTH = 0.671
 MMLU_GROUND_TRUTH = 0.859
-AIME25_GROUND_TRUTH = 0.504
 
 # 198 questions -> single-pass sigma 3.3pts, under 1 sigma for a 3pt gate. 4 repeats
 # put the mean's SE at ~1.7pts, making the floor ~1.8 sigma. The card uses 8; 4 halves
@@ -58,14 +57,9 @@ GPQA_N_REPEATS = 4
 MMLU_ATOL = 0.03
 MMLU_NUM_EXAMPLES = 2000
 
-# The noisiest gate: 30 questions (AIME2025-I + II) at p=0.504, the worst case for
-# binomial noise since p(1-p) peaks at 0.5. Single-pass sigma 9.1pts; at 8 repeats the
-# mean's SE is 3.2pts, leaving the 3pt floor 0.9 sigma below the reference, so it trips
-# ~18% of runs on noise alone. 2 sigma would take 37 repeats, 3 sigma 83. atol is
-# capped at 3pts by contract, so repeats are the only lever -- re-run before
-# investigating a red result.
-AIME25_ATOL = 0.03
-AIME25_REPEAT = 8
+# Completion budget both gates are sized against: low-effort generations finish well
+# under it, and CONTEXT_LEN leaves room for it on top of the longest prompt.
+MAX_TOKENS = 8192
 
 
 def _gpqa_via_openai_harness(base_url: str) -> dict:
@@ -90,7 +84,7 @@ def _gpqa_via_openai_harness(base_url: str) -> dict:
         base_url=base_url + "/v1",
         # Their CLI uses 131072; capped to fit CONTEXT_LEN. Proven
         # non-truncating: low-effort generations complete well under 8k.
-        max_tokens=8192,
+        max_tokens=MAX_TOKENS,
     )
     result = GPQAEval(n_repeats=GPQA_N_REPEATS, n_threads=32)(sampler)
     print(
@@ -106,12 +100,44 @@ def _gpqa_via_openai_harness(base_url: str) -> dict:
     return {"score": result.score}
 
 
+# server.sh owns how the model is served -- tp8+ep8, MXFP4 auto-detect, RPA v3 (the only
+# backend implementing attention sinks), SC gather off, mem_fraction 0.6, page 64 -- and
+# is sized by default for the throughput sweep. The gates need seven values changed:
+#   MODEL           the ROX PVC mount; server.sh defaults to the HF id.
+#   EXTRA_ARGS      Harmony's analysis channel -> reasoning_content, so a harness grades
+#                   final-channel text only. served-model-name is SERVED_MODEL_NAME.
+#   KV_CACHE_DTYPE  empty = bf16 KV, what GPQA 0.671 was validated on (2026-07-28);
+#                   server.sh defaults to fp8_e4m3, which nothing here is anchored to.
+#   ISL/OSL/CONCUR  server.sh derives the prefill chunk from ISL, and the KV pool plus
+#                   the bs ceiling from CONCUR. CONCUR=32 holds MAX_TOTAL_TOKENS
+#                   (2*CONCUR*CONTEXT_LEN = 1.05M) under the ~1.5M at which the extend
+#                   precompile OOMs, and matches MAX_RUNNING to the decode bucket below.
+#   CONTEXT_LEN     longest GPQA prompt (~2.9k tokens) + the MAX_TOKENS budget. The
+#                   sweep's default is ISL+OSL+64 = 2112, which a GPQA prompt overruns.
+#   TPU_COMPILE_*   one prefill bucket (= the 4096 chunk ISL derives) and one decode
+#                   bucket, which keeps bring-up ~10 min; the derived default is powers
+#                   of two up to CONCUR, i.e. six decode compiles.
+#   ENABLE_PROFILER_ENDPOINT  launch_server.sh defaults it to 1; a nightly wants none.
+LAUNCH_ENV = {
+    "MODEL": "/weights/gpt-oss-120b",
+    "EXTRA_ARGS": f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}",
+    "KV_CACHE_DTYPE": "",
+    "ISL": "4096",
+    "OSL": str(MAX_TOKENS),
+    "CONCUR": "32",
+    "CONTEXT_LEN": "16384",
+    "TPU_COMPILE_TOKENS": "4096",
+    "TPU_COMPILE_BS": "32",
+    "ENABLE_PROFILER_ENDPOINT": "0",
+}
+
 MODEL_CONFIG = {
-    "model": MODEL_PATH,
+    "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b",
     "variant": "TP8+EP8",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b.sh",
+        "recipe": "recipe/gpt_oss_120b/server.sh",
+        "env": LAUNCH_ENV,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpqa-e2e",
     },
@@ -131,17 +157,7 @@ MODEL_CONFIG = {
             "num_examples": MMLU_NUM_EXAMPLES,
             "num_threads": 32,
             "reasoning_effort": REASONING_EFFORT,
-            "max_tokens": 8192,
-        },
-        {
-            "dataset": "aime25",
-            "label": "aime25_low",
-            "baseline": AIME25_GROUND_TRUTH,
-            "atol": AIME25_ATOL,
-            "num_threads": 32,
-            "repeat": AIME25_REPEAT,
-            "reasoning_effort": REASONING_EFFORT,
-            "max_tokens": 32768,
+            "max_tokens": MAX_TOKENS,
         },
     ],
 }

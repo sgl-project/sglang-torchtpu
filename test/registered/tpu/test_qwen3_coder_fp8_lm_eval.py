@@ -4,6 +4,8 @@ Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml is the single source of truth for the
 mmlu_llama / mmlu_pro ground truths and tolerances. The gate runs on lm-eval because
 mmlu_pro has no simple-evals equivalent, and mmlu_llama's few-shot protocol is what
 the reference values were measured with.
+
+Serving config lives in recipe/qwen3_coder_30b_a3b_fp8.sh, which CI runs verbatim.
 """
 
 import os

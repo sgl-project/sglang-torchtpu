@@ -10,7 +10,7 @@ call, so a test file is a register call, a dict, and two lines to run it:
         "model": "/weights/gpt-oss-120b",
         "test_name": "gpt-oss-120b",
         "variant": "TP8+EP8",
-        "launch": {"recipe": "recipe/gpt_oss_120b.sh", "tag": "gpqa-e2e"},
+        "launch": {"recipe": "recipe/gpt_oss_120b/eval.sh", "tag": "gpqa-e2e"},
         "gates": [
             {"dataset": "mmlu", "baseline": 0.859, "atol": 0.03,
              "num_examples": 2000, "reasoning_effort": "low"},
@@ -32,10 +32,13 @@ Top level
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
-    recipe        Shell recipe under benchmark/tpu/, e.g. "recipe/gpt_oss_120b.sh".
-                  Preferred over `env`: the recipe is what a human runs to reproduce
-                  a CI failure, so keeping config there leaves only one copy.
-    env           Extra environment for the recipe. Prefer the recipe itself.
+    recipe        Script under benchmark/tpu/ that brings the server up, e.g.
+                  "recipe/gpt_oss_120b/eval.sh". It is also what a human runs to
+                  reproduce a CI failure, so the serving config stays one copy: point at
+                  the model's recipe, or at a wrapper that execs it with the eval delta.
+    env           Environment for the recipe. The launcher logs it on boot, so a red run
+                  stays reproducible by hand. Config describing *how* the model is
+                  served belongs in the recipe.
     external      True -> attach to a server an external orchestrator already started
                   (the multi-host JobSets). Takes no recipe/env.
     tag           Prefix on this model's progress lines, e.g. "gpqa-e2e".
@@ -49,8 +52,8 @@ gates -- one entry per evaluation
     label         Name in reports and metrics. Defaults to `dataset`; set it when one
                   dataset is gated more than once.
     repeat        Passes to average. Small datasets need several before a tight
-                  tolerance means anything -- see AIME in test_tpu_gpt_oss_120b.py
-                  for how to size it.
+                  tolerance means anything -- see GPQA in test_tpu_gpt_oss_120b.py
+                  for how to size it against the single-pass sigma.
     reasoning_effort   "low"/"medium"/"high". Cards report a different score per
                   level, so this must match whichever the baseline came from.
     runner        runner(base_url) -> score or metrics dict. Scores the gate with a
