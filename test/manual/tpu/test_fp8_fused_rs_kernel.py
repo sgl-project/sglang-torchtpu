@@ -99,6 +99,9 @@ def main():
     _build_fused_moe_rs_op()
 
     def kernel(x, w1, w2, s1, s2, weights, ids, group_offset, norm_weight):
+        valid = ids >= 0
+        ids = torch.where(valid, ids, torch.zeros_like(ids))
+        weights = weights * valid.to(weights.dtype)
         return fused_moe_rs_call(
             hidden_states=x,
             w1=w1,

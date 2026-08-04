@@ -25,22 +25,21 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
+    _recover_quant_block_size,
+    align_to,
+    calculate_tiling,
     Dimensions,
+    dma_gather_gm_start,
+    dma_gather_gm_wait,
     FusedDims,
     FusedWeightsRef,
+    get_maybe_quantize_lhs,
     GmmConfigs,
+    inner_kernel,
     InputConfigs,
     MetadataRef,
     TileSizes,
     WeightsRef,
-    _recover_quant_block_size,
-    align_to,
-    calculate_tiling,
-    dma_gather_gm_start,
-    dma_gather_gm_wait,
-    fill_metadata,
-    get_maybe_quantize_lhs,
-    inner_kernel,
     zero_out_end_3d,
     zero_out_start_3d,
 )
@@ -49,17 +48,20 @@ from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
 )
 
 # TODO(rupliu) when the model is small, latency bound, needs to increase pipeline depth
+_IN_KERNEL_RECV_COUNT_MAX_M = 2048
 
 # =============================================================================
 # Phase 1: Pre-kernel metadata computation (JAX level)
 # =============================================================================
 
 
-def compute_num_gm(group_sizes, tile_m, size_lhs_sublane):
+def compute_num_gm(group_sizes, tile_m, size_lhs_sublane, start_offset=0):
     """Compute number of gm tiles from group sizes (JAX level).
 
-    Mirrors fill_metadata logic including sublane alignment offset.
+    Mirrors fill_local_metadata logic including sublane alignment offset.
     """
+
+    start_offset = jnp.asarray(start_offset, dtype=jnp.int32)
 
     def _per_group(carry, group_size):
         num_gm, m_offset = carry
@@ -68,7 +70,7 @@ def compute_num_gm(group_sizes, tile_m, size_lhs_sublane):
         curr_gm = jnp.where(group_size > 0, pl.cdiv(aligned, tile_m), 0)
         return (num_gm + curr_gm, m_offset + group_size), None
 
-    (total_gm, _), _ = lax.scan(_per_group, (jnp.int32(0), jnp.int32(0)), group_sizes)
+    (total_gm, _), _ = lax.scan(_per_group, (jnp.int32(0), start_offset), group_sizes)
     return total_gm
 
 
@@ -254,7 +256,6 @@ def _select_fused_rs_block_sizes(
             fp8_direct_write=fp8_direct_write,
         )
     )
-
     # --- Step 5: Alignment post-processing ---
     k_align1 = num_lanes
     if tile_k1 % k_align1 != 0:
@@ -289,8 +290,8 @@ def _select_fused_rs_block_sizes(
 
     # NOTE: fp8 direct-write tile_m sizing is now handled in Step 4
     # (get_fused_rs_tuned_block_sizes, called with fp8_direct_write): dedicated
-    # fp8-comm entries carry VMEM-safe tiles (e.g. tile_m=96 full-N), and shapes
-    # without one fall back to the bf16 tile clamped to tile_m<=64. Both the host
+    # fp8-comm entries carry VMEM-safe tiles, and shapes without one fall back
+    # to the bf16 tile clamped to tile_m<=64. Both the host
     # max-gm calc and the kernel call this helper, so their loop bounds stay
     # aligned. (Replaces the former unconditional ``tile_m = min(tile_m, 64)``.)
 
@@ -326,7 +327,7 @@ def _select_fused_rs_block_sizes(
 
 
 def kernel_main_fused_rs(
-    # Scalar prefetch (9) — `output_indices` was dropped (== lhs_indices for EP).
+    # Scalar prefetch (10) — `output_indices` was dropped (== lhs_indices for EP).
     # `topk_indices_ref` is included but conditionally used:
     #   - pack_indices=False: lhs_indices_ref holds raw lhs_idx values, and
     #     topk_indices_ref holds raw topk_slot values (both size_m).
@@ -335,10 +336,11 @@ def kernel_main_fused_rs(
     #     1-element dummy (saves ~512 KB of SMEM at large prefill).
     lhs_group_sizes_ref,
     group_offset_ref,
+    group_start_ref,
     lhs_indices_ref,
     topk_indices_ref,
     max_num_gm_ref,  # (1,) int32 — max gm tiles across all chips
-    total_recv_count_ref,  # (1,) int32 — total remote rows this chip receives
+    total_recv_count_ref,  # (1,) int32 — precomputed for large prefill
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
@@ -405,6 +407,7 @@ def kernel_main_fused_rs(
     top_k: int,
     pack_indices: bool = True,
     fp8_direct_write: bool = False,
+    use_in_kernel_recv_count: bool = True,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -426,8 +429,49 @@ def kernel_main_fused_rs(
     )
     max_num_gm = max_num_gm_ref[0]
 
-    @jax.named_scope("sync_barrier")
-    def sync_barrier():
+    if use_in_kernel_recv_count:
+        # Derive the receive count from the same scalar-prefetched routing refs
+        # used by metadata construction and direct writes. A separate VMEM view
+        # can cross a different materialization boundary in a compiled model
+        # graph and disagree with the rows that actually issue remote DMAs.
+        with jax.named_scope("routing_scalar_prologue"):
+            group_offset = group_offset_ref[0]
+            local_start = group_start_ref[0]
+
+            def _sum_local_group_size(local_group_id, count):
+                return count + lhs_group_sizes_ref[group_offset + local_group_id]
+
+            local_end = local_start + lax.fori_loop(
+                0,
+                dims.size_group,
+                _sum_local_group_size,
+                jnp.int32(0),
+            )
+
+            def _count_remote_receive(assignment_row, count):
+                gathered_index = lhs_indices_ref[assignment_row]
+                if pack_indices:
+                    gathered_index = gathered_index // top_k
+                destination_chip = gathered_index // chunk_size
+                row_is_local = jnp.logical_and(
+                    assignment_row >= local_start, assignment_row < local_end
+                )
+                is_remote_receive = jnp.logical_and(
+                    destination_chip == my_id, jnp.logical_not(row_is_local)
+                )
+                return count + is_remote_receive.astype(jnp.int32)
+
+            total_recv = lax.fori_loop(
+                0,
+                dims.size_m,
+                _count_remote_receive,
+                jnp.int32(0),
+            )
+    else:
+        total_recv = total_recv_count_ref[0]
+
+    @jax.named_scope("sync_barrier_signal")
+    def sync_barrier_signal():
         barrier_sem = pltpu.get_barrier_semaphore()
         for i in range(ep_size):
             pltpu.semaphore_signal(
@@ -435,9 +479,39 @@ def kernel_main_fused_rs(
                 device_id={ep_axis_name: jnp.int32(i)},
                 device_id_type=pltpu.DeviceIdType.MESH,
             )
+
+    @jax.named_scope("sync_barrier_wait")
+    def sync_barrier_wait():
+        barrier_sem = pltpu.get_barrier_semaphore()
         pltpu.semaphore_wait(barrier_sem, ep_size)
 
-    sync_barrier()
+    def sync_barrier():
+        sync_barrier_signal()
+        sync_barrier_wait()
+
+    # Zero-init the output buffer (which is ALSO the ICI DMA landing pad for
+    # peers) and WAIT for it BEFORE signaling the entry barrier. A peer only
+    # issues its remote writes after its DEFERRED barrier wait releases, and
+    # that wait cannot release until every chip has signaled -- i.e. after every
+    # chip has finished zeroing. Ordering the zero-init ahead of the signal
+    # therefore guarantees no remote write lands in an out_buf that is still
+    # being zeroed. Previously the signal came first and the async zero-init
+    # raced incoming ICI writes: a received row was nondeterministically
+    # overwritten with 0, dropping one expert's contribution -> wrong output
+    # and greedy-decode divergence.
+    zero_src = (
+        scatter_fp8_staging_3x_ref.at[0]
+        if fp8_direct_write
+        else scatter_staging_3x_ref.at[0]
+    )
+    zero_size = zero_out_start_3d(out_buf_ref, zero_src, zero_sem_ref)
+    zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
+
+    # Entry barrier: signal now, DEFER the matching wait until right before this
+    # chip issues its first remote a2a write (gm_id==0, before direct_write_rows)
+    # to overlap the barrier latency with tile-0 compute. Chips with no compute
+    # drain the barrier in the ``local_num_gm == 0`` fallback below.
+    sync_barrier_signal()
 
     # Build metadata.
     meta_dims = Dimensions(
@@ -461,20 +535,61 @@ def kernel_main_fused_rs(
         acc_dtype=jnp.float32,
         zero_init=False,
     )
-    local_num_gm = fill_metadata(
-        lhs_group_sizes_ref,
-        group_offset_ref,
-        metadata_ref,
-        cfgs=meta_cfgs,
-    )
 
-    # Zero-init the output buffer (also serves as ICI DMA target).
-    zero_src = (
-        scatter_fp8_staging_3x_ref.at[0]
-        if fp8_direct_write
-        else scatter_staging_3x_ref.at[0]
-    )
-    zero_size = zero_out_start_3d(out_buf_ref, zero_src, zero_sem_ref)
+    @jax.named_scope("fill_local_metadata")
+    def fill_local_metadata():
+        group_offset = group_offset_ref[0]
+        metadata_ref.gm_id_to_m_offset[0] = group_start_ref[0]
+
+        @jax.named_scope("inner_tm_loop")
+        def inner_tm_loop(tm_id, curr_m_offset, *, end_m_offset, group_id):
+            local_offset = curr_m_offset % meta_cfgs.dims.size_lhs_sublane
+            tm_size = jnp.minimum(
+                meta_cfgs.tiles.tile_m - local_offset,
+                end_m_offset - curr_m_offset,
+            )
+
+            metadata_ref.gm_id_to_group_id[tm_id] = group_id
+
+            next_m_offset = curr_m_offset + tm_size
+            metadata_ref.gm_id_to_m_offset[tm_id] = curr_m_offset
+            metadata_ref.gm_id_to_m_offset[tm_id + 1] = next_m_offset
+            return next_m_offset
+
+        @jax.named_scope("outer_local_group_loop")
+        def outer_local_group_loop(local_group_id, carry):
+            num_gm, start_m_offset = carry
+            lhs_group_id = group_offset + local_group_id
+            group_size = lhs_group_sizes_ref[lhs_group_id]
+            end_m_offset = start_m_offset + group_size
+
+            local_offset = start_m_offset % meta_cfgs.dims.size_lhs_sublane
+            aligned_group_size = group_size + local_offset
+            curr_num_gm = pl.cdiv(aligned_group_size, meta_cfgs.tiles.tile_m)
+            curr_num_gm = jnp.where(group_size > 0, curr_num_gm, 0)
+            next_num_gm = num_gm + curr_num_gm
+
+            tm_loop_fn = functools.partial(
+                inner_tm_loop,
+                end_m_offset=end_m_offset,
+                group_id=local_group_id,
+            )
+            lax.fori_loop(num_gm, next_num_gm, tm_loop_fn, start_m_offset)
+
+            return next_num_gm, end_m_offset
+
+        num_gm, _ = lax.fori_loop(
+            0,
+            meta_cfgs.dims.size_group,
+            outer_local_group_loop,
+            (0, group_start_ref[0]),
+        )
+        return num_gm
+
+    local_num_gm = fill_local_metadata()
+
+    # (out_buf was zero-initialized and awaited above, before the entry-barrier
+    # signal, so incoming ICI writes can never race the zeroing.)
 
     if cfgs1.rhs_cfgs.quant_dtype is not None:
         w1_packed = w1_ref.bitcast(jnp.uint32)
@@ -646,13 +761,16 @@ def kernel_main_fused_rs(
 
     # --- GMM compute helpers ---
     @jax.named_scope("compute_gmm1_tile")
-    def compute_gmm1_tile(buf_id, n_id, k_id, gm_id):
+    def compute_gmm1_tile(buf_id, n_id, k_id, gm_id, m_rows):
         sem_id = gm_id % 2
+        _cfgs1 = dataclasses.replace(
+            cfgs1, tiles=dataclasses.replace(cfgs1.tiles, tile_m=m_rows)
+        )
         k_cols = tile_k1 // num_lanes
         k_offset = k_id * k_cols
-        lhs_data = gathered_lhs_2x_ref[sem_id, :, pl.ds(k_offset, k_cols), :].reshape(
-            -1, dims.size_lhs_sublane, tile_k1
-        )
+        lhs_data = gathered_lhs_2x_ref[
+            sem_id, pl.ds(0, m_rows), pl.ds(k_offset, k_cols), :
+        ].reshape(-1, dims.size_lhs_sublane, tile_k1)
         w1_tile = w1_buf_ref.at[buf_id]
         w1_sc = w1_scale_buf_ref.at[buf_id] if has_scale else None
         w1_bias_tile = w1_bias_buf_ref if has_bias else None
@@ -672,11 +790,13 @@ def kernel_main_fused_rs(
         inner_kernel(
             lhs_data,
             w1_weights,
-            gmm1_out_ref.at[:, pl.ds(n_id * tile_n1, tile_n1)],
+            gmm1_out_ref.at[pl.ds(0, m_rows), pl.ds(n_id * tile_n1, tile_n1)],
             partial_out1_ref,
-            shared_acc_ref.at[:, pl.ds(0, tile_n1 * 2 if act_fn else tile_n1)],
+            shared_acc_ref.at[
+                pl.ds(0, m_rows), pl.ds(0, tile_n1 * 2 if act_fn else tile_n1)
+            ],
             fused_metadata_ref,
-            cfgs=cfgs1,
+            cfgs=_cfgs1,
             gs_gate_ref=w1_gs_gate_ref,
             gs_up_ref=w1_gs_up_ref,
             scatter_mode=True,
@@ -687,9 +807,14 @@ def kernel_main_fused_rs(
         )
 
     @jax.named_scope("compute_gmm2_tile")
-    def compute_gmm2_tile(buf_id, n_id, k_id, gm_id):
+    def compute_gmm2_tile(buf_id, n_id, k_id, gm_id, m_rows):
         sem_id = gm_id % 2
-        lhs_data = intermediate_ref[:, :, pl.ds(k_id * tile_k2, tile_k2)]
+        _cfgs2 = dataclasses.replace(
+            cfgs2, tiles=dataclasses.replace(cfgs2.tiles, tile_m=m_rows)
+        )
+        lhs_data = intermediate_ref[
+            pl.ds(0, m_rows // dims.size_lhs_sublane), :, pl.ds(k_id * tile_k2, tile_k2)
+        ]
         w2_tile = w2_buf_ref.at[buf_id]
         w2_sc = w2_scale_buf_ref.at[buf_id] if has_scale else None
         inner_kernel(
@@ -697,11 +822,13 @@ def kernel_main_fused_rs(
             WeightsRef(
                 weight=w2_tile, scale=w2_sc, bias=w2_bias_buf_ref if has_bias else None
             ),
-            tiled_out_2x_ref.at[sem_id, :, pl.ds(n_id * tile_n2, tile_n2)],
+            tiled_out_2x_ref.at[
+                sem_id, pl.ds(0, m_rows), pl.ds(n_id * tile_n2, tile_n2)
+            ],
             partial_out2_ref,
-            shared_acc_ref.at[:, pl.ds(0, tile_n2)],
+            shared_acc_ref.at[pl.ds(0, m_rows), pl.ds(0, tile_n2)],
             fused_metadata_ref,
-            cfgs=cfgs2,
+            cfgs=_cfgs2,
             gs_gate_ref=w2_gs_ref,
             gs_up_ref=w2_gs_ref,
             scatter_mode=True,
@@ -715,6 +842,36 @@ def kernel_main_fused_rs(
     for _s in range(3):
         gm_id_ref[1 + _s] = jnp.int32(0)  # send counts
         gm_id_ref[4 + _s] = jnp.int32(0)  # local write counts
+
+    # --- Bucketed tile_m (option 1): compute each gm-tile over the smallest
+    # static row-bucket >= its real rows, capped at the tuned tile_m. Trims the
+    # MXU M-padding on partial (tail) tiles without shrinking the tile globally
+    # (which regresses imbalanced routing). Buckets are multiples of the sublane
+    # tiling; a single-bucket list (tile_m == sublane) disables the dispatch.
+    #
+    # TODO(rupengliu): explore host-side size-grouped gm-loops. Instead of a
+    # per-tile lax.switch, partition gm-tiles by bucket in the scalar metadata
+    # prologue and run one loop per static tile_m (full tiles in a tile_m=128
+    # loop, small tails in a tile_m=32 loop, ...). Each loop has a single static
+    # shape -> uniform control flow, pipelines cleanly, no per-tile branch, and
+    # the small-bucket loop is ~empty at high concurrency (0 high-end cost). It
+    # runs the same matmul shapes as unconditional bucketing (so no extra
+    # low-token gain) but removes the ~0.5% switch overhead at large sizes.
+    # Cost: extra loop body + scratch + metadata partitioning; a tail re-streams
+    # its expert's weights once. Marginal vs the ~8% weight-streaming ceiling.
+    _sls_b = dims.size_lhs_sublane
+    M_BUCKETS = [b for b in (8, 16, 32, 64, 128, 256, 512) if _sls_b <= b <= tile_m]
+    if not M_BUCKETS or M_BUCKETS[-1] != tile_m:
+        M_BUCKETS = sorted(set(M_BUCKETS) | {tile_m})
+    # fp4-only gate. Bucketing materializes a separate f32 matmul accumulator
+    # (~0.7MB) per lax.switch branch. That headroom only exists with fp4 weights
+    # (0.5 B/param); fp8 (1 B) / bf16 (2 B) weight buffers are 2-4x larger and, on
+    # tight configs (e.g. EP8 E_32 M_256), leave less than the bucket transient of
+    # VMEM free -> scoped-VMEM OOM. All measured bucketing gains are on fp4 (the
+    # prod decode dtype) anyway, so only bucket when the weights are fp4.
+    _w_qdt = cfgs1.rhs_cfgs.quant_dtype
+    _weight_is_fp4 = _w_qdt is not None and jax.dtypes.itemsize_bits(_w_qdt) <= 4
+    _USE_BUCKETS = len(M_BUCKETS) > 1 and _weight_is_fp4
 
     # --- Main padded gm loop ---
     @jax.named_scope("gm_loop_body")
@@ -859,6 +1016,38 @@ def kernel_main_fused_rs(
                 metadata_ref,
             )
 
+            # Pick the smallest row-bucket >= this tile's real rows (capped at
+            # tile_m), then dispatch each matmul over that bucket via lax.switch.
+            # NOTE: this is applied UNCONDITIONALLY to every gm-tile. An earlier
+            # attempt to guard it with lax.cond(is_last_tile, ...) — only
+            # bucketing an expert's partial last tile — regressed >=2048 tokens
+            # ~4x: the per-tile data-dependent branch diverges once experts span
+            # multiple tiles, which breaks the gm-loop's DMA/compute pipelining.
+            # Uniform control flow (same switch structure every tile) pipelines
+            # cleanly and only costs ~0.5% at the largest sizes.
+            _m_s = metadata_ref.gm_id_to_m_offset[gm_id]
+            _m_e = metadata_ref.gm_id_to_m_offset[gm_id + 1]
+            _tile_real = _m_e - (_m_s - _m_s % dims.size_lhs_sublane)
+            if _USE_BUCKETS:
+                # Index of the smallest bucket >= real rows (no captured array
+                # constant: sum scalar comparisons against Python-int buckets).
+                bucket_idx = jnp.int32(0)
+                for _b in M_BUCKETS:
+                    bucket_idx += (_tile_real > _b).astype(jnp.int32)
+                bucket_idx = jnp.minimum(bucket_idx, len(M_BUCKETS) - 1)
+
+            def _dispatch(fn, *args):
+                if _USE_BUCKETS:
+                    lax.switch(
+                        bucket_idx,
+                        [
+                            (lambda b=b: (fn(*args, b), jnp.int32(0))[1])
+                            for b in M_BUCKETS
+                        ],
+                    )
+                else:
+                    fn(*args, tile_m)
+
             # GMM1 loop.
             for step in range(total_w1_steps):
                 _n1 = step // num_k1
@@ -871,10 +1060,14 @@ def kernel_main_fused_rs(
                 def _():
                     wait_w1_dma(buf_id)
 
+                # Consume this rotating slot on the MXU BEFORE refilling it.
+                # ns % num_w1_bufs == buf_id, so starting the next DMA first
+                # would overwrite the tile this matmul is still reading (WAR
+                # race between the refill DMA and compute -> nondeterminism).
+                _dispatch(compute_gmm1_tile, buf_id, _n1, _k1, gm_id)
                 if step + num_w1_bufs < total_w1_steps:
                     ns = step + num_w1_bufs
                     start_w1_dma(ns % num_w1_bufs, expert_id, ns // num_k1, ns % num_k1)
-                compute_gmm1_tile(buf_id, _n1, _k1, gm_id)
                 if step == 0:
 
                     @pl.when(gm_id + 1 < local_num_gm)
@@ -905,19 +1098,23 @@ def kernel_main_fused_rs(
             with jax.named_scope("interlude"):
                 # Copy gmm1_out (f32) to intermediate_ref (bf16, scatter layout).
                 # Activation was already applied inside inner_kernel via fuse_act.
-                gmm1_result = gmm1_out_ref[...]
-                k2_pad = dims.size_k2 - gmm1_result.shape[1]
-                if k2_pad > 0:
-                    gmm1_result = jnp.concatenate(
-                        [
-                            gmm1_result,
-                            jnp.zeros((tile_m, k2_pad), dtype=gmm1_result.dtype),
-                        ],
-                        axis=1,
-                    )
-                intermediate_ref[...] = gmm1_result.astype(out_dtype).reshape(
-                    intermediate_ref.shape
-                )
+                def _interlude(m_rows):
+                    gmm1_result = gmm1_out_ref[pl.ds(0, m_rows)]
+                    k2_pad = dims.size_k2 - gmm1_result.shape[1]
+                    if k2_pad > 0:
+                        gmm1_result = jnp.concatenate(
+                            [
+                                gmm1_result,
+                                jnp.zeros((m_rows, k2_pad), dtype=gmm1_result.dtype),
+                            ],
+                            axis=1,
+                        )
+                    m_sub = m_rows // dims.size_lhs_sublane
+                    intermediate_ref[pl.ds(0, m_sub)] = gmm1_result.astype(
+                        out_dtype
+                    ).reshape(m_sub, dims.size_lhs_sublane, dims.size_k2)
+
+                _dispatch(_interlude)
 
             # GMM2 loop.
             for step in range(total_w2_steps):
@@ -930,16 +1127,11 @@ def kernel_main_fused_rs(
                 def _():
                     wait_w2_dma(buf_id)
 
+                # See GMM1 loop: consume the slot before refilling it (WAR).
+                _dispatch(compute_gmm2_tile, buf_id, _n2, _k2, gm_id)
                 if step + num_w2_bufs < total_w2_steps:
                     ns = step + num_w2_bufs
                     start_w2_dma(ns % num_w2_bufs, expert_id, ns // num_k2, ns % num_k2)
-                compute_gmm2_tile(buf_id, _n2, _k2, gm_id)
-
-            # Finish zero-init on first tile.
-            @jax.named_scope("zero_out_end")
-            @pl.when(gm_id == 0)
-            def _():
-                zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
 
             m_st = metadata_ref.gm_id_to_m_offset[gm_id]
             m_en = metadata_ref.gm_id_to_m_offset[gm_id + 1]
@@ -1093,6 +1285,12 @@ def kernel_main_fused_rs(
                     0, num_valid, _write_row, (jnp.int32(0), jnp.int32(0))
                 )
 
+            # Deferred entry-barrier wait: overlaps with tile-0 gather + GMM
+            # compute above. Must complete before the first remote a2a write.
+            @pl.when(gm_id == 0)
+            def _():
+                sync_barrier_wait()
+
             send_sz, local_sz = _do_direct_write()
             gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + send_sz
             gm_id_ref[4 + stg_id] = gm_id_ref[4 + stg_id] + local_sz
@@ -1101,12 +1299,11 @@ def kernel_main_fused_rs(
 
     lax.fori_loop(0, max_num_gm, gm_loop_body, None)
 
-    # If max_num_gm == 0 OR local_num_gm == 0 (this chip has no work but
-    # the loop ran padded iterations), zero_out_end was never called inside
-    # the loop body (it's guarded by is_active AND gm_id==0). Drain it here.
-    @pl.when(jnp.logical_or(max_num_gm == 0, local_num_gm == 0))
+    # Chips with no compute never reach the deferred in-loop barrier wait, so
+    # drain the entry barrier here to avoid leaking barrier_sem signals.
+    @pl.when(local_num_gm == 0)
     def _():
-        zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
+        sync_barrier_wait()
 
     # Epilogue: drain remaining per-slot DMA counts.
     @jax.named_scope("epilogue_drain")
@@ -1149,14 +1346,9 @@ def kernel_main_fused_rs(
                         sem=scale_local_write_sems_ref.at[_slot],
                     ).wait()
 
-    # Final barrier: ensures all chips have finished their sends before
-    # any chip returns. This guarantees all remote DMAs have landed.
-    sync_barrier()
-
     # Drain recv_sem — each incoming remote DMA incremented it by 1.
     # Must be zero before kernel exit (Mosaic requirement).
     with jax.named_scope("drain_recv_sem"):
-        total_recv = total_recv_count_ref[0]
         pltpu.make_async_copy(
             src_ref=out_buf_ref.at[pl.ds(0, total_recv), :, :],
             dst_ref=out_buf_ref.at[pl.ds(0, total_recv), :, :],
@@ -1168,7 +1360,6 @@ def kernel_main_fused_rs(
                 dst_ref=out_scale_ref.at[pl.ds(0, total_recv), :],
                 sem=scale_recv_sem_ref.at[0],
             ).wait()
-
     # All ICI DMA writes go directly to out_buf_ref (the pallas_call output).
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
 
@@ -1176,6 +1367,7 @@ def kernel_main_fused_rs(
 def kernel_main_fused_rs_fp8(
     lhs_group_sizes_ref,
     group_offset_ref,
+    group_start_ref,
     lhs_indices_ref,
     topk_indices_ref,
     max_num_gm_ref,
@@ -1241,11 +1433,13 @@ def kernel_main_fused_rs_fp8(
     ep_axis_name: str,
     top_k: int,
     pack_indices: bool = True,
+    use_in_kernel_recv_count: bool = True,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
         lhs_group_sizes_ref,
         group_offset_ref,
+        group_start_ref,
         lhs_indices_ref,
         topk_indices_ref,
         max_num_gm_ref,
@@ -1311,6 +1505,7 @@ def kernel_main_fused_rs_fp8(
         top_k=top_k,
         pack_indices=pack_indices,
         fp8_direct_write=True,
+        use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
 
 
@@ -1328,6 +1523,8 @@ def kernel_main_fused_rs_fp8(
         "ep_axis_name",
         "top_k",
         "fp8_direct_write",
+        "use_in_kernel_recv_count",
+        "collective_id",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1346,15 +1543,17 @@ def gmm_v2_fused_rs(
     w2_bias: jax.Array | None = None,
     act_fn: str = "silu",
     group_offset: jax.Array | None = None,
+    group_start: jax.Array | None = None,
     output_size: int,
     vmem_limit_bytes: int | None = None,
     topk_indices: jax.Array,
     ep_size: int,
     ep_axis_name: str,
     max_num_gm: jax.Array,
-    total_recv_count: jax.Array,
     top_k: int,
     fp8_direct_write: bool = False,
+    use_in_kernel_recv_count: bool | None = None,
+    collective_id: int = 0,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -1365,6 +1564,8 @@ def gmm_v2_fused_rs(
     _, size_k2, size_n2 = w2.shape
     size_m = lhs_indices.shape[0]
     chunk_size = output_size // ep_size
+    if use_in_kernel_recv_count is None:
+        use_in_kernel_recv_count = size_m <= _IN_KERNEL_RECV_COUNT_MAX_M
 
     is_quantized = w1_scale is not None
     if is_quantized:
@@ -1397,19 +1598,18 @@ def gmm_v2_fused_rs(
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
+    if group_start is None:
+        group_start = jnp.array([0], dtype=jnp.int32)
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.95)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     sls = pltpu.get_tpu_info().get_sublane_tiling(hidden_states.dtype)
     out_dtype = hidden_states.dtype
-    size_lhs_sublane = min(sls, size_m)
     intermediate_size = size_n1 // 2
 
     # --- Single source of truth for all block/tile sizes ---
-    # This helper is pure-Python and deterministic; it is also called from
-    # ``run_gmm_fused_rs`` with the same inputs so that ``compute_num_gm``
-    # / ``max_num_gm`` agree with the kernel's own ``local_num_gm``.
+    # This helper is pure-Python and deterministic.
     block_sizes = _select_fused_rs_block_sizes(
         size_m=size_m,
         size_k1=size_k1,
@@ -1438,10 +1638,36 @@ def gmm_v2_fused_rs(
     padded_k1 = block_sizes.padded_k1
     aligned_n1 = block_sizes.aligned_n1
     aligned_n2 = block_sizes.aligned_n2
+    size_lhs_sublane = min(sls, size_m)
 
     # --- Apply the padding the helper chose ---
-    # Pad K1 for DMA gather alignment.
-    if padded_k1 != size_k1:
+    # Pad K1 for DMA gather alignment.  A caller may pass a pre-tiled
+    # [M, K // lanes, lanes] activation when the producer already emitted the
+    # GMM-ready layout; keep it tiled instead of flattening and reshaping again.
+    hidden_states_is_tiled = hidden_states.ndim == 3
+    if hidden_states_is_tiled:
+        if hidden_states.shape[2] != num_lanes:
+            raise ValueError(
+                "tiled hidden_states must have the TPU lane dimension last, got "
+                f"{hidden_states.shape} with num_lanes={num_lanes}"
+            )
+        tiled_k = hidden_states.shape[1] * num_lanes
+        if tiled_k < padded_k1:
+            k_pad = padded_k1 - tiled_k
+            if k_pad % num_lanes:
+                raise ValueError(
+                    f"cannot pad tiled hidden_states by {k_pad}; num_lanes={num_lanes}"
+                )
+            hidden_states = jnp.pad(
+                hidden_states, ((0, 0), (0, k_pad // num_lanes), (0, 0))
+            )
+        elif tiled_k > padded_k1:
+            if padded_k1 % num_lanes:
+                raise ValueError(
+                    f"padded_k1 must be divisible by {num_lanes}, got {padded_k1}"
+                )
+            hidden_states = hidden_states[:, : padded_k1 // num_lanes, :]
+    elif padded_k1 != size_k1:
         k_pad = padded_k1 - size_k1
         hidden_states = jnp.pad(hidden_states, ((0, 0), (0, k_pad)))
 
@@ -1511,10 +1737,12 @@ def gmm_v2_fused_rs(
         w1_bias = w1_bias.astype(jnp.float32)
         w2_bias = w2_bias.astype(jnp.float32)
 
-    hidden_3d = hidden_states.reshape(
-        hidden_states.shape[0], padded_k1 // num_lanes, num_lanes
-    )
-
+    if hidden_states_is_tiled:
+        hidden_3d = hidden_states
+    else:
+        hidden_3d = hidden_states.reshape(
+            hidden_states.shape[0], padded_k1 // num_lanes, num_lanes
+        )
     fused_dims = FusedDims(
         size_m=size_m,
         size_k1=size_k1,
@@ -1721,7 +1949,7 @@ def gmm_v2_fused_rs(
     compiler_params = pltpu.CompilerParams(
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
-        collective_id=0,
+        collective_id=collective_id,
     )
 
     w1_scale_input = w1_scale if is_quantized else jnp.zeros((1, 1, 1, 1), jnp.float32)
@@ -1729,6 +1957,41 @@ def gmm_v2_fused_rs(
     w1_bias_input = w1_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     w2_bias_input = w2_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     max_num_gm_arr = jnp.array([max_num_gm], dtype=jnp.int32)
+
+    if use_in_kernel_recv_count:
+        total_recv_count_input = jnp.zeros((1,), dtype=jnp.int32)
+    else:
+        with jax.named_scope("precomputed_recv_count"):
+            group_ids = jnp.arange(group_sizes.shape[0], dtype=jnp.int32)
+            group_offset_scalar = group_offset[0]
+            local_start = group_start[0]
+            local_end = local_start + jnp.sum(
+                jnp.where(
+                    jnp.logical_and(
+                        group_ids >= group_offset_scalar,
+                        group_ids < group_offset_scalar + size_group,
+                    ),
+                    group_sizes,
+                    0,
+                )
+            )
+            assignment_rows = jnp.arange(size_m, dtype=jnp.int32)
+            destination_chips = output_indices // chunk_size
+            row_is_local = jnp.logical_and(
+                assignment_rows >= local_start, assignment_rows < local_end
+            )
+            physical_mesh_id = (
+                group_offset[1]
+                if group_offset.shape[0] > 1
+                else lax.axis_index(ep_axis_name)
+            )
+            to_this_chip_remote = jnp.logical_and(
+                destination_chips == physical_mesh_id,
+                jnp.logical_not(row_is_local),
+            )
+            total_recv_count_input = jnp.array(
+                [jnp.sum(to_this_chip_remote.astype(jnp.int32))], dtype=jnp.int32
+            )
 
     # Output buffer — also serves as ICI DMA target. In the FP8 direct-write
     # path this stores quantized payload rows; row scales are returned as a
@@ -1764,10 +2027,11 @@ def gmm_v2_fused_rs(
     pallas_inputs = (
         group_sizes,
         group_offset,
+        group_start,
         primary_idx_ref,
         secondary_idx_ref,
         max_num_gm_arr,
-        total_recv_count,
+        total_recv_count_input,
         _w1_gs_gate,
         _w1_gs_up,
         _w2_gs,
@@ -1803,6 +2067,7 @@ def gmm_v2_fused_rs(
         ep_axis_name=ep_axis_name,
         top_k=top_k,
         pack_indices=pack_indices,
+        use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -1826,7 +2091,7 @@ def gmm_v2_fused_rs(
             functools.partial(kernel_main_fused_rs_fp8, **kernel_kwargs),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=9,
+                num_scalar_prefetch=10,
                 in_specs=in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1844,7 +2109,7 @@ def gmm_v2_fused_rs(
         functools.partial(kernel_main_fused_rs, **kernel_kwargs),
         out_shape=out_buf_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=9,
+            num_scalar_prefetch=10,
             in_specs=in_specs,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,
@@ -1920,15 +2185,15 @@ def run_gmm_fused_rs(
     del tile_m  # ignored; see docstring. See _select_fused_rs_block_sizes.
     from jax.sharding import PartitionSpec as P
 
-    size_m = lhs_indices.shape[0]
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     hidden_size = w2.shape[-1]
+    size_m = lhs_indices.shape[0]
     sls = min(pltpu.get_tpu_info().get_sublane_tiling(hidden_states.dtype), size_m)
 
     # Single source of truth for tile_m. Using the same helper the kernel
     # calls internally guarantees that ``compute_num_gm`` / ``max_num_gm``
-    # (outer loop bound) matches the kernel's ``fill_metadata``-derived
+    # (outer loop bound) matches the kernel's ``fill_local_metadata``-derived
     # ``local_num_gm``. Mismatch here causes the kernel's final prefetch
     # gather DMA to be unawaited and leaks ``gather_sem`` on kernel exit.
     block_sizes = _select_fused_rs_block_sizes(
@@ -1954,28 +2219,18 @@ def run_gmm_fused_rs(
     group_offset = jnp.arange(0, num_experts, num_experts_per_shard)
 
     def _run(h, w1l, w2l, gs, go, li, oi, tw, ti):
-        my_id = lax.axis_index(ep_axis_name)
         num_tokens = h.shape[0]
         chunk_size = num_tokens // ep_size
 
         num_local_experts = w1l.shape[0]
-        local_group_sizes = lax.dynamic_slice(gs, (go[0],), (num_local_experts,))
-        local_num_gm = compute_num_gm(local_group_sizes, kernel_tile_m, sls)
-        send_dest_chips = li // chunk_size
-        max_num_gm = lax.pmax(local_num_gm, axis_name=ep_axis_name)
-
+        group_ids = jnp.arange(gs.shape[0], dtype=jnp.int32)
         go_val = go[0]
-        gs_cumsum = jnp.cumsum(gs)
-        local_start = jnp.where(go_val > 0, gs_cumsum[go_val - 1], 0)
-        local_end = gs_cumsum[go_val + num_local_experts - 1]
-        # Single-pass recv_count: sum(dest == my_id AND NOT row_is_mine).
-        rows_arr = jnp.arange(li.shape[0], dtype=jnp.int32)
-        row_is_mine = jnp.logical_and(rows_arr >= local_start, rows_arr < local_end)
-        to_me_remote = jnp.logical_and(
-            send_dest_chips == my_id, jnp.logical_not(row_is_mine)
+        local_start = jnp.sum(jnp.where(group_ids < go_val, gs, 0))
+        local_group_sizes = lax.dynamic_slice(gs, (go[0],), (num_local_experts,))
+        local_num_gm = compute_num_gm(
+            local_group_sizes, kernel_tile_m, sls, start_offset=local_start
         )
-        my_recv_count = jnp.sum(jnp.where(to_me_remote, 1, 0))
-        total_recv_count = jnp.array([my_recv_count], dtype=jnp.int32)
+        max_num_gm = lax.pmax(local_num_gm, axis_name=ep_axis_name)
 
         out_buf = gmm_v2_fused_rs(
             h,
@@ -1987,11 +2242,11 @@ def run_gmm_fused_rs(
             act_fn=act_fn,
             output_size=num_tokens,
             group_offset=go,
+            group_start=jnp.array([local_start], dtype=jnp.int32),
             topk_indices=ti,
             ep_size=ep_size,
             ep_axis_name=ep_axis_name,
             max_num_gm=max_num_gm,
-            total_recv_count=total_recv_count,
             top_k=top_k,
         )
 

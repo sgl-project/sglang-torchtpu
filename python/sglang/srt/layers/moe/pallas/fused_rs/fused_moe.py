@@ -137,6 +137,7 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
+    collective_id: int = 0,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -168,27 +169,6 @@ def moe_gmm_local_rs_nodedup(
     go_val = group_offset[0]
     expert_idx = jnp.arange(num_experts, dtype=jnp.int32)
     local_start = jnp.sum(jnp.where(expert_idx < go_val, group_sizes, 0))
-    local_end = local_start + jnp.sum(
-        jnp.where(
-            jnp.logical_and(
-                expert_idx >= go_val, expert_idx < go_val + num_local_experts
-            ),
-            group_sizes,
-            0,
-        )
-    )
-
-    # Recv count: rows from OTHER chips destined for me = (dest == my_id) AND
-    # (row not in my local range).
-    send_dest_chips = output_indices // chunk_size
-    rows = jnp.arange(size_m, dtype=jnp.int32)
-    row_is_mine = jnp.logical_and(rows >= local_start, rows < local_end)
-    to_me_remote = jnp.logical_and(
-        send_dest_chips == my_id, jnp.logical_not(row_is_mine)
-    )
-    my_recv_count = jnp.sum(jnp.where(to_me_remote, 1, 0))
-    total_recv_count = jnp.array([my_recv_count], dtype=jnp.int32)
-
     # Static loop bound — kernel pads with ``is_active`` gating.
     #
     # ``tile_m`` MUST match the value the kernel picks internally (via
@@ -247,13 +227,14 @@ def moe_gmm_local_rs_nodedup(
         act_fn=activation,
         output_size=num_tokens,
         group_offset=group_offset,
+        group_start=jnp.array([local_start], dtype=jnp.int32),
         topk_indices=topk_slot_indices,
         ep_size=ep_size,
         ep_axis_name=ep_axis_name,
         max_num_gm=max_num_gm,
-        total_recv_count=total_recv_count,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
+        collective_id=collective_id,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -326,6 +307,7 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    collective_id: int = 0,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -389,6 +371,7 @@ def expert_parallel_gmm_rs(
             has_post_norm=_has_pn_rs,
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
+            collective_id=collective_id,
         ),
         mesh=mesh,
         in_specs=(
@@ -443,6 +426,7 @@ def expert_parallel_gmm_rs(
         "activation",
         "scoring_fn",
         "fp8_direct_write",
+        "collective_id",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -467,6 +451,7 @@ def fused_moe_func_rs(
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    collective_id: int = 0,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -525,6 +510,7 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
+        collective_id=collective_id,
     )
 
     return result[:num_tokens, :hidden_size]

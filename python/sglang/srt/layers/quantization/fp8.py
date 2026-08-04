@@ -1954,13 +1954,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
+                if self.handles_moe_reduction and get_tensor_model_parallel_rank() == 0:
+                    logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
                 if (
                     moe_runner_backend.is_tpu_fused_rs()
                     and not self.handles_moe_reduction
                 ):
+                    reason = getattr(
+                        layer,
+                        "_tpu_fused_rs_unsupported_reason",
+                        "unknown incompatibility",
+                    )
                     raise ValueError(
                         "--moe-runner-backend tpu_fused_rs is not supported by "
-                        "this model or parallel layout"
+                        f"this model or parallel layout: {reason}"
                     )
 
         if hasattr(layer, "dispatcher"):

@@ -17,9 +17,9 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# The 256-token Qwen3 specialization caused a TPU core halt during integration
-# testing. Keep larger prefills on the stock path pending root-cause analysis.
-_FUSED_RS_MAX_TOKENS = 128
+# Keep larger prefills on the stock path; the fused kernel is device-validated
+# through the 256-token Qwen3 specialization.
+_FUSED_RS_MAX_TOKENS = 256
 _POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
 _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
 _POST_EXPERT_NORM_FALLBACK = "finalize_tpu_fused_rs_fallback"
@@ -83,23 +83,74 @@ def supports_fp8_fused_rs(
 ) -> bool:
     """Return whether the runtime layout matches the validated fused-RS path."""
     return (
-        ep_size > 1
-        and ep_size == tp_size == world_size
-        and reduction_compatible
-        and attn_dp_size == 1
-        and not block_quantized
-        and gated
-        and activation == "silu"
-        and not apply_router_weight_on_input
-        # The standard path is already combined. A compatible post-expert norm
-        # contract requests per-expert output so normalization can run before
-        # the weighted combination.
-        and no_combine == has_compatible_post_expert_norm
-        and not has_fused_shared_experts
-        and standard_dispatcher
-        and not enable_dp_attention
-        and not enable_fused_moe_sum_all_reduce
+        fp8_fused_rs_unsupported_reason(
+            ep_size=ep_size,
+            tp_size=tp_size,
+            world_size=world_size,
+            reduction_compatible=reduction_compatible,
+            attn_dp_size=attn_dp_size,
+            block_quantized=block_quantized,
+            gated=gated,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            no_combine=no_combine,
+            has_compatible_post_expert_norm=has_compatible_post_expert_norm,
+            has_fused_shared_experts=has_fused_shared_experts,
+            standard_dispatcher=standard_dispatcher,
+            enable_dp_attention=enable_dp_attention,
+            enable_fused_moe_sum_all_reduce=enable_fused_moe_sum_all_reduce,
+        )
+        is None
     )
+
+
+def fp8_fused_rs_unsupported_reason(
+    *,
+    ep_size: int,
+    tp_size: int,
+    world_size: int,
+    reduction_compatible: bool,
+    attn_dp_size: int,
+    block_quantized: bool,
+    gated: bool,
+    activation: str,
+    apply_router_weight_on_input: bool,
+    no_combine: bool,
+    has_compatible_post_expert_norm: bool,
+    has_fused_shared_experts: bool,
+    standard_dispatcher: bool,
+    enable_dp_attention: bool,
+    enable_fused_moe_sum_all_reduce: bool,
+) -> str | None:
+    """Return the first reason the fused-RS backend cannot be selected."""
+    if ep_size <= 1:
+        return f"expert parallel size must be greater than 1, got {ep_size}"
+    if ep_size != tp_size or ep_size != world_size:
+        return (
+            "expert parallel, tensor parallel, and world sizes must match, got "
+            f"EP={ep_size}, TP={tp_size}, world={world_size}"
+        )
+    if not reduction_compatible:
+        return "the model does not allow backend-owned MoE reduction"
+    if attn_dp_size != 1 or enable_dp_attention:
+        return "DP attention and hybrid DP/TP attention are not supported"
+    if block_quantized:
+        return "block-quantized FP8 weights are not supported"
+    if not gated:
+        return "the MoE activation must be gated"
+    if activation != "silu":
+        return f"the MoE activation must be silu, got {activation}"
+    if apply_router_weight_on_input:
+        return "applying router weights on the expert input is not supported"
+    if no_combine != has_compatible_post_expert_norm:
+        return "no_combine must match the model's post-expert norm contract"
+    if has_fused_shared_experts:
+        return "fused shared experts are not supported"
+    if not standard_dispatcher:
+        return "a custom MoE all-to-all dispatcher is not supported"
+    if enable_fused_moe_sum_all_reduce:
+        return "the external fused MoE sum all-reduce must be disabled"
+    return None
 
 
 def should_use_fp8_fused_rs(num_tokens: int) -> bool:
@@ -124,7 +175,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     server_args = get_server_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     has_post_expert_norm = _has_post_expert_norm_contract(layer)
-    if not supports_fp8_fused_rs(
+    unsupported_reason = fp8_fused_rs_unsupported_reason(
         ep_size=ep_size,
         tp_size=get_tp_group().world_size,
         world_size=world_size,
@@ -140,8 +191,11 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
         standard_dispatcher=get_moe_a2a_backend().is_none(),
         enable_dp_attention=server_args.enable_dp_attention,
         enable_fused_moe_sum_all_reduce=(server_args.enable_fused_moe_sum_all_reduce),
-    ):
+    )
+    if unsupported_reason is not None:
+        layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason
         return False
+    layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
 
     _prepare_post_expert_norm_contract(layer)
 
@@ -217,6 +271,7 @@ def apply_fp8_fused_rs(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=True,
+        collective_id=layer._tpu_fused_rs_collective_id,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])

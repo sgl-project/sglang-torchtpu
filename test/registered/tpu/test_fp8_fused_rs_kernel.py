@@ -30,7 +30,9 @@ class TestFp8FusedRsKernel(CustomTestCase):
         for name in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
             env.pop(name, None)
         env["SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM"] = str(int(post_expert_norm))
-        env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = "128"
+        # Exercise the M=2048 routing boundary used by Qwen3 at 256 tokens.
+        env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = "256"
+        env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = "8"
 
         try:
             result = subprocess.run(

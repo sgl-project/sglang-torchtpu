@@ -11,6 +11,7 @@ import torch
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     _prepare_post_expert_norm_contract,
     apply_fp8_fused_rs,
+    fp8_fused_rs_unsupported_reason,
     should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
@@ -100,6 +101,30 @@ class TestFp8MoeFusedRs(CustomTestCase):
             with self.subTest(overrides=overrides):
                 self.assertFalse(self._supported(**overrides))
 
+    def test_reports_rejected_layout(self):
+        config = {
+            "ep_size": 8,
+            "tp_size": 8,
+            "world_size": 16,
+            "reduction_compatible": True,
+            "attn_dp_size": 1,
+            "block_quantized": False,
+            "gated": True,
+            "activation": "silu",
+            "apply_router_weight_on_input": False,
+            "no_combine": False,
+            "has_compatible_post_expert_norm": False,
+            "has_fused_shared_experts": False,
+            "standard_dispatcher": True,
+            "enable_dp_attention": False,
+            "enable_fused_moe_sum_all_reduce": False,
+        }
+        self.assertEqual(
+            fp8_fused_rs_unsupported_reason(**config),
+            "expert parallel, tensor parallel, and world sizes must match, got "
+            "EP=8, TP=8, world=16",
+        )
+
     def test_prepares_model_owned_post_expert_norm_contract(self):
         weight = torch.ones(4)
         layer = SimpleNamespace(
@@ -127,7 +152,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             _prepare_post_expert_norm_contract(layer)
 
     def test_large_prefill_finalizes_then_reduces_once(self):
-        tokens, topk, hidden = 129, 2, 4
+        tokens, topk, hidden = 257, 2, 4
         x = torch.zeros(tokens, hidden)
         raw = torch.arange(tokens * topk * hidden, dtype=torch.float32).reshape(
             tokens, topk, hidden
@@ -179,7 +204,8 @@ class TestFp8MoeFusedRs(CustomTestCase):
     def test_uses_fused_rs_only_through_small_prefill_boundary(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
         self.assertTrue(should_use_fp8_fused_rs(128))
-        self.assertFalse(should_use_fp8_fused_rs(129))
+        self.assertTrue(should_use_fp8_fused_rs(256))
+        self.assertFalse(should_use_fp8_fused_rs(257))
         self.assertFalse(should_use_fp8_fused_rs(8192))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
