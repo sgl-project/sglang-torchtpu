@@ -12,7 +12,7 @@ permuted-choice prompt and grader; MMLU uses run_eval, itself adapted from OpenA
 simple-evals.
 
 Both gate at atol 0.03, capped by the tolerance contract. Headroom differs by sample
-count: MMLU ~3.7 sigma, GPQA ~1.8.
+count: MMLU ~3.7 sigma, GPQA ~2.6 at the card's 8 repeats.
 
 Serving config is recipe/gpt_oss_120b/server.sh, the one script for this model and what
 the perf sweep runs too. LAUNCH_ENV below is the eval delta on top of it, itemised
@@ -27,10 +27,12 @@ import os
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import gpqa_openai_runner, model_config_main
 
-# est_time drives the JobSet deadline, so an under-estimate kills the run. ~2800
-# generations on one boot (GPQA 4x198, MMLU 2000), much of it low-effort reasoning up
-# to 8k tokens. weekly-update-est-time.yml refreshes it from real p90s.
-register_tpu_ci(est_time=10800, suite="nightly-tpu-4-v7", nightly=True)
+# est_time drives the JobSet deadline, so an under-estimate kills the run. ~3600
+# generations on one boot (GPQA 8x198, MMLU 2000), much of it low-effort reasoning up to
+# 8k tokens. Scaled from the GPQA-only nightly, which budgeted 3600s for 4x198 at these
+# settings: ~3.8s/generation at 32 threads, plus ~600s of weight load and compile.
+# weekly-update-est-time.yml refreshes it from real p90s.
+register_tpu_ci(est_time=16200, suite="nightly-tpu-4-v7", nightly=True)
 
 # Must match --served-model-name in LAUNCH_ENV: every gate sends this as the model id,
 # and it is what the server echoes back in its responses.
@@ -43,11 +45,12 @@ REASONING_EFFORT = "low"
 GPQA_GROUND_TRUTH = 0.671
 MMLU_GROUND_TRUTH = 0.859
 
-# 198 questions -> single-pass sigma 3.3pts, under 1 sigma for a 3pt gate. 4 repeats
-# put the mean's SE at ~1.7pts, making the floor ~1.8 sigma. The card uses 8; 4 halves
-# CI time. Do NOT go below 4.
+# 198 questions -> single-pass sigma 3.3pts, under 1 sigma for a 3pt gate, so the gate
+# is only meaningful on a mean of several passes. 8 is the card's own repeat count: the
+# mean's SE is 3.3/sqrt(8) = 1.2pts, putting the floor ~2.6 sigma below the reference.
+# Do NOT lower it -- at 4 the floor is ~1.8 sigma and the gate reds on noise alone.
 GPQA_ATOL = 0.03
-GPQA_N_REPEATS = 4
+GPQA_N_REPEATS = 8
 
 # 2000 questions -> sigma ~0.8pts, so 3pts is ~3.7 sigma. The headroom also absorbs
 # prompt-formatting differences between simple-evals and OpenAI's internal harness.
@@ -60,27 +63,42 @@ MAX_TOKENS = 8192
 
 
 # server.sh owns how the model is served -- tp8+ep8, MXFP4 auto-detect, RPA v3 (the only
-# backend implementing attention sinks), SC gather off, mem_fraction 0.6, page 64 -- and
-# is sized by default for the throughput sweep. The gates need seven values changed:
+# backend implementing attention sinks), SC gather off, mem_fraction 0.6 -- but its
+# defaults size it for the throughput sweep. Everything below restates the accuracy
+# nightly's configuration, so the server this file launches matches what the GPQA-only
+# nightly launched before these gates shared a boot:
 #   MODEL           the ROX PVC mount; server.sh defaults to the HF id.
 #   EXTRA_ARGS      Harmony's analysis channel -> reasoning_content, so a harness grades
 #                   final-channel text only. served-model-name is SERVED_MODEL_NAME.
 #   KV_CACHE_DTYPE  empty = bf16 KV, what GPQA 0.671 was validated on (2026-07-28);
 #                   server.sh defaults to fp8_e4m3, which nothing here is anchored to.
-#   ISL/OSL/CONCUR  server.sh derives the prefill chunk from ISL, and the KV pool plus
-#                   the bs ceiling from CONCUR. CONCUR=32 holds MAX_TOTAL_TOKENS
-#                   (2*CONCUR*CONTEXT_LEN = 1.05M) under the ~1.5M at which the extend
-#                   precompile OOMs, and matches MAX_RUNNING to the decode bucket below.
+#   PAGE_SIZE       128, the platform default the nightly ran on. server.sh drops to 64
+#                   to raise the prefix-cache hit rate, which no gate here depends on.
+#   DISABLE_RADIX_CACHE  prefix caching off, as the nightly ran it. server.sh turns it
+#                   on for the cache-hit sweep; leaving it on would let a repeated
+#                   prompt skip a real prefill.
+#   MAX_TOTAL_TOKENS  empty = let sglang size the KV pool from mem_fraction, as the
+#                   nightly did. server.sh's 2*CONCUR*CONTEXT_LEN is sized for its fp8
+#                   pool; at bf16 that formula would ask for most of the budget.
+#   ISL/OSL/CONCUR  server.sh derives the prefill chunk from ISL, and the bs ceiling
+#                   from CONCUR. CONCUR=32 reproduces the nightly's MAX_RUNNING and
+#                   TORCH_COMPILE_MAX_BS.
 #   CONTEXT_LEN     longest GPQA prompt (~2.9k tokens) + the MAX_TOKENS budget. The
 #                   sweep's default is ISL+OSL+64 = 2112, which a GPQA prompt overruns.
 #   TPU_COMPILE_*   one prefill bucket (= the 4096 chunk ISL derives) and one decode
 #                   bucket, which keeps bring-up ~10 min; the derived default is powers
 #                   of two up to CONCUR, i.e. six decode compiles.
 #   ENABLE_PROFILER_ENDPOINT  launch_server.sh defaults it to 1; a nightly wants none.
+#
+# With these, the argv launch_server.sh builds is identical to the GPQA-only nightly's.
 LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",
     "EXTRA_ARGS": f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}",
     "KV_CACHE_DTYPE": "",
+    "MAX_TOTAL_TOKENS": "",
+    "PAGE_SIZE": "128",
+    "DISABLE_RADIX_CACHE": "1",
+    "MEM_FRACTION_STATIC": "0.60",
     "ISL": "4096",
     "OSL": str(MAX_TOKENS),
     "CONCUR": "32",

@@ -83,7 +83,12 @@ export TORCH_COMPILE_MAX_BS=$CONCUR
 # not the 2x16=2.1M this formula would give. A cache hit does not add to the
 # requirement: the shared prefix *is* part of the hitting sequence's KV, so
 # CONCUR full-length sequences already covers every resident prefix.
-export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-$(( 2 * CONCUR * CONTEXT_LEN ))}
+#
+# Bare `-`, as with KV_CACHE_DTYPE above: MAX_TOTAL_TOKENS= (explicitly empty) passes
+# through empty, and launch_server.sh then omits --max-total-tokens so sglang sizes the
+# pool from mem_fraction. The accuracy nightly wants that, since bf16 KV costs ~2x the
+# fp8 figure above and this formula would ask for most of the budget outright.
+export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$(( 2 * CONCUR * CONTEXT_LEN ))}
 # MXFP4 MoE weights are dequantized to bf16 at load (~233 GB total, ~29 GB per
 # chip of the 101.7 GB HBM), so 0.6 leaves a ~32 GB/chip KV budget — far more
 # than MAX_TOTAL_TOKENS needs — plus ~40 GB/chip of headroom for the
