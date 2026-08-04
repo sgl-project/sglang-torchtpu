@@ -1195,8 +1195,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_per_token_activation: Optional[bool] = None,
-        load_packed: bool = True,
-        fold_global_scale: bool = False,
         global_scale: bool = True,
         scale_dtype: Optional[str] = None,
     ) -> None:
@@ -1213,8 +1211,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             if use_per_token_activation is None
             else use_per_token_activation
         )
-        self.load_packed = load_packed
-        self.fold_global_scale = fold_global_scale
         self.global_scale = global_scale
         self.scale_dtype = scale_dtype
 
@@ -1359,9 +1355,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             group_size=group_size,
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
-            use_per_token_activation=checkpoint_format.get("use_per_token_activation"),
-            load_packed=checkpoint_format.get("load_packed", True),
-            fold_global_scale=checkpoint_format.get("fold_global_scale", False),
             global_scale=checkpoint_format.get("global_scale", True),
             scale_dtype=checkpoint_format.get("scale_dtype"),
         )

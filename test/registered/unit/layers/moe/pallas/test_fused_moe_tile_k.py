@@ -2,8 +2,9 @@
 
 Pure tile-sizing math, no TPU: ``_dividing_tile_k`` only reads ``dims.size_k``
 and ``rhs_cfgs``, so the wrapped tile fn is driven with hand-built dataclasses.
-Registered as a CPU CI test but skipped gracefully where JAX / the pallas
-import chain is unavailable.
+Registered on both lanes and skipped gracefully where JAX / the pallas import
+chain is unavailable: the CPU agents have no JAX, so the TPU lane is the one
+that actually executes these assertions.
 
 The regression under test: ``calculate_tiling`` rejects a ``tile_k`` that
 straddles rhs quantization blocks, but the tuned-lookup and pinned tile paths
@@ -17,9 +18,10 @@ multiple nor a divisor of the 512 block size.
 
 from types import SimpleNamespace
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 
 import unittest
 
