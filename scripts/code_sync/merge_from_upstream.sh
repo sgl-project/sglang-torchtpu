@@ -79,8 +79,11 @@ else
   CONFLICT_SECTION=""
 fi
 
-BODY=$(printf 'Merges %s new commit(s) from [sgl-project/sglang@%s](https://github.com/sgl-project/sglang/commit/%s) into `%s`.\n%s\nUpstream commits: %s\n\n---\n*Automated by `scripts/code_sync/merge_from_upstream.sh` (.github/workflows/bot-sync-from-upstream.yml).*' \
-  "$AHEAD" "$UP_SHA" "$UP_SHA" "$BASE_BRANCH" "$CONFLICT_SECTION" "$COMMIT_RANGE_URL")
+# Operating instructions shown on every sync PR so reviewers merge it correctly.
+HOWTO_SECTION=$(printf '\n## How to merge this PR\n- **Use "Create a merge commit"** — do **not** squash or rebase. This is a merge-based sync that must preserve upstream git history; squashing collapses the upstream commits into one and rebasing rewrites them, either of which breaks future incremental syncs.\n- **Add the `run-ci` label** to trigger PR CI (after resolving any conflicts), then **fix any new test failures** before merging.\n')
+
+BODY=$(printf 'Merges %s new commit(s) from [sgl-project/sglang@%s](https://github.com/sgl-project/sglang/commit/%s) into `%s`.\n%s%s\nUpstream commits: %s\n\n---\n*Automated by `scripts/code_sync/merge_from_upstream.sh` (.github/workflows/bot-sync-from-upstream.yml).*' \
+  "$AHEAD" "$UP_SHA" "$UP_SHA" "$BASE_BRANCH" "$CONFLICT_SECTION" "$HOWTO_SECTION" "$COMMIT_RANGE_URL")
 
 PR_URL=$(gh pr create \
   --repo "$REPO" \
