@@ -982,6 +982,10 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
+    # NVFP4 MoE: "auto" takes the fused reduce-scatter path whenever the layer
+    # satisfies its contract, "0" forces the stock path, "1" additionally logs
+    # the unmet requirements when the contract is not satisfied.
+    SGLANG_TPU_FP4_FUSED_RS = EnvStr("auto")
     # MoE: offload the gather in permute and unpermute to SparseCore.
     SGLANG_TPU_FUSED_MOE_SC_GATHER = EnvBool(True)
     # MoE: use onehot dense matmul for small permute and unpermute/combine

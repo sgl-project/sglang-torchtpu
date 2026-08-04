@@ -2164,6 +2164,43 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale._sglang_require_global_experts = True
             layer.register_parameter("w2_input_scale", w2_input_scale)
 
+    def _resolve_tpu_fused_rs(self, layer: torch.nn.Module) -> None:
+        """Decide whether fused-RS owns this layer's MoE reduction.
+
+        Deliberately deferred to weight-load time. The gate reads
+        ``layer.allow_backend_reduction`` and the layer's post-expert-norm
+        contract, and models set both *after* ``FusedMoE.__init__`` returns, so
+        deciding inside ``create_moe_runner`` would always see the constructor
+        defaults and never select fused-RS. Mirrors the FP8 sibling, which
+        resolves the same flag in ``process_weights_after_loading``.
+        """
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            unmet_tpu_nvfp4_fused_rs_requirements,
+        )
+
+        fused_rs_setting = envs.SGLANG_TPU_FP4_FUSED_RS.get()
+        unmet_requirements = (
+            ["SGLANG_TPU_FP4_FUSED_RS=0"]
+            if fused_rs_setting == "0"
+            else unmet_tpu_nvfp4_fused_rs_requirements(
+                layer,
+                group_size=self.quant_config.group_size,
+                no_combine=self.moe_runner_config.no_combine,
+            )
+        )
+        self.handles_moe_reduction = not unmet_requirements
+        if self.handles_moe_reduction:
+            logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
+        elif fused_rs_setting == "1":
+            # An explicit opt-in that silently serves the stock path hides a
+            # whole class of misconfiguration, so name the unmet contract.
+            logger.warning(
+                "SGLANG_TPU_FP4_FUSED_RS=1 requested but fused-RS cannot "
+                "honor this layer; serving the stock TPU NVFP4 MoE path "
+                "instead. Unmet requirements: %s",
+                ", ".join(unmet_requirements),
+            )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
@@ -2174,6 +2211,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.hardware_backend.tpu.fp4_moe import (
                 prepare_tpu_nvfp4_moe_weights,
             )
+
+            # Must precede prepare_tpu_nvfp4_moe_weights: the chosen path
+            # determines the weight layout it writes.
+            self._resolve_tpu_fused_rs(layer)
 
             # Preserve the checkpoint scale precision unless its config explicitly
             # requests a supported narrower storage dtype.
@@ -2520,34 +2561,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         if _is_tpu:
-            import os
-
-            from sglang.srt.hardware_backend.tpu.fp4_moe import (
-                unmet_tpu_nvfp4_fused_rs_requirements,
-            )
-
-            fused_rs_setting = os.environ.get("SGLANG_TPU_FP4_FUSED_RS", "auto")
-            unmet_requirements = (
-                ["SGLANG_TPU_FP4_FUSED_RS=0"]
-                if fused_rs_setting == "0"
-                else unmet_tpu_nvfp4_fused_rs_requirements(
-                    layer,
-                    group_size=self.quant_config.group_size,
-                    no_combine=moe_runner_config.no_combine,
-                )
-            )
-            self.handles_moe_reduction = not unmet_requirements
-            if self.handles_moe_reduction:
-                logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
-            elif fused_rs_setting == "1":
-                # An explicit opt-in that silently serves the stock path hides a
-                # whole class of misconfiguration, so name the unmet contract.
-                logger.warning(
-                    "SGLANG_TPU_FP4_FUSED_RS=1 requested but fused-RS cannot "
-                    "honor this layer; serving the stock TPU NVFP4 MoE path "
-                    "instead. Unmet requirements: %s",
-                    ", ".join(unmet_requirements),
-                )
+            # The fused-RS gate is NOT decided here: this runs from
+            # FusedMoE.__init__, before models set allow_backend_reduction or
+            # attach their post-expert norm. See _resolve_tpu_fused_rs.
+            #
             # TPU bypasses MoeRunner entirely; apply() dispatches straight to the
             # Pallas fused grouped-GEMM. --moe-runner-backend is a no-op here.
             return

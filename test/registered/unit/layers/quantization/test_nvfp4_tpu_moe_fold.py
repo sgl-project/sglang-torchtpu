@@ -668,5 +668,100 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 )
 
 
+@unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+class TestNvfp4FusedRsGateTiming(CustomTestCase):
+    """The fused-RS decision must outlive `FusedMoE.__init__`.
+
+    `create_moe_runner` runs from the constructor, before models assign
+    `allow_backend_reduction` or declare a post-expert norm. Deciding there
+    reads the constructor defaults and pins fused-RS off for the whole run --
+    silently, since the stock path still serves correct numerics.
+    """
+
+    def _run_gate(self, *, ep_size: int = 4, world_size: int = 4):
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        config = modelopt_quant.ModelOptFp4Config.from_config(
+            {
+                "quant_method": "modelopt",
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "group_size": BLOCK_SIZE,
+                    "exclude_modules": ["self_attn", "lm_head"],
+                },
+            }
+        )
+        moe_runner_config = types.SimpleNamespace(
+            is_gated=True,
+            activation="silu",
+            apply_router_weight_on_input=False,
+            no_combine=False,
+        )
+        # The model has not applied its overrides yet at construction time.
+        layer = types.SimpleNamespace(
+            moe_ep_size=ep_size,
+            allow_backend_reduction=False,
+            num_fused_shared_experts=0,
+            moe_runner_config=moe_runner_config,
+        )
+        prepared = {}
+
+        def _fake_prepare(layer, **kwargs):
+            prepared.update(kwargs)
+
+        with (
+            mock.patch.object(modelopt_quant, "_is_tpu", True),
+            mock.patch(
+                "sglang.srt.distributed.get_world_group",
+                return_value=types.SimpleNamespace(world_size=world_size),
+            ),
+            mock.patch(
+                "sglang.srt.distributed.get_tp_group",
+                return_value=types.SimpleNamespace(world_size=world_size),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=types.SimpleNamespace(attn_dp_size=1),
+            ),
+            mock.patch(
+                "sglang.srt.runtime_context.get_server_args",
+                return_value=types.SimpleNamespace(
+                    enable_dp_attention=False,
+                    enable_fused_moe_sum_all_reduce=False,
+                ),
+            ),
+            mock.patch(
+                "sglang.srt.layers.moe.get_moe_a2a_backend",
+                return_value=types.SimpleNamespace(is_none=lambda: True),
+            ),
+            mock.patch(
+                "sglang.srt.hardware_backend.tpu.fp4_moe.prepare_tpu_nvfp4_moe_weights",
+                _fake_prepare,
+            ),
+        ):
+            method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(config)
+            method.create_moe_runner(layer, moe_runner_config)
+            constructed = method.handles_moe_reduction
+            # What the model does after FusedMoE.__init__ returns.
+            layer.allow_backend_reduction = True
+            method.process_weights_after_loading(layer)
+        return constructed, method.handles_moe_reduction, prepared
+
+    def test_gate_sees_overrides_applied_after_construction(self):
+        constructed, resolved, prepared = self._run_gate()
+
+        self.assertFalse(constructed, "gate must not be decided in the constructor")
+        self.assertTrue(resolved)
+        self.assertTrue(prepared["use_fused_rs"])
+
+    def test_gate_still_declines_an_unsupported_layout(self):
+        # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
+        # list rejects; deferring the decision must not soften the gate.
+        _, resolved, prepared = self._run_gate(ep_size=2, world_size=4)
+
+        self.assertFalse(resolved)
+        self.assertFalse(prepared["use_fused_rs"])
+
+
 if __name__ == "__main__":
     unittest.main()
