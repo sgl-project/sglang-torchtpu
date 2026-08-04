@@ -252,7 +252,9 @@ C) {C}
 D) {D}
 """.strip()
 
-ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
+# Skip wrappers the letter arrives in -- "Answer: $B$", "**B**", "(B)" -- which are
+# otherwise scored wrong. \b stops "Answer: Amsterdam" matching "A".
+ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*[\s\$\*\\()\[\]{}]*([A-D])\b"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
 
 

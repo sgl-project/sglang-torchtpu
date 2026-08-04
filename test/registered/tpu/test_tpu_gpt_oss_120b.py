@@ -14,6 +14,10 @@ simple-evals.
 Both gate at atol 0.03, capped by the tolerance contract. Headroom differs by sample
 count: MMLU ~3.7 sigma, GPQA ~2.6 at the card's 8 repeats.
 
+Measured 2026-08-04 on one v7x host at this config: GPQA 0.6553, MMLU 0.8670. MMLU is
+sensitive to answer extraction -- this model ends its replies "Answer: $B$" -- so check
+the unextractable rate before suspecting the serving stack.
+
 Serving config is recipe/gpt_oss_120b/server.sh, the one script for this model and what
 the perf sweep runs too. LAUNCH_ENV below is the eval delta on top of it, itemised
 there; the launcher logs it on boot, so a red nightly reproduces as that line plus
