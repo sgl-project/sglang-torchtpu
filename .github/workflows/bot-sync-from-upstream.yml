@@ -7,8 +7,8 @@ name: Bot Sync From Upstream sglang
 on:
   workflow_dispatch:
   schedule:
-    # Every 2 days at 10:00 UTC.
-    - cron: '0 10 */2 * *'
+    # Weekly, Mondays at 10:00 UTC.
+    - cron: '0 10 * * 1'
 
 permissions:
   contents: write
