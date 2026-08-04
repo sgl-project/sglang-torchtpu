@@ -67,6 +67,7 @@ def supports_fp8_fused_rs(
     *,
     ep_size: int,
     tp_size: int,
+    pp_size: int,
     world_size: int,
     reduction_compatible: bool,
     attn_dp_size: int,
@@ -86,6 +87,7 @@ def supports_fp8_fused_rs(
         fp8_fused_rs_unsupported_reason(
             ep_size=ep_size,
             tp_size=tp_size,
+            pp_size=pp_size,
             world_size=world_size,
             reduction_compatible=reduction_compatible,
             attn_dp_size=attn_dp_size,
@@ -108,6 +110,7 @@ def fp8_fused_rs_unsupported_reason(
     *,
     ep_size: int,
     tp_size: int,
+    pp_size: int,
     world_size: int,
     reduction_compatible: bool,
     attn_dp_size: int,
@@ -125,6 +128,8 @@ def fp8_fused_rs_unsupported_reason(
     """Return the first reason the fused-RS backend cannot be selected."""
     if ep_size <= 1:
         return f"expert parallel size must be greater than 1, got {ep_size}"
+    if pp_size != 1:
+        return f"pipeline parallelism is not supported, got PP={pp_size}"
     if ep_size != tp_size or ep_size != world_size:
         return (
             "expert parallel, tensor parallel, and world sizes must match, got "
@@ -178,6 +183,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         ep_size=ep_size,
         tp_size=get_tp_group().world_size,
+        pp_size=parallel.pp_size,
         world_size=world_size,
         reduction_compatible=layer.allow_backend_reduction,
         attn_dp_size=parallel.attn_dp_size,

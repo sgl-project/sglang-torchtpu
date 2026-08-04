@@ -33,10 +33,11 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertTrue(backend.is_tpu_fused_rs())
         self.assertFalse(backend.is_auto())
 
-    def _supported(self, **overrides):
+    def _config(self, **overrides):
         config = {
             "ep_size": 8,
             "tp_size": 8,
+            "pp_size": 1,
             "world_size": 8,
             "reduction_compatible": True,
             "attn_dp_size": 1,
@@ -52,10 +53,19 @@ class TestFp8MoeFusedRs(CustomTestCase):
             "enable_fused_moe_sum_all_reduce": False,
         }
         config.update(overrides)
-        return supports_fp8_fused_rs(**config)
+        return config
+
+    def _supported(self, **overrides):
+        return supports_fp8_fused_rs(**self._config(**overrides))
 
     def test_accepts_validated_ep_equals_tp_layout(self):
         self.assertTrue(self._supported())
+
+    def test_rejects_pipeline_parallel_layout(self):
+        self.assertEqual(
+            fp8_fused_rs_unsupported_reason(**self._config(pp_size=2, world_size=16)),
+            "pipeline parallelism is not supported, got PP=2",
+        )
 
     def test_accepts_compatible_post_expert_norm_contract(self):
         self.assertTrue(
@@ -105,6 +115,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         config = {
             "ep_size": 8,
             "tp_size": 8,
+            "pp_size": 1,
             "world_size": 16,
             "reduction_compatible": True,
             "attn_dp_size": 1,

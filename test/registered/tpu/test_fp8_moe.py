@@ -20,10 +20,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 
-# Eager and compiled kernels may use different BF16 accumulation orders. These
-# tolerances remain substantially tighter than the independent FP8 reference.
-_COMPILED_BF16_ATOL = 5e-4
-_COMPILED_BF16_RTOL = 0.02
+# Eager and compiled kernels use different BF16 accumulation orders. Retain
+# BF16's default relative tolerance and cover rounding near zero explicitly.
+_COMPILED_BF16_ATOL = 2e-4
+_COMPILED_BF16_RTOL = 0.016
 
 
 def _quantize_per_expert(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
