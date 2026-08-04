@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.kits.lm_eval_kit import LMEvalMixin
 from sglang.test.test_utils import ModelLaunchSettings, dump_metric
 
 DEFAULT_HEALTH_TIMEOUT = 1800.0
@@ -121,7 +122,14 @@ class RecipeLauncher:
 
             env = os.environ.copy()
             env.update(self.env)
-            print(f"[{self.tag}] boot: bash {self.script} (cwd={self.cwd})", flush=True)
+            # The whole invocation, env included: this line is what a reader reproduces
+            # a red nightly with.
+            overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))
+            print(
+                f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
+                f"bash {self.script} (cwd={self.cwd})",
+                flush=True,
+            )
             self._process = subprocess.Popen(
                 ["bash", self.script], cwd=self.cwd, env=env
             )
@@ -194,10 +202,19 @@ class TpuModelLaunchSettings(ModelLaunchSettings):
         self.extra_args = []
 
 
-def lm_eval_runner(
-    config_path: str,
-    default_rtol: float = 0.08,
-):
+class _LMEvalHarness(LMEvalMixin):
+    """Adapter that lets a runner call ``LMEvalMixin.launch_lm_eval``.
+
+    ``launch_lm_eval`` needs nothing but ``base_url``, and it is the one implementation
+    of the lm-eval invocation -- endpoint suffix, model_args, ``env_vars`` scoping --
+    shared with every other lm-eval test and with run_lm_eval.sh.
+    """
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url
+
+
+def lm_eval_runner(config_path: str):
     """Build an ``AccuracyTestParams.runner`` that scores via lm-eval.
 
     Needed because these models' reference values are the cards' standard few-shot
@@ -207,7 +224,6 @@ def lm_eval_runner(
     """
 
     def run(base_url: str) -> Dict[str, Any]:
-        import lm_eval
         import yaml
 
         cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
@@ -218,29 +234,10 @@ def lm_eval_runner(
         except requests.RequestException:
             pass
 
-        backend = cfg.get("backend", "local-completions")
-        api = cfg.get("api", "chat" if "chat" in backend else "completion")
-        suffix = "/v1/chat/completions" if api == "chat" else "/v1/completions"
-        model_args = {
-            "model": cfg["model_name"],
-            "base_url": base_url.rstrip("/") + suffix,
-            "num_concurrent": cfg.get("num_concurrent", 1),
-        }
-        model_args.update(cfg.get("model_args", {}))
+        results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
 
-        results = lm_eval.simple_evaluate(
-            model=backend,
-            model_args=model_args,
-            tasks=[task["name"] for task in cfg["tasks"]],
-            num_fewshot=cfg.get("num_fewshot", 0),
-            limit=cfg.get("limit", None),
-            apply_chat_template=cfg.get("apply_chat_template", False),
-            fewshot_as_multiturn=cfg.get("fewshot_as_multiturn", False),
-            gen_kwargs=cfg.get("gen_kwargs"),
-            batch_size=cfg.get("batch_size", "auto"),
-        )
-
-        rtol = cfg.get("rtol", default_rtol)
+        # Same floor as LMEvalMixin.test_lm_eval, which asserts instead of reporting.
+        rtol = cfg.get("rtol", LMEvalMixin.default_rtol)
         atol = cfg.get("atol", 0.0)
         passed = True
         failures: List[str] = []

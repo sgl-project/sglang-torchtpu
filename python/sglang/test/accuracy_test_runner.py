@@ -491,6 +491,8 @@ def _dispatch_eval(
             # failing later on a dict lookup.
             if isinstance(metrics, (int, float)):
                 metrics = {"score": float(metrics)}
+            if metrics is None:
+                return False, f"Runner for {params.name} returned no metrics", None
             return True, None, metrics
         except Exception as e:
             return False, f"Runner exception: {str(e)}", None
@@ -577,6 +579,15 @@ def run_accuracy_test(
         passed = metrics["_passed"]
         error = None if passed else "; ".join(metrics.get("_failures") or [])
         print(f"{'✓' if passed else '✗'} {params.name}: {error or 'all floors met'}")
+    elif params.floor is None:
+        # Nothing to compare against: the params carry no baseline and the runner did
+        # not gate itself. Fail loudly -- a silent pass here is an ungated nightly.
+        passed = False
+        error = (
+            f"{params.name}: no baseline_accuracy, and the runner returned no "
+            f"'_passed' key -- a gate must either carry a baseline or gate itself"
+        )
+        print(f"✗ {error}")
     else:
         floor = params.floor
         passed = score >= floor
