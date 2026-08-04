@@ -145,26 +145,97 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
 
 
+def _quant_block_compatible(tile_k, quant_block_size):
+    """Whether ``tile_k`` can index whole rhs scale blocks.
+
+    ``IndexMaps.rhs_scale_index_map`` derives the scale window from
+    ``b_id = (k_id * tile_k) // quant_block_size`` and
+    ``b_tile_id = b_id // cdiv(tile_k, quant_block_size)``. That arithmetic is
+    only exact when one of the two sizes divides the other; otherwise a tile
+    straddles a block boundary and every ``k_id >= 1`` reads a window that has
+    drifted behind the one it needs.
+    """
+    if quant_block_size is None:
+        return True
+    return tile_k % quant_block_size == 0 or quant_block_size % tile_k == 0
+
+
+def _largest_compatible_tile_k(size_k, limit, quant_block_size, alignment=128):
+    """Largest ``alignment``-aligned divisor of ``size_k`` that is ``<= limit``
+    and quant-block compatible. Subsumes gmm_v2's
+    ``_largest_aligned_divisor_at_most`` (identical when unquantized).
+    """
+    limit = min(size_k, limit)
+    for candidate in range(limit - (limit % alignment), 0, -alignment):
+        if size_k % candidate == 0 and _quant_block_compatible(
+            candidate, quant_block_size
+        ):
+            return candidate
+    raise ValueError(
+        f"no {alignment}-aligned divisor of size_k={size_k} that is <= {limit} "
+        f"is compatible with quant_block_size={quant_block_size}; pad K to an "
+        "aligned, divisor-rich width at load time"
+    )
+
+
+def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
+    """Pick the gmm2 ``tile_info`` source: tuned lookup for packed FP4 only.
+
+    Packed FP4 w2 stores a halved K, which ``calculate_tiling`` would read as
+    the real K and size tiles against half the contraction dim, so packed w2
+    needs the packed-aware ``_lookup_tile_info`` (it keys on the real K and the
+    float4 dtype the kernel contracts in).
+
+    Every other dtype keeps the kernel's own adaptive ``calculate_tiling``.
+    That is the only path that budgets the rhs tile against ``rhs_vmem_target``
+    -- a pinned ``TileSizes`` is consumed verbatim with no clamp, so routing
+    bf16/FP8 through the lookup would retune stock TPU MoE and could overflow
+    VMEM at an untested shape. Widening this gate is a separate change that
+    needs its own perf data.
+    """
+    from sglang.srt.layers.moe.pallas.gmm_v2 import calculate_tiling
+
+    if not w2_packed:
+        return calculate_tiling
+    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+
+
 def _dividing_tile_k(base_tile_info):
     """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
-    ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent).
+    ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent) and
+    stays compatible with the rhs quantization block size.
+
+    ``calculate_tiling`` enforces the quant-block constraint itself, but a
+    pinned ``TileSizes`` (compact block-FP8 GMM1) or a tuned-lookup one
+    (``_lookup_tile_info``, which every NVFP4 call reaches because
+    ``TUNED_BLOCK_SIZES`` carries no fp4 entries) bypasses it. A straddling
+    tile_k does not fail -- it silently loads the wrong per-block scales -- so
+    re-apply the constraint here, on whatever tile_k the caller ended up with.
+
+    This is a no-op for every configuration that already worked: unscaled bf16
+    has no block size, channelwise scales have ``quant_block_size == size_k``
+    (any divisor is compatible), block-FP8's 128 divides every 128-aligned
+    tile, and NVFP4 at ``size_k`` a multiple of 2048 resolves ``tile_k=2048``,
+    a multiple of 512. It only fires where the scale indexing would be wrong.
     """
     import dataclasses
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import (
-        TileSizes,
-        _largest_aligned_divisor_at_most,
-    )
+    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
 
     def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
         if isinstance(base_tile_info, TileSizes):
             tiles = base_tile_info
         else:
             tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-        if dims.size_k % tiles.tile_k != 0:
+        quant_block_size = rhs_cfgs.quant_block_size if rhs_cfgs.has_scale else None
+        if dims.size_k % tiles.tile_k != 0 or not _quant_block_compatible(
+            tiles.tile_k, quant_block_size
+        ):
             tiles = dataclasses.replace(
                 tiles,
-                tile_k=_largest_aligned_divisor_at_most(dims.size_k, tiles.tile_k, 128),
+                tile_k=_largest_compatible_tile_k(
+                    dims.size_k, tiles.tile_k, quant_block_size, 128
+                ),
             )
         return tiles
 
@@ -389,11 +460,8 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    # Packed FP4 w2 has a halved (packed) K; ``_lookup_tile_info`` is packed-aware
-    # (keys on the real K + the float4 dtype), so packed and bf16 w2 both go
-    # through the tuned lookup (tuned triple on a hit, heuristic on a miss).
     gmm2_tiling = _dividing_tile_k(
-        _lookup_tile_info(gmm1_out, w2, w2_scale, num_experts, packed_fp4=w2_packed)
+        _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
     )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
