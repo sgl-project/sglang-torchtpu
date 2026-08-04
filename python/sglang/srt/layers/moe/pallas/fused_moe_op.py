@@ -104,10 +104,19 @@ def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
     so we key the lookup on the real K and the float4 dtype the kernel contracts
     in -- otherwise packed w2 mismatches lhs K and falls back to the heuristic.
 
-    ``num_current_groups`` is set equal to ``num_total_groups``
-    because this bridge is single-host (no expert parallelism); when
-    EP is added the caller will need to pass the local group count
-    through.
+    ``num_current_groups`` is set equal to ``num_total_groups`` because callers
+    pass the LOCAL expert count (``w1.shape[0]``), which under EP is already
+    this rank's share -- so both are the local count and the lookup is correct
+    under expert parallelism as written.
+
+    Keep it that way. The heuristic behind a table miss computes
+    ``tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)``, and with
+    the local g (16 under EP16) ``2m/g`` is >= 512 for every prefill bucket, so
+    ``tm`` saturates at 512 and is identical across buckets. Passing the GLOBAL
+    count instead would make ``2m/g`` = 64/128/256 at pad_t 1024/2048/4096 and
+    ``tm`` would become 128/128/256 -- a tiling that silently changes at one
+    bucket and not the others, which is precisely the failure signature we are
+    trying not to have.
     """
     import jax.numpy as jnp
 
