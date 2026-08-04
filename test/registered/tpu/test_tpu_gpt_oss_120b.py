@@ -23,12 +23,9 @@ pins never touch the pinned torch.
 """
 
 import os
-import subprocess
-import sys
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.test_utils import dump_metric
-from sglang.test.tpu import model_config_main
+from sglang.test.tpu import gpqa_openai_runner, model_config_main
 
 # est_time drives the JobSet deadline, so an under-estimate kills the run. ~2800
 # generations on one boot (GPQA 4x198, MMLU 2000), much of it low-effort reasoning up
@@ -60,44 +57,6 @@ MMLU_NUM_EXAMPLES = 2000
 # Completion budget both gates are sized against: low-effort generations finish well
 # under it, and CONTEXT_LEN leaves room for it on top of the longest prompt.
 MAX_TOKENS = 8192
-
-
-def _gpqa_via_openai_harness(base_url: str) -> dict:
-    """Score GPQA Diamond with OpenAI's own gpt_oss.evals harness."""
-    # Pure-python eval code; --no-deps so its pins never touch the pinned
-    # TPU torch stack. openai/pandas/blobfile are image deps (test extra).
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
-        check=True,
-    )
-    # The openai client insists on a key even for a local base_url.
-    os.environ.setdefault("OPENAI_API_KEY", "dummy")
-
-    from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
-    from gpt_oss.evals.gpqa_eval import GPQAEval
-
-    sampler = ChatCompletionsSampler(
-        model=SERVED_MODEL_NAME,
-        reasoning_model=True,
-        reasoning_effort=REASONING_EFFORT,
-        temperature=1.0,
-        base_url=base_url + "/v1",
-        # Their CLI uses 131072; capped to fit CONTEXT_LEN. Proven
-        # non-truncating: low-effort generations complete well under 8k.
-        max_tokens=MAX_TOKENS,
-    )
-    result = GPQAEval(n_repeats=GPQA_N_REPEATS, n_threads=32)(sampler)
-    print(
-        f"gpqa_diamond (openai harness, n_repeats={GPQA_N_REPEATS}): "
-        f"score={result.score:.4f} metrics={result.metrics}"
-    )
-    # Built-in backends dump their own metrics; a runner must do its own.
-    dump_metric(
-        "gpqa_diamond_openai_harness",
-        result.score,
-        labels={"model": "openai/gpt-oss-120b", "eval": "gpt_oss.evals"},
-    )
-    return {"score": result.score}
 
 
 # server.sh owns how the model is served -- tp8+ep8, MXFP4 auto-detect, RPA v3 (the only
@@ -145,7 +104,12 @@ MODEL_CONFIG = {
         {
             "dataset": "gpqa",
             "label": "gpqa_diamond_low",
-            "runner": _gpqa_via_openai_harness,
+            "runner": gpqa_openai_runner(
+                model=SERVED_MODEL_NAME,
+                n_repeats=GPQA_N_REPEATS,
+                reasoning_effort=REASONING_EFFORT,
+                max_tokens=MAX_TOKENS,
+            ),
             "baseline": GPQA_GROUND_TRUTH,
             "atol": GPQA_ATOL,
         },

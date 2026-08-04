@@ -7,13 +7,14 @@ Plugs into the two extension points on the shared accuracy runner:
   topology must all be exported before exec, and only ``launch_server.sh`` (plus its
   recipe wrappers) knows how.
 * ``AccuracyTestParams.runner`` -- scores a gate with a harness the shared runner has
-  no dependency on (lm-eval here, OpenAI's own package in the gpt-oss test).
+  no dependency on: lm-eval, and OpenAI's own gpt_oss.evals package.
 """
 
 import atexit
 import contextlib
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -272,5 +273,61 @@ def lm_eval_runner(config_path: str):
                     )
 
         return {"score": primary, "_passed": passed, "_failures": failures}
+
+    return run
+
+
+def gpqa_openai_runner(
+    model: str,
+    n_repeats: int,
+    reasoning_effort: str,
+    max_tokens: int,
+    n_threads: int = 32,
+):
+    """Build an ``AccuracyTestParams.runner`` that scores GPQA via OpenAI's harness.
+
+    gpt_oss.evals is the only harness that reproduces the gpt-oss card's GPQA number --
+    it owns the permuted-choice prompt and the grader, and temperature 1.0 below is part
+    of that methodology. ``n_repeats`` is the caller's, because how many passes a tight
+    floor needs depends on the tolerance it is gated at.
+
+    ``model`` is both the id sent to the server and the metric label, so a gate cannot
+    report under a name the server was never asked for.
+    """
+
+    def run(base_url: str) -> Dict[str, Any]:
+        # Pure-python eval code; --no-deps so its pins never touch the pinned
+        # TPU torch stack. openai/pandas/blobfile are image deps (test extra).
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
+            check=True,
+        )
+        # The openai client insists on a key even for a local base_url.
+        os.environ.setdefault("OPENAI_API_KEY", "dummy")
+
+        from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
+        from gpt_oss.evals.gpqa_eval import GPQAEval
+
+        sampler = ChatCompletionsSampler(
+            model=model,
+            reasoning_model=True,
+            reasoning_effort=reasoning_effort,
+            temperature=1.0,
+            base_url=base_url.rstrip("/") + "/v1",
+            # Their CLI uses 131072; the caller caps it to fit CONTEXT_LEN.
+            max_tokens=max_tokens,
+        )
+        result = GPQAEval(n_repeats=n_repeats, n_threads=n_threads)(sampler)
+        print(
+            f"gpqa_diamond (openai harness, n_repeats={n_repeats}): "
+            f"score={result.score:.4f} metrics={result.metrics}"
+        )
+        # Built-in backends dump their own metrics; a runner must do its own.
+        dump_metric(
+            "gpqa_diamond_openai_harness",
+            result.score,
+            labels={"model": model, "eval": "gpt_oss.evals"},
+        )
+        return {"score": result.score}
 
     return run
