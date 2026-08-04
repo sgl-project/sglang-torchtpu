@@ -2258,15 +2258,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if layer.w13_weight_scale_2.dim() == 1:
                     # Some checkpoints store a shared scale for w1/w3.
                     w13_weight_scale_2 = layer.w13_weight_scale_2
-                elif layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                    layer.w13_weight_scale_2[:, 0],
-                    layer.w13_weight_scale_2[:, 1],
-                ):
-                    logger.warning_once(
-                        "w1_weight_scale_2 must match w3_weight_scale_2. "
-                        "Accuracy may be affected."
-                    )
-
+                else:
+                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                        layer.w13_weight_scale_2[:, 0],
+                        layer.w13_weight_scale_2[:, 1],
+                    ):
+                        logger.warning_once(
+                            "w1_weight_scale_2 must match w3_weight_scale_2. "
+                            "Accuracy may be affected."
+                        )
                     w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
             else:
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:]
