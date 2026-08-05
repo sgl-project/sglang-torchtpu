@@ -27,7 +27,17 @@ token. These builders turn that geometry into
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Protocol, Sequence, Tuple
+
+
+class FusedKVLayerTensor(Protocol):
+    """Duck-typed fused KV layer tensor. Only ``shape`` and ``element_size`` are
+    read, so the byte math stays free of a torch import (and unit-testable with a
+    plain stub)."""
+
+    shape: Sequence[int]
+
+    def element_size(self) -> int: ...
 
 
 def reshard_ratio(src_tp: int, dst_tp: int) -> int:
@@ -54,7 +64,7 @@ def source_ranks_for(decode_rank: int, ratio: int) -> List[int]:
     return list(range(decode_rank * ratio, (decode_rank + 1) * ratio))
 
 
-def head_pair_bytes(fused_layer_tensor) -> int:
+def head_pair_bytes(fused_layer_tensor: FusedKVLayerTensor) -> int:
     """Bytes of one kv-head's contiguous K+V run in a fused KV layer tensor.
 
     Independent of the per-rank kv-head count, so it matches on prefill and
@@ -65,7 +75,7 @@ def head_pair_bytes(fused_layer_tensor) -> int:
     return int(shape[3]) * int(shape[4]) * fused_layer_tensor.element_size()
 
 
-def per_rank_head_count(fused_layer_tensor) -> int:
+def per_rank_head_count(fused_layer_tensor: FusedKVLayerTensor) -> int:
     """kv_heads_packed (this rank's kv-head count) of a fused KV layer tensor."""
     return int(fused_layer_tensor.shape[2])
 
@@ -147,7 +157,7 @@ class ReshardGeometry:
 
 
 def _add_entry(
-    schedule,
+    schedule: Any,
     *,
     peer: str,
     src_block_id: int,

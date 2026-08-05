@@ -72,6 +72,14 @@ def get_raiden_kv_caches(pool) -> list:
 
 
 class RaidenKVManager(CommonKVManager):
+    """KV manager for the raiden prefill/decode transport.
+
+    FIXME: the ZMQ rendezvous scaffolding here (per-rank listener socket,
+    handshake message routing, poll draining) overlaps the tpu backend's
+    ``base.py`` control plane. Consolidate onto a shared base so raiden reuses it
+    instead of reimplementing the coordination.
+    """
+
     def __init__(
         self,
         args: KVArgs,
@@ -120,13 +128,6 @@ class RaidenKVManager(CommonKVManager):
             self._decode_aux_index: Dict[int, int] = {}
             self._remote_blocks: Dict[int, List[int]] = {}
             self._remote_endpoint: Dict[int, str] = {}
-            # room -> wall-clock stamps for lifecycle timing instrumentation:
-            # t_reg (PULL_REQ sent), t_reply (BLOCKS arrived), t_pull (start_read
-            # issued), n_blocks (pages pulled). Logged as a breakdown on completion.
-            self._t_reg: Dict[int, float] = {}
-            self._t_reply: Dict[int, float] = {}
-            self._t_pull: Dict[int, float] = {}
-            self._n_blocks: Dict[int, int] = {}
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -287,34 +288,6 @@ class RaidenKVManager(CommonKVManager):
                 logger.error(
                     "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
                 )
-            if self.disaggregation_mode != DisaggregationMode.PREFILL:
-                now = time.time()
-                for ids, status in ((done_recv, "done"), (failed, "FAIL")):
-                    for raw in ids:
-                        try:
-                            room = int(self._norm_req_id(raw))
-                        except (TypeError, ValueError):
-                            continue
-                        t_reg = self._t_reg.get(room)
-                        t_reply = self._t_reply.get(room)
-                        t_pull = self._t_pull.get(room)
-                        if t_reg is None:
-                            continue
-                        handshake = (t_reply - t_reg) if t_reply else -1.0
-                        pull_wait = (t_pull - t_reply) if (t_pull and t_reply) else -1.0
-                        transfer = (now - t_pull) if t_pull else -1.0
-                        logger.error(
-                            "RAIDENTIME rank%d room=%d status=%s blocks=%s "
-                            "handshake=%.3f pull_wait=%.3f transfer=%.3f total=%.3f",
-                            self.attn_tp_rank,
-                            room,
-                            status,
-                            self._n_blocks.get(room, -1),
-                            handshake,
-                            pull_wait,
-                            transfer,
-                            now - t_reg,
-                        )
 
     def register_to_bootstrap(self):
         # Topology/handshake registration is backend-agnostic; raiden adds no
@@ -373,7 +346,6 @@ class RaidenKVManager(CommonKVManager):
         with self._state_lock:
             self._remote_blocks[room] = remote_blocks
             self._remote_endpoint[room] = endpoint
-            self._t_reply[room] = time.time()
             aux_index = self._decode_aux_index.get(room)
         if aux_index is not None and aux_blob:
             write_aux_blob(
@@ -441,7 +413,6 @@ class RaidenKVManager(CommonKVManager):
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
-        self._t_reg[room] = time.time()
         if len(bootstrap_infos) != 1:
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
@@ -506,8 +477,6 @@ class RaidenKVManager(CommonKVManager):
         elif len(remote) < len(local):
             local = local[: len(remote)]
         engine = self._ensure_engine()
-        self._t_pull[room] = time.time()
-        self._n_blocks[room] = len(local)
         engine.start_read(str(room), room, endpoint, remote, local)
         return True
 
