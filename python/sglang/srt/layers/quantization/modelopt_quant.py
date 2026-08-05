@@ -2158,18 +2158,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def _resolve_tpu_fused_rs(self, layer: torch.nn.Module) -> None:
-        """Decide whether fused-RS owns this layer's MoE reduction.
-
-        Deliberately deferred to weight-load time. The gate reads
-        ``layer.allow_backend_reduction`` and the layer's post-expert-norm
-        contract, and models set both *after* ``FusedMoE.__init__`` returns, so
-        deciding inside ``create_moe_runner`` would always see the constructor
-        defaults and never select fused-RS. Mirrors the FP8 sibling, which
-        resolves the same flag in ``process_weights_after_loading``.
-        """
+        """Resolve fused-RS after the model publishes its ownership contract."""
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            has_tpu_fused_rs_post_expert_norm,
             unmet_tpu_nvfp4_fused_rs_requirements,
         )
+
+        model_delegates_finalize = hasattr(
+            layer, "handles_post_expert_finalize"
+        ) and has_tpu_fused_rs_post_expert_norm(layer)
+        if model_delegates_finalize:
+            layer.allow_backend_reduction = True
 
         fused_rs_setting = envs.SGLANG_TPU_FP4_FUSED_RS.get()
         unmet_requirements = (
@@ -2182,6 +2181,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
         )
         self.handles_moe_reduction = not unmet_requirements
+        if self.handles_moe_reduction and model_delegates_finalize:
+            layer.handles_post_expert_finalize = True
         if self.handles_moe_reduction:
             logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
         elif fused_rs_setting == "1":

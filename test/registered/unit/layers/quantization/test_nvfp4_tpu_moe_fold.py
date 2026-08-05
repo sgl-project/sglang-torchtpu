@@ -401,29 +401,23 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
         The apply tests hand-set these attributes on their own fixtures and the
         eager-prepare test replaces the producer with a bare Mock, so neither
-        side of that boundary pins the contract. That is exactly how a newly
-        required ``collective_id`` reached the apply path with nothing in the
-        suite writing it. Here prepare and apply run against the SAME layer
-        object with only the kernel entry point mocked, so anything apply reads
-        must have been written by prepare.
+        side of that boundary pins the contract. Here prepare and apply run
+        against the SAME layer object with only the kernel entry point mocked,
+        so anything apply reads must have been written by prepare.
         """
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
         layer = _make_block512_layer()
-        layer.layer_id = 7
 
         def fake_prepare_fused_moe_rs(prepared_layer):
             # Mirrors fused_moe_rs_op.prepare_fused_moe_rs, which cannot run
             # here (it needs an initialized TP group). Keep the attribute names
-            # and the collective-id formula in sync with that function.
+            # in sync with that function.
             prepared_layer._tpu_fused_rs_physical_order = torch.tensor(
                 [0], dtype=torch.int64
             )
             prepared_layer._tpu_fused_rs_group_offset = torch.tensor(
                 [0, 0], dtype=torch.int32
-            )
-            prepared_layer._tpu_fused_rs_collective_id = 100 + int(
-                prepared_layer.layer_id
             )
 
         hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
@@ -464,7 +458,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         # Every layer-owned value the kernel receives came from prepare, not
         # from the fixture, so dropping or renaming one fails here.
         call = fused_moe_rs_gather.call_args.kwargs
-        self.assertEqual(call["collective_id"], 100 + layer.layer_id)
+        self.assertNotIn("collective_id", call)
         self.assertIs(call["group_offset"], layer._tpu_fused_rs_group_offset)
         self.assertIs(
             call["physical_order_to_tp_rank"], layer._tpu_fused_rs_physical_order
@@ -485,15 +479,17 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
         layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
-        layer._tpu_fused_rs_collective_id = 107
-        fused_moe_rs_gather = mock.Mock(
-            return_value=torch.randn(4, HIDDEN_SIZE, dtype=torch.bfloat16)
-        )
-        fused_rs_module = types.SimpleNamespace(fused_moe_rs_gather=fused_moe_rs_gather)
+        from sglang.srt.layers.moe.pallas import fused_moe_rs_op
 
-        with mock.patch.dict(
-            sys.modules,
-            {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+        # Autospec is intentional: it catches adapter/backend API skew during a
+        # rebase instead of letting a permissive Mock accept removed keywords.
+        fused_moe_rs_gather = mock.create_autospec(
+            fused_moe_rs_op.fused_moe_rs_gather,
+            return_value=torch.randn(4, HIDDEN_SIZE, dtype=torch.bfloat16),
+        )
+
+        with mock.patch.object(
+            fused_moe_rs_op, "fused_moe_rs_gather", fused_moe_rs_gather
         ):
             result = fp4_moe.apply_tpu_nvfp4_moe(
                 layer=layer,
@@ -506,7 +502,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         call = fused_moe_rs_gather.call_args.kwargs
         self.assertFalse(call["fp8_direct_write"])
         self.assertFalse(call["has_post_expert_norm"])
-        self.assertEqual(call["collective_id"], 107)
+        self.assertNotIn("collective_id", call)
         self.assertEqual(call["topk_ids"][1, 1].item(), 0)
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
@@ -526,7 +522,6 @@ class TestNvfp4Block512Contract(CustomTestCase):
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
         layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
-        layer._tpu_fused_rs_collective_id = 107
         fused_moe_rs_gather = mock.Mock(
             side_effect=lambda **kwargs: kwargs["hidden_states"]
         )
@@ -552,14 +547,13 @@ class TestNvfp4Block512Contract(CustomTestCase):
             ],
             [1024, 1024, 2],
         )
-        # The chunks are sequential invocations of the same layer's collective,
-        # so they share its id; every rank issues the same chunk sequence.
-        self.assertEqual(
-            {
-                call.kwargs["collective_id"]
+        # The shared backend owns collective-ID reuse; the adapter only issues
+        # the same deterministic chunk sequence on every rank.
+        self.assertTrue(
+            all(
+                "collective_id" not in call.kwargs
                 for call in fused_moe_rs_gather.call_args_list
-            },
-            {107},
+            )
         )
         torch.testing.assert_close(result.hidden_states, hidden_states)
 
@@ -678,7 +672,9 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
     silently, since the stock path still serves correct numerics.
     """
 
-    def _run_gate(self, *, ep_size: int = 4, world_size: int = 4):
+    def _run_gate(
+        self, *, ep_size: int = 4, world_size: int = 4, model_contract: bool = False
+    ):
         from sglang.srt.layers.quantization import modelopt_quant
 
         config = modelopt_quant.ModelOptFp4Config.from_config(
@@ -704,6 +700,10 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
             num_fused_shared_experts=0,
             moe_runner_config=moe_runner_config,
         )
+        if model_contract:
+            layer.supports_tpu_fused_rs_post_expert_norm = True
+            layer.handles_post_expert_finalize = False
+            moe_runner_config.no_combine = True
         prepared = {}
 
         def _fake_prepare(layer, **kwargs):
@@ -742,22 +742,30 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
             method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(config)
             method.create_moe_runner(layer, moe_runner_config)
             constructed = method.handles_moe_reduction
-            # What the model does after FusedMoE.__init__ returns.
-            layer.allow_backend_reduction = True
+            if not model_contract:
+                layer.allow_backend_reduction = True
             method.process_weights_after_loading(layer)
-        return constructed, method.handles_moe_reduction, prepared
+        return constructed, method.handles_moe_reduction, prepared, layer
 
     def test_gate_sees_overrides_applied_after_construction(self):
-        constructed, resolved, prepared = self._run_gate()
+        constructed, resolved, prepared, _ = self._run_gate()
 
         self.assertFalse(constructed, "gate must not be decided in the constructor")
         self.assertTrue(resolved)
         self.assertTrue(prepared["use_fused_rs"])
 
+    def test_gate_accepts_model_finalize_ownership_contract(self):
+        _, resolved, prepared, layer = self._run_gate(model_contract=True)
+
+        self.assertTrue(resolved)
+        self.assertTrue(prepared["use_fused_rs"])
+        self.assertTrue(layer.allow_backend_reduction)
+        self.assertTrue(layer.handles_post_expert_finalize)
+
     def test_gate_still_declines_an_unsupported_layout(self):
         # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
         # list rejects; deferring the decision must not soften the gate.
-        _, resolved, prepared = self._run_gate(ep_size=2, world_size=4)
+        _, resolved, prepared, _ = self._run_gate(ep_size=2, world_size=4)
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
