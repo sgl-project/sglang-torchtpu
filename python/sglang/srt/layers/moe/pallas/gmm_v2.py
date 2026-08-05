@@ -174,7 +174,7 @@ class TileSizes:
     tile_n: int
 
 
-def _recover_quant_block_size(size_k: int, num_blocks: int) -> int:
+def recover_quant_block_size(size_k: int, num_blocks: int) -> int:
     """Recover a power-of-two quantization block size from its block count."""
     if num_blocks <= 1:
         return size_k

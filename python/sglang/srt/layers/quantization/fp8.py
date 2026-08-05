@@ -2052,9 +2052,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
-        if moe_runner_backend.is_tpu_fused_rs() and not _is_tpu:
-            raise ValueError("tpu_fused_rs is only available on TPU")
-
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
@@ -2066,6 +2063,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif moe_runner_backend.is_tpu_fused_rs() and not _is_tpu:
+            raise ValueError("tpu_fused_rs is only available on TPU")
 
         if (
             moe_runner_backend.is_deep_gemm()

@@ -38,7 +38,7 @@ from sglang.srt.layers.moe.pallas.fused_rs.utils import (
     get_mesh_shape_product,
     get_moe_expert_axis,
 )
-from sglang.srt.layers.moe.pallas.gmm_v2 import _recover_quant_block_size
+from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 
 EXPERT = "model"
 MLP_DATA = "data"
@@ -191,7 +191,7 @@ def moe_gmm_local_rs_nodedup(
         w2_dtype=w2.dtype,
         is_quantized=w1_scale is not None,
         # Use the same power-of-two recovery the in-kernel path uses
-        # (gmm_v2_fused_rs via _recover_quant_block_size). A raw floor
+        # (gmm_v2_fused_rs via recover_quant_block_size). A raw floor
         # ``w1.shape[1] // w1_scale.shape[1]`` underestimates the block size
         # when K is not a multiple of it (e.g. K=2304, 5 scale blocks -> 460
         # instead of 512), which makes this host-side tile lookup key differ
@@ -199,7 +199,7 @@ def moe_gmm_local_rs_nodedup(
         # entry here and can pick a different tile_m than the kernel -> the
         # max_num_gm undercount / gather_sem leak described above.
         quant_block_size=(
-            _recover_quant_block_size(w1.shape[1], w1_scale.shape[1])
+            recover_quant_block_size(w1.shape[1], w1_scale.shape[1])
             if w1_scale is not None
             else None
         ),

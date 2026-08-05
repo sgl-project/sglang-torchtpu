@@ -10,13 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
-    get_fused_tuned_block_sizes,
-)
-from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
-    get_tuned_block_sizes_v2 as get_tuned_block_sizes,
-)
-from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, _recover_quant_block_size
+from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
 
 
 def get_maybe_quantize_lhs(
@@ -1707,9 +1701,6 @@ def make_gmm_configs(
     original_k: int | None = None,
     fuse_act: str | None = None,
     post_expert_norm_weight: jax.Array | None = None,
-    original_size_m: int | None = None,
-    original_size_k: int | None = None,
-    original_size_n: int | None = None,
     packed_nvfp4: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
@@ -1732,7 +1723,7 @@ def make_gmm_configs(
         # When K was zero-padded for DMA alignment, use the original K
         # to compute block_size so quant block boundaries stay correct.
         _k_for_blocks = original_k if original_k is not None else dims.size_k
-        block_size = _recover_quant_block_size(_k_for_blocks, num_blocks)
+        block_size = recover_quant_block_size(_k_for_blocks, num_blocks)
         rhs_packing = 8 if packed_nvfp4 else 32 // jax.dtypes.itemsize_bits(rhs.dtype)
     else:
         has_scale = False
@@ -1794,24 +1785,6 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-        default_block_sizes = (tiles.tile_m, tiles.tile_k, tiles.tile_n)
-        # Use original sizes (before padding) if provided, to keep lookup keys consistent
-        # across different kernels
-        tile_m, tile_k, tile_n = get_tuned_block_sizes(
-            dims.size_m if original_size_m is None else original_size_m,
-            dims.size_k if original_size_k is None else original_size_k,
-            dims.size_n if original_size_n is None else original_size_n,
-            dims.size_group,
-            lhs_cfgs.dtype,
-            rhs_cfgs.dtype,
-            maybe_quantize_lhs,
-            rhs_cfgs.quant_block_size,
-            default_block_sizes,
-            lhs_indices,
-            output_indices,
-            fuse_act,
-        )
-        tiles = TileSizes(tile_m=tile_m, tile_k=tile_k, tile_n=tile_n)
 
     return GmmConfigs(
         dims=dims,
@@ -1967,9 +1940,6 @@ def gmm_v2(
     # does not change the matmul result.  For quantized rhs we keep the
     # original quant_block_size / num_blocks — the extra K elements are
     # zeros and their scale value is irrelevant.
-    original_size_m = lhs.shape[0]
-    _, original_size_k_raw, original_size_n = rhs.shape
-    original_size_k = original_size_k_raw * 2 if packed_nvfp4 else original_size_k_raw
     _use_dma_gather = lhs_indices is not None and _can_dma_rows(lhs.shape[1], lhs.dtype)
     _original_k = lhs.shape[1]
     if not _use_dma_gather and lhs_indices is not None:
@@ -2035,10 +2005,7 @@ def gmm_v2(
         original_k=_original_k if _original_k != lhs.shape[1] else None,
         fuse_act=fuse_act,
         post_expert_norm_weight=post_expert_norm_weight,
-        original_size_m=original_size_m,
-        original_size_k=original_size_k,
         packed_nvfp4=packed_nvfp4,
-        original_size_n=original_size_n,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -3177,8 +3144,8 @@ def gmm_v2_fused(
     is_quantized = w1_scale is not None
     if is_quantized:
         assert w2_scale is not None
-        rhs1_quant_block_size = _recover_quant_block_size(size_k1, w1_scale.shape[1])
-        rhs2_quant_block_size = _recover_quant_block_size(size_k2, w2_scale.shape[1])
+        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
+        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2_scale.shape[1])
         quant_block_size = rhs1_quant_block_size
         w1_scale = w1_scale.astype(jnp.float32)
         w2_scale = w2_scale.astype(jnp.float32)
@@ -3379,22 +3346,8 @@ def gmm_v2_fused(
             2,
         )
 
-    # Override with jointly tuned block sizes if available
-    tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = (
-        get_fused_tuned_block_sizes(
-            size_m,
-            size_k1,
-            size_n1,
-            size_k2,
-            aligned_n2,
-            size_group,
-            out_dtype,
-            w1.dtype,
-            quant_block_size if quant_block_size else None,
-            default_tiles,
-            fuse_act=act_fn,
-        )
-    )
+    # This non-RS path has no in-tree tuning table; keep its heuristic tiles.
+    tile_m, tile_k1, tile_n1, tile_k2, tile_n2, num_w1_bufs, num_w2_bufs = default_tiles
 
     # Post-processing: alignment and divisibility
     k_align1 = num_lanes  # matmul only needs lane alignment, not sublane

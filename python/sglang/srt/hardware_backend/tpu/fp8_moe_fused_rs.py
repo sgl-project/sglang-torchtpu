@@ -20,6 +20,8 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 # Keep larger prefills on the stock path; the fused kernel is device-validated
 # through the 256-token Qwen3 specialization.
 _FUSED_RS_MAX_TOKENS = 256
+# Models with post-expert normalization must opt in and provide both hooks;
+# no_combine alone does not establish compatible normalization semantics.
 _POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
 _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
 _POST_EXPERT_NORM_FALLBACK = "finalize_tpu_fused_rs_fallback"

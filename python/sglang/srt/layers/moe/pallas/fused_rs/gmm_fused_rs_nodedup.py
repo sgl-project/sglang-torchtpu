@@ -25,27 +25,27 @@ from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
-    _recover_quant_block_size,
-    align_to,
-    calculate_tiling,
     Dimensions,
-    dma_gather_gm_start,
-    dma_gather_gm_wait,
     FusedDims,
     FusedWeightsRef,
-    get_maybe_quantize_lhs,
     GmmConfigs,
-    inner_kernel,
     InputConfigs,
     MetadataRef,
     TileSizes,
     WeightsRef,
+    align_to,
+    calculate_tiling,
+    dma_gather_gm_start,
+    dma_gather_gm_wait,
+    get_maybe_quantize_lhs,
+    inner_kernel,
     zero_out_end_3d,
     zero_out_start_3d,
 )
 from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
     get_fused_rs_tuned_block_sizes,
 )
+from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 
 # TODO(rupliu) when the model is small, latency bound, needs to increase pipeline depth
 _IN_KERNEL_RECV_COUNT_MAX_M = 2048
@@ -1570,8 +1570,8 @@ def gmm_v2_fused_rs(
     is_quantized = w1_scale is not None
     if is_quantized:
         assert w2_scale is not None
-        rhs1_quant_block_size = _recover_quant_block_size(size_k1, w1_scale.shape[1])
-        rhs2_quant_block_size = _recover_quant_block_size(size_k2, w2_scale.shape[1])
+        rhs1_quant_block_size = recover_quant_block_size(size_k1, w1_scale.shape[1])
+        rhs2_quant_block_size = recover_quant_block_size(size_k2, w2_scale.shape[1])
         quant_block_size = rhs1_quant_block_size
         w1_scale = w1_scale.astype(jnp.float32)
         w2_scale = w2_scale.astype(jnp.float32)
