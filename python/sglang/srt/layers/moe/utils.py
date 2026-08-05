@@ -97,13 +97,13 @@ class MoeRunnerBackend(Enum):
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     AITER = "aiter"
-    TPU_FUSED_RS = "tpu_fused_rs"
+    PALLAS_TPU_FUSED_RS = "pallas_tpu_fused_rs"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
 
-    def is_tpu_fused_rs(self):
-        return self == MoeRunnerBackend.TPU_FUSED_RS
+    def is_pallas_tpu_fused_rs(self):
+        return self == MoeRunnerBackend.PALLAS_TPU_FUSED_RS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM

@@ -12,6 +12,7 @@ and small prefills, with the stock FP8 MoE path for larger prefills.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 import torch
 
@@ -20,49 +21,6 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 # Keep larger prefills on the stock path; the fused kernel is device-validated
 # through the 256-token Qwen3 specialization.
 _FUSED_RS_MAX_TOKENS = 256
-# Models with post-expert normalization must opt in and provide both hooks;
-# no_combine alone does not establish compatible normalization semantics.
-_POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
-_POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
-_POST_EXPERT_NORM_FALLBACK = "finalize_tpu_fused_rs_fallback"
-
-
-def _has_post_expert_norm_contract(layer: torch.nn.Module) -> bool:
-    return bool(getattr(layer, _POST_EXPERT_NORM_CAPABILITY, False))
-
-
-def _prepare_post_expert_norm_contract(layer: torch.nn.Module) -> None:
-    """Validate and cache the model-owned post-expert norm contract."""
-    has_post_expert_norm = _has_post_expert_norm_contract(layer)
-    layer.__dict__["_tpu_fused_rs_has_post_expert_norm"] = has_post_expert_norm
-    if not has_post_expert_norm:
-        return
-
-    weight_getter = getattr(layer, _POST_EXPERT_NORM_WEIGHT_GETTER, None)
-    fallback = getattr(layer, _POST_EXPERT_NORM_FALLBACK, None)
-    if not callable(weight_getter) or not callable(fallback):
-        raise TypeError(
-            "TPU fused-RS post-expert norm requires model-provided weight and "
-            "fallback-finalization hooks"
-        )
-
-    # The model hook owns semantic validation (norm type, gain convention, and
-    # epsilon). Calling it after weight loading also proves the weight exists.
-    weight = weight_getter()
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError("TPU fused-RS post-expert norm weight must be a tensor")
-    if weight.ndim != 1 or weight.numel() != layer.hidden_size:
-        raise RuntimeError(
-            "TPU fused-RS post-expert norm weight must have shape "
-            f"({layer.hidden_size},), got {tuple(weight.shape)}"
-        )
-    if weight.device != layer.w2_weight.device:
-        raise RuntimeError(
-            "TPU fused-RS post-expert norm weight must be on the MoE device"
-        )
-    # Bypass nn.Module registration: this is an alias of the model-owned
-    # parameter, not a second checkpoint parameter.
-    layer.__dict__["_tpu_fused_rs_post_expert_norm_weight"] = weight
 
 
 def supports_fp8_fused_rs(
@@ -78,7 +36,6 @@ def supports_fp8_fused_rs(
     activation: str,
     apply_router_weight_on_input: bool,
     no_combine: bool,
-    has_compatible_post_expert_norm: bool,
     has_fused_shared_experts: bool,
     standard_dispatcher: bool,
     enable_dp_attention: bool,
@@ -98,7 +55,6 @@ def supports_fp8_fused_rs(
             activation=activation,
             apply_router_weight_on_input=apply_router_weight_on_input,
             no_combine=no_combine,
-            has_compatible_post_expert_norm=has_compatible_post_expert_norm,
             has_fused_shared_experts=has_fused_shared_experts,
             standard_dispatcher=standard_dispatcher,
             enable_dp_attention=enable_dp_attention,
@@ -121,7 +77,6 @@ def fp8_fused_rs_unsupported_reason(
     activation: str,
     apply_router_weight_on_input: bool,
     no_combine: bool,
-    has_compatible_post_expert_norm: bool,
     has_fused_shared_experts: bool,
     standard_dispatcher: bool,
     enable_dp_attention: bool,
@@ -149,8 +104,8 @@ def fp8_fused_rs_unsupported_reason(
         return f"the MoE activation must be silu, got {activation}"
     if apply_router_weight_on_input:
         return "applying router weights on the expert input is not supported"
-    if no_combine != has_compatible_post_expert_norm:
-        return "no_combine must match the model's post-expert norm contract"
+    if no_combine:
+        return "no_combine output is not supported"
     if has_fused_shared_experts:
         return "fused shared experts are not supported"
     if not standard_dispatcher:
@@ -167,6 +122,10 @@ def should_use_fp8_fused_rs(num_tokens: int) -> bool:
 
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     """Eager, load-time prep for the FP8 fused-RS path. Returns True if enabled."""
+    return _prepare_fp8_fused_rs(layer, allow_no_combine=False)
+
+
+def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.distributed.parallel_state import (
         get_moe_expert_parallel_world_size,
@@ -181,7 +140,6 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     parallel = get_parallel()
     server_args = get_server_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    has_post_expert_norm = _has_post_expert_norm_contract(layer)
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         ep_size=ep_size,
         tp_size=get_tp_group().world_size,
@@ -193,8 +151,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
         gated=runner_config.is_gated,
         activation=runner_config.activation,
         apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
-        no_combine=runner_config.no_combine,
-        has_compatible_post_expert_norm=has_post_expert_norm,
+        no_combine=runner_config.no_combine and not allow_no_combine,
         has_fused_shared_experts=bool(layer.num_fused_shared_experts),
         standard_dispatcher=get_moe_a2a_backend().is_none(),
         enable_dp_attention=server_args.enable_dp_attention,
@@ -204,8 +161,6 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
         layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason
         return False
     layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
-
-    _prepare_post_expert_norm_contract(layer)
 
     # prepare_tpu_fp8_moe_weights already stores weights as (E, K, N) and
     # channelwise scales as (E, 1, 1, N), exactly as fused-RS expects.
@@ -224,8 +179,29 @@ def apply_fp8_fused_rs(
     dispatch_output,
     activation: str,
 ) -> StandardCombineInput:
+    return _apply_fp8_fused_rs(
+        layer=layer,
+        dispatch_output=dispatch_output,
+        activation=activation,
+        post_expert_norm_weight=None,
+        finalize_fallback=None,
+    )
+
+
+def _apply_fp8_fused_rs(
+    *,
+    layer: torch.nn.Module,
+    dispatch_output,
+    activation: str,
+    post_expert_norm_weight: torch.Tensor | None = None,
+    finalize_fallback: Callable | None = None,
+) -> StandardCombineInput:
     x = dispatch_output.hidden_states
-    has_post_expert_norm = layer._tpu_fused_rs_has_post_expert_norm
+    has_post_expert_norm = post_expert_norm_weight is not None
+    if has_post_expert_norm != (finalize_fallback is not None):
+        raise ValueError(
+            "post_expert_norm_weight and finalize_fallback must be provided together"
+        )
     if not should_use_fp8_fused_rs(x.shape[0]):
         from sglang.srt.distributed import moe_expert_parallel_all_reduce
         from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
@@ -240,10 +216,8 @@ def apply_fp8_fused_rs(
             ),
             no_combine=layer.moe_runner_config.no_combine,
         )
-        if has_post_expert_norm:
-            stock_output = getattr(layer, _POST_EXPERT_NORM_FALLBACK)(
-                stock_output, dispatch_output
-            )
+        if finalize_fallback is not None:
+            stock_output = finalize_fallback(stock_output, dispatch_output)
         # The model-level EP reduction is disabled whenever fused-RS is
         # selected, so large-prefill fallback must perform it here.
         return StandardCombineInput(
@@ -259,9 +233,9 @@ def apply_fp8_fused_rs(
     topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
     topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
-    post_expert_norm_weight = (
-        layer._tpu_fused_rs_post_expert_norm_weight
-        if has_post_expert_norm
+    norm_weight = (
+        post_expert_norm_weight
+        if post_expert_norm_weight is not None
         else x.new_zeros((1,))
     )
 
@@ -273,7 +247,7 @@ def apply_fp8_fused_rs(
         w2_scale=layer.w2_weight_scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        post_expert_norm_weight=post_expert_norm_weight,
+        post_expert_norm_weight=norm_weight,
         group_offset=layer._tpu_fused_rs_group_offset,
         topk=int(topk_ids.shape[-1]),
         activation=activation,

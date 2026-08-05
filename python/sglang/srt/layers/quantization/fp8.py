@@ -1948,7 +1948,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_fp4_expert=self.is_fp4_expert,
             )
             moe_runner_backend = get_moe_runner_backend()
-            if moe_runner_backend.is_auto() or moe_runner_backend.is_tpu_fused_rs():
+            if (
+                moe_runner_backend.is_auto()
+                or moe_runner_backend.is_pallas_tpu_fused_rs()
+            ):
                 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
                     prepare_fp8_fused_rs,
                 )
@@ -1957,7 +1960,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 if self.handles_moe_reduction and get_tensor_model_parallel_rank() == 0:
                     logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
                 if (
-                    moe_runner_backend.is_tpu_fused_rs()
+                    moe_runner_backend.is_pallas_tpu_fused_rs()
                     and not self.handles_moe_reduction
                 ):
                     reason = getattr(
@@ -1966,7 +1969,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         "unknown incompatibility",
                     )
                     raise ValueError(
-                        "--moe-runner-backend tpu_fused_rs is not supported by "
+                        "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
                         f"this model or parallel layout: {reason}"
                     )
 
@@ -2063,8 +2066,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        elif moe_runner_backend.is_tpu_fused_rs() and not _is_tpu:
-            raise ValueError("tpu_fused_rs is only available on TPU")
+        elif moe_runner_backend.is_pallas_tpu_fused_rs() and not _is_tpu:
+            raise ValueError("pallas_tpu_fused_rs is only available on TPU")
 
         if (
             moe_runner_backend.is_deep_gemm()
