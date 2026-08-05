@@ -137,7 +137,6 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
-    collective_id: int = 0,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -234,7 +233,6 @@ def moe_gmm_local_rs_nodedup(
         max_num_gm=max_num_gm,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
-        collective_id=collective_id,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -307,7 +305,6 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
-    collective_id: int = 0,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -371,7 +368,6 @@ def expert_parallel_gmm_rs(
             has_post_norm=_has_pn_rs,
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
-            collective_id=collective_id,
         ),
         mesh=mesh,
         in_specs=(
@@ -426,7 +422,6 @@ def expert_parallel_gmm_rs(
         "activation",
         "scoring_fn",
         "fp8_direct_write",
-        "collective_id",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -451,7 +446,6 @@ def fused_moe_func_rs(
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
-    collective_id: int = 0,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -510,7 +504,6 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
-        collective_id=collective_id,
     )
 
     return result[:num_tokens, :hidden_size]

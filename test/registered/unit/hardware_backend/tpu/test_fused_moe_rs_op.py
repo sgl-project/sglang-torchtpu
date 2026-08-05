@@ -15,9 +15,8 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFusedMoeRsOp(CustomTestCase):
-    def test_prepare_assigns_group_offset(self):
+    def test_prepare_sets_physical_rank_metadata(self):
         layer = Mock(
-            layer_id=7,
             num_local_experts=16,
             w13_weight=torch.empty(1),
         )
@@ -36,6 +35,10 @@ class TestFusedMoeRsOp(CustomTestCase):
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
 
+        torch.testing.assert_close(
+            layer._tpu_fused_rs_physical_order,
+            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64),
+        )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 4], dtype=torch.int32),
@@ -59,7 +62,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 fused_moe_rs_op,
                 "fused_moe_rs_call",
                 return_value=token_shard,
-            ) as fused_call,
+            ),
         ):
             output = fused_moe_rs_op.fused_moe_rs_gather(
                 hidden_states=torch.zeros(8, 1),

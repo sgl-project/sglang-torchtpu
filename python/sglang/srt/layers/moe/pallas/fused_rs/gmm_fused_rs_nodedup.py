@@ -1524,7 +1524,6 @@ def kernel_main_fused_rs_fp8(
         "top_k",
         "fp8_direct_write",
         "use_in_kernel_recv_count",
-        "collective_id",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1553,7 +1552,6 @@ def gmm_v2_fused_rs(
     top_k: int,
     fp8_direct_write: bool = False,
     use_in_kernel_recv_count: bool | None = None,
-    collective_id: int = 0,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -1946,10 +1944,12 @@ def gmm_v2_fused_rs(
         pltpu.SemaphoreType.DMA((1,)),
     ]
 
+    # Keep the ID shared so identical MoE layers reuse one Mosaic compilation.
+    # The wrapper's post-kernel TP all-gather orders successive layer calls.
     compiler_params = pltpu.CompilerParams(
         vmem_limit_bytes=vmem_limit_bytes,
         disable_bounds_checks=True,
-        collective_id=collective_id,
+        collective_id=0,
     )
 
     w1_scale_input = w1_scale if is_quantized else jnp.zeros((1, 1, 1, 1), jnp.float32)
