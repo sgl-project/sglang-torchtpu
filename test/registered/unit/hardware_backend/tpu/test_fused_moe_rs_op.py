@@ -15,7 +15,7 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFusedMoeRsOp(CustomTestCase):
-    def test_prepare_assigns_layer_specific_collective_id(self):
+    def test_prepare_assigns_group_offset(self):
         layer = Mock(
             layer_id=7,
             num_local_experts=16,
@@ -36,7 +36,6 @@ class TestFusedMoeRsOp(CustomTestCase):
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
 
-        self.assertEqual(layer._tpu_fused_rs_collective_id, 107)
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 4], dtype=torch.int32),
@@ -76,12 +75,10 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=True,
-                collective_id=100,
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
             )
 
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
-        self.assertEqual(fused_call.call_args.kwargs["collective_id"], 100)
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
 
 

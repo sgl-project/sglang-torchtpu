@@ -279,7 +279,6 @@ def apply_fp8_fused_rs(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=True,
-        collective_id=layer._tpu_fused_rs_collective_id,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])

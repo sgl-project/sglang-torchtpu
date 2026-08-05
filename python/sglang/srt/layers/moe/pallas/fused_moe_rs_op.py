@@ -49,7 +49,6 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )
-    layer._tpu_fused_rs_collective_id = 100 + int(layer.layer_id)
     _build_fused_moe_rs_op()
 
 
@@ -95,7 +94,6 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
-        collective_id: int,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -107,6 +105,8 @@ def _build_fused_moe_rs_op():
             topk_ids = jnp.pad(topk_ids, ((0, token_padding), (0, 0)))
 
         # Run the experts and fuse their model-axis reduce-scatter in one kernel.
+        # MoE layers are data-dependent and cannot overlap. Reuse the default
+        # collective ID so the exported kernel can be compiled once per shape.
         result = fused_moe_func_rs(
             hidden_states=hidden_states,
             w1=w1,
@@ -132,7 +132,6 @@ def _build_fused_moe_rs_op():
             # staging can exceed the safe device-side synchronization budget
             # for wide expert geometries such as Qwen3-Coder-480B.
             fp8_direct_write=fp8_direct_write,
-            collective_id=collective_id,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
@@ -153,7 +152,6 @@ def _build_fused_moe_rs_op():
             P(),
             P(),
             P("model"),
-            None,
             None,
             None,
             None,
@@ -179,7 +177,6 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
-    collective_id: int = 0,
 ) -> torch.Tensor:
     return _build_fused_moe_rs_op()(
         hidden_states,
@@ -195,7 +192,6 @@ def fused_moe_rs_call(
         activation,
         has_post_expert_norm,
         fp8_direct_write,
-        collective_id,
     )
 
 
@@ -215,7 +211,6 @@ def fused_moe_rs_gather(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
-    collective_id: int,
     physical_order_to_tp_rank: torch.Tensor,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
@@ -234,7 +229,6 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
-        collective_id=collective_id,
     )
     output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]
