@@ -89,6 +89,24 @@ class DecoderCompilePolicy(CompilePolicy):
         """Finalize outputs from a speculative forward."""
         return outputs
 
+    def should_defer_verify_output_unpadding(
+        self, batch: Any, verify_input: Any, sampling_info: Any
+    ) -> bool:
+        """Return whether this policy keeps target verify outputs padded."""
+        return False
+
+    def prepare_spec_verify(
+        self, batch: Any, verify_input: Any, next_token_logits: Any
+    ) -> Any:
+        """Prepare inputs for speculative verification."""
+        return None
+
+    def finalize_spec_verify(
+        self, padding: Any, predict: Any, accept_lens: Any, accept_index: Any
+    ) -> tuple[Any, Any, Any]:
+        """Restore inputs and trim verification outputs."""
+        return predict, accept_lens, accept_index
+
 
 class NoopCompilePolicy(DecoderCompilePolicy):
     """Default noop policy carried until a decoder policy installs itself."""

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
+import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -31,9 +33,54 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecPaddingState
 
 logger = get_logger(__name__)
+
+
+# Safe values for padded sampling rows.
+_TEMPERATURE_FILL = 1.0
+_TOP_K_FILL = 1
+_TOP_P_FILL = 1.0
+# -1 keeps padded results out of real request slots.
+_DRAFT_TOKEN_FILL = 0
+_RETRIEVE_INDEX_FILL = -1
+
+
+@dataclass(frozen=True)
+class _SpecVerifyPadding:
+    """Original tensors needed to restore a logical verify batch."""
+
+    state: SpecPaddingState
+    batch: Any
+    verify_input: SpecInput
+    seq_lens: torch.Tensor
+    draft_token: torch.Tensor
+    retrieve_index: torch.Tensor
+    temperatures: torch.Tensor | None
+    top_ks: torch.Tensor | None
+    top_ps: torch.Tensor | None
+
+
+def _pad_rows(tensor: torch.Tensor, pad_rows: int, fill: float) -> torch.Tensor:
+    """Append ``pad_rows`` filler requests to a per-request tensor."""
+    pad_spec = [0, 0] * (tensor.dim() - 1) + [0, pad_rows]
+    return F.pad(tensor, pad_spec, value=fill)
+
+
+def _deferred_padding_state(spec_info: SpecInput, logits_rows: int):
+    """Report the padding still present in the target logits, if any."""
+    state = spec_info.padding_state
+    if state is None or not spec_info.keep_outputs_padded:
+        return None
+    if state.physical_num_tokens == state.logical_num_tokens:
+        return None
+    if logits_rows != state.physical_num_tokens:
+        raise ValueError(
+            "Deferred verify logits do not match the recorded padding: "
+            f"state={state}, logits rows={logits_rows}."
+        )
+    return state
 
 
 def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | None:
@@ -586,7 +633,6 @@ class SpecDecodeCompilePolicyMixin:
             spec_info.topk_index = _pad_first_dim(spec_info.topk_index, pad_b)
             spec_info.hidden_states = _pad_first_dim(spec_info.hidden_states, pad_b)
 
-            # input_ids is built later by the per-step draft loop.
             spec_info.record_padding(
                 logical_batch_size=real_bs,
                 physical_batch_size=pad_b,
@@ -663,6 +709,113 @@ class SpecDecodeCompilePolicyMixin:
                 logical_num_tokens=real_tokens,
                 physical_num_tokens=pad_tokens,
             )
+
+    def should_defer_verify_output_unpadding(
+        self, batch: Any, verify_input: SpecInput, sampling_info: Any
+    ) -> bool:
+        """Decide whether TPU can defer target-output unpadding until sampling."""
+        verify_input.keep_outputs_padded = (
+            not batch.forward_mode.is_idle()
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and sampling_info.acc_additive_penalties is None
+            and sampling_info.acc_scaling_penalties is None
+            and sampling_info.logit_bias is None
+        )
+        return verify_input.keep_outputs_padded
+
+    def prepare_spec_verify(
+        self,
+        batch: Any,
+        verify_input: SpecInput,
+        next_token_logits: torch.Tensor,
+    ) -> _SpecVerifyPadding | None:
+        """Temporarily pad scheduler inputs to match deferred target logits."""
+        if batch.forward_mode.is_idle():
+            return None
+        state = _deferred_padding_state(verify_input, int(next_token_logits.shape[0]))
+        if state is None:
+            return None
+
+        pad_bs = state.physical_batch_size - state.logical_batch_size
+        sampling_info = batch.sampling_info
+
+        # Preserve original tensors so aliases can be restored exactly.
+        padding = _SpecVerifyPadding(
+            state=state,
+            batch=batch,
+            verify_input=verify_input,
+            seq_lens=batch.seq_lens,
+            draft_token=verify_input.draft_token,
+            retrieve_index=verify_input.retrieve_index,
+            temperatures=sampling_info.temperatures,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+        )
+
+        # Build every replacement before publishing any of them, so an error
+        # cannot leave the caller with a partially padded batch.
+        seq_lens = _pad_rows(padding.seq_lens, pad_bs, 0)
+        draft_token = _pad_rows(
+            padding.draft_token,
+            pad_bs * verify_input.draft_token_num,
+            _DRAFT_TOKEN_FILL,
+        )
+        retrieve_index = _pad_rows(padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL)
+        temperatures = (
+            _pad_rows(padding.temperatures, pad_bs, _TEMPERATURE_FILL)
+            if padding.temperatures is not None
+            else None
+        )
+        top_ks = (
+            _pad_rows(padding.top_ks, pad_bs, _TOP_K_FILL)
+            if padding.top_ks is not None
+            else None
+        )
+        top_ps = (
+            _pad_rows(padding.top_ps, pad_bs, _TOP_P_FILL)
+            if padding.top_ps is not None
+            else None
+        )
+
+        # Publish padded tensors only while eagle_sample runs.
+        batch.seq_lens = seq_lens
+        verify_input.draft_token = draft_token
+        verify_input.retrieve_index = retrieve_index
+        sampling_info.temperatures = temperatures
+        sampling_info.top_ks = top_ks
+        sampling_info.top_ps = top_ps
+        # Deliberately not widened, because the TPU verify path never reads them:
+        # retrieve_next_token / retrieve_next_sibling are sgl_kernel-only
+        # arguments, and draft_probs is accepted but ignored by the torch
+        # rejection sampler.
+        return padding
+
+    def finalize_spec_verify(
+        self,
+        padding: _SpecVerifyPadding | None,
+        predict: torch.Tensor | None,
+        accept_lens: torch.Tensor | None,
+        accept_index: torch.Tensor | None,
+    ) -> tuple[Any, Any, Any]:
+        """Restore original tensors and trim verification results."""
+        if padding is None:
+            return predict, accept_lens, accept_index
+        sampling_info = padding.batch.sampling_info
+        padding.batch.seq_lens = padding.seq_lens
+        padding.verify_input.draft_token = padding.draft_token
+        padding.verify_input.retrieve_index = padding.retrieve_index
+        sampling_info.temperatures = padding.temperatures
+        sampling_info.top_ks = padding.top_ks
+        sampling_info.top_ps = padding.top_ps
+        if predict is None:
+            return predict, accept_lens, accept_index
+        state = padding.state
+        return (
+            predict[: state.logical_num_tokens],
+            accept_lens[: state.logical_batch_size],
+            accept_index[: state.logical_batch_size],
+        )
 
 
 class SpecDecoderTpuCompilePolicy(

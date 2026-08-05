@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
@@ -127,7 +128,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         existing_backend = object()
         decode_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
 
@@ -148,7 +151,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
 

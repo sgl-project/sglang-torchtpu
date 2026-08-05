@@ -1571,6 +1571,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
+        target_compile_policy = self.target_worker.model_runner.compile_policy
+        # Keep scheduler tensors logical; the policy pads them around sampling.
+        defer_output_unpadding = (
+            target_compile_policy.should_defer_verify_output_unpadding(
+                batch, verify_input, batch.sampling_info
+            )
+        )
 
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
@@ -1658,11 +1665,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        # Match scheduler inputs to any padded target logits.
+        verify_padding = target_compile_policy.prepare_spec_verify(
+            batch, verify_input, logits_output.next_token_logits
+        )
+        verify_result = (None, None, None)
+        try:
+            verify_result = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        finally:
+            # Restore logical tensors and finalize target outputs.
+            verify_result = target_compile_policy.finalize_spec_verify(
+                verify_padding, *verify_result
+            )
+            if defer_output_unpadding:
+                logits_output = target_compile_policy.finalize_forward_batch(
+                    logits_output, verify_forward_batch
+                )
+        predict, accept_lens, accept_index = verify_result
         new_seq_lens = batch.seq_lens + accept_lens
         clear_unaccepted_c128 = getattr(
             self.token_to_kv_pool_allocator.get_kvcache(),
