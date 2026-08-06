@@ -17,6 +17,9 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+# TODO: Enable larger M, including prefill, once these issues are resolved:
+# https://github.com/sgl-project/sglang-torchtpu/issues/308
+# https://github.com/google-pytorch/torch_tpu/issues/2794
 _FUSED_RS_MAX_SIZE_M = 2048
 
 
