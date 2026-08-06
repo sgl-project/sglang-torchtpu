@@ -18,8 +18,9 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# Keep larger prefills on the stock path; the fused kernel is device-validated
-# through the 256-token Qwen3 specialization.
+# A 4K fused prefill core-halts only when many fused-RS calls share one compiled
+# decoder graph; the same calls pass eagerly. Keep shapes above the validated
+# 256-token specialization on the stock path pending selective graph partitioning.
 _FUSED_RS_MAX_TOKENS = 256
 
 
