@@ -2,7 +2,6 @@
 
 """Unit tests for TPU FP8 fused-RS runtime selection."""
 
-import itertools
 import sys
 import unittest
 from types import SimpleNamespace
@@ -11,10 +10,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
-    _assign_fused_rs_layer_ordinal,
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
-    should_partition_fp8_fused_rs,
     should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
@@ -160,39 +157,19 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertEqual(all_reduce.call_count, 1)
         self.assertFalse(stock_moe.call_args.kwargs["no_combine"])
 
-    def test_uses_fused_rs_through_validated_large_prefill_boundary(self):
+    def test_uses_fused_rs_only_through_validated_inline_limit(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
         self.assertTrue(should_use_fp8_fused_rs(128))
         self.assertTrue(should_use_fp8_fused_rs(2048))
-        self.assertTrue(should_use_fp8_fused_rs(2049))
-        self.assertTrue(should_use_fp8_fused_rs(32768))
+        self.assertFalse(should_use_fp8_fused_rs(2049))
+        self.assertFalse(should_use_fp8_fused_rs(32768))
         self.assertFalse(should_use_fp8_fused_rs(32769))
         self.assertFalse(should_use_fp8_fused_rs(65536))
 
-    def test_padded_routed_rows_respect_large_prefill_boundary(self):
-        padded_tokens = fused_moe_rs_padded_tokens(10922, topk=3, ep_size=8)
-        self.assertEqual(padded_tokens, 10928)
+    def test_padded_routed_rows_respect_inline_limit(self):
+        padded_tokens = fused_moe_rs_padded_tokens(682, topk=3, ep_size=8)
+        self.assertEqual(padded_tokens, 688)
         self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
-
-    def test_partitions_large_prefill_every_two_layers(self):
-        self.assertFalse(should_partition_fp8_fused_rs(2048, 1))
-        self.assertFalse(should_partition_fp8_fused_rs(32768, 0))
-        self.assertTrue(should_partition_fp8_fused_rs(32768, 1))
-        self.assertFalse(should_partition_fp8_fused_rs(32768, 2))
-        self.assertTrue(should_partition_fp8_fused_rs(32768, 3))
-
-    def test_assigns_ordinals_independent_of_transformer_layer_ids(self):
-        layers = [SimpleNamespace(layer_id=layer_id) for layer_id in (0, 2, 4)]
-        with patch(
-            "sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs."
-            "_FUSED_RS_LAYER_ORDINALS",
-            itertools.count(),
-        ):
-            ordinals = [_assign_fused_rs_layer_ordinal(layer) for layer in layers]
-            repeated = [_assign_fused_rs_layer_ordinal(layer) for layer in layers]
-
-        self.assertEqual(ordinals, [0, 1, 2])
-        self.assertEqual(repeated, ordinals)
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         self.assertTrue(

@@ -45,11 +45,6 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
     from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_rank
 
-    # Large prefills selectively expose their existing all-gather as a graph
-    # boundary. TorchTPU only honors those boundaries when materialization is
-    # enabled before Dynamo captures the decoder.
-    os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "true"
-
     global_device_id, physical_order = _get_physical_rank_metadata()
 
     layer._tpu_fused_rs_physical_order = torch.tensor(
@@ -142,10 +137,6 @@ def _build_fused_moe_rs_op(op_name: str = _FUSED_MOE_RS_OP_NAME):
             post_expert_norm_weight=(
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
-            # FP8 direct-write halves the reduce-scatter payload. Large
-            # prefills use the BF16-payload variant: the extra row-scale
-            # staging can exceed the safe device-side synchronization budget
-            # for wide expert geometries such as Qwen3-Coder-480B.
             fp8_direct_write=fp8_direct_write,
         )
         if not has_post_expert_norm:
@@ -211,7 +202,8 @@ def fused_moe_rs_call(
     )
 
 
-def _fused_moe_rs_gather_impl(
+@spmd_safe
+def fused_moe_rs_gather(
     *,
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -227,7 +219,6 @@ def _fused_moe_rs_gather_impl(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
-    materialize_gather: bool,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -246,67 +237,8 @@ def _fused_moe_rs_gather_impl(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
     )
-    tp_group = get_tp_group()
-    if materialize_gather:
-        output = torch.ops._c10d_functional.all_gather_into_tensor(
-            token_shard,
-            tp_group.world_size,
-            tp_group.device_group.group_name,
-        )
-        output = torch.ops._c10d_functional.wait_tensor(output)
-    else:
-        output = tp_group.all_gather(token_shard, dim=0)
+    output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]
     return output.reshape(
         physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
     )[physical_order_to_tp_rank].reshape(-1, output.shape[-1])
-
-
-@spmd_safe
-def _fused_moe_rs_gather_inline(**kwargs) -> torch.Tensor:
-    return _fused_moe_rs_gather_impl(**kwargs, materialize_gather=False)
-
-
-def _fused_moe_rs_gather_boundary(**kwargs) -> torch.Tensor:
-    # This is the same all-gather as the inline path. Keeping it outside an
-    # SPMD-safe region lets TorchTPU materialize it as a compiler boundary.
-    return _fused_moe_rs_gather_impl(**kwargs, materialize_gather=True)
-
-
-def fused_moe_rs_gather(
-    *,
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w1_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    post_expert_norm_weight: torch.Tensor,
-    group_offset: torch.Tensor,
-    topk: int,
-    activation: str,
-    has_post_expert_norm: bool,
-    fp8_direct_write: bool,
-    partition_boundary: bool,
-    physical_order_to_tp_rank: torch.Tensor,
-) -> torch.Tensor:
-    kwargs = dict(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
-        post_expert_norm_weight=post_expert_norm_weight,
-        group_offset=group_offset,
-        topk=topk,
-        activation=activation,
-        has_post_expert_norm=has_post_expert_norm,
-        fp8_direct_write=fp8_direct_write,
-        physical_order_to_tp_rank=physical_order_to_tp_rank,
-    )
-    if partition_boundary:
-        return _fused_moe_rs_gather_boundary(**kwargs)
-    return _fused_moe_rs_gather_inline(**kwargs)

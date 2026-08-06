@@ -58,7 +58,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
             self.assertEqual(
                 os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"],
-                "true",
+                "false",
             )
 
         torch.testing.assert_close(
@@ -105,62 +105,11 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=True,
-                partition_boundary=False,
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
             )
 
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
-
-    def test_boundary_materializes_existing_all_gather(self):
-        physical_order_to_tp_rank = torch.arange(2)
-        token_shard = torch.zeros(1, 1)
-        rank_order_shards = torch.tensor([[0], [1]])
-        tp_group = Mock(world_size=2)
-        tp_group.device_group.group_name = "tp-group"
-
-        with (
-            patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=tp_group,
-            ),
-            patch.object(
-                fused_moe_rs_op,
-                "fused_moe_rs_call",
-                return_value=token_shard,
-            ),
-            patch.object(
-                torch.ops._c10d_functional,
-                "all_gather_into_tensor",
-                return_value=rank_order_shards,
-            ) as all_gather,
-            patch.object(
-                torch.ops._c10d_functional,
-                "wait_tensor",
-                return_value=rank_order_shards,
-            ) as wait_tensor,
-        ):
-            output = fused_moe_rs_op._fused_moe_rs_gather_boundary(
-                hidden_states=torch.zeros(2, 1),
-                w1=torch.empty(1),
-                w2=torch.empty(1),
-                w1_scale=torch.empty(1),
-                w2_scale=torch.empty(1),
-                topk_weights=torch.empty(1),
-                topk_ids=torch.empty(1),
-                post_expert_norm_weight=torch.empty(1),
-                group_offset=torch.empty(1),
-                topk=1,
-                activation="silu",
-                has_post_expert_norm=False,
-                fp8_direct_write=True,
-                physical_order_to_tp_rank=physical_order_to_tp_rank,
-            )
-
-        torch.testing.assert_close(output, rank_order_shards)
-        all_gather.assert_called_once_with(token_shard, 2, "tp-group")
-        wait_tensor.assert_called_once_with(rank_order_shards)
-        tp_group.all_gather.assert_not_called()
 
 
 if __name__ == "__main__":
