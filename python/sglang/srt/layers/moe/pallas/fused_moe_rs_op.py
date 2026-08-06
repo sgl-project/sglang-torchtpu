@@ -5,26 +5,10 @@ import functools
 import os
 
 import torch
-from torch_tpu._internal.compile import collective_ops
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
-_FUSED_MOE_RS_BOUNDARY_OP_NAME = "sglang_tpu_pallas::fused_moe_rs_partition_boundary"
 _FUSED_MOE_RS_OPS = {}
-
-
-def _register_partition_boundary_op() -> None:
-    op = torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary
-    register = getattr(collective_ops, "register_collective_op", None)
-    if register is not None:
-        register(op)
-        return
-
-    # TorchTPU releases before the registration helper expose a module-level
-    # tuple that the split compiler reads when it partitions the FX graph.
-    target = getattr(op, "overloadpacket", op)
-    if target not in collective_ops.COLLECTIVE_OPS:
-        collective_ops.COLLECTIVE_OPS += (target,)
 
 
 @functools.cache
@@ -50,6 +34,11 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
     from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_rank
 
+    # Large prefills selectively expose their existing all-gather as a graph
+    # boundary. TorchTPU only honors those boundaries when materialization is
+    # enabled before Dynamo captures the decoder.
+    os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"] = "true"
+
     global_device_id, physical_order = _get_physical_rank_metadata()
 
     layer._tpu_fused_rs_physical_order = torch.tensor(
@@ -66,8 +55,6 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         device=layer.w13_weight.device,
     )
     _build_fused_moe_rs_op(_FUSED_MOE_RS_OP_NAME)
-    _build_fused_moe_rs_op(_FUSED_MOE_RS_BOUNDARY_OP_NAME)
-    _register_partition_boundary_op()
 
 
 @functools.cache
@@ -195,12 +182,8 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
-    partition_boundary: bool = False,
 ) -> torch.Tensor:
-    op_name = (
-        _FUSED_MOE_RS_BOUNDARY_OP_NAME if partition_boundary else _FUSED_MOE_RS_OP_NAME
-    )
-    return _build_fused_moe_rs_op(op_name)(
+    return _build_fused_moe_rs_op()(
         hidden_states,
         w1,
         w2,
@@ -233,7 +216,7 @@ def _fused_moe_rs_gather_impl(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
-    partition_boundary: bool,
+    materialize_gather: bool,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -251,9 +234,17 @@ def _fused_moe_rs_gather_impl(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
-        partition_boundary=partition_boundary,
     )
-    output = get_tp_group().all_gather(token_shard, dim=0)
+    tp_group = get_tp_group()
+    if materialize_gather:
+        output = torch.ops._c10d_functional.all_gather_into_tensor(
+            token_shard,
+            tp_group.world_size,
+            tp_group.device_group.group_name,
+        )
+        output = torch.ops._c10d_functional.wait_tensor(output)
+    else:
+        output = tp_group.all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]
     return output.reshape(
         physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
@@ -262,11 +253,13 @@ def _fused_moe_rs_gather_impl(
 
 @spmd_safe
 def _fused_moe_rs_gather_inline(**kwargs) -> torch.Tensor:
-    return _fused_moe_rs_gather_impl(**kwargs, partition_boundary=False)
+    return _fused_moe_rs_gather_impl(**kwargs, materialize_gather=False)
 
 
 def _fused_moe_rs_gather_boundary(**kwargs) -> torch.Tensor:
-    return _fused_moe_rs_gather_impl(**kwargs, partition_boundary=True)
+    # This is the same all-gather as the inline path. Keeping it outside an
+    # SPMD-safe region lets TorchTPU materialize it as a compiler boundary.
+    return _fused_moe_rs_gather_impl(**kwargs, materialize_gather=True)
 
 
 def fused_moe_rs_gather(

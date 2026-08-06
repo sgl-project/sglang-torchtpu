@@ -163,12 +163,12 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertFalse(should_use_fp8_fused_rs(32769))
         self.assertFalse(should_use_fp8_fused_rs(65536))
 
-    def test_partitions_large_prefill_every_eleven_layers(self):
-        self.assertFalse(should_partition_fp8_fused_rs(2048, 10))
-        self.assertFalse(should_partition_fp8_fused_rs(32768, 9))
-        self.assertTrue(should_partition_fp8_fused_rs(32768, 10))
-        self.assertFalse(should_partition_fp8_fused_rs(32768, 11))
-        self.assertTrue(should_partition_fp8_fused_rs(32768, 21))
+    def test_partitions_large_prefill_every_two_layers(self):
+        self.assertFalse(should_partition_fp8_fused_rs(2048, 1))
+        self.assertFalse(should_partition_fp8_fused_rs(32768, 0))
+        self.assertTrue(should_partition_fp8_fused_rs(32768, 1))
+        self.assertFalse(should_partition_fp8_fused_rs(32768, 2))
+        self.assertTrue(should_partition_fp8_fused_rs(32768, 3))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         self.assertTrue(

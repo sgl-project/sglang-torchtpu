@@ -2,8 +2,9 @@
 
 """Unit tests for the TPU fused-RS Torch wrapper."""
 
+import os
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -15,46 +16,6 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFusedMoeRsOp(CustomTestCase):
-    def test_register_partition_boundary_with_legacy_torchtpu(self):
-        op = Mock(overloadpacket=object())
-        fake_torch = Mock()
-        fake_torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary = op
-
-        with (
-            patch.object(fused_moe_rs_op, "torch", fake_torch),
-            patch.object(
-                fused_moe_rs_op.collective_ops,
-                "register_collective_op",
-                None,
-                create=True,
-            ),
-            patch.object(fused_moe_rs_op.collective_ops, "COLLECTIVE_OPS", ()),
-        ):
-            fused_moe_rs_op._register_partition_boundary_op()
-            self.assertEqual(
-                fused_moe_rs_op.collective_ops.COLLECTIVE_OPS,
-                (op.overloadpacket,),
-            )
-
-    def test_register_partition_boundary_with_torchtpu_helper(self):
-        op = Mock()
-        register = Mock()
-        fake_torch = Mock()
-        fake_torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary = op
-
-        with (
-            patch.object(fused_moe_rs_op, "torch", fake_torch),
-            patch.object(
-                fused_moe_rs_op.collective_ops,
-                "register_collective_op",
-                register,
-                create=True,
-            ),
-        ):
-            fused_moe_rs_op._register_partition_boundary_op()
-
-        register.assert_called_once_with(op)
-
     def test_prepare_sets_physical_rank_metadata(self):
         layer = Mock(
             num_local_experts=16,
@@ -62,6 +23,10 @@ class TestFusedMoeRsOp(CustomTestCase):
         )
 
         with (
+            patch.dict(
+                os.environ,
+                {"TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false"},
+            ),
             patch.object(
                 fused_moe_rs_op,
                 "_get_physical_rank_metadata",
@@ -72,11 +37,12 @@ class TestFusedMoeRsOp(CustomTestCase):
                 return_value=2,
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
-            patch.object(
-                fused_moe_rs_op, "_register_partition_boundary_op"
-            ) as register,
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
+            self.assertEqual(
+                os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"],
+                "true",
+            )
 
         torch.testing.assert_close(
             layer._tpu_fused_rs_physical_order,
@@ -86,13 +52,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 4], dtype=torch.int32),
         )
-        build.assert_has_calls(
-            [
-                call(fused_moe_rs_op._FUSED_MOE_RS_OP_NAME),
-                call(fused_moe_rs_op._FUSED_MOE_RS_BOUNDARY_OP_NAME),
-            ]
-        )
-        register.assert_called_once_with()
+        build.assert_called_once_with(fused_moe_rs_op._FUSED_MOE_RS_OP_NAME)
 
     def test_gather_reorders_tp_ranks_to_physical_device_order(self):
         rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
@@ -134,6 +94,56 @@ class TestFusedMoeRsOp(CustomTestCase):
 
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
+
+    def test_boundary_materializes_existing_all_gather(self):
+        physical_order_to_tp_rank = torch.arange(2)
+        token_shard = torch.zeros(1, 1)
+        rank_order_shards = torch.tensor([[0], [1]])
+        tp_group = Mock(world_size=2)
+        tp_group.device_group.group_name = "tp-group"
+
+        with (
+            patch(
+                "sglang.srt.distributed.get_tp_group",
+                return_value=tp_group,
+            ),
+            patch.object(
+                fused_moe_rs_op,
+                "fused_moe_rs_call",
+                return_value=token_shard,
+            ),
+            patch.object(
+                torch.ops._c10d_functional,
+                "all_gather_into_tensor",
+                return_value=rank_order_shards,
+            ) as all_gather,
+            patch.object(
+                torch.ops._c10d_functional,
+                "wait_tensor",
+                return_value=rank_order_shards,
+            ) as wait_tensor,
+        ):
+            output = fused_moe_rs_op._fused_moe_rs_gather_boundary(
+                hidden_states=torch.zeros(2, 1),
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=torch.empty(1),
+                topk_ids=torch.empty(1),
+                post_expert_norm_weight=torch.empty(1),
+                group_offset=torch.empty(1),
+                topk=1,
+                activation="silu",
+                has_post_expert_norm=False,
+                fp8_direct_write=True,
+                physical_order_to_tp_rank=physical_order_to_tp_rank,
+            )
+
+        torch.testing.assert_close(output, rank_order_shards)
+        all_gather.assert_called_once_with(token_shard, 2, "tp-group")
+        wait_tensor.assert_called_once_with(rank_order_shards)
+        tp_group.all_gather.assert_not_called()
 
 
 if __name__ == "__main__":

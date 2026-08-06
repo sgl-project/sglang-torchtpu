@@ -20,10 +20,10 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 _FUSED_RS_INLINE_MAX_SIZE_M = 2048
 _FUSED_RS_MAX_SIZE_M = 32768
-# The TPU compiler miscompiles 12 large fused-RS routing/kernel regions in one
-# executable and trips a generated SparseCore descriptor-queue bounds check.
-# Isolating every 11th layer keeps each ordinary partition below that boundary.
-_FUSED_RS_PARTITION_INTERVAL = 11
+# Three large fused-RS decoder layers in one TPU program can trip a generated
+# TensorCoreSequencer descriptor-queue check. Materialize the existing output
+# all-gather every second layer so no compiled segment reaches that boundary.
+_FUSED_RS_PARTITION_INTERVAL = 2
 
 
 def supports_fp8_fused_rs(
