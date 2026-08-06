@@ -5,10 +5,16 @@ import functools
 import os
 
 import torch
+from torch_tpu._internal.compile.collective_ops import register_collective_op
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
-_FUSED_MOE_RS_OP = None
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
+_FUSED_MOE_RS_BOUNDARY_OP_NAME = "sglang_tpu_pallas::fused_moe_rs_partition_boundary"
+_FUSED_MOE_RS_OPS = {}
+
+
+def _register_partition_boundary_op() -> None:
+    register_collective_op(torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary)
 
 
 @functools.cache
@@ -49,7 +55,9 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )
-    _build_fused_moe_rs_op()
+    _build_fused_moe_rs_op(_FUSED_MOE_RS_OP_NAME)
+    _build_fused_moe_rs_op(_FUSED_MOE_RS_BOUNDARY_OP_NAME)
+    _register_partition_boundary_op()
 
 
 @functools.cache
@@ -66,10 +74,9 @@ def _get_mesh():
     return Mesh(export_devices, ("data", "model"))
 
 
-def _build_fused_moe_rs_op():
-    global _FUSED_MOE_RS_OP
-    if _FUSED_MOE_RS_OP is not None:
-        return _FUSED_MOE_RS_OP
+def _build_fused_moe_rs_op(op_name: str = _FUSED_MOE_RS_OP_NAME):
+    if op_name in _FUSED_MOE_RS_OPS:
+        return _FUSED_MOE_RS_OPS[op_name]
 
     import jax
     import jax.numpy as jnp
@@ -138,8 +145,8 @@ def _build_fused_moe_rs_op():
         return result
 
     # Bridge the JAX kernel into Torch with model-sharded weights and output.
-    _FUSED_MOE_RS_OP = cpu_export_jax_op(
-        _FUSED_MOE_RS_OP_NAME,
+    op = cpu_export_jax_op(
+        op_name,
         _wrapped,
         mesh=mesh,
         input_partition_specs=(
@@ -159,7 +166,8 @@ def _build_fused_moe_rs_op():
         ),
         output_partition_specs=(P("model", None),),
     )
-    return _FUSED_MOE_RS_OP
+    _FUSED_MOE_RS_OPS[op_name] = op
+    return op
 
 
 def fused_moe_rs_call(
@@ -177,8 +185,12 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
+    partition_boundary: bool = False,
 ) -> torch.Tensor:
-    return _build_fused_moe_rs_op()(
+    op_name = (
+        _FUSED_MOE_RS_BOUNDARY_OP_NAME if partition_boundary else _FUSED_MOE_RS_OP_NAME
+    )
+    return _build_fused_moe_rs_op(op_name)(
         hidden_states,
         w1,
         w2,
@@ -195,8 +207,7 @@ def fused_moe_rs_call(
     )
 
 
-@spmd_safe
-def fused_moe_rs_gather(
+def _fused_moe_rs_gather_impl(
     *,
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -212,6 +223,7 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
+    partition_boundary: bool,
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -229,9 +241,58 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
+        partition_boundary=partition_boundary,
     )
     output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]
     return output.reshape(
         physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
     )[physical_order_to_tp_rank].reshape(-1, output.shape[-1])
+
+
+@spmd_safe
+def _fused_moe_rs_gather_inline(**kwargs) -> torch.Tensor:
+    return _fused_moe_rs_gather_impl(**kwargs, partition_boundary=False)
+
+
+def _fused_moe_rs_gather_boundary(**kwargs) -> torch.Tensor:
+    return _fused_moe_rs_gather_impl(**kwargs, partition_boundary=True)
+
+
+def fused_moe_rs_gather(
+    *,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    post_expert_norm_weight: torch.Tensor,
+    group_offset: torch.Tensor,
+    topk: int,
+    activation: str,
+    has_post_expert_norm: bool,
+    fp8_direct_write: bool,
+    partition_boundary: bool,
+    physical_order_to_tp_rank: torch.Tensor,
+) -> torch.Tensor:
+    kwargs = dict(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        post_expert_norm_weight=post_expert_norm_weight,
+        group_offset=group_offset,
+        topk=topk,
+        activation=activation,
+        has_post_expert_norm=has_post_expert_norm,
+        fp8_direct_write=fp8_direct_write,
+        physical_order_to_tp_rank=physical_order_to_tp_rank,
+    )
+    if partition_boundary:
+        return _fused_moe_rs_gather_boundary(**kwargs)
+    return _fused_moe_rs_gather_inline(**kwargs)

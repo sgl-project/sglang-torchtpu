@@ -12,6 +12,7 @@ import torch
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
+    should_partition_fp8_fused_rs,
     should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
@@ -112,12 +113,16 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
     def test_large_prefill_reduces_stock_output_once(self):
-        tokens, hidden = 257, 4
+        tokens, hidden = 4097, 4
         x = torch.zeros(tokens, hidden)
         raw = torch.arange(tokens * hidden, dtype=torch.float32).reshape(tokens, hidden)
         dispatch_output = SimpleNamespace(
             hidden_states=x,
-            topk_output=None,
+            topk_output=(
+                torch.zeros(tokens, 8),
+                torch.zeros(tokens, 8, dtype=torch.int32),
+                None,
+            ),
         )
         layer = SimpleNamespace(
             moe_runner_config=SimpleNamespace(
@@ -149,12 +154,21 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertEqual(all_reduce.call_count, 1)
         self.assertFalse(stock_moe.call_args.kwargs["no_combine"])
 
-    def test_uses_fused_rs_only_through_small_prefill_boundary(self):
+    def test_uses_fused_rs_through_validated_large_prefill_boundary(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
         self.assertTrue(should_use_fp8_fused_rs(128))
-        self.assertTrue(should_use_fp8_fused_rs(256))
-        self.assertFalse(should_use_fp8_fused_rs(257))
-        self.assertFalse(should_use_fp8_fused_rs(8192))
+        self.assertTrue(should_use_fp8_fused_rs(2048))
+        self.assertTrue(should_use_fp8_fused_rs(2049))
+        self.assertTrue(should_use_fp8_fused_rs(32768))
+        self.assertFalse(should_use_fp8_fused_rs(32769))
+        self.assertFalse(should_use_fp8_fused_rs(65536))
+
+    def test_partitions_large_prefill_every_eleven_layers(self):
+        self.assertFalse(should_partition_fp8_fused_rs(2048, 10))
+        self.assertFalse(should_partition_fp8_fused_rs(32768, 9))
+        self.assertTrue(should_partition_fp8_fused_rs(32768, 10))
+        self.assertFalse(should_partition_fp8_fused_rs(32768, 11))
+        self.assertTrue(should_partition_fp8_fused_rs(32768, 21))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         self.assertTrue(

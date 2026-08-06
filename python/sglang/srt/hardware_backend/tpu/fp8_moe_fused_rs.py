@@ -5,8 +5,8 @@
 Routes the FP8 MoE through the in-tree SGLang-owned fused-RS kernel
 (`fused_moe_rs_gather`) instead of `fused_moe_call` + a separate all-reduce.
 Load-time `prepare_fp8_fused_rs` validates the supported runtime layout and
-caches physical-device ordering. The compiled forward uses fused-RS for decode
-and small prefills, with the stock FP8 MoE path for larger prefills.
+caches physical-device ordering. Large prefills use periodic compiler
+partitions to keep routing and fused-RS calls within the validated graph size.
 """
 
 from __future__ import annotations
@@ -18,10 +18,12 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# A 4K fused prefill core-halts only when many fused-RS calls share one compiled
-# decoder graph; the same calls pass eagerly. Keep shapes above the validated
-# 256-token specialization on the stock path pending selective graph partitioning.
-_FUSED_RS_MAX_TOKENS = 256
+_FUSED_RS_INLINE_MAX_SIZE_M = 2048
+_FUSED_RS_MAX_SIZE_M = 32768
+# The TPU compiler miscompiles 12 large fused-RS routing/kernel regions in one
+# executable and trips a generated SparseCore descriptor-queue bounds check.
+# Isolating every 11th layer keeps each ordinary partition below that boundary.
+_FUSED_RS_PARTITION_INTERVAL = 11
 
 
 def supports_fp8_fused_rs(
@@ -116,9 +118,17 @@ def fp8_fused_rs_unsupported_reason(
     return None
 
 
-def should_use_fp8_fused_rs(num_tokens: int) -> bool:
-    """Use fused-RS only for device-validated decode and small-prefill shapes."""
-    return num_tokens <= _FUSED_RS_MAX_TOKENS
+def should_use_fp8_fused_rs(size_m: int) -> bool:
+    """Use fused-RS only for validated routed-assignment counts."""
+    return size_m <= _FUSED_RS_MAX_SIZE_M
+
+
+def should_partition_fp8_fused_rs(size_m: int, layer_id: int) -> bool:
+    """Return whether this layer is a large-prefill compiler boundary."""
+    return (
+        size_m > _FUSED_RS_INLINE_MAX_SIZE_M
+        and (layer_id + 1) % _FUSED_RS_PARTITION_INTERVAL == 0
+    )
 
 
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
@@ -167,9 +177,6 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     # channelwise scales as (E, 1, 1, N), exactly as fused-RS expects.
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
-    # fused_moe_rs_gather uses the standard get_tp_group().all_gather, which is
-    # already in split_compiler._COLLECTIVE_OPS -- no register_collective_op
-    # (that #2429 API is only needed for custom collectives like inplace_all_reduce).
     prepare_fused_moe_rs(layer)
     return True
 
@@ -203,7 +210,9 @@ def _apply_fp8_fused_rs(
         raise ValueError(
             "post_expert_norm_weight and finalize_fallback must be provided together"
         )
-    if not should_use_fp8_fused_rs(x.shape[0]):
+    topk_weights, topk_ids, _ = dispatch_output.topk_output
+    size_m = x.shape[0] * topk_ids.shape[-1]
+    if not should_use_fp8_fused_rs(size_m):
         from sglang.srt.distributed import moe_expert_parallel_all_reduce
         from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
 
@@ -227,7 +236,6 @@ def _apply_fp8_fused_rs(
 
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
-    topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     valid = topk_ids >= 0
@@ -240,6 +248,7 @@ def _apply_fp8_fused_rs(
         else x.new_zeros((1,))
     )
 
+    large_prefill = size_m > _FUSED_RS_INLINE_MAX_SIZE_M
     result = fused_moe_rs_gather(
         hidden_states=x,
         w1=layer.w13_weight,
@@ -253,7 +262,10 @@ def _apply_fp8_fused_rs(
         topk=int(topk_ids.shape[-1]),
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
-        fp8_direct_write=True,
+        # Large prefills use the validated BF16-payload specialization. The
+        # FP8 row-scale staging path is retained for decode and small prefills.
+        fp8_direct_write=not large_prefill,
+        partition_boundary=should_partition_fp8_fused_rs(size_m, int(layer.layer_id)),
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])

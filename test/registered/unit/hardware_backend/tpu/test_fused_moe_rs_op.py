@@ -3,7 +3,7 @@
 """Unit tests for the TPU fused-RS Torch wrapper."""
 
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -31,7 +31,10 @@ class TestFusedMoeRsOp(CustomTestCase):
                 "sglang.srt.distributed.parallel_state." "get_moe_expert_parallel_rank",
                 return_value=2,
             ),
-            patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op"),
+            patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
+            patch.object(
+                fused_moe_rs_op, "_register_partition_boundary_op"
+            ) as register,
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
 
@@ -43,6 +46,13 @@ class TestFusedMoeRsOp(CustomTestCase):
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 4], dtype=torch.int32),
         )
+        build.assert_has_calls(
+            [
+                call(fused_moe_rs_op._FUSED_MOE_RS_OP_NAME),
+                call(fused_moe_rs_op._FUSED_MOE_RS_BOUNDARY_OP_NAME),
+            ]
+        )
+        register.assert_called_once_with()
 
     def test_gather_reorders_tp_ranks_to_physical_device_order(self):
         rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
@@ -78,6 +88,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=True,
+                partition_boundary=False,
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
             )
 
