@@ -74,7 +74,7 @@ dependencies = [
   # torch-tpu wheels come from a private package server (see the
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
-  "torch-tpu==0.1.1.dev20260707090224",
+  "torch-tpu==0.1.1.dev20260731160222",
   "libtpu==0.0.42.1",
   "torch==2.11.0",
   "torchvision==0.26.0",

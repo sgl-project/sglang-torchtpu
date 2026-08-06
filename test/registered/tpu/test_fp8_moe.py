@@ -1,4 +1,4 @@
-"""Manual TPU tests for FP8 fused MoE experts."""
+"""TPU tests for FP8 fused MoE experts."""
 
 import unittest
 from types import SimpleNamespace
@@ -19,6 +19,11 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+
+# Eager and compiled kernels use different BF16 accumulation orders. Retain
+# BF16's default relative tolerance and cover rounding near zero explicitly.
+_COMPILED_BF16_ATOL = 2e-4
+_COMPILED_BF16_RTOL = 0.016
 
 
 def _quantize_per_expert(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -360,7 +365,12 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(eager_out.shape, (num_tokens, hidden_size))
         self.assertEqual(eager_out.dtype, torch.bfloat16)
         torch.testing.assert_close(eager_out.cpu(), ref, atol=0.1, rtol=0.1)
-        torch.testing.assert_close(compiled_out.cpu(), eager_out.cpu())
+        torch.testing.assert_close(
+            compiled_out.cpu(),
+            eager_out.cpu(),
+            atol=_COMPILED_BF16_ATOL,
+            rtol=_COMPILED_BF16_RTOL,
+        )
 
     def test_block_fp8_moe_runs_eager_and_compiled(self):
         _build_fused_moe_op()
@@ -457,7 +467,12 @@ class TestTpuFp8MoE(CustomTestCase):
         self.assertEqual(eager_out.shape, (num_tokens, hidden_size))
         self.assertEqual(eager_out.dtype, torch.bfloat16)
         torch.testing.assert_close(eager_out.cpu(), ref, atol=0.1, rtol=0.1)
-        torch.testing.assert_close(compiled_out.cpu(), eager_out.cpu())
+        torch.testing.assert_close(
+            compiled_out.cpu(),
+            eager_out.cpu(),
+            atol=_COMPILED_BF16_ATOL,
+            rtol=_COMPILED_BF16_RTOL,
+        )
 
 
 if __name__ == "__main__":

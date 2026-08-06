@@ -1567,7 +1567,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         def _view(**kw):
-            defaults = dict(quantization=None, moe_runner_backend="auto")
+            defaults = dict(device="cuda", quantization=None, moe_runner_backend="auto")
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
@@ -1593,6 +1593,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {"moe_runner_backend": "flashinfer_cutlass"},
             )
+        with self.assertRaises(ValueError):
+            _moe_runner_backend_quant_constraints(
+                _view(moe_runner_backend="pallas_tpu_fused_rs")
+            )
+        self.assertEqual(
+            _moe_runner_backend_quant_constraints(
+                _view(device="tpu", moe_runner_backend="pallas_tpu_fused_rs")
+            ),
+            {},
+        )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_cutlass_moe_env_override_pass(self):

@@ -262,6 +262,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "pallas_tpu_fused_rs",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [

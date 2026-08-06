@@ -267,7 +267,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
         )
-
+        # This block owns reduction outside FusedMoE and consults the selected
+        # backend's handles_moe_reduction contract below.
+        self.experts.allow_backend_reduction = True
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
@@ -330,6 +332,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             is_tp_path=False,
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
+            experts_reduced=getattr(self.experts, "handles_moe_reduction", False),
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 

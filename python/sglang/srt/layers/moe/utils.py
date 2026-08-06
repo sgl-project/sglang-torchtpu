@@ -9,9 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    is_dp_attention_enabled,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_cuda, is_npu, is_tpu
 
@@ -99,9 +97,13 @@ class MoeRunnerBackend(Enum):
     CUTLASS = "cutlass"
     MARLIN = "marlin"
     AITER = "aiter"
+    PALLAS_TPU_FUSED_RS = "pallas_tpu_fused_rs"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
+
+    def is_pallas_tpu_fused_rs(self):
+        return self == MoeRunnerBackend.PALLAS_TPU_FUSED_RS
 
     def is_deep_gemm(self):
         return self == MoeRunnerBackend.DEEP_GEMM
@@ -421,6 +423,7 @@ def should_skip_post_experts_all_reduce(
     is_tp_path: bool,
     use_reduce_scatter: bool = False,
     should_allreduce_fusion: bool = False,
+    experts_reduced: bool = False,
 ) -> bool:
     """Whether to skip the post-experts all-reduce (EP or TP) because a
     downstream component will fuse, replace, or absorb it.
@@ -432,6 +435,8 @@ def should_skip_post_experts_all_reduce(
         do reduce-scatter, which would double-reduce on top of an all-reduce.
       - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
         path replaces the all-reduce with a reduce-scatterv.
+      - TPU FP8 fused-RS: the kernel already performs the EP reduction; the TP
+        reduction, when present, is still required.
       - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
         the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
         the post-experts TP all-reduce. Not relevant to the EP all-reduce.
@@ -447,6 +452,8 @@ def should_skip_post_experts_all_reduce(
     for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
     """
     if should_allreduce_fusion or use_reduce_scatter:
+        return True
+    if experts_reduced and not is_tp_path:
         return True
     if should_use_dp_reduce_scatterv():
         return True

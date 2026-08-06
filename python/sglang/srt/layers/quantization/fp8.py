@@ -12,10 +12,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tp_group,
-)
+from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -168,10 +165,7 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter.ops.shuffle import (
-        shuffle_scale,
-        shuffle_weight,
-    )
+    from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -1036,9 +1030,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if _is_tpu and not self.block_quant and not self.use_mxfp8:
-            from sglang.srt.hardware_backend.tpu.fp8_linear import (
-                apply_tpu_fp8_linear,
-            )
+            from sglang.srt.hardware_backend.tpu.fp8_linear import apply_tpu_fp8_linear
 
             return apply_tpu_fp8_linear(
                 x=x,
@@ -1073,6 +1065,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
+        self.handles_moe_reduction = False
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
@@ -1954,6 +1947,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_mxfp8=self.use_mxfp8,
                 is_fp4_expert=self.is_fp4_expert,
             )
+            moe_runner_backend = get_moe_runner_backend()
+            if (
+                moe_runner_backend.is_auto()
+                or moe_runner_backend.is_pallas_tpu_fused_rs()
+            ):
+                from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+                    prepare_fp8_fused_rs,
+                )
+
+                self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
+                if self.handles_moe_reduction and get_tensor_model_parallel_rank() == 0:
+                    logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
+                if (
+                    moe_runner_backend.is_pallas_tpu_fused_rs()
+                    and not self.handles_moe_reduction
+                ):
+                    reason = getattr(
+                        layer,
+                        "_tpu_fused_rs_unsupported_reason",
+                        "unknown incompatibility",
+                    )
+                    raise ValueError(
+                        "--moe-runner-backend pallas_tpu_fused_rs is not supported by "
+                        f"this model or parallel layout: {reason}"
+                    )
 
         if hasattr(layer, "dispatcher"):
             layer.dispatcher.set_quant_config({"weight_dtype": layer.w13_weight.dtype})
@@ -2048,6 +2066,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif moe_runner_backend.is_pallas_tpu_fused_rs() and not _is_tpu:
+            raise ValueError("pallas_tpu_fused_rs is only available on TPU")
 
         if (
             moe_runner_backend.is_deep_gemm()
@@ -2093,9 +2113,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         moe_runner_config = self.moe_runner_config
 
         if _is_tpu:
-            from sglang.srt.hardware_backend.tpu.fp8_moe import (
-                apply_tpu_fp8_moe,
-            )
+            if self.handles_moe_reduction:
+                from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+                    apply_fp8_fused_rs,
+                )
+
+                return apply_fp8_fused_rs(
+                    layer=layer,
+                    dispatch_output=dispatch_output,
+                    activation=moe_runner_config.activation,
+                )
+            from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
 
             return apply_tpu_fp8_moe(
                 layer=layer,
