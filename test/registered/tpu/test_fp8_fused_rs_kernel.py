@@ -15,7 +15,9 @@ register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit")
 
 
 class TestFp8FusedRsKernel(CustomTestCase):
-    def _run_compiled_tp8_kernel(self, *, post_expert_norm: bool):
+    def _run_compiled_tp8_kernel(
+        self, *, post_expert_norm: bool, tokens: int, topk: int
+    ):
         repo_root = Path(__file__).resolve().parents[3]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
         wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
@@ -30,9 +32,8 @@ class TestFp8FusedRsKernel(CustomTestCase):
         for name in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
             env.pop(name, None)
         env["SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM"] = str(int(post_expert_norm))
-        # Exercise the M=2048 routing boundary used by Qwen3 at 256 tokens.
-        env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = "256"
-        env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = "8"
+        env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = str(tokens)
+        env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
 
         try:
             result = subprocess.run(
@@ -62,7 +63,13 @@ class TestFp8FusedRsKernel(CustomTestCase):
     def test_compiled_tp8_kernel_matches_reference(self):
         for post_expert_norm in (False, True):
             with self.subTest(post_expert_norm=post_expert_norm):
-                self._run_compiled_tp8_kernel(post_expert_norm=post_expert_norm)
+                # Exercise the M=2048 boundary used by Qwen3 at 256 tokens.
+                self._run_compiled_tp8_kernel(
+                    post_expert_norm=post_expert_norm, tokens=256, topk=8
+                )
+
+    def test_compiled_tp8_kernel_pads_routed_rows(self):
+        self._run_compiled_tp8_kernel(post_expert_norm=False, tokens=8, topk=1)
 
 
 if __name__ == "__main__":

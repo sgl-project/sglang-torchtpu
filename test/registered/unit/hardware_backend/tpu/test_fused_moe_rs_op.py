@@ -16,6 +16,23 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFusedMoeRsOp(CustomTestCase):
+    def test_padding_satisfies_ep_and_routed_row_alignment(self):
+        cases = (
+            # num_tokens, topk, ep_size, padded_tokens
+            (8, 1, 8, 16),
+            (4, 2, 4, 8),
+            (16, 8, 16, 16),
+            (17, 8, 16, 32),
+        )
+        for num_tokens, topk, ep_size, expected in cases:
+            with self.subTest(num_tokens=num_tokens, topk=topk, ep_size=ep_size):
+                actual = fused_moe_rs_op.fused_moe_rs_padded_tokens(
+                    num_tokens, topk, ep_size
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual % ep_size, 0)
+                self.assertEqual((actual * topk) % 16, 0)
+
     def test_prepare_sets_physical_rank_metadata(self):
         layer = Mock(
             num_local_experts=16,

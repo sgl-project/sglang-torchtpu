@@ -94,6 +94,7 @@ def main():
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         _build_fused_moe_rs_op,
         fused_moe_rs_call,
+        fused_moe_rs_padded_tokens,
     )
 
     _build_fused_moe_rs_op()
@@ -138,7 +139,10 @@ def main():
         ),
     ).cpu()
 
-    shard_size = tokens // world_size
+    padded_tokens = fused_moe_rs_padded_tokens(tokens, topk, world_size)
+    if padded_tokens != tokens:
+        expected = torch.nn.functional.pad(expected, (0, 0, 0, padded_tokens - tokens))
+    shard_size = padded_tokens // world_size
     shard = slice(physical_id * shard_size, (physical_id + 1) * shard_size)
     torch.testing.assert_close(
         actual,

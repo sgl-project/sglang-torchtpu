@@ -17,6 +17,9 @@ from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     supports_fp8_fused_rs,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+    fused_moe_rs_padded_tokens,
+)
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
@@ -129,6 +132,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
                 apply_router_weight_on_input=False,
                 no_combine=False,
             ),
+            _tpu_fused_rs_physical_order=torch.arange(8),
         )
         expected = raw + 1
         stock_moe = Mock(return_value=StandardCombineInput(hidden_states=raw))
@@ -162,6 +166,11 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertTrue(should_use_fp8_fused_rs(32768))
         self.assertFalse(should_use_fp8_fused_rs(32769))
         self.assertFalse(should_use_fp8_fused_rs(65536))
+
+    def test_padded_routed_rows_respect_large_prefill_boundary(self):
+        padded_tokens = fused_moe_rs_padded_tokens(10922, topk=3, ep_size=8)
+        self.assertEqual(padded_tokens, 10928)
+        self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
 
     def test_partitions_large_prefill_every_two_layers(self):
         self.assertFalse(should_partition_fp8_fused_rs(2048, 1))

@@ -2,6 +2,7 @@
 """TPU MoE with fused ICI reduce-scatter."""
 
 import functools
+import math
 import os
 
 import torch
@@ -9,6 +10,16 @@ from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_MOE_RS_OPS = {}
+_FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
+
+
+def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
+    """Pad tokens for both EP sharding and the fused kernel's routed rows."""
+    routed_row_token_alignment = _FUSED_RS_ROUTED_ROW_ALIGNMENT // math.gcd(
+        _FUSED_RS_ROUTED_ROW_ALIGNMENT, topk
+    )
+    token_alignment = math.lcm(ep_size, routed_row_token_alignment)
+    return ((num_tokens + token_alignment - 1) // token_alignment) * token_alignment
 
 
 @functools.cache
@@ -101,7 +112,7 @@ def _build_fused_moe_rs_op(op_name: str = _FUSED_MOE_RS_OP_NAME):
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
-        padded_tokens = ((num_tokens + ep_size - 1) // ep_size) * ep_size
+        padded_tokens = fused_moe_rs_padded_tokens(num_tokens, topk, ep_size)
         if padded_tokens != num_tokens:
             token_padding = padded_tokens - num_tokens
             hidden_states = jnp.pad(hidden_states, ((0, token_padding), (0, 0)))

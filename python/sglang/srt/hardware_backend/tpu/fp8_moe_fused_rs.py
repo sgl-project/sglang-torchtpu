@@ -211,7 +211,15 @@ def _apply_fp8_fused_rs(
             "post_expert_norm_weight and finalize_fallback must be provided together"
         )
     topk_weights, topk_ids, _ = dispatch_output.topk_output
-    size_m = x.shape[0] * topk_ids.shape[-1]
+    topk = int(topk_ids.shape[-1])
+    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+        fused_moe_rs_gather,
+        fused_moe_rs_padded_tokens,
+    )
+
+    ep_size = int(layer._tpu_fused_rs_physical_order.shape[0])
+    padded_tokens = fused_moe_rs_padded_tokens(x.shape[0], topk, ep_size)
+    size_m = padded_tokens * topk
     if not should_use_fp8_fused_rs(size_m):
         from sglang.srt.distributed import moe_expert_parallel_all_reduce
         from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
@@ -233,8 +241,6 @@ def _apply_fp8_fused_rs(
         return StandardCombineInput(
             hidden_states=moe_expert_parallel_all_reduce(stock_output.hidden_states)
         )
-
-    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
@@ -259,7 +265,7 @@ def _apply_fp8_fused_rs(
         topk_ids=topk_ids,
         post_expert_norm_weight=norm_weight,
         group_offset=layer._tpu_fused_rs_group_offset,
-        topk=int(topk_ids.shape[-1]),
+        topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         # Large prefills use the validated BF16-payload specialization. The
