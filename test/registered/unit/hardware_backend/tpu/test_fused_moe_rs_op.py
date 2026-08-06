@@ -15,6 +15,46 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFusedMoeRsOp(CustomTestCase):
+    def test_register_partition_boundary_with_legacy_torchtpu(self):
+        op = Mock(overloadpacket=object())
+        fake_torch = Mock()
+        fake_torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary = op
+
+        with (
+            patch.object(fused_moe_rs_op, "torch", fake_torch),
+            patch.object(
+                fused_moe_rs_op.collective_ops,
+                "register_collective_op",
+                None,
+                create=True,
+            ),
+            patch.object(fused_moe_rs_op.collective_ops, "COLLECTIVE_OPS", ()),
+        ):
+            fused_moe_rs_op._register_partition_boundary_op()
+            self.assertEqual(
+                fused_moe_rs_op.collective_ops.COLLECTIVE_OPS,
+                (op.overloadpacket,),
+            )
+
+    def test_register_partition_boundary_with_torchtpu_helper(self):
+        op = Mock()
+        register = Mock()
+        fake_torch = Mock()
+        fake_torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary = op
+
+        with (
+            patch.object(fused_moe_rs_op, "torch", fake_torch),
+            patch.object(
+                fused_moe_rs_op.collective_ops,
+                "register_collective_op",
+                register,
+                create=True,
+            ),
+        ):
+            fused_moe_rs_op._register_partition_boundary_op()
+
+        register.assert_called_once_with(op)
+
     def test_prepare_sets_physical_rank_metadata(self):
         layer = Mock(
             num_local_experts=16,

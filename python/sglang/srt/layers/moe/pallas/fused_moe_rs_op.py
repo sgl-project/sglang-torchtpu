@@ -5,7 +5,7 @@ import functools
 import os
 
 import torch
-from torch_tpu._internal.compile.collective_ops import register_collective_op
+from torch_tpu._internal.compile import collective_ops
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
@@ -14,7 +14,17 @@ _FUSED_MOE_RS_OPS = {}
 
 
 def _register_partition_boundary_op() -> None:
-    register_collective_op(torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary)
+    op = torch.ops.sglang_tpu_pallas.fused_moe_rs_partition_boundary
+    register = getattr(collective_ops, "register_collective_op", None)
+    if register is not None:
+        register(op)
+        return
+
+    # TorchTPU releases before the registration helper expose a module-level
+    # tuple that the split compiler reads when it partitions the FX graph.
+    target = getattr(op, "overloadpacket", op)
+    if target not in collective_ops.COLLECTIVE_OPS:
+        collective_ops.COLLECTIVE_OPS += (target,)
 
 
 @functools.cache
