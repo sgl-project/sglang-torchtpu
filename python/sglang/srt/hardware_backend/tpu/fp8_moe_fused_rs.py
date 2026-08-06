@@ -11,6 +11,7 @@ partitions to keep routing and fused-RS calls within the validated graph size.
 
 from __future__ import annotations
 
+import itertools
 import os
 from collections.abc import Callable
 
@@ -24,6 +25,16 @@ _FUSED_RS_MAX_SIZE_M = 32768
 # TensorCoreSequencer descriptor-queue check. Materialize the existing output
 # all-gather every second layer so no compiled segment reaches that boundary.
 _FUSED_RS_PARTITION_INTERVAL = 2
+_FUSED_RS_LAYER_ORDINALS = itertools.count()
+
+
+def _assign_fused_rs_layer_ordinal(layer: torch.nn.Module) -> int:
+    """Assign an ordinal among eligible fused-RS layers in model load order."""
+    ordinal = layer.__dict__.get("_tpu_fused_rs_layer_ordinal")
+    if ordinal is None:
+        ordinal = next(_FUSED_RS_LAYER_ORDINALS)
+        layer.__dict__["_tpu_fused_rs_layer_ordinal"] = ordinal
+    return ordinal
 
 
 def supports_fp8_fused_rs(
@@ -123,11 +134,11 @@ def should_use_fp8_fused_rs(size_m: int) -> bool:
     return size_m <= _FUSED_RS_MAX_SIZE_M
 
 
-def should_partition_fp8_fused_rs(size_m: int, layer_id: int) -> bool:
+def should_partition_fp8_fused_rs(size_m: int, fused_layer_ordinal: int) -> bool:
     """Return whether this layer is a large-prefill compiler boundary."""
     return (
         size_m > _FUSED_RS_INLINE_MAX_SIZE_M
-        and (layer_id + 1) % _FUSED_RS_PARTITION_INTERVAL == 0
+        and (fused_layer_ordinal + 1) % _FUSED_RS_PARTITION_INTERVAL == 0
     )
 
 
@@ -172,6 +183,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason
         return False
     layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
+    _assign_fused_rs_layer_ordinal(layer)
 
     # prepare_tpu_fp8_moe_weights already stores weights as (E, K, N) and
     # channelwise scales as (E, 1, 1, N), exactly as fused-RS expects.
@@ -271,7 +283,9 @@ def _apply_fp8_fused_rs(
         # Large prefills use the validated BF16-payload specialization. The
         # FP8 row-scale staging path is retained for decode and small prefills.
         fp8_direct_write=not large_prefill,
-        partition_boundary=should_partition_fp8_fused_rs(size_m, int(layer.layer_id)),
+        partition_boundary=should_partition_fp8_fused_rs(
+            size_m, int(layer._tpu_fused_rs_layer_ordinal)
+        ),
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])

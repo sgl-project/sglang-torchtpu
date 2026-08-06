@@ -2,6 +2,7 @@
 
 """Unit tests for TPU FP8 fused-RS runtime selection."""
 
+import itertools
 import sys
 import unittest
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
+    _assign_fused_rs_layer_ordinal,
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
     should_partition_fp8_fused_rs,
@@ -178,6 +180,19 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertTrue(should_partition_fp8_fused_rs(32768, 1))
         self.assertFalse(should_partition_fp8_fused_rs(32768, 2))
         self.assertTrue(should_partition_fp8_fused_rs(32768, 3))
+
+    def test_assigns_ordinals_independent_of_transformer_layer_ids(self):
+        layers = [SimpleNamespace(layer_id=layer_id) for layer_id in (0, 2, 4)]
+        with patch(
+            "sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs."
+            "_FUSED_RS_LAYER_ORDINALS",
+            itertools.count(),
+        ):
+            ordinals = [_assign_fused_rs_layer_ordinal(layer) for layer in layers]
+            repeated = [_assign_fused_rs_layer_ordinal(layer) for layer in layers]
+
+        self.assertEqual(ordinals, [0, 1, 2])
+        self.assertEqual(repeated, ordinals)
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         self.assertTrue(
