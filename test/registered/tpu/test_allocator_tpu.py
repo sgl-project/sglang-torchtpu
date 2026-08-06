@@ -302,6 +302,21 @@ class TestFreeRoundTrip(CustomTestCase):
         a.free(tok)
         self.assertEqual(len(a.free_pages), before + 1)
 
+    def test_free_int64_preserves_pool_dtype_for_decode(self):
+        a = _make_allocator(size=32, page_size=4)
+        allocated = a.alloc(4)
+
+        a.free(allocated.to(torch.int64))
+
+        self.assertEqual(a.free_pages.dtype, torch.int32)
+        out = a.alloc_decode(
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([15], dtype=torch.int32),
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out.dtype, torch.int32)
+
     def test_free_empty_is_noop(self):
         a = _make_allocator(size=32, page_size=4)
         before = len(a.free_pages)

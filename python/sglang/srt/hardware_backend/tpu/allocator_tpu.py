@@ -202,6 +202,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         return out_indices.int()
 
     def free(self, free_index: torch.Tensor) -> None:
-        if free_index.device.type != "cpu":
-            free_index = free_index.cpu()
+        # Page pools are host-resident int32 tensors. Scheduler locations can
+        # be int64, so normalize before the parent derives and reinserts page
+        # IDs; otherwise torch.cat promotes the pool and the next decode-page
+        # assignment fails against its int32 destination.
+        free_index = free_index.to(device="cpu", dtype=torch.int32)
         super().free(free_index)
