@@ -86,6 +86,16 @@ class SWAKVPool(BaseSWAKVPool):
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
+    def get_state(self) -> list[torch.Tensor]:
+        """Return the buffers from both attention pools."""
+        return [*self.full_kv_pool.get_state(), *self.swa_kv_pool.get_state()]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Replace the buffers in both attention pools."""
+        full_state_count = len(self.full_kv_pool.get_state())
+        self.full_kv_pool.set_state(state[:full_state_count])
+        self.swa_kv_pool.set_state(state[full_state_count:])
+
     @property
     def post_capture_active(self) -> bool:
         """True iff the sub-pools took the post-capture VA-backed path (both share the flag)."""

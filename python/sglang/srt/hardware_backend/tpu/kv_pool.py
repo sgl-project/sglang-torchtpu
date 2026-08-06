@@ -165,6 +165,14 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = True
 
+    def get_state(self) -> list[torch.Tensor]:
+        """Return the fused KV buffers used by forward execution."""
+        return self.kv_buffer
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Replace the fused KV buffers used by forward execution."""
+        self.kv_buffer = state
+
     # ------------------------------------------------------------------ #
     # Buffer creation / accessors
     # ------------------------------------------------------------------ #

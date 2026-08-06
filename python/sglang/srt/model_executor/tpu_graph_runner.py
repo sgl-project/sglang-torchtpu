@@ -180,13 +180,16 @@ class TpuGraphRunner:
                 )
             policy_cls = _augment_spec_policy(policy_cls, model_runner)
 
-            policy = policy_cls(
+            policy_kwargs = dict(
                 model_runner=model_runner,
                 owner=module,
                 method_name=method_name,
                 method=method,
                 label=type(module).__name__,
             )
+            if issubclass(policy_cls, DecoderTpuCompilePolicy):
+                policy_kwargs["tracer"] = model_runner.server_args.tpu_compile_tracer
+            policy = policy_cls(**policy_kwargs)
             installed = policy.install()
             if installed:
                 installed_any = True
@@ -194,6 +197,7 @@ class TpuGraphRunner:
                 policy.precompile()
 
         if not installed_any:
+            server_args = model_runner.server_args
             fallback_cls = _augment_spec_policy(DecoderTpuCompilePolicy, model_runner)
             logger.info(
                 "enable_torch_compile=True but %s declares no TPU compile "
@@ -207,6 +211,7 @@ class TpuGraphRunner:
                 method_name="forward",
                 method=getattr(self.model, "forward", None),
                 label=type(self.model).__name__,
+                tracer=server_args.tpu_compile_tracer,
             )
             if fallback_policy.install():
                 installed_any = True

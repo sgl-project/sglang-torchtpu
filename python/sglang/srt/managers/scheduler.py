@@ -3866,6 +3866,10 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        if self.server_args.enable_torch_compile:
+            counters = torch._dynamo.utils.counters
+            ret["torch_compile_dynamo_frames"] = counters["frames"]["total"]
+            ret["torch_compile_aot_autograd_graphs"] = counters["aot_autograd"]["total"]
         save_bundle = self.server_args.unsafe_save_torch_compile_bundle
         load_bundle = self.server_args.unsafe_load_torch_compile_bundle
         if save_bundle is not None or load_bundle is not None:

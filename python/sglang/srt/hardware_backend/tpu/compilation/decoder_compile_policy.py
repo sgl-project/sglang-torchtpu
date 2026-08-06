@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 
 import msgspec
 import torch
@@ -32,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -265,6 +267,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         method: Callable[..., Any] | None = None,
         name: str | None = None,
         label: str | None = None,
+        tracer: Literal["dynamo", "direct"] = "dynamo",
     ) -> None:
         super().__init__(
             model_runner=model_runner,
@@ -276,6 +279,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
+        self.tracer = tracer
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
@@ -342,18 +346,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         compile_owner = self.owner.model if is_draft_worker else self.owner
         compile_fn = compile_owner.forward if is_draft_worker else fn
 
-        backend = self.backend or current_platform.get_compile_backend()
-        use_bundle = (
-            server_args.unsafe_save_torch_compile_bundle is not None
-            or server_args.unsafe_load_torch_compile_bundle is not None
-        )
-        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
-        compiled = compiler(
-            torch.no_grad()(compile_fn),
-            backend=backend,
-            fullgraph=self.fullgraph,
-            dynamic=self.dynamic,
-        )
+        compiled = self._compile(compile_fn)
         compiled.__signature__ = inspect.signature(compile_fn)
         setattr(
             compile_owner,
@@ -364,7 +357,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             logits_fn = self.owner.logits_processor.forward
             compiled_logits = torch.compile(
                 torch.no_grad()(logits_fn),
-                backend=backend,
+                backend=self.backend or current_platform.get_compile_backend(),
                 fullgraph=self.fullgraph,
                 dynamic=self.dynamic,
             )
@@ -433,6 +426,90 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        if self.tracer == "direct":
+            return self._direct_compile(fn)
+
+        server_args = self.model_runner.server_args
+        use_bundle = (
+            server_args.unsafe_save_torch_compile_bundle is not None
+            or server_args.unsafe_load_torch_compile_bundle is not None
+        )
+        compiler = torch_compile_bundle.Compiler if use_bundle else torch.compile
+        return compiler(
+            torch.no_grad()(fn),
+            backend=self.backend or current_platform.get_compile_backend(),
+            fullgraph=self.fullgraph,
+            dynamic=self.dynamic,
+        )
+
+    def _direct_compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        """Compile directly through TorchTPU without Dynamo or AOTAutograd."""
+        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+            direct_compile,
+        )
+
+        fn = torch.no_grad()(fn)
+        model = self.model_runner.model
+
+        def trace_forward(
+            attention_metadata: Any,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            forward_batch: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            backend = get_forward_context().attn_backend
+            previous_metadata = backend.forward_metadata
+            # Attention reads metadata through the backend during tracing.
+            backend.forward_metadata = attention_metadata
+            try:
+                return fn(input_ids, positions, forward_batch, *args, **kwargs)
+            finally:
+                backend.forward_metadata = previous_metadata
+
+        compiled = direct_compile(
+            trace_forward,
+            specialization_key=self._direct_compile_specialization_key,
+            model=model,
+            kv_pool=self.model_runner.token_to_kv_pool,
+            ignored_argnames=(
+                "forward_batch.sampling_info",
+                "forward_batch.orig_seq_lens",
+                # Pallas consumes these host mirrors before the compiled model.
+                "forward_batch.req_pool_indices_cpu",
+                "forward_batch.seq_lens_cpu",
+            ),
+        )
+
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            backend = get_forward_context().attn_backend
+            return compiled(
+                backend.forward_metadata,
+                *args,
+                **kwargs,
+            )
+
+        return call
+
+    def _direct_compile_specialization_key(
+        self,
+        _attention_metadata: Any,
+        input_ids: torch.Tensor,
+        _positions: torch.Tensor,
+        forward_batch: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> tuple[Any, ...]:
+        return (
+            forward_batch.forward_mode,
+            forward_batch.capture_hidden_mode,
+            forward_batch.batch_size,
+            input_ids.shape[0],
+        )
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a normal or target forward before attention planning."""
@@ -625,7 +702,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
-        forward_batch = args[2]
+        forward_batch = (
+            kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
+        )
         self._seed_dummy_req_to_token(forward_batch)
 
         model = self.model_runner.model
@@ -826,6 +905,25 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
+    def _direct_compile_specialization_key(
+        self,
+        _attention_metadata: Any,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        forward_batch: Any,
+        *,
+        input_embeds: torch.Tensor,
+        input_deepstack_embeds: torch.Tensor | None = None,
+        **_kwargs: Any,
+    ) -> tuple[Any, ...]:
+        return (
+            forward_batch.forward_mode,
+            forward_batch.capture_hidden_mode,
+            forward_batch.batch_size,
+            input_embeds.shape[0],
+            input_deepstack_embeds is not None,
+        )
+
     def finalize_forward_batch(self, out: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
@@ -1011,5 +1109,10 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 ),
             )
 
-        call_kwargs["input_embeds"] = input_embeds
-        return (None, positions, forward_batch), call_kwargs
+        call_kwargs.update(
+            input_ids=None,
+            positions=positions,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+        )
+        return (), call_kwargs

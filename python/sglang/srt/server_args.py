@@ -1626,6 +1626,11 @@ class ServerArgs:
     enable_torch_compile_debug_mode: A[bool, "Enable debug mode for torch compile"] = (
         False
     )
+    tpu_compile_tracer: A[
+        Literal["dynamo", "direct"],
+        "Select the TPU compilation tracer. Dynamo provides guards and broader "
+        "input support; direct lowers through TorchTPU with less compilation overhead.",
+    ] = "dynamo"
     unsafe_save_torch_compile_bundle: A[
         Optional[str],
         "Directory in which to save per-rank torch.compile bundles after warmup. "
@@ -2780,6 +2785,7 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+        self._handle_tpu_compile_tracer()
         self._handle_unsafe_torch_compile_bundle()
 
         # Validate PD disaggregation flags before CUDA graph config.
@@ -3246,6 +3252,23 @@ class ServerArgs:
             self._quantization_explicitly_unset = False
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
+
+    def _handle_tpu_compile_tracer(self) -> None:
+        if self.tpu_compile_tracer == "dynamo":
+            return
+        if self.device != "tpu":
+            raise ValueError("--tpu-compile-tracer direct is supported only on TPU")
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--tpu-compile-tracer direct does not support speculative decoding"
+            )
+        if (
+            self.unsafe_save_torch_compile_bundle is not None
+            or self.unsafe_load_torch_compile_bundle is not None
+        ):
+            raise ValueError(
+                "--tpu-compile-tracer direct does not support torch.compile bundles"
+            )
 
     def _handle_unsafe_torch_compile_bundle(self) -> None:
         save_dir = self.unsafe_save_torch_compile_bundle

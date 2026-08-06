@@ -82,6 +82,13 @@ class TestTpuGraphRunner(CustomTestCase):
         )
         self.mock_compile = compile_patcher.start()
         self.addCleanup(compile_patcher.stop)
+        direct_patcher = patch(
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "decoder_compile_policy.DecoderTpuCompilePolicy._direct_compile",
+            return_value=MagicMock(name="direct_compiled"),
+        )
+        self.mock_direct_compile = direct_patcher.start()
+        self.addCleanup(direct_patcher.stop)
         # Stub the backend-registration import so the test doesn't need torch_tpu.
         register_patcher = patch(
             "sglang.srt.hardware_backend.tpu.patches._register_tpu_compile_backend"
@@ -118,10 +125,14 @@ class TestTpuGraphRunner(CustomTestCase):
         self.addCleanup(dp_patcher.stop)
 
     def _runner_for(
-        self, model: Any, enable_torch_compile: bool = True
+        self,
+        model: Any,
+        enable_torch_compile: bool = True,
+        tpu_compile_tracer: str = "dynamo",
     ) -> SimpleNamespace:
         server_args = SimpleNamespace(
             enable_torch_compile=enable_torch_compile,
+            tpu_compile_tracer=tpu_compile_tracer,
             unsafe_save_torch_compile_bundle=None,
             unsafe_load_torch_compile_bundle=None,
             tpu_compile_tokens=None,
@@ -231,15 +242,17 @@ class TestTpuGraphRunner(CustomTestCase):
         TpuGraphRunner(self._runner_for(model))
         self.mock_compile.assert_called_once()
 
-    def test_no_annotation_falls_back_to_decoder_policy(self):
+    def test_no_annotation_uses_direct_tracer(self):
         # Most text decoder models should not need an explicit annotation.
         # If no annotated boundary is installed, TPU compile falls back to
         # the generic decoder policy on the model forward.
         model = _model_with(forward=MagicMock())
-        runner = self._runner_for(model)
+        runner = self._runner_for(model, tpu_compile_tracer="direct")
         TpuGraphRunner(runner)
-        self.mock_compile.assert_called_once()
+        self.mock_direct_compile.assert_called_once()
+        self.mock_compile.assert_not_called()
         self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
+        self.assertEqual(runner.compile_policy.tracer, "direct")
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
 
@@ -345,6 +358,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertFalse(hasattr(foreign_module, "installed"))
         self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
         self.mock_compile.assert_called_once()
+        self.mock_direct_compile.assert_not_called()
 
     def test_dynamic_compile_unwrap_updates_repetition_penalty_alias(self):
         from sglang.srt.hardware_backend.tpu import patches as tpu_patches

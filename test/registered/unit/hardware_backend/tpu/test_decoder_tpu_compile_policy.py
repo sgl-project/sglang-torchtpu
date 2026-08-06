@@ -252,7 +252,7 @@ class TestInstallExtendCap(CustomTestCase):
         self.assertIs(policy.compiled_forward_shim.fn, original_outer)
 
 
-class TestQwen3VLDecoderUnpadding(CustomTestCase):
+class TestQwen3VLDecoderPolicy(CustomTestCase):
     def _forward_batch(self):
         return SimpleNamespace(
             _tpu_real_q=3,
@@ -301,6 +301,49 @@ class TestQwen3VLDecoderUnpadding(CustomTestCase):
         self.assertEqual(forward_batch.extend_seq_lens_cpu, [2, 1])
         self.assertEqual(forward_batch.mm_input_embeds.shape, (3, 4))
         self.assertEqual(sampled_hidden_states.shape, (2, 4))
+
+    def test_direct_warmup_matches_serving_call_convention(self):
+        model_runner = _model_runner()
+        model_runner.model.get_image_feature = MagicMock()
+        model_runner.model.get_input_embeddings = MagicMock(
+            return_value=torch.nn.Embedding(2, 4)
+        )
+        model_runner.model.num_deepstack_embeddings = 2
+        forward_batch = SimpleNamespace(
+            input_ids=torch.ones(8, dtype=torch.int64),
+            positions=torch.arange(8),
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            batch_size=2,
+        )
+        policy = Qwen3VLDecoderTpuCompilePolicy(
+            model_runner=model_runner, owner=model_runner.model
+        )
+        policy._make_dummy_forward_batch = MagicMock(return_value=forward_batch)
+
+        args, kwargs = policy._make_warmup_inputs(
+            num_tokens=8,
+            bs=2,
+            mode=ForwardMode.EXTEND,
+            variant="deepstack",
+        )
+
+        self.assertEqual(args, ())
+        self.assertEqual(
+            set(kwargs),
+            {
+                "input_ids",
+                "positions",
+                "forward_batch",
+                "input_embeds",
+                "input_deepstack_embeds",
+            },
+        )
+        deepstack_key = policy._direct_compile_specialization_key(None, **kwargs)
+        kwargs.pop("input_deepstack_embeds")
+        self.assertNotEqual(
+            deepstack_key, policy._direct_compile_specialization_key(None, **kwargs)
+        )
 
     def test_slices_hidden_and_aux_tuple(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()

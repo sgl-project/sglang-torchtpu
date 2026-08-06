@@ -1486,6 +1486,20 @@ class MHATokenToKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
+    def get_state(self) -> list[torch.Tensor]:
+        """Return the K/V buffers used by forward execution.
+
+        Subclasses with different buffer layouts must override this method and
+        ``set_state``.
+        """
+        return [*self.k_buffer, *self.v_buffer]
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Replace the K/V buffers used by forward execution."""
+        k_buffer_count = len(self.k_buffer)
+        self.k_buffer = state[:k_buffer_count]
+        self.v_buffer = state[k_buffer_count:]
+
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:
@@ -2816,6 +2830,14 @@ class MLATokenToKVPool(KVCache):
         if not use_dsa:
             # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
+
+    def get_state(self) -> list[torch.Tensor]:
+        """Return the latent KV buffers used by forward execution."""
+        return self.kv_buffer
+
+    def set_state(self, state: list[torch.Tensor]) -> None:
+        """Replace the latent KV buffers used by forward execution."""
+        self.kv_buffer = state
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
