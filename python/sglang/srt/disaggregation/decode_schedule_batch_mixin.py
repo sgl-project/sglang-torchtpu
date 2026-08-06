@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from array import array
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -11,8 +11,11 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils import is_tpu
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -21,7 +24,6 @@ if TYPE_CHECKING:
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
-
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -38,11 +40,14 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Pre-calculate total size
         total_size = sum(req.extend_range.length for req in reqs)
-        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
+        out_cache_loc_device = "cpu" if _is_tpu else self.device
+        out_cache_loc = torch.empty(
+            total_size, dtype=torch.int64, device=out_cache_loc_device
+        )
 
         # Fill the tensor in one pass
         offset = 0
-        for i, req in enumerate(reqs):
+        for req in reqs:
             req_pool_indices.append(req.req_pool_idx)
             pre_len = len(req.prefix_indices)
 
@@ -52,7 +57,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
             assert (
                 offset + req.extend_range.length <= total_size
             ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_range.length] = chunk
+            if not _is_tpu:
+                out_cache_loc[offset : offset + req.extend_range.length] = chunk
             offset += req.extend_range.length
 
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
@@ -113,7 +119,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         future_map: FutureMap,
     ):
         """Assign the buffered last input id to schedule batch"""
-        last_tokens: List[int] = []
+        last_tokens: list[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
             maybe_cache_unfinished_req(req, self.tree_cache)
