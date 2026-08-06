@@ -8,8 +8,8 @@ import os
 import torch
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
+_FUSED_MOE_RS_OP = None
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
-_FUSED_MOE_RS_OPS = {}
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
 
 
@@ -60,7 +60,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )
-    _build_fused_moe_rs_op(_FUSED_MOE_RS_OP_NAME)
+    _build_fused_moe_rs_op()
 
 
 @functools.cache
@@ -77,9 +77,10 @@ def _get_mesh():
     return Mesh(export_devices, ("data", "model"))
 
 
-def _build_fused_moe_rs_op(op_name: str = _FUSED_MOE_RS_OP_NAME):
-    if op_name in _FUSED_MOE_RS_OPS:
-        return _FUSED_MOE_RS_OPS[op_name]
+def _build_fused_moe_rs_op():
+    global _FUSED_MOE_RS_OP
+    if _FUSED_MOE_RS_OP is not None:
+        return _FUSED_MOE_RS_OP
 
     import jax
     import jax.numpy as jnp
@@ -144,8 +145,8 @@ def _build_fused_moe_rs_op(op_name: str = _FUSED_MOE_RS_OP_NAME):
         return result
 
     # Bridge the JAX kernel into Torch with model-sharded weights and output.
-    op = cpu_export_jax_op(
-        op_name,
+    _FUSED_MOE_RS_OP = cpu_export_jax_op(
+        _FUSED_MOE_RS_OP_NAME,
         _wrapped,
         mesh=mesh,
         input_partition_specs=(
@@ -165,8 +166,7 @@ def _build_fused_moe_rs_op(op_name: str = _FUSED_MOE_RS_OP_NAME):
         ),
         output_partition_specs=(P("model", None),),
     )
-    _FUSED_MOE_RS_OPS[op_name] = op
-    return op
+    return _FUSED_MOE_RS_OP
 
 
 def fused_moe_rs_call(

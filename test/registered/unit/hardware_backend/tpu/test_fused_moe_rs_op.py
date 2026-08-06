@@ -69,7 +69,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 4], dtype=torch.int32),
         )
-        build.assert_called_once_with(fused_moe_rs_op._FUSED_MOE_RS_OP_NAME)
+        build.assert_called_once_with()
 
     def test_gather_reorders_tp_ranks_to_physical_device_order(self):
         rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
