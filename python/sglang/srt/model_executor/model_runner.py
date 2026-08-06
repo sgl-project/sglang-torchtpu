@@ -273,6 +273,7 @@ MLA_ATTENTION_BACKENDS = [
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
     "intel_xpu",
+    "pallas_tpu_mla",
 ]
 
 

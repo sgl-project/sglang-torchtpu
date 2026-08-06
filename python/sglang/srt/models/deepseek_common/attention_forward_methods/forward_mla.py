@@ -63,6 +63,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_gfx95_supported,
     _is_hip,
     _is_musa,
+    _is_tpu,
     _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
@@ -512,7 +513,7 @@ class DeepseekMLAForwardMixin:
                         )
 
             elif self.w_kc.dtype == torch.float8_e4m3fn:
-                if _is_cpu:
+                if _is_cpu or _is_tpu:
                     q_nope_out = torch.bmm(
                         q_nope.to(torch.bfloat16).transpose(0, 1),
                         self.w_kc.to(torch.bfloat16) * self.w_scale,
@@ -920,7 +921,7 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            if _is_cpu:
+            if _is_cpu or _is_tpu:
                 attn_bmm_output = torch.bmm(
                     attn_output.to(torch.bfloat16).transpose(0, 1),
                     self.w_vc.to(torch.bfloat16) * self.w_scale,
@@ -951,8 +952,10 @@ class DeepseekMLAForwardMixin:
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_tc_piecewise_cuda_graph():
-                # torch dynamo requires out= op was called where output tensor was non-contiguous
+            if is_in_tc_piecewise_cuda_graph() or _is_tpu:
+                # Dynamo cannot trace a bmm whose out= tensor is non-contiguous,
+                # so traced paths (tc piecewise cuda graph, TPU whole-graph
+                # compile) use the transpose-and-flatten form instead.
                 attn_bmm_output = (
                     torch.bmm(attn_output.transpose(0, 1), self.w_vc)
                     .transpose(0, 1)

@@ -199,6 +199,15 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 
+def handle_attention_pallas_tpu_mla(attn, forward_batch):
+    # Absorb-only: the MLA v2 kernel owns cache writes, so the MHA prefill
+    # path (out-of-band set_kv_buffer) is unsupported.
+    # TODO: route pure prefill through MHA like the GPU handlers above
+    # (cheaper qk_head_dim-wide scores); needs a latent cache-write kernel
+    # to pair with the RPA v3 attention kernel.
+    return AttnForwardMethod.MLA
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -214,3 +223,4 @@ AttentionBackendRegistry.register(
 )  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register("pallas_tpu_mla", handle_attention_pallas_tpu_mla)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -27,10 +27,11 @@ from sglang.srt.mem_cache.triton_ops.common import (
 )
 from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, support_triton
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, support_triton
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 _is_hip = is_hip()
 
@@ -320,7 +321,7 @@ def get_last_loc_torch(
     )
 
 
-def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+def get_alloc_len_per_decode(server_args: ServerArgs | None = None) -> int:
     if server_args is None:
         server_args = get_global_server_args()
 
@@ -348,7 +349,7 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
         return max(num_new_pages_per_topk * page_size * spec_topk, spec_tokens)
 
 
-def get_alloc_reserve_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+def get_alloc_reserve_per_decode(server_args: ServerArgs | None = None) -> int:
     """KV length reserved per request at each decode step.
 
     The 2x is a double-buffer that absorbs the kv_committed_len lag in overlap
@@ -451,10 +452,10 @@ def alloc_paged_token_slots_extend(
     last_loc: torch.Tensor,
     extend_num_tokens: int,
     backup_state: bool = False,
-    req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_lens: Optional[DSV4StateLens] = None,
+    req_pool_indices: torch.Tensor | None = None,
+    dsv4_state_lens: DSV4StateLens | None = None,
     batch=None,
-    out_cache_loc_host: Optional[torch.Tensor] = None,
+    out_cache_loc_host: torch.Tensor | None = None,
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -645,8 +646,8 @@ def alloc_paged_token_slots_decode(
     seq_lens_cpu: torch.Tensor,
     last_loc: torch.Tensor,
     token_per_req: int = 1,
-    req_pool_indices: Optional[torch.Tensor] = None,
-    dsv4_state_lens: Optional[DSV4StateLens] = None,
+    req_pool_indices: torch.Tensor | None = None,
+    dsv4_state_lens: DSV4StateLens | None = None,
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
@@ -701,8 +702,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    seq_lens_gpu = batch.seq_lens
-    bs = seq_lens_gpu.shape[0]
+    seq_lens = batch.seq_lens_cpu if _is_tpu else batch.seq_lens
+    bs = seq_lens.shape[0]
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
@@ -713,10 +714,10 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         if _r2t.device.type == "cpu":
             # Host-resident pool: gather last_loc on host (alloc_decode runs
             # its formula on host).
-            last_loc = _r2t[batch.req_pool_indices.cpu(), batch.seq_lens_cpu - 1]
+            last_loc = _r2t[batch.req_pool_indices.cpu(), seq_lens - 1]
         else:
-            last_loc = _r2t[batch.req_pool_indices, seq_lens_gpu - 1]
-        seq_lens_next = seq_lens_gpu + token_per_req
+            last_loc = _r2t[batch.req_pool_indices, seq_lens - 1]
+        seq_lens_next = seq_lens + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -730,13 +731,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
+        locs = batch.encoder_lens.to(seq_lens.device) + seq_lens
     else:
-        locs = seq_lens_gpu.clone()
+        locs = seq_lens.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
+    if _is_tpu:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices_cpu, locs), out_cache_loc.to(torch.int32)
+        )
+    else:
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+        )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:

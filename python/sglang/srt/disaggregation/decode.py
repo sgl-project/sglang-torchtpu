@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -85,12 +85,14 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, is_tpu
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -134,22 +136,36 @@ class DecodeReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
+        # FIXME: SGLANG_TPU_REQ_TO_TOKEN_ON_HOST will always be True in the future.
+        self.host_resident = (
+            str(device).startswith("tpu") and envs.SGLANG_TPU_REQ_TO_TOKEN_ON_HOST.get()
+        )
+        r2t_device = "cpu" if self.host_resident else device
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len),
                 dtype=torch.int32,
-                device=device,
+                device=r2t_device,
             )
 
         self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
+        # Host-resident pool: move device index/value tensors to host scatter.
+        # FIXME: please refactor this inherit from ReqToTokenPool
+        if self.req_to_token.device.type == "cpu":
+            if isinstance(indices, tuple):
+                indices = tuple(i.cpu() if torch.is_tensor(i) else i for i in indices)
+            elif torch.is_tensor(indices):
+                indices = indices.cpu()
+            if torch.is_tensor(values):
+                values = values.cpu()
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
@@ -190,14 +206,14 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         device: str,
         enable_memory_saver: bool,
         cache_params: Mamba2CacheParams,
-        mamba_layer_ids: List[int],
+        mamba_layer_ids: list[int],
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
         pre_alloc_size: int,
         enable_overlap_schedule: bool,
         mamba_size: int = None,
         start_layer: int = None,
-        speculative_eagle_topk: Optional[int] = None,
+        speculative_eagle_topk: int | None = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -257,8 +273,8 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
 
     # HiCache Status
-    prefix_match: Optional[DecodePrefixMatch] = None
-    hicache_restored_kv_indices: Optional[torch.Tensor] = None
+    prefix_match: DecodePrefixMatch | None = None
+    hicache_restored_kv_indices: torch.Tensor | None = None
     hicache_restored_node: Any = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
@@ -268,7 +284,7 @@ class DecodeRequest:
         return self.req.seqlen
 
     @property
-    def priority(self) -> Optional[int]:
+    def priority(self) -> int | None:
         return self.req.priority
 
 
@@ -281,7 +297,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        draft_token_to_kv_pool: Optional[KVCache],
+        draft_token_to_kv_pool: KVCache | None,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
@@ -319,12 +335,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
-        self.queue: List[DecodeRequest] = []
-        self.retracted_queue: List[Req] = []
-        self.pending_reqs: List[DecodeRequest] = []
-        self._ensure_retry_count: Dict[str, int] = {}
+        self.queue: list[DecodeRequest] = []
+        self.retracted_queue: list[Req] = []
+        self.pending_reqs: list[DecodeRequest] = []
+        self._ensure_retry_count: dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
-        self._ensure_last_attempt_time: Dict[str, float] = {}
+        self._ensure_last_attempt_time: dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
@@ -372,13 +388,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return len(req.origin_input_ids) + len(req.output_ids)
         return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
 
-    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
+    def _prealloc_kv_lens(self, req: Req) -> tuple[int, int]:
         allocated_kv_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         if self._uses_swa_tail_prealloc():
             return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
         return allocated_kv_len, allocated_kv_len
 
-    def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
+    def _prealloc_required_tokens(self, req: Req) -> tuple[int, int]:
         full_len, swa_len = self._prealloc_kv_lens(req)
         swa_reserved = self.num_reserved_decode_tokens
         if self.scheduler.server_args.disable_radix_cache:
@@ -528,7 +544,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.tree_cache.inc_lock_ref(result.last_device_node)
         return self._build_decode_prefix_match(req, result)
 
-    def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+    def _resolve_prefill_dp_rank(self, req: Req) -> int | None:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
         if prefill_info is None:
@@ -587,7 +603,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 return True
         return False
 
-    def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
+    def extend(self, reqs: list[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
@@ -603,8 +619,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.kv_manager.register_buffer_to_engine()
 
     def resume_retracted_reqs(
-        self, rids_to_check: Optional[List[str]] = None
-    ) -> List[Req]:
+        self, rids_to_check: list[str] | None = None
+    ) -> list[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
 
         # allocate memory
@@ -652,9 +668,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return resumed_reqs
 
-    def _update_handshake_waiters(
-        self, rids_to_check: Optional[List[str]] = None
-    ) -> None:
+    def _update_handshake_waiters(self, rids_to_check: list[str] | None = None) -> None:
         if not self.queue:
             return
 
@@ -702,12 +716,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 raise ValueError(f"Unexpected poll case: {poll}")
 
     def _ensure_prefill_info(
-        self, addr_to_reqs: Dict[str, List[DecodeRequest]]
-    ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
+        self, addr_to_reqs: dict[str, list[DecodeRequest]]
+    ) -> tuple[dict[str, list[DecodeRequest]], list[DecodeRequest]]:
         """Non-blocking ensure parallel info for each addr.
         Returns (ready_addrs, remaining_reqs)."""
-        ready: Dict[str, List[DecodeRequest]] = {}
-        remaining: List[DecodeRequest] = []
+        ready: dict[str, list[DecodeRequest]] = {}
+        remaining: list[DecodeRequest] = []
 
         now = time.monotonic()
         for bootstrap_addr, reqs in addr_to_reqs.items():
@@ -751,7 +765,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return
 
         # Group pending requests by bootstrap_addr
-        addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
+        addr_to_reqs: dict[str, list[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
@@ -759,9 +773,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Pass 1: ensure parallel info for each addr
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
-        resolved: List[Tuple[DecodeRequest, int]] = []
+        resolved: list[tuple[DecodeRequest, int]] = []
         for bootstrap_addr, decode_reqs in ready_addrs.items():
-            need_query: List[DecodeRequest] = []
+            need_query: list[DecodeRequest] = []
             for decode_req in decode_reqs:
                 prefill_dp_rank = self._resolve_prefill_dp_rank(decode_req.req)
                 if prefill_dp_rank is not None:
@@ -790,8 +804,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
-    ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
+        self, rids_to_check: list[str] | None = None
+    ) -> tuple[list[DecodeRequest], list[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
@@ -895,7 +909,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
-            prefix_match: Optional[DecodePrefixMatch] = None
+            prefix_match: DecodePrefixMatch | None = None
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
@@ -1082,7 +1096,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
 
             state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[List] = []
+            state_indices: list | None = []
             if StateType.C128_STATE in state_types:
                 clear_c128_state = getattr(
                     self.token_to_kv_pool, "clear_c128_req_state", None
@@ -1142,9 +1156,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             decode_req.req.extend_range.end for decode_req in self.transfer_queue.queue
         )
 
-    def _need_space_for_single_req(
-        self, retractable_tokens: Optional[int] = None
-    ) -> int:
+    def _need_space_for_single_req(self, retractable_tokens: int | None = None) -> int:
         need_space_for_single_req = (
             max(
                 [
@@ -1169,7 +1181,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     def _active_reserved_tokens(
-        self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0
+        self, n_active: int | None = None, extra_reserved_reqs: int = 0
     ) -> int:
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
@@ -1177,10 +1189,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _swa_aware_allocatable_token_budgets(
         self,
-        retractable_tokens: Optional[int] = None,
-        retractable_swa_tokens: Optional[int] = None,
+        retractable_tokens: int | None = None,
+        retractable_swa_tokens: int | None = None,
         count_retracted: bool = True,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         n_active = self._active_req_count()
         reserved_tokens = self._active_reserved_tokens(n_active)
 
@@ -1200,10 +1212,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _allocatable_token_budgets(
         self,
-        retractable_tokens: Optional[int] = None,
+        retractable_tokens: int | None = None,
         count_retracted: bool = True,
         extra_reserved_reqs: int = 0,
-        reserved_tokens: Optional[int] = None,
+        reserved_tokens: int | None = None,
         hicache_reserved_tokens: int = 0,
     ) -> int:
         need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
@@ -1252,11 +1264,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _swa_tail_allocatable_token_budget(
         self,
-        retractable_tokens: Optional[int] = None,
-        retractable_swa_tokens: Optional[int] = None,
+        retractable_tokens: int | None = None,
+        retractable_swa_tokens: int | None = None,
         count_retracted: bool = True,
-        n_active: Optional[int] = None,
-        reserved_tokens: Optional[int] = None,
+        n_active: int | None = None,
+        reserved_tokens: int | None = None,
     ) -> int:
         need_swa_space_for_single_req = self._need_space_for_single_req(
             retractable_tokens
@@ -1328,9 +1340,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _pre_alloc(
         self,
         req: Req,
-        prefix_indices: Optional[torch.Tensor] = None,
-        prefix_len: Optional[int] = None,
-        total_prefix_len: Optional[int] = None,
+        prefix_indices: torch.Tensor | None = None,
+        prefix_len: int | None = None,
+        total_prefix_len: int | None = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool.
 
@@ -1504,7 +1516,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
     ):
-        self.queue: List[DecodeRequest] = []
+        self.queue: list[DecodeRequest] = []
         self.gloo_group = gloo_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
@@ -1518,7 +1530,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 
-    def extend(self, decode_reqs: List[DecodeRequest]) -> None:
+    def extend(self, decode_reqs: list[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
         if self.enable_staging:
             for dr in decode_reqs:
@@ -1639,7 +1651,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
-    def _poll_with_metadata_gate(self) -> List[int]:
+    def _poll_with_metadata_gate(self) -> list[int]:
         pollers = (
             [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
             if self.scheduler.enable_decode_hicache
@@ -1673,7 +1685,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def pop_transferred(self, rids_to_check: list[str] | None = None) -> list[Req]:
         if not self.queue:
             return []
 
@@ -1797,7 +1809,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def resume_memory_occupation(self):
         """Queues are already cleared on release; new transfers can be accepted."""
-        pass
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -1831,7 +1842,7 @@ class SchedulerDisaggregationDecodeMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
-        self.last_batch: Optional[ScheduleBatch] = None
+        self.last_batch: ScheduleBatch | None = None
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -1891,7 +1902,7 @@ class SchedulerDisaggregationDecodeMixin:
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
-    ) -> Optional[ScheduleBatch]:
+    ) -> ScheduleBatch | None:
         """Process prebuilt batch and schedule the next decode batch."""
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
@@ -1923,7 +1934,7 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
-    def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
+    def get_new_prebuilt_batch(self: Scheduler) -> ScheduleBatch | None:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
@@ -1943,8 +1954,8 @@ class SchedulerDisaggregationDecodeMixin:
         num_not_used_batch = batch_size - curr_batch_size
 
         # pop req from waiting queue
-        can_run_list: List[Req] = []
-        waiting_queue: List[Req] = []
+        can_run_list: list[Req] = []
+        waiting_queue: list[Req] = []
 
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]

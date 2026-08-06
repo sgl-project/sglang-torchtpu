@@ -54,6 +54,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_hip,
     _is_musa,
     _is_npu,
+    _is_tpu,
     _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
@@ -504,6 +505,12 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+
+            # GPU binds kv_b_proj at forward prepare
+            # TPU whole-graph compile traces the forward graph during warmup and
+            # can't bound kv_b_proj at forward prepare, so we bind it here for TPU.
+            if _is_tpu and getattr(self_attn.attn_mha, "kv_b_proj", None) is None:
+                self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported

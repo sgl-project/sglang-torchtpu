@@ -30,8 +30,6 @@ The fix only affects the TPU subclass; the parent
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import torch
 
 from sglang.srt.mem_cache.allocator import (
@@ -39,9 +37,6 @@ from sglang.srt.mem_cache.allocator import (
     alloc_extend_naive,
 )
 from sglang.srt.utils import get_num_new_pages
-
-if TYPE_CHECKING:
-    pass
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -207,24 +202,6 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         return out_indices.int()
 
     def free(self, free_index: torch.Tensor) -> None:
-        if free_index.numel() == 0:
-            return
-
-        if self.is_not_in_free_group:
-            # D2H copy of the freed token indices, then everything
-            # stays on host until merge_and_sort_free flushes them
-            # back into self.free_pages.
-            free_page_indices = torch.unique(free_index.cpu() // self.page_size).to(
-                torch.int32
-            )
-            if self.need_sort:
-                self.release_pages = torch.cat([free_page_indices, self.release_pages])
-            else:
-                self.free_pages = torch.cat([free_page_indices, self.free_pages])
-        else:
-            # Aggregated frees still come in as device tensors; flush
-            # at free_group_end -> free.
-            self.free_group.append(free_index)
-
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+        if free_index.device.type != "cpu":
+            free_index = free_index.cpu()
+        super().free(free_index)

@@ -602,6 +602,7 @@ _PALLAS_TPU_BACKENDS = (
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_batched",
+    "pallas_tpu_mla",
 )
 
 

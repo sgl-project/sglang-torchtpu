@@ -984,8 +984,9 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 
 def get_compiler_backend(mode=None) -> str:
-    # OOT platforms provide their own compile backend.
-    if current_platform.is_out_of_tree():
+    # OOT platforms provide their own compile backend. TPU is in-tree but also
+    # supplies its own ("tpu"), so it must not fall through to inductor.
+    if current_platform.is_out_of_tree() or current_platform.is_tpu():
         return current_platform.get_compile_backend(mode)
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():

@@ -33,10 +33,12 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
+    is_tpu,
     is_xpu,
 )
 
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_musa = is_musa()
@@ -68,6 +70,7 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "tokenspeed_mla",
     "ascend",
     "intel_xpu",
+    "pallas_tpu_mla",
 ]
 
 
