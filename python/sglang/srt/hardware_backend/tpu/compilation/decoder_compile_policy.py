@@ -1013,6 +1013,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
         )
 
+    def _decode_uses_input_ids(self) -> bool:
+        """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
+
+        Wrappers that set ``decode_embeds_in_language_model`` bypass
+        ``general_mm_embed_routine`` in decode so the embedding lands inside the
+        compiled graph instead of running as eager device programs in front of
+        it.
+        """
+        return self.model_runner.model.decode_embeds_in_language_model
+
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
@@ -1167,6 +1177,12 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._model_is_mrope
             else forward_batch.positions
         )
+
+        if mode.is_decode() and self._decode_uses_input_ids():
+            # Mirror the wrapper's decode shortcut: input_ids in, no
+            # input_embeds. Note this still uses the VL positions (mrope when
+            # enabled) -- only the embedding moves, not the position layout.
+            return (forward_batch.input_ids, positions, forward_batch), {}
 
         embed_tokens = self.owner.get_input_embeddings()
         input_embeds = embed_tokens(forward_batch.input_ids)

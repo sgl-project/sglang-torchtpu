@@ -100,6 +100,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -1833,6 +1834,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    decode_embeds_in_language_model = current_platform.is_tpu()
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 
@@ -2003,6 +2005,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
+    decode_embeds_in_language_model = current_platform.is_tpu()
 
     supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
 

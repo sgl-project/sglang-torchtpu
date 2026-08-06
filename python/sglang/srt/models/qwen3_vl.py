@@ -1250,6 +1250,12 @@ if current_platform.supports_torch_compile():
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Whether decode hands the language model raw ``input_ids`` rather than the
+    # ``input_embeds`` that ``general_mm_embed_routine`` precomputes. Subclasses
+    # that override ``forward`` to skip that routine in decode set this True.
+    # The TPU decoder compile policy reads it so warmup traces the same call
+    # shape serving uses; getting the two out of step is a serve-time recompile.
+    decode_embeds_in_language_model: bool = False
 
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
@@ -1438,6 +1444,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return bool(self._lora_pattern.match(module_name))
 
     @torch.no_grad()
+    def _embeds_in_language_model(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch lets the language model do its own token embedding.
+
+        ``general_mm_embed_routine`` always embeds itself and hands the language
+        model ready-made ``input_embeds``. Where the language model is a compiled
+        boundary (TPU), that puts a VocabParallelEmbedding's device programs --
+        shard mask, index_select, zeroing multiply, cross-TP all-reduce -- in
+        front of the graph on every step.
+
+        Decode has one query token per sequence and can never splice image
+        embeddings into it, so the routine's purpose is inert there and the model
+        can embed inside the graph instead. Prefill still goes through the
+        routine, which is where image embeddings actually get spliced.
+
+        Opt-in per wrapper: the routine also copies into
+        ``forward_batch.input_embeds`` when that pre-allocated buffer exists (for
+        CUDA-graph address stability), which this path skips.
+        """
+        return (
+            self.decode_embeds_in_language_model
+            and forward_batch.forward_mode.is_decode()
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1461,7 +1490,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        if self.language_model_only:
+        if self.language_model_only or self._embeds_in_language_model(forward_batch):
             hidden_states = self.model(
                 input_ids=input_ids,
                 forward_batch=forward_batch,
