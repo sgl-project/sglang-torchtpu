@@ -2,7 +2,7 @@
 set -e
 
 # Script to build sglang-torchtpu docker image.
-# It handles torch_tpu dependency (builds it if needed)
+# It handles torch_tpu dependency (builds base image if needed)
 # and then builds the sglang-torchtpu image.
 #
 # Options:
@@ -11,6 +11,8 @@ set -e
 #       building/cloning locally.
 #   --rebuild-torchtpu-base
 #       Force rebuild of the local torch-tpu base image.
+#   --skip-raiden
+#       Skip installing the tpu-raiden package in the container.
 #
 # Example:
 #   ./docker/build_sgl_torchtpu.sh \
@@ -21,8 +23,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SGLANG_ROOT="$(cd "${SCRIPT_DIR}/../" && pwd)"
 
-# Define paths
-TORCH_TPU_DIR="${SGLANG_ROOT}/../torch_tpu"
+# Define path for torch_tpu
+if [ -d "${HOME}/torch_tpu" ]; then
+  TORCH_TPU_DIR="${HOME}/torch_tpu"
+else
+  TORCH_TPU_DIR="${SGLANG_ROOT}/../torch_tpu"
+fi
+
 # Optional directory containing a `docker` shim (e.g. a Podman wrapper), used
 # only when the Docker daemon is unavailable. Set PODMAN_WRAPPER_DIR to enable.
 WRAPPER_DIR="${PODMAN_WRAPPER_DIR:-}"
@@ -37,6 +44,7 @@ fi
 
 # Parse command line arguments
 REBUILD_BASE=false
+SKIP_RAIDEN=false
 REMOTE_TORCH_TPU_IMAGE=""
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --rebuild-torchtpu-base)
       REBUILD_BASE=true
+      shift 1
+      ;;
+    --skip-raiden)
+      SKIP_RAIDEN=true
       shift 1
       ;;
     *)
@@ -108,13 +120,19 @@ fi
 # Tag with both :latest (for convenience) and a timestamp (for traceability /
 # to keep a history of local builds).
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-echo "===> Building sglang-torchtpu image (tags: latest, ${TIMESTAMP})..."
+INSTALL_RAIDEN_ARG="true"
+if [ "$SKIP_RAIDEN" = true ]; then
+  INSTALL_RAIDEN_ARG="false"
+fi
+
+echo "===> Building sglang-torchtpu image (tags: latest, ${TIMESTAMP}, INSTALL_RAIDEN=${INSTALL_RAIDEN_ARG})..."
 docker build \
   --progress=plain \
   -f "${SCRIPT_DIR}/sgl-torchtpu.Dockerfile" \
   -t sglang-torchtpu:latest \
   -t "sglang-torchtpu:${TIMESTAMP}" \
   --build-arg BASEIMAGE="${BASEIMAGE}" \
+  --build-arg INSTALL_RAIDEN="${INSTALL_RAIDEN_ARG}" \
   "${SGLANG_ROOT}"
 
 echo "===> Done! sglang-torchtpu:latest (also tagged ${TIMESTAMP}) built successfully."
