@@ -169,15 +169,17 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
-        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+        # Leave room for compiler padding, semaphores, and spill slots that are
+        # not represented in the logical schedule payload below.
+        smem_limit_bytes = pltpu.get_tpu_info().smem_capacity_bytes - 64 * 1024
         available_bytes = smem_limit_bytes - fixed_bytes
 
         # Per step per batch item:
-        # s_idx, q_idx, k_idx, is_last_k, do_writeback: 5 * 4 = 20
-        # dma_q: 2 * 4 = 8
+        # Seven scalar fields: 7 * 4 = 28
+        # dma_q and dma_o: 4 * 4 = 16
         # dma_kv_cache: bkv_p_cache * 3 * 4 = 12 * bkv_p_cache
         # dma_kv_new: bkv_p_new * 4 * 4 = 16 * bkv_p_new
-        bytes_per_step = 28 + 12 * self.bkv_p_cache + 16 * self.bkv_p_new
+        bytes_per_step = 44 + 12 * self.bkv_p_cache + 16 * self.bkv_p_new
         bytes_per_step *= self.block.batch_size
 
         max_steps_ub = available_bytes // bytes_per_step

@@ -251,15 +251,15 @@ class BatchingORef(pltpu.BufferedRef):
         dma_list = []
         for b in range(self.cfgs.batch_size):
             is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
-            q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
-            q_sz = jnp.where(is_last_k, q_sz, 0)
-            dma_list.append((q_src, q_sz, b))
+            o_dst, o_sz = schedule_ref.get_dma_o(block_idx, b)
+            o_sz = jnp.where(is_last_k, o_sz, 0)
+            dma_list.append((o_dst, o_sz, b))
 
         for i in range(len(dma_list)):
-            q_src, q_sz, b = dma_list[i]
+            o_dst, o_sz, b = dma_list[i]
             pltpu.make_async_copy(
-                vmem_src.at[b, :, pl.ds(0, q_sz)],
-                o_hbm.at[:, pl.ds(q_src, q_sz)],
+                vmem_src.at[b, :, pl.ds(0, o_sz)],
+                o_hbm.at[:, pl.ds(o_dst, o_sz)],
                 sem,
             ).start()
 
@@ -277,9 +277,9 @@ class BatchingORef(pltpu.BufferedRef):
         total_sz = 0
         for b in range(self.cfgs.batch_size):
             is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
-            _, q_sz = schedule_ref.get_dma_q(block_idx, b)
-            q_sz = jnp.where(is_last_k, q_sz, 0)
-            total_sz += q_sz
+            _, o_sz = schedule_ref.get_dma_o(block_idx, b)
+            o_sz = jnp.where(is_last_k, o_sz, 0)
+            total_sz += o_sz
 
         flat_ref = o_hbm.reshape((-1, *o_hbm.shape[2:]))
         pltpu.make_async_copy(

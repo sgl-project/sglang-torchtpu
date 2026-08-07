@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
@@ -49,28 +48,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-_STACKED_RPA_MAX_DECODE_TOKENS = 1
-
-
-def should_use_stacked_rpa(
-    *,
-    decode: bool,
-    enabled: bool,
-    num_tokens: int,
-    has_sinks: bool,
-    has_sliding_window: bool,
-) -> bool:
-    """Use split-K only when no request-level decode parallelism is available."""
-    return (
-        decode
-        and enabled
-        and num_tokens <= _STACKED_RPA_MAX_DECODE_TOKENS
-        and not has_sinks
-        and not has_sliding_window
-    )
-
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +109,6 @@ class InvokeKernelFn(Protocol):
         soft_cap,
         k_scale,
         v_scale,
-        stacked,
     ) -> tuple: ...
 
 
@@ -164,8 +140,6 @@ class RpaKernelSpec:
     # Which draft-extend forward-mode variant this backend recognizes: v3 uses
     # the ``*_v2`` modes; batched uses the plain ones.
     uses_draft_extend_v2: bool
-    # Whether decode may use the kernel's split-K stacked schedule.
-    supports_stacked_decode: bool = False
     # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
     # the TPU platform's page-size defaulting, not by this module.
     min_page_size: int | None = None
@@ -230,7 +204,6 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        stacked: bool = False,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -255,15 +228,14 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             soft_cap=soft_cap,
             k_scale=k_scale,
             v_scale=v_scale,
-            stacked=stacked,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
-        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale, 15=stacked.
-        static_argnums=(10, 11, 12, 13, 14, 15),
+        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale.
+        static_argnums=(10, 11, 12, 13, 14),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -290,7 +262,6 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
-        stacked: bool = False,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -309,7 +280,6 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 soft_cap,
                 k_scale,
                 v_scale,
-                stacked,
             )
         return output
 
@@ -400,10 +370,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # traced region — dynamo can't handle ``inspect.signature`` on the
         # wrapped JAX function. The forward path then just looks the op up.
         self._op = self._build_kernel_op()
-        self._stacked_decode_enabled = (
-            self.kernel_spec.supports_stacked_decode
-            and envs.SGLANG_USE_TPU_STACKED_RPA.get()
-        )
 
     def _build_kernel_op(self):
         """Build the Pallas custom op stored as ``self._op``.
@@ -787,9 +753,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
-        return self._forward(
-            q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"), decode=False
-        )
+        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def forward_decode(
         self,
@@ -805,9 +769,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # the view below matches the kernel's expected layout. This mirrors
         # TorchNativeAttnBackend.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-        return self._forward(
-            q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"), decode=True
-        )
+        return self._forward(q, k, v, layer, forward_batch, sinks=kwargs.get("sinks"))
 
     def _forward(
         self,
@@ -817,7 +779,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         layer: "RadixAttention",
         forward_batch: ForwardBatch,
         sinks: torch.Tensor | None = None,
-        decode: bool = False,
     ) -> torch.Tensor:
         assert self.forward_metadata is not None, (
             "Pallas attention backend was not initialised for this forward pass; "
@@ -876,14 +837,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
-        stacked = should_use_stacked_rpa(
-            decode=decode,
-            enabled=self._stacked_decode_enabled,
-            num_tokens=num_tokens,
-            has_sinks=sinks is not None,
-            has_sliding_window=sliding_window is not None,
-        )
-
         out = op(
             q,
             k,
@@ -900,7 +853,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
-            stacked,
         )
 
         # The kernel emits output at the (padded) qk head_dim. For asymmetric

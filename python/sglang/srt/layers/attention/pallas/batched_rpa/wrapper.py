@@ -130,18 +130,17 @@ def get_kv_cache_shape(
     )
 
 
-def calculate_block_sizes(
+def _calculate_vmem_usage(
     model_cfgs: configs.ModelConfigs,
     serve_cfgs: configs.ServingConfigs,
-    vmem_limit_bytes: int,
-) -> tuple[configs.BlockSizes, configs.BlockSizes]:
-    """Calculate optimal block size for decode and prefill."""
-
-    tpu_info = pltpu.get_tpu_info()
-    num_lanes = tpu_info.num_lanes
-    mxu_column_size = tpu_info.mxu_column_size
-
-    # Calculate aligned model dimensions.
+    *,
+    batch_size: int,
+    n_buffer: int,
+    bq_sz: int,
+    bkv_sz: int,
+    num_lanes: int,
+) -> int:
+    """Estimate the kernel's buffered and compute VMEM footprint."""
     aligned_head_dim = utils.align_to(model_cfgs.head_dim, num_lanes)
     aligned_num_q_heads_per_kv_head = utils.align_to(
         model_cfgs.num_q_heads_per_kv_head, serve_cfgs.packing_q
@@ -157,57 +156,48 @@ def calculate_block_sizes(
     kv_bytes = jnp.dtype(serve_cfgs.dtype_kv).itemsize
     out_bytes = jnp.dtype(serve_cfgs.dtype_out).itemsize
 
-    def calculate_vmem_usage(
+    bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
+    bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
+    bo_array_size = bq_array_size
+
+    buffer_bytes = (
+        bq_array_size * q_bytes * n_buffer
+        + bkv_array_size * kv_bytes * n_buffer
+        + bo_array_size * out_bytes * 2
+    )
+
+    loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
+    loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
+    qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
+    compute_bytes = (
+        loaded_bq_size * q_bytes + loaded_bkv_size * kv_bytes + qk_size * out_bytes
+    )
+    return (buffer_bytes + compute_bytes) * batch_size
+
+
+def calculate_block_sizes(
+    model_cfgs: configs.ModelConfigs,
+    serve_cfgs: configs.ServingConfigs,
+    vmem_limit_bytes: int,
+) -> tuple[configs.BlockSizes, configs.BlockSizes]:
+    """Calculate optimal block size for decode and prefill."""
+
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    mxu_column_size = tpu_info.mxu_column_size
+
+    def estimate_vmem_usage(
         batch_size: int, n_buffer: int, bq_sz: int, bkv_sz: int
     ) -> int:
-        """Given tile size, calculate VMEM usage of the kernel."""
-
-        # Step 1: Calculate buffer sizes.
-
-        # Calculate size bq & bkv arrays for a single buffer.
-        bq_array_size = bq_sz * aligned_num_q_heads * aligned_head_dim
-        bkv_array_size = bkv_sz * aligned_num_kv_heads_x2 * aligned_head_dim
-
-        # Get output buffer size as well - which has same size as query size.
-        bo_array_size = bq_array_size
-
-        # Convert to bytes.
-        bq_bytes = bq_array_size * q_bytes
-        bkv_bytes = bkv_array_size * kv_bytes
-        bo_bytes = bo_array_size * out_bytes
-
-        # Account for multiple buffers. For output, we always use double buffer.
-        bq_bytes *= n_buffer
-        bkv_bytes *= n_buffer
-        bo_bytes *= 2
-
-        # Sum up all buffer memory usage.
-        buffer_bytes = bq_bytes + bkv_bytes + bo_bytes
-
-        # Step 2: Calculate worst case memory usage during computation.
-
-        # Calculate the size of loaded bq and bkv size.
-        loaded_bq_size = bq_sz * model_cfgs.num_q_heads * aligned_head_dim
-        loaded_bkv_size = bkv_sz * model_cfgs.num_kv_heads * aligned_head_dim
-
-        # Calculate peak memory requirement of output - which is attention weight.
-        qk_size = bq_sz * bkv_sz * model_cfgs.num_q_heads
-
-        # Convert to bytes.
-        loaded_bq_bytes = loaded_bq_size * q_bytes
-        loaded_bkv_bytes = loaded_bkv_size * kv_bytes
-        qk_bytes = qk_size * out_bytes
-
-        # Sum up all compute memory usage.
-        compute_bytes = loaded_bq_bytes + loaded_bkv_bytes + qk_bytes
-
-        # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
-
-        return total_bytes
+        return _calculate_vmem_usage(
+            model_cfgs,
+            serve_cfgs,
+            batch_size=batch_size,
+            n_buffer=n_buffer,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            num_lanes=num_lanes,
+        )
 
     def calculate_compute_buffer_time(
         batch_size: int, bq_c_sz: int, bkv_sz: int
@@ -245,14 +235,14 @@ def calculate_block_sizes(
         # If current batch size triggers OOM, decrease batch size until the kernel
         # fits within VMEM limit.
         while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            estimate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
             > capped_vmem_limit_bytes
         ):
             batch_size -= 1
 
         # As a last resort, attempt to decrease number of buffers to avoid OOM.
         while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            estimate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
             > capped_vmem_limit_bytes
         ):
             n_buffer -= 1
@@ -265,7 +255,7 @@ def calculate_block_sizes(
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
         while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
+            estimate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz)
             < capped_vmem_limit_bytes
         ):
             # Unless bq is a fixed value, we want to ensure bq size is the same as bkv
@@ -474,9 +464,29 @@ def ragged_paged_attention(
         if mode == configs.RpaCase.DECODE:
             effective_blocks = decode_block_sizes or default_decode
             if stacked:
+                stacked_bkv_sz = max(page_size, utils.align_to(1024, page_size))
+                stacked_batch_size = effective_blocks.batch_size
+                while (
+                    stacked_batch_size > 1
+                    and _calculate_vmem_usage(
+                        model_cfgs,
+                        serve_cfgs,
+                        batch_size=stacked_batch_size,
+                        n_buffer=effective_blocks.n_buffer,
+                        bq_sz=effective_blocks.bq_sz,
+                        bkv_sz=stacked_bkv_sz,
+                        num_lanes=pltpu.get_tpu_info().num_lanes,
+                    )
+                    > vmem_limit_bytes
+                ):
+                    stacked_batch_size -= 1
                 effective_blocks = dataclasses.replace(
                     effective_blocks,
-                    bkv_sz=max(page_size, utils.align_to(1024, page_size)),
+                    bkv_sz=stacked_bkv_sz,
+                    # The normal tuner sizes request-parallel decode before
+                    # stacked mode expands each lane to a 1K KV tile. Refit
+                    # the lane count so GQA shapes do not exceed device VMEM.
+                    batch_size=stacked_batch_size,
                 )
         else:
             effective_blocks = prefill_block_sizes or default_prefill

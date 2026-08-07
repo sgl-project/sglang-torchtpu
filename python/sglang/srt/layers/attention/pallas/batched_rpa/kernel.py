@@ -310,9 +310,7 @@ def rpa_body(
     cfgs: configs.RpaConfigs,
 ):
     step = pl.program_id(0)
-    is_finalize = jnp.logical_and(
-        cfgs.stacked, schedule_ref.do_writeback[step, 0] == -1
-    )
+    is_finalize = jnp.logical_and(cfgs.stacked, schedule_ref.is_finalize[step, 0] == 1)
 
     @pl.when(jnp.logical_not(is_finalize))
     def _compute():
@@ -331,10 +329,15 @@ def rpa_body(
 
     @pl.when(is_finalize)
     def _finalize():
+        source_mask = schedule_ref.finalize_source_mask[step, 0]
+
+        def is_source(lane):
+            return (source_mask & (1 << lane)) != 0
+
         m_all = jnp.stack(
             [
                 jnp.where(
-                    schedule_ref.s_idx[step, lane] >= 0,
+                    is_source(lane),
                     m_scratch_ref[lane],
                     -jnp.inf,
                 )
@@ -344,7 +347,7 @@ def rpa_body(
         l_all = jnp.stack(
             [
                 jnp.where(
-                    schedule_ref.s_idx[step, lane] >= 0,
+                    is_source(lane),
                     l_scratch_ref[lane],
                     0.0,
                 )
@@ -354,7 +357,7 @@ def rpa_body(
         acc_all = jnp.stack(
             [
                 jnp.where(
-                    schedule_ref.s_idx[step, lane] >= 0,
+                    is_source(lane),
                     acc_scratch_ref[lane],
                     0.0,
                 )
@@ -595,6 +598,10 @@ def rpa_kernel(
 
         _run()
 
+    schedule_leaf_count = len(jax.tree_util.tree_leaves(schedule_hbm))
+    q_hbm_alias_index = 3 + schedule_leaf_count
+    kv_cache_hbm_alias_index = q_hbm_alias_index + 2
+
     return pl.pallas_call(
         ragged_paged_attention_pipeline,
         out_shape=[q_hbm, kv_cache_hbm],
@@ -615,7 +622,7 @@ def rpa_kernel(
             vmem_limit_bytes=cfgs.vmem_limit_bytes,
             disable_bounds_checks=True,
         ),
-        input_output_aliases={12: 0, 14: 1},
+        input_output_aliases={q_hbm_alias_index: 0, kv_cache_hbm_alias_index: 1},
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
     )(

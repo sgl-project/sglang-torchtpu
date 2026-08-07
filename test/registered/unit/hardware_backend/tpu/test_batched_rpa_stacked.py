@@ -6,9 +6,6 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-    should_use_stacked_rpa,
-)
 from sglang.srt.layers.attention.pallas.batched_rpa.kernel import (
     combine_stacked_partials,
 )
@@ -24,20 +21,6 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 class TestStackedRpaFinalization(CustomTestCase):
     BATCH_SIZE = 8
     NUM_K_CASES = (1, 8, 9, 15, 16, 17)
-
-    def test_stacked_selection_preserves_large_batch_parallelism(self):
-        common = dict(
-            decode=True,
-            enabled=True,
-            has_sinks=False,
-            has_sliding_window=False,
-        )
-        self.assertTrue(should_use_stacked_rpa(num_tokens=1, **common))
-        self.assertFalse(should_use_stacked_rpa(num_tokens=2, **common))
-        self.assertFalse(should_use_stacked_rpa(num_tokens=8, **common))
-        self.assertFalse(
-            should_use_stacked_rpa(num_tokens=1, **(common | {"decode": False}))
-        )
 
     def test_lane_validity_keeps_every_lane_with_work(self):
         for num_k in self.NUM_K_CASES:

@@ -58,7 +58,10 @@ class RpaSchedule:
     k_idx: SmemWrapper  # [steps, batch]
     is_last_k: SmemWrapper  # [steps, batch]
     do_writeback: SmemWrapper  # [steps, batch]
+    is_finalize: SmemWrapper  # [steps, batch]
+    finalize_source_mask: SmemWrapper  # [steps, batch]
     dma_q: SmemWrapper  # [steps, batch, 2]
+    dma_o: SmemWrapper  # [steps, batch, 2]
     dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
     dma_kv_new: SmemWrapper  # [steps, batch, bkv_p_new, 4]
     actual_steps: Any  # [1]
@@ -78,7 +81,12 @@ class RpaSchedule:
             k_idx=idx_wrapper,
             is_last_k=idx_wrapper,
             do_writeback=idx_wrapper,
+            is_finalize=idx_wrapper,
+            finalize_source_mask=idx_wrapper,
             dma_q=SmemWrapper.create_shape_dtype(
+                (cfgs.max_steps_ub, cfgs.batch_size, 2)
+            ),
+            dma_o=SmemWrapper.create_shape_dtype(
                 (cfgs.max_steps_ub, cfgs.batch_size, 2)
             ),
             dma_kv_cache=SmemWrapper.create_shape_dtype(
@@ -123,6 +131,14 @@ class RpaSchedule:
         src_hbm = self.dma_q[step, batch_idx, 0]
         sz = self.dma_q[step, batch_idx, 1]
         return src_hbm, sz
+
+    def get_dma_o(
+        self, step: jax.typing.ArrayLike, batch_idx: jax.typing.ArrayLike
+    ) -> tuple[jax.Array, jax.Array]:
+        # 0: dst_hbm, 1: size
+        dst_hbm = self.dma_o[step, batch_idx, 0]
+        sz = self.dma_o[step, batch_idx, 1]
+        return dst_hbm, sz
 
     def scratch_shapes(self):
         """Returns a Pytree of SMEM scratch memory."""
@@ -201,6 +217,8 @@ def compute_metadata(
 
         schedule.dma_q[step, target_lane, 0] = q_src
         schedule.dma_q[step, target_lane, 1] = q_sz_task
+        schedule.dma_o[step, target_lane, 0] = q_src
+        schedule.dma_o[step, target_lane, 1] = q_sz_task
 
         kv_len_start = k_idx * cfgs.bkv_sz
         kv_p_start = k_idx * cfgs.bkv_p
@@ -360,8 +378,12 @@ def compute_metadata(
                 schedule.k_idx[step, lane] = 0
                 schedule.is_last_k[step, lane] = 0
                 schedule.do_writeback[step, lane] = 0
+                schedule.is_finalize[step, lane] = 0
+                schedule.finalize_source_mask[step, lane] = 0
                 schedule.dma_q[step, lane, 0] = 0
                 schedule.dma_q[step, lane, 1] = 0
+                schedule.dma_o[step, lane, 0] = 0
+                schedule.dma_o[step, lane, 1] = 0
                 for page in range(cfgs.bkv_p_cache):
                     schedule.dma_kv_cache[step, lane, page, 0] = 0
                     schedule.dma_kv_cache[step, lane, page, 1] = 0
@@ -394,18 +416,20 @@ def compute_metadata(
 
         jax.lax.fori_loop(0, num_k, stacked_k_loop, None)
 
-        # Finalization is its own pipeline program. The body snapshots the
-        # per-lane online-softmax state before this step's dummy compute and
-        # only this step is allowed to schedule output DMA.
+        # Finalization is its own pipeline program. The body combines the
+        # per-lane online-softmax state, and only this step schedules output DMA.
         final_step = base_step + num_compute_steps
+        source_mask = jnp.array(0, dtype=jnp.int32)
         for lane in range(cfgs.batch_size):
             lane_valid = stacked_lane_has_work(num_k, cfgs.batch_size, lane)
             schedule.s_idx[final_step, lane] = jnp.where(lane_valid, s_idx, -1)
+            source_mask = source_mask | jnp.where(lane_valid, 1 << lane, 0)
         schedule.s_idx[final_step, 0] = s_idx
-        schedule.dma_q[final_step, 0, 0] = q_start
-        schedule.dma_q[final_step, 0, 1] = jnp.minimum(q_len, cfgs.bq_sz)
+        schedule.dma_o[final_step, 0, 0] = q_start
+        schedule.dma_o[final_step, 0, 1] = jnp.minimum(q_len, cfgs.bq_sz)
         schedule.is_last_k[final_step, 0] = 1
-        schedule.do_writeback[final_step, 0] = -1
+        schedule.is_finalize[final_step, 0] = 1
+        schedule.finalize_source_mask[final_step, 0] = source_mask
         next_step = base_step + num_steps
         for lane in range(cfgs.batch_size):
             lane_lengths_ref[lane] = next_step
@@ -488,9 +512,13 @@ def rpa_metadata_schedule_kernel(
         schedule_ref.k_idx[step, b_idx] = 0
         schedule_ref.is_last_k[step, b_idx] = 0
         schedule_ref.do_writeback[step, b_idx] = 0
+        schedule_ref.is_finalize[step, b_idx] = 0
+        schedule_ref.finalize_source_mask[step, b_idx] = 0
 
         schedule_ref.dma_q[step, b_idx, 0] = 0
         schedule_ref.dma_q[step, b_idx, 1] = 0
+        schedule_ref.dma_o[step, b_idx, 0] = 0
+        schedule_ref.dma_o[step, b_idx, 1] = 0
 
         for i in range(cfgs.bkv_p_cache):
             schedule_ref.dma_kv_cache[step, b_idx, i, 0] = 0
