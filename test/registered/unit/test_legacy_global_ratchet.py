@@ -28,7 +28,9 @@ _RATCHETS = [
     # 279 -> 287: the upstream sync merged new call-sites in upstream-owned code
     # (distributed/device_communicators, npu & mlx backends, dsa indexer); those
     # are not fork code to migrate here. Fork TPU sites are unchanged.
-    ("get_global_server_args", r"\bget_global_server_args\s*\(", 287),
+    # 287 -> 286: Qwen3MoeAttention now reads server args once through
+    # get_server_args() for the fused qk-norm + RoPE gate.
+    ("get_global_server_args", r"\bget_global_server_args\s*\(", 286),
     (
         "set_global_server_args_for_*",
         r"\bset_global_server_args_for_(?:scheduler|tokenizer)\s*\(",

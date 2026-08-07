@@ -31,7 +31,14 @@ export TORCH_COMPILE_MAX_BS=$CONCUR
 # which can be faster than gather/scatter.
 export SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=2048
 
-export EXTRA_ARGS="--tpu-fp8-runtime channelwise --sampling-defaults openai${EXTRA_ARGS:+ $EXTRA_ARGS}"
+extra_args=(
+  --tpu-fp8-runtime channelwise
+  --sampling-defaults openai
+  # Fuse the per-head q/k RMSNorms and the rotary embedding into one Pallas op
+  # which is faster than a series of separate ops.
+  --enable-fused-qk-norm-rope
+)
+export EXTRA_ARGS="${extra_args[*]}${EXTRA_ARGS:+ $EXTRA_ARGS}"
 
 cd "$(dirname "$0")/../.."
 exec ./launch_server.sh "$@"

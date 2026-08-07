@@ -81,6 +81,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_non_idle_and_non_empty,
     is_npu,
+    is_tpu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -101,6 +102,7 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -523,8 +525,10 @@ class Qwen3MoeAttention(nn.Module):
             self.rotary_emb, MRotaryEmbedding
         ) and self.head_dim in (64, 128, 256)
         _yarn_factor, _, _, _ = compute_yarn_parameters(config)
+        server_args = get_server_args()
+        enable_fused_qk_norm_rope = server_args.enable_fused_qk_norm_rope
         self.use_fused_qk_norm_rope = (
-            get_global_server_args().enable_fused_qk_norm_rope
+            enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
             and _is_cuda
             and can_use_fused_qk_norm_rope(
@@ -534,6 +538,25 @@ class Qwen3MoeAttention(nn.Module):
                 _yarn_factor != 1.0,
             )
         )
+        self.use_tpu_fused_qk_norm_rope = False
+        if (
+            enable_fused_qk_norm_rope
+            and _is_tpu
+            and self.compatible_with_fused_qk_norm_rope
+        ):
+            from sglang.srt.hardware_backend.tpu.qk_norm_rope import (
+                can_use_tpu_fused_qk_norm_rope,
+                register_tpu_qk_norm_rope_op,
+            )
+
+            self.use_tpu_fused_qk_norm_rope = can_use_tpu_fused_qk_norm_rope(
+                rotary_emb=self.rotary_emb,
+                dtype=torch.bfloat16,
+                head_dim=self.head_dim,
+            )
+            if self.use_tpu_fused_qk_norm_rope:
+                register_tpu_qk_norm_rope_op()
+
         self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
@@ -626,6 +649,23 @@ class Qwen3MoeAttention(nn.Module):
                 attention_factor,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            self._used_fused_qk_norm_rope_last_call = True
+        elif self.use_tpu_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            from sglang.srt.hardware_backend.tpu.qk_norm_rope import (
+                tpu_fused_qk_norm_rope,
+            )
+
+            q, k, v = tpu_fused_qk_norm_rope(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
             self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
