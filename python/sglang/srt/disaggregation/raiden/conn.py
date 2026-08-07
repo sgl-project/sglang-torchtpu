@@ -173,20 +173,14 @@ class RaidenKVManager(CommonKVManager):
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
-            per_rank_head_count,
         )
 
         tensor = self._kv_caches[0]
         hp = head_pair_bytes(tensor)
-        # Distinct kv-head count. kv_args.total_kv_head_num is a bare annotation
-        # that is not set on every KVArgs instance (the decode/receiver side
-        # leaves it unset), so fall back to deriving it from the local per-rank
-        # count. On the side where the fallback fires the per-rank count times the
-        # local attn TP equals the true count (attn TP == kv-head count there).
-        total_kv_heads = int(getattr(self.kv_args, "total_kv_head_num", 0) or 0)
-        if total_kv_heads <= 0:
-            total_kv_heads = per_rank_head_count(tensor) * self.attn_tp_size
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, int(total_kv_heads))
+        # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
+        # set on both the prefill and decode KVArgs.
+        total_kv_heads = int(self.kv_args.total_kv_head_num)
+        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
 
     def _host_slot_blocks(self, room: int, n: int) -> List[int]:
         """Host staging block-ids for ``room`` (n blocks) in a round-robin slot.

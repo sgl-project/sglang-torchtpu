@@ -438,6 +438,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.transfer_backend == TransferBackend.NIXL:
             kv_args.kv_data_mem_kinds = kv_data_mem_kinds
         kv_args.page_size = self.token_to_kv_pool.page_size
+        if not self.is_mla_backend:
+            kv_args.kv_head_num = self.token_to_kv_pool.head_num
+            kv_args.total_kv_head_num = (
+                self.scheduler.model_config.get_total_num_kv_heads()
+            )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
