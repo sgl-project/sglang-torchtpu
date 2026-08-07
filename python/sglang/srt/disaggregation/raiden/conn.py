@@ -162,18 +162,18 @@ class RaidenKVManager(CommonKVManager):
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
-            per_rank_head_count,
         )
 
         tensor = self._kv_caches[0]
         hp = head_pair_bytes(tensor)
-        # total kv-heads: prefer kv_args, else derive from the local per-rank
-        # count (this rank's fused tensor holds total/local_attn_tp heads, and
-        # self.attn_tp_size is the local attention TP).
+        # Distinct kv-head count (framework-provided). Deriving it from the local
+        # tensor would overcount under GQA replication, so require it.
         total_kv_heads = int(self.kv_args.total_kv_head_num or 0)
         if total_kv_heads <= 0:
-            total_kv_heads = per_rank_head_count(tensor) * self.attn_tp_size
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, int(total_kv_heads))
+            raise RuntimeError(
+                "raiden reshard needs kv_args.total_kv_head_num but it is unset"
+            )
+        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
 
     def _host_slot_blocks(self, room: int, n: int) -> List[int]:
         """Host staging block-ids for ``room`` (n blocks) in a round-robin slot.
@@ -371,15 +371,14 @@ class RaidenKVManager(CommonKVManager):
                     self.kv_args.aux_item_lens,
                     aux_index,
                 )
-        # Asymmetric TP: a RESHARD_REQ (not a PULL_REQ) drives this room, so reply
-        # with the (now complete) prefill blocks over RESHARD_BLOCKS and skip the
-        # pull notify.
+        # Resharded rooms reply over RESHARD_BLOCKS, never the pull path. If the
+        # decode's RESHARD_REQ hasn't arrived yet this is a no-op; _on_reshard_req
+        # drives the reply once both sides are present.
         if self._reshard_enabled:
             with self._state_lock:
                 self._reshard_finalized.add(room)
-            if room in self._reshard_req:
-                self._maybe_reshard_reply(room)
-                return
+            self._maybe_reshard_reply(room)
+            return
         engine.register_read(str(room), room, blocks)
         self._maybe_reply(room)
 
@@ -670,12 +669,6 @@ class RaidenKVManager(CommonKVManager):
         self._maybe_reshard_push(room)
 
     def _maybe_reshard_push(self, room: int) -> None:
-        from tpu_raiden.rpc import raiden_service_pb2 as pb2
-
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
-            build_sender_request,
-        )
-
         with self._state_lock:
             if (
                 room not in self._reshard_ready
@@ -685,6 +678,23 @@ class RaidenKVManager(CommonKVManager):
             ):
                 return
             self._reshard_pushed.add(room)
+        # A push failure marks the room failed so the sender poll surfaces it
+        # instead of the request hanging until the decode-side timeout.
+        try:
+            self._run_reshard_push(room)
+        except Exception as e:
+            logger.error("raiden reshard push failed for room %s: %s", room, e)
+            with self._state_lock:
+                self._failed.add(str(room))
+
+    def _run_reshard_push(self, room: int) -> None:
+        from tpu_raiden.rpc import raiden_service_pb2 as pb2
+
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            build_sender_request,
+        )
+
+        with self._state_lock:
             req_meta = dict(self._reshard_req[room])
             prefill_blocks = list(self._send_blocks[room])
 
