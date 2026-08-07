@@ -22,6 +22,7 @@ host staging into HBM. Schedules are built in ``reshard_schedule.py``.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import os
@@ -137,6 +138,16 @@ class RaidenKVManager(CommonKVManager):
             self._reshard_replied: Set[int] = set()  # RESHARD_BLOCKS sent
             self._reshard_ready: Set[int] = set()  # rooms cleared to push
             self._reshard_pushed: Set[int] = set()
+            # Push (d2h wait + per-layer push_registered_plan) runs off the
+            # _listen dispatch thread. raiden runs SyncPush unlocked, so
+            # _reshard_push_lock serializes register+push across workers.
+            self._push_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(
+                    1, int(os.environ.get("SGLANG_RAIDEN_PUSH_WORKERS", "1"))
+                ),
+                thread_name_prefix="raiden-reshard-push",
+            )
+            self._reshard_push_lock = threading.Lock()
         else:
             # room -> {src_prefill_rank: prefill_block_ids} and per-room meta.
             self._reshard_sources: Dict[int, Dict[int, List[int]]] = {}
@@ -680,6 +691,9 @@ class RaidenKVManager(CommonKVManager):
             ):
                 return
             self._reshard_pushed.add(room)
+        self._push_executor.submit(self._do_reshard_push, room)
+
+    def _do_reshard_push(self, room: int) -> None:
         # A push failure marks the room failed so the sender poll surfaces it
         # instead of the request hanging until the decode-side timeout.
         try:
@@ -723,6 +737,13 @@ class RaidenKVManager(CommonKVManager):
                     f"raiden reshard D2H stage for room {room} timed out"
                 )
             time.sleep(0.0005)
+        # is_ready() is true even for a ready-with-error future, so check ok()
+        # before pushing -- otherwise a failed d2h would push stale staging.
+        if fut is not None and not fut.ok():
+            raise RuntimeError(
+                f"raiden reshard D2H stage for room {room} failed: "
+                f"{fut.error_message()}"
+            )
 
         req = build_sender_request(
             pb2,
@@ -747,14 +768,18 @@ class RaidenKVManager(CommonKVManager):
             prefill_blocks[:4],
             decode_blocks[:4],
         )
-        engine.register_active_plan(room, req, is_sender=True)
-        # The receiver's completion barrier is total_blocks * num_layers, and each
-        # push counts its blocks once regardless of how many layers it carries, so
-        # push one layer per request to deliver (and count) every layer.
-        for layer_idx in range(len(self._kv_caches)):
-            engine.push_registered_plan(
-                room, push_endpoint, prefill_blocks, decode_blocks, layer_idx
-            )
+        # raiden runs SyncPush unlocked, so serialize register+push across workers
+        # (concurrent pushes to a decode peer corrupt its shared transport); d2h
+        # above is internally locked and can overlap.
+        with self._reshard_push_lock:
+            engine.register_active_plan(room, req, is_sender=True)
+            # The receiver's completion barrier is total_blocks * num_layers, and
+            # each push counts its blocks once regardless of how many layers it
+            # carries, so push one layer per request to deliver every layer.
+            for layer_idx in range(len(self._kv_caches)):
+                engine.push_registered_plan(
+                    room, push_endpoint, prefill_blocks, decode_blocks, layer_idx
+                )
         with self._state_lock:
             self._completed_send.add(str(room))
 
