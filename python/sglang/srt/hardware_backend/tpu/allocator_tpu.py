@@ -206,5 +206,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         # be int64, so normalize before the parent derives and reinserts page
         # IDs; otherwise torch.cat promotes the pool and the next decode-page
         # assignment fails against its int32 destination.
-        free_index = free_index.to(device="cpu", dtype=torch.int32)
+        if free_index.device.type != "cpu":
+            free_index = free_index.cpu()
+        free_index = free_index.to(dtype=torch.int32)
         super().free(free_index)
