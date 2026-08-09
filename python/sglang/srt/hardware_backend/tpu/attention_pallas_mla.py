@@ -46,6 +46,7 @@ import torch
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
+from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -135,19 +136,22 @@ def _build_pallas_mla_kernel_op():
         distribution: torch.Tensor,
         sm_scale: float = 1.0,
     ) -> torch.Tensor:
-        output, _updated_kv = jax_kernel(
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            kv_cache_fused,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            cu_kv_lens,
-            distribution,
-            sm_scale,
-        )
+        # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
+        # Inside the custom op like the RPA base: Dynamo can't trace the patch's lock.
+        with tpu_info_for_cpu_export():
+            output, _updated_kv = jax_kernel(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                kv_cache_fused,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                cu_kv_lens,
+                distribution,
+                sm_scale,
+            )
         return output
 
     def _fake_impl(
@@ -276,7 +280,8 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         new_kv_c = k.reshape(num_tokens, kv_lora_rank).contiguous()
         new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
 
-        kv_cache = forward_batch.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
+        # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
+        kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
         out = self._op(
             ql_nope,
