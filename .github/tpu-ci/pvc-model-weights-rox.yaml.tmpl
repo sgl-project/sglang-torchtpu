@@ -4,6 +4,8 @@
 #   /weights/Qwen3-30B-A3B-FP8   (~60GB)
 #   /weights/gpt-oss-120b        (~65GB, MXFP4)
 #   /weights/MiMo-V2.5-Pro       (~963GB, blockwise-fp8)
+#   /weights/DeepSeek-R1-0528    (~641GB, blockwise-fp8)
+#   /weights/Kimi-K2.6           (~554GB, INT4 compressed-tensors)
 #
 # Built 2026-07-29 by consolidating the former per-model disks (qwen30b-rox,
 # gptoss120b-rox, mimo25pro-rox) onto a 5Ti disk: RWO PVC model-weights-rwo +
@@ -29,7 +31,7 @@
 # Teardown (order matters -- the SC is Retain, so k8s never deletes the disk for you,
 # and `gcloud compute disks delete` FAILS while any PV/PVC still references it):
 #   kubectl -n tpu-ci delete pvc model-weights-rox     # 1. drop the ROX claim
-#   kubectl -n tpu-ci delete pv  model-weights-rox-pv  # 2. then the static PV
+#   kubectl -n tpu-ci delete pv  model-weights-v2-rox-pv  # 2. then the static PV
 #   kubectl -n tpu-ci delete pvc model-weights-rwo 2>/dev/null || true  # 3. if around
 #   # 4. ONLY now is the disk detached and deletable; find it by the SC label:
 #   DISK=$(gcloud compute disks list \
@@ -38,7 +40,7 @@
 apiVersion: v1
 kind: PersistentVolume
 metadata:
-  name: model-weights-rox-pv
+  name: model-weights-v2-rox-pv
 spec:
   storageClassName: hyperdisk-ml-fast
   capacity:

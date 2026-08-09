@@ -1,0 +1,113 @@
+# One-time hydration for the DeepSeek-R1-0528 (671B MoE, block-fp8) weights (~688GB).
+# Downloads into an RWO disk, whose contents are then copied onto model-weights-rox --
+# that disk is rebuilt rather than appended to, since ROX conversion is one-way.
+#
+#   kubectl apply -f .github/tpu-ci/hydrate-deepseek-r1.yaml
+#   kubectl -n tpu-ci logs -f job/hydrate-deepseek-r1
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: deepseek-r1-rwo
+  namespace: tpu-ci
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: hyperdisk-ml-fast
+  resources:
+    requests:
+      # 688.6GB (641GiB) checkpoint + staging headroom (kimi used 750Gi for 595GB).
+      storage: 900Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hydrate-deepseek-r1
+  namespace: tpu-ci
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      # Spare CPU on a pr-gate TPU node; requests no TPU chip, so the nightly 2x2x2
+      # slice stays free.
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        ci-tpu-pool: pr-gate
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: weights
+          persistentVolumeClaim:
+            claimName: deepseek-r1-rwo
+      containers:
+        - name: hydrate
+          image: python:3.12-slim
+          env:
+            # Repo is ungated, but anonymous pulls get rate-limited (429).
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+                  optional: true
+          command: ["bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+              pip install --no-cache-dir huggingface_hub
+              export HF_XET_HIGH_PERFORMANCE=1 HF_HOME=/weights/.hf-cache
+              python - <<'PY'
+              import os, time
+              from huggingface_hub import HfApi, snapshot_download
+              tok = os.environ.get("HF_TOKEN") or None
+              try:
+                  who = HfApi(token=tok).whoami()["name"] if tok else None
+              except Exception as e:
+                  who = None
+                  print("WARNING: token present but whoami failed:", e)
+              print("HF auth:", who or "ANONYMOUS (expect 429 throttling)")
+              # max_workers 4: more parallel Xet streams trip the CDN rate limit.
+              for attempt in range(1, 9):
+                  try:
+                      p = snapshot_download(
+                          "deepseek-ai/DeepSeek-R1-0528",
+                          local_dir="/weights/DeepSeek-R1-0528",
+                          token=tok,
+                          max_workers=4,
+                          # Keep *.py: configuration_deepseek.py is loaded via
+                          # --trust-remote-code.
+                          ignore_patterns=["original/*", "*.gguf", "*.pth"],
+                      )
+                      print("hydrated ->", p)
+                      break
+                  except Exception as e:
+                      back = min(60 * attempt, 300)
+                      print(f"attempt {attempt} failed ({type(e).__name__}): "
+                            f"{str(e)[:200]} -- retrying in {back}s", flush=True)
+                      time.sleep(back)
+              else:
+                  raise SystemExit("hydration failed after 8 attempts")
+              PY
+              echo "== shard count vs index =="
+              python - <<'PY'
+              import json
+              idx = "/weights/DeepSeek-R1-0528/model.safetensors.index.json"
+              want = sorted(set(json.load(open(idx))["weight_map"].values()))
+              import os
+              have = sorted(f for f in os.listdir("/weights/DeepSeek-R1-0528")
+                            if f.endswith(".safetensors"))
+              missing = [w for w in want if w not in have]
+              print(f"index lists {len(want)} shards, disk has {len(have)}")
+              raise SystemExit(f"MISSING {missing}" if missing else 0)
+              PY
+              echo "== size =="; du -sh /weights/DeepSeek-R1-0528
+              echo "== free =="; df -h /weights | tail -1
+          resources:
+            requests:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: weights
+              mountPath: /weights
