@@ -559,6 +559,51 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
 
         self.assertEqual(result.shape, (3, 4))
 
+    def test_returns_the_same_tensor_when_no_trim_is_needed(self):
+        # A no-op slice still produces a strided view, which torch_tpu
+        # materializes as a same-shape identity copy in its own program between
+        # decode steps. Identity, not just equality, is what proves no view was
+        # created -- assertEqual on the shapes would pass either way.
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        forward_batch = self._forward_batch()
+        forward_batch._tpu_real_q = 5
+        out = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+
+        result = policy.finalize_forward_batch(out, forward_batch)
+
+        self.assertIs(result, out)
+
+    def test_returns_the_same_tensors_in_the_aux_hidden_state_branch(self):
+        # The aux branch slices once per captured layer, so a no-op slice here
+        # multiplies the identity copies.
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        forward_batch = self._forward_batch()
+        forward_batch._tpu_real_q = 5
+        hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        aux = [torch.ones(5, 4), torch.zeros(5, 4)]
+
+        result_hidden, result_aux = policy.finalize_forward_batch(
+            (hidden_states, aux), forward_batch
+        )
+
+        self.assertIs(result_hidden, hidden_states)
+        self.assertIs(result_aux[0], aux[0])
+        self.assertIs(result_aux[1], aux[1])
+
+    def test_still_trims_when_the_batch_was_padded(self):
+        # The skip must be conditional on the shape, not unconditional.
+        policy = Qwen3VLDecoderTpuCompilePolicy()
+        forward_batch = self._forward_batch()  # _tpu_real_q=3
+        hidden_states = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+        aux = [torch.ones(5, 4)]
+
+        result_hidden, result_aux = policy.finalize_forward_batch(
+            (hidden_states, aux), forward_batch
+        )
+
+        self.assertEqual(result_hidden.shape, (3, 4))
+        self.assertEqual(result_aux[0].shape, (3, 4))
+
     @staticmethod
     def _policy_for(*, multimodal: bool):
         """Policy whose owner model does / does not expose the VL image path."""

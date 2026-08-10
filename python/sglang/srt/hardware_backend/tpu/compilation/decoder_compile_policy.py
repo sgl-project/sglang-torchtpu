@@ -1252,6 +1252,24 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         """
         return self.model_runner.model.decode_embeds_in_language_model
 
+    @staticmethod
+    def _trim_q(t: torch.Tensor, real_q: int) -> torch.Tensor:
+        """Trim the token axis, but skip the slice when it would be a no-op.
+
+        ``prepare_forward_batch`` pads to the *next* bucket, so a batch whose size
+        already lands on a bucket boundary is not padded at all. In steady-state
+        decode ``real_q`` is just the running-request count and serving
+        concurrencies sit on the bucket values, so this is the common case.
+
+        A no-op slice is still a strided view, and torch_tpu tensors are opaque
+        dense buffers with no stride metadata, so the backend materializes every
+        view -- here as a same-shape identity copy in its own
+        ``tt_jit_as_strided`` program. This hook runs on the compiled forward's
+        output, outside the graph, where the per-program host cost is serial and
+        unhidden.
+        """
+        return t if t.shape[0] == real_q else t[:real_q]
+
     def finalize_forward_batch(self, outputs: Any, forward_batch: Any) -> Any:
         """Slice the inner VL decoder output before outer logits processing."""
         real_q = getattr(forward_batch, _REAL_Q_KEY, None)
@@ -1259,7 +1277,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         if real_q is None:
             return out
         if isinstance(out, torch.Tensor):
-            return out[:real_q]
+            return self._trim_q(out, real_q)
         if isinstance(out, PPProxyTensors):
             # Intermediate pipeline stages must transmit the padded proxy. The
             # next stage pads ForwardBatch again but consumes this proxy as-is.
@@ -1267,10 +1285,17 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         if isinstance(out, tuple) and len(out) == 2:
             hidden_states, aux_hidden_states = out
             if isinstance(hidden_states, torch.Tensor):
-                hidden_states = hidden_states[:real_q]
+                hidden_states = self._trim_q(hidden_states, real_q)
             if isinstance(aux_hidden_states, (list, tuple)):
+                # One slice per captured layer. Empty unless EAGLE3 / DFLASH
+                # populated ``layers_to_capture``, so this branch multiplies the
+                # identity copies only under speculative decoding.
                 aux_hidden_states = type(aux_hidden_states)(
-                    value[:real_q] if isinstance(value, torch.Tensor) else value
+                    (
+                        self._trim_q(value, real_q)
+                        if isinstance(value, torch.Tensor)
+                        else value
+                    )
                     for value in aux_hidden_states
                 )
             return hidden_states, aux_hidden_states
