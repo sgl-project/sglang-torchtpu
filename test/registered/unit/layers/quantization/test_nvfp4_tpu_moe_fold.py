@@ -637,8 +637,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     imports `fp4_moe` lazily, and `create_weights` raises before any such call.
     """
 
-    def test_tpu_selects_moe_subclass_and_owns_reduction_state(self):
-        from sglang.srt.layers.moe import MoeRunnerBackend
+    def test_tpu_selects_moe_subclass_and_inherits_reduction_default(self):
         from sglang.srt.layers.quantization import modelopt_quant
 
         config = modelopt_quant.ModelOptFp4Config.from_config(
@@ -651,19 +650,18 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 },
             }
         )
-        with (
-            mock.patch.object(modelopt_quant, "_is_tpu", True),
-            mock.patch.object(
-                modelopt_quant,
-                "get_moe_runner_backend",
-                return_value=MoeRunnerBackend.AUTO,
-            ),
-        ):
+        with mock.patch.object(modelopt_quant, "_is_tpu", True):
             method_cls = modelopt_quant._modelopt_nvfp4_moe_method_cls()
             method = method_cls(config)
 
         self.assertIs(method_cls, modelopt_quant.TpuModelOptNvFp4FusedMoEMethod)
+        self.assertNotIn("handles_moe_reduction", method.__dict__)
         self.assertFalse(method.handles_moe_reduction)
+        with mock.patch.object(modelopt_quant, "_is_tpu", False):
+            self.assertIs(
+                modelopt_quant._modelopt_nvfp4_moe_method_cls(),
+                modelopt_quant.ModelOptNvFp4FusedMoEMethod,
+            )
         self.assertFalse(
             hasattr(
                 modelopt_quant.ModelOptFp4LinearMethod(config), "handles_moe_reduction"
@@ -683,19 +681,17 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 },
             }
         )
-        with mock.patch.object(modelopt_quant, "_is_tpu", True):
-            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
-            with self.assertRaisesRegex(NotImplementedError, "block-512"):
-                method.create_weights(
-                    torch.nn.Module(),
-                    num_experts=EXPERTS,
-                    hidden_size=HIDDEN_SIZE,
-                    intermediate_size_per_partition=INTERMEDIATE_SIZE,
-                    params_dtype=torch.bfloat16,
-                )
+        method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+        with self.assertRaisesRegex(NotImplementedError, "block-512"):
+            method.create_weights(
+                torch.nn.Module(),
+                num_experts=EXPERTS,
+                hidden_size=HIDDEN_SIZE,
+                intermediate_size_per_partition=INTERMEDIATE_SIZE,
+                params_dtype=torch.bfloat16,
+            )
 
     def test_folded_scale_checkpoint_skips_unused_auxiliary_parameters(self):
-        from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.quantization import modelopt_quant
 
         config = modelopt_quant.ModelOptFp4Config.from_config(
@@ -715,22 +711,14 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         layer.num_experts = EXPERTS
         layer.moe_runner_config = types.SimpleNamespace(is_gated=True)
 
-        with (
-            mock.patch.object(modelopt_quant, "_is_tpu", True),
-            mock.patch.object(
-                modelopt_quant,
-                "get_moe_runner_backend",
-                return_value=MoeRunnerBackend.AUTO,
-            ),
-        ):
-            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
-            method.create_weights(
-                layer,
-                num_experts=EXPERTS,
-                hidden_size=HIDDEN_SIZE,
-                intermediate_size_per_partition=INTERMEDIATE_SIZE,
-                params_dtype=torch.bfloat16,
-            )
+        method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+        method.create_weights(
+            layer,
+            num_experts=EXPERTS,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size_per_partition=INTERMEDIATE_SIZE,
+            params_dtype=torch.bfloat16,
+        )
 
         for name in (
             "w13_weight",

@@ -1910,14 +1910,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
-        self._validate_platform()
-        self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
-        )
-        self._cache_permute_indices = {}
-
-    def _validate_platform(self) -> None:
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and is_cuda():
             capability = get_device_capability()
@@ -1930,6 +1922,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
+        self.enable_flashinfer_trtllm_moe = (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+        )
+        self._cache_permute_indices = {}
 
     def _weight_scale_dtype(self) -> torch.dtype:
         return torch.float8_e4m3fn
@@ -2178,6 +2175,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                             "w1_weight_scale_2 must match w3_weight_scale_2. "
                             "Accuracy may be affected."
                         )
+
                     w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
             else:
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:]
@@ -2679,10 +2677,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """TPU adapter for ModelOpt NVFP4 MoE checkpoints."""
 
-    def _validate_platform(self) -> None:
-        # TPU support is validated against the Pallas checkpoint contract in
-        # create_weights and against the fused-RS contract after model setup.
-        pass
+    def __init__(self, quant_config: ModelOptFp4Config):
+        # Do not run the GPU backend/capability validation in the parent
+        # constructor. TPU validates its checkpoint and runner contracts below.
+        self.quant_config = quant_config
+        self.enable_flashinfer_trtllm_moe = False
 
     def _weight_scale_dtype(self) -> torch.dtype:
         if self.quant_config.global_scale:
