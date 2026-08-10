@@ -637,6 +637,39 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     imports `fp4_moe` lazily, and `create_weights` raises before any such call.
     """
 
+    def test_tpu_selects_moe_subclass_and_owns_reduction_state(self):
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        config = modelopt_quant.ModelOptFp4Config.from_config(
+            {
+                "quant_method": "modelopt",
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "group_size": BLOCK_SIZE,
+                    "exclude_modules": ["self_attn", "lm_head"],
+                },
+            }
+        )
+        with (
+            mock.patch.object(modelopt_quant, "_is_tpu", True),
+            mock.patch.object(
+                modelopt_quant,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+        ):
+            method_cls = modelopt_quant._modelopt_nvfp4_moe_method_cls()
+            method = method_cls(config)
+
+        self.assertIs(method_cls, modelopt_quant.TpuModelOptNvFp4FusedMoEMethod)
+        self.assertFalse(method.handles_moe_reduction)
+        self.assertFalse(
+            hasattr(
+                modelopt_quant.ModelOptFp4LinearMethod(config), "handles_moe_reduction"
+            )
+        )
+
     def test_modelopt_rejects_block16_on_tpu(self):
         from sglang.srt.layers.quantization import modelopt_quant
 
@@ -651,7 +684,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             }
         )
         with mock.patch.object(modelopt_quant, "_is_tpu", True):
-            method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(config)
+            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
             with self.assertRaisesRegex(NotImplementedError, "block-512"):
                 method.create_weights(
                     torch.nn.Module(),
@@ -690,7 +723,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 return_value=MoeRunnerBackend.AUTO,
             ),
         ):
-            method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(config)
+            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
             method.create_weights(
                 layer,
                 num_experts=EXPERTS,
@@ -803,7 +836,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 _fake_prepare,
             ),
         ):
-            method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(config)
+            method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
             method.create_moe_runner(layer, moe_runner_config)
             constructed = method.handles_moe_reduction
             if not model_contract:

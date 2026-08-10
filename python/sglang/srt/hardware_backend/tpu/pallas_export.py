@@ -47,31 +47,12 @@ def configure_jax_export_env(world_size: int) -> None:
     )
     configured_counts = [int(value) for value in pattern.findall(xla_flags)]
     if configured_counts:
-        if len(configured_counts) != 1:
-            raise RuntimeError(
-                f"Expected one {_CPU_DEVICE_COUNT_FLAG} setting; "
-                f"XLA_FLAGS={xla_flags!r}."
-            )
-        if configured_counts[0] == world_size:
-            return
-        # A count of 1 is the provisional value a caller writes before the real
-        # world size is known (the private launcher configures TP1, then the
-        # actual TP16). Replacing that is safe as long as JAX has not started.
-        # Any other mismatch -- notably a *downgrade* to a pre-distributed
-        # fallback of 1 -- would silently shrink the export mesh, so it stays an
-        # error.
-        if configured_counts[0] != 1:
+        if len(configured_counts) != 1 or configured_counts[0] != world_size:
             raise RuntimeError(
                 f"{_CPU_DEVICE_COUNT_FLAG} must equal WORLD_SIZE={world_size}; "
                 f"XLA_FLAGS={xla_flags!r}."
             )
-        if _jax_backend_initialized():
-            raise RuntimeError(
-                f"Cannot change {_CPU_DEVICE_COUNT_FLAG} from "
-                f"{configured_counts[0]} to WORLD_SIZE={world_size} after the "
-                "JAX backend initialized."
-            )
-        xla_flags = pattern.sub("", xla_flags).strip()
+        return
 
     if _jax_backend_initialized():
         raise RuntimeError(

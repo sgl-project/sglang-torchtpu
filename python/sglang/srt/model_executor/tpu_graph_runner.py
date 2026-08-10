@@ -123,12 +123,6 @@ class TpuGraphRunner:
         torch._dynamo.config.accumulated_cache_size_limit = 1024
         if hasattr(torch._dynamo.config, "cache_size_limit"):
             torch._dynamo.config.cache_size_limit = 1024
-        # torch>=2.11 forbids suppress_errors + fail_on_recompile_limit_hit
-        # both being set; the CUDA attention backends set suppress_errors=True at
-        # import. The TPU compile path wants recompiles to fail loudly, so clear
-        # suppress_errors before enabling fail_on_recompile_limit_hit.
-        if hasattr(torch._dynamo.config, "suppress_errors"):
-            torch._dynamo.config.suppress_errors = False
         # Fail loudly on compile-limit hits to expose latency cliffs early.
         # NOTE: fail_on_recompile_limit_hit and suppress_errors are mutually
         # exclusive (torch._dynamo asserts). flashinfer_backend sets
