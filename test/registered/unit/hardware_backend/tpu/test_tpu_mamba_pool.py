@@ -4,9 +4,17 @@
 CPU (``device="cpu"``) and need no TPU — they pin the kernel-native buffer
 layout and slot bookkeeping that the fused Pallas GDN kernel depends on:
 
-* conv buffer is ``[num_layers, size+1, K-1, conv_dim]`` (trailing axes
+* **one tensor per layer, never a stacked ``[num_layers, ...]`` buffer**, and
+  ``at_layer_idx`` hands back a tensor that *owns its storage*. This is a
+  performance invariant with no functional symptom, so nothing else catches a
+  regression: torch_tpu's Pallas bridge writes donated state back with
+  ``tensor.copy_(result)``, which XLA elides against a whole buffer but must
+  lower to slice + dynamic-update-slice against a view of a stacked pool. On
+  Qwen3.5-397B that view cost ~0.70 ms per decode step — 1.4x the GDN kernel
+  itself — while producing byte-identical output;
+* conv buffer is ``[size+1, K-1, conv_dim]`` per layer (trailing axes
   swapped vs. the GPU pool's ``[..., conv_dim, K-1]``);
-* recurrent buffer is ``[num_layers, size+1, n_v, d_k, d_v]`` (swapped vs.
+* recurrent buffer is ``[size+1, n_v, d_k, d_v]`` per layer (swapped vs.
   the GPU ``[..., n_v, d_v, d_k]``);
 * slot 0 is reserved; ``alloc``/``free`` cycle real slots ``1..size``;
 * ``clear_slots`` is a no-op (kernel masks stale slots via
@@ -68,16 +76,37 @@ class TestTpuMambaPool(CustomTestCase):
         pool = self._pool()
         num_layers = len(self.LAYERS)
         conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
-        self.assertEqual(
-            list(pool.mamba_cache.conv[0].shape),
-            [num_layers, self.SIZE + 1, self.K - 1, conv_dim],
-        )
-        self.assertEqual(
-            list(pool.mamba_cache.temporal.shape),
-            [num_layers, self.SIZE + 1, self.N_V, self.D_K, self.D_V],
-        )
+        # One tensor per layer: the layer axis is the list index, not a
+        # tensor dimension.
+        self.assertEqual(len(pool.mamba_cache.conv[0]), num_layers)
+        self.assertEqual(len(pool.mamba_cache.temporal), num_layers)
+        for layer in range(num_layers):
+            self.assertEqual(
+                list(pool.mamba_cache.conv[0][layer].shape),
+                [self.SIZE + 1, self.K - 1, conv_dim],
+            )
+            self.assertEqual(
+                list(pool.mamba_cache.temporal[layer].shape),
+                [self.SIZE + 1, self.N_V, self.D_K, self.D_V],
+            )
 
-    def test_per_layer_cache_slice(self):
+    def test_layers_are_independent_allocations(self):
+        """Every layer's state must own its buffer.
+
+        A stacked ``[num_layers, ...]`` pool passes every *functional* test in
+        this file while silently costing ~0.70 ms/decode step, so the allocation
+        shape has to be asserted directly. ``_base`` is what discriminates:
+        distinct ``data_ptr()`` does not, because iterating a stacked tensor
+        also yields one view per layer, each at its own offset.
+        """
+        pool = self._pool()
+        for layer, temporal in enumerate(pool.mamba_cache.temporal):
+            self.assertIsNone(temporal._base, f"recurrent layer {layer} is a view")
+        for kind, conv_kind in enumerate(pool.mamba_cache.conv):
+            for layer, conv in enumerate(conv_kind):
+                self.assertIsNone(conv._base, f"conv[{kind}] layer {layer} is a view")
+
+    def test_per_layer_cache_owns_its_storage(self):
         pool = self._pool()
         conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
         # dense layer index 0 corresponds to global layer id LAYERS[0].
@@ -86,13 +115,35 @@ class TestTpuMambaPool(CustomTestCase):
         self.assertEqual(
             list(per.temporal.shape), [self.SIZE + 1, self.N_V, self.D_K, self.D_V]
         )
+        # The invariant the Pallas bridge's in-place write-back depends on:
+        # a whole buffer, not a view into a stacked pool. `_base is None` is
+        # exactly what distinguishes the two.
+        self.assertIsNone(per.temporal._base)
+        self.assertIsNone(per.conv[0]._base)
+        # ...and it must still be the pool's own tensor, not a copy, or the
+        # kernel's state write-back would land nowhere.
+        self.assertIs(per.temporal, pool.mamba_cache.temporal[0])
+        per.temporal.fill_(4.0)
+        self.assertTrue(torch.all(pool.mamba_cache.temporal[0] == 4.0))
+        self.assertTrue(torch.all(pool.mamba_cache.temporal[1] == 0.0))
+
+    def test_total_bytes_match_stacked_layout(self):
+        """Per-layer allocation must not change the memory footprint."""
+        pool = self._pool()
+        num_layers = len(self.LAYERS)
+        conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
+        expected = num_layers * (self.SIZE + 1) * 4 * (
+            (self.K - 1) * conv_dim + self.N_V * self.D_K * self.D_V
+        )
+        self.assertEqual(int(pool.mamba_cache.mem_usage_bytes()), expected)
 
     def test_clear_slots_is_noop(self):
         pool = self._pool()
-        pool.mamba_cache.temporal.fill_(7.0)
+        for temporal in pool.mamba_cache.temporal:
+            temporal.fill_(7.0)
         pool.clear_slots(torch.tensor([1, 2]))
         # Kernel handles fresh-slot masking; pool must not touch the buffer.
-        self.assertTrue(torch.all(pool.mamba_cache.temporal == 7.0))
+        self.assertTrue(all(torch.all(t == 7.0) for t in pool.mamba_cache.temporal))
 
     def test_copy_from_unsupported(self):
         pool = self._pool()
