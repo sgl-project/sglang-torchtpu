@@ -377,11 +377,7 @@ def _fused_moe_jax(
     # halves, so run an unfused GMM1 and apply the activation in JAX for
     # correctness.
     compact_block_scales = w1_scale is not None and w1_scale.shape[-1] != w1.shape[-1]
-    # Packed FP4 fuses the SwiGLU in-kernel (gmm_v2 slices the up-half's per-block
-    # scale). Only compact block scales, which need distinct gate/up scale offsets,
-    # still run unfused with a separate JAX activation.
-    unfused_gmm1 = compact_block_scales
-    gmm1_fuse_act = None if unfused_gmm1 else _fuse_act_name(activation_name)
+    gmm1_fuse_act = None if compact_block_scales else _fuse_act_name(activation_name)
 
     gmm1_tile_info = None
     if compact_block_scales:
@@ -445,7 +441,7 @@ def _fused_moe_jax(
         fuse_act=gmm1_fuse_act,
         packed_fp4=w1_packed,
     )
-    if unfused_gmm1:
+    if compact_block_scales:
         gmm1_out = apply_act_fn(
             gmm1_out, int(gmm1_out.shape[-1] // 2), _fuse_act_name(activation_name)
         )

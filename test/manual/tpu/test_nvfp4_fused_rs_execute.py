@@ -21,8 +21,6 @@ _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
 os.environ["LIBTPU_INIT_ARGS"] = " ".join(
     (_existing_libtpu_args, *_REQUIRED_LIBTPU_FLAGS)
 ).strip()
-os.environ.setdefault("SGLANG_TPU_FP4_FUSED_RS", "1")
-
 import torch
 import torch.distributed as dist
 from torch_tpu._internal.distributed import tpu_distributed

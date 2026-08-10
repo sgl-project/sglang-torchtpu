@@ -2101,64 +2101,64 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
-        if not _is_tpu or self.quant_config.global_scale:
-            w13_weight_scale_shape = (
-                (layer.num_local_experts, 2)
-                if layer.moe_runner_config.is_gated
-                else (layer.num_local_experts,)
-            )
-            w13_weight_scale_2 = PerTensorScaleParameter(
-                data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
+        if _is_tpu and not self.quant_config.global_scale:
+            return
+
+        w13_weight_scale_shape = (
+            (layer.num_local_experts, 2)
+            if layer.moe_runner_config.is_gated
+            else (layer.num_local_experts,)
+        )
+        w13_weight_scale_2 = PerTensorScaleParameter(
+            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
+
+        w2_weight_scale_2 = PerTensorScaleParameter(
+            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
+
+        if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
+            # FP8 checkpoints usually store expert scales as weight_scale_inv.
+            # Online NVFP4 consumes them in the loader and writes the generated
+            # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
+            w13_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
-            layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
-
-            w2_weight_scale_2 = PerTensorScaleParameter(
-                data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            layer.register_parameter(
+                "w13_weight_scale_inv", w13_source_weight_scale_inv
+            )
+            w2_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
                 weight_loader=weight_loader,
             )
-            layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
+            layer.register_parameter("w2_weight_scale_inv", w2_source_weight_scale_inv)
 
-            if is_nvfp4_online and self.quant_config.is_checkpoint_fp8_serialized:
-                # FP8 checkpoints usually store expert scales as weight_scale_inv.
-                # Online NVFP4 consumes them in the loader and writes the generated
-                # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
-                w13_source_weight_scale_inv = PerTensorScaleParameter(
-                    data=torch.empty(0, dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                layer.register_parameter(
-                    "w13_weight_scale_inv", w13_source_weight_scale_inv
-                )
-                w2_source_weight_scale_inv = PerTensorScaleParameter(
-                    data=torch.empty(0, dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                layer.register_parameter(
-                    "w2_weight_scale_inv", w2_source_weight_scale_inv
-                )
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+        )
 
-            extra_weight_attrs.update(
-                {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-            )
+        w13_input_scale_shape = (layer.num_experts, num_shards)
+        w13_input_scale = PerTensorScaleParameter(
+            data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        w13_input_scale._sglang_require_global_experts = True
+        layer.register_parameter("w13_input_scale", w13_input_scale)
 
-            w13_input_scale_shape = (layer.num_experts, num_shards)
-            w13_input_scale = PerTensorScaleParameter(
-                data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            w13_input_scale._sglang_require_global_experts = True
-            layer.register_parameter("w13_input_scale", w13_input_scale)
-
-            w2_input_scale = PerTensorScaleParameter(
-                data=torch.empty(layer.num_experts, dtype=torch.float32),
-                weight_loader=weight_loader,
-            )
-            w2_input_scale._sglang_require_global_experts = True
-            layer.register_parameter("w2_input_scale", w2_input_scale)
+        w2_input_scale = PerTensorScaleParameter(
+            data=torch.empty(layer.num_experts, dtype=torch.float32),
+            weight_loader=weight_loader,
+        )
+        w2_input_scale._sglang_require_global_experts = True
+        layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def _resolve_tpu_fused_rs(self, layer: torch.nn.Module) -> None:
-        """Resolve fused-RS after the model publishes its ownership contract."""
+        """Resolve the TPU MoE backend after the model publishes its contract."""
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
             has_tpu_fused_rs_post_expert_norm,
             unmet_tpu_nvfp4_fused_rs_requirements,
@@ -2170,29 +2170,29 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if model_delegates_finalize:
             layer.allow_backend_reduction = True
 
-        fused_rs_setting = envs.SGLANG_TPU_FP4_FUSED_RS.get()
-        unmet_requirements = (
-            ["SGLANG_TPU_FP4_FUSED_RS=0"]
-            if fused_rs_setting == "0"
-            else unmet_tpu_nvfp4_fused_rs_requirements(
-                layer,
-                group_size=self.quant_config.group_size,
-                no_combine=self.moe_runner_config.no_combine,
+        moe_runner_backend = get_moe_runner_backend()
+        if not (
+            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+        ):
+            raise ValueError(
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
+                "pallas_tpu_fused_rs"
             )
+
+        unmet_requirements = unmet_tpu_nvfp4_fused_rs_requirements(
+            layer,
+            group_size=self.quant_config.group_size,
+            no_combine=self.moe_runner_config.no_combine,
         )
         self.handles_moe_reduction = not unmet_requirements
         if self.handles_moe_reduction and model_delegates_finalize:
             layer.handles_post_expert_finalize = True
         if self.handles_moe_reduction:
-            logger.info("Using SGLang fused-RS for block-512 TPU NVFP4 MoE")
-        elif fused_rs_setting == "1":
-            # An explicit opt-in that silently serves the stock path hides a
-            # whole class of misconfiguration, so name the unmet contract.
-            logger.warning(
-                "SGLANG_TPU_FP4_FUSED_RS=1 requested but fused-RS cannot "
-                "honor this layer; serving the stock TPU NVFP4 MoE path "
-                "instead. Unmet requirements: %s",
-                ", ".join(unmet_requirements),
+            logger.info("Using TPU Pallas NVFP4 fused-RS MoE backend")
+        elif moe_runner_backend.is_pallas_tpu_fused_rs():
+            raise ValueError(
+                "--moe-runner-backend pallas_tpu_fused_rs cannot honor this "
+                "TPU NVFP4 layer. Unmet requirements: " + ", ".join(unmet_requirements)
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -2555,12 +2555,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         if _is_tpu:
-            # The fused-RS gate is NOT decided here: this runs from
+            moe_runner_backend = get_moe_runner_backend()
+            if not (
+                moe_runner_backend.is_auto()
+                or moe_runner_backend.is_pallas_tpu_fused_rs()
+            ):
+                raise ValueError(
+                    "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
+                    "pallas_tpu_fused_rs"
+                )
+            # Backend compatibility is NOT decided here: this runs from
             # FusedMoE.__init__, before models set allow_backend_reduction or
-            # attach their post-expert norm. See _resolve_tpu_fused_rs.
-            #
-            # TPU bypasses MoeRunner entirely; apply() dispatches straight to the
-            # Pallas fused grouped-GEMM. --moe-runner-backend is a no-op here.
+            # attach their post-expert norm. See _resolve_tpu_fused_rs, which
+            # mirrors the existing FP8 Pallas backend's late auto/strict policy.
             return
         moe_runner_backend = get_moe_runner_backend()
 

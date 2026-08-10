@@ -661,6 +661,59 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                     params_dtype=torch.bfloat16,
                 )
 
+    def test_folded_scale_checkpoint_skips_unused_auxiliary_parameters(self):
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        config = modelopt_quant.ModelOptFp4Config.from_config(
+            {
+                "quant_method": "modelopt",
+                "quantization": {
+                    "quant_algo": "NVFP4",
+                    "group_size": BLOCK_SIZE,
+                    "global_scale": False,
+                    "scale_dtype": "fp32",
+                    "exclude_modules": ["self_attn", "lm_head"],
+                },
+            }
+        )
+        layer = torch.nn.Module()
+        layer.num_local_experts = EXPERTS
+        layer.num_experts = EXPERTS
+        layer.moe_runner_config = types.SimpleNamespace(is_gated=True)
+
+        with (
+            mock.patch.object(modelopt_quant, "_is_tpu", True),
+            mock.patch.object(
+                modelopt_quant,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.AUTO,
+            ),
+        ):
+            method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(config)
+            method.create_weights(
+                layer,
+                num_experts=EXPERTS,
+                hidden_size=HIDDEN_SIZE,
+                intermediate_size_per_partition=INTERMEDIATE_SIZE,
+                params_dtype=torch.bfloat16,
+            )
+
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale",
+            "w2_weight_scale",
+        ):
+            self.assertIn(name, layer._parameters)
+        for name in (
+            "w13_weight_scale_2",
+            "w2_weight_scale_2",
+            "w13_input_scale",
+            "w2_input_scale",
+        ):
+            self.assertNotIn(name, layer._parameters)
+
 
 @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
 class TestNvfp4FusedRsGateTiming(CustomTestCase):
@@ -673,8 +726,14 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
     """
 
     def _run_gate(
-        self, *, ep_size: int = 4, world_size: int = 4, model_contract: bool = False
+        self,
+        *,
+        ep_size: int = 4,
+        world_size: int = 4,
+        model_contract: bool = False,
+        backend: str = "auto",
     ):
+        from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.quantization import modelopt_quant
 
         config = modelopt_quant.ModelOptFp4Config.from_config(
@@ -711,6 +770,11 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
         with (
             mock.patch.object(modelopt_quant, "_is_tpu", True),
+            mock.patch.object(
+                modelopt_quant,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend(backend),
+            ),
             mock.patch(
                 "sglang.srt.distributed.get_world_group",
                 return_value=types.SimpleNamespace(world_size=world_size),
@@ -762,6 +826,12 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertTrue(layer.allow_backend_reduction)
         self.assertTrue(layer.handles_post_expert_finalize)
 
+    def test_explicit_pallas_backend_selects_fused_rs(self):
+        _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu_fused_rs")
+
+        self.assertTrue(resolved)
+        self.assertTrue(prepared["use_fused_rs"])
+
     def test_gate_still_declines_an_unsupported_layout(self):
         # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
         # list rejects; deferring the decision must not soften the gate.
@@ -769,6 +839,18 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
+
+    def test_explicit_pallas_backend_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "Unmet requirements"):
+            self._run_gate(
+                ep_size=2,
+                world_size=4,
+                backend="pallas_tpu_fused_rs",
+            )
+
+    def test_rejects_non_pallas_backend_on_tpu(self):
+        with self.assertRaisesRegex(ValueError, "supports only"):
+            self._run_gate(backend="triton")
 
 
 if __name__ == "__main__":
