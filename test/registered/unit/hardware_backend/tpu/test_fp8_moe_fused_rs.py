@@ -160,8 +160,9 @@ class TestFp8MoeFusedRs(CustomTestCase):
     def test_uses_fused_rs_only_through_validated_inline_limit(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
         self.assertTrue(should_use_fp8_fused_rs(128))
-        self.assertTrue(should_use_fp8_fused_rs(2048))
-        self.assertFalse(should_use_fp8_fused_rs(2049))
+        self.assertTrue(should_use_fp8_fused_rs(1024))
+        self.assertFalse(should_use_fp8_fused_rs(1025))
+        self.assertFalse(should_use_fp8_fused_rs(2048))
         self.assertFalse(should_use_fp8_fused_rs(32768))
         self.assertFalse(should_use_fp8_fused_rs(32769))
         self.assertFalse(should_use_fp8_fused_rs(65536))
