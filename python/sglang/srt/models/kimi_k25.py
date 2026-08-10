@@ -1,6 +1,6 @@
 import logging
 from copy import deepcopy
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -50,29 +50,84 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
 )
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_tpu
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_tpu = is_tpu()
+
+
+class RealRoPE(NamedTuple):
+    """Real ``(cos, sin)`` RoPE tables for the compiled TPU path.
+
+    A distinct type rather than a bare tuple: ``PreparedInplaceComplexRoPE`` is
+    also ``Tuple[Tensor, Tensor]``, so ``apply_rope`` cannot tell the two apart
+    structurally — see the isinstance order there.
+    """
+
+    cos: torch.Tensor
+    sin: torch.Tensor
+
+
+def freqs_cis_to_cos_sin(freqs_cis: torch.Tensor) -> RealRoPE:
+    """Split a complex64 ``freqs_cis`` [..., head_dim/2] into real ``(cos, sin)``.
+
+    Lets the RoPE rotation run as real arithmetic (see ``apply_rope``), which the
+    TPU torch.compile backend can lower — unlike ``torch.view_as_complex`` /
+    complex multiply. Intended for the eager preamble before the compiled ViT.
+    """
+    return RealRoPE(freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
+
+
+def _rotate_interleaved(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """Real-arithmetic equivalent of the complex ``apply_rope`` multiply.
+
+    Interleaved convention: adjacent pairs (x[2i], x[2i+1]) rotate by angle i.
+    Exactly matches ``view_as_real((x[2i]+i*x[2i+1]) * (cos+i*sin))``.
+
+    Args:
+        x: (..., num_heads, head_dim)
+        cos, sin: (..., head_dim/2)
+    """
+    cos = cos.unsqueeze(-2)  # (..., 1, head_dim/2)
+    sin = sin.unsqueeze(-2)
+    x_ = x.float().view(*x.shape[:-1], -1, 2)  # (..., num_heads, head_dim/2, 2)
+    x_even = x_[..., 0]
+    x_odd = x_[..., 1]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_even * sin + x_odd * cos
+    out = torch.stack([out_even, out_odd], dim=-1).flatten(-2)
+    return out.type_as(x)
 
 
 def apply_rope(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor | PreparedInplaceComplexRoPE,
+    freqs_cis: torch.Tensor | PreparedInplaceComplexRoPE | RealRoPE,
     x_shape=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Args: (The leading dimensions of all inputs should be the same)
         xq: query, tensor of shape (..., num_heads, head_dim)
         xk: key, tensor of shape (..., num_heads, head_dim)
-        freqs_cis: Complex frequencies for the portable path, or inputs
-            prepared once for the contiguous in-place CUDA kernel.
+        freqs_cis: complex frequencies for the portable path, inputs prepared
+            once for the contiguous in-place CUDA kernel, or a ``RealRoPE``
+            (cos, sin) pair for the compiled TPU path. All encode the same
+            rotation; the RealRoPE form avoids complex ops in the graph.
     Returns:
         xq_out, xk_out: tensors of shape (..., num_heads, head_dim)
     """
+    # Must precede the bare-tuple branch: RealRoPE subclasses tuple, and the
+    # fused kernel below expects a prepared (cache, positions) pair instead.
+    if isinstance(freqs_cis, RealRoPE):
+        return (
+            _rotate_interleaved(xq, freqs_cis.cos, freqs_cis.sin),
+            _rotate_interleaved(xk, freqs_cis.cos, freqs_cis.sin),
+        )
 
     if isinstance(freqs_cis, tuple):
         return apply_fused_qk_complex_rope_inplace(xq, xk, freqs_cis)
@@ -135,13 +190,16 @@ class MoonViTEncoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
-        rope_freqs_cis: torch.Tensor | None = None,
+        rope_freqs_cis: torch.Tensor | RealRoPE | None = None,
         forward_metadata: Optional[VisionAttentionMetadata] = None,
         sequence_lengths: torch.Tensor | None = None,
+        segment_ids: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
 
+        # segment_ids, when supplied, bypasses cu_seqlens in the TPU backend;
+        # None means the backend derives them from cu_seqlens as before.
         hidden_states = self.attn(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -149,6 +207,7 @@ class MoonViTEncoderLayer(nn.Module):
             forward_metadata=forward_metadata,
             max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
+            segment_ids=segment_ids,
         )
 
         hidden_states = residual + hidden_states
@@ -212,6 +271,79 @@ def get_rope_shape(org, interpolation_mode, shape):
     )
 
 
+def _bicubic_interp_axis(in_size: int, out_size: int) -> tuple[np.ndarray, np.ndarray]:
+    """PyTorch-compatible 1D bicubic taps + coefficients (align_corners=False).
+
+    Reproduces the per-axis sampling of
+    ``F.interpolate(..., mode="bicubic", align_corners=False)``: the half-pixel
+    source-coordinate mapping, the 4-tap cubic-convolution kernel (A=-0.75), and
+    the clamped boundary access. Runs on the host in numpy — no torch op sees the
+    data-dependent ``out_size``.
+
+    Returns ``(taps, coeffs)``, each ``[out_size, 4]``: the 4 clamped source
+    indices per output position and their cubic weights.
+    """
+    A = -0.75
+    scale = in_size / out_size
+    # Half-pixel mapping; NOT clamped to >= 0 for cubic (matches aten's `cubic`
+    # branch of area_pixel_compute_source_index).
+    src = (np.arange(out_size, dtype=np.float64) + 0.5) * scale - 0.5
+    floor = np.floor(src).astype(np.int64)
+    t = src - floor  # fractional offset in [0, 1)
+
+    def cc1(x):  # cubic_convolution1: |x| <= 1
+        return ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+
+    def cc2(x):  # cubic_convolution2: 1 < |x| < 2
+        return ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A
+
+    # Coefficients for taps at offsets [-1, 0, 1, 2] relative to `floor`.
+    coeffs = np.stack([cc2(t + 1.0), cc1(t), cc1(1.0 - t), cc2(2.0 - t)], axis=1)
+
+    offsets = np.array([-1, 0, 1, 2], dtype=np.int64)
+    taps = np.clip(floor[:, None] + offsets[None, :], 0, in_size - 1)
+    return taps, coeffs
+
+
+def _bicubic_pos_embed_interpolate(
+    weight: torch.Tensor, out_h: int, out_w: int
+) -> torch.Tensor:
+    """Bicubic-interpolate a ``[H, W, D]`` pos-embed grid to ``[out_h*out_w, D]``.
+
+    Numerically matches
+    ``get_rope_shape(weight, "bicubic", (out_h, out_w))`` (i.e.
+    ``F.interpolate(mode="bicubic", align_corners=False)``), but computes the
+    data-dependent taps/weights on the host and leaves only a static gather +
+    weighted sum on device — the same structure Qwen3-VL uses for its (bilinear)
+    pos-embed interpolation, so it carries no dynamic-shape `F.interpolate` op.
+    """
+    src_h, src_w, dim = weight.shape
+
+    taps_h, coeffs_h = _bicubic_interp_axis(src_h, out_h)  # [out_h, 4]
+    taps_w, coeffs_w = _bicubic_interp_axis(src_w, out_w)  # [out_w, 4]
+
+    # 16 separable (kh, kw) tap combos over the flattened out_h*out_w output grid.
+    # Flattened source index = tap_h * src_w + tap_w; weight = coeff_h * coeff_w.
+    th = taps_h[:, None, :, None]  # [out_h, 1, 4, 1]
+    tw = taps_w[None, :, None, :]  # [1, out_w, 1, 4]
+    flat_idx = (th * src_w + tw).reshape(out_h * out_w, 16)
+
+    ch = coeffs_h[:, None, :, None]
+    cw = coeffs_w[None, :, None, :]
+    flat_wt = (ch * cw).reshape(out_h * out_w, 16)
+
+    device = weight.device
+    idx = torch.from_numpy(np.ascontiguousarray(flat_idx)).to(device=device)
+    wt = torch.from_numpy(np.ascontiguousarray(flat_wt)).to(
+        device=device, dtype=torch.float32
+    )
+
+    flat_weight = weight.reshape(src_h * src_w, dim)
+    gathered = flat_weight[idx.reshape(-1)].reshape(out_h * out_w, 16, dim)
+    out = (gathered.to(torch.float32) * wt.unsqueeze(-1)).sum(dim=1)
+    return out.to(weight.dtype)
+
+
 def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
     """
     t_size: int of the temporal size
@@ -261,6 +393,17 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
             assert t <= self.num_frames, f"t:{t} > self.num_frames:{self.num_frames}"
             if (h, w) == self.weight.shape[:-1]:
                 pos_emb_2d = self.weight.flatten(end_dim=1)
+            elif _is_tpu:
+                # Bicubic via host taps + device gather: no dynamic-shape op.
+                # Only bicubic is reproduced, and this assert is what keeps TPU
+                # out of get_rope_shape's @torch.compile(dynamic=True), which the
+                # TPU backend cannot lower -- relaxing it means adding _is_tpu to
+                # that decorator's disable=.
+                assert self.interpolation_mode == "bicubic", (
+                    "TPU pos-embed interpolation only implements bicubic; got "
+                    f"{self.interpolation_mode!r}."
+                )
+                pos_emb_2d = _bicubic_pos_embed_interpolate(self.weight, h, w)
             else:
                 pos_emb_2d = get_rope_shape(
                     self.weight,
@@ -421,9 +564,10 @@ class MoonVision3dPatchEmbed(nn.Module):
 
 
 class MoonViT3dEncoder(nn.Module):
-    # Class-level default so forward() stays usable on instances built with
+    # Class-level defaults so forward() stays usable on instances built with
     # __new__ (unit tests skip __init__).
     use_fused_rope = False
+    graph_runners = None
 
     def __init__(
         self,
@@ -458,6 +602,18 @@ class MoonViT3dEncoder(nn.Module):
         )
         self.final_layernorm = nn.LayerNorm(hidden_dim)
 
+        # TPU: block loop + final_layernorm become a torch.compile boundary;
+        # rope/cu_seqlens preamble and tpool_patch_merger stay eager.
+        self.graph_runners = None
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.graph_runner.moonvit_tpu_compile_runner import (
+                MoonVitTpuCompileRunner,
+            )
+
+            runner = MoonVitTpuCompileRunner(self)
+            if runner.supports_segment_ids:
+                self.graph_runners = runner
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -489,6 +645,23 @@ class MoonViT3dEncoder(nn.Module):
 
         cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
+        if self.graph_runners is not None:
+            # Segment-id TPU path. cu_seqlens must be on CPU (the segment-id
+            # builder runs on host). Returns early: the compiled boundary takes
+            # segment_ids, not a VisionAttentionMetadata.
+            rope = freqs_cis_to_cos_sin(rope_freqs_cis)
+            cu_seqlens_cpu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32),
+                    (grid_thws[:, 0] * grid_thws[:, 1] * grid_thws[:, 2]).to(
+                        device="cpu", dtype=torch.int32
+                    ),
+                )
+            ).cumsum(dim=0, dtype=torch.int32)
+            return self.graph_runners.run(
+                hidden_states, rope.cos, rope.sin, cu_seqlens_cpu
+            )
+
         forward_metadata = prepare_vision_attention_metadata(
             cu_seqlens,
             device=hidden_states.device,
@@ -508,6 +681,17 @@ class MoonViT3dEncoder(nn.Module):
         hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
+
+
+if _is_tpu:
+    # Register MoonViT's encoder as a torch.compile boundary for the TPU graph
+    # runner to discover (inert unless --enable-torch-compile).
+    from sglang.srt.compilation.support_torch_compile import support_torch_compile
+    from sglang.srt.hardware_backend.tpu.graph_runner.moonvit_tpu_compile_runner import (
+        MoonVitTpuCompilePolicy,
+    )
+
+    support_torch_compile(MoonViT3dEncoder, policy=MoonVitTpuCompilePolicy)
 
 
 class MoonViT3dPretrainedModel(nn.Module):
@@ -696,6 +880,22 @@ class KimiK25ForConditionalGeneration(nn.Module):
             target_dtype = self.language_model.dtype
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
+
+        # TPU: annotate the inner DeepSeek-V3 decoder (mirrors Qwen3-VL) so the
+        # data-dependent multimodal merge and logits stay out of the graph.
+        # Inert unless --enable-torch-compile.
+        if _is_tpu and self.language_model is not None:
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(
+                self.language_model.model,
+                policy=Qwen3VLDecoderTpuCompilePolicy,
+            )
 
     @property
     def model(self):

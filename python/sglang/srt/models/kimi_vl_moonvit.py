@@ -486,8 +486,16 @@ class MoonVitEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
+        # Rope2DPosEmb defaults to device="cuda"; resolve from the platform so
+        # the lazily precomputed freqs land on the accelerator actually in use
+        # (identical to the old default on CUDA).
+        from sglang.srt.platforms import current_platform
+
         self.rope_2d = Rope2DPosEmb(
-            block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
+            block_cfg["hidden_dim"] // block_cfg["num_heads"],
+            512,
+            512,
+            device=current_platform.device_type,
         )
         self.blocks = nn.ModuleList(
             [
