@@ -17,13 +17,13 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
+    verify_bookkeeping_func,
 )
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_draft_cache_locs_contiguous_func,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    fill_bonus_tokens_func,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -494,7 +494,7 @@ def run_eagle_verify(
     target_compile_policy = target_worker.model_runner.compile_policy
     # Keep scheduler tensors logical; the policy pads them around sampling.
     defer_output_unpadding = target_compile_policy.should_defer_verify_output_unpadding(
-        batch, verify_input, batch.sampling_info
+        batch, verify_input
     )
 
     # Batch 1: Target verify
@@ -591,19 +591,29 @@ def run_eagle_verify(
         batch, verify_input, logits_output.next_token_logits
     )
     verify_result = (None, None, None)
+    verify_bookkeeping_result = (None, None)
     try:
         verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+        post_predict, post_accept_lens, post_accept_index = verify_result
+        verify_bookkeeping_result = verify_bookkeeping_func(
+            batch.seq_lens,
+            post_accept_lens,
+            post_predict,
+            post_accept_index,
+        )
     finally:
         # Restore logical tensors and finalize target outputs.
-        verify_result = target_compile_policy.finalize_spec_verify(
-            verify_padding, *verify_result
+        verify_result, verify_bookkeeping_result = (
+            target_compile_policy.finalize_spec_verify(
+                verify_padding, verify_result, verify_bookkeeping_result
+            )
         )
         if defer_output_unpadding:
             logits_output = target_compile_policy.finalize_forward_batch(
                 logits_output, verify_forward_batch
             )
     predict, accept_lens, accept_index = verify_result
-    new_seq_lens = batch.seq_lens + accept_lens
+    new_seq_lens, bonus_tokens = verify_bookkeeping_result
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -625,20 +635,6 @@ def run_eagle_verify(
         accept_index,
         num_draft_tokens,
     )
-
-    if not batch.forward_mode.is_idle():
-        accept_tokens = predict[accept_index]
-        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-        # stride = accept_tokens per-req width = accept_index.shape[1]
-        # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-        fill_bonus_tokens_func(
-            accept_tokens,
-            accept_lens,
-            bonus_tokens,
-            accept_index.shape[1],
-        )
-    else:
-        bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
         compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)

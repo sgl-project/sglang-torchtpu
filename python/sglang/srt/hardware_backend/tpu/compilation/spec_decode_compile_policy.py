@@ -711,17 +711,10 @@ class SpecDecodeCompilePolicyMixin:
             )
 
     def should_defer_verify_output_unpadding(
-        self, batch: Any, verify_input: SpecInput, sampling_info: Any
+        self, batch: Any, verify_input: SpecInput
     ) -> bool:
-        """Decide whether TPU can defer target-output unpadding until sampling."""
-        verify_input.keep_outputs_padded = (
-            not batch.forward_mode.is_idle()
-            and not batch.has_grammar
-            and not batch.return_logprob
-            and sampling_info.acc_additive_penalties is None
-            and sampling_info.acc_scaling_penalties is None
-            and sampling_info.logit_bias is None
-        )
+        """Keep compiled verify outputs bucketed through sampling helpers."""
+        verify_input.keep_outputs_padded = not batch.forward_mode.is_idle()
         return verify_input.keep_outputs_padded
 
     def prepare_spec_verify(
@@ -785,22 +778,25 @@ class SpecDecodeCompilePolicyMixin:
         sampling_info.temperatures = temperatures
         sampling_info.top_ks = top_ks
         sampling_info.top_ps = top_ps
-        # Deliberately not widened, because the TPU verify path never reads them:
-        # retrieve_next_token / retrieve_next_sibling are sgl_kernel-only
-        # arguments, and draft_probs is accepted but ignored by the torch
-        # rejection sampler.
+        # Penalties, logit bias, and grammar data stay logical and are applied
+        # only to the logical logits prefix. retrieve_next_token /
+        # retrieve_next_sibling are sgl_kernel-only arguments, and draft_probs
+        # is accepted but ignored by the torch rejection sampler.
         return padding
 
     def finalize_spec_verify(
         self,
         padding: _SpecVerifyPadding | None,
-        predict: torch.Tensor | None,
-        accept_lens: torch.Tensor | None,
-        accept_index: torch.Tensor | None,
-    ) -> tuple[Any, Any, Any]:
-        """Restore original tensors and trim verification results."""
+        verify_result: tuple[
+            torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+        ],
+        bookkeeping_result: tuple[torch.Tensor | None, torch.Tensor | None],
+    ) -> tuple[tuple[Any, Any, Any], tuple[Any, Any]]:
+        """Restore logical inputs and trim all padded verification outputs."""
         if padding is None:
-            return predict, accept_lens, accept_index
+            return verify_result, bookkeeping_result
+        predict, accept_lens, accept_index = verify_result
+        new_seq_lens, bonus_tokens = bookkeeping_result
         sampling_info = padding.batch.sampling_info
         padding.batch.seq_lens = padding.seq_lens
         padding.verify_input.draft_token = padding.draft_token
@@ -808,13 +804,18 @@ class SpecDecodeCompilePolicyMixin:
         sampling_info.temperatures = padding.temperatures
         sampling_info.top_ks = padding.top_ks
         sampling_info.top_ps = padding.top_ps
-        if predict is None:
-            return predict, accept_lens, accept_index
         state = padding.state
+        logical_bs = state.logical_batch_size
         return (
-            predict[: state.logical_num_tokens],
-            accept_lens[: state.logical_batch_size],
-            accept_index[: state.logical_batch_size],
+            (
+                predict[: state.logical_num_tokens] if predict is not None else None,
+                accept_lens[:logical_bs] if accept_lens is not None else None,
+                accept_index[:logical_bs] if accept_index is not None else None,
+            ),
+            (
+                new_seq_lens[:logical_bs] if new_seq_lens is not None else None,
+                bonus_tokens[:logical_bs] if bonus_tokens is not None else None,
+            ),
         )
 
 

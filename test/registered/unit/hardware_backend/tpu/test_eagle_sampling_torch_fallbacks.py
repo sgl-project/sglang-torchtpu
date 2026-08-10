@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -340,6 +341,198 @@ class TestEagleSamplingTorchFallbacks(unittest.TestCase):
         )
         expected = expected / expected.sum(dim=-1, keepdim=True)
         self.assertTrue(torch.allclose(out, expected, atol=1e-6))
+
+
+class TestGreedyVerifyTorchEquivalence(unittest.TestCase):
+    """The fused greedy verify must match the staged-buffer implementation."""
+
+    @staticmethod
+    def _reference(next_token_logits, candidates, retrieve_index):
+        # Independent staged-buffer oracle for the functional implementation.
+        bs, ntv = candidates.shape
+        predicts = torch.zeros((bs * ntv,), dtype=torch.int32)
+        accept_index = torch.full((bs, ntv), -1, dtype=torch.int32)
+        accept_token_num = torch.empty((bs,), dtype=torch.int32)
+        target_predict = torch.argmax(next_token_logits, dim=-1).reshape(bs, ntv)
+        predicts[: bs * ntv] = target_predict.flatten().to(predicts.dtype)
+
+        matches = target_predict[:, :-1] == candidates[:, 1:]
+        if matches.shape[1] > 0:
+            all_match = matches.all(dim=1)
+            first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
+            num_correct = torch.where(all_match, ntv - 1, first_mismatch)
+        else:
+            num_correct = torch.zeros((bs,), dtype=torch.long)
+        accept_len = num_correct + 1
+
+        ri_valid = retrieve_index != -1
+        col_idx = torch.arange(ntv, dtype=torch.long)
+        within_accept = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)
+        invalid_within = within_accept & ~ri_valid
+        has_invalid = invalid_within.any(dim=1)
+        first_invalid = invalid_within.to(torch.int32).argmax(dim=1)
+        accept_len = torch.where(has_invalid, first_invalid, accept_len)
+        num_correct = accept_len - 1
+
+        copy_mask = col_idx.unsqueeze(0) < accept_len.unsqueeze(1)
+        accept_index[:bs] = torch.where(
+            copy_mask,
+            retrieve_index.to(accept_index.dtype),
+            torch.tensor(-1, dtype=accept_index.dtype),
+        )
+        accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
+        return predicts, accept_index, accept_token_num
+
+    def test_matches_reference_on_random_cases(self):
+        from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
+
+        torch.manual_seed(0)
+        vocab = 32
+        for bs, ntv in ((3, 1), (1, 4), (2, 4), (3, 2), (2, 8)):
+            for trial in range(8):
+                logits = torch.randn(bs * ntv, vocab)
+                candidates = torch.randint(0, vocab, (bs, ntv), dtype=torch.int32)
+                retrieve_index = torch.arange(bs * ntv, dtype=torch.int32).reshape(
+                    bs, ntv
+                )
+                if trial % 3 == 1 and ntv > 1:
+                    # Exercise the -1 clamp inside the accepted prefix.
+                    retrieve_index[:, -1] = -1
+
+                want_p, want_ai, want_n = self._reference(
+                    logits, candidates, retrieve_index
+                )
+                got_p, got_ai, got_lens = _verify_tree_greedy_torch(
+                    logits, candidates, retrieve_index
+                )
+
+                with self.subTest(bs=bs, ntv=ntv, trial=trial):
+                    self.assertTrue(torch.equal(got_p, want_p))
+                    self.assertTrue(torch.equal(got_ai, want_ai))
+                    # fused returns accept_len (incl. bonus); reference counts drafts
+                    self.assertTrue(torch.equal(got_lens - 1, want_n))
+
+    def test_handles_single_verify_token(self):
+        from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
+
+        logits = torch.randn(3, 16)
+        candidates = torch.randint(0, 16, (3, 1), dtype=torch.int32)
+        retrieve_index = torch.arange(3, dtype=torch.int32).reshape(3, 1)
+
+        predicts, accept_index, accept_lens = _verify_tree_greedy_torch(
+            logits, candidates, retrieve_index
+        )
+
+        self.assertEqual(predicts.shape, (3,))
+        self.assertEqual(accept_index.shape, (3, 1))
+        # Only the bonus token is ever accepted when there are no drafts.
+        self.assertEqual(accept_lens.tolist(), [1, 1, 1])
+
+    def test_logical_logits_view_leaves_the_bucketed_tail_untouched(self):
+        from sglang.srt.speculative.spec_info import SpecInput
+
+        logits = torch.zeros((16, 8))
+        spec_info = SimpleNamespace(
+            padding_state=SimpleNamespace(
+                logical_num_tokens=12,
+                physical_num_tokens=16,
+            )
+        )
+
+        logical_logits = SpecInput.logical_token_view(spec_info, logits)
+        logical_logits.add_(1)
+
+        self.assertEqual(logical_logits.shape, (12, 8))
+        self.assertTrue(torch.all(logits[:12] == 1))
+        self.assertTrue(torch.all(logits[12:] == 0))
+
+
+class TestVerifyBookkeepingEquivalence(unittest.TestCase):
+    """Fused bookkeeping must match seq-len add + gather + bonus fill."""
+
+    def test_matches_the_unfused_sequence(self):
+        from sglang.srt.speculative.eagle_utils import fused_verify_bookkeeping
+
+        torch.manual_seed(1)
+        for bs, width, ndt in ((1, 4, 4), (3, 4, 4), (2, 3, 6)):
+            seq_lens = torch.randint(8, 64, (bs,), dtype=torch.int32)
+            accept_lens = torch.randint(1, width + 1, (bs,), dtype=torch.int32)
+            predict = torch.randint(0, 1000, (bs * ndt,), dtype=torch.int32)
+            accept_index = torch.randint(0, bs * ndt, (bs, width), dtype=torch.int32)
+
+            got_seq, got_bonus = fused_verify_bookkeeping(
+                seq_lens, accept_lens, predict, accept_index
+            )
+
+            want_seq = seq_lens + accept_lens
+            accept_tokens = predict[accept_index]
+            want_bonus = torch.empty_like(accept_lens, dtype=torch.int32)
+            for i in range(bs):
+                want_bonus[i] = accept_tokens.reshape(-1)[
+                    width * i + int(accept_lens[i]) - 1
+                ]
+
+            with self.subTest(bs=bs, width=width):
+                self.assertTrue(torch.equal(got_seq, want_seq))
+                self.assertTrue(torch.equal(got_bonus, want_bonus))
+
+
+class TestDraftExtendSelectFused(unittest.TestCase):
+    """Fused draft-extend select must match the eager gather + argmax."""
+
+    def test_matches_eager_select_and_argmax(self):
+        from sglang.srt.speculative.eagle_utils import (
+            fused_draft_extend_select_argmax_func,
+        )
+
+        torch.manual_seed(3)
+        for bs, ndt, vocab, hdim in ((1, 4, 64, 8), (3, 4, 128, 16), (2, 6, 32, 4)):
+            logits = torch.randn(bs * ndt, vocab)
+            hidden = torch.randn(bs * ndt, hdim)
+            accept_lens = torch.randint(1, ndt + 1, (bs,), dtype=torch.int32)
+            select_index = (
+                torch.arange(0, bs * ndt, ndt, dtype=torch.int32) + accept_lens - 1
+            ).long()
+
+            sel_l, sel_h, tp, ti = fused_draft_extend_select_argmax_func(
+                logits, hidden, select_index
+            )
+
+            want_l = logits[select_index]
+            want_h = hidden[select_index]
+            want_ti = torch.argmax(want_l, dim=-1, keepdim=True)
+            with self.subTest(bs=bs, ndt=ndt):
+                self.assertTrue(torch.equal(sel_l, want_l))
+                self.assertTrue(torch.equal(sel_h, want_h))
+                self.assertTrue(torch.equal(ti, want_ti))
+                self.assertTrue(torch.all(tp == 1.0))
+                self.assertEqual(tp.shape, want_ti.shape)
+
+    def test_none_hidden_states_passes_through(self):
+        from sglang.srt.speculative.eagle_utils import (
+            fused_draft_extend_select_argmax_func,
+        )
+
+        logits = torch.randn(8, 16)
+        sel_l, sel_h, _, _ = fused_draft_extend_select_argmax_func(
+            logits, None, torch.tensor([1, 5])
+        )
+        self.assertIsNone(sel_h)
+        self.assertEqual(sel_l.shape, (2, 16))
+
+    def test_draft_extend_input_builds_a_safe_bucketed_selector(self):
+        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+
+        draft_extend_input = EagleDraftExtendInput(
+            num_accept_tokens=torch.tensor([2, 3, 2, 0], dtype=torch.int32),
+            num_tokens_per_req=4,
+        )
+
+        # The compile policy pads accept counts with zero. Its inert request
+        # selects the first row in that request rather than an invalid -1 row.
+        self.assertEqual(
+            draft_extend_input.last_accepted_indices().tolist(), [1, 6, 9, 12]
+        )
 
 
 if __name__ == "__main__":

@@ -11,12 +11,19 @@ from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.srt.compilation.compiled_op import compiled_op
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
+)
+from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+    make_draft_extend_select_args,
+    make_verify_bookkeeping_args,
+    make_verify_tree_greedy_args,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.spec_utils import fill_bonus_tokens_func
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -332,7 +339,7 @@ def build_tree_kernel_efficient(
     )
 
 
-def _verify_tree_greedy_torch(
+def _verify_tree_greedy_torch_inplace(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
@@ -387,6 +394,38 @@ def _verify_tree_greedy_torch(
         torch.tensor(-1, dtype=accept_index.dtype, device=candidates.device),
     )
     accept_token_num[:bs] = num_correct.to(accept_token_num.dtype)
+
+
+@compiled_op(warmup=make_verify_tree_greedy_args)
+def _verify_tree_greedy_torch(
+    next_token_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+):
+    bs, num_verify_tokens = candidates.shape
+    target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
+        bs, num_verify_tokens
+    )
+    predicts = target_predict.flatten().to(torch.int32)
+    if num_verify_tokens > 1:
+        matches = target_predict[:, :-1] == candidates[:, 1:]
+        all_match = matches.all(dim=1)
+        first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
+        num_correct = torch.where(all_match, num_verify_tokens - 1, first_mismatch)
+    else:
+        num_correct = torch.zeros((bs,), dtype=torch.long, device=candidates.device)
+    accept_len = num_correct + 1
+    columns = torch.arange(num_verify_tokens, device=candidates.device)
+    invalid = (columns.unsqueeze(0) < accept_len.unsqueeze(1)) & (retrieve_index == -1)
+    has_invalid = invalid.any(dim=1)
+    first_invalid = invalid.to(torch.int32).argmax(dim=1)
+    accept_len = torch.where(has_invalid, first_invalid, accept_len)
+    accept_index = torch.where(
+        columns.unsqueeze(0) < accept_len.unsqueeze(1),
+        retrieve_index.to(torch.int32),
+        torch.tensor(-1, dtype=torch.int32, device=candidates.device),
+    )
+    return predicts, accept_index, accept_len.to(torch.int32)
 
 
 def sgl_build_tree_kernel_triton(
@@ -479,8 +518,9 @@ def verify_tree_greedy_func(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
-    target_predict: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
     topk: int = -1,
+    next_token_logits: Optional[torch.Tensor] = None,
 ):
     if _is_cuda or _is_hip or _is_musa:
         from sgl_kernel import verify_tree_greedy
@@ -526,15 +566,14 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _use_torch_native:
-        _verify_tree_greedy_torch(
-            predicts,
-            accept_index,
-            accept_token_num,
-            candidates,
-            retrieve_index,
-            target_predict,
-            topk,
+        assert next_token_logits is not None
+        out_predicts, out_accept_index, out_accept_token_num = (
+            _verify_tree_greedy_torch(next_token_logits, candidates, retrieve_index)
         )
+        bs, num_verify_tokens = candidates.shape
+        predicts[: bs * num_verify_tokens] = out_predicts.to(predicts.dtype)
+        accept_index[:bs] = out_accept_index.to(accept_index.dtype)
+        accept_token_num[:bs] = (out_accept_token_num - 1).to(accept_token_num.dtype)
     elif _is_xpu:
         verify_tree_greedy_triton(
             predicts=predicts,
@@ -547,6 +586,53 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num
+
+
+@compiled_op(warmup=make_verify_bookkeeping_args)
+def fused_verify_bookkeeping(
+    seq_lens: torch.Tensor,
+    accept_lens: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+):
+    """Compute updated sequence lengths and bonus tokens in one dispatch."""
+    new_seq_lens = seq_lens + accept_lens
+    accept_tokens = predict[accept_index]
+    bs = accept_lens.shape[0]
+    accept_width = accept_index.shape[1]
+    idx = accept_width * torch.arange(bs, device=accept_lens.device) + accept_lens - 1
+    bonus_tokens = accept_tokens.reshape(-1)[idx].to(torch.int32)
+    return new_seq_lens, bonus_tokens
+
+
+def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
+    if seq_lens.numel() == 0:
+        return seq_lens + accept_lens, torch.empty(
+            (0,), device=seq_lens.device, dtype=torch.int32
+        )
+    if _use_torch_native:
+        return fused_verify_bookkeeping(seq_lens, accept_lens, predict, accept_index)
+    new_seq_lens = seq_lens + accept_lens
+    accept_tokens = predict[accept_index]
+    bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+    fill_bonus_tokens_func(
+        accept_tokens, accept_lens, bonus_tokens, accept_index.shape[1]
+    )
+    return new_seq_lens, bonus_tokens
+
+
+@compiled_op(warmup=make_draft_extend_select_args)
+def fused_draft_extend_select_argmax_func(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    select_index: torch.Tensor,
+):
+    """Select draft-extend rows and compute their greedy next-draft tokens."""
+    selected_logits = next_token_logits[select_index]
+    selected_hidden = hidden_states[select_index] if hidden_states is not None else None
+    topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
+    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+    return selected_logits, selected_hidden, topk_p, topk_index
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
@@ -815,26 +901,27 @@ def eagle_sample(
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
     if sampling_info.acc_additive_penalties is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.acc_additive_penalties,
-                verify_input.draft_token_num,
-                dim=0,
-            )
+        additive_penalties = torch.repeat_interleave(
+            sampling_info.acc_additive_penalties,
+            verify_input.draft_token_num,
+            dim=0,
         )
+        next_token_logits[: additive_penalties.shape[0]].add_(additive_penalties)
     if sampling_info.acc_scaling_penalties is not None:
+        scaling_penalties = torch.repeat_interleave(
+            sampling_info.acc_scaling_penalties,
+            verify_input.draft_token_num,
+            dim=0,
+        )
         apply_scaling_penalties(
-            next_token_logits,
-            torch.repeat_interleave(
-                sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
-            ),
+            next_token_logits[: scaling_penalties.shape[0]],
+            scaling_penalties,
         )
     if sampling_info.logit_bias is not None:
-        next_token_logits.add_(
-            torch.repeat_interleave(
-                sampling_info.logit_bias, verify_input.draft_token_num, dim=0
-            )
+        logit_bias = torch.repeat_interleave(
+            sampling_info.logit_bias, verify_input.draft_token_num, dim=0
         )
+        next_token_logits[: logit_bias.shape[0]].add_(logit_bias)
 
     # Apply grammar mask if provided
     if grammar_mask is not None:
@@ -851,8 +938,9 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
-        target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        if not _use_torch_native:
+            target_predict = torch.argmax(next_token_logits, dim=-1)
+            target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
@@ -863,6 +951,7 @@ def eagle_sample(
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
             target_predict=target_predict,
             topk=verify_input.tree_topk,
+            next_token_logits=next_token_logits,
         )
     else:
         if _use_torch_native:

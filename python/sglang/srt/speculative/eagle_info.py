@@ -895,6 +895,22 @@ class EagleDraftExtendInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 
+    def last_accepted_indices(self) -> torch.Tensor:
+        """Return the final accepted row for every request in this batch shape."""
+        assert self.num_tokens_per_req > 0
+        num_requests = self.num_accept_tokens.shape[0]
+        row_starts = torch.arange(
+            0,
+            num_requests * self.num_tokens_per_req,
+            self.num_tokens_per_req,
+            dtype=torch.int64,
+            device=self.num_accept_tokens.device,
+        )
+        # Compile-policy padding uses zero accept counts. Select the first row
+        # for those inert requests so padded indices remain in bounds.
+        accept_offsets = self.num_accept_tokens.to(torch.int64).clamp_min(1) - 1
+        return row_starts + accept_offsets
+
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,

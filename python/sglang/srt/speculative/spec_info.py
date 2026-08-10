@@ -384,6 +384,11 @@ class SpecInput(ABC):
         )
         return self.padding_state
 
+    def logical_token_view(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return the logical token prefix of a possibly bucketed tensor."""
+        state = self.padding_state
+        return tensor if state is None else tensor[: state.logical_num_tokens]
+
     # Cross-algorithm phase guards. Used by attention backends and
     # ForwardBatch padding logic to dispatch on phase without hardcoding the
     # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have

@@ -45,6 +45,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -73,6 +74,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
+    fused_draft_extend_select_argmax_func,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -965,17 +967,35 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
+        if current_platform.is_tpu():
+            execution_select_index = forward_batch.spec_info.last_accepted_indices()
+            (
+                draft_logits_output.next_token_logits,
+                draft_logits_output.hidden_states,
+                ret_topk_p,
+                ret_topk_index,
+            ) = self.draft_runner.compile_policy.finalize_spec_forward_batch(
+                outputs=fused_draft_extend_select_argmax_func(
+                    draft_logits_output.next_token_logits,
+                    draft_logits_output.hidden_states,
+                    execution_select_index,
+                ),
+                forward_batch=forward_batch,
+            )
+            ret_draft_probs = None
+        else:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if get_spec().speculative_use_rejection_sampling:
+        if current_platform.is_tpu():
+            pass
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,

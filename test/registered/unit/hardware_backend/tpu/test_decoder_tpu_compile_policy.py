@@ -1346,16 +1346,14 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
         policy = _policy()
 
         self.assertTrue(
-            policy.should_defer_verify_output_unpadding(
-                batch, verify_input, batch.sampling_info
-            )
+            policy.should_defer_verify_output_unpadding(batch, verify_input)
         )
         self.assertTrue(verify_input.keep_outputs_padded)
 
         verify_input.keep_outputs_padded = False
         self.assertFalse(
             NoopCompilePolicy().should_defer_verify_output_unpadding(
-                batch, verify_input, batch.sampling_info
+                batch, verify_input
             )
         )
         self.assertFalse(verify_input.keep_outputs_padded)
@@ -1396,7 +1394,7 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
         }
 
         padding = _policy().prepare_spec_verify(batch, verify_input, logits)
-        _policy().finalize_spec_verify(padding, None, None, None)
+        _policy().finalize_spec_verify(padding, (None, None, None), (None, None))
 
         # Restored by identity, not by narrowing: the forward batch aliases
         # these same objects.
@@ -1417,9 +1415,10 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
         self.assertEqual(batch.seq_lens.shape, (BUCKET_BS,))
 
         # What the finally block passes when eagle_sample never returned.
-        predict, accept_lens, accept_index = policy.finalize_spec_verify(
-            padding, None, None, None
+        verify_result, bookkeeping_result = policy.finalize_spec_verify(
+            padding, (None, None, None), (None, None)
         )
+        predict, accept_lens, accept_index = verify_result
 
         self.assertEqual(batch.seq_lens.shape, (BS,))
         self.assertEqual(verify_input.draft_token.shape, (LOGICAL_TOKENS,))
@@ -1432,16 +1431,26 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
         logits = torch.zeros((PADDED_TOKENS, VOCAB_SIZE))
         padding = _policy().prepare_spec_verify(batch, verify_input, logits)
 
-        predict, accept_lens, accept_index = _policy().finalize_spec_verify(
+        verify_result, bookkeeping_result = _policy().finalize_spec_verify(
             padding,
-            torch.arange(PADDED_TOKENS, dtype=torch.int32),
-            torch.arange(BUCKET_BS, dtype=torch.int32),
-            torch.zeros((BUCKET_BS, DRAFT_TOKEN_NUM), dtype=torch.int32),
+            (
+                torch.arange(PADDED_TOKENS, dtype=torch.int32),
+                torch.arange(BUCKET_BS, dtype=torch.int32),
+                torch.zeros((BUCKET_BS, DRAFT_TOKEN_NUM), dtype=torch.int32),
+            ),
+            (
+                torch.arange(BUCKET_BS, dtype=torch.int32),
+                torch.arange(BUCKET_BS, dtype=torch.int32),
+            ),
         )
+        predict, accept_lens, accept_index = verify_result
+        new_seq_lens, bonus_tokens = bookkeeping_result
 
         self.assertEqual(predict.shape, (LOGICAL_TOKENS,))
         self.assertEqual(accept_lens.shape, (BS,))
         self.assertEqual(accept_index.shape, (BS, DRAFT_TOKEN_NUM))
+        self.assertEqual(new_seq_lens.shape, (BS,))
+        self.assertEqual(bonus_tokens.shape, (BS,))
 
     def test_skips_when_the_forward_did_not_defer(self):
         batch = _make_batch(temperature=0.7)
@@ -1489,9 +1498,12 @@ class TestSpecVerifyPaddingIsInert(CustomTestCase):
             predict, accept_lens, accept_index = eagle_sample(
                 verify_input, batch, logits_output, None
             )
-        return _policy().finalize_spec_verify(
-            padding, predict, accept_lens, accept_index
+        verify_result, _ = _policy().finalize_spec_verify(
+            padding,
+            (predict, accept_lens, accept_index),
+            (None, None),
         )
+        return verify_result
 
     def _assert_inert(self, temperature, expected_accept_lens):
         first = self._run(temperature=temperature, pad_seed=1)
@@ -1564,6 +1576,35 @@ class TestSpecVerifyPaddingIsInert(CustomTestCase):
 
         self.assertTrue(probed)
         self.assertEqual([msg for msg, has_nan in probed if has_nan], [])
+
+    def test_penalties_modify_only_the_logical_logits_prefix(self):
+        batch = _make_batch(temperature=0.0)
+        batch.sampling_info.acc_additive_penalties = torch.ones((BS, VOCAB_SIZE))
+        batch.sampling_info.acc_scaling_penalties = torch.full((BS, VOCAB_SIZE), 2.0)
+        batch.sampling_info.logit_bias = torch.ones((BS, VOCAB_SIZE))
+        # Target-forward padding records this state before the policy decides
+        # to keep its outputs physical through sampling.
+        verify_input = _make_verify_input()
+        policy = _policy()
+        self.assertTrue(
+            policy.should_defer_verify_output_unpadding(batch, verify_input)
+        )
+        logits = torch.zeros((PADDED_TOKENS, VOCAB_SIZE))
+        padding = policy.prepare_spec_verify(batch, verify_input, logits)
+
+        with _serving_stubs():
+            result = eagle_sample(
+                verify_input,
+                batch,
+                SimpleNamespace(next_token_logits=logits),
+                None,
+            )
+
+        # additive 1 -> scale by 2 -> bias 1
+        self.assertTrue(torch.all(logits[:LOGICAL_TOKENS] == 1.5))
+        self.assertTrue(torch.all(logits[LOGICAL_TOKENS:] == 0))
+        finalized, _ = policy.finalize_spec_verify(padding, result, (None, None))
+        self.assertEqual(finalized[1].shape, (BS,))
 
 
 if __name__ == "__main__":

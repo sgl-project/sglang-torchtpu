@@ -612,6 +612,12 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
+        if (
+            current_platform.is_tpu()
+            and self.draft_worker is not None
+            and self.spec_algorithm.is_eagle3()
+        ):
+            self.precompile_tpu_spec_ops()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -1512,6 +1518,38 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+    def precompile_tpu_spec_ops(self) -> None:
+        from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+            SpecDecodeCompilePolicyMixin,
+        )
+        from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
+            precompile_spec_v2_ops,
+        )
+
+        compile_policy = self.tp_worker.model_runner.compile_policy
+        if not isinstance(compile_policy, SpecDecodeCompilePolicyMixin):
+            return
+        assert compile_policy.b_bucketer is not None
+
+        draft_runner = self.draft_worker.draft_worker.draft_runner
+        hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(draft_runner)
+        if hidden_size is None or hidden_dtype is None:
+            return
+        draft_vocab_size = (
+            getattr(draft_runner.model.config, "draft_vocab_size", None)
+            or draft_runner.model.config.vocab_size
+        )
+
+        precompile_spec_v2_ops(
+            device=torch.device(self.device),
+            physical_batch_buckets=compile_policy.b_bucketer.buckets,
+            num_verify_tokens=compile_policy.draft_token_num,
+            vocab_size=self.model_config.vocab_size,
+            draft_vocab_size=draft_vocab_size,
+            hidden_size=hidden_size,
+            hidden_dtype=hidden_dtype,
+        )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (

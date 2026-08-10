@@ -90,7 +90,7 @@ class DecoderCompilePolicy(CompilePolicy):
         return outputs
 
     def should_defer_verify_output_unpadding(
-        self, batch: Any, verify_input: Any, sampling_info: Any
+        self, batch: Any, verify_input: Any
     ) -> bool:
         """Return whether this policy keeps target verify outputs padded."""
         return False
@@ -102,10 +102,13 @@ class DecoderCompilePolicy(CompilePolicy):
         return None
 
     def finalize_spec_verify(
-        self, padding: Any, predict: Any, accept_lens: Any, accept_index: Any
-    ) -> tuple[Any, Any, Any]:
-        """Restore inputs and trim verification outputs."""
-        return predict, accept_lens, accept_index
+        self,
+        padding: Any,
+        verify_result: tuple[Any, Any, Any],
+        bookkeeping_result: tuple[Any, Any],
+    ) -> tuple[tuple[Any, Any, Any], tuple[Any, Any]]:
+        """Restore inputs and trim verification and bookkeeping outputs."""
+        return verify_result, bookkeeping_result
 
 
 class NoopCompilePolicy(DecoderCompilePolicy):
