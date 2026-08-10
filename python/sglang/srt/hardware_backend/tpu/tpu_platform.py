@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
@@ -204,6 +205,23 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.model_executor.tpu_graph_runner import TpuGraphRunner
 
         return TpuGraphRunner
+
+    def get_quantization_config(
+        self, quantization: str
+    ) -> Optional[Type[QuantizationConfig]]:
+        if quantization == "modelopt_fp4":
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                TpuModelOptCompatibleFp4Config,
+            )
+
+            return TpuModelOptCompatibleFp4Config
+        if quantization == "modelopt_mixed":
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                TpuModelOptMixedPrecisionConfig,
+            )
+
+            return TpuModelOptMixedPrecisionConfig
+        return None
 
     def get_mha_kv_pool_cls(self) -> type:
         # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native

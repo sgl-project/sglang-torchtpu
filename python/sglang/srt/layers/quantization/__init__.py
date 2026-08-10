@@ -147,8 +147,6 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"Invalid quantization method: {quantization}. "
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
-    from sglang.srt.utils import is_cpu
-
     if is_cpu() and cpu_has_amx_support():
         if quantization not in CPU_QUANTIZATION_METHODS:
             raise ValueError(
@@ -158,7 +156,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         else:
             return CPU_QUANTIZATION_METHODS[quantization]
 
-    if current_platform.is_out_of_tree():
+    if current_platform.is_out_of_tree() or current_platform.is_tpu():
         config = current_platform.get_quantization_config(quantization)
 
         # If the platform has a quantization config, use it else use the default

@@ -32,7 +32,6 @@ PACKING = 2  # two FP4 codes per uint8 byte
 # the NVFP4 adapter only validates and caches that downstream-owned contract.
 _POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
 _POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
-_POST_EXPERT_NORM_FALLBACK = "finalize_tpu_fused_rs_fallback"
 
 # Load-bearing, not a tuning knob: a single fused-RS invocation over a full
 # 4096-token prefill reproducibly triggered RuntimeUnexpectedCoreHalt during the
@@ -53,11 +52,9 @@ def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
         return
 
     weight_getter = getattr(layer, _POST_EXPERT_NORM_WEIGHT_GETTER, None)
-    fallback = getattr(layer, _POST_EXPERT_NORM_FALLBACK, None)
-    if not callable(weight_getter) or not callable(fallback):
+    if not callable(weight_getter):
         raise TypeError(
-            "TPU fused-RS post-expert norm requires model-provided weight and "
-            "fallback-finalization hooks"
+            "TPU fused-RS post-expert norm requires a model-provided weight hook"
         )
 
     # The model hook owns semantic validation (norm type, gain convention, and

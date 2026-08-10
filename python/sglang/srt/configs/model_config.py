@@ -370,6 +370,8 @@ class ModelConfig:
             self.nvfp4_moe_meta = {
                 "group_size": int(hybrid_quant_cfg["group_size"]),
                 "exclude_modules": list(hybrid_quant_cfg.get("ignore") or []),
+                "global_scale": hybrid_quant_cfg.get("global_scale", True),
+                "scale_dtype": hybrid_quant_cfg.get("scale_dtype"),
             }
             logger.info(
                 "Auto-detected hybrid FP8+NVFP4 checkpoint "
