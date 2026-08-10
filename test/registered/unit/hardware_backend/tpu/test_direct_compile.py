@@ -61,8 +61,10 @@ class TestDirectCompile(CustomTestCase):
         pool_input = kv_pool.value
         traced_model_state = []
         traced_pool_state = []
+        traced_compile_state = []
 
         def fn(*, inputs):
+            traced_compile_state.append(torch.compiler.is_compiling())
             traced_model_state.append((model.state.weight, model.state_alias.weight))
             traced_pool_state.append(kv_pool.value)
             kv_pool.value.add_(model.state.weight)
@@ -132,6 +134,7 @@ class TestDirectCompile(CustomTestCase):
             ) as execute,
         ):
             output = compiled(inputs=first)
+            self.assertFalse(torch.compiler.is_compiling())
             self.assertTrue(torch.equal(output.value, first_result))
             self.assertTrue(torch.equal(kv_pool.value, first_pool))
 
@@ -152,6 +155,7 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(traced_model_state[0][0], traced_model_state[0][1])
         self.assertIsNot(traced_model_state[0][0], model.state.weight)
         self.assertIsNot(traced_pool_state[0], pool_input)
+        self.assertEqual(traced_compile_state, [True])
 
         unexpected = torch.ones(2)
         invalid = direct_compile.direct_compile(

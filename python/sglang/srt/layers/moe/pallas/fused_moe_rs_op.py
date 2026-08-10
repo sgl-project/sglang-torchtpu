@@ -47,12 +47,12 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
     global_device_id, physical_order = _get_physical_rank_metadata()
 
-    layer._tpu_fused_rs_physical_order = torch.tensor(
+    physical_order_tensor = torch.tensor(
         physical_order,
         dtype=torch.int64,
         device=layer.w13_weight.device,
     )
-    layer._tpu_fused_rs_group_offset = torch.tensor(
+    group_offset = torch.tensor(
         [
             get_moe_expert_parallel_rank() * layer.num_local_experts,
             global_device_id,
@@ -60,6 +60,10 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )
+    layer.register_buffer(
+        "_tpu_fused_rs_physical_order", physical_order_tensor, persistent=False
+    )
+    layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
     _build_fused_moe_rs_op()
 
 

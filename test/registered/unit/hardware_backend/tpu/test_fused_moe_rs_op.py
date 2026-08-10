@@ -34,10 +34,9 @@ class TestFusedMoeRsOp(CustomTestCase):
                 self.assertEqual((actual * topk) % 16, 0)
 
     def test_prepare_sets_physical_rank_metadata(self):
-        layer = Mock(
-            num_local_experts=16,
-            w13_weight=torch.empty(1),
-        )
+        layer = torch.nn.Module()
+        layer.num_local_experts = 16
+        layer.w13_weight = torch.empty(1)
 
         with (
             patch.dict(
@@ -56,6 +55,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
+            fused_moe_rs_op.prepare_fused_moe_rs(layer)
             self.assertEqual(
                 os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"],
                 "false",
@@ -69,7 +69,11 @@ class TestFusedMoeRsOp(CustomTestCase):
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 4], dtype=torch.int32),
         )
-        build.assert_called_once_with()
+        self.assertIn("_tpu_fused_rs_physical_order", layer._buffers)
+        self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
+        self.assertIn("_tpu_fused_rs_physical_order", layer._non_persistent_buffers_set)
+        self.assertIn("_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set)
+        self.assertEqual(build.call_count, 2)
 
     def test_gather_reorders_tp_ranks_to_physical_device_order(self):
         rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])

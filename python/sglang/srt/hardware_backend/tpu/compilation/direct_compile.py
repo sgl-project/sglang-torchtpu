@@ -93,6 +93,22 @@ def direct_compile(
     KV-cache Tensor through `get_state`; all are assumed to be mutated and are
     copied back after execution. The KV pool is the only mutable input.
 
+    Common problems/assumptions:
+
+    * Every Tensor reachable from model execution must be an explicit function
+      input, a model parameter/buffer, or KV-pool state. An ``nn.Module`` must
+      not keep a Tensor as an ordinary attribute; register such Tensors with
+      ``register_buffer(persistent=False)``.
+    * A plain helper object owned by a module is not traversed by
+      ``named_parameters``/``named_buffers``. These objects must not own Tensor
+      attributes; the easiest workaround is to make the Tensor a buffer
+      of the module and have the code use the buffer through accessing
+      module attributes.
+    * ``build_mlir`` reporting ``identified an argument that was not provided:
+      DeviceBufferRef`` means tracing captured such an unregistered Tensor.
+      The reported shape and dtype are usually the fastest way to find the
+      offending model/helper attribute.
+
     """
     compiled = CompiledFunction(
         fn,
@@ -211,6 +227,15 @@ class CompiledFunction:
             execution_mode.set_eager_mode(execution_mode.EagerMode.INTERNAL_DEFER_ALL),
             ExitStack() as stack,
         ):
+            # Respect torch.compiler.is_compiling() during tracing by returning True.
+            previous_is_compiling = torch.compiler._is_compiling_flag
+            torch.compiler._is_compiling_flag = True
+            stack.callback(
+                setattr,
+                torch.compiler,
+                "_is_compiling_flag",
+                previous_is_compiling,
+            )
             if self._model is not None:
                 parameters = dict(zip(model_names, graph_inputs[:model_input_count]))
                 # Need to temporarily yeet the placeholder params/buffers onto
