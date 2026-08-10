@@ -597,7 +597,9 @@ class MoonViT3dEncoder(nn.Module):
                 MoonVitTpuCompileRunner,
             )
 
-            self.graph_runners = MoonVitTpuCompileRunner(self)
+            runner = MoonVitTpuCompileRunner(self)
+            if runner.supports_segment_ids:
+                self.graph_runners = runner
 
     def forward(
         self,

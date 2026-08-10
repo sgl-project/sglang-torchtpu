@@ -65,8 +65,13 @@ class MoonVitTpuCompileRunner:
         if not self._supports_segment_ids:
             logger.warning(
                 "MoonVitTpuCompileRunner: MoonViT attention does not support "
-                "segment_ids; falling back to eager execution."
+                "segment_ids; the caller must keep the eager cu_seqlens loop."
             )
+
+    @property
+    def supports_segment_ids(self) -> bool:
+        """False => the caller must not use this runner; nothing would mask."""
+        return self._supports_segment_ids
 
     def _all_blocks_use_segment_id_attention(self) -> bool:
         for block in self.encoder.blocks:
