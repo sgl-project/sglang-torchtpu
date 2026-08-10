@@ -21,9 +21,13 @@ def _quantize_activation_per_row(
     x_scale = torch.clamp(
         x.abs().amax(dim=1, keepdim=True).float() / dtype_max, min=1e-12
     )
-    x_q = torch.clamp(x.float() / x_scale, min=-dtype_max, max=dtype_max).to(
-        target_dtype
-    )
+    # No clamp on the quotient: x_scale is this row's amax / dtype_max, so
+    # |x / x_scale| <= dtype_max by construction, and the 1e-12 floor binds only
+    # where the numerator is small enough to stay in range. Keep the scale
+    # per-row -- the fp8 cast does not saturate, so an over-range quotient
+    # becomes NaN (pinned by test_fp8_activation_quantize.py). Saves one [M,K]
+    # elementwise kernel per dense linear, ~120 per decode step.
+    x_q = (x.float() / x_scale).to(target_dtype)
     return x_q, x_scale
 
 
