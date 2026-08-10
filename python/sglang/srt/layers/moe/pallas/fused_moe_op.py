@@ -50,6 +50,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
 # strings and validation would reject them.
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -78,6 +79,25 @@ _PALLAS_MOE_OP = None
 # ``fused_moe_op`` on a non-TPU host stays cheap (the only inbound paths to
 # this module are TPU-only: ``UnquantizedFusedMoEMethod.forward_tpu`` and the
 # op registration in ``FusedMoE.__init__``, which is gated on ``_is_tpu``).
+
+
+def _padded_token_count(m: int, topk: int) -> int:
+    """Smallest ``m_pad >= m`` with ``(m_pad * topk) % 16 == 0``.
+
+    gmm_v2 constrains the LHS row count, which after the permute is
+    ``m_pad * topk``, not the token count -- so the minimal token alignment is
+    ``16 // gcd(16, topk)``, not a flat 16. 
+    ``topk=10``, giving gcd 2
+    and an alignment of 8: a decode batch of 8 then pads to 8 instead of 16, and
+    both the grouped matmul and the permute see 80 routed rows instead of 160.
+    ``topk=1`` or any odd ``topk`` resolves back to 16, so this only ever loosens
+    the padding, never tightens it.
+
+    """
+    token_align = 16 // math.gcd(16, topk)
+    m_pad = ((m + token_align - 1) // token_align) * token_align
+    
+    return m_pad
 
 
 def _valid_rows_mask(group_sizes, expert_group_offset, local_num_experts, unsort_idx):
@@ -329,10 +349,7 @@ def _fused_moe_jax(
     # to expert 0 with zero weight, so they contribute nothing to any real
     # token and are sliced off at the very end.
     m_orig = m
-    TOKEN_ALIGN = (
-        16  # token bucket; m_pad % 16 == 0 => (m_pad*topk) % 16 == 0 for any topk
-    )
-    m_pad = ((m + TOKEN_ALIGN - 1) // TOKEN_ALIGN) * TOKEN_ALIGN
+    m_pad = _padded_token_count(m, topk)
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
         topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0
