@@ -60,6 +60,11 @@
 #                                  # tensor-parallel within the TP group). For a
 #                                  # MoE model set EP to a divisor of TP_SIZE and
 #                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
+#   DP_SIZE=                       # When set > 1, enable DP attention.
+#                                  # --enable-dp-attention --dp-size DP_SIZE
+#                                  # --enable-dp-lm-head.
+#   DP_ENABLE_PREFILL_DELAYER=1    # 1 = enable the prefill delayer, 0 = disable.
+#                                  # Only applies when DP is on.
 #   CONC=64                        # bench concurrency this server is sized for
 #   MAX_RUNNING=$CONC              # in-flight request cap (InferenceX parity:
 #                                  # exactly the bench concurrency)
@@ -179,6 +184,23 @@ fi
 
 TP_SIZE=${TP_SIZE:-$DEFAULT_TP}
 EP_SIZE=${EP_SIZE:-}
+
+# ----- DP attention + prefill delayer -----
+DP_SIZE=${DP_SIZE:-}
+DP_ENABLE_PREFILL_DELAYER=${DP_ENABLE_PREFILL_DELAYER:-1}
+
+DP_ENABLED=0
+[[ -n "$DP_SIZE" && "$DP_SIZE" -gt 1 ]] && DP_ENABLED=1
+
+# The delayer requires overlap scheduling (sglang asserts otherwise); fail fast
+# rather than silently dropping it.
+if [[ "$DP_ENABLED" == "1" && "$DP_ENABLE_PREFILL_DELAYER" == "1" \
+      && "${DISABLE_OVERLAP_SCHEDULE:-0}" == "1" ]]; then
+    echo "ERROR: DP_ENABLE_PREFILL_DELAYER=1 requires overlap scheduling, but" \
+         "DISABLE_OVERLAP_SCHEDULE=1. Set DP_ENABLE_PREFILL_DELAYER=0 or" \
+         "DISABLE_OVERLAP_SCHEDULE=0." >&2
+    exit 2
+fi
 
 TS=$(date +%Y%m%d_%H%M%S)
 RUN_DIR=${RUN_DIR:-./profile/${MODEL_SLUG}-tpu/$TS}
@@ -334,6 +356,12 @@ if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
   fi
 fi
 echo "  ep_size            = ${EP_SIZE:-<unset>}"
+if [[ "$DP_ENABLED" == "1" ]]; then
+  echo "  dp_size            = $DP_SIZE  (attn_tp=$((TP_SIZE / DP_SIZE)), dp_lm_head=on)"
+  echo "  prefill_delayer    = $DP_ENABLE_PREFILL_DELAYER  (watermark=0.7, max_delay_ms=5000)"
+else
+  echo "  dp_size            = <off>"
+fi
 echo "  host:port          = $HOST:$PORT"
 echo "  max_running        = $MAX_RUNNING  (CONC=$CONC)"
 echo "  page_size          = $PAGE_SIZE"
@@ -379,6 +407,16 @@ args=(
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
+if [[ "$DP_ENABLED" == "1" ]]; then
+    args+=(--enable-dp-attention --dp-size "$DP_SIZE" --enable-dp-lm-head)
+fi
+if [[ "$DP_ENABLED" == "1" && "$DP_ENABLE_PREFILL_DELAYER" == "1" ]]; then
+    args+=(
+        --enable-prefill-delayer
+        --prefill-delayer-token-usage-low-watermark 0.7
+        --prefill-delayer-max-delay-ms 5000
+    )
+fi
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
