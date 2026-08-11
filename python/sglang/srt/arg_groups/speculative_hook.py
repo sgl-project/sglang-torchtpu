@@ -21,6 +21,23 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     )
 
 
+def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> None:
+    if server_args.device != "tpu":
+        return
+    if server_args.speculative_eagle_topk != 1:
+        raise ValueError(
+            "TPU speculative decoding requires --speculative-eagle-topk=1."
+        )
+    if server_args.speculative_use_rejection_sampling:
+        raise ValueError(
+            "TPU speculative decoding does not support rejection sampling."
+        )
+    if server_args.kv_canary != "none":
+        raise ValueError("TPU speculative decoding does not support KV canary.")
+    if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
+        raise ValueError("TPU speculative decoding does not support DSA index sharing.")
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -558,7 +575,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "eagle speculative decoding."
         )
 
-    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    model_config = server_args.get_model_config()
+    model_arch = model_config.hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
@@ -605,6 +623,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             raise ValueError(
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
+
+    _validate_tpu_speculative_args(server_args, model_config)
 
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.

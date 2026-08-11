@@ -834,12 +834,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
+        draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
+        kv_lens = (
+            draft_kv_lens
+            if draft_kv_lens is not None
+            else self.forward_metadata.kv_lens
+        )
         out = op(
             q,
             k,
             v,
             kv_cache,
-            self.forward_metadata.kv_lens,
+            kv_lens,
             page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,

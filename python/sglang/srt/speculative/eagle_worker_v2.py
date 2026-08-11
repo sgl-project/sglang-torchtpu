@@ -111,6 +111,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
     log_info_on_rank0,
 )
@@ -121,6 +122,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 
@@ -186,6 +188,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
+        self._compiled_fused_steps = None
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -543,7 +546,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                draft_outputs = self.draft_forward(forward_batch)
+                if (
+                    _is_tpu
+                    and not forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                ):
+                    draft_outputs = self._fused_draft_forward(forward_batch)
+                else:
+                    draft_outputs = self.draft_forward(forward_batch)
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_runner.compile_policy.finalize_spec_forward_batch(
                         outputs=draft_outputs,
@@ -565,6 +575,92 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+
+    def _fused_draft_forward(self, forward_batch: ForwardBatch):
+        """Run all draft steps in one compiled call."""
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p")
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        attn_backends = self.draft_attn_backend.attn_backends
+        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
+        out_cache_loc = per_step_draft_out_cache_loc(
+            forward_batch.out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+        steps_fn = self._compiled_fused_steps
+        if steps_fn is None:
+            # Model forwards are already compiled; compile only the loop.
+            steps_fn = torch.compile(
+                self._fused_draft_steps,
+                backend="tpu",
+                fullgraph=False,
+                dynamic=False,
+            )
+            self._compiled_fused_steps = steps_fn
+
+        # Keep one backend active and pass each step's KV lengths separately.
+        with forward_context(ForwardContext(attn_backend=attn_backends[0])):
+            token_list = steps_fn(
+                forward_batch,
+                topk_p,
+                topk_index,
+                hidden_states,
+                kv_lens_stack,
+                out_cache_loc,
+            )
+        spec_info.rpa_draft_kv_lens = None
+
+        bs = token_list[0].shape[0]
+        return (
+            self._topk1_parents_prealloc[:bs],
+            self._topk1_score_indices_prealloc[:bs],
+            torch.cat(token_list, dim=1),
+            None,
+        )
+
+    def _fused_draft_steps(
+        self,
+        forward_batch: ForwardBatch,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_lens_stack: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ):
+        """Run the compiled draft loop."""
+        num_steps = self.speculative_num_steps
+        model = self.draft_runner.model
+        base_positions = forward_batch.positions
+        tokens: tuple = ()
+        scores = None
+        for i in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            tokens += (tree_info[1],)
+            if i == num_steps - 1:
+                break
+
+            forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
+            forward_batch.spec_info.hidden_states.copy_(hidden_states)
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            logits_output = model.forward(input_ids, base_positions + i, forward_batch)
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+        return tokens
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
