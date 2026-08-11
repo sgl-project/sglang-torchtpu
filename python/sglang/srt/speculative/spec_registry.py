@@ -104,6 +104,9 @@ class CustomSpecAlgo:
         # scheduler's grammar barrier), letting spec + grammar decode overlap.
         return False
 
+    def supports_tpu_direct_compile(self) -> bool:
+        return False
+
     def has_draft_kv(self) -> bool:
         # Conservative default: the larger KV reserve.
         return True

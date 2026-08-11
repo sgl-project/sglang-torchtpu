@@ -148,6 +148,10 @@ class SpeculativeAlgorithm(Enum):
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
         return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
+    def supports_tpu_direct_compile(self) -> bool:
+        """Whether this algorithm supports TPU direct compilation."""
+        return self.is_eagle3()
+
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
         lives only in the verify mask), so per-decode KV sizing needs no

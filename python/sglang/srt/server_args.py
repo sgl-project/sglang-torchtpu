@@ -4182,9 +4182,16 @@ class ServerArgs:
         if self.device != "tpu":
             raise ValueError("--tpu-compile-tracer direct is supported only on TPU")
         if self.speculative_algorithm is not None:
-            raise ValueError(
-                "--tpu-compile-tracer direct does not support speculative decoding"
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            spec_algorithm = SpeculativeAlgorithm.from_string(
+                self.speculative_algorithm
             )
+            if not spec_algorithm.supports_tpu_direct_compile():
+                raise ValueError(
+                    "--tpu-compile-tracer direct does not support speculative "
+                    f"algorithm {self.speculative_algorithm}"
+                )
         if (
             self.unsafe_save_torch_compile_bundle is not None
             or self.unsafe_load_torch_compile_bundle is not None

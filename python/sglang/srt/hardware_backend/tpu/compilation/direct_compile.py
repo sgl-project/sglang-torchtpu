@@ -7,7 +7,7 @@ import inspect
 import logging
 from collections.abc import Callable, Hashable
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Any, Protocol
 
@@ -23,6 +23,10 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,13 @@ def direct_compile(
       DeviceBufferRef`` means tracing captured such an unregistered Tensor.
       The reported shape and dtype are usually the fastest way to find the
       offending model/helper attribute.
+    * ``Unsupported direct_compile input type ...; register structured inputs
+      as JAX pytrees`` means an input container must be registered before its
+      Tensor fields can become graph inputs.
+    * A compiled artifact requires the same input pytree at warmup and runtime,
+      including which fields are Tensors versus ``None``. Either exclude
+      host-only or preprocessing-only fields with ``ignored_argnames``, or use
+      pytree tricks to hide them; only pytree leaves become graph inputs.
 
     """
     compiled = CompiledFunction(
@@ -312,7 +323,15 @@ class _CompiledArtifact:
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.
-        inputs.extend(_get_path(call, path) for path in self.tensor_inputs_key_paths)
+        for path in self.tensor_inputs_key_paths:
+            value = _get_path(call, path)
+            if not _is_tpu_tensor(value):
+                raise TypeError(
+                    "A direct_compile tensor input changed type at runtime: "
+                    f"{tree_util.keystr(path)} was traced as a TPU tensor but is "
+                    f"now {type(value).__name__}"
+                )
+            inputs.append(value)
 
         outputs = tpu_torch_compile.execute(self.executable, inputs)
 
@@ -375,3 +394,21 @@ def _selector_path(
 
 def _is_tpu_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor) and value.device.type == "tpu"
+
+
+def _register_hidden_states_pytree(cls: type) -> None:
+    """Only expose hidden_states for draft model compilation.
+
+    All other fields are unused by the compiled draft model forward.
+    """
+    field_names = tuple(field.name for field in fields(cls))
+    tree_util.register_dataclass(
+        cls,
+        data_fields=("hidden_states",),
+        meta_fields=(),
+        drop_fields=tuple(name for name in field_names if name != "hidden_states"),
+    )
+
+
+_register_hidden_states_pytree(EagleDraftInput)
+_register_hidden_states_pytree(EagleDraftExtendInput)

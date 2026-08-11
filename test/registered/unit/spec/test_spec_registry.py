@@ -164,6 +164,9 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertEqual(self.algo.is_some(), not self.algo.is_none())
         self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
 
+    def test_tpu_direct_compile_defaults_off(self):
+        self.assertFalse(self.algo.supports_tpu_direct_compile())
+
     def test_supports_overlap_false_warns_deprecation(self):
         # supports_overlap=False plugins run the V2 schema synchronously; the
         # removed V1 path is surfaced as a deprecation warning at create time.
@@ -276,6 +279,20 @@ class TestSubclassOverride(_RegistryIsolated):
         algo = SpeculativeAlgorithm.from_string("MY_CUSTOM")
         # Custom dispatch bypasses default overlap check
         self.assertEqual(algo.create_worker(MagicMock()), "custom-dispatched")
+
+    def test_subclass_can_enable_tpu_direct_compile(self):
+        class DirectCompileSpec(CustomSpecAlgo):
+            def supports_tpu_direct_compile(self) -> bool:
+                return True
+
+        @SpeculativeAlgorithm.register(
+            "MY_DIRECT_COMPILE", spec_class=DirectCompileSpec
+        )
+        def _factory(server_args):
+            return MagicMock
+
+        algo = SpeculativeAlgorithm.from_string("MY_DIRECT_COMPILE")
+        self.assertTrue(algo.supports_tpu_direct_compile())
 
 
 class TestConformanceGuard(_RegistryIsolated):

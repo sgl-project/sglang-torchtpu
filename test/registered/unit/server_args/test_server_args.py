@@ -1520,10 +1520,28 @@ class TestTpuCompileTracer(unittest.TestCase):
         args = ServerArgs(model_path="dummy")
         self.assertEqual(args.tpu_compile_tracer, "dynamo")
 
+    def test_eagle3_default_is_dynamo(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            speculative_algorithm="EAGLE3",
+        )
+        args._handle_tpu_compile_tracer()
+        self.assertEqual(args.tpu_compile_tracer, "dynamo")
+
+    def test_direct_accepts_eagle3(self):
+        args = ServerArgs(
+            model_path="dummy",
+            device="tpu",
+            tpu_compile_tracer="direct",
+            speculative_algorithm="EAGLE3",
+        )
+        args._handle_tpu_compile_tracer()
+
     def test_direct_rejects_unsupported_configurations(self):
         cases = (
             ({"device": "cuda"}, "supported only on TPU"),
-            ({"speculative_algorithm": "EAGLE3"}, "speculative decoding"),
+            ({"speculative_algorithm": "EAGLE"}, "does not support.*EAGLE"),
             ({"unsafe_save_torch_compile_bundle": "/tmp/bundle"}, "bundles"),
         )
         for overrides, error in cases:

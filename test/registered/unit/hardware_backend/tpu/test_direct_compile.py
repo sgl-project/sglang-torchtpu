@@ -9,6 +9,10 @@ import torch
 from jax import tree_util
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+)
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -107,6 +111,31 @@ class TestDirectCompile(CustomTestCase):
         runtime_inputs = execute.call_args.args[1]
         self.assertIs(runtime_inputs[0], model.weight)
         self.assertEqual(len(runtime_inputs), 2)
+
+    def test_eagle_draft_pytrees_only_expose_hidden_states(self):
+        draft_hidden_states = torch.ones((1, 2))
+        draft_extend_hidden_states = torch.ones((1, 3))
+        inputs = (
+            EagleDraftInput(
+                topk_p=torch.ones((1, 1)),
+                hidden_states=draft_hidden_states,
+            ),
+            EagleDraftExtendInput(
+                hidden_states=draft_extend_hidden_states,
+                input_ids=torch.ones(1, dtype=torch.long),
+            ),
+        )
+
+        leaves, treespec = tree_util.tree_flatten(inputs)
+        rebuilt = tree_util.tree_unflatten(treespec, leaves)
+
+        self.assertEqual(len(leaves), 2)
+        self.assertIs(leaves[0], draft_hidden_states)
+        self.assertIs(leaves[1], draft_extend_hidden_states)
+        self.assertIs(rebuilt[0].hidden_states, draft_hidden_states)
+        self.assertIsNone(rebuilt[0].topk_p)
+        self.assertIs(rebuilt[1].hidden_states, draft_extend_hidden_states)
+        self.assertIsNone(rebuilt[1].input_ids)
 
     def test_artifact_dispatches_and_rebuilds_outputs(self):
         model = _Model()
@@ -226,6 +255,25 @@ class TestDirectCompile(CustomTestCase):
             self.assertRaisesRegex(TypeError, "Unsupported.*Tensor"),
         ):
             invalid(torch.ones(2), unexpected)
+
+    def test_artifact_reports_runtime_tensor_structure_changes(self):
+        value = torch.ones(2)
+        artifact = direct_compile._CompiledArtifact(
+            executable=object(),
+            model_inputs=(),
+            kv_pool=None,
+            tensor_inputs_key_paths=(
+                (tree_util.SequenceKey(0), tree_util.SequenceKey(0)),
+            ),
+            output_treespec=None,
+            output_count=0,
+        )
+
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=False),
+            self.assertRaisesRegex(TypeError, r"\[0\]\[0\].*now Tensor"),
+        ):
+            artifact(((value,), {}))
 
 
 if __name__ == "__main__":
