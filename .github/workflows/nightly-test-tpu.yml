@@ -71,10 +71,12 @@ jobs:
       id-token: write
 
   multihost-combo:
-    needs: build
-    if: ${{ contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
+    # Chained: shares the hosts=2 slice with multi-host.
+    needs: [build, multi-host]
+    if: ${{ !cancelled() && needs.build.result == 'success' && contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
     strategy:
       fail-fast: false
+      max-parallel: 1   # one 2x2x2 slice
       matrix:
         row: [pd, spec]
     name: multihost-combo-test-${{ matrix.row }}
@@ -121,6 +123,7 @@ jobs:
     if: needs.discover.outputs.groups != '[]'
     strategy:
       fail-fast: false
+      max-parallel: 1   # one 2x2x2 slice
       matrix:
         group: ${{ fromJSON(needs.discover.outputs.groups) }}
     name: ${{ matrix.group.name }}

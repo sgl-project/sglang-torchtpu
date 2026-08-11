@@ -31,12 +31,10 @@ import os
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import gpqa_openai_runner, model_config_main
 
-# est_time drives the JobSet deadline, so an under-estimate kills the run. ~3600
-# generations on one boot (GPQA 8x198, MMLU 2000), much of it low-effort reasoning up to
-# 8k tokens. Scaled from the GPQA-only nightly, which budgeted 3600s for 4x198 at these
-# settings: ~3.8s/generation at 32 threads, plus ~600s of weight load and compile.
-# weekly-update-est-time.yml refreshes it from real p90s.
-register_tpu_ci(est_time=16200, suite="nightly-tpu-4-v7", nightly=True)
+# est_time drives the JobSet poll budget, so an under-estimate kills the run. Measured
+# 1913s / 1944s on the 2026-08-05 and 08-04 nightlies; 2400 leaves headroom for GPQA's
+# temperature-1.0 variance. Not auto-refreshed: update_est_time.py omits the tpu backend.
+register_tpu_ci(est_time=2400, suite="nightly-tpu-4-v7", nightly=True)
 
 # Must match --served-model-name in LAUNCH_ENV: every gate sends this as the model id,
 # and it is what the server echoes back in its responses.
