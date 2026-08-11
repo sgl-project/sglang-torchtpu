@@ -43,6 +43,14 @@ class _Model(torch.nn.Module):
         self.state_alias = self.state
 
 
+class _ModelWithRegisteredAlias(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2))
+        self.register_buffer("weight_alias", self.weight, persistent=False)
+        self.register_buffer("second_weight_alias", self.weight, persistent=False)
+
+
 class _KVPool:
     def __init__(self, value):
         self.value = value
@@ -55,6 +63,51 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_registered_tensor_aliases_are_traced(self):
+        model = _ModelWithRegisteredAlias()
+        traced_state = []
+
+        def fn(value):
+            traced_state.append(
+                (model.weight, model.weight_alias, model.second_weight_alias)
+            )
+            return value + model.weight + model.weight_alias + model.second_weight_alias
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+        )
+        compiler = direct_compile.tpu_torch_compile
+        result = torch.full((2,), 3.0)
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(compiler, "build_mlir", return_value="module"),
+            patch.object(compiler, "compile_mlir", return_value="executable"),
+            patch.object(compiler, "execute", return_value=[result]) as execute,
+        ):
+            output = compiled(torch.zeros(2))
+
+        self.assertTrue(torch.equal(output, result))
+        self.assertIsNot(traced_state[0][0], model.weight)
+        self.assertIs(traced_state[0][0], traced_state[0][1])
+        self.assertIs(traced_state[0][0], traced_state[0][2])
+        runtime_inputs = execute.call_args.args[1]
+        self.assertIs(runtime_inputs[0], model.weight)
+        self.assertEqual(len(runtime_inputs), 2)
+
     def test_artifact_dispatches_and_rebuilds_outputs(self):
         model = _Model()
         kv_pool = _KVPool(torch.zeros(2))

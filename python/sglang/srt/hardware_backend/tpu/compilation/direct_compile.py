@@ -99,6 +99,9 @@ def direct_compile(
       input, a model parameter/buffer, or KV-pool state. An ``nn.Module`` must
       not keep a Tensor as an ordinary attribute; register such Tensors with
       ``register_buffer(persistent=False)``.
+    * Registered aliases are supported, including a parameter also registered
+      as a non-persistent buffer. Aliases share one graph input and remain tied
+      while tracing.
     * A plain helper object owned by a module is not traversed by
       ``named_parameters``/``named_buffers``. These objects must not own Tensor
       attributes; the easiest workaround is to make the Tensor a buffer
@@ -169,10 +172,18 @@ class CompiledFunction:
         model_names: tuple[str, ...] = ()
         model_inputs: list[torch.Tensor] = []
         if self._model is not None:
-            names_and_tensors = [
-                *self._model.named_parameters(),
-                *self._model.named_buffers(),
+            all_names_and_tensors = [
+                *self._model.named_parameters(remove_duplicate=False),
+                *self._model.named_buffers(remove_duplicate=False),
             ]
+            seen_tensor_ids: set[int] = set()
+            names_and_tensors = []
+            for name, tensor in all_names_and_tensors:
+                tensor_id = id(tensor)
+                if tensor_id in seen_tensor_ids:
+                    continue
+                seen_tensor_ids.add(tensor_id)
+                names_and_tensors.append((name, tensor))
             model_names = tuple(name for name, _ in names_and_tensors)
             model_inputs.extend(tensor for _, tensor in names_and_tensors)
 
@@ -237,14 +248,19 @@ class CompiledFunction:
                 previous_is_compiling,
             )
             if self._model is not None:
-                parameters = dict(zip(model_names, graph_inputs[:model_input_count]))
+                parameters_and_buffers = dict(
+                    zip(model_names, graph_inputs[:model_input_count])
+                )
                 # Need to temporarily yeet the placeholder params/buffers onto
                 # the nn.Modules
                 # Restore in LIFO order so shared module aliases do not retain
                 # placeholders.
                 stack.enter_context(
                     _reparametrize_module(
-                        self._model, parameters, tie_weights=True, stack_weights=True
+                        self._model,
+                        parameters_and_buffers,
+                        tie_weights=True,
+                        stack_weights=True,
                     )
                 )
             if self._kv_pool is not None:

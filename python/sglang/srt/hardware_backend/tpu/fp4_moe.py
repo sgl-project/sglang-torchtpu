@@ -71,9 +71,11 @@ def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
         raise RuntimeError(
             "TPU fused-RS post-expert norm weight must be on the MoE device"
         )
-    # This is an alias of the model-owned parameter, not a second checkpoint
-    # parameter, so bypass nn.Module registration.
-    layer.__dict__["_tpu_fused_rs_post_expert_norm_weight"] = weight
+    layer.register_buffer(
+        "_tpu_fused_rs_post_expert_norm_weight",
+        weight,
+        persistent=False,
+    )
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
