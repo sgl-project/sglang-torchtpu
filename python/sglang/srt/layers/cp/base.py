@@ -16,18 +16,29 @@
 
 The strategy implementation is split across:
 
-* ``base.py``: base ABC, base metadata dataclass, enums, and singleton helpers.
-* ``zigzag.py``: former in-seq-split strategy and zigzag metadata.
-* ``interleave.py``: former round-robin-split strategy and interleave metadata.
-* ``utils.py``: public re-exports for import convenience.
+* ``base.py``: base ABC, base metadata struct, enums, and singleton helpers.
+* ``zigzag.py``: in-seq-split strategy and zigzag metadata.
+* ``interleave.py``: round-robin-split strategy and interleave metadata.
+* ``utils.py``: public re-exports, ``is_cp_v2_active``, ``prepare_cp_forward``,
+  ``cp_split_before_forward`` / ``cp_gather_after_forward``.
+
+Downstream PRs in the PCP series add:
+
+* ``pcp_streaming.py``: TPU Prefill-Context-Parallel via the PCP
+  streaming Pallas kernel; strategy + attention driver.
+* ``pcp_sequence_layout.py``: host-side rank-major compact-Q layout planner
+  consumed by the PCP streaming path.
+* ``pcp_streaming_op_registry.py``: process-scoped registry that caches one
+  torch custom op per (sm_scale, sliding_window, ...) tuple for the PCP path.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+
+import msgspec
 
 from sglang.srt.runtime_context import get_parallel
 
@@ -42,6 +53,16 @@ class ContextParallelStrategyKind(IntEnum):
     NONE = 0
     ZIGZAG = 1
     INTERLEAVE = 2
+    # PCP_STREAMING: TPU Prefill-Context-Parallel via the PCP
+    # streaming RPA kernel. KV cache striped per-page
+    # across CP ranks (i % cp_size == rank); each rank keeps rank-major
+    # packed Q rows; KV pages stream through the CP ring in-kernel via
+    # ``pltpu.make_async_remote_copy`` while the kernel runs online-
+    # softmax on the locally-owned Q rows. Single Pallas call per
+    # attention layer; handles both prefill and decode via the standard
+    # ``distribution=[decode_end, prefill_end, mixed_end]`` metadata.
+    # See :mod:`sglang.srt.layers.cp.pcp_streaming`.
+    PCP_STREAMING = 3
 
     @classmethod
     def from_string(cls, value: str) -> ContextParallelStrategyKind:
@@ -49,9 +70,11 @@ class ContextParallelStrategyKind(IntEnum):
             return cls.ZIGZAG
         if value == "interleave":
             return cls.INTERLEAVE
+        if value == "pcp":
+            return cls.PCP_STREAMING
         raise ValueError(
             f"Unknown cp_strategy={value!r}; expected one of "
-            "{'zigzag', 'interleave'}"
+            "{'zigzag', 'interleave', 'pcp'}"
         )
 
     @property
@@ -60,6 +83,7 @@ class ContextParallelStrategyKind(IntEnum):
             ContextParallelStrategyKind.NONE: "none",
             ContextParallelStrategyKind.ZIGZAG: "zigzag",
             ContextParallelStrategyKind.INTERLEAVE: "interleave",
+            ContextParallelStrategyKind.PCP_STREAMING: "pcp",
         }[self]
 
 
@@ -67,19 +91,25 @@ class CPAttentionBackendKind(IntEnum):
     """Attention backend calling convention used by CP strategy dispatch."""
 
     FLASH_ATTENTION = 0
+    # PALLAS_TPU_RPA_V3_CP: sglang's Pallas RPA v3 CP backend on torch_tpu.
+    # PCP_STREAMING strategy uses this — the backend subclass
+    # ``TpuPallasRpaV3CpAttnBackend._forward_pcp`` invokes the PCP streaming
+    # kernel via ``pcp_streaming_attention``.
+    PALLAS_TPU_RPA_V3_CP = 1
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
         if value in ("fa3", "flashinfer"):
             return cls.FLASH_ATTENTION
+        if value == "pallas_tpu_rpa_v3_cp":
+            return cls.PALLAS_TPU_RPA_V3_CP
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'flashinfer'}"
+            "of {'fa3', 'flashinfer', 'pallas_tpu_rpa_v3_cp'}"
         )
 
 
-@dataclass
-class BaseContextParallelMetadata:
+class BaseContextParallelMetadata(msgspec.Struct, kw_only=True):
     total_seq_lens: int = 0
     bs: int = 1
 
@@ -102,6 +132,13 @@ class ContextParallelStrategy(ABC):
     def per_layer_attn_cp_comm(self) -> bool:
         return _is_dsa_active()
 
+    @property
+    def local_compile_token_multiple(self) -> int:
+        """Kernel lockstep floor for per-rank token counts. Only PCP overrides."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not expose local_compile_token_multiple"
+        )
+
     @abstractmethod
     def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
         """Return True if this strategy can shard the current forward."""
@@ -115,15 +152,38 @@ class ContextParallelStrategy(ABC):
     ) -> BaseContextParallelMetadata:
         """Build per-forward metadata for this strategy."""
 
-    @abstractmethod
+    def build_extra_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        seq_lens_cpu: Optional[List[int]],
+        extend_lens_cpu: Optional[List[int]],
+    ) -> None:
+        """Optional per-forward preparation beyond ``build_metadata``.
+
+        PCP overrides this to materialise the sequence-layout plan and
+        the Dynamo-safe plain-scalar mirrors on ForwardBatch. Zigzag /
+        Interleave leave it as a no-op.
+        """
+        del forward_batch, seq_lens_cpu, extend_lens_cpu
+
+    # ------------------------------------------------------------------
+    # Optional per-strategy operations. Overridden only where the
+    # strategy actually uses them; the base raises so a wrongly-routed
+    # call surfaces a clear error instead of a silent no-op.
+    # ------------------------------------------------------------------
+
     def shard_hidden_states(self, x: Any, forward_batch: ForwardBatch) -> Any:
         """Shard hidden states to the current CP rank, usually at the first layer."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement shard_hidden_states"
+        )
 
-    @abstractmethod
     def shard_position_ids(self, positions: Any, forward_batch: ForwardBatch) -> Any:
         """Shard KV-cache slot position IDs for each token to the current CP rank."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement shard_position_ids"
+        )
 
-    @abstractmethod
     def gather_hidden_states(
         self,
         x: Any,
@@ -131,8 +191,10 @@ class ContextParallelStrategy(ABC):
         stream: Optional[Any] = None,
     ) -> Any:
         """Gather rank-local hidden states, usually at the last layer."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement gather_hidden_states"
+        )
 
-    @abstractmethod
     def gather_kv_cache(
         self,
         x: Any,
@@ -140,6 +202,9 @@ class ContextParallelStrategy(ABC):
         stream: Optional[Any] = None,
     ) -> Any:
         """Gather rank-local KV payloads back to full token order."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement gather_kv_cache"
+        )
 
     def shard_per_request(
         self,
@@ -150,24 +215,6 @@ class ContextParallelStrategy(ABC):
             f"{self.name} strategy does not support per-request sharding"
         )
 
-    def split_before_forward(
-        self,
-        forward_batch: ForwardBatch,
-        input_ids: Optional[Any],
-        positions: Any,
-        input_embeds: Optional[Any] = None,
-    ) -> Optional[Any]:
-        """Shard model inputs before model.forward in CP-v2 paths."""
-        if input_ids is not None:
-            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
-                input_ids, forward_batch
-            )
-        forward_batch.positions = self.shard_position_ids(positions, forward_batch)
-        if input_embeds is not None:
-            return self.shard_hidden_states(input_embeds, forward_batch)
-        return None
-
-    @abstractmethod
     def run_attention(
         self,
         q: Any,
@@ -177,8 +224,10 @@ class ContextParallelStrategy(ABC):
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
         """Dispatch CP attention using the selected backend convention."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement run_attention"
+        )
 
-    @abstractmethod
     def materialize_full_kv(
         self,
         forward_batch: ForwardBatch,
@@ -188,6 +237,9 @@ class ContextParallelStrategy(ABC):
         swa_loc: Optional[Any] = None,
     ) -> None:
         """Write full-layout K/V to the backend cache if needed."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not implement materialize_full_kv"
+        )
 
     def reindex_attn_metadata(self, core_attn_metadata: Any) -> None:
         """Optional attention metadata rewrite for strategies that need it."""
@@ -229,6 +281,20 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 
         _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
+    elif kind == ContextParallelStrategyKind.PCP_STREAMING:
+        # The PCP strategy module lands with the PCP infrastructure PR.
+        # On a checkout that lacks it, raise with a clear pointer rather
+        # than a bare ImportError from the module load.
+        try:
+            from sglang.srt.layers.cp.pcp_streaming import PCPStreamingCPStrategy
+        except ImportError as e:
+            raise NotImplementedError(
+                "cp_strategy='pcp' requires the PCP strategy module "
+                "(sglang.srt.layers.cp.pcp_streaming), which lands with "
+                "the PCP infrastructure PR."
+            ) from e
+
+        _STRATEGY = PCPStreamingCPStrategy(cp_size=cp_size)
     else:
         raise ValueError(
             f"Unsupported cp_strategy kind {kind} for "
@@ -275,3 +341,7 @@ def is_zigzag() -> bool:
 
 def is_interleave() -> bool:
     return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
+
+
+def is_pcp() -> bool:
+    return get_cp_strategy_kind() == ContextParallelStrategyKind.PCP_STREAMING

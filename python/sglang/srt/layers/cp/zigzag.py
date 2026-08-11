@@ -31,7 +31,6 @@ After all-gather, the blocks are reranged back to their original order:
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 from itertools import accumulate
 from typing import Any, List, Optional
 
@@ -55,8 +54,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 
-@dataclass
-class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
+class ZigzagContextParallelMetadata(BaseContextParallelMetadata, kw_only=True):
     # Layout lists have length bs * cp_segment_num (= bs * 2 * cp_size).
     split_list: Optional[List[int]] = None
     zigzag_index: Optional[List[int]] = None
@@ -98,11 +96,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
             return False
-        forward_mode = getattr(forward_batch, "forward_mode", None)
-        if forward_mode is not None and not forward_mode.is_context_parallel_extend():
+        if not forward_batch.forward_mode.is_context_parallel_extend():
             return False
 
-        extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        extend_lens = forward_batch.extend_seq_lens_cpu
         if extend_lens is None:
             return True
         return all(int(length) >= self.cp_size * 2 for length in extend_lens)

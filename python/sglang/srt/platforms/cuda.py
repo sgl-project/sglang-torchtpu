@@ -73,3 +73,6 @@ class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
 
     def support_piecewise_cuda_graph(self) -> bool:
         return True
+
+    def supports_attn_cp(self) -> bool:
+        return True

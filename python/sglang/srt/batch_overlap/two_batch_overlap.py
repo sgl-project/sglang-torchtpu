@@ -739,8 +739,27 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
+            # CP-v2 plain-scalar mirrors: default False/0 on every ForwardBatch,
+            # so the fields-not-in-output_dict check below would raise on ANY
+            # TBO forward without this passthrough. PCP+TBO isn't supported
+            # yet (both children would need their own layout plan); the assert
+            # below catches that combo explicitly.
+            "pcp_attn_active",
+            "moe_cp_active",
+            "moe_cp_pad_max_tokens",
+            "moe_cp_local_tokens",
         ]:
             output_dict[key] = getattr(batch, key)
+
+        # TBO + CP-v2 (any strategy) would require splitting the CP
+        # metadata across children — not implemented. Fail loudly instead
+        # of silently sharing the parent's plan / metadata.
+        assert batch.attn_cp_metadata is None and batch.pcp_layout_plan is None, (
+            "TBO + CP-v2 is not supported yet: attn_cp_metadata / "
+            "pcp_layout_plan cannot be split across TBO children."
+        )
+        output_dict["attn_cp_metadata"] = None
+        output_dict["pcp_layout_plan"] = None
 
         mrope_positions = getattr(batch, "mrope_positions")
         if mrope_positions is not None:

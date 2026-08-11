@@ -12,12 +12,13 @@ Out-of-tree platforms register via setuptools entry_points under the
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Type
+from typing import TYPE_CHECKING, Optional, Tuple, Type
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.server_args import ServerArgs
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -63,6 +64,16 @@ class SRTPlatform(DeviceMixin):
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""
         raise NotImplementedError
+
+    def get_mha_kv_pool_extra_kwargs(self, server_args: ServerArgs) -> dict:
+        """Extra constructor kwargs for the MHA KV pool class.
+
+        Default is an empty dict. Platforms whose pool subclass takes
+        additional keyword arguments (e.g. TPU's PCP-sharded pool needing
+        ``cp_group_size``) override this and return the kwargs to splat
+        into the constructor at pool-creation time.
+        """
+        return {}
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         """Return the host (L2) MHA KV pool class matching ``device_pool``.
@@ -137,6 +148,30 @@ class SRTPlatform(DeviceMixin):
         (torch.compile backend).
         """
         return False
+
+    def supports_attn_cp(self) -> bool:
+        """Whether this platform can run CP-v2 attention (zigzag / interleave / PCP).
+
+        Gates the ``--attn-cp-size N`` server-arg on platforms that have
+        not wired up the required strategy/backend + collective helpers.
+        Backends override this to ``True`` as they land support (CUDA
+        already; TPU when the PCP strategy + backend land).
+        """
+        return False
+
+    def build_gpu_id_remap(
+        self, server_args: ServerArgs, tp_size_per_node: int
+    ) -> Optional[Tuple[int, ...]]:
+        """Return a ``remap[gpu_id] -> physical device index`` for spawn,
+        or ``None`` when the identity mapping is fine.
+
+        Default is ``None``. TPU overrides to build the PCP LOCAL_RANK
+        remap when ``SGLANG_TPU_PCP_LOCAL_RANK_REMAP=1`` and PCP is
+        active. Callers assume ``server_args.base_gpu_id == 0`` and
+        ``server_args.gpu_id_step == 1`` when a remap is returned; the
+        override must raise if the assumption doesn't hold.
+        """
+        return None
 
     # ------------------------------------------------------------------
     # Initialization
