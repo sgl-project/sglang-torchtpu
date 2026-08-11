@@ -151,6 +151,9 @@ class TpuMambaPool(MambaPool):
         The fused GDN kernel zeroes a slot's contribution whenever
         ``has_initial_state`` is False (a fresh request), so reused slots need
         no explicit clearing and we avoid a dynamic in-place device scatter.
+        Note that the masking is derived from ``query_lens``, so anything that
+        corrupts ``query_start_loc`` makes the predicate read True for a fresh
+        request and resurrects the previous occupant's state.
         """
         return
 

@@ -59,11 +59,22 @@ class TestGDNDistribution(CustomTestCase):
             self.assertEqual(dist.device.type, "cpu")
 
     def test_extend_distribution(self):
-        # Extend/prefill batch: no BATCHED decode seqs -> [0, bs, bs].
+        # Extend/prefill batch: no decode seqs -> [0, 0, bs]. The middle element
+        # is inert (the GDN wrapper reads only distribution[0] and [-1]); it is
+        # written as num_decode to match tpu-inference's tpu_runner.py.
         for bs in (1, 4, 37):
             dist = self.backend._get_distribution(False, bs, self.device)
-            self.assertEqual(dist.tolist(), [0, bs, bs])
+            self.assertEqual(dist.tolist(), [0, 0, bs])
             self.assertEqual(dist.dtype, torch.int32)
+
+    def test_distribution_last_element_is_the_real_seq_count(self):
+        # What the kernel actually depends on: seqs[distribution[0]:distribution[-1]]
+        # bounds the non-decode range, so the last element must be the request
+        # count in both modes.
+        for is_decode in (True, False):
+            for bs in (1, 8):
+                dist = self.backend._get_distribution(is_decode, bs, self.device)
+                self.assertEqual(dist.tolist()[-1], bs)
 
     def test_decode_and_extend_differ(self):
         bs = 8

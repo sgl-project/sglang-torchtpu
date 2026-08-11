@@ -243,16 +243,27 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         key = (is_decode, bs, device)
         dist = self._distribution_cache.get(key)
         if dist is None:
-            # decode: every seq is one step -> [bs, bs, bs]; else no BATCHED
-            # decode seqs -> [0, bs, bs] (matches the RPA v3 distribution).
-            vals = [bs, bs, bs] if is_decode else [0, bs, bs]
+            # `distribution` is (i, j, k): seqs[:i] decode, seqs[i:j] prefill,
+            # seqs[j:k] mixed (kernels/causal_conv1d docstring). The GDN wrapper
+            # only reads distribution[0] and distribution[-1], so the middle
+            # element is inert; spell it [num_decode, num_decode, num_reqs] to
+            # match tpu-inference's tpu_runner.py, where this kernel came from.
+            num_decode = bs if is_decode else 0
+            vals = [num_decode, num_decode, bs]
             dist = torch.tensor(vals, dtype=torch.int32, device=device)
             self._distribution_cache[key] = dist
         return dist
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch"):
         super().init_forward_metadata(forward_batch)
-        bs = int(forward_batch.seq_lens.shape[0])
+        # `distribution` bounds which sequences the kernel walks, so give it the
+        # pre-bucket row count: `forward_batch.seq_lens` is already padded to the
+        # batch bucket here, and in decode `num_tiles = cdiv(distribution[0],
+        # tile_size)` would put the padded rows in scope. They are inert either
+        # way -- their state writes land in the reserved null slot -- but there is
+        # no reason to compute them. Same source RPA reads
+        # (attention_pallas_rpa_base._pre_bucket_padded_batch_size).
+        bs = int(getattr(forward_batch, "_tpu_real_b", forward_batch.seq_lens.shape[0]))
         device = forward_batch.seq_lens.device
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         self._distribution = self._get_distribution(is_decode, bs, device)
@@ -262,7 +273,15 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
         # GDN layers) rather than per-layer in _run.
         self._seq_lens = forward_batch.seq_lens.to(torch.int32)
         md = self.forward_metadata
-        self._state_indices = md.mamba_cache_indices.to(torch.int32)
+        # Keep every state index in bounds. Under DP attention
+        # `hybrid_linear_attn_backend` poisons the padded tail of
+        # mamba_cache_indices with the CUDA/Triton "skip this row" sentinel -1,
+        # which this kernel does not honour -- gdn/metadata.py feeds
+        # state_indices straight to the state load/store, so -1 is an
+        # out-of-bounds pool index rather than a skip. Slot 0 is the reserved
+        # null block (MambaSlotAllocator hands out 1 .. size), which is where
+        # zero-padded rows already point.
+        self._state_indices = md.mamba_cache_indices.to(torch.int32).clamp(min=0)
         self._query_start_loc = md.query_start_loc.to(torch.int32)
 
     def _run(
