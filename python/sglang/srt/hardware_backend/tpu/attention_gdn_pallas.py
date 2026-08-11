@@ -70,7 +70,12 @@ def build_gdn_pallas_op():
     import jax  # noqa: F401  (force a loud failure if JAX is missing)
     from torch_tpu._internal import pallas as _torch_pallas
 
+    from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
     from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+
+    # Shapes whose kernel is already compiled, so the export guard below can be
+    # skipped on the hot path. Per-op (this builder runs once).
+    _exported_shapes: set = set()
 
     op_name = "sglang_tpu_pallas::gdn_attention"
 
@@ -94,30 +99,44 @@ def build_gdn_pallas_op():
         d_v: int,
         kernel_size: int,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        (new_conv_state, new_recurrent_state), output = fused_conv1d_gdn(
-            qkv,
-            b,
-            a,
-            conv_state,
-            recurrent_state,
-            conv_weight,
-            conv_bias,
-            a_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            n_kq=n_kq,
-            n_v=n_v,
-            d_k=d_k,
-            d_v=d_v,
-            kernel_size=kernel_size,
-        )
+        # The GDN kernel sizes its tiling from `pltpu.get_tpu_info().num_lanes`
+        # (gdn/wrapper.py), but distributed Pallas programs are exported through
+        # a logical CPU mesh, so at trace time JAX reports device_kind="cpu" and
+        # get_tpu_info() raises. Substitute the physical TPU metadata for the
+        # trace, as RPA does (attention_pallas_rpa_base.py). The generic bridge
+        # in pallas_jax_op.py does this automatically; this op registers through
+        # torch_tpu's pallas helper directly and has to opt in.
+        with tpu_info_for_cpu_export():
+            (new_conv_state, new_recurrent_state), output = fused_conv1d_gdn(
+                qkv,
+                b,
+                a,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                a_log,
+                dt_bias,
+                query_start_loc,
+                state_indices,
+                distribution,
+                seq_lens,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+            )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
         return new_conv_state, new_recurrent_state, output
 
+    # Buffer donation: the kernel writes the updated state straight back into the
+    # caller's conv/recurrent buffers via an input/output alias, no extra copy.
+    # This requires each layer to donate a whole tensor, not a view of a shared
+    # pool -- the bridge's write-back cannot alias a view and would fall back to
+    # slice-in plus dynamic-update-slice per layer. `TpuPerLayerState` allocates
+    # one tensor per layer for that reason.
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
@@ -153,26 +172,65 @@ def build_gdn_pallas_op():
         d_v: int,
         kernel_size: int,
     ) -> torch.Tensor:
-        _new_conv, _new_rec, output = jax_kernel(
-            qkv,
-            b,
-            a,
-            conv_state,
-            recurrent_state,
-            conv_weight,
-            conv_bias,
-            a_log,
-            dt_bias,
-            query_start_loc,
-            state_indices,
-            distribution,
-            seq_lens,
-            n_kq,
-            n_v,
-            d_k,
-            d_v,
-            kernel_size,
-        )
+        # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
+        # lowering queries TPU metadata again (`_check_block_mappings` ->
+        # get_tpu_info().num_sublanes) and runs here, outside `_wrapped`, so it
+        # needs its own guard or precompile dies on device_kind="cpu".
+        #
+        # Enter it only on the compiling call:
+        # `export_ignore_forward_compatibility` is a JAX config context that
+        # participates in jit cache keys, so toggling it per forward thrashes
+        # them (pallas_jax_op.py guards the same way). Keyed by shape rather
+        # than a one-shot flag because each token/batch bucket compiles
+        # separately.
+        key = (qkv.shape[0], n_kq, n_v, d_k, d_v, kernel_size)
+        if key in _exported_shapes:
+            _new_conv, _new_rec, output = jax_kernel(
+                qkv,
+                b,
+                a,
+                conv_state,
+                recurrent_state,
+                conv_weight,
+                conv_bias,
+                a_log,
+                dt_bias,
+                query_start_loc,
+                state_indices,
+                distribution,
+                seq_lens,
+                n_kq,
+                n_v,
+                d_k,
+                d_v,
+                kernel_size,
+            )
+        else:
+            with (
+                tpu_info_for_cpu_export(),
+                jax._src.config.export_ignore_forward_compatibility(True),
+            ):
+                _new_conv, _new_rec, output = jax_kernel(
+                    qkv,
+                    b,
+                    a,
+                    conv_state,
+                    recurrent_state,
+                    conv_weight,
+                    conv_bias,
+                    a_log,
+                    dt_bias,
+                    query_start_loc,
+                    state_indices,
+                    distribution,
+                    seq_lens,
+                    n_kq,
+                    n_v,
+                    d_k,
+                    d_v,
+                    kernel_size,
+                )
+            _exported_shapes.add(key)
         return output
 
     def _fake_impl(
