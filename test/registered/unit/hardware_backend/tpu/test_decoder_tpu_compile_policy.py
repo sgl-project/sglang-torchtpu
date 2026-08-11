@@ -559,8 +559,16 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
 
         self.assertEqual(result.shape, (3, 4))
 
-    def test_rejects_dp_attention_at_install(self):
-        policy = Qwen3VLDecoderTpuCompilePolicy()
+    @staticmethod
+    def _policy_for(*, multimodal: bool):
+        """Policy whose owner model does / does not expose the VL image path."""
+        model = SimpleNamespace()
+        if multimodal:
+            model.get_image_feature = lambda *args, **kwargs: None
+        return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
+
+    def test_rejects_dp_attention_at_multimodal_install(self):
+        policy = self._policy_for(multimodal=True)
 
         with patch(
             "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
@@ -568,6 +576,22 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
             return_value=True,
         ), self.assertRaisesRegex(NotImplementedError, "does not support DP attention"):
             policy.install()
+
+    def test_allows_dp_attention_at_text_only_install(self):
+        # This policy is also attached to the text-only backbone, where none of
+        # the VL machinery the DP restriction covers is reachable.
+        policy = self._policy_for(multimodal=False)
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=True,
+        ), patch.object(
+            DecoderTpuCompilePolicy, "install", return_value=True
+        ) as base_install:
+            self.assertTrue(policy.install())
+
+        base_install.assert_called_once()
 
     def test_restores_extend_metadata_before_logits_processing(self):
         policy = Qwen3VLDecoderTpuCompilePolicy()
