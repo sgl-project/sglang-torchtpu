@@ -103,10 +103,13 @@ class TpuMambaPool(MambaPool):
         self.replayssm_is_kda = False
         self.replayssm_write_pos = None
 
-        # Correctness-first: store both states in fp32. The kernel casts conv
-        # input to fp32 internally regardless; keeping ssm in fp32 avoids
-        # recurrent-state precision loss over long sequences. (A bf16 conv
-        # store is a later memory optimization.)
+        # ssm (recurrent) fp32 is NOT a TPU-specific choice: mainline defaults
+        # the ssm state to fp32 too (mamba_utils.get_mamba2_state_dtype), since
+        # the recurrent state accumulates over the sequence and drifts in bf16.
+        # conv fp32 IS the only TPU-specific deviation (mainline defaults conv
+        # to bf16): the fused GDN kernel upcasts the conv input to fp32
+        # internally regardless, so a bf16 conv store buys memory but no
+        # accuracy — deferred as a later memory optimization.
         conv_dtype = torch.float32
         ssm_dtype = torch.float32
 
