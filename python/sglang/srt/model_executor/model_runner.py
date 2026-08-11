@@ -1206,11 +1206,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise
 
         backend = get_default_distributed_backend(self.device)
-        # tpu_dist bootstrap requires exactly one TPU device per process.
-        # On multi-chip hosts with world_size==1, PJRT sees multiple chips
-        # and raises. Match torchtpu-vllm: use gloo for single-rank TPU.
-        if self.device == "tpu" and self.tp_size == 1:
-            backend = "gloo"
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
             if self.server_args.mooncake_ib_device:
