@@ -216,6 +216,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             enable_dp_attention=False,
             enable_dp_lm_head=False,
             page_size=None,
+            kv_cache_dtype="auto",
             use_ray=False,
             hicache_io_backend=None,
             speculative_algorithm=None,
@@ -251,6 +252,43 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         # scheduler_overlap_mixin; the platform must NOT force-disable it.
         self.assertFalse(args.disable_overlap_schedule)
         self.assertEqual(args.mem_fraction_static, 0.40)
+
+    def test_rpa_backends_default_to_fp8_kv_cache(self):
+        for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):
+            with self.subTest(backend=backend):
+                args = self._args(attention_backend=backend)
+                self._apply(args)
+                self.assertEqual(args.kv_cache_dtype, "fp8_e4m3")
+
+    def test_explicit_kv_cache_dtype_not_overridden(self):
+        args = self._args(
+            attention_backend="pallas_tpu_rpa_batched", kv_cache_dtype="bfloat16"
+        )
+        self._apply(args)
+        self.assertEqual(args.kv_cache_dtype, "bfloat16")
+
+    def test_non_rpa_backend_keeps_auto_kv_cache_dtype(self):
+        # pallas_tpu_mla rejects an fp8 KV cache, so the fp8 default is scoped
+        # to the RPA backends and must not leak to it.
+        args = self._args(attention_backend="pallas_tpu_mla")
+        self._apply(args)
+        self.assertEqual(args.kv_cache_dtype, "auto")
+        self.assertEqual(args.page_size, 64)
+
+    def test_batched_rpa_page_size_default_meets_the_kernel_floor(self):
+        args = self._args(attention_backend="pallas_tpu_rpa_batched")
+        self._apply(args)
+        self.assertEqual(args.page_size, 256)
+
+    def test_batched_rpa_rejects_a_page_size_below_the_floor(self):
+        args = self._args(attention_backend="pallas_tpu_rpa_batched", page_size=64)
+        with self.assertRaisesRegex(ValueError, "page-size >= 256"):
+            self._apply(args)
+
+    def test_explicit_page_size_above_the_floor_is_kept(self):
+        args = self._args(attention_backend="pallas_tpu_rpa_batched", page_size=512)
+        self._apply(args)
+        self.assertEqual(args.page_size, 512)
 
     def test_enable_torch_compile_preserved_when_opted_in(self):
         args = self._args(enable_torch_compile=True)

@@ -362,6 +362,112 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
 
+class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
+    """MHA KV pool in the SEQ_ALONG_LANE layout the batched-RPA kernel reads.
+
+    Selected when SGLANG_TPU_USE_SEQ_ALONG_LANE_KV is set. Same paged
+    bookkeeping as the fused pool, different buffer shape -- it must match
+    ``batched_rpa.wrapper.get_kv_cache_shape`` for that layout::
+
+        [num_blocks, num_kv_heads * 2,
+         align(head_dim, num_sublanes * kv_packing) // kv_packing, kv_packing,
+         page_size]
+
+    K and V interleave along axis 1 (K at ``2h``, V at ``2h + 1``) and the token
+    index sits on the *lane* axis, so a page's tokens are contiguous in lanes
+    rather than in rows. The head-dim axis is split into
+    ``(hd // kv_packing, kv_packing)`` so a 32-bit word holds ``kv_packing``
+    consecutive head-dim elements.
+
+    ``num_kv_heads * 2`` is a plain axis here rather than something packed into
+    32-bit lanes, so it carries no padding. At one KV head per rank that makes
+    an fp8 cache half the size of the fused layout's, which rounds two heads up
+    to ``kv_packing``. The flip side is that nothing written against the fused
+    5D row layout works on this buffer, so the host-offload paths below refuse
+    rather than reinterpret it.
+    """
+
+    def _head_dim_lanes(self) -> int:
+        # Under TorchTPU, JAX is initialised CPU-only so Pallas can export
+        # without a competing TPU client; `tpu_info_for_cpu_export` swaps in the
+        # physical device's metadata for the duration of the query.
+        from jax.experimental.pallas import tpu as pltpu
+
+        from sglang.srt.hardware_backend.tpu.pallas_export import (
+            tpu_info_for_cpu_export,
+        )
+
+        with tpu_info_for_cpu_export():
+            num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tile = num_sublanes * self.kv_packing
+        return _cdiv(self.head_dim, tile) * tile
+
+    def _create_buffers(self):
+        shape = (
+            self.num_blocks,
+            self.head_num * 2,
+            self._head_dim_lanes() // self.kv_packing,
+            self.kv_packing,
+            self.page_size,
+        )
+        logger.info(
+            "Allocating SEQ_ALONG_LANE TPU KV buffers: layers=%d, shape per layer=%s, "
+            "dtype=%s",
+            self.layer_num,
+            shape,
+            self.store_dtype,
+        )
+        # torch.zeros cannot materialize fp8 on TPU; allocate zeroed uint8 and
+        # reinterpret (all-zero bytes are +0.0 in e4m3 and e5m2), as the fused
+        # pool above does.
+        if self.store_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            self.kv_buffer = [
+                torch.zeros(shape, dtype=torch.uint8, device=self.device).view(
+                    self.store_dtype
+                )
+                for _ in range(self.layer_num)
+            ]
+        else:
+            self.kv_buffer = [
+                torch.zeros(shape, dtype=self.store_dtype, device=self.device)
+                for _ in range(self.layer_num)
+            ]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_strides = torch.tensor(
+            [int(np.prod(x.shape[1:])) * x.dtype.itemsize for x in self.kv_buffer],
+            device=self.device,
+        )
+
+    def _logical_kv_view(self, layer_id: int) -> torch.Tensor:
+        """[num_tokens, num_kv_heads * 2, head_dim], as a copy.
+
+        The token axis is minormost in this layout, so a logical row is
+        strided; materialising it costs a transpose. Only the diagnostic and
+        cache-inspection helpers below use it, never the forward path.
+        """
+        buf = self.kv_buffer[layer_id - self.start_layer]
+        n_blocks, kv_heads_x2, hd_words, packing, page_size = buf.shape
+        return buf.permute(0, 4, 1, 2, 3).reshape(
+            n_blocks * page_size, kv_heads_x2, hd_words * packing
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout: "
+            "a token is a lane, not a row, so the fused pool's row gather does "
+            "not apply. Use --attention-backend pallas_tpu_rpa_batched or v3."
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError(
+            "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout."
+        )
+
+
 class TpuFusedMLATokenToKVPool(MLATokenToKVPool):
     """MLA latent KV pool with the paged 4D layout consumed by the Pallas MLA kernel.
 

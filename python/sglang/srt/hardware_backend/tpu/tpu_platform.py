@@ -60,6 +60,92 @@ def _sync_weight_stream(weights):
             pending_tensors = 0
 
 
+# Page size used when the user does not pick one and the attention backend has
+# no floor of its own. Token-granular pages (SGLang's global default of 1) turn
+# each KV fetch into many tiny DMAs, which is fine for GPU kernels and wasteful
+# here.
+_DEFAULT_PAGE_SIZE = 64
+
+
+def _rpa_kernel_spec(backend: str | None):
+    """``backend``'s ``RpaKernelSpec``, or None if it is not an RPA backend.
+
+    The Pallas RPA backends share one kernel shell, so what the platform needs
+    to know about them -- the page-size floor, whether they read fp8 KV -- is
+    declared on the spec rather than restated here.
+    """
+    if backend == "pallas_tpu_rpa_batched":
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+            RPA_BATCHED_SPEC as spec,
+        )
+    elif backend == "pallas_tpu_rpa_v3":
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
+            RPA_V3_SPEC as spec,
+        )
+    else:
+        return None
+    return spec
+
+
+def _uses_seq_along_lane_kv() -> bool:
+    """Ask the backend, so the pool cannot disagree with the kernel."""
+    from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+        uses_seq_along_lane_kv,
+    )
+
+    return uses_seq_along_lane_kv()
+
+
+def _apply_page_size_default(server_args) -> None:
+    """Resolve ``page_size`` against the attention backend's declared floor.
+
+    A backend whose kernel cannot address small pages -- the SEQ_ALONG_LANE
+    path tiles the page axis onto lanes and needs a multiple of the 128-lane
+    width -- must not silently receive the generic default, or it fails deep
+    inside the Pallas trace with a shape error that reads like a kernel bug.
+    """
+    from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+    spec = _rpa_kernel_spec(server_args.attention_backend)
+    floor = spec.min_page_size if spec is not None else None
+    if server_args.page_size is None:
+        default = max(_DEFAULT_PAGE_SIZE, floor or 0)
+        declare_late_resolution(
+            server_args, "tpu.apply_server_args_defaults", page_size=default
+        )
+        return
+    if floor is not None and server_args.page_size < floor:
+        raise ValueError(
+            f"--attention-backend {server_args.attention_backend} needs "
+            f"--page-size >= {floor}, got {server_args.page_size}."
+        )
+
+
+def _apply_kv_cache_dtype_default(server_args) -> None:
+    """Default the KV cache to fp8 for the Pallas RPA backends.
+
+    Those kernels dequantize KV on read, and at the head counts TPU serving
+    runs (tensor parallel leaves one KV head per rank) fp8 halves KV bytes per
+    token. That doubles the context or the batch that fits in HBM, which is the
+    binding constraint at long context -- decode there is bound by streaming
+    KV, not by arithmetic. "auto" (model dtype) is the generic SGLang default
+    and gives up both.
+
+    Only those backends: ``pallas_tpu_mla`` rejects an fp8 KV cache outright,
+    and ``pallas_tpu_flash`` has no dequantization scale, so defaulting either
+    to fp8 breaks or silently degrades it.
+    """
+    from sglang.srt.arg_groups.overrides import declare_late_resolution
+
+    if server_args.kv_cache_dtype != "auto":
+        return
+    if _rpa_kernel_spec(server_args.attention_backend) is None:
+        return
+    declare_late_resolution(
+        server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
+    )
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -147,13 +233,14 @@ class TpuSRTPlatform(SRTPlatform):
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
             if server_args.attention_backend == "pallas_tpu_rpa_batched":
-                # Batched RPA has no draft-backend wiring in
-                # speculative.draft_utils, so reject here with a clear message
-                # rather than failing later during draft-backend creation.
+                # It has no draft-backend wiring in speculative.draft_utils,
+                # so reject here with a clear message rather than failing later
+                # during draft-backend creation.
                 raise NotImplementedError(
                     "Speculative decoding is not supported with "
-                    "--attention-backend pallas_tpu_rpa_batched yet. Use "
-                    "--attention-backend pallas_tpu_rpa_v3 for speculative decoding."
+                    "--attention-backend pallas_tpu_rpa_batched yet. "
+                    "Use --attention-backend pallas_tpu_rpa_v3 for speculative "
+                    "decoding."
                 )
             if spec_algo == "EAGLE3":
                 if server_args.speculative_use_rejection_sampling:
@@ -179,10 +266,8 @@ class TpuSRTPlatform(SRTPlatform):
                     "--enable-dp-lm-head must be enabled."
                 )
 
-        if server_args.page_size is None:
-            declare_late_resolution(
-                server_args, "tpu.apply_server_args_defaults", page_size=64
-            )
+        _apply_page_size_default(server_args)
+        _apply_kv_cache_dtype_default(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -238,7 +323,17 @@ class TpuSRTPlatform(SRTPlatform):
         # time (set in ModelRunner.__init__, before _init_pools).
         from sglang.srt.server_args import get_global_server_args
 
-        if get_global_server_args().attention_backend in (
+        backend = get_global_server_args().attention_backend
+        if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
+            # SEQ_ALONG_LANE puts the token index on the lane axis, so the
+            # buffer shape differs from the fused one the other backends read.
+            from sglang.srt.hardware_backend.tpu.kv_pool import (
+                TpuSeqAlongLaneKVPool,
+            )
+
+            return TpuSeqAlongLaneKVPool
+
+        if backend in (
             "pallas_tpu_rpa_v3",
             "pallas_tpu_rpa_batched",
         ):

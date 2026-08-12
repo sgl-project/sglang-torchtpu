@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Direct TPU correctness coverage for the dormant stacked-RPA kernel."""
+"""Direct TPU correctness coverage for the batched-RPA kernel."""
 
 from __future__ import annotations
 
@@ -31,8 +31,12 @@ def _has_jax_tpu() -> bool:
 
 
 @unittest.skipIf(not _has_jax_tpu(), "Requires JAX with a TPU device")
-class TestBatchedRpaStackedKernel(unittest.TestCase):
-    """Compare the static stacked kernel with pure-JAX attention."""
+class TestBatchedRpaKernel(unittest.TestCase):
+    """Compare the kernel against pure-JAX attention on the token-major layout.
+
+    16 q heads over 8 kv heads with kv_len 2049 -- a partial last page and an
+    idle lane -- plus a check that the new K/V landed in the right cache slot.
+    """
 
     PAGE_SIZE = 256
     PAGES_PER_SEQ = 9
@@ -142,7 +146,6 @@ class TestBatchedRpaStackedKernel(unittest.TestCase):
             cu_q_lens,
             distribution,
             sm_scale=sm_scale,
-            stacked=True,
         )
 
         max_diff = jnp.max(

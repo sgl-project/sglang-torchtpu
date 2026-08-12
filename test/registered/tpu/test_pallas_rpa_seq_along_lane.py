@@ -1,0 +1,213 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Unit tests for the SEQ_ALONG_LANE KV layout on the batched-RPA backend.
+
+The kernel reads either KV layout; these cover the sglang-side wiring that has
+to agree with whichever one is chosen -- the page-size floor, the fp8 KV
+default, and the prefill tile the wrapper derives. CPU-runnable via the Pallas
+export shim.
+"""
+
+from sglang.test.ci.ci_register import register_tpu_ci
+
+register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
+
+import types
+import unittest
+
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+    RPA_BATCHED_SPEC,
+    kv_layout,
+)
+from sglang.test.test_utils import CustomTestCase
+
+
+class TestKvLayoutSelection(CustomTestCase):
+    """One flag picks the layout, and the KV pool has to follow it."""
+
+    def test_defaults_to_token_major(self):
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+
+        self.assertEqual(kv_layout(), configs.KVLayout.HEAD_ALONG_SUBLANE)
+
+    def test_flag_selects_seq_along_lane(self):
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs
+
+        with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
+            self.assertEqual(kv_layout(), configs.KVLayout.SEQ_ALONG_LANE)
+
+    def test_pool_class_follows_the_flag(self):
+        from sglang.srt.hardware_backend.tpu.kv_pool import (
+            TpuFusedMHATokenToKVPool,
+            TpuSeqAlongLaneKVPool,
+        )
+        from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
+
+        sa = types.SimpleNamespace(attention_backend="pallas_tpu_rpa_batched")
+        import sglang.srt.server_args as server_args_mod
+
+        original = server_args_mod.get_global_server_args
+        server_args_mod.get_global_server_args = lambda: sa
+        try:
+            self.assertIs(
+                TpuSRTPlatform().get_mha_kv_pool_cls(), TpuFusedMHATokenToKVPool
+            )
+            with envs.SGLANG_TPU_USE_SEQ_ALONG_LANE_KV.override(True):
+                self.assertIs(
+                    TpuSRTPlatform().get_mha_kv_pool_cls(), TpuSeqAlongLaneKVPool
+                )
+        finally:
+            server_args_mod.get_global_server_args = original
+
+
+class TestPageSizeFloor(CustomTestCase):
+    """SEQ_ALONG_LANE tiles pages onto lanes, so a page must be >= the floor."""
+
+    def _server_args(self, page_size):
+        # declare_late_resolution writes the fields in place, so a plain
+        # namespace is enough -- it only refuses the *published* config.
+        return types.SimpleNamespace(
+            attention_backend="pallas_tpu_rpa_batched", page_size=page_size
+        )
+
+    def test_default_is_raised_to_the_floor(self):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _apply_page_size_default,
+        )
+
+        sa = self._server_args(None)
+        _apply_page_size_default(sa)
+        self.assertEqual(sa.page_size, RPA_BATCHED_SPEC.min_page_size)
+
+    def test_explicit_below_floor_is_rejected(self):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _apply_page_size_default,
+        )
+
+        with self.assertRaises(ValueError):
+            _apply_page_size_default(self._server_args(64))
+
+    def test_explicit_above_floor_is_kept(self):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _apply_page_size_default,
+        )
+
+        sa = self._server_args(512)
+        _apply_page_size_default(sa)
+        self.assertEqual(sa.page_size, 512)
+
+
+class TestKvCacheDtypeDefault(CustomTestCase):
+    """fp8 KV halves bytes per token, but only where the kernel reads it."""
+
+    def _server_args(self, kv_cache_dtype, backend="pallas_tpu_rpa_batched"):
+        return types.SimpleNamespace(
+            kv_cache_dtype=kv_cache_dtype, attention_backend=backend
+        )
+
+    def test_auto_becomes_fp8_for_the_rpa_backends(self):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _apply_kv_cache_dtype_default,
+        )
+
+        for backend in ("pallas_tpu_rpa_batched", "pallas_tpu_rpa_v3"):
+            sa = self._server_args("auto", backend)
+            _apply_kv_cache_dtype_default(sa)
+            self.assertEqual(sa.kv_cache_dtype, "fp8_e4m3", backend)
+
+    def test_backends_that_reject_fp8_keep_auto(self):
+        # pallas_tpu_mla raises on an fp8 KV cache and pallas_tpu_flash has no
+        # dequantization scale, so the default must not reach them -- the
+        # DeepSeek recipe launches MLA with no --kv-cache-dtype.
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _apply_kv_cache_dtype_default,
+        )
+
+        for backend in ("pallas_tpu_mla", "pallas_tpu_flash"):
+            sa = self._server_args("auto", backend)
+            _apply_kv_cache_dtype_default(sa)
+            self.assertEqual(sa.kv_cache_dtype, "auto", backend)
+
+    def test_explicit_choice_is_left_alone(self):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _apply_kv_cache_dtype_default,
+        )
+
+        for given in ("bf16", "fp8_e5m2"):
+            sa = self._server_args(given)
+            _apply_kv_cache_dtype_default(sa)
+            self.assertEqual(sa.kv_cache_dtype, given)
+
+
+class TestPrefillBlockSizes(CustomTestCase):
+    """The prefill tile: one cell, and an operator override for the k block."""
+
+    def _resolve(self, num_q_heads=4, ctx_pages=133):
+        import jax.numpy as jnp
+
+        from sglang.srt.hardware_backend.tpu.pallas_export import (
+            tpu_info_for_cpu_export,
+        )
+        from sglang.srt.layers.attention.pallas.batched_rpa import configs, wrapper
+
+        model = configs.ModelConfigs(
+            num_q_heads=num_q_heads,
+            num_kv_heads=1,
+            head_dim=128,
+            mask_value=float("-inf"),
+        )
+        with tpu_info_for_cpu_export():
+            serve = configs.ServingConfigs(
+                num_seqs=32,
+                num_page_indices=32 * ctx_pages,
+                total_q_tokens=4096,
+                dtype_q=jnp.bfloat16,
+                dtype_kv=jnp.float8_e4m3fn,
+                dtype_out=jnp.bfloat16,
+                page_size=256,
+                kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
+            )
+            _, prefill = wrapper.calculate_block_sizes(model, serve, 67108864)
+        return prefill
+
+    def test_prefill_uses_one_cell(self):
+        """A second cell halves the VMEM per cell and adds no parallel compute.
+
+        Measured on v7-8 (Qwen3-Coder-30B, tp8, one 32k MIXED step, 4k chunk):
+        two cells pick bq=bkv=1280 and run 1194us, one cell picks bq=bkv=2048
+        and runs 880us, and bq=2048 with two cells does not fit VMEM.
+        """
+        self.assertEqual(self._resolve().batch_size, 1)
+
+    def test_compute_chunk_divides_the_q_block(self):
+        blocks = self._resolve()
+        self.assertEqual(blocks.bq_sz % blocks.bq_c_sz, 0)
+
+    def test_k_block_is_a_page_multiple(self):
+        # A k block below one page gives an empty DMA schedule leaf and fails
+        # Mosaic compilation.
+        self.assertEqual(self._resolve().bkv_sz % 256, 0)
+
+    def test_wider_head_config_gets_a_smaller_tile(self):
+        """A query token costs VMEM per q head, so 12 heads must tile smaller."""
+        self.assertLess(
+            self._resolve(num_q_heads=12).bq_sz, self._resolve(num_q_heads=4).bq_sz
+        )
+
+    def test_override_pins_the_k_block(self):
+        with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):
+            self.assertEqual(self._resolve().bkv_sz, 4096)
+
+    def test_override_is_rounded_up_to_a_page(self):
+        with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(5000):
+            self.assertEqual(self._resolve().bkv_sz, 5120)
+
+    def test_override_unset_leaves_the_search_in_charge(self):
+        derived = self._resolve().bkv_sz
+        with envs.SGLANG_TPU_FORCE_RPA_PREFILL_BKV.override(4096):
+            pass
+        self.assertEqual(self._resolve().bkv_sz, derived)
+
+
+if __name__ == "__main__":
+    unittest.main()
