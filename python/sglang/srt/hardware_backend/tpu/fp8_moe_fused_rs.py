@@ -96,8 +96,6 @@ def fp8_fused_rs_unsupported_reason(
         return "the model does not allow backend-owned MoE reduction"
     if attn_dp_size != 1 or enable_dp_attention:
         return "DP attention and hybrid DP/TP attention are not supported"
-    if block_quantized:
-        return "block-quantized FP8 weights are not supported"
     if not gated:
         return "the MoE activation must be gated"
     if activation != "silu":
@@ -158,8 +156,8 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         return False
     layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
 
-    # prepare_tpu_fp8_moe_weights already stores weights as (E, K, N) and
-    # channelwise scales as (E, 1, 1, N), exactly as fused-RS expects.
+    # prepare_tpu_fp8_moe_weights stores weights as (E, K, N) and scales as
+    # (E, 1, 1, N) channelwise or (E, K // block, 1, N) blockwise.
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
     prepare_fused_moe_rs(layer)
@@ -197,6 +195,7 @@ def _apply_fp8_fused_rs(
         )
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
+    block_quantized = getattr(layer, "weight_block_size", None) is not None
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         fused_moe_rs_gather,
         fused_moe_rs_padded_tokens,
@@ -213,7 +212,7 @@ def _apply_fp8_fused_rs(
             layer=layer,
             dispatch_output=dispatch_output,
             activation=activation,
-            block_quant=False,
+            block_quant=block_quantized,
             apply_router_weight_on_input=(
                 layer.moe_runner_config.apply_router_weight_on_input
             ),
@@ -238,13 +237,15 @@ def _apply_fp8_fused_rs(
         if post_expert_norm_weight is not None
         else x.new_zeros((1,))
     )
+    w1_scale = layer.w13_weight_scale_inv if block_quantized else layer.w13_weight_scale
+    w2_scale = layer.w2_weight_scale_inv if block_quantized else layer.w2_weight_scale
 
     result = fused_moe_rs_gather(
         hidden_states=x,
         w1=layer.w13_weight,
         w2=layer.w2_weight,
-        w1_scale=layer.w13_weight_scale,
-        w2_scale=layer.w2_weight_scale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         post_expert_norm_weight=norm_weight,
