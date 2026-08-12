@@ -163,15 +163,21 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
 
     def test_non_dcp_pool_unchanged(self):
-        pool = MLATokenToKVPoolHost(
-            _fake_mla_device_pool(),
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=PHYSICAL_PAGE,
-            layout="layer_first",
-            pin_memory=False,
-            device="cpu",
-        )
+        # Same pinned memory probe as _make_host_pool: the 10 GiB reserve
+        # rejects even a zero-byte pool on a loaded CI runner.
+        with mock.patch(
+            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
+            return_value=SimpleNamespace(available=64 * 1024**3),
+        ):
+            pool = MLATokenToKVPoolHost(
+                _fake_mla_device_pool(),
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=PHYSICAL_PAGE,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+            )
         self.assertEqual(pool.page_size, PHYSICAL_PAGE)
         self.assertEqual(pool.logical_size, pool.size)
         self.assertEqual(pool.logical_page_size, PHYSICAL_PAGE)

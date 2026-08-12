@@ -1263,6 +1263,11 @@ def _make_batch(temperature):
             temperatures=torch.full((BS, 1), temperature or 1.0),
             top_ks=torch.full((BS,), VOCAB_SIZE, dtype=torch.int32),
             top_ps=torch.full((BS,), 0.9),
+            # Both renorm passes stay on, matching the pre-gate math this
+            # fixture was derived under (top_ks=VOCAB_SIZE is an identity).
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+            sampling_seed=None,  # unseeded: keep the pre-seed coin stream
             is_all_greedy=temperature == 0.0,
             acc_additive_penalties=None,
             acc_scaling_penalties=None,

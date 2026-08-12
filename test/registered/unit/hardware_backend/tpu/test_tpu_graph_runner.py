@@ -28,6 +28,7 @@ from sglang.srt.model_executor.tpu_graph_runner import (
     TpuGraphRunner,
     _augment_spec_policy,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,6 +66,27 @@ class TestTpuGraphRunner(CustomTestCase):
     """TpuGraphRunner orchestrates annotated compile policies."""
 
     def setUp(self):
+        # TpuGraphRunner.__init__ warms the CP decode-attn-TP singleton, which
+        # reads a parallel config leaf — publish a dummy config for it.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        # Flush the runner's lazy imports HERE, before the torch.compile patch
+        # below: their import-time @torch.compile decorators would otherwise be
+        # recorded as policy compiles (breaking assert_not_called) and leave
+        # those modules holding MagicMock-wrapped functions.
+        import sglang.kernels.ops.moe.virtual_experts  # noqa: F401
+        import sglang.kernels.ops.speculative.cache_locs  # noqa: F401
+        import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe  # noqa: F401
+        import sglang.srt.layers.sampler  # noqa: F401
+        import sglang.srt.layers.vocab_parallel_embedding  # noqa: F401
+        import sglang.srt.managers.overlap_utils  # noqa: F401
+        import sglang.srt.sampling.penaltylib.repetition_penalty  # noqa: F401
+        import sglang.srt.speculative.spec_utils  # noqa: F401
+        from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+
+        get_cp_decode_attn_tp_ctx()
+
         # Stub torch.compile so the test doesn't need the tpu dynamo backend.
         # Return a MagicMock that records the wrapped fn/kwargs and lets
         # tpu_graph_runner assign ``__signature__`` on the result (a tuple
@@ -222,18 +244,21 @@ class TestTpuGraphRunner(CustomTestCase):
         policy_prepare.assert_called_once_with(forward_batch)
 
     def test_respects_can_torch_compile_false(self):
+        from sglang.srt.runtime_context import get_flags
+
         original = MagicMock()
         model = _model_with(forward=original)
         model._can_torch_compile = False
         runner = self._runner_for(model)
-        TpuGraphRunner(runner)
-        # forward was not replaced; torch.compile and registration both skipped.
-        self.assertIs(model.forward, original)
-        self.mock_compile.assert_not_called()
-        self.mock_register.assert_not_called()
-        # The skip is reflected back so downstream warmup doesn't try
-        # to specialize over compile-only buckets.
-        self.assertFalse(runner.server_args.enable_torch_compile)
+        with get_flags().capture.override(enable_torch_compile=True):
+            TpuGraphRunner(runner)
+            # forward was not replaced; compile and registration both skipped.
+            self.assertIs(model.forward, original)
+            self.mock_compile.assert_not_called()
+            self.mock_register.assert_not_called()
+            # The skip is reflected into the capture flag so downstream warmup
+            # doesn't try to specialize over compile-only buckets.
+            self.assertFalse(get_flags().capture.enable_torch_compile)
 
     def test_annotation_drives_compile_when_can_torch_compile_default(self):
         # Models that don't set _can_torch_compile should compile only when
@@ -402,53 +427,65 @@ class TestDraftTorchCompileInstall(CustomTestCase):
     """A runner that skips decode-graph capture must still be compiled on TPU.
 
     Speculative draft runners pass ``capture_decode_cuda_graph=False`` (they
-    capture their own decode-style graphs). On TPU ``init_decode_cuda_graph``
+    capture their own decode-style graphs). On TPU ``capture_decode_graph``
     performs no capture — it only installs torch.compile — so that flag must
-    not switch compilation off for the draft model.
+    not switch compilation off for the draft model
+    (``cuda_graph_setup.capture_cuda_graphs``'s tpu+compile elif branch).
     """
 
-    @staticmethod
-    def _runner(device="tpu"):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+    _SETUP_MOD = "sglang.srt.model_executor.model_runner_components.cuda_graph_setup"
 
-        runner = ModelRunner.__new__(ModelRunner)
-        runner.device = device
-        runner.init_decode_cuda_graph = MagicMock()
-        return runner
+    @staticmethod
+    def _runner(device):
+        return SimpleNamespace(
+            device=device,
+            is_draft_worker=True,
+            model=object(),
+            model_config=SimpleNamespace(quantization=None),
+            server_args=SimpleNamespace(
+                speculative_moe_runner_backend=None,
+                moe_runner_backend="triton",
+                speculative_moe_a2a_backend=None,
+                moe_a2a_backend="none",
+                forward_hooks=[],
+                enable_symm_mem=False,
+            ),
+            forward_stream=None,
+            canary_manager=None,
+        )
 
     def _call(self, device, enable_torch_compile):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            capture_cuda_graphs,
+        )
+        from sglang.srt.runtime_context import get_flags
 
         runner = self._runner(device)
         with patch(
-            "sglang.srt.model_executor.model_runner.get_flags",
-            return_value=SimpleNamespace(
-                capture=SimpleNamespace(enable_torch_compile=enable_torch_compile)
-            ),
+            f"{self._SETUP_MOD}.GraphSharedOutput.create_for_model_runner"
+        ), patch(f"{self._SETUP_MOD}.EagerRunner"), patch(
+            f"{self._SETUP_MOD}.capture_prefill_graph"
         ), patch(
-            "sglang.srt.model_executor.model_runner."
-            "GraphSharedOutput.create_for_model_runner"
+            f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"
         ), patch(
-            "sglang.srt.model_executor.model_runner.EagerRunner"
+            f"{self._SETUP_MOD}.capture_decode_graph"
+        ) as decode_capture, get_flags().capture.override(
+            enable_torch_compile=enable_torch_compile
         ):
-            runner.init_prefill_cuda_graph = MagicMock()
-            runner.server_args = SimpleNamespace(forward_hooks=[])
-            runner.prealloc_symmetric_memory_pool = MagicMock()
-            runner.canary_manager = None
-            ModelRunner.init_cuda_graphs(runner, capture_decode_cuda_graph=False)
-        return runner
+            capture_cuda_graphs(model_runner=runner, capture_decode_cuda_graph=False)
+        return decode_capture
 
     def test_installs_on_tpu_when_compile_enabled(self):
-        runner = self._call("tpu", True)
-        runner.init_decode_cuda_graph.assert_called_once_with()
+        decode_capture = self._call("tpu", True)
+        decode_capture.assert_called_once()
 
     def test_noop_when_torch_compile_disabled(self):
-        runner = self._call("tpu", False)
-        runner.init_decode_cuda_graph.assert_not_called()
+        decode_capture = self._call("tpu", False)
+        decode_capture.assert_not_called()
 
     def test_noop_off_tpu(self):
-        runner = self._call("cuda", True)
-        runner.init_decode_cuda_graph.assert_not_called()
+        decode_capture = self._call("cuda", True)
+        decode_capture.assert_not_called()
 
 
 class TestDraftPrecompileOrdering(CustomTestCase):
