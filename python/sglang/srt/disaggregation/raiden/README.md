@@ -36,22 +36,39 @@ Schedules are built in `reshard_schedule.py` (unit-tested in
 the total kv-head count evenly; the byte granule is one kv-head's contiguous K+V.
 
 DP-attention replicas that co-locate on a decode host get distinct raiden control
-ports via `base + 2*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to
-`base + 2*attn_tp_rank` when `attn_dp_size == 1`).
+ports via `base + 4*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to
+`base + 4*attn_tp_rank` when `attn_dp_size == 1`); each rank owns 4 ports —
+full-engine control/data, then SWA-engine control/data.
+
+## Hybrid sliding-window models
+
+Hybrid-SWA models (e.g. gpt-oss) keep two KV pools with distinct page-id
+spaces: full-attention layers in a full-size pool, sliding-window layers in a
+smaller pool that only retains the attention window. One raiden transfer
+applies a single block-id list to every tensor it wraps, so each rank runs a
+second engine over the SWA sub-pool's layers. The full engine pulls the whole
+sequence's pages; the SWA engine pulls just the window's pages, using the
+per-side SWA page ids both schedulers already derive for `StateType.SWA`
+(`_swa_payload` in prefill.py/decode.py). The extra block list and endpoint
+ride in the existing `BLOCKS` reply. Symmetric attn TP only: asymmetric TP
+(push-resharding) rejects hybrid models, since the reshard plan carries a
+single block-id space.
 
 ## Scope (v1)
 
-Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models, decode in chunk-cache mode.
+Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
+sliding-window at symmetric TP), decode in chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
 push-resharding path above. Needs `tpu_raiden` built against the same `torch_tpu`
-as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP, Mamba/SWA/NSA,
-speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
+as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP, Mamba/NSA,
+hybrid-SWA under push-resharding, speculative draft KV, decode prefix-cache
+reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 2*(dp_rank*tp_size + tp_rank)` (data = `+1`) |
+| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*(dp_rank*tp_size + tp_rank)` (data = `+1`, SWA engine control/data = `+2`/`+3`) |
 | `SGLANG_RAIDEN_RESHARD` | `1` | on by default; activates only for asymmetric attn TP (`dst_tp < src_tp`) — symmetric traffic is unaffected. Set `0` to disable (asymmetric TP then raises) and keep the multi-slot host pool instead of the reshard device-shadow sizing. |
 | `SGLANG_RAIDEN_NUM_SLOTS` | `16` | raiden host-pool transfer slots |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | max pages/request; auto = `ceil(context_len/page_size)` |

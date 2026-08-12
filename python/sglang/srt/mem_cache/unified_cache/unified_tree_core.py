@@ -397,9 +397,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
 
-        # ``device`` is derived from the construction-time allocator; the
-        # allocator/pool themselves are owned by the cache, not the tree.
-        if params.token_to_kv_pool_allocator:
+        # self.device is only used to create the tree's zero-length placeholder
+        # index tensors (the "no match" / "no values" results). Placeholders
+        # are concatenated with real index tensors, so they must live with the
+        # real ones (sliced from the req_to_token table). Without a
+        # req_to_token pool (test fixtures), fall back to the allocator's
+        # device.
+        if params.req_to_token_pool is not None:
+            self.device = params.req_to_token_pool.req_to_token.device
+        elif params.token_to_kv_pool_allocator:
             self.device = params.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
