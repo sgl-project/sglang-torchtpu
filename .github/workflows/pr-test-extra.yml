@@ -139,7 +139,10 @@ jobs:
   # stays at the default so the two workflows share one cache entry.
   rust-ext-build:
     needs: [check-changes, call-gate]
+    # [Do Not Upstream] This fork cannot use upstream's self-hosted 5090
+    # runner. Test jobs retain their source-build fallback when this is skipped.
     if: |
+      github.repository != 'sgl-project/sglang-torchtpu' &&
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')

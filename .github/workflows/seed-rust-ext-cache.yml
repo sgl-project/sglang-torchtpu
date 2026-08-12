@@ -5,13 +5,15 @@ name: Seed Rust Ext Cache
 # every PR compiling for itself until the next scheduled run, up to 12h later.
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'rust/**'
-      - 'python/setup.py'
-      # The key's prefix lives in this file, so a bump there also moves the key.
-      - '.github/workflows/_pr-test-rust-ext-build.yml'
+  # Disabled in sglang-torchtpu: this fork cannot use the self-hosted 5090
+  # runner. Cache seeding remains available manually for a future runner.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'rust/**'
+  #     - 'python/setup.py'
+  #     # The key's prefix lives in this file, so a bump there also moves the key.
+  #     - '.github/workflows/_pr-test-rust-ext-build.yml'
   workflow_dispatch:
 
 # Only the newest merge needs to seed; earlier ones are already stale.
