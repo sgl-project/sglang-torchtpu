@@ -163,8 +163,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             pool.alloc(PHYSICAL_PAGE)  # not a multiple of the widened page
 
     def test_non_dcp_pool_unchanged(self):
-        # Same pinned memory probe as _make_host_pool: the 10 GiB reserve
-        # rejects even a zero-byte pool on a loaded CI runner.
+        # Pin the memory probe like _make_host_pool (10 GiB reserve vs loaded runner).
         with mock.patch(
             "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory",
             return_value=SimpleNamespace(available=64 * 1024**3),

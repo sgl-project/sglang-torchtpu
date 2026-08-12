@@ -66,15 +66,12 @@ class TestTpuGraphRunner(CustomTestCase):
     """TpuGraphRunner orchestrates annotated compile policies."""
 
     def setUp(self):
-        # TpuGraphRunner.__init__ warms the CP decode-attn-TP singleton, which
-        # reads a parallel config leaf — publish a dummy config for it.
+        # Publish a dummy config: init warms the CP singleton (parallel leaf read).
         override = get_context().override_server_args()
         override.install()
         self.addCleanup(override.restore)
-        # Flush the runner's lazy imports HERE, before the torch.compile patch
-        # below: their import-time @torch.compile decorators would otherwise be
-        # recorded as policy compiles (breaking assert_not_called) and leave
-        # those modules holding MagicMock-wrapped functions.
+        # Flush init's lazy imports before the torch.compile patch: their
+        # import-time @torch.compile decorators must not hit the recorder.
         import sglang.kernels.ops.moe.virtual_experts  # noqa: F401
         import sglang.kernels.ops.speculative.cache_locs  # noqa: F401
         import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe  # noqa: F401
@@ -256,8 +253,7 @@ class TestTpuGraphRunner(CustomTestCase):
             self.assertIs(model.forward, original)
             self.mock_compile.assert_not_called()
             self.mock_register.assert_not_called()
-            # The skip is reflected into the capture flag so downstream warmup
-            # doesn't try to specialize over compile-only buckets.
+            # The skip is reflected into the capture flag for downstream warmup.
             self.assertFalse(get_flags().capture.enable_torch_compile)
 
     def test_annotation_drives_compile_when_can_torch_compile_default(self):
@@ -428,9 +424,8 @@ class TestDraftTorchCompileInstall(CustomTestCase):
 
     Speculative draft runners pass ``capture_decode_cuda_graph=False`` (they
     capture their own decode-style graphs). On TPU ``capture_decode_graph``
-    performs no capture — it only installs torch.compile — so that flag must
-    not switch compilation off for the draft model
-    (``cuda_graph_setup.capture_cuda_graphs``'s tpu+compile elif branch).
+    only installs torch.compile, so that flag must not switch compilation off
+    for the draft model (capture_cuda_graphs' tpu+compile elif branch).
     """
 
     _SETUP_MOD = "sglang.srt.model_executor.model_runner_components.cuda_graph_setup"

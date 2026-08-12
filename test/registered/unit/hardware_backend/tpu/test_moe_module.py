@@ -547,12 +547,8 @@ class TestForwardTpuViaDispatch(CustomTestCase):
         self.runner.stop()
 
     def test_dispatch_resolves_forward_tpu(self):
-        """``dispatch_forward()`` must resolve to ``forward_tpu``. Pin its
-        identity so an accidental rename in ``BaseFusedOp`` (or a
-        regression in the platform-key branch ordering) catches here --
-        the most common failure mode would be silently dropping back to
-        ``forward_native``.
-        """
+        """``dispatch_forward()`` must resolve to ``forward_tpu``, never
+        silently drop back to ``forward_native``."""
         self.assertEqual(
             self.runner.method.dispatch_forward().__func__.__name__,
             "forward_tpu",

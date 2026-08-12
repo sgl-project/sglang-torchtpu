@@ -94,8 +94,7 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn(str(indices.tolist()), msg)
 
     def test_shm_allocator(self):
-        # Same pinned memory probe as setUp: the fixed 10 GB reserve rejects
-        # even a ~0-byte pool on a low-memory CI runner.
+        # Pin the memory probe like setUp (10 GB reserve vs low-memory runner).
         with patch(
             "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory"
         ) as mock_vm:
