@@ -288,9 +288,9 @@ class TpuSRTPlatform(SRTPlatform):
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
         # addresses; other backends (torch_native reference) keep the flat
         # upstream pool.
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_exec
 
-        if get_server_args().attention_backend == "pallas_tpu_mla":
+        if get_exec().kernel.attention_backend == "pallas_tpu_mla":
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,
             )

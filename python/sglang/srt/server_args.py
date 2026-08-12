@@ -1755,6 +1755,7 @@ class ServerArgs:
             "'channelwise' (default) converts block scales to per-output-channel scales at load time. "
             "'blockwise' preserves true blockwise scales and uses the TPU block-FP8 Pallas kernel.",
         ),
+        NS("exec.kernel"),
     ] = "channelwise"
     fp4_gemm_runner_backend: A[
         str,
@@ -3506,11 +3507,13 @@ class ServerArgs:
     ] = None
 
     # For TPU backend
-    tpu_compile_tokens: Optional[List[int]] = None
-    tpu_compile_bs: Optional[List[int]] = None
-    tpu_worker_hostnames: Optional[str] = None
-    torch_tpu_slicebuilder_addresses: Optional[str] = None
-    torch_tpu_topology: Optional[str] = None
+    # NS only, no Arg/help: these keep their hand-written add_argument calls in
+    # add_cli_args, and a help string here would auto-register a duplicate flag.
+    tpu_compile_tokens: A[Optional[List[int]], NS("exec.graph")] = None
+    tpu_compile_bs: A[Optional[List[int]], NS("exec.graph")] = None
+    tpu_worker_hostnames: A[Optional[str], NS("parallel")] = None
+    torch_tpu_slicebuilder_addresses: A[Optional[str], NS("parallel")] = None
+    torch_tpu_topology: A[Optional[str], NS("parallel")] = None
 
     def __post_init__(self):
         """

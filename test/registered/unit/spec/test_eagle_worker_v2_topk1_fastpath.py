@@ -174,7 +174,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.cuda_graph_runner = SimpleNamespace(
                     execute=MagicMock(return_value=graph_result)
                 )
-                worker.draft_runner = SimpleNamespace(canary_manager=None)
+                # draft() routes the draft forward through the runner's compile
+                # policy on both the graph and eager paths; every real
+                # ModelRunner has one (NoopCompilePolicy by default).
+                worker.draft_runner = SimpleNamespace(
+                    canary_manager=None, compile_policy=NoopCompilePolicy()
+                )
                 worker.topk = 1
                 worker.speculative_num_steps = 1
                 worker.speculative_num_draft_tokens = 2

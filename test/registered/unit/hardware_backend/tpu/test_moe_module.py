@@ -30,7 +30,6 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
-from sglang.srt.layers.utils import multi_platform as mp_mod
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -64,21 +63,20 @@ class _MoeMockRunner:
 
       * Patch ``fused_moe_call`` with a capturing fake so tests run on
         any host (no torch_tpu, no JAX).
-      * Optionally patch ``_is_tpu`` so ``MultiPlatformOp.dispatch_forward``
-        resolves to ``forward_tpu`` at ``__init__`` time. This enables
-        tests that exercise the full dispatch -> forward_tpu chain via
+      * Optionally pin ``_platform_key`` so ``BaseFusedOp`` resolves
+        ``forward_tpu`` at ``__init__`` time. This enables tests that
+        exercise the full dispatch -> forward_tpu chain via
         ``method.forward(...)``.
       * Build ``layer`` / ``dispatch_output`` / ``method`` on demand.
 
     Two invocation paths are exposed:
 
       * ``tpu_forward(layer, d_out)``: direct ``method.forward_tpu(...)``
-        call. Isolates the method's contract from MultiPlatformOp
-        dispatch.
+        call. Isolates the method's contract from BaseFusedOp dispatch.
       * ``dispatched_forward(layer, d_out)``: goes through
         ``method.forward(...)`` which routes via
-        ``MultiPlatformOp._forward_method``. Confirms the dispatch
-        wiring on top of the method's contract.
+        ``BaseFusedOp._forward_method``. Confirms the dispatch wiring on
+        top of the method's contract.
 
     Usage as a context manager (clean for variant-per-test configs):
 
@@ -138,19 +136,21 @@ class _MoeMockRunner:
             )
         ]
         if self.force_tpu_dispatch:
-            # MultiPlatformOp.dispatch_forward reads these globals at
-            # __init__ time. Pin them so ``method.forward`` routes to
-            # ``forward_tpu`` regardless of the test host's real platform.
+            # BaseFusedOp resolves the platform forward at __init__ time via
+            # _platform_key() (the former MultiPlatformOp module-level _is_*
+            # globals are gone, RFC #29630). Pin the key so ``method.forward``
+            # routes to ``forward_tpu`` regardless of the test host, and pin
+            # the OOT key to None so it does not short-circuit ahead of it.
             patchers.extend(
                 [
-                    patch.object(mp_mod, "_is_tpu", True),
-                    patch.object(mp_mod, "_is_cuda", False),
-                    patch.object(mp_mod, "_is_hip", False),
-                    patch.object(mp_mod, "_is_cpu", False),
-                    patch.object(mp_mod, "_is_cpu_amx_available", False),
-                    patch.object(mp_mod, "_is_npu", False),
-                    patch.object(mp_mod, "_is_xpu", False),
-                    patch.object(mp_mod, "_is_musa", False),
+                    patch(
+                        "sglang.kernels.fused_op._platform_key",
+                        return_value="tpu",
+                    ),
+                    patch(
+                        "sglang.kernels.fused_op._oot_dispatch_key",
+                        return_value=None,
+                    ),
                 ]
             )
         for p in patchers:
@@ -532,8 +532,8 @@ class TestForwardTpuContract(CustomTestCase):
 
 
 class TestForwardTpuViaDispatch(CustomTestCase):
-    """Integration: ``MultiPlatformOp.forward`` -> dispatch -> ``forward_tpu``
-    -> kernel. Forces ``_is_tpu=True`` at module level so the method's
+    """Integration: ``BaseFusedOp.forward`` -> dispatch -> ``forward_tpu``
+    -> kernel. Pins ``_platform_key()`` to ``"tpu"`` so the method's
     ``__init__`` caches ``forward_tpu`` on ``self._forward_method``.
     Confirms the dispatch wiring is intact on top of the method's
     contract.
@@ -549,9 +549,9 @@ class TestForwardTpuViaDispatch(CustomTestCase):
     def test_dispatch_caches_forward_tpu_on_init(self):
         """The chosen forward method is bound at ``__init__`` time and
         stored on ``self._forward_method``. Pin its identity so an
-        accidental rename in ``MultiPlatformOp`` (or a regression in
-        the ``_is_tpu`` branch ordering) catches here -- the most
-        common failure mode would be silently dropping back to
+        accidental rename in ``BaseFusedOp`` (or a regression in the
+        platform-key branch ordering) catches here -- the most common
+        failure mode would be silently dropping back to
         ``forward_native``.
         """
         self.assertEqual(

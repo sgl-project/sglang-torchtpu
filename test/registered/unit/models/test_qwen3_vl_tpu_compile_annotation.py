@@ -107,7 +107,7 @@ class TestQwen3VLTpuCompileAnnotation(CustomTestCase):
                 with (
                     patch.object(
                         vision,
-                        "get_global_server_args",
+                        "get_mm",
                         return_value=types.SimpleNamespace(mm_attention_backend=None),
                     ),
                     patch.object(vision, "is_cuda", return_value=False),

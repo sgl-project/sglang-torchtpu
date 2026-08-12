@@ -789,6 +789,9 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
             dp_local_num_tokens=torch.tensor([2]),
             global_dp_buffer_len=0,
             is_prefill_only=True,
+            # Read to publish is_extend_in_batch to the flags tier; the
+            # getattr default is evaluated eagerly, so it must always exist.
+            forward_mode=_ForwardModeMock("extend"),
         )
 
     def test_sets_uniform_padded_global_counts(self):

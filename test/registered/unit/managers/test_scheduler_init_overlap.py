@@ -41,9 +41,9 @@ def _make_scheduler(*, enable_overlap: bool) -> Scheduler:
     s.draft_worker = None
     s.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(attn_backend=object()))
     s.req_to_token_pool = object()
-    # Passed positionally to decide_needs_cpu_seq_lens (patched in the runner),
-    # so it only needs to exist as a sentinel.
-    s.server_args = object()
+    # Passed to decide_needs_cpu_seq_lens (patched in the runner) and to
+    # decide_needs_confidence_relay, which reads speculative_algorithm.
+    s.server_args = SimpleNamespace(speculative_algorithm=None)
     return s
 
 

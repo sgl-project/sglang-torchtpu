@@ -188,7 +188,12 @@ jobs:
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently).
+    # [Do Not Upstream] This fork cannot use upstream's self-hosted
+    # x64-kernel-build-node. Without the skip the job queues forever and, since
+    # pr-test-finish needs it, hangs the required check on every PR that touches
+    # kernels/aot/** -- which every upstream sync does.
     if: |
+      github.repository != 'sgl-project/sglang-torchtpu' &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
@@ -205,7 +210,9 @@ jobs:
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
     # Skip for scheduled runs (they run stages independently).
+    # [Do Not Upstream] Same as above for arm-kernel-build-node.
     if: |
+      github.repository != 'sgl-project/sglang-torchtpu' &&
       github.event_name != 'schedule' &&
       inputs.test_parallel_dispatch != true &&
       needs.check-changes.result == 'success' &&
