@@ -1,9 +1,54 @@
-# Kueue admission for the TPU CI slices. Apply once per cluster:
+# Kueue admission for the TPU CI slices. Apply once per cluster, in this order -- the
+# workflows in this PR remove the GitHub-side mutex, so they must not merge before step 3
+# reports both queues Active.
 #
-#   kubectl apply --server-side -f \
-#     https://github.com/kubernetes-sigs/kueue/releases/download/v0.10.1/manifests.yaml
-#   kubectl -n kueue-system rollout status deploy/kueue-controller-manager
-#   kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
+# 1. Install Kueue (needs cluster-admin). JobSet v0.12.0 is already present; Kueue's
+#    integration hooks into it.
+#      kubectl apply --server-side -f \
+#        https://github.com/kubernetes-sigs/kueue/releases/download/v0.18.5/manifests.yaml
+#      kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=180s
+#
+# 2. Confirm the JobSet framework is enabled. If `jobset.x-k8s.io/jobset` is absent from
+#    integrations.frameworks, Kueue IGNORES the queue-name label and every JobSet runs
+#    unmanaged -- no gang admission, no error, nothing in the logs. Silent, and it looks
+#    exactly like success until two JobSets deadlock on one slice.
+#      kubectl -n kueue-system get cm kueue-manager-config \
+#        -o jsonpath='{.data.controller_manager_config\.yaml}' | grep -A12 frameworks
+#    If missing: edit that ConfigMap, then
+#      kubectl -n kueue-system rollout restart deploy/kueue-controller-manager
+#
+# 3. Apply this file and check admission is live:
+#      kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
+#      kubectl get clusterqueues -o wide        # ACTIVE=True on both
+#      kubectl -n tpu-ci get localqueues
+#
+# 4. The multi-host pool must exist or tpu-multihost workloads queue forever. As of
+#    2026-08-12 `ci-tpu-pool=nightly` does NOT exist -- multi-host nightly jobs sit
+#    Pending with "0/11 nodes matched Pod's node affinity/selector" until their deadline.
+#    Recreate it (flags verified against ci-tpu7x-2x2x1 and tpu7x-2x2x2-haolin-dev):
+#      gcloud compute resource-policies create workload-policy ci-tpu7x-2x2x2-wp \
+#        --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2 --region=us-central1 \
+#        --project=sglang-torchtpu
+#      gcloud container node-pools create ci-tpu7x-2x2x2 \
+#        --cluster=tpu-cluster --zone=us-central1-c --project=sglang-torchtpu \
+#        --machine-type=tpu7x-standard-4t --tpu-topology=2x2x2 \
+#        --placement-policy=ci-tpu7x-2x2x2-wp \
+#        --reservation-affinity=specific \
+#        --reservation=projects/sglang-torchtpu/reservations/ghostfish-u2zcmybntv70q \
+#        --node-labels=ci-tpu-pool=nightly
+#    --type must be HIGH_THROUGHPUT (COMPACT is a different API; HIGH_AVAILABILITY
+#    rejects --accelerator-topology). --num-nodes is inferred from --tpu-topology.
+#    NB: README.md cites reservation ghostfish-7vg0iyvvgks52; the live one is
+#    ghostfish-u2zcmybntv70q.
+#
+# 5. Verify gang admission before merging -- this is the load-bearing assumption, that
+#    Kueue assigns a whole PodSet to ONE ResourceFlavor. Submit two multi-host JobSets at
+#    once and confirm the first admits, the second stays queued (not half-scheduled), and
+#    the admitted one's two pods share a pool:
+#      kubectl -n tpu-ci get workloads
+#      kubectl -n tpu-ci get pods -o wide
+#    If pods from one JobSet ever straddle two pools, this design needs Kueue
+#    Topology-Aware Scheduling instead of flavor-per-slice.
 #
 # WHY: a JobSet asks for HOSTS pods at once, and kube-scheduler places pods one at a
 # time -- it will hand node 1 to JobSet A and node 2 to JobSet B and leave both stuck at
