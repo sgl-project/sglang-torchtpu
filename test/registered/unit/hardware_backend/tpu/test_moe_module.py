@@ -242,8 +242,8 @@ class _MoeMockRunner:
         """Direct ``method.forward_tpu(layer, d_out)`` call."""
         # Single-rank EP: no distributed process group in a unit test.
         with patch(
-            "sglang.srt.layers.quantization.unquant.get_moe_expert_parallel_rank",
-            lambda: 0,
+            "sglang.srt.layers.quantization.unquant.get_parallel",
+            lambda: SimpleNamespace(moe_ep_rank=0),
         ):
             return self.method.forward_tpu(layer, d_out)
 
@@ -254,8 +254,8 @@ class _MoeMockRunner:
         the dispatch -> forward_tpu chain.
         """
         with patch(
-            "sglang.srt.layers.quantization.unquant.get_moe_expert_parallel_rank",
-            lambda: 0,
+            "sglang.srt.layers.quantization.unquant.get_parallel",
+            lambda: SimpleNamespace(moe_ep_rank=0),
         ):
             return self.method.forward(layer, d_out)
 
