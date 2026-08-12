@@ -57,6 +57,12 @@ concurrency:
   # Runs sharing a slice must serialize (no gang scheduler -> two multi-host JobSets on
   # one pool could deadlock). Key on host count == the slice: all multi-host runs
   # (hosts=2) serialize on the 2x2x2 pool; single-host (hosts=1) runs on pr-gate.
+  #
+  # Capacity is one in-progress + one pending; a third entrant cancels the pending one.
+  # So the hosts=2 budget is two callers, each throttled to one in-flight job:
+  # nightly-test-tpu.yml (multi-host matrix max-parallel 1, multihost-combo chained
+  # behind it) and combo-test-tpu.yml (matrix max-parallel 1). A third caller needs a
+  # real queue -- adding one here just moves which job gets silently cancelled.
   group: tpu-slice-${{ inputs.hosts }}
   cancel-in-progress: false
 
