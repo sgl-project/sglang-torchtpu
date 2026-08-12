@@ -135,10 +135,9 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     runner_config = layer.moe_runner_config
 
     from sglang.srt.layers.moe import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_parallel, get_server_args
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     parallel = get_parallel()
-    server_args = get_server_args()
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         ep_size=ep_size,
@@ -154,8 +153,10 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         no_combine=runner_config.no_combine and not allow_no_combine,
         has_fused_shared_experts=bool(layer.num_fused_shared_experts),
         standard_dispatcher=get_moe_a2a_backend().is_none(),
-        enable_dp_attention=server_args.enable_dp_attention,
-        enable_fused_moe_sum_all_reduce=(server_args.enable_fused_moe_sum_all_reduce),
+        enable_dp_attention=parallel.enable_dp_attention,
+        enable_fused_moe_sum_all_reduce=(
+            get_exec().moe.enable_fused_moe_sum_all_reduce
+        ),
     )
     if unsupported_reason is not None:
         layer.__dict__["_tpu_fused_rs_unsupported_reason"] = unsupported_reason

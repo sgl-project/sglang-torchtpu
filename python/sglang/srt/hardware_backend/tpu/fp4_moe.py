@@ -167,10 +167,9 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     """Return the fused-RS contract requirements this layer does not meet."""
     from sglang.srt.distributed import get_tp_group, get_world_group
     from sglang.srt.layers.moe import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_parallel, get_server_args
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     parallel = get_parallel()
-    server_args = get_server_args()
     runner_config = layer.moe_runner_config
     requirements = (
         (f"group_size == {TPU_NVFP4_GROUP_SIZE}", group_size == TPU_NVFP4_GROUP_SIZE),
@@ -199,10 +198,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         ),
         ("no fused shared experts", not layer.num_fused_shared_experts),
         ("standard token dispatcher", get_moe_a2a_backend().is_none()),
-        ("dp attention disabled", not server_args.enable_dp_attention),
+        ("dp attention disabled", not parallel.enable_dp_attention),
         (
             "fused MoE sum all-reduce disabled",
-            not server_args.enable_fused_moe_sum_all_reduce,
+            not get_exec().moe.enable_fused_moe_sum_all_reduce,
         ),
     )
     return [name for name, met in requirements if not met]
