@@ -228,8 +228,6 @@ if _is_npu:
 # NOTE: these must be module-level imports -- doing them inside a function
 # binds the name in that function's local scope only, leaving RMSNormGated
 # undefined at the call sites below.
-# Gate on CUDA/HIP (not `else`): this fork doesn't vendor
-# layers/attention/fla, and CPU CI imports this module on GPU-less runners.
 if _is_cuda or _is_hip:
     from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 else:
