@@ -300,8 +300,16 @@ class TpuKVSenderBase(CommonKVSender):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank=req_has_disagg_prefill_dp_rank,
+        )
         self.conclude_state = None
         self.init_time = time.time()
 
