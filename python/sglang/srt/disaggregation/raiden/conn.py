@@ -28,12 +28,13 @@ import math
 import os
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
     CommonKVManager,
@@ -55,21 +56,50 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 
-def get_raiden_kv_caches(pool) -> list:
-    """Per-layer device KV tensors raiden indexes by page (major dim).
+@dataclass(frozen=True)
+class RaidenKVCacheGroups:
+    """Page-compatible cache groups registered with independent Raiden engines."""
+
+    full: List[Any]
+    swa: List[Any]
+
+
+def get_raiden_kv_caches(pool) -> RaidenKVCacheGroups:
+    """Group per-layer device KV tensors by their page-index namespace.
 
     The TPU fused KV pool stores one [num_blocks, page_size, ...] tensor per
-    layer in ``kv_buffer`` and exposes them via ``get_fused_kv_buffer``.
+    layer in ``kv_buffer`` and exposes them via ``get_fused_kv_buffer``. Hybrid
+    SWA pools allocate full-attention and sliding-window pages independently, so
+    they must not share one Raiden block-id list.
     """
     if hasattr(pool, "get_fused_kv_buffer"):
         start = pool.start_layer
-        return [pool.get_fused_kv_buffer(start + i) for i in range(pool.layer_num)]
-    if hasattr(pool, "kv_buffer"):
-        return list(pool.kv_buffer)
-    raise RuntimeError(
-        f"Raiden backend requires a fused KV pool exposing kv_buffer; got "
-        f"{type(pool).__name__}"
-    )
+        buffers = [pool.get_fused_kv_buffer(start + i) for i in range(pool.layer_num)]
+    elif hasattr(pool, "kv_buffer"):
+        buffers = list(pool.kv_buffer)
+    else:
+        raise RuntimeError(
+            f"Raiden backend requires a fused KV pool exposing kv_buffer; got "
+            f"{type(pool).__name__}"
+        )
+    layers_mapping = getattr(pool, "layers_mapping", None)
+    if layers_mapping:
+        full = []
+        swa = []
+        for offset, buf in enumerate(buffers):
+            layer_id = pool.start_layer + offset
+            (swa if layers_mapping[layer_id][1] else full).append(buf)
+    else:
+        full, swa = buffers, []
+
+    for name, group in (("full", full), ("SWA", swa)):
+        block_counts = {int(buf.shape[0]) for buf in group}
+        if len(block_counts) > 1:
+            raise RuntimeError(
+                f"Raiden requires uniform {name} KV block counts; got "
+                f"{sorted(block_counts)}"
+            )
+    return RaidenKVCacheGroups(full=full, swa=swa)
 
 
 class RaidenKVManager(CommonKVManager):
@@ -91,13 +121,15 @@ class RaidenKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
+        self._swa_engine: Optional[Any] = None
         self._kv_caches: Optional[list] = None
+        self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
-        # Deterministic control port per (dp, tp) rank (data port is
-        # +1).
+        self.swa_raiden_endpoint: Optional[str] = None
+        # Each rank reserves control+data ports for full KV and SWA KV.
         base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", "30000"))
         self._local_rank = self.attn_dp_rank * self.attn_tp_size + self.attn_tp_rank
-        self._control_port = base_port + 2 * self._local_rank
+        self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
         # Strided push-resharding for asymmetric TP (decode TP < prefill TP),
         # on by default and auto-engaged per request only when a
@@ -120,15 +152,19 @@ class RaidenKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # room -> accumulated page block-ids, aux blob, decode reply addr
             self._send_blocks: Dict[int, List[int]] = {}
+            self._send_swa_blocks: Dict[int, List[int]] = {}
             self._send_aux: Dict[int, bytes] = {}
             self._decode_addr: Dict[int, Tuple[str, int]] = {}
             self._replied: Set[int] = set()
         else:
             # room -> local page block-ids, remote page block-ids, endpoint
             self._local_blocks: Dict[int, List[int]] = {}
+            self._local_swa_blocks: Dict[int, List[int]] = {}
             self._decode_aux_index: Dict[int, int] = {}
             self._remote_blocks: Dict[int, List[int]] = {}
+            self._remote_swa_blocks: Dict[int, List[int]] = {}
             self._remote_endpoint: Dict[int, str] = {}
+            self._remote_swa_endpoint: Dict[int, str] = {}
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -206,7 +242,7 @@ class RaidenKVManager(CommonKVManager):
 
     # ----- engine lifecycle -------------------------------------------------
 
-    def set_kv_caches(self, kv_caches: list) -> None:
+    def set_kv_caches(self, kv_caches: RaidenKVCacheGroups) -> None:
         """Hand raiden the per-layer device KV tensors and build the engine.
 
         Called by prefill.py/decode.py right after construction (the KV pool is
@@ -214,7 +250,12 @@ class RaidenKVManager(CommonKVManager):
         block/page, which matches the TPU fused KV pool layout
         ([num_blocks, page_size, ...]).
         """
-        self._kv_caches = list(kv_caches)
+        self._kv_caches = list(kv_caches.full)
+        self._swa_kv_caches = list(kv_caches.swa)
+        if not self._kv_caches:
+            raise RuntimeError(
+                "Raiden requires at least one full-attention KV cache tensor"
+            )
         self._build_engine()
 
     def _build_engine(self) -> None:
@@ -251,6 +292,26 @@ class RaidenKVManager(CommonKVManager):
             max_blocks,
             num_slots,
         )
+        if self._swa_kv_caches:
+            self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
+            swa_max_blocks = self._max_request_blocks()
+            swa_num_slots = self._num_slots()
+            self._swa_engine = KVCacheManager(
+                kv_caches=self._swa_kv_caches,
+                node_id=self._local_rank,
+                local_control_port=self._control_port + 2,
+                max_blocks=swa_max_blocks,
+                num_slots=swa_num_slots,
+                timeout_s=self._timeout_s,
+            )
+            logger.info(
+                "RaidenKVManager rank%d SWA engine up | endpoint=%s "
+                "max_blocks=%d num_slots=%d",
+                self.attn_tp_rank,
+                self.swa_raiden_endpoint,
+                swa_max_blocks,
+                swa_num_slots,
+            )
 
     def _max_request_blocks(self) -> int:
         override = int(os.environ.get("SGLANG_RAIDEN_MAX_BLOCKS", "0"))
@@ -282,19 +343,26 @@ class RaidenKVManager(CommonKVManager):
         prefix = "resharded_transfer_"
         return rid[len(prefix) :] if rid.startswith(prefix) else rid
 
+    @staticmethod
+    def _swa_req_id(room: int) -> str:
+        return f"swa:{room}"
+
     def _drain_engine(self) -> None:
-        if self._engine is None:
+        if self._engine is None and self._swa_engine is None:
             return
-        done_send, done_recv, failed = self._engine.poll_stats()
-        if done_send or done_recv or failed:
-            with self._state_lock:
-                self._completed_send.update(self._norm_req_id(r) for r in done_send)
-                self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
-                self._failed.update(self._norm_req_id(r) for r in failed)
-            if failed:
-                logger.error(
-                    "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
-                )
+        for engine in (self._engine, self._swa_engine):
+            if engine is None:
+                continue
+            done_send, done_recv, failed = engine.poll_stats()
+            if done_send or done_recv or failed:
+                with self._state_lock:
+                    self._completed_send.update(self._norm_req_id(r) for r in done_send)
+                    self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
+                    self._failed.update(self._norm_req_id(r) for r in failed)
+                if failed:
+                    logger.error(
+                        "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
+                    )
 
     def register_to_bootstrap(self):
         # Topology/handshake registration is backend-agnostic; raiden adds no
@@ -344,15 +412,19 @@ class RaidenKVManager(CommonKVManager):
         self._maybe_reply(room)
 
     def _on_blocks(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.BLOCKS, 5)
+        self._require_frames(msg, MessageTag.BLOCKS, 7)
         room = int(msg[1].decode("ascii"))
         remote_blocks = unpack_blocks(msg[2])
         endpoint = msg[3].decode("ascii")
-        aux_blob = msg[4]
+        remote_swa_blocks = unpack_blocks(msg[4])
+        swa_endpoint = msg[5].decode("ascii")
+        aux_blob = msg[6]
         aux_index = None
         with self._state_lock:
             self._remote_blocks[room] = remote_blocks
             self._remote_endpoint[room] = endpoint
+            self._remote_swa_blocks[room] = remote_swa_blocks
+            self._remote_swa_endpoint[room] = swa_endpoint
             aux_index = self._decode_aux_index.get(room)
         if aux_index is not None and aux_blob:
             write_aux_blob(
@@ -364,47 +436,82 @@ class RaidenKVManager(CommonKVManager):
 
     # ----- prefill side ------------------------------------------------------
 
-    def append_send_blocks(self, room: int, block_ids: List[int]) -> None:
+    def _swa_blocks_from_state_indices(
+        self, state_indices: Optional[List]
+    ) -> List[int]:
+        if not self._swa_kv_caches:
+            return []
+        try:
+            index = self.kv_args.state_types.index(StateType.SWA)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Raiden has SWA KV tensors but StateType.SWA is not registered"
+            ) from exc
+        if (
+            state_indices is None
+            or index >= len(state_indices)
+            or state_indices[index] is None
+        ):
+            raise RuntimeError("Raiden SWA transfer is missing its page indices")
+        return [int(x) for x in state_indices[index]]
+
+    def append_send_blocks(
+        self,
+        room: int,
+        block_ids: List[int],
+        swa_block_ids: Optional[List[int]] = None,
+    ) -> None:
         with self._state_lock:
             self._send_blocks.setdefault(room, []).extend(block_ids)
+            if swa_block_ids is not None:
+                self._send_swa_blocks[room] = list(swa_block_ids)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> None:
-        engine = self._ensure_engine()
+        self._ensure_engine()
         with self._state_lock:
-            blocks = list(self._send_blocks.get(room, []))
             if aux_index is not None:
                 self._send_aux[room] = read_aux_blob(
                     self.kv_args.aux_data_ptrs,
                     self.kv_args.aux_item_lens,
                     aux_index,
                 )
-        # Resharded rooms reply over RESHARD_BLOCKS, never the pull path. If the
-        # decode's RESHARD_REQ hasn't arrived yet this is a no-op; _on_reshard_req
-        # drives the reply once both sides are present.
-        if self._reshard_enabled:
-            with self._state_lock:
-                self._reshard_finalized.add(room)
+            self._reshard_finalized.add(room)
+            is_reshard = room in self._reshard_req
+        # The request type is selected by the decode handshake, not by whether
+        # reshard support is globally enabled. Symmetric TP uses PULL_REQ even
+        # when resharding is available; asymmetric TP uses RESHARD_REQ.
+        if is_reshard:
             self._maybe_reshard_reply(room)
-            return
-        engine.register_read(str(room), room, blocks)
-        self._maybe_reply(room)
+        else:
+            self._maybe_reply(room)
 
     def _maybe_reply(self, room: int) -> None:
         with self._state_lock:
             if room in self._replied:
                 return
-            if room not in self._send_blocks or room not in self._decode_addr:
+            if (
+                room not in self._reshard_finalized
+                or room not in self._send_blocks
+                or (self._swa_engine is not None and room not in self._send_swa_blocks)
+                or room not in self._decode_addr
+            ):
                 return
+            swa_blocks = list(self._send_swa_blocks.get(room, []))
             blocks = list(self._send_blocks[room])
             addr = self._decode_addr[room]
             aux_blob = self._send_aux.get(room, b"")
             self._replied.add(room)
+        if self._swa_engine is not None:
+            self._swa_engine.register_read(self._swa_req_id(room), room, swa_blocks)
+        self._ensure_engine().register_read(str(room), room, blocks)
         endpoint = f"tcp://{addr[0]}:{addr[1]}"
         payload = [
             MessageTag.BLOCKS,
             str(room).encode("ascii"),
             pack_blocks(blocks),
             (self.raiden_endpoint or "").encode("ascii"),
+            pack_blocks(swa_blocks),
+            (self.swa_raiden_endpoint or "").encode("ascii"),
             aux_blob,
         ]
         with self._push_lock:
@@ -416,10 +523,17 @@ class RaidenKVManager(CommonKVManager):
         self,
         room: int,
         local_blocks: List[int],
+        local_swa_blocks: List[int],
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
         if len(bootstrap_infos) != 1:
+            if self._swa_engine is not None:
+                raise NotImplementedError(
+                    "Raiden cannot reshard hybrid SWA KV caches: decode rank "
+                    f"received {len(bootstrap_infos)} prefill sources. Use "
+                    "symmetric attention TP for prefill and decode."
+                )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
             # head-slice strided into the wider decode block.
@@ -443,6 +557,7 @@ class RaidenKVManager(CommonKVManager):
             )
         with self._state_lock:
             self._local_blocks[room] = local_blocks
+            self._local_swa_blocks[room] = local_swa_blocks
             if aux_index is not None:
                 self._decode_aux_index[room] = aux_index
         payload = [
@@ -456,17 +571,44 @@ class RaidenKVManager(CommonKVManager):
             with self._push_lock:
                 self._connect(endpoint).send_multipart(payload)
 
+    @staticmethod
+    def _pair_blocks(
+        remote: List[int], local: List[int]
+    ) -> Tuple[List[int], List[int]]:
+        local = list(local)
+        remote = list(remote)
+        if not local:
+            remote = []
+        elif len(remote) > len(local):
+            remote = remote[-len(local) :]
+        elif len(remote) < len(local):
+            local = local[: len(remote)]
+        return remote, local
+
     def maybe_start_pull(self, room: int) -> bool:
         """Issue the raiden pull once the prefill reply has arrived.
 
         Returns True if the pull was (or had already been) issued.
         """
         with self._state_lock:
-            if room not in self._remote_blocks or room not in self._remote_endpoint:
+            if (
+                room not in self._remote_blocks
+                or room not in self._remote_endpoint
+                or (
+                    self._swa_engine is not None and room not in self._remote_swa_blocks
+                )
+                or (
+                    self._swa_engine is not None
+                    and room not in self._remote_swa_endpoint
+                )
+            ):
                 return False
             local = list(self._local_blocks.get(room, []))
             remote = list(self._remote_blocks[room])
             endpoint = self._remote_endpoint[room]
+            local_swa = list(self._local_swa_blocks.get(room, []))
+            remote_swa = list(self._remote_swa_blocks.get(room, []))
+            swa_endpoint = self._remote_swa_endpoint.get(room, "")
         # start_read needs equal-length, position-paired remote/local. Reconcile
         # the two independent ways they can differ:
         #   - decode prefix-cache hit: decode already holds the head pages and
@@ -476,14 +618,14 @@ class RaidenKVManager(CommonKVManager):
         #     prefill produced no KV for, so drop it from local.
         # Empty local => full prefix hit; pull nothing (and avoid remote[-0:],
         # which would select the whole list).
-        if not local:
-            remote = []
-        elif len(remote) > len(local):
-            remote = remote[-len(local) :]
-        elif len(remote) < len(local):
-            local = local[: len(remote)]
+        remote, local = self._pair_blocks(remote, local)
         engine = self._ensure_engine()
         engine.start_read(str(room), room, endpoint, remote, local)
+        if self._swa_engine is not None:
+            remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
+            self._swa_engine.start_read(
+                self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
+            )
         return True
 
     # ----- asymmetric-TP resharding (producer-push) -------------------------
@@ -784,28 +926,42 @@ class RaidenKVManager(CommonKVManager):
     # ----- completion queries (drained by poll()) ---------------------------
 
     def is_send_done(self, room: int) -> bool:
-        return str(room) in self._completed_send
+        rid = str(room)
+        return rid in self._completed_send and (
+            self._swa_engine is None or self._swa_req_id(room) in self._completed_send
+        )
 
     def is_recv_done(self, room: int) -> bool:
-        return str(room) in self._completed_recv
+        rid = str(room)
+        return rid in self._completed_recv and (
+            self._swa_engine is None or self._swa_req_id(room) in self._completed_recv
+        )
 
     def is_failed(self, room: int) -> bool:
-        return str(room) in self._failed
+        return str(room) in self._failed or self._swa_req_id(room) in self._failed
 
     def clear_room(self, room: int) -> None:
         rid = str(room)
+        swa_rid = self._swa_req_id(room)
         with self._state_lock:
             self._completed_send.discard(rid)
+            self._completed_send.discard(swa_rid)
             self._completed_recv.discard(rid)
+            self._completed_recv.discard(swa_rid)
             self._failed.discard(rid)
+            self._failed.discard(swa_rid)
             for d in (
                 getattr(self, "_send_blocks", None),
+                getattr(self, "_send_swa_blocks", None),
                 getattr(self, "_send_aux", None),
                 getattr(self, "_decode_addr", None),
                 getattr(self, "_local_blocks", None),
+                getattr(self, "_local_swa_blocks", None),
                 getattr(self, "_decode_aux_index", None),
                 getattr(self, "_remote_blocks", None),
+                getattr(self, "_remote_swa_blocks", None),
                 getattr(self, "_remote_endpoint", None),
+                getattr(self, "_remote_swa_endpoint", None),
                 getattr(self, "_reshard_req", None),
                 getattr(self, "_reshard_meta", None),
                 getattr(self, "_reshard_sources", None),
@@ -868,12 +1024,18 @@ class RaidenKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         if self.kv_mgr.is_dummy_cp_rank:
             return
         self._record_transfer_indices(kv_indices, state_indices)
+        swa_blocks = (
+            self.kv_mgr._swa_blocks_from_state_indices(state_indices)
+            if state_indices is not None
+            else None
+        )
         self.kv_mgr.append_send_blocks(
-            self.bootstrap_room, [int(x) for x in kv_indices]
+            self.bootstrap_room, [int(x) for x in kv_indices], swa_blocks
         )
         if self._last_chunk and not self._started:
             self._started = True
@@ -920,7 +1082,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
     ):
         if self.conclude_state == KVPoll.Failed:
@@ -928,6 +1090,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         self.kv_mgr.register_decode_request(
             self.bootstrap_room,
             [int(x) for x in kv_indices],
+            self.kv_mgr._swa_blocks_from_state_indices(state_indices),
             aux_index,
             self.bootstrap_infos,
         )

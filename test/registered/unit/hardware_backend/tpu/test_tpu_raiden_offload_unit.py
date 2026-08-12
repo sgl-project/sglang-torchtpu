@@ -13,10 +13,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import inspect
+import threading
 import unittest
+from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.disaggregation.base.conn import BaseKVSender, StateType
+from sglang.srt.disaggregation.raiden.conn import (
+    RaidenKVManager,
+    RaidenKVSender,
+    get_raiden_kv_caches,
+)
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -59,6 +68,192 @@ def _make_host_pool(page_size=4, page_num=3):
 
 
 class TestRaidenHostPoolPaging(CustomTestCase):
+    def test_sender_matches_base_api_contract(self):
+        for method_name in ("__init__", "send"):
+            base_params = inspect.signature(
+                getattr(BaseKVSender, method_name)
+            ).parameters
+            raiden_params = inspect.signature(
+                getattr(RaidenKVSender, method_name)
+            ).parameters
+            self.assertEqual(list(raiden_params), list(base_params))
+
+    def test_uniform_kv_caches_are_returned(self):
+        class _Pool:
+            start_layer = 0
+            layer_num = 2
+            buffers = [torch.empty(3, 4), torch.empty(3, 4)]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        pool = _Pool()
+        groups = get_raiden_kv_caches(pool)
+        self.assertEqual(groups.full, pool.buffers)
+        self.assertEqual(groups.swa, [])
+
+    def test_mixed_block_counts_require_uniform_swa_memory(self):
+        class _Pool:
+            start_layer = 0
+            layer_num = 2
+            buffers = [torch.empty(2, 4), torch.empty(3, 4)]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        with self.assertRaisesRegex(RuntimeError, "uniform full KV block counts"):
+            get_raiden_kv_caches(_Pool())
+
+    def test_hybrid_swa_caches_are_grouped_by_page_namespace(self):
+        class _Pool:
+            start_layer = 0
+            layer_num = 4
+            layers_mapping = {
+                0: (0, False),
+                1: (0, True),
+                2: (1, False),
+                3: (1, True),
+            }
+            buffers = [
+                torch.empty(3, 4),
+                torch.empty(2, 4),
+                torch.empty(3, 4),
+                torch.empty(2, 4),
+            ]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        groups = get_raiden_kv_caches(_Pool())
+        self.assertEqual(groups.full, [_Pool.buffers[0], _Pool.buffers[2]])
+        self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
+
+    def test_symmetric_pull_rendezvous_works_with_reshard_enabled(self):
+        class _Engine:
+            def __init__(self):
+                self.register_read = Mock()
+
+        room = 17
+        blocks = [3, 9]
+        for finalize_first in (False, True):
+            with self.subTest(finalize_first=finalize_first):
+                mgr = object.__new__(RaidenKVManager)
+                mgr._state_lock = threading.Lock()
+                mgr._push_lock = threading.Lock()
+                mgr._send_blocks = {}
+                mgr._send_aux = {}
+                mgr._decode_addr = {}
+                mgr._replied = set()
+                mgr._reshard_req = {}
+                mgr._reshard_finalized = set()
+                mgr._reshard_enabled = True
+                mgr._engine = _Engine()
+                mgr._swa_engine = None
+                mgr._swa_kv_caches = []
+                mgr._send_swa_blocks = {}
+                mgr.swa_raiden_endpoint = None
+                mgr.raiden_endpoint = "127.0.0.1:31020"
+                socket = Mock()
+                mgr._connect = Mock(return_value=socket)
+
+                mgr.append_send_blocks(room, blocks)
+                if finalize_first:
+                    mgr.finalize_send(room, None)
+                    mgr._engine.register_read.assert_not_called()
+                    mgr._decode_addr[room] = ("127.0.0.1", 31002)
+                    mgr._maybe_reply(room)
+                else:
+                    mgr._decode_addr[room] = ("127.0.0.1", 31002)
+                    mgr._maybe_reply(room)
+                    mgr._engine.register_read.assert_not_called()
+                    mgr.finalize_send(room, None)
+
+                mgr._engine.register_read.assert_called_once_with(
+                    str(room), room, blocks
+                )
+
+    def test_hybrid_swa_rendezvous_registers_both_engines(self):
+        room = 23
+        full_blocks = [3, 9]
+        swa_blocks = [5, 7]
+        mgr = object.__new__(RaidenKVManager)
+        mgr.kv_args = Mock(state_types=[StateType.SWA])
+        mgr._state_lock = threading.Lock()
+        mgr._push_lock = threading.Lock()
+        mgr._send_blocks = {}
+        mgr._send_swa_blocks = {}
+        mgr._send_aux = {}
+        mgr._decode_addr = {}
+        mgr._replied = set()
+        mgr._reshard_req = {}
+        mgr._reshard_finalized = set()
+        mgr._engine = Mock()
+        mgr._swa_engine = Mock()
+        mgr._swa_kv_caches = [object()]
+        mgr.raiden_endpoint = "127.0.0.1:31020"
+        mgr.swa_raiden_endpoint = "127.0.0.1:31022"
+        mgr._completed_send = set()
+        socket = Mock()
+        mgr._connect = Mock(return_value=socket)
+
+        swa_from_state = mgr._swa_blocks_from_state_indices([swa_blocks])
+        mgr.append_send_blocks(room, full_blocks, swa_from_state)
+        mgr._decode_addr[room] = ("127.0.0.1", 31002)
+        mgr.finalize_send(room, None)
+
+        mgr._engine.register_read.assert_called_once_with(str(room), room, full_blocks)
+        mgr._swa_engine.register_read.assert_called_once_with(
+            mgr._swa_req_id(room), room, swa_blocks
+        )
+        payload = socket.send_multipart.call_args.args[0]
+        self.assertEqual(len(payload), 7)
+        self.assertEqual(payload[5], b"127.0.0.1:31022")
+
+        self.assertFalse(mgr.is_send_done(room))
+        mgr._completed_send.update((str(room), mgr._swa_req_id(room)))
+        self.assertTrue(mgr.is_send_done(room))
+
+    def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
+        room = 29
+        mgr = object.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._swa_engine = Mock()
+        mgr._local_blocks = {room: [8, 9]}
+        mgr._local_swa_blocks = {room: [7]}
+        mgr._remote_blocks = {room: [1, 2, 3]}
+        mgr._remote_swa_blocks = {room: [4, 5]}
+        mgr._remote_endpoint = {room: "127.0.0.1:31020"}
+        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_called_once_with(
+            str(room), room, "127.0.0.1:31020", [2, 3], [8, 9]
+        )
+        mgr._swa_engine.start_read.assert_called_once_with(
+            mgr._swa_req_id(room), room, "127.0.0.1:31022", [5], [7]
+        )
+
+    def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
+        mgr = object.__new__(RaidenKVManager)
+        mgr._swa_engine = Mock()
+        mgr._reshard_enabled = True
+        mgr._register_reshard_request = Mock()
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "cannot reshard hybrid SWA KV caches.*2 prefill sources",
+        ):
+            mgr.register_decode_request(
+                room=31,
+                local_blocks=[8, 9],
+                local_swa_blocks=[6, 7],
+                aux_index=None,
+                bootstrap_infos=[{}, {}],
+            )
+
+        mgr._register_reshard_request.assert_not_called()
+
     def test_alloc_returns_page_aligned_token_runs(self):
         pool = _make_host_pool(page_size=4, page_num=3)
         idx = pool.alloc(8)
