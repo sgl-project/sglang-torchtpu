@@ -94,16 +94,22 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn(str(indices.tolist()), msg)
 
     def test_shm_allocator(self):
-        shm_host_pool = MHATokenToKVPoolHost(
-            device_pool=self.device_pool,
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=self.page_size,
-            layout="layer_first",
-            pin_memory=False,
-            device="cpu",
-            allocator_type="shm",
-        )
+        # Same pinned memory probe as setUp: the fixed 10 GB reserve rejects
+        # even a ~0-byte pool on a low-memory CI runner.
+        with patch(
+            "sglang.srt.mem_cache.pool_host.base.psutil.virtual_memory"
+        ) as mock_vm:
+            mock_vm.return_value.available = 1 << 40  # 1 TiB
+            shm_host_pool = MHATokenToKVPoolHost(
+                device_pool=self.device_pool,
+                host_to_device_ratio=2.0,
+                host_size=0,
+                page_size=self.page_size,
+                layout="layer_first",
+                pin_memory=False,
+                device="cpu",
+                allocator_type="shm",
+            )
         self.assertIsNotNone(shm_host_pool.fd)
         self.assertGreaterEqual(shm_host_pool.fd, 0)
 
