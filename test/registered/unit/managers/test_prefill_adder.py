@@ -542,8 +542,14 @@ class TestPrefillAdder(CustomTestCase):
                 self.assertEqual(len(adder.can_run_list), 0)
 
     def test_swa_budget_for_req(self):
-        # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
-        # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the
+        # Unchunked: budget = max(extend - window, 0)
+        #                     + min(extend + max_new, window) + page.
+        # Chunked (rem_chunk set): budget = min(extend, rem_chunk)
+        #                     + min(extend + max_new, window) + page --
+        # the chunk and the window reservation are charged ADDITIVELY, because
+        # until the overlap result commits the allocator's evictable count can
+        # still include this request's retained window; offsetting them can
+        # over-admit and force retraction. The decode headroom is the SWA the
         # request adds to its own sliding window (extend + decode), capped at the
         # window -- a cached prefix funds the rest -- rather than a constant
         # window, which over-charged short requests into an admission livelock.
@@ -553,11 +559,12 @@ class TestPrefillAdder(CustomTestCase):
             (64, 32, None, 128, 16, 96 + 16, "short_req_reserves_below_window"),
             (10, 20, None, 512, 8, 30 + 8, "short_resume_tiny_budget"),
             (300, 512, None, 128, 16, 300 + 16, "big_extend_over_window"),
-            (200, 512, 50, 64, 8, 64 + 8, "chunk_capped_alloc_hits_floor"),
-            # Multi-chunk: alloc = rem_chunk (1024) caps a huge extend, and the
-            # chunk itself exceeds the window, so term1 = alloc - window is driven
-            # by the chunk, not the full extend -> budget = chunk + page.
-            (2000, 256, 1024, 512, 16, 1024 + 16, "multichunk_alloc_over_window"),
+            # Chunked: alloc = min(200, 50) = 50 charged on top of the
+            # window-floored reservation (64 + 8).
+            (200, 512, 50, 64, 8, 50 + 64 + 8, "chunk_capped_alloc_added_to_floor"),
+            # Multi-chunk: alloc = rem_chunk (1024) caps a huge extend and is
+            # charged additively with the window reservation (512 + 16).
+            (2000, 256, 1024, 512, 16, 1024 + 512 + 16, "multichunk_alloc_added"),
             (0, 512, None, 128, 16, 128 + 16, "extend_zero_long_decode"),
             (0, 40, None, 128, 16, 40 + 16, "extend_zero_short_decode"),
         ]
