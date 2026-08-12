@@ -76,6 +76,12 @@ class SRTPlatform(DeviceMixin):
 
         return get_mha_host_pool_cls(device_pool)
 
+    def get_mamba_pool_cls(self) -> type:
+        """Return the recurrent (GDN / mamba) state pool class for this platform."""
+        from sglang.srt.mem_cache.memory_pool import MambaPool
+
+        return MambaPool
+
     def get_mla_kv_pool_cls(self) -> type:
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError

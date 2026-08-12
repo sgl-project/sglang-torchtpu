@@ -1236,6 +1236,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
     ):
+        # Platform selects the pool class (TpuMambaPool on TPU); overrides the
+        # ``mamba_pool_cls = MambaPool`` class-attr default.
+        self.mamba_pool_cls = current_platform.get_mamba_pool_cls()
         self.mamba_pool = self.mamba_pool_cls(
             size=mamba_size,
             spec_state_size=mamba_spec_state_size,
@@ -3667,7 +3670,9 @@ class HybridLinearKVPool(KVCache):
             TokenToKVPoolClass = MHATokenToKVPool
             quant_method_kwarg = {"quant_method": quant_method}
 
-            if current_platform.is_out_of_tree():
+            # TPU is a known-enum platform (is_out_of_tree() is False) but still
+            # overrides the MHA pool class (fused RPA-v3 layout), so include it.
+            if current_platform.is_out_of_tree() or current_platform.is_tpu():
                 TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
                 quant_method_kwarg = {}
             elif _is_npu:
@@ -3832,6 +3837,12 @@ class HybridLinearKVPool(KVCache):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_raw_kv_buffer(layer_id)
+
+    def get_fused_kv_buffer(self, layer_id: int):
+        # TPU fused-KV layout (TpuFusedMHATokenToKVPool + RPA v3 backend).
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_fused_kv_buffer(layer_id)
 
     def get_dequant_workspace(self) -> tuple[torch.Tensor, torch.Tensor]:
         return self.full_kv_pool.get_dequant_workspace()
