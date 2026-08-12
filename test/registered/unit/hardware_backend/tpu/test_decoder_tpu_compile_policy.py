@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -90,11 +91,7 @@ def _target_and_padding(policy):
 
 
 def _run_cases(policy, mode):
-    with patch(
-        "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-        "get_tensor_model_parallel_rank",
-        return_value=1,
-    ):
+    with get_parallel().override(tp_rank=1):
         if mode == ForwardMode.EXTEND:
             policy._precompile_extend()
         else:
@@ -508,11 +505,7 @@ class TestPrecompileLoops(CustomTestCase):
         policy.extend_bs = 16
         policy._run_one = MagicMock()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy._precompile_extend()
 
         self.assertEqual(policy._run_one.call_count, 2)
@@ -550,11 +543,7 @@ class TestPrecompileLoops(CustomTestCase):
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
@@ -698,11 +687,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         )
         policy.extend_bs = 16
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy._precompile_extend_full()
 
         self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
@@ -712,16 +697,8 @@ class TestSpecPrecompileLoops(CustomTestCase):
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
         # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
-        # in spec_decode_compile_policy. Patch the rank helper in both.
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        # in spec_decode_compile_policy. One topology override serves both.
+        with get_parallel().override(tp_rank=1):
             policy.precompile()
         # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
         # TARGET_VERIFY buckets bs: (4,1),(16,4)=2  EXTEND(FULL) 2
@@ -732,11 +709,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
     def test_draft_worker_skips_precompile(self):
         mr = _spec_model_runner(is_draft_worker=True)
         policy = _make_spec_policy(mr)
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile()
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mr.attn_backend.calls, [])
@@ -749,11 +722,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         draft_backend = SimpleNamespace(attn_backends=decode_backends)
         draft_extend_backend = _FakeAttnBackend()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_backend, draft_extend_backend)
 
         self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
@@ -1178,11 +1147,7 @@ class TestDraftPrecompile(CustomTestCase):
         draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
         draft_extend_attn_backend = _FakeAttnBackend()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
 
         # EXTEND(LAST) 2 token buckets at the bs cap + DECODE 2 bs x 3 steps
@@ -1251,13 +1216,10 @@ def _serving_stubs():
     ), patch(
         "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
         return_value=False,
-    ), patch(
-        "sglang.srt.server_args.get_global_server_args",
-        return_value=SimpleNamespace(
-            speculative_use_rejection_sampling=False,
-            speculative_accept_threshold_single=1.0,
-            speculative_accept_threshold_acc=1.0,
-        ),
+    ), get_context().override_server_args(
+        speculative_use_rejection_sampling=False,
+        speculative_accept_threshold_single=1.0,
+        speculative_accept_threshold_acc=1.0,
     ):
         yield
 
