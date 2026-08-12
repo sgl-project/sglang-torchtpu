@@ -43,7 +43,7 @@ def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
 
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
-    from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_rank
+    from sglang.srt.runtime_context import get_parallel
 
     global_device_id, physical_order = _get_physical_rank_metadata()
 
@@ -54,7 +54,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     )
     group_offset = torch.tensor(
         [
-            get_moe_expert_parallel_rank() * layer.num_local_experts,
+            get_parallel().moe_ep_rank * layer.num_local_experts,
             global_device_id,
         ],
         dtype=torch.int32,

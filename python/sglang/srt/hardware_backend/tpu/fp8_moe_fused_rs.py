@@ -127,17 +127,12 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
 
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
     from sglang.srt.distributed import get_tp_group
-    from sglang.srt.distributed.parallel_state import (
-        get_moe_expert_parallel_world_size,
-    )
-
-    ep_size = get_moe_expert_parallel_world_size()
-    runner_config = layer.moe_runner_config
-
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.runtime_context import get_exec, get_parallel
 
+    runner_config = layer.moe_runner_config
     parallel = get_parallel()
+    ep_size = parallel.moe_ep_size
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         ep_size=ep_size,

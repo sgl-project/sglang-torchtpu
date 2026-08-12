@@ -18,7 +18,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.distributed import get_tensor_model_parallel_rank, get_tp_group
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -594,7 +594,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         if _is_tpu:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             layer.tpu_fp8_output_tp_rank = (
                 tp_rank if output_size != output_size_per_partition else 0
             )
@@ -643,7 +643,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
                 if _is_tpu and not use_mxfp8:
-                    tp_rank = get_tensor_model_parallel_rank()
+                    tp_rank = get_parallel().tp_rank
                     output_tp_rank = (
                         tp_rank if output_size != output_size_per_partition else 0
                     )
@@ -2319,7 +2319,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
                 self.handles_moe_reduction = prepare_fp8_fused_rs(layer)
-                if self.handles_moe_reduction and get_tensor_model_parallel_rank() == 0:
+                if self.handles_moe_reduction and get_parallel().tp_rank == 0:
                     logger.info_once("Using TPU Pallas FP8 fused-RS MoE backend")
                 if (
                     moe_runner_backend.is_pallas_tpu_fused_rs()

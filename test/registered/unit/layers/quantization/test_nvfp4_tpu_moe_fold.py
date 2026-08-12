@@ -183,10 +183,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(attn_dp_size=1)
-        server_args = types.SimpleNamespace(
-            enable_dp_attention=False,
-            enable_fused_moe_sum_all_reduce=False,
+        parallel = types.SimpleNamespace(attn_dp_size=1, enable_dp_attention=False)
+        exec_ns = types.SimpleNamespace(
+            moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
         a2a_backend = types.SimpleNamespace(is_none=lambda: True)
         with (
@@ -197,9 +196,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
-            mock.patch(
-                "sglang.srt.runtime_context.get_server_args", return_value=server_args
-            ),
+            mock.patch("sglang.srt.runtime_context.get_exec", return_value=exec_ns),
             mock.patch(
                 "sglang.srt.layers.moe.get_moe_a2a_backend",
                 return_value=a2a_backend,
@@ -252,7 +249,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 )
             )
             del layer.supports_tpu_fused_rs_post_expert_norm
-            server_args.enable_dp_attention = True
+            parallel.enable_dp_attention = True
             self.assertFalse(
                 can_use_tpu_nvfp4_fused_rs(
                     layer, group_size=BLOCK_SIZE, no_combine=False
@@ -282,10 +279,9 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         tp_group = types.SimpleNamespace(world_size=4)
         world_group = types.SimpleNamespace(world_size=4)
-        parallel = types.SimpleNamespace(attn_dp_size=1)
-        server_args = types.SimpleNamespace(
-            enable_dp_attention=False,
-            enable_fused_moe_sum_all_reduce=False,
+        parallel = types.SimpleNamespace(attn_dp_size=1, enable_dp_attention=False)
+        exec_ns = types.SimpleNamespace(
+            moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
         )
         a2a_backend = types.SimpleNamespace(is_none=lambda: True)
         with (
@@ -296,9 +292,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel", return_value=parallel
             ),
-            mock.patch(
-                "sglang.srt.runtime_context.get_server_args", return_value=server_args
-            ),
+            mock.patch("sglang.srt.runtime_context.get_exec", return_value=exec_ns),
             mock.patch(
                 "sglang.srt.layers.moe.get_moe_a2a_backend",
                 return_value=a2a_backend,
@@ -1115,13 +1109,14 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
             ),
             mock.patch(
                 "sglang.srt.runtime_context.get_parallel",
-                return_value=types.SimpleNamespace(attn_dp_size=1),
+                return_value=types.SimpleNamespace(
+                    attn_dp_size=1, enable_dp_attention=False
+                ),
             ),
             mock.patch(
-                "sglang.srt.runtime_context.get_server_args",
+                "sglang.srt.runtime_context.get_exec",
                 return_value=types.SimpleNamespace(
-                    enable_dp_attention=False,
-                    enable_fused_moe_sum_all_reduce=False,
+                    moe=types.SimpleNamespace(enable_fused_moe_sum_all_reduce=False)
                 ),
             ),
             mock.patch(

@@ -13,7 +13,6 @@ import tqdm
 
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
@@ -35,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -613,14 +613,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 desc="Compiling EXTEND/MIXED",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else compile_cases
         )
         for num_tokens, bs, mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(num_tokens=num_tokens, bs=bs, mode=mode)
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
@@ -645,14 +645,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 desc="Compiling DECODE",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else bs_buckets
         )
         for bs in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(num_tokens=bs, bs=bs, mode=ForwardMode.DECODE)
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
@@ -985,7 +985,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 desc="Compiling VL EXTEND",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else compile_items
         )
         for num_tokens, bs, mode, variant in compile_range:
@@ -997,7 +997,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 mode=mode,
                 variant=variant,
             )
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
@@ -1024,7 +1024,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 desc="Compiling VL DECODE",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else bs_buckets
         )
         for bs in compile_range:
@@ -1036,7 +1036,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 mode=ForwardMode.DECODE,
                 variant="text_only",
             )
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)

@@ -533,8 +533,8 @@ class TestForwardTpuContract(CustomTestCase):
 
 class TestForwardTpuViaDispatch(CustomTestCase):
     """Integration: ``BaseFusedOp.forward`` -> dispatch -> ``forward_tpu``
-    -> kernel. Pins ``_platform_key()`` to ``"tpu"`` so the method's
-    ``__init__`` caches ``forward_tpu`` on ``self._forward_method``.
+    -> kernel. Pins ``_platform_key()`` to ``"tpu"`` so dispatch resolution
+    (lazy, on first call / ``dispatch_forward()``) lands on ``forward_tpu``.
     Confirms the dispatch wiring is intact on top of the method's
     contract.
     """
@@ -546,16 +546,15 @@ class TestForwardTpuViaDispatch(CustomTestCase):
     def tearDown(self):
         self.runner.stop()
 
-    def test_dispatch_caches_forward_tpu_on_init(self):
-        """The chosen forward method is bound at ``__init__`` time and
-        stored on ``self._forward_method``. Pin its identity so an
-        accidental rename in ``BaseFusedOp`` (or a regression in the
-        platform-key branch ordering) catches here -- the most common
-        failure mode would be silently dropping back to
+    def test_dispatch_resolves_forward_tpu(self):
+        """``dispatch_forward()`` must resolve to ``forward_tpu``. Pin its
+        identity so an accidental rename in ``BaseFusedOp`` (or a
+        regression in the platform-key branch ordering) catches here --
+        the most common failure mode would be silently dropping back to
         ``forward_native``.
         """
         self.assertEqual(
-            self.runner.method._forward_method.__func__.__name__,
+            self.runner.method.dispatch_forward().__func__.__name__,
             "forward_tpu",
         )
 

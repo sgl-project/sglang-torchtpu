@@ -31,6 +31,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         server_args = SimpleNamespace(
             max_speculative_num_draft_tokens=self.DRAFT_TOKENS,
             speculative_algorithm="EAGLE3",
+            speculative_num_steps=None,
             speculative_eagle_topk=1,
             page_size=self.PAGE_SIZE,
         )
@@ -77,10 +78,11 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
 
     def test_pages_per_seq_uses_context_plus_spec_headroom(self):
         backend = self._make_backend()
-        self.assertEqual(backend.max_context_len, self.CONTEXT_LEN + 12)
+        # extra = max(4 + draft, 2*max(steps*topk, draft) + page - 1) = 79
+        self.assertEqual(backend.max_context_len, self.CONTEXT_LEN + 79)
         self.assertEqual(
             (backend.max_context_len + self.PAGE_SIZE - 1) // self.PAGE_SIZE,
-            2049,
+            2050,
         )
         self.assertLess(backend.max_context_len, self.POOL_WIDTH)
 
@@ -100,7 +102,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         capacity = metadata.cu_kv_lens[1].item()
         self.assertEqual(metadata.kv_lens.item(), self.CONTEXT_LEN + 6)
         self.assertLessEqual(metadata.kv_lens.item(), capacity)
-        self.assertEqual(metadata.page_indices.numel(), 2049)
+        self.assertEqual(metadata.page_indices.numel(), 2050)
 
     def test_target_verify_rejects_bump_above_page_stride(self):
         for req_to_token_device in ("cpu", "meta"):
@@ -113,7 +115,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
                         backend,
                         ForwardMode.TARGET_VERIFY,
                         SimpleNamespace(draft_token_num=self.DRAFT_TOKENS),
-                        seq_len=131130,
+                        seq_len=131194,
                     )
 
     def test_multistep_decode_bump_fits_rectangular_page_stride(self):
@@ -141,7 +143,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
                         backend,
                         ForwardMode.DECODE,
                         SimpleNamespace(),
-                        seq_len=131130,
+                        seq_len=131194,
                     )
 
     def test_seq_lens_cpu_list_and_empty_inputs(self):

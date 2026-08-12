@@ -161,6 +161,7 @@ def _load_standard_dispatcher(get_parallel, get_backend):
         "get_parallel": get_parallel,
         "get_moe_runner_backend": get_backend,
         "_use_aiter": False,
+        "_is_tpu": False,
         "get_moe_a2a_backend": lambda: types.SimpleNamespace(
             supports_aiter=lambda: False
         ),

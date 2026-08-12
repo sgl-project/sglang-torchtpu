@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.srt.distributed import get_moe_expert_parallel_rank
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -31,6 +30,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -885,7 +885,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             kernel_topk_weights,
             topk_ids,
             layer.num_local_experts,
-            get_moe_expert_parallel_rank(),
+            get_parallel().moe_ep_rank,
         )
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
