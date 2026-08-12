@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
     SGLANG_GRPC_ENDPOINT_ENV,
     Sidecar,
@@ -1266,6 +1267,43 @@ class TestHiCacheArgs(unittest.TestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
+
+    def _make_tpu_offload_args(
+        self, io_backend: str, is_hybrid_swa: bool
+    ) -> ServerArgs:
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_io_backend=io_backend,
+            hicache_mem_layout="page_first_fused",
+            attention_backend="pallas_tpu_rpa_v3",
+        )
+        # Short-circuit get_model_config(): the TPU io-backend guards only read
+        # attention_arch (use_mla_backend) and is_hybrid_swa.
+        args.model_config = MagicMock()
+        args.model_config.attention_arch = AttentionArch.MHA
+        args.model_config.is_hybrid_swa = is_hybrid_swa
+        return args
+
+    def test_torch_tpu_io_backend_rejects_hybrid_swa(self):
+        # The torch_tpu host pool mirrors only the full-attention pool; a
+        # hybrid sliding-window model's SWA sub-pool has its own page-id space
+        # with no host storage, so the combination must refuse at startup
+        # instead of failing deep inside pool construction.
+        args = self._make_tpu_offload_args("torch_tpu", is_hybrid_swa=True)
+        with self.assertRaisesRegex(ValueError, "hybrid sliding-window"):
+            args._handle_hicache()
+
+    def test_raiden_io_backend_accepts_hybrid_swa(self):
+        # raiden builds one host pool + engine per SWAKVPool sub-pool, so the
+        # hybrid combination is admitted.
+        args = self._make_tpu_offload_args("raiden", is_hybrid_swa=True)
+        args._handle_hicache()
+        self.assertEqual(args.hicache_io_backend, "raiden")
+
+    def test_tpu_io_backend_accepts_non_hybrid(self):
+        args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
+        args._handle_hicache()
+        self.assertEqual(args.hicache_io_backend, "raiden")
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

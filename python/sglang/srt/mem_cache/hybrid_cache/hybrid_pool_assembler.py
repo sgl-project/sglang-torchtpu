@@ -81,8 +81,15 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    # The MHA host-pool class is a platform decision (TPU substitutes its
+    # fused/raiden host pools); the platform default delegates to
+    # get_mha_host_pool_cls.
+    from sglang.srt.platforms import current_platform
+
     kv_host_pool_cls = (
-        MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
+        MLATokenToKVPoolHost
+        if use_mla
+        else current_platform.get_mha_kv_pool_host_cls(kv_pool)
     )
     kwargs = {}
     if override_kv_cache_dim is not None:
@@ -298,7 +305,7 @@ def build_hybrid_swa_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = HybridCacheController.create_for_backend(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         params.page_size,

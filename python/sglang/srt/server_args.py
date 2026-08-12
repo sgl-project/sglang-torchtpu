@@ -7390,6 +7390,21 @@ class ServerArgs:
                     "--attention-backend pallas_tpu_rpa_v3, or disable KV offload."
                 )
 
+            if (
+                self.hicache_io_backend == "torch_tpu"
+                and self.get_model_config().is_hybrid_swa
+            ):
+                raise ValueError(
+                    "torch_tpu KV offloading does not support hybrid "
+                    "sliding-window models: its host pool mirrors only the "
+                    "full-attention pool, and the SWA sub-pool has its own "
+                    "page-id space with no host storage. Re-run with "
+                    "--hicache-io-backend raiden (one host pool per sub-pool), "
+                    "with --disable-hybrid-swa-memory (sliding layers then "
+                    "share the full-size pool), or without "
+                    "--enable-hierarchical-cache."
+                )
+
         if (
             self.hicache_io_backend == "raiden"
             and self.hicache_storage_backend is not None

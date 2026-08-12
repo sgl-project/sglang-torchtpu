@@ -218,6 +218,22 @@ class HybridCacheController(BaseHiCacheController):
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
 
+    @classmethod
+    def create_for_backend(cls, *args, **kwargs) -> HybridCacheController:
+        """Instantiate the io-backend-specific hybrid controller.
+
+        Mirrors ``HiCacheController.create_for_backend``: the raiden io backend
+        has no device streams and drives per-pool all-layer DMAs, so it needs
+        its own controller class.
+        """
+        if kwargs.get("io_backend") == "raiden":
+            from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
+                TpuRaidenHybridCacheController,
+            )
+
+            return TpuRaidenHybridCacheController(*args, **kwargs)
+        return cls(*args, **kwargs)
+
     def _start_storage_threads(self):
         super()._start_storage_threads()
         self._init_extra_host_mem_release_queues()

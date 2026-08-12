@@ -40,9 +40,17 @@ RAIDEN_LAYOUT = "fused_raiden"
 
 
 class TpuRaidenHostKVCache(HostKVCache):
-    """Page-granular host KV pool whose storage + transfer live in raiden."""
+    """Page-granular host KV pool whose storage + transfer live in raiden.
+
+    One instance mirrors one fused device pool: a hybrid sliding-window model
+    builds two of these (one per ``SWAKVPool`` sub-pool), each owning a raiden
+    engine over just its sub-pool's layers and page-id space.
+    """
 
     device_pool: TpuFusedMHATokenToKVPool
+    # The hybrid HostPoolGroup reads this directly off every entry; the JIT
+    # write-back path is a CUDA kernel feature.
+    can_use_write_back_jit = False
 
     def __init__(
         self,
@@ -54,18 +62,24 @@ class TpuRaidenHostKVCache(HostKVCache):
         pin_memory: bool = False,
         device: str = "cpu",
         allocator_type: str = "default",
+        *,
         pool_label: str = "kv",
+        mtp_draft_device_pools: tuple = (),
     ):
+        if mtp_draft_device_pools:
+            raise NotImplementedError(
+                "MTP draft KV offload is not supported on the TPU raiden path."
+            )
         # Deliberately do NOT call ``HostKVCache.__init__``: it allocates a
         # torch host buffer via ``init_kv_buffer`` and does a psutil RAM check.
         # raiden owns (and bounds-checks) the host pool, so we only replicate
         # the sizing math here, then build the transfer engine.
         self.device_pool = device_pool
+        self.pool_label = pool_label
         self.page_size = page_size
         self.layout = RAIDEN_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
-        self.pool_label = pool_label
 
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
