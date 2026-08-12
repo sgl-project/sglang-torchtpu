@@ -71,12 +71,12 @@ jobs:
       id-token: write
 
   multihost-combo:
-    # Chained: shares the hosts=2 slice with multi-host.
-    needs: [build, multi-host]
-    if: ${{ !cancelled() && needs.build.result == 'success' && contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
+    # Unchained: Kueue queues the hosts=2 jobs against slice quota, so this no longer has
+    # to wait for multi-host to finish just to keep a third claimant off a depth-1 mutex.
+    needs: build
+    if: ${{ contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
     strategy:
       fail-fast: false
-      max-parallel: 1   # one 2x2x2 slice
       matrix:
         row: [pd, spec]
     name: multihost-combo-test-${{ matrix.row }}
@@ -123,7 +123,6 @@ jobs:
     if: needs.discover.outputs.groups != '[]'
     strategy:
       fail-fast: false
-      max-parallel: 1   # one 2x2x2 slice
       matrix:
         group: ${{ fromJSON(needs.discover.outputs.groups) }}
     name: ${{ matrix.group.name }}

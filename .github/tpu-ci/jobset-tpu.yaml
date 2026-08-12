@@ -24,6 +24,13 @@ kind: JobSet
 metadata:
   generateName: tpu-ci-${RUN_NAME}-
   namespace: tpu-ci
+  labels:
+    # Hands admission to Kueue (see kueue-tpu.yaml): the JobSet is created suspended and
+    # starts only once a whole slice's quota is free, so its pods cannot half-allocate a
+    # slice. The nodeSelector below still pins the pool -- redundant while each slice
+    # class has one pool, but it keeps pods off the dev pools if Kueue is absent. Drop the
+    # ci-tpu-pool pin in the same change that adds a second slice flavor.
+    kueue.x-k8s.io/queue-name: ${QUEUE}
 spec:
   ttlSecondsAfterFinished: 7200
   failurePolicy:

@@ -1,0 +1,101 @@
+# Kueue admission for the TPU CI slices. Apply once per cluster:
+#
+#   kubectl apply --server-side -f \
+#     https://github.com/kubernetes-sigs/kueue/releases/download/v0.10.1/manifests.yaml
+#   kubectl -n kueue-system rollout status deploy/kueue-controller-manager
+#   kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
+#
+# WHY: a JobSet asks for HOSTS pods at once, and kube-scheduler places pods one at a
+# time -- it will hand node 1 to JobSet A and node 2 to JobSet B and leave both stuck at
+# half a gang until activeDeadlineSeconds. GitHub concurrency groups were papering over
+# that by allowing only one multi-host job to exist; the group holds one in-progress plus
+# one pending, so a third claimant silently cancelled the pending one. Kueue admits a
+# JobSet only when a whole slice's quota is free, all-or-nothing, before any pod is
+# created -- so the GitHub-side throttles are no longer load-bearing and are removed.
+#
+# ONE FLAVOR PER SLICE. GKE tpu7x nodes carry no per-slice label (only accelerator,
+# topology, nodepool, hostname, zone -- and none of the cloud.google.com/gke-topology-*
+# labels Kueue's Topology-Aware Scheduling needs), so `ci-tpu-pool` is the finest slice
+# selector available. A pool holding two slices could not be split, and a JobSet's pods
+# could straddle both and fail at ICI rendezvous. Add capacity as a NEW pool.
+#
+# Sizing: tpu7x-standard-4t = 4 chips/host.
+#   2x2x1 = 4 chips  = 1 node  -> each ci-tpu7x-2x2x1 node is a whole single-host slice
+#   2x2x2 = 8 chips  = 2 nodes -> one multi-host slice per pool
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: tpu7x-2x2x1-pr-gate
+spec:
+  nodeLabels:
+    ci-tpu-pool: pr-gate
+  tolerations:
+    - key: google.com/tpu
+      operator: Exists
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: tpu7x-2x2x2-nightly
+spec:
+  nodeLabels:
+    ci-tpu-pool: nightly
+  tolerations:
+    - key: google.com/tpu
+      operator: Exists
+      effect: NoSchedule
+---
+# Single-host: 4 nodes x 4 chips. Each 2x2x1 node is an independent slice, so quota 16
+# admits four concurrent single-host jobs -- the pool's real capacity. The old
+# tpu-slice-1 concurrency group admitted ONE, stranding three quarters of it.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: tpu-singlehost
+spec:
+  namespaceSelector: {}
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+    - coveredResources: ["google.com/tpu"]
+      flavors:
+        - name: tpu7x-2x2x1-pr-gate
+          resources:
+            - name: "google.com/tpu"
+              nominalQuota: 16
+---
+# Multi-host: one slice = 8 chips = one concurrent job. Adding a second slice means a new
+# node pool (ci-tpu-pool=nightly-b), a second ResourceFlavor, and one more entry in this
+# flavors list -- parallelism then rises with no workflow change. Kueue assigns a PodSet
+# to a single flavor, which is what keeps a JobSet's two pods inside one slice.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: tpu-multihost
+spec:
+  namespaceSelector: {}
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+    - coveredResources: ["google.com/tpu"]
+      flavors:
+        - name: tpu7x-2x2x2-nightly
+          resources:
+            - name: "google.com/tpu"
+              nominalQuota: 8
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: tpu-singlehost
+  namespace: tpu-ci
+spec:
+  clusterQueue: tpu-singlehost
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: LocalQueue
+metadata:
+  name: tpu-multihost
+  namespace: tpu-ci
+spec:
+  clusterQueue: tpu-multihost

@@ -54,7 +54,6 @@ jobs:
     if: ${{ contains(fromJSON('["all","multihost","pd","spec"]'), inputs.target || 'all') }}
     strategy:
       fail-fast: false
-      max-parallel: 1   # one 2x2x2 slice; keeps tpu-slice-2 claimants <= 2 alongside the nightly
       matrix:
         # matrix context is unavailable in job-level `if`; selection shapes the matrix.
         row: ${{ (inputs.target == 'pd' && fromJSON('["pd"]')) || (inputs.target == 'spec' && fromJSON('["spec"]')) || fromJSON('["pd","spec"]') }}

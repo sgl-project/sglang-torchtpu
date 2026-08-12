@@ -9,6 +9,8 @@
 #
 #   topology : cloud.google.com/gke-tpu-topology node label
 #   pool     : ci-tpu-pool node label
+#   queue    : Kueue LocalQueue in namespace tpu-ci (see kueue-tpu.yaml) -- gang-admits
+#              the JobSet against that slice class's quota
 slices:
-  1: { topology: 2x2x1, pool: pr-gate }   # single-host: PR gate + single-host nightly
-  2: { topology: 2x2x2, pool: nightly }   # multi-host: tp = 2 x chips
+  1: { topology: 2x2x1, pool: pr-gate, queue: tpu-singlehost }   # single-host: PR gate + single-host nightly
+  2: { topology: 2x2x2, pool: nightly, queue: tpu-multihost }    # multi-host: tp = 2 x chips

@@ -54,16 +54,13 @@ permissions:
   id-token: write
 
 concurrency:
-  # Runs sharing a slice must serialize (no gang scheduler -> two multi-host JobSets on
-  # one pool could deadlock). Key on host count == the slice: all multi-host runs
-  # (hosts=2) serialize on the 2x2x2 pool; single-host (hosts=1) runs on pr-gate.
-  #
-  # Capacity is one in-progress + one pending; a third entrant cancels the pending one.
-  # So the hosts=2 budget is two callers, each throttled to one in-flight job:
-  # nightly-test-tpu.yml (multi-host matrix max-parallel 1, multihost-combo chained
-  # behind it) and combo-test-tpu.yml (matrix max-parallel 1). A third caller needs a
-  # real queue -- adding one here just moves which job gets silently cancelled.
-  group: tpu-slice-${{ inputs.hosts }}
+  # Slice admission moved to Kueue (.github/tpu-ci/kueue-tpu.yaml), which gang-admits a
+  # JobSet only when a whole slice's quota is free. This group used to be that mutex, and
+  # it was the wrong primitive: it holds one in-progress plus one pending, so a third
+  # claimant silently cancelled the pending one. Keyed per job now so it never gates --
+  # the callers' workflow-level groups (tpu-slice-nightly, tpu-combo, pr-test-tpu-<PR>)
+  # still stop two runs of the same workflow from stacking.
+  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
   cancel-in-progress: false
 
 env:
@@ -114,8 +111,33 @@ jobs:
 
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
-          for _ in $(seq 1 120); do
-            [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ] && break || sleep 5
+
+          # Kueue creates the JobSet suspended and releases it only when a whole slice's
+          # quota is free, so no pods exist while it is queued. Admission gets its own
+          # budget: queue time must not be charged against the runtime budget below.
+          admit_s=3600
+          admit_deadline=$(( $(date +%s) + admit_s ))
+          until [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ]; do
+            if [ "$(date +%s)" -ge "$admit_deadline" ]; then
+              echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- slice quota never freed"
+              kubectl -n tpu-ci get workloads 2>/dev/null | grep -- "${short}" || true
+              kubectl -n tpu-ci describe "$name" 2>/dev/null | tail -n 40 || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+          # Admitted means the gang is placed, but pods still bind and pull the image.
+          # Hold off the runtime budget until one is Running so the pull is not charged
+          # to the test.
+          running_deadline=$(( $(date +%s) + 900 ))
+          until kubectl -n tpu-ci get pods -l "$sel" \
+                  -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+            if [ "$(date +%s)" -ge "$running_deadline" ]; then
+              echo "⚠️  ${label}: no pod Running 900s after admission; continuing anyway"
+              break
+            fi
+            sleep 5
           done
 
           # Stream logs from every host (best effort; may restart while pods come up).

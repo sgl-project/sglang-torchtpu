@@ -185,6 +185,7 @@ def main():
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
         "POOL": sl["pool"],
+        "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
         "NIGHTLY_FLAG": "--nightly" if a.nightly else "",
