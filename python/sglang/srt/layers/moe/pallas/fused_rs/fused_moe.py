@@ -23,11 +23,15 @@ before the post-kernel top-k weighted reduction.
 import functools
 
 import jax
+from jax import lax
 from jax import numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from jax.experimental.pallas import tpu as pltpu
+
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
+    compute_num_gm,
     _select_fused_rs_block_sizes,
 )
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
@@ -79,35 +83,38 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 # ============================================================================
 
 
-def _compute_rs_routing(topk_indices, *, num_experts, topk):
-    """Inline routing for the RS path. Computes:
+def _compute_rs_routing(topk_indices, *, num_experts, topk, ep_size, my_id):
+    """Inline routing for the RS path with full VPU vectorized precomputations.
+    Computes:
       - lhs_indices: int32[size_m] — gather indices (token ID per row)
       - group_sizes: int32[num_experts] — rows per expert
-      - output_indices: int32[size_m] — = lhs_indices for EP
-      - topk_slot_indices: int32[size_m] — top-k slot (0..topk-1) per row
-
-    Two TPU-specific perf optimizations vs the textbook formulation:
-
-    1. ``lhs_indices`` and ``topk_slot_indices`` computed via integer arithmetic
-       (``// topk``, ``% topk``) instead of gathers — avoids gather_custom_fusion.
-
-    2. ``group_sizes`` uses one-hot + sum instead of ``jnp.bincount`` — avoids
-       contended scatter_add. ~7.7x faster at 65K rows.
-
-    Note: dtype must remain int32 — Pallas/Mosaic requires 32-bit signless
-    integers for scalar prefetch refs (``tpu.memref_slice`` constraint).
+      - topk_slot_indices: int32[size_m] — topk slot (0..topk-1) per row
+      - peer_recv_counts: int32[ep_size] — incoming row counts per peer
     """
     topk_indices_flat = topk_indices.flatten()
     topk_argsort_indices = jnp.argsort(topk_indices_flat)
+    sorted_experts = topk_indices_flat[topk_argsort_indices]
+    num_experts_per_shard = num_experts // ep_size
+    source_peers = (sorted_experts // num_experts_per_shard).astype(jnp.int32)
+
     expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
     group_sizes = jnp.sum(
         (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
         axis=0,
     )
-    lhs_indices = topk_argsort_indices // topk
-    topk_slot_indices = topk_argsort_indices % topk
-    output_indices = lhs_indices
-    return lhs_indices, group_sizes, output_indices, topk_slot_indices
+    lhs_indices = (topk_argsort_indices // topk).astype(jnp.int32)
+    topk_slot_indices = (topk_argsort_indices % topk).astype(jnp.int32)
+
+    num_tokens = topk_indices.shape[0]
+    chunk_size = (num_tokens + ep_size - 1) // ep_size
+    output_tokens_per_chip = max(chunk_size, 1)
+    dest_chips = (lhs_indices // output_tokens_per_chip).astype(jnp.int32)
+
+    is_to_me = (dest_chips == my_id) & (source_peers != my_id)
+    filtered_peers = jnp.where(is_to_me, source_peers, ep_size)
+    peer_recv_counts = jnp.bincount(filtered_peers, length=ep_size + 1)[:ep_size].astype(jnp.int32)
+
+    return lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts
 
 
 # ============================================================================
@@ -123,11 +130,11 @@ def moe_gmm_local_rs_nodedup(
     w2: jax.Array,
     w2_scale: jax.Array | None,
     w2_bias: jax.Array | None,
-    w1_global_scale: jax.Array | None,
-    w2_global_scale: jax.Array | None,
-    group_offset: jax.Array,
-    topk_weights: jax.Array,
-    topk_indices: jax.Array,
+    w1_global_scale: jax.Array | None = None,
+    w2_global_scale: jax.Array | None = None,
+    group_offset: jax.Array | None = None,
+    topk_weights: jax.Array | None = None,
+    topk_indices: jax.Array | None = None,
     post_expert_norm_weight_input: jax.Array | None = None,
     *,
     activation: str,
@@ -137,37 +144,43 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
+    w1_gs_gate: jax.Array | None = None,
+    w1_gs_up: jax.Array | None = None,
+    w2_gs: jax.Array | None = None,
 ) -> jax.Array:
-    """Per-chip MoE using the nodedup gmm_fused_rs kernel.
-
-    Sends every row to its (local_row, topk_slot) slot via ICI direct-write,
-    then applies topk weights and reduces over the top_k dim post-kernel.
-    """
+    """Per-chip MoE using the nodedup gmm_fused_rs kernel."""
+    if w1_global_scale is None and w1_gs_gate is not None:
+        w1_global_scale = w1_gs_gate
+    if w2_global_scale is None and w2_gs is not None:
+        w2_global_scale = w2_gs
     num_tokens = hidden_states_local.shape[0]
     hidden_size = w2.shape[-1]
-    chunk_size = num_tokens // ep_size
+    chunk_size = (num_tokens + ep_size - 1) // ep_size
     num_experts = w1.shape[0] * ep_size  # global num_experts
     num_local_experts = w1.shape[0]
-    my_id = (
-        group_offset[1]
-        if group_offset.shape[0] > 1
-        else jax.lax.axis_index(ep_axis_name)
-    )
+    go_flat = group_offset.reshape(-1)
+    go_val = go_flat[0]
+    my_id = go_flat[1] if go_flat.shape[0] > 1 else (go_val // num_local_experts)
 
-    # Routing — inlined here so bincount lives in the SAME shard_map as the
-    # kernel call. Mirrors v1 where bincount is co-located with the heavy
-    # ``hidden_states[token_indices_sorted]`` gather, letting XLA fuse them.
-    lhs_indices, group_sizes, output_indices, topk_slot_indices = _compute_rs_routing(
-        topk_indices, num_experts=num_experts, topk=topk
+    # Routing with vectorized VPU precomputations:
+    lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts = _compute_rs_routing(
+        topk_indices, num_experts=num_experts, topk=topk, ep_size=ep_size, my_id=my_id
     )
+    output_indices = (lhs_indices * topk + topk_slot_indices).astype(jnp.int32)
     size_m = lhs_indices.shape[0]
     _assert_fused_rs_smem_safe(size_m)
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
-    go_val = group_offset[0]
     expert_idx = jnp.arange(num_experts, dtype=jnp.int32)
     local_start = jnp.sum(jnp.where(expert_idx < go_val, group_sizes, 0))
+    local_end = local_start + jnp.sum(
+        jnp.where(
+            (expert_idx >= go_val) & (expert_idx < go_val + num_local_experts),
+            group_sizes,
+            0,
+        )
+    )
     # Static loop bound — kernel pads with ``is_active`` gating.
     #
     # ``tile_m`` MUST match the value the kernel picks internally (via
@@ -206,9 +219,16 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
     )
     tile_m = block_sizes.tile_m
-    max_num_gm = jnp.array(
-        num_experts + (size_m + tile_m - 1) // tile_m - 1, dtype=jnp.int32
+    size_lhs_sublane = min(
+        pltpu.get_tpu_info().get_sublane_tiling(hidden_states_local.dtype),
+        tile_m,
+        size_m,
     )
+    local_group_sizes = jax.lax.dynamic_slice(group_sizes, (go_val,), (num_local_experts,))
+    local_num_gm = compute_num_gm(
+        local_group_sizes, tile_m, size_lhs_sublane, start_offset=local_start
+    )
+    max_num_gm = jax.lax.pmax(local_num_gm, axis_name=ep_axis_name)
 
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
@@ -216,14 +236,15 @@ def moe_gmm_local_rs_nodedup(
         w2,
         group_sizes,
         lhs_indices,
-        output_indices,
+        output_indices,  # <--- MUST BE output_indices!
+        peer_recv_counts=peer_recv_counts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
-        act_fn=activation,
+        activation=activation,
         output_size=num_tokens,
         group_offset=group_offset,
         group_start=jnp.array([local_start], dtype=jnp.int32),
@@ -235,17 +256,8 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
     )
 
-    # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
-    # (matches v1 — no fp32 cast needed for topk=8).
-    # SP off: topk_weights is replicated; slice this chip's [chunk_size] shard
-    # to match out_3d (SP on already passes the local shard).
-    local_topk_weights = (
-        topk_weights
-        if sp_enabled
-        else jax.lax.dynamic_slice_in_dim(
-            topk_weights, my_id * chunk_size, chunk_size, axis=0
-        )
-    )
+    # out_buf has arrived directly on this chip via in-kernel ICI direct-write!
+    # Shape: (output_size, top_k, hidden_size) where output_size = chunk_size.
     out_3d = out_buf.reshape(chunk_size, topk, hidden_size)
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
     if post_expert_norm_weight is not None:
@@ -269,12 +281,25 @@ def moe_gmm_local_rs_nodedup(
         var = jnp.sum(out_f32**2, axis=-1, keepdims=True) / norm_size
         out_3d = (out_f32 * jax.lax.rsqrt(var + 1e-8)).astype(out_3d.dtype)
 
-    token_hidden = jnp.sum(out_3d * local_topk_weights[:, :, None], axis=1)
+    # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
+    # (matches v1 — no fp32 cast needed for topk=8).
+    # SP off: topk_weights is replicated; slice this chip's [chunk_size] shard
+    # to match out_3d (SP on already passes the local shard).
+    output_size = max(chunk_size, 1)
+    my_token_start = my_id * output_size
+    my_weights = (
+        topk_weights
+        if sp_enabled
+        else jax.lax.dynamic_slice_in_dim(
+            topk_weights, my_token_start, output_size, axis=0
+        )
+    )
 
     # Return the per-chip token shard (reduce-scattered output). The SP exit is
     # owned by the model: SP on keeps it token-sharded; SP off gathers it back to
     # replicated in the model-side TPU MoE path, optionally as an FP8
     # payload. See expert_parallel_gmm_rs's out_spec.
+    token_hidden = jnp.sum(out_3d * my_weights[:, :, None].astype(out_3d.dtype), axis=1)
     return token_hidden
 
 
@@ -314,15 +339,16 @@ def expert_parallel_gmm_rs(
     expert_axis = get_moe_expert_axis(mesh, EXPERT)
     ep_size = get_mesh_shape_product(mesh, expert_axis)
     ep_p_spec = P(expert_axis)
+    ep_2d_spec = P(expert_axis, None)
     data_p_spec = P(MLP_DATA)
     # SGLang enters this kernel with replicated tokens and gathers the returned
     # expert-axis token shard in the Torch wrapper.
     sp_enabled = False
     hidden_in_spec = data_p_spec if sp_enabled else P()
     moe_out_spec = (
-        P(combine_partition_axes(MLP_DATA, expert_axis))
+        P(combine_partition_axes(MLP_DATA, expert_axis), None)
         if sp_enabled
-        else P(expert_axis)
+        else P(expert_axis, None)
     )
     fp8_direct_write = (
         (not sp_enabled)
@@ -337,13 +363,29 @@ def expert_parallel_gmm_rs(
         P(combine_partition_axes(MLP_DATA, expert_axis), None) if sp_enabled else P()
     )
     topk_i_spec = P(MLP_DATA, None) if sp_enabled else P()
+    if not sp_enabled:
+        topk_weights = jax.lax.with_sharding_constraint(
+            topk_weights, NamedSharding(mesh, P())
+        )
+        topk_indices = jax.lax.with_sharding_constraint(
+            topk_indices, NamedSharding(mesh, P())
+        )
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
-    group_offset = (
-        group_offset_input
-        if group_offset_input is not None
-        else jnp.arange(0, num_experts, num_experts_per_shard)
-    )
+    if group_offset_input is None:
+        group_offset = jnp.stack([
+            jnp.arange(0, num_experts, num_experts_per_shard, dtype=jnp.int32),
+            jnp.arange(ep_size, dtype=jnp.int32),
+        ], axis=-1)  # shape (ep_size, 2)
+    else:
+        # Ensure 2D (ep_size, 2)
+        if group_offset_input.ndim == 1:
+            group_offset = jnp.stack([
+                group_offset_input,
+                jnp.arange(ep_size, dtype=jnp.int32),
+            ], axis=-1)
+        else:
+            group_offset = group_offset_input
 
     w1_scale_spec = None if w1_scale is None else ep_p_spec
     w1_bias_spec = None if w1_bias is None else ep_p_spec
@@ -380,7 +422,7 @@ def expert_parallel_gmm_rs(
             w2_bias_spec,
             w1_gs_spec,  # w1_global_scale
             w2_gs_spec,  # w2_global_scale
-            ep_p_spec,  # group_offset
+            ep_2d_spec,  # group_offset
             topk_w_spec,  # topk_weights (SP-sharded local chunk; replicated when SP off)
             topk_i_spec,  # topk_indices (replicated when SP off)
             P(),  # post_expert_norm_weight (replicated)
@@ -474,10 +516,10 @@ def fused_moe_func_rs(
         topk_weights is not None and topk_indices is not None
     ), "fused_moe_func_rs requires pre-computed topk weights and indices"
     topk_weights = jax.lax.with_sharding_constraint(
-        topk_weights, NamedSharding(mesh, P(MLP_DATA, None))
+        topk_weights, NamedSharding(mesh, P())
     )
     topk_indices = jax.lax.with_sharding_constraint(
-        topk_indices, NamedSharding(mesh, P(MLP_DATA, None))
+        topk_indices, NamedSharding(mesh, P())
     )
 
     # Pad hidden_states to match w1's K dimension if needed.

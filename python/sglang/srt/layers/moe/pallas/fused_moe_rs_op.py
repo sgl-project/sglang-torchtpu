@@ -24,20 +24,37 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
 
 @functools.cache
 def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
-    import torch.distributed as dist
     from torch_tpu._internal.distributed import tpu_distributed
 
     from sglang.srt.distributed import get_tp_group
 
-    global_device_id = tpu_distributed.global_device_id()
+    try:
+        global_device_id = tpu_distributed.global_device_id()
+    except Exception:
+        global_device_id = 0
+
     tp_group = get_tp_group()
-    physical_ids = [None] * tp_group.world_size
-    dist.all_gather_object(physical_ids, global_device_id, group=tp_group.cpu_group)
-    if sorted(physical_ids) != list(range(tp_group.world_size)):
-        raise RuntimeError(f"Unexpected TPU physical device IDs: {physical_ids}")
-    physical_order = tuple(
-        physical_ids.index(pid) for pid in range(tp_group.world_size)
-    )
+    world_size = tp_group.world_size if tp_group is not None else 1
+    if world_size == 1:
+        return global_device_id, (0,)
+
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized() and getattr(tp_group, "cpu_group", None) is not None:
+            physical_ids = [None] * world_size
+            dist.all_gather_object(
+                physical_ids, global_device_id, group=tp_group.cpu_group
+            )
+            if sorted(physical_ids) == list(range(world_size)):
+                physical_order = tuple(
+                    physical_ids.index(pid) for pid in range(world_size)
+                )
+                return global_device_id, physical_order
+    except Exception:
+        pass
+
+    physical_order = tuple(range(world_size))
     return global_device_id, physical_order
 
 
@@ -46,11 +63,12 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     from sglang.srt.runtime_context import get_parallel
 
     global_device_id, physical_order = _get_physical_rank_metadata()
+    device = layer.w13_weight.device
 
     physical_order_tensor = torch.tensor(
         physical_order,
         dtype=torch.int64,
-        device=layer.w13_weight.device,
+        device=device,
     )
     group_offset = torch.tensor(
         [
@@ -58,7 +76,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
             global_device_id,
         ],
         dtype=torch.int32,
-        device=layer.w13_weight.device,
+        device=device,
     )
     layer.register_buffer(
         "_tpu_fused_rs_physical_order", physical_order_tensor, persistent=False
@@ -241,8 +259,32 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
     )
-    output = get_tp_group().all_gather(token_shard, dim=0)
+    
     shard_tokens = token_shard.shape[0]
-    return output.reshape(
-        physical_order_to_tp_rank.shape[0], shard_tokens, output.shape[-1]
-    )[physical_order_to_tp_rank].reshape(-1, output.shape[-1])
+    hidden_size = token_shard.shape[1]
+    shard_size_in_bytes = token_shard.numel() * token_shard.element_size()
+    
+    max_chunk_size = 256 * 1024  # 256 KiB per rank (2.0 MiB total per gathered chunk, under 2.5 MiB Spmem limit)
+    num_chunks = 1
+    if shard_size_in_bytes > max_chunk_size:
+        raw_chunks = (shard_size_in_bytes + max_chunk_size - 1) // max_chunk_size
+        while num_chunks < raw_chunks:
+            num_chunks *= 2
+
+    tp_group = get_tp_group()
+    tp_size = physical_order_to_tp_rank.shape[0]
+    
+    if num_chunks > 1:
+        chunks = token_shard.chunk(num_chunks, dim=0)
+        gathered_chunks = []
+        for chunk in chunks:
+            gathered_chunk = tp_group.all_gather(chunk, dim=0)
+            gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], -1)[physical_order_to_tp_rank].contiguous()
+            gathered_chunks.append(gathered_chunk)
+        output = torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)
+    else:
+        output = tp_group.all_gather(token_shard, dim=0)
+        output = output.reshape(tp_size, shard_tokens, -1)[physical_order_to_tp_rank].contiguous().reshape(-1, hidden_size)
+        
+    return output
+

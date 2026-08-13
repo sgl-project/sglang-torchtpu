@@ -17,10 +17,7 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# TODO: Enable larger M, including prefill, once these issues are resolved:
-# https://github.com/sgl-project/sglang-torchtpu/issues/308
-# https://github.com/google-pytorch/torch_tpu/issues/2794
-_FUSED_RS_MAX_SIZE_M = 1024
+_FUSED_RS_MAX_SIZE_M = 65536
 
 
 def supports_fp8_fused_rs(
@@ -252,7 +249,9 @@ def _apply_fp8_fused_rs(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
-        fp8_direct_write=True,
+        fp8_direct_write=False,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
-    return StandardCombineInput(hidden_states=result[: x.shape[0]])
+    if result.shape[0] != x.shape[0]:
+        result = result[: x.shape[0]].contiguous()
+    return StandardCombineInput(hidden_states=result)

@@ -159,18 +159,18 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def test_uses_fused_rs_only_through_validated_inline_limit(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
+        self.assertTrue(should_use_fp8_fused_rs(64))
         self.assertTrue(should_use_fp8_fused_rs(128))
         self.assertTrue(should_use_fp8_fused_rs(1024))
-        self.assertFalse(should_use_fp8_fused_rs(1025))
-        self.assertFalse(should_use_fp8_fused_rs(2048))
-        self.assertFalse(should_use_fp8_fused_rs(32768))
-        self.assertFalse(should_use_fp8_fused_rs(32769))
-        self.assertFalse(should_use_fp8_fused_rs(65536))
+        self.assertTrue(should_use_fp8_fused_rs(2048))
+        self.assertTrue(should_use_fp8_fused_rs(32768))
+        self.assertTrue(should_use_fp8_fused_rs(65536))
+        self.assertFalse(should_use_fp8_fused_rs(65537))
 
     def test_padded_routed_rows_respect_inline_limit(self):
         padded_tokens = fused_moe_rs_padded_tokens(682, topk=3, ep_size=8)
         self.assertEqual(padded_tokens, 688)
-        self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
+        self.assertTrue(should_use_fp8_fused_rs(padded_tokens * 3))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         # Upstream's dwdp gate reads the published parallel context, which
