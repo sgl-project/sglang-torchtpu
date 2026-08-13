@@ -421,9 +421,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-2048_n-1536_g-16_lhs_quant_rhs_bs-128"
                 "+k-768_n-2048_g-16_lhs_quant_rhs_bs-128"
             ): _all_m(_H2048_I768_FP8),
-            ("k-2048_n-1536_g-16_lhs_quant" "+k-768_n-2048_g-16_lhs_quant"): _all_m(
-                _H2048_I768_FP8
-            ),
+            (
+                "k-2048_n-1536_g-16_lhs_quant"
+                "+k-768_n-2048_g-16_lhs_quant"
+            ): _all_m(_H2048_I768_FP8),
         },
         # ---------------------------------------------------------------------
         # FP4 (lhs bf16 × rhs fp4, rhs_quant_block_size=16)
