@@ -18,6 +18,12 @@ import torch
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 _FUSED_RS_MAX_SIZE_M = 65536
+# The kernel's M dimension is padded_tokens * topk. The serving recipe compiles
+# 1,024- and 2,048-token prefill buckets at top-k 8, which produce M=8,192 and
+# M=16,384. Those block-FP8 boundaries are covered by the compiled TPU test;
+# larger block-FP8 shapes keep the stock MoE + one EP reduction path.
+_FUSED_RS_BLOCK_FP8_DECODE_MAX_SIZE_M = 128
+_FUSED_RS_BLOCK_FP8_TOPK8_MAX_SIZE_M = 16_384
 
 
 def supports_fp8_fused_rs(
@@ -93,8 +99,6 @@ def fp8_fused_rs_unsupported_reason(
         return "the model does not allow backend-owned MoE reduction"
     if attn_dp_size != 1 or enable_dp_attention:
         return "DP attention and hybrid DP/TP attention are not supported"
-    if block_quantized:
-        return "block-quantized FP8 weights are not supported"
     if not gated:
         return "the MoE activation must be gated"
     if activation != "silu":
@@ -112,9 +116,18 @@ def fp8_fused_rs_unsupported_reason(
     return None
 
 
-def should_use_fp8_fused_rs(size_m: int) -> bool:
+def should_use_fp8_fused_rs(
+    size_m: int,
+    *,
+    block_quantized: bool = False,
+    topk: int | None = None,
+) -> bool:
     """Use fused-RS only for validated routed-assignment counts."""
-    return size_m <= _FUSED_RS_MAX_SIZE_M
+    if not block_quantized:
+        return size_m <= _FUSED_RS_MAX_SIZE_M
+    if size_m <= _FUSED_RS_BLOCK_FP8_DECODE_MAX_SIZE_M:
+        return True
+    return topk == 8 and size_m <= _FUSED_RS_BLOCK_FP8_TOPK8_MAX_SIZE_M
 
 
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
@@ -155,8 +168,8 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
         return False
     layer.__dict__.pop("_tpu_fused_rs_unsupported_reason", None)
 
-    # prepare_tpu_fp8_moe_weights already stores weights as (E, K, N) and
-    # channelwise scales as (E, 1, 1, N), exactly as fused-RS expects.
+    # prepare_tpu_fp8_moe_weights stores weights as (E, K, N) and scales as
+    # (E, 1, 1, N) channelwise or (E, K // block, 1, N) blockwise.
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import prepare_fused_moe_rs
 
     prepare_fused_moe_rs(layer)
@@ -194,6 +207,7 @@ def _apply_fp8_fused_rs(
         )
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
+    block_quantized = getattr(layer, "weight_block_size", None) is not None
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         fused_moe_rs_gather,
         fused_moe_rs_padded_tokens,
@@ -202,7 +216,11 @@ def _apply_fp8_fused_rs(
     ep_size = int(layer._tpu_fused_rs_physical_order.shape[0])
     padded_tokens = fused_moe_rs_padded_tokens(x.shape[0], topk, ep_size)
     size_m = padded_tokens * topk
-    if not should_use_fp8_fused_rs(size_m):
+    if not should_use_fp8_fused_rs(
+        size_m,
+        block_quantized=block_quantized,
+        topk=topk,
+    ):
         from sglang.srt.distributed import moe_expert_parallel_all_reduce
         from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
 
@@ -210,7 +228,7 @@ def _apply_fp8_fused_rs(
             layer=layer,
             dispatch_output=dispatch_output,
             activation=activation,
-            block_quant=False,
+            block_quant=block_quantized,
             apply_router_weight_on_input=(
                 layer.moe_runner_config.apply_router_weight_on_input
             ),
@@ -224,7 +242,10 @@ def _apply_fp8_fused_rs(
             hidden_states=moe_expert_parallel_all_reduce(stock_output.hidden_states)
         )
 
-    topk_weights = topk_weights.to(x.dtype)
+    # Preserve float32 routing weights for block-FP8. Channelwise FP8 keeps its
+    # existing model-dtype routing contract.
+    if not block_quantized:
+        topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     valid = topk_ids >= 0
     topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
@@ -235,13 +256,15 @@ def _apply_fp8_fused_rs(
         if post_expert_norm_weight is not None
         else x.new_zeros((1,))
     )
+    w1_scale = layer.w13_weight_scale_inv if block_quantized else layer.w13_weight_scale
+    w2_scale = layer.w2_weight_scale_inv if block_quantized else layer.w2_weight_scale
 
     result = fused_moe_rs_gather(
         hidden_states=x,
         w1=layer.w13_weight,
         w2=layer.w2_weight,
-        w1_scale=layer.w13_weight_scale,
-        w2_scale=layer.w2_weight_scale,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         post_expert_norm_weight=norm_weight,
@@ -249,9 +272,7 @@ def _apply_fp8_fused_rs(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
-        fp8_direct_write=False,
+        fp8_direct_write=block_quantized,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
-    if result.shape[0] != x.shape[0]:
-        result = result[: x.shape[0]].contiguous()
-    return StandardCombineInput(hidden_states=result)
+    return StandardCombineInput(hidden_states=result[: x.shape[0]].to(x.dtype))

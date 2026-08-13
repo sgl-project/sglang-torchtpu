@@ -140,6 +140,13 @@ def _get_tpu_fp8_runtime() -> str:
     return get_global_server_args().tpu_fp8_runtime
 
 
+def _should_prepare_tpu_fp8_fused_rs(
+    backend: MoeRunnerBackend, *, block_quant: bool
+) -> bool:
+    """Require explicit fused-RS selection for the new block-FP8 path."""
+    return backend.is_pallas_tpu_fused_rs() or (backend.is_auto() and not block_quant)
+
+
 def _clear_replaced_param(module: Module, name: str) -> None:
     param = getattr(module, name, None)
     if not isinstance(param, Parameter):
@@ -349,7 +356,9 @@ class Fp8Config(QuantizationConfig):
             cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
         )
         ignored_layers = cls.get_from_keys_or(
-            config, ["ignored_layers", "modules_to_not_convert"], None
+            config,
+            ["ignored_layers", "modules_to_not_convert", "exclude_modules"],
+            None,
         )
         if ignored_layers:
             # Keep both "model." and non-"model." variants for robust prefix matching.
@@ -2310,9 +2319,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 is_fp4_expert=self.is_fp4_expert,
             )
             moe_runner_backend = get_moe_runner_backend()
-            if (
-                moe_runner_backend.is_auto()
-                or moe_runner_backend.is_pallas_tpu_fused_rs()
+            if _should_prepare_tpu_fp8_fused_rs(
+                moe_runner_backend, block_quant=self.block_quant
             ):
                 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
                     prepare_fp8_fused_rs,

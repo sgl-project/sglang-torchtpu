@@ -246,6 +246,30 @@ class InputConfigs:
     scale_dtype: jnp.dtype | None = None
 
 
+def _uses_blockwise_fp8(rhs_cfgs: InputConfigs) -> bool:
+    """Return whether the RHS uses multi-block E4M3 quantization."""
+    return (
+        rhs_cfgs.quant_dtype == jnp.float8_e4m3fn.dtype
+        and rhs_cfgs.num_quant_blocks > 1
+    )
+
+
+def _quantize_lhs_block(
+    block_lhs: jax.Array,
+    lhs_q_dtype: jnp.dtype,
+    dtype_max: float,
+    rhs_cfgs: InputConfigs,
+) -> tuple[jax.Array, jax.Array]:
+    """Quantize one activation block and return its multiplicative scale."""
+    scale_lhs = (
+        block_lhs.astype(jnp.float32) if _uses_blockwise_fp8(rhs_cfgs) else block_lhs
+    )
+    block_abs_max = jnp.max(jnp.abs(scale_lhs), axis=1, keepdims=True)
+    block_scale = block_abs_max / dtype_max
+    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
+    return (scale_lhs * block_scale_inv).astype(lhs_q_dtype), block_scale
+
+
 @dataclasses.dataclass(frozen=True)
 class GmmConfigs:
     tiles: TileSizes
@@ -520,15 +544,15 @@ def inner_kernel(
                     # Perform lhs quantization. Note that for every block_lhs,
                     # same computation will be performed tiles_n//mxu_size times.
                     # But we can let compiler perform CSE and avoid recomputation.
-                    block_abs_max = jnp.max(jnp.abs(block_lhs), axis=1, keepdims=True)
-                    block_scale = block_abs_max / dtype_max
-
-                    # If block_scale=0, it will cause division by zero and return either
-                    # NaN or Inf. Since this can cause numeric issue when downcasting to
-                    # quantized value, we convert them into 0.
-                    block_scale_inv = jnp.where(block_scale == 0, 0, 1 / block_scale)
-                    # Convert lhs into quantized dtype.
-                    block_lhs_q = (block_lhs * block_scale_inv).astype(lhs_q_dtype)
+                    # Compute block-FP8 activation scales in float32. Preserve
+                    # channelwise FP8, INT8, and packed FP4 arithmetic. Zero
+                    # blocks quantize to zero without NaN/Inf.
+                    block_lhs_q, block_scale = _quantize_lhs_block(
+                        block_lhs,
+                        lhs_q_dtype,
+                        dtype_max,
+                        cfgs.rhs_cfgs,
+                    )
 
                     block_acc = jnp.matmul(
                         block_lhs_q,
@@ -987,7 +1011,11 @@ def calculate_tiling(
 
     scratch_reserve_bytes = 0
     if fuse_act:
-        acc_bytes = 2 if lhs_cfgs.quant_dtype is not None else 4  # bf16 vs f32 acc
+        # Blockwise FP8 uses an f32 accumulator to match the validated fused-RS
+        # numerical path. Account for that scratch explicitly when choosing M.
+        acc_bytes = (
+            4 if lhs_cfgs.quant_dtype is None or _uses_blockwise_fp8(rhs_cfgs) else 2
+        )
         out_bytes = 2  # bf16 output / partial-out tile
         lhs_bytes = lhs_bits // 8
         scratch_bytes_per_m = (
@@ -1305,7 +1333,9 @@ def make_gmm_configs(
         out_dtype = lhs.dtype
 
     if acc_dtype is None:
-        if lhs_cfgs.quant_dtype is None:
+        if lhs_cfgs.quant_dtype is None or _uses_blockwise_fp8(rhs_cfgs):
+            # Offline block-FP8 needs f32 accumulation; bf16 compounds error
+            # across K blocks and MoE layers.
             acc_dtype = jnp.float32.dtype
         else:
             # Input quantization requires elementwise ops which can put pressure on

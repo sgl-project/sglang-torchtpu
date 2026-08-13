@@ -28,8 +28,14 @@ except Exception:  # pragma: no cover - depends on JAX/pallas availability
 
 _SKIP_REASON = "Requires JAX + the gmm_v2 pallas import chain"
 
-# tpu7x geometry; calculate_tiling only reads mxu_column_size and num_lanes.
-_TPU_INFO = SimpleNamespace(mxu_column_size=128, num_lanes=128)
+# tpu7x geometry plus quantized-config capabilities used below.
+_TPU_INFO = SimpleNamespace(
+    mxu_column_size=128,
+    num_lanes=128,
+    fp8_ops_per_second=1,
+    int8_ops_per_second=1,
+    get_sublane_tiling=lambda _dtype: 8,
+)
 
 _MiB = 1024 * 1024
 
@@ -118,6 +124,70 @@ class TestCalculateTilingFuseAct(CustomTestCase):
         tiles = self._tiling(4 * _MiB, fuse_act=None)
         self.assertGreater(tiles.tile_k, 0)
         self.assertGreater(tiles.tile_n, 0)
+
+
+@unittest.skipUnless(_HAS_GMM, _SKIP_REASON)
+class TestBlockFp8AccumulatorContract(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(
+            gmm_v2.pltpu, "get_tpu_info", return_value=_TPU_INFO
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _configs(num_blocks, rhs_dtype=None):
+        if rhs_dtype is None:
+            rhs_dtype = jnp.float8_e4m3fn
+        size_m, size_k, size_n, groups = 16, 1024, 512, 2
+        return gmm_v2.make_gmm_configs(
+            jnp.zeros((size_m, size_k), dtype=jnp.bfloat16),
+            jnp.zeros((groups, size_k, size_n), dtype=rhs_dtype),
+            jnp.ones((groups, num_blocks, 1, size_n), dtype=jnp.bfloat16),
+            None,
+            jnp.array([8, 8], dtype=jnp.int32),
+            jnp.array([0], dtype=jnp.int32),
+            tile_info=gmm_v2.TileSizes(tile_m=16, tile_k=512, tile_n=512),
+            vmem_limit_bytes=128 * _MiB,
+            out_dtype=None,
+            acc_dtype=None,
+            maybe_quantize_lhs=True,
+            zero_initialize=True,
+        )
+
+    def test_blockwise_fp8_defaults_to_float32_accumulator(self):
+        self.assertEqual(self._configs(num_blocks=2).acc_dtype, jnp.float32.dtype)
+
+    def test_blockwise_fp8_activation_scale_is_computed_in_float32(self):
+        # This value straddles an E4M3 rounding boundary: BF16 scale arithmetic
+        # gives -24, while the required FP32 path gives -26.
+        lhs = jnp.array([[-0.12060546875, 2.15625]], dtype=jnp.bfloat16)
+        rhs_cfgs = gmm_v2.InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn.dtype,
+            quant_block_size=1,
+            dtype=jnp.float8_e4m3fn,
+            num_quant_blocks=2,
+        )
+
+        quantized, scale = gmm_v2._quantize_lhs_block(
+            lhs,
+            jnp.float8_e4m3fn.dtype,
+            float(jnp.finfo(jnp.float8_e4m3fn).max),
+            rhs_cfgs,
+        )
+
+        self.assertEqual(scale.dtype, jnp.float32.dtype)
+        self.assertEqual(float(quantized[0, 0]), -26.0)
+
+    def test_channelwise_fp8_keeps_bfloat16_accumulator(self):
+        self.assertEqual(self._configs(num_blocks=1).acc_dtype, jnp.bfloat16.dtype)
+
+    def test_blockwise_int8_keeps_bfloat16_accumulator(self):
+        self.assertEqual(
+            self._configs(num_blocks=2, rhs_dtype=jnp.int8).acc_dtype,
+            jnp.bfloat16.dtype,
+        )
 
 
 if __name__ == "__main__":

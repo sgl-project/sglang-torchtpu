@@ -330,7 +330,11 @@ def apply_tpu_fp8_moe(
 
     x = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
-    topk_weights = topk_weights.to(x.dtype)
+    # Block-FP8 accumulates and applies routing weights in float32. Narrowing
+    # here would discard routing precision before the Pallas kernel can use it.
+    # Preserve the established channelwise-FP8 contract.
+    if not block_quant:
+        topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     # Padded tokens might have expert index of -1, override the expert
     # selection to expert 0.

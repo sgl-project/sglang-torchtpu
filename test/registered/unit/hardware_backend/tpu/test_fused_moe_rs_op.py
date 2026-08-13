@@ -50,8 +50,8 @@ class TestFusedMoeRsOp(CustomTestCase):
                 return_value=(4, (0, 1, 6, 7, 2, 3, 4, 5)),
             ),
             patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=Mock(rank=2),
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=Mock(moe_ep_rank=2),
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
         ):
@@ -68,13 +68,72 @@ class TestFusedMoeRsOp(CustomTestCase):
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
-            torch.tensor([[64, 4]], dtype=torch.int32),
+            torch.tensor([[32, 4]], dtype=torch.int32),
         )
         self.assertIn("_tpu_fused_rs_physical_order", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
         self.assertIn("_tpu_fused_rs_physical_order", layer._non_persistent_buffers_set)
         self.assertIn("_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set)
         self.assertEqual(build.call_count, 2)
+
+    def test_physical_rank_metadata_rejects_invalid_device_ids(self):
+        tp_group = Mock(world_size=4, cpu_group=object())
+
+        def gather_duplicate_id(output, _device_id, *, group):
+            self.assertIs(group, tp_group.cpu_group)
+            output[:] = [0, 1, 1, 3]
+
+        fused_moe_rs_op._get_physical_rank_metadata.cache_clear()
+        try:
+            with (
+                patch(
+                    "torch_tpu._internal.distributed.tpu_distributed."
+                    "global_device_id",
+                    return_value=0,
+                ),
+                patch(
+                    "sglang.srt.distributed.get_tp_group",
+                    return_value=tp_group,
+                ),
+                patch("torch.distributed.is_initialized", return_value=True),
+                patch(
+                    "torch.distributed.all_gather_object",
+                    side_effect=gather_duplicate_id,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "physical device IDs"):
+                    fused_moe_rs_op._get_physical_rank_metadata()
+        finally:
+            fused_moe_rs_op._get_physical_rank_metadata.cache_clear()
+
+    def test_call_forwards_logical_and_physical_rank_metadata(self):
+        expected = torch.ones(1, 4)
+        op = Mock(return_value=expected)
+        group_offset = torch.tensor([[32, 4]], dtype=torch.int32)
+
+        with patch.object(
+            fused_moe_rs_op,
+            "_build_fused_moe_rs_op",
+            return_value=op,
+        ):
+            actual = fused_moe_rs_op.fused_moe_rs_call(
+                hidden_states=torch.zeros(1, 4),
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=torch.ones(1, 1),
+                topk_ids=torch.zeros(1, 1, dtype=torch.int32),
+                post_expert_norm_weight=torch.ones(4),
+                group_offset=group_offset,
+                topk=1,
+                activation="silu",
+                has_post_expert_norm=True,
+                fp8_direct_write=False,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertIs(op.call_args.args[8], group_offset)
 
     def test_gather_reorders_tp_ranks_to_physical_device_order(self):
         rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
@@ -133,6 +192,8 @@ class TestFusedMoeRsOp(CustomTestCase):
         "requires TorchTPU",
     )
     def test_dynamo_faketensor_export_fused_moe_rs(self):
+        from sglang.srt.hardware_backend.tpu import pallas_export
+
         class FusedMoeRsModule(torch.nn.Module):
             def forward(
                 self,
@@ -144,6 +205,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk_weights: torch.Tensor,
                 topk_ids: torch.Tensor,
                 post_expert_norm_weight: torch.Tensor,
+                group_offset: torch.Tensor,
             ) -> torch.Tensor:
                 return fused_moe_rs_op.fused_moe_rs_call(
                     hidden_states=hidden_states,
@@ -154,13 +216,14 @@ class TestFusedMoeRsOp(CustomTestCase):
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     post_expert_norm_weight=post_expert_norm_weight,
-                    group_offset=None,
+                    group_offset=group_offset,
                     topk=8,
                     activation="silu",
                     has_post_expert_norm=False,
                     fp8_direct_write=True,
                 )
 
+        pallas_export.configure_jax_export_env(8)
         fused_moe_rs_op._build_fused_moe_rs_op()
         mod = FusedMoeRsModule()
         tokens = 128
@@ -172,23 +235,38 @@ class TestFusedMoeRsOp(CustomTestCase):
             torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="meta"),
             torch.randn(
                 num_local_experts,
+                hidden_size,
                 inter_size * 2,
+                dtype=torch.float8_e4m3fn,
+                device="meta",
+            ),
+            torch.randn(
+                num_local_experts,
+                inter_size,
                 hidden_size,
                 dtype=torch.float8_e4m3fn,
                 device="meta",
             ),
             torch.randn(
                 num_local_experts,
-                hidden_size,
-                inter_size,
-                dtype=torch.float8_e4m3fn,
+                hidden_size // 512,
+                1,
+                inter_size * 2,
+                dtype=torch.float32,
                 device="meta",
             ),
-            torch.randn(num_local_experts, dtype=torch.float32, device="meta"),
-            torch.randn(num_local_experts, dtype=torch.float32, device="meta"),
+            torch.randn(
+                num_local_experts,
+                inter_size // 512,
+                1,
+                hidden_size,
+                dtype=torch.float32,
+                device="meta",
+            ),
             torch.randn(tokens, topk, dtype=torch.float32, device="meta"),
             torch.zeros(tokens, topk, dtype=torch.int32, device="meta"),
             torch.ones(1, hidden_size, dtype=torch.bfloat16, device="meta"),
+            torch.zeros(1, 2, dtype=torch.int32, device="meta"),
         )
         exported = torch.export.export(mod, example_inputs)
         self.assertIsNotNone(exported)
@@ -196,6 +274,3 @@ class TestFusedMoeRsOp(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-

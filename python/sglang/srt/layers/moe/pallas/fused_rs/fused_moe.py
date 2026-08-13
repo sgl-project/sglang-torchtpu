@@ -23,16 +23,14 @@ before the post-kernel top-k weighted reduction.
 import functools
 
 import jax
-from jax import lax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from jax.experimental.pallas import tpu as pltpu
-
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
-    compute_num_gm,
     _select_fused_rs_block_sizes,
+    compute_num_gm,
 )
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
@@ -112,7 +110,9 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk, ep_size, my_id):
 
     is_to_me = (dest_chips == my_id) & (source_peers != my_id)
     filtered_peers = jnp.where(is_to_me, source_peers, ep_size)
-    peer_recv_counts = jnp.bincount(filtered_peers, length=ep_size + 1)[:ep_size].astype(jnp.int32)
+    peer_recv_counts = jnp.bincount(filtered_peers, length=ep_size + 1)[
+        :ep_size
+    ].astype(jnp.int32)
 
     return lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts
 
@@ -213,7 +213,11 @@ def moe_gmm_local_rs_nodedup(
         quant_block_size=(
             recover_quant_block_size(
                 w1.shape[1],
-                w1_scale.shape[1] if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1) else 1,
+                (
+                    w1_scale.shape[1]
+                    if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1)
+                    else 1
+                ),
             )
             if w1_scale is not None
             else None
@@ -227,7 +231,9 @@ def moe_gmm_local_rs_nodedup(
         tile_m,
         size_m,
     )
-    local_group_sizes = jax.lax.dynamic_slice(group_sizes, (go_val,), (num_local_experts,))
+    local_group_sizes = jax.lax.dynamic_slice(
+        group_sizes, (go_val,), (num_local_experts,)
+    )
     local_num_gm = compute_num_gm(
         local_group_sizes, tile_m, size_lhs_sublane, start_offset=local_start
     )
@@ -284,8 +290,9 @@ def moe_gmm_local_rs_nodedup(
         var = jnp.sum(out_f32**2, axis=-1, keepdims=True) / norm_size
         out_3d = (out_f32 * jax.lax.rsqrt(var + 1e-8)).astype(out_3d.dtype)
 
-    # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
-    # (matches v1 — no fp32 cast needed for topk=8).
+    # Post-kernel: FP32 block-FP8 router weights promote the multiply and sum;
+    # channelwise FP8 keeps its existing BF16 arithmetic. Restore the model
+    # dtype before the reduce-scatter result leaves the kernel.
     # SP off: topk_weights is replicated; slice this chip's [chunk_size] shard
     # to match out_3d (SP on already passes the local shard).
     output_size = max(chunk_size, 1)
@@ -302,7 +309,9 @@ def moe_gmm_local_rs_nodedup(
     # owned by the model: SP on keeps it token-sharded; SP off gathers it back to
     # replicated in the model-side TPU MoE path, optionally as an FP8
     # payload. See expert_parallel_gmm_rs's out_spec.
-    token_hidden = jnp.sum(out_3d * my_weights[:, :, None].astype(out_3d.dtype), axis=1)
+    token_hidden = jnp.sum(out_3d * my_weights[:, :, None], axis=1).astype(
+        hidden_states_local.dtype
+    )
     return token_hidden
 
 
@@ -376,17 +385,23 @@ def expert_parallel_gmm_rs(
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     if group_offset_input is None:
-        group_offset = jnp.stack([
-            jnp.arange(0, num_experts, num_experts_per_shard, dtype=jnp.int32),
-            jnp.arange(ep_size, dtype=jnp.int32),
-        ], axis=-1)  # shape (ep_size, 2)
+        group_offset = jnp.stack(
+            [
+                jnp.arange(0, num_experts, num_experts_per_shard, dtype=jnp.int32),
+                jnp.arange(ep_size, dtype=jnp.int32),
+            ],
+            axis=-1,
+        )  # shape (ep_size, 2)
     else:
         # Ensure 2D (ep_size, 2)
         if group_offset_input.ndim == 1:
-            group_offset = jnp.stack([
-                group_offset_input,
-                jnp.arange(ep_size, dtype=jnp.int32),
-            ], axis=-1)
+            group_offset = jnp.stack(
+                [
+                    group_offset_input,
+                    jnp.arange(ep_size, dtype=jnp.int32),
+                ],
+                axis=-1,
+            )
         else:
             group_offset = group_offset_input
 

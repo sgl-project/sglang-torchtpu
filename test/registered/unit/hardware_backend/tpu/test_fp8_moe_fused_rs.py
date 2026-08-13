@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
@@ -76,7 +77,6 @@ class TestFp8MoeFusedRs(CustomTestCase):
             {"world_size": 16},
             {"reduction_compatible": False},
             {"attn_dp_size": 2},
-            {"block_quantized": True},
             {"gated": False},
             {"activation": "gelu"},
             {"apply_router_weight_on_input": True},
@@ -89,6 +89,9 @@ class TestFp8MoeFusedRs(CustomTestCase):
         for overrides in unsupported:
             with self.subTest(overrides=overrides):
                 self.assertFalse(self._supported(**overrides))
+
+    def test_accepts_block_fp8_runtime_layout(self):
+        self.assertTrue(self._supported(block_quantized=True))
 
     def test_reports_rejected_layout(self):
         config = {
@@ -132,6 +135,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
                 no_combine=False,
             ),
             _tpu_fused_rs_physical_order=torch.arange(8),
+            weight_block_size=[1, 512],
         )
         expected = raw + 1
         stock_moe = Mock(return_value=StandardCombineInput(hidden_states=raw))
@@ -156,8 +160,144 @@ class TestFp8MoeFusedRs(CustomTestCase):
         torch.testing.assert_close(actual.hidden_states, expected)
         self.assertEqual(all_reduce.call_count, 1)
         self.assertFalse(stock_moe.call_args.kwargs["no_combine"])
+        self.assertTrue(stock_moe.call_args.kwargs["block_quant"])
 
-    def test_uses_fused_rs_only_through_validated_inline_limit(self):
+    def test_blockwise_path_passes_scales_and_fp32_router_weights(self):
+        tokens, hidden = 8, 4
+        x = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1, dtype=torch.float32),
+                torch.zeros(tokens, 1, dtype=torch.int32),
+                None,
+            ),
+        )
+        w13_scale_inv = torch.ones(1, 1, 1, 8)
+        w2_scale_inv = torch.ones(1, 1, 1, 4)
+        layer = SimpleNamespace(
+            weight_block_size=[1, 512],
+            w13_weight=torch.zeros(1, 4, 8),
+            w2_weight=torch.zeros(1, 4, 4),
+            w13_weight_scale_inv=w13_scale_inv,
+            w2_weight_scale_inv=w2_scale_inv,
+            _tpu_fused_rs_physical_order=torch.arange(8),
+            _tpu_fused_rs_group_offset=torch.tensor([[0, 0]], dtype=torch.int32),
+        )
+
+        with patch(
+            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            return_value=torch.zeros(tokens, hidden, dtype=torch.float32),
+        ) as fused:
+            actual = apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+
+        self.assertEqual(actual.hidden_states.dtype, x.dtype)
+        self.assertIs(fused.call_args.kwargs["w1_scale"], w13_scale_inv)
+        self.assertIs(fused.call_args.kwargs["w2_scale"], w2_scale_inv)
+        self.assertTrue(fused.call_args.kwargs["fp8_direct_write"])
+        self.assertEqual(fused.call_args.kwargs["topk_weights"].dtype, torch.float32)
+
+    def test_stock_blockwise_path_preserves_fp32_router_weights(self):
+        tokens, hidden = 8, 4
+        x = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1, dtype=torch.float32),
+                torch.zeros(tokens, 1, dtype=torch.int64),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            weight_block_size=[1, 512],
+            w13_weight=torch.zeros(1, hidden, hidden),
+            w2_weight=torch.zeros(1, hidden, hidden),
+            w13_weight_scale_inv=torch.ones(1, 1, 1, hidden),
+            w2_weight_scale_inv=torch.ones(1, 1, 1, hidden),
+            num_fused_shared_experts=0,
+            num_local_experts=1,
+        )
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.fp8_moe.fused_moe_call",
+                return_value=torch.zeros_like(x),
+            ) as fused,
+            patch(
+                "sglang.srt.hardware_backend.tpu.fp8_moe.get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+            ),
+        ):
+            apply_tpu_fp8_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                block_quant=True,
+                apply_router_weight_on_input=False,
+            )
+
+        self.assertEqual(fused.call_args.kwargs["topk_weights"].dtype, torch.float32)
+        self.assertEqual(fused.call_args.kwargs["topk_ids"].dtype, torch.int32)
+
+    def test_channelwise_paths_keep_hidden_dtype_router_weights(self):
+        tokens, hidden = 8, 4
+        x = torch.zeros(tokens, hidden, dtype=torch.bfloat16)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1, dtype=torch.float32),
+                torch.zeros(tokens, 1, dtype=torch.int64),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            weight_block_size=None,
+            w13_weight=torch.zeros(1, hidden, hidden),
+            w2_weight=torch.zeros(1, hidden, hidden),
+            w13_weight_scale=torch.ones(1, 1, 1, hidden),
+            w2_weight_scale=torch.ones(1, 1, 1, hidden),
+            num_fused_shared_experts=0,
+            num_local_experts=1,
+            _tpu_fused_rs_physical_order=torch.arange(8),
+            _tpu_fused_rs_group_offset=torch.tensor([[0, 0]], dtype=torch.int32),
+        )
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.fp8_moe.fused_moe_call",
+                return_value=torch.zeros_like(x),
+            ) as stock,
+            patch(
+                "sglang.srt.hardware_backend.tpu.fp8_moe.get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
+            ),
+        ):
+            apply_tpu_fp8_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                block_quant=False,
+                apply_router_weight_on_input=False,
+            )
+        self.assertEqual(stock.call_args.kwargs["topk_weights"].dtype, x.dtype)
+
+        with patch(
+            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            return_value=torch.zeros_like(x),
+        ) as fused:
+            apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+        self.assertEqual(fused.call_args.kwargs["topk_weights"].dtype, x.dtype)
+        self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
+
+    def test_uses_fused_rs_only_through_validated_limits(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
         self.assertTrue(should_use_fp8_fused_rs(64))
         self.assertTrue(should_use_fp8_fused_rs(128))
@@ -166,6 +306,10 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertTrue(should_use_fp8_fused_rs(32768))
         self.assertTrue(should_use_fp8_fused_rs(65536))
         self.assertFalse(should_use_fp8_fused_rs(65537))
+        self.assertTrue(should_use_fp8_fused_rs(8192, block_quantized=True, topk=8))
+        self.assertFalse(should_use_fp8_fused_rs(8192, block_quantized=True, topk=4))
+        self.assertTrue(should_use_fp8_fused_rs(16_384, block_quantized=True, topk=8))
+        self.assertFalse(should_use_fp8_fused_rs(16_385, block_quantized=True, topk=8))
 
     def test_padded_routed_rows_respect_inline_limit(self):
         padded_tokens = fused_moe_rs_padded_tokens(682, topk=3, ep_size=8)

@@ -21,6 +21,34 @@ def _quantize_channelwise(weight: torch.Tensor):
     return quantized.to(torch.float8_e4m3fn), scale.to(torch.bfloat16)
 
 
+def _quantize_blockwise(weight: torch.Tensor, block_size: int = 512):
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    num_experts, k_size, n_size = weight.shape
+    assert k_size % block_size == 0
+    quantized = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(
+        num_experts,
+        k_size // block_size,
+        1,
+        n_size,
+        dtype=torch.bfloat16,
+    )
+    dequantized = torch.empty_like(weight)
+    for k_start in range(0, k_size, block_size):
+        k_end = k_start + block_size
+        block = weight[:, k_start:k_end, :]
+        block_scale = block.abs().amax(dim=1).clamp_min(1e-6) / fp8_max
+        block_quantized = (block / block_scale[:, None, :]).clamp(-fp8_max, fp8_max)
+        block_quantized = block_quantized.to(torch.float8_e4m3fn)
+        quantized[:, k_start:k_end, :] = block_quantized
+        stored_scale = block_scale.to(torch.bfloat16)
+        scale[:, k_start // block_size, 0, :] = stored_scale
+        dequantized[:, k_start:k_end, :] = (
+            block_quantized.float() * stored_scale.float()[:, None, :]
+        )
+    return quantized, scale, dequantized
+
+
 def _reference(
     hidden_states,
     w1,
@@ -54,9 +82,14 @@ def main():
     test_post_expert_norm = (
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM", "0") == "1"
     )
+    test_blockwise = os.environ.get("SGLANG_TPU_FUSED_RS_TEST_BLOCKWISE", "0") == "1"
     tokens = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOKENS", "64"))
     topk = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOPK", "2"))
-    hidden_size, intermediate_size = 256, 256
+    large_blockwise_boundary = test_blockwise and tokens == 2048 and topk == 8
+    if test_blockwise:
+        hidden_size = intermediate_size = 512 if large_blockwise_boundary else 1024
+    else:
+        hidden_size = intermediate_size = 256
     hidden_states = torch.randn(tokens, hidden_size, dtype=torch.bfloat16) * 0.1
     w1_float = (
         torch.randn(world_size, hidden_size, 2 * intermediate_size, dtype=torch.float32)
@@ -66,26 +99,40 @@ def main():
         torch.randn(world_size, intermediate_size, hidden_size, dtype=torch.float32)
         * 0.02
     )
-    w1_quantized, w1_scale = _quantize_channelwise(w1_float)
-    w2_quantized, w2_scale = _quantize_channelwise(w2_float)
-    w1_dequantized = w1_quantized.float() * w1_scale.float()[:, None, :]
-    w2_dequantized = w2_quantized.float() * w2_scale.float()[:, None, :]
+    if test_blockwise:
+        # Separate adjacent K-block magnitudes so layout mistakes are visible.
+        if not large_blockwise_boundary:
+            w1_float[:, :512, :] *= 0.03125
+            w2_float[:, 512:1024, :] *= 0.03125
+        w1_quantized, w1_scale, w1_dequantized = _quantize_blockwise(w1_float)
+        w2_quantized, w2_scale, w2_dequantized = _quantize_blockwise(w2_float)
+    else:
+        w1_quantized, w1_scale = _quantize_channelwise(w1_float)
+        w2_quantized, w2_scale = _quantize_channelwise(w2_float)
+        w1_dequantized = w1_quantized.float() * w1_scale.float()[:, None, :]
+        w2_dequantized = w2_quantized.float() * w2_scale.float()[:, None, :]
 
     token_ids = torch.arange(tokens, dtype=torch.int32)[:, None]
     slots = torch.arange(topk, dtype=torch.int32)[None, :]
     topk_ids = (token_ids + slots) % world_size
-    topk_weights = torch.full((tokens, topk), 1 / topk, dtype=torch.bfloat16)
+    topk_weights = torch.full(
+        (tokens, topk),
+        1 / topk,
+        dtype=torch.float32 if test_blockwise else torch.bfloat16,
+    )
     post_expert_norm_weight = torch.linspace(
         -0.2, 0.2, hidden_size, dtype=torch.bfloat16
     )
-    expected = _reference(
-        hidden_states,
-        w1_dequantized,
-        w2_dequantized,
-        topk_weights,
-        topk_ids,
-        post_expert_norm_weight if test_post_expert_norm else None,
-    )
+    expected = None
+    if not large_blockwise_boundary:
+        expected = _reference(
+            hidden_states,
+            w1_dequantized,
+            w2_dequantized,
+            topk_weights,
+            topk_ids,
+            post_expert_norm_weight if test_post_expert_norm else None,
+        )
 
     device = torch.device("tpu")
     physical_id = tpu_distributed.global_device_id()
@@ -120,39 +167,63 @@ def main():
         )
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
+    w1_scale_local = w1_scale[local_expert : local_expert + 1]
+    w2_scale_local = w2_scale[local_expert : local_expert + 1]
+    if not test_blockwise:
+        w1_scale_local = w1_scale_local[:, None, None, :]
+        w2_scale_local = w2_scale_local[:, None, None, :]
     kernel_args = (
         hidden_states.to(device),
         w1_quantized[local_expert : local_expert + 1].to(device),
         w2_quantized[local_expert : local_expert + 1].to(device),
-        w1_scale[local_expert : local_expert + 1, None, None, :].to(device),
-        w2_scale[local_expert : local_expert + 1, None, None, :].to(device),
+        w1_scale_local.to(device),
+        w2_scale_local.to(device),
         topk_weights.to(device),
         topk_ids.to(device),
-        torch.tensor([local_expert, physical_id], dtype=torch.int32, device=device),
+        torch.tensor([[local_expert, physical_id]], dtype=torch.int32, device=device),
     )
-    actual = compiled(
-        *kernel_args,
-        (
-            post_expert_norm_weight.to(device)
-            if test_post_expert_norm
-            else torch.zeros(1, dtype=torch.bfloat16, device=device)
-        ),
-    ).cpu()
+    norm_weight = (
+        post_expert_norm_weight.to(device)
+        if test_post_expert_norm
+        else torch.zeros(1, dtype=torch.bfloat16, device=device)
+    )
+    actual = compiled(*kernel_args, norm_weight).cpu()
+    if test_blockwise:
+        for _ in range(4):
+            repeated = compiled(*kernel_args, norm_weight).cpu()
+            torch.testing.assert_close(repeated, actual, rtol=0, atol=0)
 
     padded_tokens = fused_moe_rs_padded_tokens(tokens, topk, world_size)
-    if padded_tokens != tokens:
+    if expected is not None and padded_tokens != tokens:
         expected = torch.nn.functional.pad(expected, (0, 0, 0, padded_tokens - tokens))
     shard_size = padded_tokens // world_size
-    shard = slice(physical_id * shard_size, (physical_id + 1) * shard_size)
+    if expected is None:
+        local_rows = sorted({0, shard_size // 3, 2 * shard_size // 3, shard_size - 1})
+        global_start = physical_id * shard_size
+        global_rows = [global_start + row for row in local_rows]
+        expected_rows = _reference(
+            hidden_states[global_rows],
+            w1_dequantized,
+            w2_dequantized,
+            topk_weights[global_rows],
+            topk_ids[global_rows],
+            post_expert_norm_weight if test_post_expert_norm else None,
+        )
+        actual_rows = actual[local_rows]
+    else:
+        shard = slice(physical_id * shard_size, (physical_id + 1) * shard_size)
+        expected_rows = expected[shard]
+        actual_rows = actual
     torch.testing.assert_close(
-        actual,
-        expected[shard],
+        actual_rows,
+        expected_rows,
         rtol=0.10 if test_post_expert_norm else 0.08,
         atol=0.15 if test_post_expert_norm else 0.03,
     )
     print(
         f"FP8_FUSED_RS_KERNEL_PASS rank={rank} physical_id={physical_id} "
-        f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm}"
+        f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm} "
+        f"blockwise={test_blockwise}"
     )
     dist.destroy_process_group()
 
