@@ -15,7 +15,10 @@ fallback, for a raiden build that does not release the GIL on H2d.
 from __future__ import annotations
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.raiden_transfer import NOOP_EVENT
+from sglang.srt.hardware_backend.tpu.raiden_transfer import (
+    NOOP_EVENT,
+    CombinedFutureEvent,
+)
 from sglang.srt.managers.cache_controller import (
     BatchDoneCounter,
     CacheOperation,
@@ -82,13 +85,62 @@ class TpuRaidenHiCacheController(HiCacheController):
         )
         return device_indices
 
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+        # Spec decoding piggybacks draft KV on every write-back / load-back
+        # with the SAME host and device indices as the target pool (the draft
+        # pool shares the target's token allocator, and the draft host pool is
+        # sized for 1-to-1 host slots). raiden addresses pages, so that only
+        # holds if the draft host pool pages exactly like the primary one.
+        primary = self.mem_pool_host
+        if type(draft_host_pool) is not type(primary):
+            raise TypeError(
+                "Draft host pool must be the raiden host pool "
+                f"({type(primary).__name__}), got {type(draft_host_pool).__name__}."
+            )
+        if draft_host_pool.page_size != primary.page_size:
+            raise ValueError(
+                "Draft host pool page size must match the primary host pool "
+                f"({draft_host_pool.page_size} != {primary.page_size})."
+            )
+        if draft_host_pool.page_num < primary.page_num:
+            raise ValueError(
+                "Draft host pool must cover every primary host page id "
+                f"({draft_host_pool.page_num} < {primary.page_num})."
+            )
+        super().set_draft_kv_pool(draft_device_pool, draft_host_pool)
+        # The draft forward gates on the same whole-batch reload event through
+        # its own pool's counter (mirrors the native TpuHiCacheController).
+        draft_device_pool.register_layer_transfer_counter(self.layer_done_counter)
+
+    def _backup_all_pools(self, host_indices, device_indices):
+        """D2H the target pool — and the draft pool at the same indices — in
+        one raiden call each; returns a single event over the DMAs."""
+        target_event = self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device, host_indices, device_indices, self.io_backend
+        )
+        if not self.has_draft:
+            return target_event
+        draft_event = self.mem_pool_host_draft.backup_from_device_all_layer(
+            self.mem_pool_device_draft, host_indices, device_indices, self.io_backend
+        )
+        return CombinedFutureEvent([target_event, draft_event])
+
+    def _load_all_pools(self, host_indices, device_indices):
+        """H2D the target pool — and the draft pool at the same indices — in
+        one raiden call each; returns a single event over the DMAs."""
+        target_event = self.mem_pool_host.load_all_layer(
+            self.mem_pool_device, host_indices, device_indices
+        )
+        if not self.has_draft:
+            return target_event
+        draft_event = self.mem_pool_host_draft.load_all_layer(
+            self.mem_pool_device_draft, host_indices, device_indices
+        )
+        return CombinedFutureEvent([target_event, draft_event])
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
-        if self.has_draft:
-            raise NotImplementedError(
-                "Draft KV offload is not supported on the TPU raiden path."
-            )
 
         op = CacheOperation.merge_ops(self.write_queue)
         host_indices, device_indices = self.move_indices(
@@ -96,11 +148,10 @@ class TpuRaidenHiCacheController(HiCacheController):
         )
         self.write_queue.clear()
 
-        # D2H for all layers in one raiden call; the returned future-event is
-        # polled by HiRadixCache.writing_check before the device slot is freed.
-        finish_event = self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device, host_indices, device_indices, self.io_backend
-        )
+        # D2H for all layers in one raiden call per pool; the returned
+        # future-event is polled by HiRadixCache.writing_check before the
+        # device slot is freed.
+        finish_event = self._backup_all_pools(host_indices, device_indices)
         self.ack_write_queue.append(
             HiCacheAck(
                 start_event=NOOP_EVENT,
@@ -112,10 +163,6 @@ class TpuRaidenHiCacheController(HiCacheController):
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
-        if self.has_draft:
-            raise NotImplementedError(
-                "Draft KV offload is not supported on the TPU raiden path."
-            )
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
@@ -129,13 +176,8 @@ class TpuRaidenHiCacheController(HiCacheController):
             # forward's CompiledForwardShim wait() blocks on the worker event, so
             # the (GIL-releasing) H2d overlaps whatever the scheduler runs before
             # the consuming forward.
-            mem_pool_host = self.mem_pool_host
-            mem_pool_device = self.mem_pool_device
-
             def _load():
-                mem_pool_host.load_all_layer(
-                    mem_pool_device, host_indices, device_indices
-                ).synchronize()
+                self._load_all_pools(host_indices, device_indices).synchronize()
 
             worker_done = self._load_worker.submit(_load)
             # BatchDoneCounter has 2 slots, so round N reuses round N-2's slot and
@@ -153,13 +195,11 @@ class TpuRaidenHiCacheController(HiCacheController):
             )
             return producer_id
 
-        # Inline path: H2D for all layers in one raiden call, then block until the
-        # DMA has landed (poll-only; never Await). TPU's wait_event is a no-op and
-        # the consuming forward runs this same step, so the load must complete
-        # here.
-        finish_event = self.mem_pool_host.load_all_layer(
-            self.mem_pool_device, host_indices, device_indices
-        )
+        # Inline path: H2D for all layers in one raiden call per pool, then block
+        # until the DMAs have landed (poll-only; never Await). TPU's wait_event is
+        # a no-op and the consuming forward runs this same step, so the load must
+        # complete here.
+        finish_event = self._load_all_pools(host_indices, device_indices)
         finish_event.synchronize()
 
         # Hand the already-landed event to the whole-batch gate; the consuming

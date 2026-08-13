@@ -7402,16 +7402,6 @@ class ServerArgs:
             )
 
         if (
-            self.hicache_io_backend == "raiden"
-            and self.speculative_algorithm is not None
-        ):
-            raise ValueError(
-                "raiden io backend does not support speculative decoding (draft "
-                "KV offload). Disable --speculative-algorithm or choose a "
-                "different --hicache-io-backend."
-            )
-
-        if (
             self.hicache_mem_layout == "page_first_direct"
             and self.hicache_io_backend == "kernel"
         ):

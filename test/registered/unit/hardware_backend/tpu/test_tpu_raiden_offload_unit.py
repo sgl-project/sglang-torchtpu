@@ -30,10 +30,15 @@ from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
 )
+from sglang.srt.hardware_backend.tpu.raiden_cache_controller import (
+    TpuRaidenHiCacheController,
+)
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
+    CombinedFutureEvent,
     RaidenFutureEvent,
 )
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -354,6 +359,152 @@ class TestRaidenFutureEvent(CustomTestCase):
         ev = RaidenFutureEvent(_FakeFuture())
         ev.record()
         ev.wait()
+
+
+class TestCombinedFutureEvent(CustomTestCase):
+    def test_ready_only_when_all_events_ready(self):
+        """The combined event must gate on EVERY underlying DMA: an ack that
+        reports ready while the draft pool's transfer is still in flight would
+        free/reuse pages mid-DMA (silent corruption)."""
+        fast = RaidenFutureEvent(_FakeFuture(ready_after=0))
+        slow = RaidenFutureEvent(_FakeFuture(ready_after=2))
+        ev = CombinedFutureEvent([fast, slow])
+        self.assertFalse(ev.query())
+        self.assertFalse(ev.query())
+        self.assertTrue(ev.query())
+        ev.synchronize()  # must not block once all are ready
+
+
+class _FakeHostPool:
+    """Raiden-host-pool stand-in recording the transfer calls it receives."""
+
+    def __init__(self, page_size=4, page_num=8, event=None):
+        self.page_size = page_size
+        self.page_num = page_num
+        self.size = page_size * page_num
+        self._event = event if event is not None else RaidenFutureEvent(None)
+        self.backup_calls = []
+        self.load_calls = []
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        self.backup_calls.append((device_pool, host_indices, device_indices))
+        return self._event
+
+    def load_all_layer(self, device_pool, host_indices, device_indices):
+        self.load_calls.append((device_pool, host_indices, device_indices))
+        return self._event
+
+
+class _FakeBatchCounter:
+    def __init__(self):
+        self.events = {}
+
+    def update_producer(self):
+        return 0
+
+    def set_event(self, producer_id, event):
+        self.events[producer_id] = event
+
+
+def _make_controller(*, draft_pool=None):
+    ctl = object.__new__(TpuRaidenHiCacheController)
+    ctl.io_backend = "raiden"
+    ctl.write_queue = []
+    ctl.load_queue = []
+    ctl.ack_write_queue = []
+    ctl.ack_load_queue = []
+    ctl.enable_storage = False
+    ctl.mem_pool_device = object()
+    ctl.mem_pool_host = _FakeHostPool()
+    ctl.has_draft = False
+    ctl.mem_pool_device_draft = None
+    ctl.mem_pool_host_draft = None
+    ctl.layer_done_counter = _FakeBatchCounter()
+    ctl._async_h2d = False
+    ctl._load_worker = None
+    if draft_pool is not None:
+        ctl.has_draft = True
+        ctl.mem_pool_device_draft = object()
+        ctl.mem_pool_host_draft = draft_pool
+    return ctl
+
+
+class TestRaidenControllerDraftPiggyback(CustomTestCase):
+    """Spec decoding stores draft-model KV in a second pool indexed by the same
+    token slots as the target pool. Write-back / load-back that moves only the
+    target pool leaves draft KV stale on every host-tier hit, which silently
+    collapses speculation instead of erroring. These pin the piggyback contract:
+    same indices to both pools, one ack gated on both DMAs."""
+
+    def test_write_back_piggybacks_draft_pool(self):
+        slow_draft = RaidenFutureEvent(_FakeFuture(ready_after=1))
+        draft_pool = _FakeHostPool(event=slow_draft)
+        ctl = _make_controller(draft_pool=draft_pool)
+        host_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        device_idx = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
+        ctl.write_queue.append(CacheOperation(host_idx, device_idx, node_id=1))
+
+        ctl.start_writing()
+
+        (target_call,) = ctl.mem_pool_host.backup_calls
+        (draft_call,) = draft_pool.backup_calls
+        self.assertIs(target_call[0], ctl.mem_pool_device)
+        self.assertIs(draft_call[0], ctl.mem_pool_device_draft)
+        # Identical host/device indices in both pools (1-to-1 slot premise).
+        self.assertIs(draft_call[1], target_call[1])
+        self.assertIs(draft_call[2], target_call[2])
+        # The single ack must not report ready while the draft DMA is in flight.
+        (ack,) = ctl.ack_write_queue
+        self.assertFalse(ack.finish_event.query())
+        self.assertTrue(ack.finish_event.query())
+
+    def test_load_back_piggybacks_draft_pool_and_gates_batch(self):
+        draft_pool = _FakeHostPool()
+        ctl = _make_controller(draft_pool=draft_pool)
+        host_idx = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+        device_idx = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        ctl.load_queue.append(CacheOperation(host_idx, device_idx, node_id=2))
+
+        producer_id = ctl.start_loading()
+
+        (target_call,) = ctl.mem_pool_host.load_calls
+        (draft_call,) = draft_pool.load_calls
+        self.assertIs(target_call[0], ctl.mem_pool_device)
+        self.assertIs(draft_call[0], ctl.mem_pool_device_draft)
+        self.assertIs(draft_call[1], target_call[1])
+        self.assertIs(draft_call[2], target_call[2])
+        # The whole-batch gate must hold the event covering BOTH pools' DMAs.
+        gate_event = ctl.layer_done_counter.events[producer_id]
+        self.assertIsInstance(gate_event, CombinedFutureEvent)
+        (ack,) = ctl.ack_load_queue
+        self.assertIs(ack.finish_event, gate_event)
+
+    def test_set_draft_kv_pool_rejects_mismatched_paging(self):
+        """Piggybacking reuses the primary pool's host page ids verbatim, so a
+        draft host pool that pages differently would corrupt addressing; it must
+        be rejected at registration, not fail silently at transfer time."""
+        ctl = _make_controller()
+        with self.assertRaises(ValueError):
+            ctl.set_draft_kv_pool(Mock(), _FakeHostPool(page_size=8))
+        with self.assertRaises(ValueError):
+            ctl.set_draft_kv_pool(Mock(), _FakeHostPool(page_num=4))
+        with self.assertRaises(TypeError):
+            ctl.set_draft_kv_pool(Mock(), object())
+        self.assertFalse(ctl.has_draft)
+
+    def test_set_draft_kv_pool_accepts_matching_paging(self):
+        ctl = _make_controller()
+        draft_pool = _FakeHostPool()
+        draft_device_pool = Mock()
+        ctl.set_draft_kv_pool(draft_device_pool, draft_pool)
+        self.assertTrue(ctl.has_draft)
+        self.assertIs(ctl.mem_pool_host_draft, draft_pool)
+        # The draft forward must gate on the shared whole-batch reload event.
+        draft_device_pool.register_layer_transfer_counter.assert_called_once_with(
+            ctl.layer_done_counter
+        )
 
 
 if __name__ == "__main__":

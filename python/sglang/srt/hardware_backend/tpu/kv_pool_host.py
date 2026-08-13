@@ -54,6 +54,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         pin_memory: bool = False,
         device: str = "cpu",
         allocator_type: str = "default",
+        pool_label: str = "kv",
     ):
         # Deliberately do NOT call ``HostKVCache.__init__``: it allocates a
         # torch host buffer via ``init_kv_buffer`` and does a psutil RAM check.
@@ -64,6 +65,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         self.layout = RAIDEN_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
+        self.pool_label = pool_label
 
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer

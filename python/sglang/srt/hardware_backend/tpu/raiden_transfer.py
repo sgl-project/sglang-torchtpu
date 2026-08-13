@@ -74,6 +74,31 @@ class RaidenFutureEvent:
 NOOP_EVENT = RaidenFutureEvent(None)
 
 
+class CombinedFutureEvent:
+    """A single event over several ``RaidenFutureEvent``-like events.
+
+    Presents one completion surface for an operation that fans out into
+    multiple raiden DMAs (e.g. the target and draft KV pools transferred by
+    one HiCache write-back): ready only when every underlying event is ready.
+    """
+
+    def __init__(self, events):
+        self._events = list(events)
+
+    def query(self) -> bool:
+        return all(event.query() for event in self._events)
+
+    def synchronize(self) -> None:
+        for event in self._events:
+            event.synchronize()
+
+    def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+    def wait(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
+        return None
+
+
 class RaidenKVTransfer:
     """Owns a raiden ``KVCacheManager`` over a TPU fused KV pool and issues
     page-granular D2H / H2D transfers.
