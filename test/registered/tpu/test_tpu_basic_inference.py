@@ -71,6 +71,16 @@ class TestTpuBasicInference(CustomTestCase):
                 "512",
                 "--context-length",
                 "1024",
+                # Every request here is a single sub-16-token prompt, so one
+                # extend bucket and one decode shape cover them all. Without
+                # these the derived grid is 4 token buckets x 7 batch sizes and
+                # precompile alone costs ~130s of the file's ~169s.
+                "--torch-compile-max-bs",
+                "1",
+                "--tpu-compile-bs",
+                "1",
+                "--tpu-compile-tokens",
+                "64",
             ],
         )
 
