@@ -125,7 +125,7 @@ class TestFusedMoeRsOp(CustomTestCase):
 
     def test_large_gather_is_chunked_below_sparsecore_limit(self):
         tp_size = 8
-        shard_tokens = 256
+        shard_tokens = 400
         hidden_size = 1024
         physical_order_to_tp_rank = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
         token_shard = torch.zeros(shard_tokens, hidden_size, dtype=torch.bfloat16)
@@ -134,7 +134,7 @@ class TestFusedMoeRsOp(CustomTestCase):
             self.assertEqual(dim, 0)
             self.assertLessEqual(
                 chunk.numel() * chunk.element_size() * tp_size,
-                2048 * 1024,
+                2304 * 1024,
             )
             return torch.cat(
                 [torch.full_like(chunk, rank) for rank in range(tp_size)], dim=0
@@ -168,9 +168,43 @@ class TestFusedMoeRsOp(CustomTestCase):
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
             )
 
-        self.assertEqual(tp_group.all_gather.call_count, 2)
+        # Three payload-sized chunks are sufficient; do not round this to the
+        # next power of two and add an unnecessary collective per MoE layer.
+        self.assertEqual(tp_group.all_gather.call_count, 3)
         expected_ranks = physical_order_to_tp_rank.repeat_interleave(shard_tokens)
         torch.testing.assert_close(output[:, 0].float(), expected_ranks.float())
+
+    @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+    def test_sender_payload_tracks_logical_source_and_remote_destinations(self):
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import (
+            _compute_sender_payload,
+            _transpose_sender_payloads,
+        )
+
+        payload = _compute_sender_payload(
+            jnp.asarray([0, 0, 1, 1], dtype=jnp.int32),
+            jnp.asarray([0, 1, 2, 3], dtype=jnp.int32),
+            expert_shard_id=jnp.int32(0),
+            physical_device_id=jnp.int32(0),
+            ep_size=4,
+        )
+        self.assertEqual(payload.tolist(), [0, 0, 1, 0, 0])
+
+        # Gather order is physical; receive semaphores are indexed by logical
+        # expert shard, so the leading sender ID controls the transpose.
+        all_payloads = jnp.asarray(
+            [
+                [2, 5, 6, 7, 8],
+                [0, 9, 10, 11, 12],
+                [3, 13, 14, 15, 16],
+                [1, 17, 18, 19, 20],
+            ],
+            dtype=jnp.int32,
+        )
+        recv_counts = _transpose_sender_payloads(all_payloads, 1, 4)
+        self.assertEqual(recv_counts.tolist(), [10, 18, 6, 14])
 
     @unittest.skipUnless(
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),

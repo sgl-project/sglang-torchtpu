@@ -33,6 +33,7 @@ def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
 
     try:
         from sglang.srt.distributed import get_tp_group
+
         tp_group = get_tp_group()
     except Exception:
         tp_group = None
@@ -79,10 +80,12 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         ep_rank = global_device_id
 
     group_offset = torch.tensor(
-        [[
-            ep_rank * layer.num_local_experts,
-            global_device_id,
-        ]],
+        [
+            [
+                ep_rank * layer.num_local_experts,
+                global_device_id,
+            ]
+        ],
         dtype=torch.int32,
         device=device,
     )
@@ -96,6 +99,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 @functools.cache
 def _get_mesh(world_size: int | None = None):
     import re
+
     import numpy as np
     from jax.sharding import Mesh
 
@@ -283,10 +287,10 @@ def fused_moe_rs_gather(
     bytes_per_token = hidden_size * token_shard.element_size()
     tp_size = physical_order_to_tp_rank.shape[0]
 
-    # Keep the complete gather comfortably below the 2.5 MiB SparseCore
-    # scratchpad limit. The collective needs scratch space beyond its payload,
-    # so reserve 512 KiB rather than filling the nominal capacity.
-    max_chunk_size = (2048 * 1024) // tp_size
+    # Keep the complete gather below the 2.5 MiB SparseCore scratchpad limit,
+    # with 256 KiB of headroom. Compute chunks from whole token rows instead of
+    # rounding their count to a power of two.
+    max_chunk_size = (2304 * 1024) // tp_size
     max_chunk_tokens = max(1, max_chunk_size // bytes_per_token)
     num_chunks = max(1, (shard_tokens + max_chunk_tokens - 1) // max_chunk_tokens)
 

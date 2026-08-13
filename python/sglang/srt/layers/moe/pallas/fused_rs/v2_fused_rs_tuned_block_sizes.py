@@ -423,10 +423,9 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-2048_n-1536_g-16_lhs_quant_rhs_bs-128"
                 "+k-768_n-2048_g-16_lhs_quant_rhs_bs-128"
             ): _all_m(_H2048_I768_FP8),
-            (
-                "k-2048_n-1536_g-16_lhs_quant"
-                "+k-768_n-2048_g-16_lhs_quant"
-            ): _all_m(_H2048_I768_FP8),
+            ("k-2048_n-1536_g-16_lhs_quant" "+k-768_n-2048_g-16_lhs_quant"): _all_m(
+                _H2048_I768_FP8
+            ),
             # H6144-I2560: H=6144, I=2560, E=160, EP=8 -> g=20 (Qwen3-Coder-480B)
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
@@ -444,13 +443,10 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-256"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-256"
             ): _all_m(_H6144_I2560_FP8),
-            (
-                "k-6144_n-5120_g-20_lhs_quant"
-                "+k-2560_n-6144_g-20_lhs_quant"
-            ): _all_m(_H6144_I2560_FP8),
-            (
-                "k-6144_n-5120_g-20+k-2560_n-6144_g-20"
-            ): _all_m(_H6144_I2560_FP8),
+            ("k-6144_n-5120_g-20_lhs_quant" "+k-2560_n-6144_g-20_lhs_quant"): _all_m(
+                _H6144_I2560_FP8
+            ),
+            ("k-6144_n-5120_g-20+k-2560_n-6144_g-20"): _all_m(_H6144_I2560_FP8),
         },
         # ---------------------------------------------------------------------
         # FP4 (lhs bf16 × rhs fp4, rhs_quant_block_size=16)
@@ -571,10 +567,9 @@ FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-2560"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
             ): _all_m(_H6144_I2560_FP8),
-            (
-                "k-6144_n-5120_g-20_lhs_quant"
-                "+k-2560_n-6144_g-20_lhs_quant"
-            ): _all_m(_H6144_I2560_FP8),
+            ("k-6144_n-5120_g-20_lhs_quant" "+k-2560_n-6144_g-20_lhs_quant"): _all_m(
+                _H6144_I2560_FP8
+            ),
         },
     },
 }

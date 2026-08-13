@@ -24,14 +24,13 @@ import functools
 
 import jax
 from jax import numpy as jnp
+from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from jax.experimental.pallas import tpu as pltpu
-
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
-    compute_num_gm,
     _select_fused_rs_block_sizes,
+    compute_num_gm,
 )
 from sglang.srt.layers.moe.pallas.fused_rs.gmm_fused_rs_nodedup import (
     gmm_v2_fused_rs as gmm_v2_fused_rs_nodedup,
@@ -57,17 +56,54 @@ MLP_DATA = "data"
 # ============================================================================
 
 
+def _compute_sender_payload(
+    source_ep_ranks,
+    dest_physical_ids,
+    *,
+    ep_size,
+    expert_shard_id,
+    physical_device_id,
+):
+    """Pack this logical sender's exact remote-copy counts."""
+    sender_rows = (source_ep_ranks == expert_shard_id) & (
+        dest_physical_ids != physical_device_id
+    )
+    sender_destinations = jnp.where(sender_rows, dest_physical_ids, ep_size)
+    sender_counts = jnp.bincount(sender_destinations, length=ep_size + 1)[
+        :ep_size
+    ].astype(jnp.int32)
+    return jnp.concatenate(
+        [jnp.asarray([expert_shard_id], dtype=jnp.int32), sender_counts]
+    )
+
+
+def _transpose_sender_payloads(all_sender_payloads, physical_device_id, ep_size):
+    """Return receive counts indexed by each sender's logical expert shard."""
+    all_source_expert_shards = all_sender_payloads[:, 0]
+    all_sender_counts = all_sender_payloads[:, 1:]
+    return (
+        jnp.zeros((ep_size,), dtype=jnp.int32)
+        .at[all_source_expert_shards]
+        .set(all_sender_counts[:, physical_device_id])
+    )
+
+
 def _compute_rs_routing(
     topk_indices,
     *,
     num_experts,
     topk,
+    ep_size,
+    ep_axis_name,
+    physical_device_id,
+    expert_shard_id,
 ):
     """Inline routing for the RS path with full VPU vectorized precomputations.
     Computes:
       - lhs_indices: int32[size_m] — gather indices (token ID per row)
       - group_sizes: int32[num_experts] — rows per expert
       - topk_slot_indices: int32[size_m] — topk slot (0..topk-1) per row
+      - peer_recv_counts: int32[ep_size] — incoming rows by logical sender
     """
     topk_indices_flat = topk_indices.flatten()
     topk_argsort_indices = jnp.argsort(topk_indices_flat)
@@ -79,7 +115,32 @@ def _compute_rs_routing(
     lhs_indices = (topk_argsort_indices // topk).astype(jnp.int32)
     topk_slot_indices = (topk_argsort_indices % topk).astype(jnp.int32)
 
-    return lhs_indices, group_sizes, topk_slot_indices
+    # Each rank counts the rows produced by its local experts, then exchanges
+    # one compact payload. Receive semaphore slots follow logical expert-shard
+    # IDs; physical IDs are used only for remote-copy destinations.
+    num_experts_per_shard = num_experts // ep_size
+    sorted_experts = topk_indices_flat[topk_argsort_indices]
+    source_ep_ranks = (sorted_experts // num_experts_per_shard).astype(jnp.int32)
+    output_tokens_per_chip = max((topk_indices.shape[0] + ep_size - 1) // ep_size, 1)
+    dest_physical_ids = (lhs_indices // output_tokens_per_chip).astype(jnp.int32)
+    sender_payload = _compute_sender_payload(
+        source_ep_ranks,
+        dest_physical_ids,
+        ep_size=ep_size,
+        expert_shard_id=expert_shard_id,
+        physical_device_id=physical_device_id,
+    )
+    all_sender_payloads = jax.lax.all_gather(
+        sender_payload,
+        axis_name=ep_axis_name,
+        axis=0,
+        tiled=False,
+    )
+    peer_recv_counts = _transpose_sender_payloads(
+        all_sender_payloads, physical_device_id, ep_size
+    )
+
+    return lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts
 
 
 # ============================================================================
@@ -126,11 +187,16 @@ def moe_gmm_local_rs_nodedup(
     go_flat = group_offset.reshape(-1)
     go_val = go_flat[0]
     my_id = go_flat[1] if go_flat.shape[0] > 1 else (go_val // num_local_experts)
+    expert_shard_id = go_val // num_local_experts
     # Routing with vectorized VPU precomputations:
-    lhs_indices, group_sizes, topk_slot_indices = _compute_rs_routing(
+    lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts = _compute_rs_routing(
         topk_indices,
         num_experts=num_experts,
         topk=topk,
+        ep_size=ep_size,
+        ep_axis_name=ep_axis_name,
+        physical_device_id=my_id,
+        expert_shard_id=expert_shard_id,
     )
     output_indices = (lhs_indices * topk + topk_slot_indices).astype(jnp.int32)
     size_m = lhs_indices.shape[0]
@@ -178,9 +244,11 @@ def moe_gmm_local_rs_nodedup(
         quant_block_size=(
             recover_quant_block_size(
                 w1.shape[1],
-                w1_scale.shape[1]
-                if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1)
-                else 1,
+                (
+                    w1_scale.shape[1]
+                    if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1)
+                    else 1
+                ),
             )
             if w1_scale is not None
             else None
@@ -194,7 +262,9 @@ def moe_gmm_local_rs_nodedup(
         tile_m,
         size_m,
     )
-    local_group_sizes = jax.lax.dynamic_slice(group_sizes, (go_val,), (num_local_experts,))
+    local_group_sizes = jax.lax.dynamic_slice(
+        group_sizes, (go_val,), (num_local_experts,)
+    )
     local_num_gm = compute_num_gm(
         local_group_sizes, tile_m, size_lhs_sublane, start_offset=local_start
     )
@@ -207,6 +277,7 @@ def moe_gmm_local_rs_nodedup(
         group_sizes,
         lhs_indices,
         output_indices,  # <--- MUST BE output_indices!
+        peer_recv_counts=peer_recv_counts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_global_scale=w1_global_scale,
@@ -342,17 +413,23 @@ def expert_parallel_gmm_rs(
     num_experts = w1.shape[0]
     num_experts_per_shard = num_experts // ep_size
     if group_offset_input is None:
-        group_offset = jnp.stack([
-            jnp.arange(0, num_experts, num_experts_per_shard, dtype=jnp.int32),
-            jnp.arange(ep_size, dtype=jnp.int32),
-        ], axis=-1)  # shape (ep_size, 2)
+        group_offset = jnp.stack(
+            [
+                jnp.arange(0, num_experts, num_experts_per_shard, dtype=jnp.int32),
+                jnp.arange(ep_size, dtype=jnp.int32),
+            ],
+            axis=-1,
+        )  # shape (ep_size, 2)
     else:
         # Ensure 2D (ep_size, 2)
         if group_offset_input.ndim == 1:
-            group_offset = jnp.stack([
-                group_offset_input,
-                jnp.arange(ep_size, dtype=jnp.int32),
-            ], axis=-1)
+            group_offset = jnp.stack(
+                [
+                    group_offset_input,
+                    jnp.arange(ep_size, dtype=jnp.int32),
+                ],
+                axis=-1,
+            )
         else:
             group_offset = group_offset_input
     w1_scale_spec = None if w1_scale is None else ep_p_spec
