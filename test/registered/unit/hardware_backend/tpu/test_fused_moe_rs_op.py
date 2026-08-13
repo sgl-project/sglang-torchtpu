@@ -49,8 +49,8 @@ class TestFusedMoeRsOp(CustomTestCase):
                 return_value=(4, (0, 1, 6, 7, 2, 3, 4, 5)),
             ),
             patch(
-                "sglang.srt.distributed.parallel_state." "get_moe_expert_parallel_rank",
-                return_value=2,
+                "sglang.srt.distributed.get_tp_group",
+                return_value=Mock(rank=2),
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
         ):
@@ -67,7 +67,7 @@ class TestFusedMoeRsOp(CustomTestCase):
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
-            torch.tensor([32, 4], dtype=torch.int32),
+            torch.tensor([[64, 4]], dtype=torch.int32),
         )
         self.assertIn("_tpu_fused_rs_physical_order", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
@@ -118,3 +118,5 @@ class TestFusedMoeRsOp(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
