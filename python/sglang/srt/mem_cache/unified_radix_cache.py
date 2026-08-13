@@ -832,8 +832,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Update req fields
         if len(new_indices) < len(kv_indices_orig):
+            # req_to_token can be host-resident while prefix matches are on an
+            # accelerator. Keep the reconstructed suffix on the match device.
             req.prefix_indices = torch.cat(
-                [new_indices, kv_indices_orig[len(new_indices) :]]
+                [
+                    new_indices,
+                    kv_indices_orig[len(new_indices) :].to(new_indices.device),
+                ]
             )
         else:
             req.prefix_indices = new_indices

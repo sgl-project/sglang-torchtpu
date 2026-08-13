@@ -220,6 +220,47 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
+class TestUnifiedRadixCacheHostResidentReqToToken(CustomTestCase):
+    def test_empty_match_keeps_uncached_indices_on_match_device(self):
+        cache = mock.Mock()
+        cache.session.try_cache_unfinished_req.return_value = False
+        cache.disable = False
+        cache._components_tuple = ()
+        cache.page_size = 1
+        cache.is_eagle = False
+
+        req_to_token_pool = mock.Mock()
+        req_to_token_pool.req_to_token = torch.tensor([[3, 7]], dtype=torch.int32)
+        cache.req_to_token_pool = req_to_token_pool
+        cache.insert.return_value = mock.Mock(prefix_len=0)
+
+        last_node = object()
+        cache.match_prefix.return_value = MatchResult(
+            # Meta stands in for a non-CPU accelerator so the regression runs
+            # without TPU hardware. A CPU suffix cannot be concatenated directly.
+            device_indices=torch.empty((0,), dtype=torch.int64, device="meta"),
+            last_device_node=last_node,
+            last_host_node=last_node,
+            best_match_node=last_node,
+        )
+        cache.inc_lock_ref.return_value = IncLockRefResult()
+
+        req = mock.Mock()
+        req.get_fill_ids.return_value = array("q", [11, 12])
+        req.req_pool_idx = 0
+        req.cache_protected_len = 0
+        req.priority = 0
+        req.extra_key = None
+        req.last_node = last_node
+        req.swa_uuid_for_lock = None
+
+        UnifiedRadixCache.cache_unfinished_req(cache, req)
+
+        self.assertEqual(req.prefix_indices.device.type, "meta")
+        self.assertEqual(req.prefix_indices.dtype, torch.int64)
+        self.assertEqual(len(req.prefix_indices), 2)
+
+
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists (#26177)."""
