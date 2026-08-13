@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, fields
 from enum import Enum
@@ -34,6 +34,31 @@ SpecializationKey = Callable[..., Hashable]
 _STATIC_INPUT_TYPES = (bool, int, float, str, Enum)
 
 
+def _resolve_dotted_attr(root: object, path: str) -> tuple[object, str, object]:
+    parts = path.split(".")
+    if not path or any(not part for part in parts):
+        raise ValueError(
+            f"model_extra_tensor_attrs contains invalid dotted path {path!r}"
+        )
+
+    parent = root
+    for part in parts[:-1]:
+        try:
+            parent = getattr(parent, part)
+        except AttributeError as error:
+            raise AttributeError(
+                f"model_extra_tensor_attrs path {path!r} has no component {part!r}"
+            ) from error
+    attr_name = parts[-1]
+    try:
+        value = getattr(parent, attr_name)
+    except AttributeError as error:
+        raise AttributeError(
+            f"model_extra_tensor_attrs path {path!r} has no attribute {attr_name!r}"
+        ) from error
+    return parent, attr_name, value
+
+
 class KVPool(Protocol):
     """Expose mutable KV-cache tensors for direct compilation.
 
@@ -58,6 +83,7 @@ def direct_compile(
     *,
     specialization_key: SpecializationKey,
     model: torch.nn.Module | None = None,
+    model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
     ignored_argnames: tuple[str, ...] = (),
 ) -> CompiledFunction:
@@ -92,25 +118,29 @@ def direct_compile(
     sources are `model` and `kv_pool`; passing them through `direct_compile`
     lifts all of their Tensors into graph inputs.
 
-    `model` assumes all Tensor state is registered as parameters or buffers and
-    that their values do not change during inference. `kv_pool` exposes every
-    KV-cache Tensor through `get_state`; all are assumed to be mutated and are
-    copied back after execution. The KV pool is the only mutable input.
+    `direct_compile` needs to know where all the Tensors in `model` are in
+    order to make all of them inputs to the captured graph.
+    It knows how to find Tensors that are registered parameters and buffers.
+    Please pass paths to non-param non-buffer Tensor attributes via
+    `model_extra_tensor_attrs` to tell `direct_compile` where to find those.
+    `direct_compile` assumes that the values of Tensors on the model do not
+    change during inference.
+
+    `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
+    them are assumed to be mutated during inference and are copied back
+    after execution. The KV pool is the only mutable input.
 
     Common problems/assumptions:
 
     * Every Tensor reachable from model execution must be an explicit function
-      input, a model parameter/buffer, or KV-pool state. An ``nn.Module`` must
-      not keep a Tensor as an ordinary attribute; register such Tensors with
-      ``register_buffer(persistent=False)``.
+      input, model parameter/buffer, `model_extra_tensor_attrs` entry, or
+      KV-pool state.
     * Registered aliases are supported, including a parameter also registered
       as a non-persistent buffer. Aliases share one graph input and remain tied
       while tracing.
     * A plain helper object owned by a module is not traversed by
-      ``named_parameters``/``named_buffers``. These objects must not own Tensor
-      attributes; the easiest workaround is to make the Tensor a buffer
-      of the module and have the code use the buffer through accessing
-      module attributes.
+      ``named_parameters``/``named_buffers``. Please list all Tensor attributes
+      via `model_extra_tensor_attrs`.
     * ``build_mlir`` reporting ``identified an argument that was not provided:
       DeviceBufferRef`` means tracing captured such an unregistered Tensor.
       The reported shape and dtype are usually the fastest way to find the
@@ -128,6 +158,7 @@ def direct_compile(
         fn,
         specialization_key=specialization_key,
         model=model,
+        model_extra_tensor_attrs=model_extra_tensor_attrs,
         kv_pool=kv_pool,
         ignored_argnames=ignored_argnames,
     )
@@ -147,6 +178,7 @@ class CompiledFunction:
         *,
         specialization_key: SpecializationKey,
         model: torch.nn.Module | None = None,
+        model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
         ignored_argnames: tuple[str, ...] = (),
     ) -> None:
@@ -155,6 +187,13 @@ class CompiledFunction:
         self.cache: dict[Hashable, _CompiledArtifact] = {}
         self._signature = inspect.signature(fn)
         self._model = model
+        self._model_extra_tensor_attrs = tuple(model_extra_tensor_attrs)
+        if self._model is None and self._model_extra_tensor_attrs:
+            raise ValueError("model_extra_tensor_attrs requires model")
+        if len(set(self._model_extra_tensor_attrs)) != len(
+            self._model_extra_tensor_attrs
+        ):
+            raise ValueError("model_extra_tensor_attrs contains duplicate paths")
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
 
@@ -180,23 +219,44 @@ class CompiledFunction:
             _selector_path(self._signature, args, kwargs, selector)
             for selector in self._ignored_argnames
         )
-        model_names: tuple[str, ...] = ()
+        registered_model_inputs: list[tuple[str, int]] = []
+        extra_model_inputs: list[tuple[object, str, int]] = []
         model_inputs: list[torch.Tensor] = []
         if self._model is not None:
             all_names_and_tensors = [
                 *self._model.named_parameters(remove_duplicate=False),
                 *self._model.named_buffers(remove_duplicate=False),
             ]
-            seen_tensor_ids: set[int] = set()
-            names_and_tensors = []
+            registered_names = {name for name, _ in all_names_and_tensors}
+            tensor_indices: dict[int, int] = {}
             for name, tensor in all_names_and_tensors:
                 tensor_id = id(tensor)
-                if tensor_id in seen_tensor_ids:
+                if tensor_id in tensor_indices:
                     continue
-                seen_tensor_ids.add(tensor_id)
-                names_and_tensors.append((name, tensor))
-            model_names = tuple(name for name, _ in names_and_tensors)
-            model_inputs.extend(tensor for _, tensor in names_and_tensors)
+                tensor_index = len(model_inputs)
+                tensor_indices[tensor_id] = tensor_index
+                model_inputs.append(tensor)
+                registered_model_inputs.append((name, tensor_index))
+
+            for path in self._model_extra_tensor_attrs:
+                if path in registered_names:
+                    raise ValueError(
+                        f"model_extra_tensor_attrs path {path!r} is already a "
+                        "registered parameter or buffer"
+                    )
+                parent, attr_name, tensor = _resolve_dotted_attr(self._model, path)
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(
+                        f"model_extra_tensor_attrs path {path!r} resolved to "
+                        f"{type(tensor).__name__}, not Tensor"
+                    )
+                tensor_id = id(tensor)
+                tensor_index = tensor_indices.get(tensor_id)
+                if tensor_index is None:
+                    tensor_index = len(model_inputs)
+                    tensor_indices[tensor_id] = tensor_index
+                    model_inputs.append(tensor)
+                extra_model_inputs.append((parent, attr_name, tensor_index))
 
         kv_pool_inputs = self._kv_pool.get_state() if self._kv_pool is not None else []
 
@@ -259,9 +319,10 @@ class CompiledFunction:
                 previous_is_compiling,
             )
             if self._model is not None:
-                parameters_and_buffers = dict(
-                    zip(model_names, graph_inputs[:model_input_count])
-                )
+                parameters_and_buffers = {
+                    name: graph_inputs[input_index]
+                    for name, input_index in registered_model_inputs
+                }
                 # Need to temporarily yeet the placeholder params/buffers onto
                 # the nn.Modules
                 # Restore in LIFO order so shared module aliases do not retain
@@ -274,6 +335,15 @@ class CompiledFunction:
                         stack_weights=True,
                     )
                 )
+                # We can't pass these directly to _reparametrize_module because
+                # it requires every intermediate dotted-path component to be an
+                # nn.Module. Explicit extras may live on ordinary helper objects,
+                # so swap those attributes directly and restore them before
+                # registered model state.
+                for parent, attr_name, input_index in extra_model_inputs:
+                    previous_value = getattr(parent, attr_name)
+                    setattr(parent, attr_name, graph_inputs[input_index])
+                    stack.callback(setattr, parent, attr_name, previous_value)
             if self._kv_pool is not None:
                 previous_state = self._kv_pool.get_state()
                 self._kv_pool.set_state(kv_pool_trace_inputs)

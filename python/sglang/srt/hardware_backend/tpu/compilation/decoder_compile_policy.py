@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 import time
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, ClassVar, Literal, Optional
 
 import msgspec
 import torch
@@ -255,6 +255,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     platform = "tpu"
     fullgraph = True
     dynamic = False
+    model_extra_tensor_attrs: ClassVar[tuple[str, ...]] = ()
 
     def __init__(
         self,
@@ -477,6 +478,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             trace_forward,
             specialization_key=self._direct_compile_specialization_key,
             model=model,
+            model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
             kv_pool=self.model_runner.token_to_kv_pool,
             ignored_argnames=(
                 "forward_batch.sampling_info",
@@ -498,6 +500,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def get_model_extra_tensor_attrs(self) -> tuple[str, ...]:
+        """Returns paths to non-param non-buffer Tensor attrs on the model.
+
+        This is only used for direct_compile. direct_compile accepts a model
+        and needs to know where all of the Tensors in the model are. It knows
+        that Tensors can be a part of the parameters and buffers but
+        we need to explicitly tell it where all of the non-parameter non-buffer
+        Tensors are.
+
+        Example: ("foo.bar.baz",).
+        """
+        return self.model_extra_tensor_attrs
 
     def _direct_compile_specialization_key(
         self,

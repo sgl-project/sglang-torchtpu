@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+from sglang.srt.compilation.support_torch_compile import (
+    NoopCompilePolicy,
+    get_torch_compile_policy,
+    support_torch_compile,
+)
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
@@ -96,6 +100,49 @@ def _run_cases(policy, mode):
             policy._precompile_extend()
         else:
             policy._precompile_decode()
+
+
+class TestDirectCompileExtraModelState(CustomTestCase):
+    def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
+        class CustomPolicy(DecoderTpuCompilePolicy):
+            model_extra_tensor_attrs = (
+                "object_state.value",
+                "object_state.weight_alias",
+            )
+
+        model = SimpleNamespace(forward=MagicMock())
+        support_torch_compile(model, policy=CustomPolicy)
+        policy_cls = get_torch_compile_policy(model)
+        self.assertIs(policy_cls, CustomPolicy)
+
+        kv_pool = object()
+        model_runner = SimpleNamespace(
+            model=model,
+            token_to_kv_pool=kv_pool,
+            is_draft_worker=False,
+        )
+        policy = policy_cls(
+            model_runner=model_runner,
+            owner=model,
+            tracer="direct",
+        )
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
+            policy._direct_compile(model.forward)
+
+        compile_module.direct_compile.assert_called_once()
+        kwargs = compile_module.direct_compile.call_args.kwargs
+        self.assertIs(kwargs["model"], model)
+        self.assertEqual(
+            kwargs["model_extra_tensor_attrs"],
+            CustomPolicy.model_extra_tensor_attrs,
+        )
+        self.assertIs(kwargs["kv_pool"], kv_pool)
 
 
 class TestInstallExtendCap(CustomTestCase):

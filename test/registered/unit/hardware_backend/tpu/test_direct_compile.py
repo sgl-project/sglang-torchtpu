@@ -55,6 +55,19 @@ class _ModelWithRegisteredAlias(torch.nn.Module):
         self.register_buffer("second_weight_alias", self.weight, persistent=False)
 
 
+class _ObjectWithTensorState:
+    def __init__(self, value, weight_alias):
+        self.value = value
+        self.weight_alias = weight_alias
+
+
+class _ModelWithObjectTensorState(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2))
+        self.object_state = _ObjectWithTensorState(torch.full((2,), 2.0), self.weight)
+
+
 class _KVPool:
     def __init__(self, value):
         self.value = value
@@ -67,6 +80,91 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
+        model = _ModelWithObjectTensorState()
+        original_value = model.object_state.value
+        original_alias = model.object_state.weight_alias
+        traced_state = []
+
+        def fn(value):
+            traced_state.append(
+                (
+                    model.weight,
+                    model.object_state.value,
+                    model.object_state.weight_alias,
+                )
+            )
+            return (
+                value
+                + model.weight
+                + model.object_state.value
+                + model.object_state.weight_alias
+            )
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+            model_extra_tensor_attrs=(
+                "object_state.value",
+                "object_state.weight_alias",
+            ),
+        )
+        compiler = direct_compile.tpu_torch_compile
+        value = torch.zeros(2)
+        result = torch.full((2,), 6.0)
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda item: isinstance(item, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(compiler, "build_mlir", return_value="module"),
+            patch.object(compiler, "compile_mlir", return_value="executable"),
+            patch.object(compiler, "execute", return_value=[result]) as execute,
+        ):
+            output = compiled(value)
+
+        self.assertTrue(torch.equal(output, result))
+        traced_weight, traced_value, traced_alias = traced_state[0]
+        self.assertIsNot(traced_weight, model.weight)
+        self.assertIsNot(traced_value, original_value)
+        self.assertIs(traced_alias, traced_weight)
+        self.assertIs(model.object_state.value, original_value)
+        self.assertIs(model.object_state.weight_alias, original_alias)
+        runtime_inputs = execute.call_args.args[1]
+        self.assertEqual(len(runtime_inputs), 3)
+        self.assertIs(runtime_inputs[0], model.weight)
+        self.assertIs(runtime_inputs[1], original_value)
+        self.assertIs(runtime_inputs[2], value)
+
+    def test_model_extra_tensor_attrs_require_model_and_tensor_values(self):
+        with self.assertRaisesRegex(ValueError, "requires model"):
+            direct_compile.direct_compile(
+                lambda value: value,
+                specialization_key=lambda value: tuple(value.shape),
+                model_extra_tensor_attrs=("state.value",),
+            )
+
+        model = _ModelWithObjectTensorState()
+        model.object_state.not_a_tensor = "static"
+        compiled = direct_compile.direct_compile(
+            lambda value: value,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+            model_extra_tensor_attrs=("object_state.not_a_tensor",),
+        )
+        with self.assertRaisesRegex(TypeError, "not Tensor"):
+            compiled(torch.ones(2))
+
     def test_registered_tensor_aliases_are_traced(self):
         model = _ModelWithRegisteredAlias()
         traced_state = []
