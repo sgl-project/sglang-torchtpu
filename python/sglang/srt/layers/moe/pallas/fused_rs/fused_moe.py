@@ -274,7 +274,9 @@ def moe_gmm_local_rs_nodedup(
         quant_block_size=(
             recover_quant_block_size(
                 w1.shape[1],
-                w1_scale.shape[1] if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1) else 1,
+                w1_scale.shape[1]
+                if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1)
+                else 1,
             )
             if w1_scale is not None
             else None

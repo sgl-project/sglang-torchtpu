@@ -26,17 +26,14 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
 def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
     from torch_tpu._internal.distributed import tpu_distributed
 
+    from sglang.srt.distributed import get_tp_group
+
     try:
         global_device_id = tpu_distributed.global_device_id()
     except Exception:
         global_device_id = 0
 
-    try:
-        from sglang.srt.distributed import get_tp_group
-        tp_group = get_tp_group()
-    except Exception:
-        tp_group = None
-
+    tp_group = get_tp_group()
     world_size = tp_group.world_size if tp_group is not None else 1
     if world_size == 1:
         return global_device_id, (0,)
@@ -94,8 +91,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
 
 @functools.cache
-def _get_mesh(world_size: int | None = None):
-    import re
+def _get_mesh():
     import numpy as np
     from jax.sharding import Mesh
 
@@ -103,14 +99,7 @@ def _get_mesh(world_size: int | None = None):
         get_jax_export_devices,
     )
 
-    if world_size is None:
-        xla_flags = os.environ.get("XLA_FLAGS", "")
-        m = re.search(r"--xla_force_host_platform_device_count=(\d+)", xla_flags)
-        if m:
-            world_size = int(m.group(1))
-        else:
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
     export_devices = np.asarray(get_jax_export_devices(world_size)).reshape(1, -1)
     return Mesh(export_devices, ("data", "model"))
 
@@ -283,10 +272,10 @@ def fused_moe_rs_gather(
     bytes_per_token = hidden_size * token_shard.element_size()
     tp_size = physical_order_to_tp_rank.shape[0]
 
-    # Keep the complete gather below the 2.5 MiB SparseCore scratchpad limit,
-    # with 64 KiB of headroom. Compute chunks from whole token rows instead of
-    # rounding their count to a power of two.
-    max_chunk_size = (2496 * 1024) // tp_size
+    # Keep the complete gather comfortably below the 2.5 MiB SparseCore
+    # scratchpad limit. The collective needs scratch space beyond its payload,
+    # so reserve 512 KiB rather than filling the nominal capacity.
+    max_chunk_size = (2048 * 1024) // tp_size
     max_chunk_tokens = max(1, max_chunk_size // bytes_per_token)
     num_chunks = max(1, (shard_tokens + max_chunk_tokens - 1) // max_chunk_tokens)
 

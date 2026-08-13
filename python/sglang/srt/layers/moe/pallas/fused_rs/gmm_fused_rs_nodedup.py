@@ -445,7 +445,8 @@ def kernel_main_fused_rs(
     send_sems_ref,  # DMA(3,) per-staging-slot send sems
     local_write_sems_ref,  # DMA(3,) per-staging-slot local write sems
     recv_sem_ref,  # REGULAR(ep_size,) for incoming remote writes per peer
-    peer_recv_counts_ref,  # SMEM(ep_size,) per-peer incoming counts
+    recv_count_sem_ref,  # REGULAR(ep_size,) for ordered sender completion counts
+    peer_recv_counts_ref,  # SMEM(ep_size,) actual outgoing counts by destination
     scale_send_sems_ref=None,  # Optional DMA(3,) for FP8 row-scale sends.
     scale_local_write_sems_ref=None,  # Optional DMA(3,) for FP8 row-scale local writes.
     scale_recv_sem_ref=None,  # Optional REGULAR(ep_size,) for incoming FP8 row-scale writes.
@@ -501,9 +502,9 @@ def kernel_main_fused_rs(
     expert_shard_id = group_offset_scalar // dims.size_group
     max_num_gm = max_num_gm_ref[0]
 
-    with jax.named_scope("copy_peer_recv_counts"):
+    with jax.named_scope("init_peer_send_counts"):
         for p in range(ep_size):
-            peer_recv_counts_ref[p] = peer_recv_counts_in_ref[p]
+            peer_recv_counts_ref[p] = 0
 
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
@@ -1224,6 +1225,9 @@ def kernel_main_fused_rs(
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
+                            peer_recv_counts_ref[dest_chip] = (
+                                peer_recv_counts_ref[dest_chip] + 1
+                            )
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_scale_3x_ref.at[
                                     stg_id, pl.ds(row_idx, 1), :
@@ -1284,6 +1288,9 @@ def kernel_main_fused_rs(
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
+                            peer_recv_counts_ref[dest_chip] = (
+                                peer_recv_counts_ref[dest_chip] + 1
+                            )
 
                         return (
                             send_sz + lax.select(is_remote, jnp.int32(1), jnp.int32(0)),
@@ -1323,18 +1330,34 @@ def kernel_main_fused_rs(
                     if fp8_direct_write:
                         pl.semaphore_wait(scale_local_write_sems_ref.at[_slot], remaining_local)
 
-    # Drain every receive semaphore with the exact count exchanged by senders.
-    @jax.named_scope("drain_recv_sems")
-    def _drain_recv():
+    # Publish each sender's actual remote-copy count only after all its send
+    # semaphores have drained. The ready marker and count are one atomic remote
+    # signal, so waiting out the marker leaves a stable exact count to consume.
+    recv_count_ready = jnp.int32(1 << 20)
+    with jax.named_scope("publish_peer_send_counts"):
         for p in range(ep_size):
-            count = peer_recv_counts_ref[p]
-            @pl.when(count > 0)
+            @pl.when(jnp.int32(p) != my_id)
             def _():
-                pl.semaphore_wait(recv_sem_ref.at[p], count)
-                if fp8_direct_write:
-                    pl.semaphore_wait(scale_recv_sem_ref.at[p], count)
+                pl.semaphore_signal(
+                    recv_count_sem_ref.at[expert_shard_id],
+                    recv_count_ready + peer_recv_counts_ref[p],
+                    device_id={ep_axis_name: jnp.int32(p)},
+                    device_id_type=pltpu.DeviceIdType.MESH,
+                )
 
-    _drain_recv()
+    with jax.named_scope("drain_recv_sems"):
+        for p in range(ep_size):
+            @pl.when(jnp.int32(p) != expert_shard_id)
+            def _():
+                pl.semaphore_wait(recv_count_sem_ref.at[p], recv_count_ready)
+                count = pl.semaphore_read(recv_count_sem_ref.at[p])
+
+                @pl.when(count > 0)
+                def _():
+                    pl.semaphore_wait(recv_sem_ref.at[p], count)
+                    if fp8_direct_write:
+                        pl.semaphore_wait(scale_recv_sem_ref.at[p], count)
+                    pl.semaphore_wait(recv_count_sem_ref.at[p], count)
     # All ICI DMA writes go directly to out_buf_ref (the pallas_call output).
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
 
@@ -1385,6 +1408,7 @@ def kernel_main_fused_rs_fp8(
     send_sems_ref,
     local_write_sems_ref,
     recv_sem_ref,
+    recv_count_sem_ref,
     peer_recv_counts_ref,
     scale_send_sems_ref,
     scale_local_write_sems_ref,
@@ -1456,6 +1480,7 @@ def kernel_main_fused_rs_fp8(
         send_sems_ref,
         local_write_sems_ref,
         recv_sem_ref,
+        recv_count_sem_ref,
         peer_recv_counts_ref,
         scale_send_sems_ref,
         scale_local_write_sems_ref,
@@ -1919,7 +1944,9 @@ def gmm_v2_fused_rs(
         pltpu.SemaphoreType.REGULAR((3,)),
         # recv_sem_ref (for incoming remote writes, per peer)
         pltpu.SemaphoreType.REGULAR((ep_size,)),
-        # peer_recv_counts_ref (per peer incoming counts)
+        # recv_count_sem_ref (ordered completion count from each peer)
+        pltpu.SemaphoreType.REGULAR((ep_size,)),
+        # peer_recv_counts_ref (actual outgoing counts by destination)
         pltpu.SMEM((ep_size,), jnp.int32),
     ]
 
