@@ -86,7 +86,7 @@ def _padded_token_count(m: int, topk: int) -> int:
 
     gmm_v2 constrains the LHS row count, which after the permute is
     ``m_pad * topk``, not the token count -- so the minimal token alignment is
-    ``16 // gcd(16, topk)``, not a flat 16. 
+    ``16 // gcd(16, topk)``, not a flat 16.
     ``topk=10``, giving gcd 2
     and an alignment of 8: a decode batch of 8 then pads to 8 instead of 16, and
     both the grouped matmul and the permute see 80 routed rows instead of 160.
@@ -96,7 +96,7 @@ def _padded_token_count(m: int, topk: int) -> int:
     """
     token_align = 16 // math.gcd(16, topk)
     m_pad = ((m + token_align - 1) // token_align) * token_align
-    
+
     return m_pad
 
 
