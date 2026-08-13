@@ -2,6 +2,7 @@
 
 """Unit tests for the TPU fused-RS Torch wrapper."""
 
+import importlib.util
 import os
 import unittest
 from unittest.mock import Mock, patch
@@ -115,8 +116,86 @@ class TestFusedMoeRsOp(CustomTestCase):
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_unmocked_build_fused_moe_rs_op_exports_mlir(self):
+        from sglang.srt.hardware_backend.tpu import pallas_export
+
+        pallas_export.configure_jax_export_env(8)
+        op = fused_moe_rs_op._build_fused_moe_rs_op()
+        self.assertIsNotNone(op)
+        self.assertTrue(hasattr(torch.ops.sglang_tpu_pallas, "fused_moe_rs"))
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("torch_tpu"),
+        "requires TorchTPU",
+    )
+    def test_dynamo_faketensor_export_fused_moe_rs(self):
+        class FusedMoeRsModule(torch.nn.Module):
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                w1: torch.Tensor,
+                w2: torch.Tensor,
+                w1_scale: torch.Tensor,
+                w2_scale: torch.Tensor,
+                topk_weights: torch.Tensor,
+                topk_ids: torch.Tensor,
+                post_expert_norm_weight: torch.Tensor,
+            ) -> torch.Tensor:
+                return fused_moe_rs_op.fused_moe_rs_call(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    post_expert_norm_weight=post_expert_norm_weight,
+                    group_offset=None,
+                    topk=8,
+                    activation="silu",
+                    has_post_expert_norm=False,
+                    fp8_direct_write=True,
+                )
+
+        fused_moe_rs_op._build_fused_moe_rs_op()
+        mod = FusedMoeRsModule()
+        tokens = 128
+        hidden_size = 6144
+        num_local_experts = 20
+        inter_size = 2560
+        topk = 8
+        example_inputs = (
+            torch.randn(tokens, hidden_size, dtype=torch.bfloat16, device="meta"),
+            torch.randn(
+                num_local_experts,
+                inter_size * 2,
+                hidden_size,
+                dtype=torch.float8_e4m3fn,
+                device="meta",
+            ),
+            torch.randn(
+                num_local_experts,
+                hidden_size,
+                inter_size,
+                dtype=torch.float8_e4m3fn,
+                device="meta",
+            ),
+            torch.randn(num_local_experts, dtype=torch.float32, device="meta"),
+            torch.randn(num_local_experts, dtype=torch.float32, device="meta"),
+            torch.randn(tokens, topk, dtype=torch.float32, device="meta"),
+            torch.zeros(tokens, topk, dtype=torch.int32, device="meta"),
+            torch.ones(1, hidden_size, dtype=torch.bfloat16, device="meta"),
+        )
+        exported = torch.export.export(mod, example_inputs)
+        self.assertIsNotNone(exported)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
