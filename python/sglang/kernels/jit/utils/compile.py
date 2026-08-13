@@ -92,7 +92,9 @@ def _resolve_kernel_path() -> pathlib.Path:
 
 
 KERNEL_PATH = _resolve_kernel_path()
-DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")] if (KERNEL_PATH / "include").exists() else []
+DEFAULT_INCLUDE = (
+    [str(KERNEL_PATH / "include")] if (KERNEL_PATH / "include").exists() else []
+)
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
