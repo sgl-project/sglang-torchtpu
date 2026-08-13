@@ -560,12 +560,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         return is_channel_group and input_quant_none and is_static
 
     def _is_tpu_w4a16_moe(self, weight_quant: BaseModel) -> bool:
-        """Symmetric 4-bit group-quantized: the only WNA16 shape the TPU Pallas
-        gmm_v2 path implements. It reads no zero points and drops g_idx, so
-        asymmetric or act-order checkpoints would silently decode wrong.
+        """Symmetric 4-bit int group-quantized: the only WNA16 shape the TPU
+        Pallas gmm_v2 path implements. It decodes signed-int4 nibbles, reads no
+        zero points and drops g_idx, so float4, asymmetric or act-order
+        checkpoints would silently decode wrong.
         """
         return (
             weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
             and weight_quant.symmetric
             and weight_quant.strategy == QuantizationStrategy.GROUP.value
             and not weight_quant.actorder

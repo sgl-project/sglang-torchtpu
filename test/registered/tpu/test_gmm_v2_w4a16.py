@@ -1,14 +1,16 @@
-"""gmm_v2 with a checkpoint-packed int4 rhs (W4A16).
+"""gmm_v2 with a checkpoint-packed int4 rhs (W4A16), through the production prep.
 
-Covers the ``rhs_quant_dtype`` path: the rhs arrives already packed as int32
-words ([G, K//8, N], the compressed-tensors layout) rather than being packed
-in-kernel, and activations stay bf16. Compares against the same weights held
-unpacked in bf16, so any drift in the unpack order, the nibble sign flip, or
-the per-group scale application lands here.
+End-to-end over the load path: weights start in the compressed-tensors
+checkpoint layout ([G, K//8, N] int32 words, offset-binary nibbles),
+``prepare_tpu_w4a16_moe_weights`` converts them in place (nibble sign flip,
+scale relayout), and the result feeds ``gmm_v2`` via ``rhs_quant_dtype``.
+Compares against the same weights dequantized to bf16 with no packing
+involved, so any drift in the prep step, the in-kernel unpack order, or the
+per-group scale application lands here.
 
-Direct JAX like the sibling gmm_v2 tests -- no torch custom op and no
-``current_platform.init_backend()``, which would put JAX on its CPU export
-frontend and leave Pallas without a TPU device kind.
+Direct JAX like the sibling gmm_v2 tests -- no ``current_platform
+.init_backend()``, which would put JAX on its CPU export frontend and leave
+Pallas without a TPU device kind. The prep step itself is torch-on-CPU.
 """
 
 from __future__ import annotations
@@ -31,16 +33,13 @@ except Exception:  # pragma: no cover - non-TPU host
 
 _SKIP = "requires a TPU backend"
 
-# compressed-tensors stores nibbles offset-binary (q+8); pltpu reads two's
-# complement. Flipping each nibble's top bit converts: (q+8) ^ 0x8 == int4(q).
-_INT4_SIGN_XOR = -2004318072  # 0x88888888 as int32
-
 
 def _pack_int4_offset_binary(q_i8):
     """[G, K, N] int4 values (-8..7) -> [G, K//8, N] int32, checkpoint layout.
 
-    Eight consecutive K values per word, LSB-first, stored offset-binary so the
-    result matches what a compressed-tensors checkpoint ships.
+    Eight consecutive K values per word, LSB-first, stored offset-binary
+    (q+8) so the result matches what a compressed-tensors checkpoint ships.
+    The sign flip to two's complement is prepare_tpu_w4a16_moe_weights' job.
     """
     g, k, n = q_i8.shape
     off = (q_i8 + 8).astype(jnp.uint32) & 0xF  # offset-binary nibbles
@@ -56,53 +55,106 @@ class TestGmmV2W4A16(CustomTestCase):
     G, M, K, N = 4, 256, 256, 128
     GROUP_SIZE = 32
 
+    def _checkpoint_weights(self, key):
+        """One weight set as the checkpoint holds it: int4 levels + one bf16
+        scale per (K-group, N), plus the packed int32 form."""
+        kq, ks = jax.random.split(key)
+        q = jax.random.randint(kq, (self.G, self.K, self.N), -8, 8, dtype=jnp.int8)
+        nb = self.K // self.GROUP_SIZE
+        scale = (
+            jnp.abs(jax.random.normal(ks, (self.G, nb, self.N), jnp.float32)) * 0.02
+            + 0.01
+        ).astype(jnp.bfloat16)
+        return q, scale, _pack_int4_offset_binary(q)
+
+    def _prep_layer(self, w13, w2):
+        """Run the production load-time prep on a stub layer holding both
+        weight pairs exactly as the loader leaves them, and hand back the
+        converted (packed, scale) jnp pairs."""
+        import numpy as np
+        import torch
+
+        from sglang.srt.hardware_backend.tpu.w4a16_moe import (
+            prepare_tpu_w4a16_moe_weights,
+        )
+
+        def to_torch(x, dtype=None):
+            # copy: prep mutates in place, and jnp->np buffers can be read-only
+            t = torch.from_numpy(np.array(x, dtype=np.float32 if dtype else None))
+            return t.to(dtype) if dtype else t
+
+        layer = torch.nn.Module()
+        for name, (_, scale, packed) in (("w13", w13), ("w2", w2)):
+            setattr(
+                layer,
+                f"{name}_weight_packed",
+                torch.nn.Parameter(to_torch(packed), requires_grad=False),
+            )
+            setattr(
+                layer,
+                f"{name}_weight_scale",
+                torch.nn.Parameter(
+                    to_torch(scale, torch.bfloat16), requires_grad=False
+                ),
+            )
+        prepare_tpu_w4a16_moe_weights(layer, self.GROUP_SIZE)
+
+        out = []
+        for name in ("w13", "w2"):
+            packed = jnp.asarray(getattr(layer, f"{name}_weight_packed").numpy())
+            scale = jnp.asarray(
+                getattr(layer, f"{name}_weight_scale").float().numpy()
+            ).astype(
+                jnp.bfloat16
+            )  # exact: bf16 -> f32 -> bf16
+            out.append((packed, scale))
+        return out
+
     def _run(self, dtype):
         from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
 
-        k1, k2 = jax.random.split(jax.random.key(0))
-        lhs = (jax.random.normal(k1, (self.M, self.K), jnp.float32) * 0.3).astype(dtype)
-
-        # Quantized weights as the checkpoint holds them: int4 levels + one
-        # bf16 scale per (K-group, N).
-        q = jax.random.randint(k2, (self.G, self.K, self.N), -8, 8, dtype=jnp.int8)
-        nb = self.K // self.GROUP_SIZE
-        scale = (
-            jnp.abs(jax.random.normal(k2, (self.G, nb, self.N), jnp.float32)) * 0.02
-            + 0.01
-        ).astype(jnp.bfloat16)
-
-        packed = _pack_int4_offset_binary(q)
-        # Load-time relayout, exactly as prepare_tpu_w4a16_moe_weights does.
-        packed = jax.lax.bitwise_xor(packed, jnp.int32(_INT4_SIGN_XOR))
-
-        got = gmm_v2(
-            lhs=lhs,
-            rhs=packed,
-            group_sizes=jnp.full((self.G,), self.M // self.G, jnp.int32),
-            rhs_scale=scale[:, :, None, :],  # [G, blocks, 1, N]
-            rhs_quant_dtype=jnp.int4,
-            maybe_quantize_lhs=False,
-            preferred_element_type=dtype,
+        klhs, k13, k2 = jax.random.split(jax.random.key(0), 3)
+        lhs = (jax.random.normal(klhs, (self.M, self.K), jnp.float32) * 0.3).astype(
+            dtype
         )
+        w13 = self._checkpoint_weights(k13)
+        w2 = self._checkpoint_weights(k2)
+        prepped = self._prep_layer(w13, w2)
+        group_sizes = jnp.full((self.G,), self.M // self.G, jnp.int32)
 
-        # Reference: the same weights dequantized to bf16, no packing involved.
-        deq = (
-            q.astype(jnp.float32)
-            * jnp.repeat(scale.astype(jnp.float32), self.GROUP_SIZE, axis=1)
-        ).astype(dtype)
-        ref = gmm_v2(
-            lhs=lhs,
-            rhs=deq,
-            group_sizes=jnp.full((self.G,), self.M // self.G, jnp.int32),
-            preferred_element_type=dtype,
-        )
+        for (q, scale, _), (packed, prepped_scale) in zip((w13, w2), prepped):
+            got = gmm_v2(
+                lhs=lhs,
+                rhs=packed,
+                group_sizes=group_sizes,
+                rhs_scale=prepped_scale,  # already [G, blocks, 1, N] from prep
+                rhs_quant_dtype=jnp.int4,
+                maybe_quantize_lhs=False,
+                preferred_element_type=dtype,
+            )
 
-        a = got.astype(jnp.float32)
-        b = ref.astype(jnp.float32)
-        cos = float(jnp.sum(a * b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b) + 1e-9))
-        self.assertGreater(
-            cos, 0.999, f"packed int4 rhs diverges from the bf16 reference ({dtype})"
-        )
+            # Reference: the same weights dequantized to bf16, no packing.
+            deq = (
+                q.astype(jnp.float32)
+                * jnp.repeat(scale.astype(jnp.float32), self.GROUP_SIZE, axis=1)
+            ).astype(dtype)
+            ref = gmm_v2(
+                lhs=lhs,
+                rhs=deq,
+                group_sizes=group_sizes,
+                preferred_element_type=dtype,
+            )
+
+            a = got.astype(jnp.float32)
+            b = ref.astype(jnp.float32)
+            cos = float(
+                jnp.sum(a * b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b) + 1e-9)
+            )
+            self.assertGreater(
+                cos,
+                0.999,
+                f"prepped int4 rhs diverges from the bf16 reference ({dtype})",
+            )
 
     def test_bfloat16(self):
         self._run(jnp.bfloat16)
