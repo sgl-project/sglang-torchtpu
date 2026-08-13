@@ -21,7 +21,9 @@ def _quantize_activation_per_row(
     x_scale = torch.clamp(
         x.abs().amax(dim=1, keepdim=True).float() / dtype_max, min=1e-12
     )
-    x_q = torch.clamp(x.float() / x_scale, min=-dtype_max, max=dtype_max).to(
+    # Divide in the input dtype without an upcast, which could potentially cause
+    # a data copy by xla.
+    x_q = torch.clamp(x / x_scale.to(x.dtype), min=-dtype_max, max=dtype_max).to(
         target_dtype
     )
     return x_q, x_scale
