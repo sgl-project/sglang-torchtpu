@@ -39,6 +39,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -105,8 +106,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
-
-from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
