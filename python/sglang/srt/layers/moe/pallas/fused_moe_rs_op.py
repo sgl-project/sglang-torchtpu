@@ -4,7 +4,6 @@
 import functools
 import math
 import os
-from typing import Optional
 
 import torch
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
@@ -95,7 +94,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
 
 @functools.cache
-def _get_mesh(world_size: Optional[int] = None):
+def _get_mesh(world_size: int | None = None):
     import re
     import numpy as np
     from jax.sharding import Mesh
@@ -139,6 +138,7 @@ def _build_fused_moe_rs_op():
         topk_weights: jax.Array,
         topk_ids: jax.Array,
         post_expert_norm_weight: jax.Array,
+        group_offset: jax.Array,
         topk: int,
         activation: str,
         has_post_expert_norm: bool,
@@ -172,7 +172,7 @@ def _build_fused_moe_rs_op():
             scoring_fn="softmax",
             topk_weights=topk_weights,
             topk_indices=topk_ids,
-            group_offset_input=None,
+            group_offset_input=group_offset,
             post_expert_norm_weight=(
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
@@ -182,8 +182,9 @@ def _build_fused_moe_rs_op():
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
         return result
 
-    # Bridge the JAX kernel into Torch without SPMD output sharding to eliminate
-    # the double-collective barrier race condition with PyTorch's fused_moe_rs_gather.
+    # The fused kernel produces one model-axis token shard per rank. Preserve
+    # that sharding through export; marking it replicated would make JAX insert
+    # an all-gather before the explicit Torch-side gather below.
     _FUSED_MOE_RS_OP = cpu_export_jax_op(
         _FUSED_MOE_RS_OP_NAME,
         _wrapped,
@@ -197,12 +198,13 @@ def _build_fused_moe_rs_op():
             P(),
             P(),
             P(),
+            P("model"),
             None,
             None,
             None,
             None,
         ),
-        output_partition_specs=(),
+        output_partition_specs=(P("model", None),),
     )
     return _FUSED_MOE_RS_OP
 
@@ -217,7 +219,7 @@ def fused_moe_rs_call(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     post_expert_norm_weight: torch.Tensor,
-    group_offset: Optional[torch.Tensor] = None,
+    group_offset: torch.Tensor,
     topk: int,
     activation: str,
     has_post_expert_norm: bool,
@@ -232,6 +234,7 @@ def fused_moe_rs_call(
         topk_weights,
         topk_ids,
         post_expert_norm_weight,
+        group_offset,
         topk,
         activation,
         has_post_expert_norm,
@@ -274,32 +277,26 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
     )
-    
+
     shard_tokens = token_shard.shape[0]
     hidden_size = token_shard.shape[1]
-    shard_size_in_bytes = token_shard.numel() * token_shard.element_size()
-    
-    max_chunk_size = 256 * 1024  # 256 KiB per rank (2.0 MiB total per gathered chunk, under 2.5 MiB Spmem limit)
-    num_chunks = 1
-    if shard_size_in_bytes > max_chunk_size:
-        raw_chunks = (shard_size_in_bytes + max_chunk_size - 1) // max_chunk_size
-        while num_chunks < raw_chunks:
-            num_chunks *= 2
+    bytes_per_token = hidden_size * token_shard.element_size()
+    tp_size = physical_order_to_tp_rank.shape[0]
+
+    # Keep the complete gather below the 2.5 MiB SparseCore scratchpad limit,
+    # with 64 KiB of headroom. Compute chunks from whole token rows instead of
+    # rounding their count to a power of two.
+    max_chunk_size = (2496 * 1024) // tp_size
+    max_chunk_tokens = max(1, max_chunk_size // bytes_per_token)
+    num_chunks = max(1, (shard_tokens + max_chunk_tokens - 1) // max_chunk_tokens)
 
     tp_group = get_tp_group()
-    tp_size = physical_order_to_tp_rank.shape[0]
-    
-    if num_chunks > 1:
-        chunks = token_shard.chunk(num_chunks, dim=0)
-        gathered_chunks = []
-        for chunk in chunks:
-            gathered_chunk = tp_group.all_gather(chunk, dim=0)
-            gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], -1)[physical_order_to_tp_rank].contiguous()
-            gathered_chunks.append(gathered_chunk)
-        output = torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)
-    else:
-        output = tp_group.all_gather(token_shard, dim=0)
-        output = output.reshape(tp_size, shard_tokens, -1)[physical_order_to_tp_rank].contiguous().reshape(-1, hidden_size)
-        
-    return output
-
+    gathered_chunks = []
+    for chunk in token_shard.chunk(num_chunks, dim=0):
+        gathered_chunk = tp_group.all_gather(chunk, dim=0)
+        gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], -1)[
+            physical_order_to_tp_rank
+        ].contiguous()
+        gathered_chunks.append(gathered_chunk)
+    output = torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)
+    return output[: hidden_states.shape[0]]

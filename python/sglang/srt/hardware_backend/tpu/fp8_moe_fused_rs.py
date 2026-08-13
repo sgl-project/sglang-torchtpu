@@ -5,7 +5,7 @@
 Routes the FP8 MoE through the in-tree SGLang-owned fused-RS kernel
 (`fused_moe_rs_gather`) instead of `fused_moe_call` + a separate all-reduce.
 Load-time `prepare_fp8_fused_rs` validates the supported runtime layout and
-caches physical-device ordering. Larger prefills retain the stock FP8 MoE path.
+caches physical-device ordering.
 """
 
 from __future__ import annotations
@@ -16,8 +16,6 @@ from collections.abc import Callable
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-_FUSED_RS_MAX_SIZE_M = 65536
 
 
 def supports_fp8_fused_rs(
@@ -112,11 +110,6 @@ def fp8_fused_rs_unsupported_reason(
     return None
 
 
-def should_use_fp8_fused_rs(size_m: int) -> bool:
-    """Use fused-RS only for validated routed-assignment counts."""
-    return size_m <= _FUSED_RS_MAX_SIZE_M
-
-
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     """Eager, load-time prep for the FP8 fused-RS path. Returns True if enabled."""
     return _prepare_fp8_fused_rs(layer, allow_no_combine=False)
@@ -194,35 +187,7 @@ def _apply_fp8_fused_rs(
         )
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
-    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-        fused_moe_rs_gather,
-        fused_moe_rs_padded_tokens,
-    )
-
-    ep_size = int(layer._tpu_fused_rs_physical_order.shape[0])
-    padded_tokens = fused_moe_rs_padded_tokens(x.shape[0], topk, ep_size)
-    size_m = padded_tokens * topk
-    if not should_use_fp8_fused_rs(size_m):
-        from sglang.srt.distributed import moe_expert_parallel_all_reduce
-        from sglang.srt.hardware_backend.tpu.fp8_moe import apply_tpu_fp8_moe
-
-        stock_output = apply_tpu_fp8_moe(
-            layer=layer,
-            dispatch_output=dispatch_output,
-            activation=activation,
-            block_quant=False,
-            apply_router_weight_on_input=(
-                layer.moe_runner_config.apply_router_weight_on_input
-            ),
-            no_combine=layer.moe_runner_config.no_combine,
-        )
-        if finalize_fallback is not None:
-            stock_output = finalize_fallback(stock_output, dispatch_output)
-        # The model-level EP reduction is disabled whenever fused-RS is
-        # selected, so large-prefill fallback must perform it here.
-        return StandardCombineInput(
-            hidden_states=moe_expert_parallel_all_reduce(stock_output.hidden_states)
-        )
+    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
 
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
@@ -252,6 +217,4 @@ def _apply_fp8_fused_rs(
         fp8_direct_write=False,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
-    if result.shape[0] != x.shape[0]:
-        result = result[: x.shape[0]].contiguous()
     return StandardCombineInput(hidden_states=result)

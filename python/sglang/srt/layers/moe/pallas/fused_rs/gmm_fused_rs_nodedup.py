@@ -57,33 +57,34 @@ def precompute_peer_recv_counts(
     lhs_indices: jax.Array,
     chunk_size: int,
     ep_size: int,
-    my_id: jax.Array | int | None = None,
+    physical_device_id: jax.Array | int | None = None,
     pack_indices: bool = False,
     top_k: int = 1,
     group_offset: jax.Array | None = None,
-    ep_axis_name: str = "model",
 ) -> jax.Array:
     """Vectorized VPU computation of per-peer incoming row counts.
 
     Returns:
         jax.Array of shape (ep_size,) int32.
     """
-    if my_id is None:
+    if physical_device_id is None:
         if group_offset is not None:
             go_flat = group_offset.reshape(-1)
             num_experts_total = group_sizes.shape[0]
             num_experts_per_shard = num_experts_total // ep_size
-            my_id = (
+            physical_device_id = (
                 go_flat[1]
                 if go_flat.shape[0] > 1
                 else (go_flat[0] // num_experts_per_shard)
             )
         else:
-            my_id = 0
-    physical_mesh_id = my_id
+            physical_device_id = 0
 
     num_experts_total = group_sizes.shape[0]
     num_experts_per_shard = num_experts_total // ep_size
+    expert_shard_id = physical_device_id
+    if group_offset is not None:
+        expert_shard_id = group_offset.reshape(-1)[0] // num_experts_per_shard
 
     # 1. Compute expert boundaries per peer: shape (ep_size,)
     peer_sizes = jnp.sum(
@@ -107,10 +108,10 @@ def precompute_peer_recv_counts(
     dest_chips = (raw_idx // output_tokens_per_chip)[:, None]
 
     # 4. Destination matching
-    is_to_my_chip = (dest_chips == physical_mesh_id)  # shape (M, 1)
+    is_to_my_chip = dest_chips == physical_device_id  # shape (M, 1)
 
     # 5. Composite valid mask and parallel reduction along M dimension:
-    is_remote = (jnp.arange(ep_size, dtype=jnp.int32)[None, :] != physical_mesh_id)
+    is_remote = jnp.arange(ep_size, dtype=jnp.int32)[None, :] != expert_shard_id
     valid_recv = is_from_peer & is_to_my_chip & is_remote  # shape (M, ep_size) bool
     peer_recv_counts = jnp.sum(valid_recv.astype(jnp.int32), axis=0)  # shape (ep_size,) int32
 
@@ -497,6 +498,7 @@ def kernel_main_fused_rs(
     else:
         group_offset_scalar = group_offset_ref[0]
         my_id = group_offset_scalar // dims.size_group
+    expert_shard_id = group_offset_scalar // dims.size_group
     max_num_gm = max_num_gm_ref[0]
 
     with jax.named_scope("copy_peer_recv_counts"):
@@ -1218,7 +1220,7 @@ def kernel_main_fused_rs(
                                 ],
                                 dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
                                 send_sem=send_sems_ref.at[stg_id],
-                                recv_sem=recv_sem_ref.at[my_id],
+                                recv_sem=recv_sem_ref.at[expert_shard_id],
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
@@ -1228,7 +1230,7 @@ def kernel_main_fused_rs(
                                 ],
                                 dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
                                 send_sem=scale_send_sems_ref.at[stg_id],
-                                recv_sem=scale_recv_sem_ref.at[my_id],
+                                recv_sem=scale_recv_sem_ref.at[expert_shard_id],
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
@@ -1278,7 +1280,7 @@ def kernel_main_fused_rs(
                                 ],
                                 dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
                                 send_sem=send_sems_ref.at[stg_id],
-                                recv_sem=recv_sem_ref.at[my_id],
+                                recv_sem=recv_sem_ref.at[expert_shard_id],
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
@@ -1321,7 +1323,7 @@ def kernel_main_fused_rs(
                     if fp8_direct_write:
                         pl.semaphore_wait(scale_local_write_sems_ref.at[_slot], remaining_local)
 
-    # Drain per-peer incoming remote writes using dynamic counts:
+    # Drain every receive semaphore with the exact count exchanged by senders.
     @jax.named_scope("drain_recv_sems")
     def _drain_recv():
         for p in range(ep_size):
@@ -1949,9 +1951,10 @@ def gmm_v2_fused_rs(
             lhs_indices=lhs_indices,
             chunk_size=chunk_size,
             ep_size=ep_size,
-            my_id=physical_mesh_id,
+            physical_device_id=physical_mesh_id,
             pack_indices=False,
             top_k=top_k,
+            group_offset=group_offset,
         )
     peer_recv_counts_input = peer_recv_counts.astype(jnp.int32)
 

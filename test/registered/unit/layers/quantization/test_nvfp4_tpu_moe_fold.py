@@ -608,7 +608,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         ).read_text()
 
         self.assertIn('P("model"),\n            None,', wrapper)
-        self.assertIn("ep_p_spec,  # group_offset", body)
+        self.assertIn("ep_2d_spec,  # group_offset", body)
 
     def test_fused_packed_transpose_preserves_codes(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
