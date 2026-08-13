@@ -330,7 +330,8 @@ class TpModelWorker(BaseTpWorker):
         self.draft_attention_backend = draft_attention_backend
 
         # Ensure only TP rank 0 dumps HLO/LLO compiler artifacts to avoid 100+ GB multi-rank duplication
-        if self.tp_rank != 0:
+        tp_rank = getattr(self.ps, "tp_rank", self.gpu_id)
+        if tp_rank != 0:
             import os
             if "XLA_FLAGS" in os.environ:
                 filtered_xla = [

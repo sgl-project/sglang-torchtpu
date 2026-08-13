@@ -211,7 +211,10 @@ def moe_gmm_local_rs_nodedup(
         # entry here and can pick a different tile_m than the kernel -> the
         # max_num_gm undercount / gather_sem leak described above.
         quant_block_size=(
-            recover_quant_block_size(w1.shape[1], w1_scale.shape[1])
+            recover_quant_block_size(
+                w1.shape[1],
+                w1_scale.shape[1] if (w1_scale.ndim > 1 and w1_scale.shape[1] > 1) else 1,
+            )
             if w1_scale is not None
             else None
         ),

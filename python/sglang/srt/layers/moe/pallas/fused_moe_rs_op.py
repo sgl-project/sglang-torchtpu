@@ -4,6 +4,7 @@
 import functools
 import math
 import os
+from typing import Optional
 
 import torch
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
@@ -26,14 +27,17 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
 def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
     from torch_tpu._internal.distributed import tpu_distributed
 
-    from sglang.srt.distributed import get_tp_group
-
     try:
         global_device_id = tpu_distributed.global_device_id()
     except Exception:
         global_device_id = 0
 
-    tp_group = get_tp_group()
+    try:
+        from sglang.srt.distributed import get_tp_group
+        tp_group = get_tp_group()
+    except Exception:
+        tp_group = None
+
     world_size = tp_group.world_size if tp_group is not None else 1
     if world_size == 1:
         return global_device_id, (0,)
@@ -70,11 +74,16 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         dtype=torch.int64,
         device=device,
     )
+    try:
+        ep_rank = get_parallel().moe_ep_rank
+    except Exception:
+        ep_rank = global_device_id
+
     group_offset = torch.tensor(
-        [
-            get_parallel().moe_ep_rank * layer.num_local_experts,
+        [[
+            ep_rank * layer.num_local_experts,
             global_device_id,
-        ],
+        ]],
         dtype=torch.int32,
         device=device,
     )
@@ -86,7 +95,8 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
 
 @functools.cache
-def _get_mesh():
+def _get_mesh(world_size: Optional[int] = None):
+    import re
     import numpy as np
     from jax.sharding import Mesh
 
@@ -94,7 +104,14 @@ def _get_mesh():
         get_jax_export_devices,
     )
 
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size is None:
+        xla_flags = os.environ.get("XLA_FLAGS", "")
+        m = re.search(r"--xla_force_host_platform_device_count=(\d+)", xla_flags)
+        if m:
+            world_size = int(m.group(1))
+        else:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
     export_devices = np.asarray(get_jax_export_devices(world_size)).reshape(1, -1)
     return Mesh(export_devices, ("data", "model"))
 
@@ -122,7 +139,6 @@ def _build_fused_moe_rs_op():
         topk_weights: jax.Array,
         topk_ids: jax.Array,
         post_expert_norm_weight: jax.Array,
-        group_offset: jax.Array,
         topk: int,
         activation: str,
         has_post_expert_norm: bool,
@@ -156,7 +172,7 @@ def _build_fused_moe_rs_op():
             scoring_fn="softmax",
             topk_weights=topk_weights,
             topk_indices=topk_ids,
-            group_offset_input=group_offset,
+            group_offset_input=None,
             post_expert_norm_weight=(
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
@@ -166,7 +182,8 @@ def _build_fused_moe_rs_op():
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
         return result
 
-    # Bridge the JAX kernel into Torch with model-sharded weights and output.
+    # Bridge the JAX kernel into Torch without SPMD output sharding to eliminate
+    # the double-collective barrier race condition with PyTorch's fused_moe_rs_gather.
     _FUSED_MOE_RS_OP = cpu_export_jax_op(
         _FUSED_MOE_RS_OP_NAME,
         _wrapped,
@@ -180,13 +197,12 @@ def _build_fused_moe_rs_op():
             P(),
             P(),
             P(),
-            P("model"),
             None,
             None,
             None,
             None,
         ),
-        output_partition_specs=(P("model", None),),
+        output_partition_specs=(),
     )
     return _FUSED_MOE_RS_OP
 
@@ -201,7 +217,7 @@ def fused_moe_rs_call(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     post_expert_norm_weight: torch.Tensor,
-    group_offset: torch.Tensor,
+    group_offset: Optional[torch.Tensor] = None,
     topk: int,
     activation: str,
     has_post_expert_norm: bool,
@@ -216,7 +232,6 @@ def fused_moe_rs_call(
         topk_weights,
         topk_ids,
         post_expert_norm_weight,
-        group_offset,
         topk,
         activation,
         has_post_expert_norm,
