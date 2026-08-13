@@ -15,7 +15,7 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 _SCHED_MOD = "sglang.srt.managers.scheduler"
 
 
-def _make_scheduler(*, speculative_algorithm):
+def _make_scheduler(*, speculative_algorithm, enable_dp_attention=False):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.tp_worker = SimpleNamespace(
         model_runner=SimpleNamespace(
@@ -23,6 +23,7 @@ def _make_scheduler(*, speculative_algorithm):
             server_args=SimpleNamespace(
                 enable_torch_compile=True,
                 speculative_algorithm=speculative_algorithm,
+                enable_dp_attention=enable_dp_attention,
             ),
         )
     )
@@ -49,6 +50,18 @@ class TestSchedulerRecompileStance(unittest.TestCase):
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_not_called()
+
+    def test_hybrid_dp_attention_freezes_spec_recompiles(self):
+        scheduler = _make_scheduler(
+            speculative_algorithm="EAGLE3", enable_dp_attention=True
+        )
+
+        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False), patch(
+            f"{_SCHED_MOD}.torch.compiler.set_stance"
+        ) as set_stance:
+            scheduler._maybe_arm_fail_on_recompile()
+
+        set_stance.assert_called_once_with("fail_on_recompile")
 
     def test_env_does_not_affect_non_spec(self):
         scheduler = _make_scheduler(speculative_algorithm=None)

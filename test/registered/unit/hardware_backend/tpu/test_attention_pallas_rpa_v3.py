@@ -6,6 +6,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    _zero_inactive_rpa_rows,
+)
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
@@ -104,8 +107,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=spec_info,
         )
-        distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
-        return backend._build_metadata(forward_batch, distribution)
+        return backend._build_metadata(forward_batch, non_empty_bs=1)
 
     def test_pages_per_seq_uses_context_plus_spec_headroom(self):
         backend = self._make_backend()
@@ -179,7 +181,6 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
 
     def test_seq_lens_cpu_list_and_empty_inputs(self):
         backend = self._make_backend()
-        distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
 
         # 1. seq_lens_cpu as a Python list
         fb_list = SimpleNamespace(
@@ -191,7 +192,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=None,
         )
-        meta_list = backend._build_metadata(fb_list, distribution)
+        meta_list = backend._build_metadata(fb_list, non_empty_bs=1)
         self.assertIsNotNone(meta_list)
 
         # 2. seq_lens_cpu as empty Tensor (e.g. idle rank forced into decode for DP collectives)
@@ -204,7 +205,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=None,
         )
-        meta_empty_tensor = backend._build_metadata(fb_empty_tensor, distribution)
+        meta_empty_tensor = backend._build_metadata(fb_empty_tensor, non_empty_bs=0)
         self.assertIsNotNone(meta_empty_tensor)
 
         # 3. seq_lens_cpu as an empty list
@@ -217,8 +218,30 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=None,
         )
-        meta_empty_list = backend._build_metadata(fb_empty_list, distribution)
+        meta_empty_list = backend._build_metadata(fb_empty_list, non_empty_bs=0)
         self.assertIsNotNone(meta_empty_list)
+
+
+class TestInactiveRpaRows(unittest.TestCase):
+    def test_zeros_only_inactive_nan_rows(self):
+        output = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        live_rows = output[:2].clone()
+        output[2:] = float("nan")
+
+        output = _zero_inactive_rpa_rows(output, torch.tensor(2))
+
+        self.assertTrue(torch.equal(output[:2], live_rows))
+        self.assertTrue(torch.equal(output[2:], torch.zeros(2, 8)))
+
+    def test_preserves_non_finite_live_values(self):
+        output = torch.ones(3, 4)
+        output[0, 0] = float("nan")
+        output[2] = float("nan")
+
+        output = _zero_inactive_rpa_rows(output, torch.tensor(2))
+
+        self.assertTrue(torch.isnan(output[0, 0]))
+        self.assertTrue(torch.equal(output[2], torch.zeros(4)))
 
 
 if __name__ == "__main__":

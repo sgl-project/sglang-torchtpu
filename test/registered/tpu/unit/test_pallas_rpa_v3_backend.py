@@ -118,12 +118,8 @@ def _build_req_to_token(
 
 def _build_meta(backend, fb) -> PallasForwardMetadata:
     """Mirror ``init_forward_metadata``."""
-    distribution = backend._get_cached_rpa_distribution(
-        fb.forward_mode.is_decode(),
-        backend._non_empty_batch_size(fb),
-        fb.seq_lens.device,
-    )
-    return backend._build_metadata(fb, distribution)
+    non_empty_bs = backend._non_empty_batch_size(fb)
+    return backend._build_metadata(fb, non_empty_bs)
 
 
 class TestPallasRpaV3MetadataDecode(CustomTestCase):

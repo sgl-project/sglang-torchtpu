@@ -524,6 +524,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        self.draft_runner.compile_policy.prepare_spec_draft_input(
+            forward_batch, draft_input
+        )
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -549,17 +552,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
+                if self.speculative_num_steps > 1:
                     self.draft_runner.compile_policy.prepare_spec_forward_batch(
                         forward_batch
                     )
                     # Skip attention backend init for 1-step draft,
                     # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
+                    if not forward_batch.forward_mode.is_idle():
+                        self.draft_attn_backend.init_forward_metadata(forward_batch)
+                        forward_batch.mark_forward_metadata_ready()
                 if (
                     self._should_fuse_draft_steps()
                     and not forward_batch.forward_mode.is_idle()
@@ -573,6 +574,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         forward_batch=forward_batch,
                     )
                 )
+
+        # Tree construction consumes scheduler-logical rows.
+        padding = draft_input.padding_state
+        if (
+            padding is not None
+            and padding.physical_batch_size > padding.logical_batch_size
+        ):
+            real_bs = padding.logical_batch_size
+
+            def _unpad_rows(tensor):
+                if isinstance(tensor, torch.Tensor) and tensor.shape[0] > real_bs:
+                    return tensor[:real_bs]
+                return tensor
+
+            parent_list = _unpad_rows(parent_list)
+            top_scores_index = _unpad_rows(top_scores_index)
+            draft_tokens = _unpad_rows(draft_tokens)
+            draft_probs = _unpad_rows(draft_probs)
+            draft_input.bonus_tokens = _unpad_rows(draft_input.bonus_tokens)
 
         return build_eagle_verify_input(
             batch,

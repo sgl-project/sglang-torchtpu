@@ -338,6 +338,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),
+                    padding_state=None,
                     dsa_topk_indices=(
                         torch.ones((1, 1), dtype=torch.int32, device=DEVICE)
                         if seed_present

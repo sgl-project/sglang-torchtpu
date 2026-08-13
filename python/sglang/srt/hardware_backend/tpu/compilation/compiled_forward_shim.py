@@ -108,6 +108,10 @@ def _dp_attn_select_bucket_shape(
 
     is_decode = forward_batch.forward_mode.is_decode()
     is_idle = forward_batch.forward_mode.is_idle()
+    is_fixed_width_spec = (
+        forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    )
 
     group_is_decode = is_decode or (
         is_idle and not getattr(forward_batch, "is_extend_in_batch", False)
@@ -119,6 +123,18 @@ def _dp_attn_select_bucket_shape(
         # so the decode BATCH bucket is identical across ranks.
         pad_t = b_bucketer.next_bucket(max(real_q, max_tokens_per_rank))
         pad_b = b_bucketer.next_bucket(max(real_b, max_tokens_per_rank))
+    elif is_fixed_width_spec:
+        # Fixed-width spec modes bucket whole requests, not independent tokens.
+        tokens_per_req = getattr(forward_batch.spec_info, "num_tokens_per_req", 0)
+        if tokens_per_req <= 0:
+            raise ValueError(
+                "Fixed-width speculative forwards require "
+                "spec_info.num_tokens_per_req > 0, "
+                f"got {tokens_per_req}."
+            )
+        max_bs_per_rank = (max_tokens_per_rank + tokens_per_req - 1) // tokens_per_req
+        pad_b = b_bucketer.next_bucket(max(real_b, max_bs_per_rank))
+        pad_t = pad_b * tokens_per_req
     else:
         # Extend pads to one fixed batch shape. It cannot contain more requests
         # than tokens, so cap the shape by the token ceiling when decode
@@ -144,9 +160,15 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
         (dp_size,), pad_t, dtype=torch.int64, device=device
     )
     if forward_batch.global_num_tokens_for_logprob_cpu is not None:
-        forward_batch.global_num_tokens_for_logprob_cpu = [pad_b] * dp_size
+        # Verify gathers one logit row per token; other modes gather per request.
+        padded_logprob_rows = (
+            pad_t if forward_batch.forward_mode.is_target_verify() else pad_b
+        )
+        forward_batch.global_num_tokens_for_logprob_cpu = [
+            padded_logprob_rows
+        ] * dp_size
         forward_batch.global_num_tokens_for_logprob_gpu = torch.full(
-            (dp_size,), pad_b, dtype=torch.int64, device=device
+            (dp_size,), padded_logprob_rows, dtype=torch.int64, device=device
         )
     # Clear cached local offsets so they recompute from the padded counts.
     forward_batch.dp_local_start_pos = None
@@ -170,7 +192,7 @@ def _dp_attn_compute_padding(
     b_bucketer: Bucketer,
     real_q: int,
     real_b: int,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int]:
     """Compute the DP-attention padding (no side effects).
 
     Every rank must run the same shape, so the bucket is chosen by taking the
@@ -227,7 +249,7 @@ def _dp_attn_prepare_padding(
 ) -> tuple[int, int, int, int]:
     """Compute the DP-attention padding and apply the DP-specific batch state.
 
-    Returns (pad_t, pad_b, real_q_out, real_b_out). the caller pads tensors to
+    Returns (pad_t, pad_b, real_q_out, real_b_out). The caller pads tensors to
     the bucket sizes.
     """
     pad_t, pad_b, real_q_out, real_b_out = _dp_attn_compute_padding(
@@ -363,8 +385,11 @@ def _pad_forward_batch_inputs(
 
     # mm_inputs is per request. Keep it aligned with padded extend_* CPU lists
     # so eager multimodal embedding code can index by batch position.
-    mm_inputs = getattr(forward_batch, "mm_inputs", None)
-    if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+    # Normalize None to avoid a separate idle-rank Dynamo guard.
+    mm_inputs = forward_batch.mm_inputs
+    if mm_inputs is None:
+        mm_inputs = []
+    if len(mm_inputs) < pad_b:
         forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
     # Pad spec_info tensors whose token dim must match input_ids after padding

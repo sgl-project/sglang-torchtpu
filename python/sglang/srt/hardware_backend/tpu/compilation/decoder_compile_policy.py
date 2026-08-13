@@ -273,6 +273,37 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     dynamic = False
     model_extra_tensor_attrs: ClassVar[tuple[str, ...]] = ()
 
+    def get_dp_padded_token_counts(
+        self,
+        forward_batch: ForwardBatch,
+        model_runner: Any,
+        global_num_tokens: list[int],
+        global_num_tokens_for_logprob: list[int],
+        *,
+        attn_tp_size: int,
+        cp_align_size: int,
+    ) -> tuple[list[int], list[int]]:
+        (
+            global_num_tokens,
+            global_num_tokens_for_logprob,
+        ) = super().get_dp_padded_token_counts(
+            forward_batch,
+            model_runner,
+            global_num_tokens,
+            global_num_tokens_for_logprob,
+            attn_tp_size=attn_tp_size,
+            cp_align_size=cp_align_size,
+        )
+
+        # TPU DPA gather derives its expected local rows from the DP-global
+        # count, so logprob counts must use the same attention-TP alignment.
+        if attn_tp_size > 1:
+            global_num_tokens_for_logprob = [
+                (value + attn_tp_size - 1) // attn_tp_size * attn_tp_size
+                for value in global_num_tokens_for_logprob
+            ]
+        return global_num_tokens, global_num_tokens_for_logprob
+
     def __init__(
         self,
         *,
@@ -654,18 +685,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
     def _install_dp_idle_as_decode(self) -> None:
-        """Run idle DP batches as DECODE.
+        """Normalize idle DP batches before model execution.
 
         An idle rank may take a different code path than decode, but with DP
-        attention all ranks must run the same code. Relabel idle as DECODE.
+        attention all ranks must run the same code. The base policy relabels an
+        idle batch as DECODE; specialized policies may override the phase.
 
         Upstream removed ``ModelRunner.forward_idle`` (idle now flows through
         ``ModelRunner.forward`` -> the eager runner), so hook ``forward`` and
         relabel idle batches at entry; the ``is_idle()`` guard keeps decode /
         extend batches untouched.
         """
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
         model_runner = self.model_runner
         # Idempotent: a re-install (tests, warmups) must not nest a second
         # wrapper around an already-wrapped forward.
@@ -686,11 +716,66 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 # the compiled forward can't match any variant's mode guard.
                 and forward_batch.global_num_tokens_cpu
             ):
-                forward_batch.forward_mode = ForwardMode.DECODE
+                self._normalize_dp_idle_forward(forward_batch)
             return orig_forward(forward_batch, *args, **kwargs)
 
         forward._tpu_idle_as_decode = True
         model_runner.forward = forward
+
+    def _normalize_dp_idle_forward(self, forward_batch) -> None:
+        """Relabel an ordinary idle DP batch for the existing decode pad path."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        forward_batch.forward_mode = ForwardMode.DECODE
+
+    def materialize_dp_idle_extend(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        if forward_batch.seq_lens.shape[0] != 0:
+            return False
+
+        device = forward_batch.seq_lens.device
+        seq_dtype = forward_batch.seq_lens.dtype
+        forward_batch.extend_num_tokens = num_tokens
+        forward_batch.extend_seq_lens = torch.tensor(
+            [num_tokens], dtype=torch.int32, device=device
+        )
+        forward_batch.extend_prefix_lens = torch.zeros(
+            1, dtype=seq_dtype, device=device
+        )
+        forward_batch.extend_start_loc = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        forward_batch.seq_lens = torch.tensor(
+            [num_tokens], dtype=seq_dtype, device=device
+        )
+        forward_batch.seq_lens_sum = int(num_tokens)
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu = torch.tensor([num_tokens], dtype=seq_dtype)
+        forward_batch.extend_prefix_lens_cpu = [0]
+        forward_batch.extend_seq_lens_cpu = [int(num_tokens)]
+        forward_batch.extend_logprob_start_lens_cpu = [0]
+        forward_batch.batch_size = 1
+        forward_batch.input_ids = torch.zeros(
+            num_tokens, dtype=forward_batch.input_ids.dtype, device=device
+        )
+        forward_batch.positions = torch.arange(
+            num_tokens, dtype=torch.int64, device=device
+        )
+        if isinstance(forward_batch.out_cache_loc, torch.Tensor):
+            forward_batch.out_cache_loc = torch.zeros(
+                num_tokens,
+                dtype=forward_batch.out_cache_loc.dtype,
+                device=device,
+            )
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            pool_dtype = forward_batch.req_pool_indices.dtype
+            forward_batch.req_pool_indices = torch.zeros(
+                1, dtype=pool_dtype, device=device
+            )
+            if isinstance(forward_batch.req_pool_indices_cpu, torch.Tensor):
+                forward_batch.req_pool_indices_cpu = torch.zeros(1, dtype=pool_dtype)
+        return True
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Forward serving-time recompilation checks to the installed shim."""

@@ -103,6 +103,7 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         global_num_tokens_cpu=None,
         # Real ForwardBatch always carries spec_info (None when not spec).
         spec_info=None,
+        mm_inputs=None,
     )
 
 
@@ -304,6 +305,16 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertIs(fb.input_ids, orig_input_ids)
         self.assertIs(fb.seq_lens, orig_seq_lens)
+
+    def test_mm_inputs_none_becomes_a_padded_list(self):
+        fb = _forward_batch(real_t=4, real_b=1, mode="extend")
+        fb.mm_inputs = None
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(fb.mm_inputs, [None] * 4)
 
     def test_decode_cpu_list_fields_stay_none(self):
         # Non-extend batches keep the upstream None for the extend_*_cpu
@@ -771,10 +782,11 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
 class TestDpAttnSelectBucketShape(CustomTestCase):
     """Every DP rank must agree on the same (pad_t, pad_b) bucket."""
 
-    def _fb(self, mode, is_extend_in_batch=False):
+    def _fb(self, mode, is_extend_in_batch=False, num_tokens_per_req=4):
         return SimpleNamespace(
             forward_mode=_ForwardModeMock(mode),
             is_extend_in_batch=is_extend_in_batch,
+            spec_info=SimpleNamespace(num_tokens_per_req=num_tokens_per_req),
         )
 
     def test_decode_uses_bs_bucketer_for_both_axes(self):
@@ -817,9 +829,26 @@ class TestDpAttnSelectBucketShape(CustomTestCase):
         # Treated as decode: both axes from the bs bucketer.
         self.assertEqual((pad_t, pad_b), (8, 8))
 
+    def test_fixed_width_spec_uses_cross_rank_request_count(self):
+        t_b = _bucketer("Token", [64, 128])
+        b_b = _bucketer("Bs", [1, 2, 4, 8])
+        for mode in ("target_verify", "draft_extend_v2"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    _dp_attn_select_bucket_shape(
+                        self._fb(mode, num_tokens_per_req=4),
+                        t_b,
+                        b_b,
+                        max_tokens_per_rank=12,
+                        real_q=4,
+                        real_b=1,
+                    ),
+                    (16, 4),
+                )
+
 
 class TestDpAttnApplyBucketMetadata(CustomTestCase):
-    def _fb(self, dp_size=2):
+    def _fb(self, dp_size=2, mode="decode"):
         return SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int32),  # CPU -> device for gpu counts
             global_num_tokens_cpu=[3] * dp_size,
@@ -832,7 +861,7 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
             is_prefill_only=True,
             # Read to publish is_extend_in_batch to the flags tier; the
             # getattr default is evaluated eagerly, so it must always exist.
-            forward_mode=_ForwardModeMock("extend"),
+            forward_mode=_ForwardModeMock(mode),
         )
 
     def test_sets_uniform_padded_global_counts(self):
@@ -861,6 +890,12 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
         fb = self._fb(dp_size=4)
         _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
         self.assertEqual(fb.global_dp_buffer_len, 8 * 4)
+
+    def test_target_verify_uses_token_rows_for_logprob_gather(self):
+        fb = self._fb(dp_size=2, mode="target_verify")
+        _dp_attn_apply_bucket_metadata(fb, pad_t=16, pad_b=4)
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [16, 16])
+        self.assertEqual(fb.global_num_tokens_for_logprob_gpu.tolist(), [16, 16])
 
 
 if __name__ == "__main__":

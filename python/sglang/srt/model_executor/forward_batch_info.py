@@ -59,7 +59,7 @@ from sglang.srt.utils import (
     is_tpu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -1288,30 +1288,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
-
-        for i in range(sync_group_size):
-            # Make sure that the padded length is divisible by attn_tp_size
-            # because we may need reduce-scatter across attn_tp dim.
-            # There is no reduce-scatter in LM logprob, so we do not need
-            # to adjust the padded length for logprob.
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
-            if _is_tpu:
-                # TPU DPA gather expects local_tokens.shape[0] == expected_rows;
-                # match global_num_tokens_cpu padding. expected_rows comes from
-                # formula global_tokens.shape[0] // get_attention_dp_size().
-                self.global_num_tokens_for_logprob_cpu[i] = ceil_align(
-                    self.global_num_tokens_for_logprob_cpu[i], attn_tp_size
-                )
-
-        # make sure that each rank has the same number of tokens to do collective communication.
-        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
-        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
-        # prefill with NaN draft logits, see #23269).
-        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        if not enable_cp_v2():
-            cp_align_size = get_cp_padding_align_size()
-            for i in range(sync_group_size):
-                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+        # Zigzag CP performs its own padding. Other CP modes expose the
+        # alignment required by the platform-neutral compile policy.
+        cp_align_size = 1 if enable_cp_v2() else get_cp_padding_align_size()
+        (
+            global_num_tokens,
+            self.global_num_tokens_for_logprob_cpu,
+        ) = model_runner.compile_policy.get_dp_padded_token_counts(
+            self,
+            model_runner,
+            global_num_tokens,
+            self.global_num_tokens_for_logprob_cpu,
+            attn_tp_size=attn_tp_size,
+            cp_align_size=cp_align_size,
+        )
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1410,7 +1400,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
                 # branch handles decode rows padded to a 1-token extend.
-                if hybrid_ssm or self.seq_lens.shape[0] == 0:
+                if model_runner.compile_policy.materialize_dp_idle_extend(
+                    self, num_tokens
+                ):
+                    bs = self.batch_size
+                    self.orig_seq_lens = torch.tensor(
+                        [num_tokens],
+                        dtype=self.orig_seq_lens.dtype,
+                        device=self.seq_lens.device,
+                    )
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
+                elif hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert (
                         self.seq_lens.shape[0] == 0
@@ -1630,6 +1632,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.req_pool_indices = self.req_pool_indices[:bs]
             if self.seq_lens_cpu is not None:
                 self.seq_lens_cpu = self.seq_lens_cpu[:bs]
+
+        if self.spec_info is not None and getattr(
+            self.spec_info, "keep_outputs_padded", False
+        ):
+            if hasattr(self, "hidden_states_backup"):
+                self.spec_info.hidden_states = self.hidden_states_backup
+            if hasattr(self, "output_cache_loc_backup"):
+                self.out_cache_loc = self.output_cache_loc_backup
+            return
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
