@@ -86,9 +86,7 @@ def precompute_peer_recv_counts(
     num_experts_per_shard = num_experts_total // ep_size
 
     # 1. Compute expert boundaries per peer: shape (ep_size,)
-    peer_sizes = jnp.sum(
-        group_sizes.reshape(ep_size, num_experts_per_shard), axis=1
-    )
+    peer_sizes = jnp.sum(group_sizes.reshape(ep_size, num_experts_per_shard), axis=1)
     peer_starts = jnp.pad(jnp.cumsum(peer_sizes)[:-1], ((1, 0),))
     peer_ends = peer_starts + peer_sizes
 
@@ -107,12 +105,14 @@ def precompute_peer_recv_counts(
     dest_chips = (raw_idx // output_tokens_per_chip)[:, None]
 
     # 4. Destination matching
-    is_to_my_chip = (dest_chips == physical_mesh_id)  # shape (M, 1)
+    is_to_my_chip = dest_chips == physical_mesh_id  # shape (M, 1)
 
     # 5. Composite valid mask and parallel reduction along M dimension:
-    is_remote = (jnp.arange(ep_size, dtype=jnp.int32)[None, :] != physical_mesh_id)
+    is_remote = jnp.arange(ep_size, dtype=jnp.int32)[None, :] != physical_mesh_id
     valid_recv = is_from_peer & is_to_my_chip & is_remote  # shape (M, ep_size) bool
-    peer_recv_counts = jnp.sum(valid_recv.astype(jnp.int32), axis=0)  # shape (ep_size,) int32
+    peer_recv_counts = jnp.sum(
+        valid_recv.astype(jnp.int32), axis=0
+    )  # shape (ep_size,) int32
 
     return peer_recv_counts
 
@@ -507,6 +507,7 @@ def kernel_main_fused_rs(
     def sync_barrier_signal():
         barrier_sem = pltpu.get_barrier_semaphore()
         for i in range(ep_size):
+
             @pl.when(jnp.int32(i) == my_id)
             def _():
                 pl.semaphore_signal(barrier_sem, 1)
@@ -533,10 +534,6 @@ def kernel_main_fused_rs(
     zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
     sync_barrier_signal()
     sync_barrier_wait()
-
-
-
-
 
     # Build metadata.
     meta_dims = Dimensions(
@@ -565,9 +562,7 @@ def kernel_main_fused_rs(
     def fill_local_metadata():
         group_offset = group_offset_scalar
         start_m_offset = (
-            group_start_ref[0, 0]
-            if group_start_ref.ndim >= 2
-            else group_start_ref[0]
+            group_start_ref[0, 0] if group_start_ref.ndim >= 2 else group_start_ref[0]
         )
         metadata_ref.gm_id_to_m_offset[0] = start_m_offset
 
@@ -917,6 +912,7 @@ def kernel_main_fused_rs(
         @pl.when(gm_id >= 3)
         def _():
             prev_send = gm_id_ref[1 + stg_id]
+
             @pl.when(prev_send > 0)
             def _():
                 pl.semaphore_wait(send_sems_ref.at[stg_id], prev_send)
@@ -924,6 +920,7 @@ def kernel_main_fused_rs(
                     pl.semaphore_wait(scale_send_sems_ref.at[stg_id], prev_send)
 
             prev_local = gm_id_ref[4 + stg_id]
+
             @pl.when(prev_local > 0)
             def _():
                 pl.semaphore_wait(local_write_sems_ref.at[stg_id], prev_local)
@@ -1157,21 +1154,32 @@ def kernel_main_fused_rs(
             def _do_direct_write():
                 if fp8_direct_write:
                     # Vectorized tile-level FP8 quantization across the static tile_m on VPU in parallel!
-                    tile_f32 = scatter_staging_3x_ref[stg_id, :, :, :].astype(jnp.float32)
+                    tile_f32 = scatter_staging_3x_ref[stg_id, :, :, :].astype(
+                        jnp.float32
+                    )
                     valid_n2 = (
                         jnp.arange(tile_f32.shape[1])[:, None] * tile_f32.shape[2]
                         + jnp.arange(tile_f32.shape[2])[None, :]
                         < dims.original_n2
                     )
-                    fp8_max = jnp.array(jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32)
+                    fp8_max = jnp.array(
+                        jnp.finfo(jnp.float8_e4m3fn).max, dtype=jnp.float32
+                    )
                     abs_tile = jnp.where(valid_n2[None, :, :], jnp.abs(tile_f32), 0.0)
                     row_max = jnp.max(abs_tile.reshape(tile_m, -1), axis=1)
-                    tile_scale = jnp.maximum(row_max, jnp.array(1e-6, dtype=jnp.float32)) / fp8_max
+                    tile_scale = (
+                        jnp.maximum(row_max, jnp.array(1e-6, dtype=jnp.float32))
+                        / fp8_max
+                    )
 
-                    scatter_scale_3x_ref[stg_id, :, :] = tile_scale[:, None] + jnp.zeros((tile_m, 128), dtype=jnp.float32)
+                    scatter_scale_3x_ref[stg_id, :, :] = tile_scale[
+                        :, None
+                    ] + jnp.zeros((tile_m, 128), dtype=jnp.float32)
                     scatter_fp8_staging_3x_ref[stg_id, :, :, :] = jnp.where(
                         valid_n2[None, :, :],
-                        jnp.clip(tile_f32 / tile_scale[:, None, None], -fp8_max, fp8_max),
+                        jnp.clip(
+                            tile_f32 / tile_scale[:, None, None], -fp8_max, fp8_max
+                        ),
                         0.0,
                     ).astype(jnp.float8_e4m3fn)
 
@@ -1190,8 +1198,8 @@ def kernel_main_fused_rs(
                         local_token_idx = lhs_idx % output_tokens_per_chip
                         write_pos = local_token_idx * top_k + topk_slot
 
-                        is_local = (dest_chip == my_id)
-                        is_remote = (dest_chip != my_id)
+                        is_local = dest_chip == my_id
+                        is_remote = dest_chip != my_id
 
                         @pl.when(is_local)
                         def _():
@@ -1242,6 +1250,7 @@ def kernel_main_fused_rs(
                         0, num_valid, _write_row, (jnp.int32(0), jnp.int32(0))
                     )
                 else:
+
                     def _write_row_bf16(i, carry):
                         send_sz, local_sz = carry
                         row_idx = _ml + i
@@ -1257,8 +1266,8 @@ def kernel_main_fused_rs(
                         local_token_idx = lhs_idx % output_tokens_per_chip
                         write_pos = local_token_idx * top_k + topk_slot
 
-                        is_local = (dest_chip == my_id)
-                        is_remote = (dest_chip != my_id)
+                        is_local = dest_chip == my_id
+                        is_remote = dest_chip != my_id
 
                         @pl.when(is_local)
                         def _():
@@ -1305,9 +1314,11 @@ def kernel_main_fused_rs(
     @pl.when(max_num_gm > 0)
     def _():
         for _slot in range(3):
+
             @pl.when(max_num_gm > _slot)
             def _():
                 remaining_send = gm_id_ref[1 + _slot]
+
                 @pl.when(remaining_send > 0)
                 def _():
                     pl.semaphore_wait(send_sems_ref.at[_slot], remaining_send)
@@ -1315,17 +1326,21 @@ def kernel_main_fused_rs(
                         pl.semaphore_wait(scale_send_sems_ref.at[_slot], remaining_send)
 
                 remaining_local = gm_id_ref[4 + _slot]
+
                 @pl.when(remaining_local > 0)
                 def _():
                     pl.semaphore_wait(local_write_sems_ref.at[_slot], remaining_local)
                     if fp8_direct_write:
-                        pl.semaphore_wait(scale_local_write_sems_ref.at[_slot], remaining_local)
+                        pl.semaphore_wait(
+                            scale_local_write_sems_ref.at[_slot], remaining_local
+                        )
 
     # Drain per-peer incoming remote writes using dynamic counts:
     @jax.named_scope("drain_recv_sems")
     def _drain_recv():
         for p in range(ep_size):
             count = peer_recv_counts_ref[p]
+
             @pl.when(count > 0)
             def _():
                 pl.semaphore_wait(recv_sem_ref.at[p], count)
@@ -1959,9 +1974,7 @@ def gmm_v2_fused_rs(
     output_size = max(chunk_size, 1)
     out_m = output_size * top_k
     payload_dtype = jnp.float8_e4m3fn if fp8_direct_write else out_dtype
-    out_buf_init = jax.ShapeDtypeStruct(
-        (out_m, n2_cols, num_lanes), payload_dtype
-    )
+    out_buf_init = jax.ShapeDtypeStruct((out_m, n2_cols, num_lanes), payload_dtype)
     out_scale_init = jax.ShapeDtypeStruct((out_m, 128), jnp.float32)
 
     pallas_inputs = (
@@ -2019,9 +2032,9 @@ def gmm_v2_fused_rs(
 
     if fp8_direct_write:
         fp8_scratch_shapes = scratch_shapes + [
-            pltpu.SemaphoreType.REGULAR((3,)),          # scale_send_sems_ref
-            pltpu.SemaphoreType.REGULAR((3,)),          # scale_local_write_sems_ref
-            pltpu.SemaphoreType.REGULAR((ep_size,)),    # scale_recv_sem_ref
+            pltpu.SemaphoreType.REGULAR((3,)),  # scale_send_sems_ref
+            pltpu.SemaphoreType.REGULAR((3,)),  # scale_local_write_sems_ref
+            pltpu.SemaphoreType.REGULAR((ep_size,)),  # scale_recv_sem_ref
             pltpu.VMEM((3, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn),
             pltpu.VMEM((3, tile_m, 128), jnp.float32),
         ]
