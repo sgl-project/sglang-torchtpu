@@ -45,7 +45,7 @@ Usage:
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=240, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(est_time=60, suite="stage-a-test-tpu-unit")
 
 import unittest
 from types import SimpleNamespace

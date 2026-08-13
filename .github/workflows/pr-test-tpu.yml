@@ -106,10 +106,25 @@ jobs:
       # commit, whose merge_commit_sha lags a force-push and can check out stale code.
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
-      # Unit suite (kernels/backends; each test self-contained, no model server) is the
-      # per-commit gate. Serving suites (stage-b-*) that launch a real server run in the
-      # nightly workflow, not on every PR.
+      # Unit suite (kernels/backends; each test self-contained, no model server) runs
+      # first so a broken kernel fails before the serving suite claims the slice.
       suite: stage-a-test-tpu-unit
+    permissions:
+      contents: read
+      id-token: write
+
+  # Serving suite: basic inference, prefix cache, compile tracer, compile bundle.
+  # Runs only after stage-a passes, so a broken kernel does not hold the slice for
+  # the suite's ~28 min. Sized for the gate because the two accuracy tests in this
+  # suite are registered disabled; re-enabling either (~1 h each) makes it
+  # nightly-only again.
+  feature:
+    needs: [build, integration]
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: stage-b-test-tpu-4-v7
     permissions:
       contents: read
       id-token: write
