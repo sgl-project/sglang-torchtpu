@@ -46,31 +46,6 @@ from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 EXPERT = "model"
 MLP_DATA = "data"
 
-# ============================================================================
-# SMEM safety guard
-# ============================================================================
-
-# ``gmm_v2_fused_rs`` SMEM budget (v7x): ~1.0 MB. Per-row scalar-prefetch
-# arrays (``lhs_indices``, ``output_indices``, ``topk_weights``, etc.) scale
-# with ``size_m`` as ``4 * size_m`` bytes each, so at ``m = 262144`` the
-# kernel overflows SMEM by ~40 KB. We guard at ``m >= 262144`` (empirical
-# OOM threshold); callers hitting this must reduce ``max-num-batched-tokens``,
-# switch to ``gmm_ep_dma`` / ``gmm_ep_original``, or shard more (tp>1).
-_FUSED_RS_MAX_SAFE_SIZE_M = 262144
-
-
-def _assert_fused_rs_smem_safe(size_m: int) -> None:
-    """Assert ``size_m`` fits the v7x SMEM budget for ``gmm_v2_fused_rs``."""
-    assert size_m < _FUSED_RS_MAX_SAFE_SIZE_M, (
-        f"gmm_v2_fused_rs SMEM OOM at size_m={size_m} (>= "
-        f"{_FUSED_RS_MAX_SAFE_SIZE_M}). Per-row scalar-prefetch arrays "
-        f"would exceed the 1 MB SMEM budget. Reduce "
-        f"max-num-batched-tokens × top_k, switch to ep_backend "
-        f"'gmm_ep_dma'/'gmm_ep_original', or increase tp so m per chip "
-        f"is smaller."
-    )
-
-
 # NOTE: the SP-off post-kernel gather of the reduce-scattered token shard back to
 # the full replicated batch (previously `_all_gather_token_hidden` here) now lives
 # in the model-side TPU MoE gather path.
@@ -82,52 +57,17 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 # ============================================================================
 
 
-def _compute_sender_payload(
-    source_expert_shards,
-    dest_physical_ids,
-    *,
-    expert_shard_id,
-    physical_device_id,
-    ep_size,
-):
-    """Pack one sender's logical ID and exact remote-copy counts."""
-    sender_rows = (source_expert_shards == expert_shard_id) & (
-        dest_physical_ids != physical_device_id
-    )
-    sender_destinations = jnp.where(sender_rows, dest_physical_ids, ep_size)
-    sender_counts = jnp.bincount(
-        sender_destinations, length=ep_size + 1
-    )[:ep_size].astype(jnp.int32)
-    return jnp.concatenate(
-        [jnp.asarray([expert_shard_id], dtype=jnp.int32), sender_counts]
-    )
-
-
-def _transpose_sender_payloads(all_sender_payloads, physical_device_id, ep_size):
-    """Return receive counts indexed by the sender's logical expert shard."""
-    all_source_expert_shards = all_sender_payloads[:, 0]
-    all_sender_counts = all_sender_payloads[:, 1:]
-    return jnp.zeros((ep_size,), dtype=jnp.int32).at[
-        all_source_expert_shards
-    ].set(all_sender_counts[:, physical_device_id])
-
-
 def _compute_rs_routing(
     topk_indices,
     *,
     num_experts,
     topk,
-    ep_size,
-    ep_axis_name,
-    physical_device_id,
-    expert_shard_id,
 ):
     """Inline routing for the RS path with full VPU vectorized precomputations.
     Computes:
       - lhs_indices: int32[size_m] — gather indices (token ID per row)
       - group_sizes: int32[num_experts] — rows per expert
       - topk_slot_indices: int32[size_m] — topk slot (0..topk-1) per row
-      - peer_recv_counts: int32[ep_size] — incoming row counts per peer
     """
     topk_indices_flat = topk_indices.flatten()
     topk_argsort_indices = jnp.argsort(topk_indices_flat)
@@ -139,35 +79,7 @@ def _compute_rs_routing(
     lhs_indices = (topk_argsort_indices // topk).astype(jnp.int32)
     topk_slot_indices = (topk_argsort_indices % topk).astype(jnp.int32)
 
-    # Each logical sender counts the remote copies it will start by physical
-    # destination. One packed all-gather exchanges both the sender ID and those
-    # counts; receivers then transpose the result into receive-semaphore order.
-    num_experts_per_shard = num_experts // ep_size
-    sorted_experts = topk_indices_flat[topk_argsort_indices]
-    source_expert_shards = (sorted_experts // num_experts_per_shard).astype(
-        jnp.int32
-    )
-    num_tokens = topk_indices.shape[0]
-    output_tokens_per_chip = max((num_tokens + ep_size - 1) // ep_size, 1)
-    dest_physical_ids = (lhs_indices // output_tokens_per_chip).astype(jnp.int32)
-    sender_payload = _compute_sender_payload(
-        source_expert_shards,
-        dest_physical_ids,
-        expert_shard_id=expert_shard_id,
-        physical_device_id=physical_device_id,
-        ep_size=ep_size,
-    )
-    all_sender_payloads = jax.lax.all_gather(
-        sender_payload,
-        axis_name=ep_axis_name,
-        axis=0,
-        tiled=False,
-    )
-    peer_recv_counts = _transpose_sender_payloads(
-        all_sender_payloads, physical_device_id, ep_size
-    )
-
-    return lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts
+    return lhs_indices, group_sizes, topk_slot_indices
 
 
 # ============================================================================
@@ -214,22 +126,14 @@ def moe_gmm_local_rs_nodedup(
     go_flat = group_offset.reshape(-1)
     go_val = go_flat[0]
     my_id = go_flat[1] if go_flat.shape[0] > 1 else (go_val // num_local_experts)
-    expert_shard_id = go_val // num_local_experts
     # Routing with vectorized VPU precomputations:
-    lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts = (
-        _compute_rs_routing(
-            topk_indices,
-            num_experts=num_experts,
-            topk=topk,
-            ep_size=ep_size,
-            ep_axis_name=ep_axis_name,
-            physical_device_id=my_id,
-            expert_shard_id=expert_shard_id,
-        )
+    lhs_indices, group_sizes, topk_slot_indices = _compute_rs_routing(
+        topk_indices,
+        num_experts=num_experts,
+        topk=topk,
     )
     output_indices = (lhs_indices * topk + topk_slot_indices).astype(jnp.int32)
     size_m = lhs_indices.shape[0]
-    _assert_fused_rs_smem_safe(size_m)
 
     # Compute local row range [local_start, local_end) without per-row source
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
@@ -303,7 +207,6 @@ def moe_gmm_local_rs_nodedup(
         group_sizes,
         lhs_indices,
         output_indices,  # <--- MUST BE output_indices!
-        peer_recv_counts=peer_recv_counts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_global_scale=w1_global_scale,
@@ -621,6 +524,4 @@ __all__ = [
     "expert_parallel_gmm_rs",
     "moe_gmm_local_rs_nodedup",
     "_compute_rs_routing",
-    "_FUSED_RS_MAX_SAFE_SIZE_M",
-    "_assert_fused_rs_smem_safe",
 ]

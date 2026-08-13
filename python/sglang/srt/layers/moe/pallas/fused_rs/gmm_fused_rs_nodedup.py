@@ -47,75 +47,7 @@ from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
 )
 from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 
-# =============================================================================
-# Phase 1: Pre-kernel metadata computation (JAX level)
-# =============================================================================
-
-
-def precompute_peer_recv_counts(
-    group_sizes: jax.Array,
-    lhs_indices: jax.Array,
-    chunk_size: int,
-    ep_size: int,
-    physical_device_id: jax.Array | int | None = None,
-    pack_indices: bool = False,
-    top_k: int = 1,
-    group_offset: jax.Array | None = None,
-) -> jax.Array:
-    """Vectorized VPU computation of per-peer incoming row counts.
-
-    Returns:
-        jax.Array of shape (ep_size,) int32.
-    """
-    if physical_device_id is None:
-        if group_offset is not None:
-            go_flat = group_offset.reshape(-1)
-            num_experts_total = group_sizes.shape[0]
-            num_experts_per_shard = num_experts_total // ep_size
-            physical_device_id = (
-                go_flat[1]
-                if go_flat.shape[0] > 1
-                else (go_flat[0] // num_experts_per_shard)
-            )
-        else:
-            physical_device_id = 0
-
-    num_experts_total = group_sizes.shape[0]
-    num_experts_per_shard = num_experts_total // ep_size
-    expert_shard_id = physical_device_id
-    if group_offset is not None:
-        expert_shard_id = group_offset.reshape(-1)[0] // num_experts_per_shard
-
-    # 1. Compute expert boundaries per peer: shape (ep_size,)
-    peer_sizes = jnp.sum(
-        group_sizes.reshape(ep_size, num_experts_per_shard), axis=1
-    )
-    peer_starts = jnp.pad(jnp.cumsum(peer_sizes)[:-1], ((1, 0),))
-    peer_ends = peer_starts + peer_sizes
-
-    # 2. Vectorized 2D broadcast masks: shape (M, ep_size)
-    size_m = lhs_indices.shape[0]
-    row_indices = jnp.arange(size_m, dtype=jnp.int32)[:, None]
-    peer_starts_2d = peer_starts[None, :]
-    peer_ends_2d = peer_ends[None, :]
-    is_from_peer = (row_indices >= peer_starts_2d) & (row_indices < peer_ends_2d)
-
-    # 3. Decode destination chip per row: shape (M, 1)
-    raw_idx = lhs_indices
-    if pack_indices:
-        raw_idx = raw_idx // top_k
-    output_tokens_per_chip = max(chunk_size, 1)
-    dest_chips = (raw_idx // output_tokens_per_chip)[:, None]
-
-    # 4. Destination matching
-    is_to_my_chip = dest_chips == physical_device_id  # shape (M, 1)
-
-    # 5. Composite valid mask and parallel reduction along M dimension:
-    is_remote = jnp.arange(ep_size, dtype=jnp.int32)[None, :] != expert_shard_id
-    valid_recv = is_from_peer & is_to_my_chip & is_remote  # shape (M, ep_size) bool
-    peer_recv_counts = jnp.sum(valid_recv.astype(jnp.int32), axis=0)  # shape (ep_size,) int32
-
-    return peer_recv_counts
+_PEER_COUNT_READY = 1
 
 
 def compute_num_gm(group_sizes, tile_m, size_lhs_sublane, start_offset=0):
@@ -394,7 +326,7 @@ def _select_fused_rs_block_sizes(
 
 
 def kernel_main_fused_rs(
-    # Scalar prefetch (10) — dual-index decoupling:
+    # Scalar prefetch (9) — dual-index decoupling:
     #   - lhs_indices_ref (pos 3): gather token ID indices (M,)
     #   - output_indices_ref (pos 4): scatter destination packed token indices (M,)
     lhs_group_sizes_ref,
@@ -403,7 +335,6 @@ def kernel_main_fused_rs(
     lhs_indices_ref,
     output_indices_ref,
     max_num_gm_ref,  # (1,) int32 — max gm tiles across all chips
-    peer_recv_counts_in_ref,  # (ep_size,) int32 — precomputed per-peer incoming counts
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
@@ -446,7 +377,7 @@ def kernel_main_fused_rs(
     local_write_sems_ref,  # DMA(3,) per-staging-slot local write sems
     recv_sem_ref,  # REGULAR(ep_size,) for incoming remote writes per peer
     recv_count_sem_ref,  # REGULAR(ep_size,) for ordered sender completion counts
-    peer_recv_counts_ref,  # SMEM(ep_size,) actual outgoing counts by destination
+    peer_send_counts_ref,  # SMEM(ep_size,) actual outgoing counts by destination
     scale_send_sems_ref=None,  # Optional DMA(3,) for FP8 row-scale sends.
     scale_local_write_sems_ref=None,  # Optional DMA(3,) for FP8 row-scale local writes.
     scale_recv_sem_ref=None,  # Optional REGULAR(ep_size,) for incoming FP8 row-scale writes.
@@ -504,7 +435,7 @@ def kernel_main_fused_rs(
 
     with jax.named_scope("init_peer_send_counts"):
         for p in range(ep_size):
-            peer_recv_counts_ref[p] = 0
+            peer_send_counts_ref[p] = 0
 
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
@@ -1225,8 +1156,8 @@ def kernel_main_fused_rs(
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
-                            peer_recv_counts_ref[dest_chip] = (
-                                peer_recv_counts_ref[dest_chip] + 1
+                            peer_send_counts_ref[dest_chip] = (
+                                peer_send_counts_ref[dest_chip] + 1
                             )
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_scale_3x_ref.at[
@@ -1288,8 +1219,8 @@ def kernel_main_fused_rs(
                                 device_id={ep_axis_name: dest_chip},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
-                            peer_recv_counts_ref[dest_chip] = (
-                                peer_recv_counts_ref[dest_chip] + 1
+                            peer_send_counts_ref[dest_chip] = (
+                                peer_send_counts_ref[dest_chip] + 1
                             )
 
                         return (
@@ -1333,14 +1264,14 @@ def kernel_main_fused_rs(
     # Publish each sender's actual remote-copy count only after all its send
     # semaphores have drained. The ready marker and count are one atomic remote
     # signal, so waiting out the marker leaves a stable exact count to consume.
-    recv_count_ready = jnp.int32(1 << 20)
+    recv_count_ready = jnp.int32(_PEER_COUNT_READY)
     with jax.named_scope("publish_peer_send_counts"):
         for p in range(ep_size):
             @pl.when(jnp.int32(p) != my_id)
             def _():
                 pl.semaphore_signal(
                     recv_count_sem_ref.at[expert_shard_id],
-                    recv_count_ready + peer_recv_counts_ref[p],
+                    recv_count_ready + peer_send_counts_ref[p],
                     device_id={ep_axis_name: jnp.int32(p)},
                     device_id_type=pltpu.DeviceIdType.MESH,
                 )
@@ -1369,7 +1300,6 @@ def kernel_main_fused_rs_fp8(
     lhs_indices_ref,
     output_indices_ref,
     max_num_gm_ref,
-    peer_recv_counts_in_ref,
     w1_gs_gate_ref,
     w1_gs_up_ref,
     w2_gs_ref,
@@ -1409,7 +1339,7 @@ def kernel_main_fused_rs_fp8(
     local_write_sems_ref,
     recv_sem_ref,
     recv_count_sem_ref,
-    peer_recv_counts_ref,
+    peer_send_counts_ref,
     scale_send_sems_ref,
     scale_local_write_sems_ref,
     scale_recv_sem_ref,
@@ -1442,7 +1372,6 @@ def kernel_main_fused_rs_fp8(
         lhs_indices_ref,
         output_indices_ref,
         max_num_gm_ref,
-        peer_recv_counts_in_ref,
         w1_gs_gate_ref,
         w1_gs_up_ref,
         w2_gs_ref,
@@ -1481,7 +1410,7 @@ def kernel_main_fused_rs_fp8(
         local_write_sems_ref,
         recv_sem_ref,
         recv_count_sem_ref,
-        peer_recv_counts_ref,
+        peer_send_counts_ref,
         scale_send_sems_ref,
         scale_local_write_sems_ref,
         scale_recv_sem_ref,
@@ -1534,7 +1463,6 @@ def gmm_v2_fused_rs(
     group_sizes: jax.Array,
     lhs_indices: jax.Array,
     output_indices: jax.Array,
-    peer_recv_counts: jax.Array | None = None,
     *,
     w1_scale: jax.Array | None = None,
     w2_scale: jax.Array | None = None,
@@ -1946,7 +1874,7 @@ def gmm_v2_fused_rs(
         pltpu.SemaphoreType.REGULAR((ep_size,)),
         # recv_count_sem_ref (ordered completion count from each peer)
         pltpu.SemaphoreType.REGULAR((ep_size,)),
-        # peer_recv_counts_ref (actual outgoing counts by destination)
+        # peer_send_counts_ref (actual outgoing counts by destination)
         pltpu.SMEM((ep_size,), jnp.int32),
     ]
 
@@ -1964,27 +1892,6 @@ def gmm_v2_fused_rs(
     w2_bias_input = w2_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     max_num_gm_arr = jnp.array([max_num_gm], dtype=jnp.int32)
 
-    if peer_recv_counts is None:
-        go_flat = group_offset.reshape(-1)
-        num_experts_total = group_sizes.shape[0]
-        num_experts_per_shard = num_experts_total // ep_size
-        physical_mesh_id = (
-            go_flat[1]
-            if go_flat.shape[0] > 1
-            else (go_flat[0] // num_experts_per_shard)
-        )
-        peer_recv_counts = precompute_peer_recv_counts(
-            group_sizes=group_sizes,
-            lhs_indices=lhs_indices,
-            chunk_size=chunk_size,
-            ep_size=ep_size,
-            physical_device_id=physical_mesh_id,
-            pack_indices=False,
-            top_k=top_k,
-            group_offset=group_offset,
-        )
-    peer_recv_counts_input = peer_recv_counts.astype(jnp.int32)
-
     # Output buffer — stores arriving rows for this chip: (output_size * top_k, n2_cols, num_lanes).
     output_size = max(chunk_size, 1)
     out_m = output_size * top_k
@@ -2001,7 +1908,6 @@ def gmm_v2_fused_rs(
         lhs_indices.astype(jnp.int32),
         output_indices.astype(jnp.int32),
         max_num_gm_arr,
-        peer_recv_counts_input,
         _w1_gs_gate,
         _w1_gs_up,
         _w2_gs,
@@ -2059,7 +1965,7 @@ def gmm_v2_fused_rs(
             functools.partial(kernel_main_fused_rs_fp8, **kernel_kwargs),
             out_shape=(out_buf_init, out_scale_init),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=10,
+                num_scalar_prefetch=9,
                 in_specs=in_specs,
                 out_specs=[
                     pl.BlockSpec(memory_space=pltpu.HBM),
@@ -2078,7 +1984,7 @@ def gmm_v2_fused_rs(
         functools.partial(kernel_main_fused_rs, **kernel_kwargs),
         out_shape=out_buf_init,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=10,
+            num_scalar_prefetch=9,
             in_specs=in_specs,
             out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
             scratch_shapes=scratch_shapes,

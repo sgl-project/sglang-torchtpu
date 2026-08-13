@@ -26,14 +26,17 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
 def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
     from torch_tpu._internal.distributed import tpu_distributed
 
-    from sglang.srt.distributed import get_tp_group
-
     try:
         global_device_id = tpu_distributed.global_device_id()
     except Exception:
         global_device_id = 0
 
-    tp_group = get_tp_group()
+    try:
+        from sglang.srt.distributed import get_tp_group
+        tp_group = get_tp_group()
+    except Exception:
+        tp_group = None
+
     world_size = tp_group.world_size if tp_group is not None else 1
     if world_size == 1:
         return global_device_id, (0,)
@@ -91,7 +94,8 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
 
 @functools.cache
-def _get_mesh():
+def _get_mesh(world_size: int | None = None):
+    import re
     import numpy as np
     from jax.sharding import Mesh
 
@@ -99,7 +103,14 @@ def _get_mesh():
         get_jax_export_devices,
     )
 
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size is None:
+        xla_flags = os.environ.get("XLA_FLAGS", "")
+        m = re.search(r"--xla_force_host_platform_device_count=(\d+)", xla_flags)
+        if m:
+            world_size = int(m.group(1))
+        else:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
     export_devices = np.asarray(get_jax_export_devices(world_size)).reshape(1, -1)
     return Mesh(export_devices, ("data", "model"))
 
