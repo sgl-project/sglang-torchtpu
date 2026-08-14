@@ -11,7 +11,7 @@
 # quota while being unschedulable, so mixing them would admit a workload that can never run.
 # Lanes are separate so pr-gate and nightly cannot borrow each other's capacity.
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: tpu7x-2x2x1-pr-gate
@@ -23,7 +23,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: tpu7x-2x2x2-pr-gate
@@ -35,7 +35,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: tpu7x-2x2x1-nightly
@@ -47,7 +47,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: tpu7x-2x2x2-nightly
@@ -59,7 +59,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: tpu7x-2x2x4-nightly
@@ -74,7 +74,7 @@ spec:
 # pr-gate 1-host: 6 nodes x 4 chips = 24, each node a whole slice. Quota'd at 20 so one node
 # going NotReady does not over-state it -- an over-stated quota admits a gang the cluster
 # cannot hold, and the extra pod goes Pending inside an *admitted* workload.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: tpu-prgate-1h
@@ -91,7 +91,7 @@ spec:
 ---
 # pr-gate 2-host: one slice = 8 chips = one concurrent job. No headroom possible: a 2-host
 # job needs exactly 8, so any lower value admits nothing.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: tpu-prgate-2h
@@ -109,7 +109,7 @@ spec:
 # nightly 1-host: 2 nodes x 4 = 8. Taken at full capacity rather than under-stated -- at two
 # nodes, one node of headroom would cost half the lane. waitForPodsReady absorbs the drift
 # by evicting and requeuing instead of deadlocking.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: tpu-nightly-1h
@@ -126,7 +126,7 @@ spec:
 ---
 # nightly 2-host: one slice. A second 2-host slice = new pool + new flavor + one more entry
 # in this flavors list; no workflow change.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: tpu-nightly-2h
@@ -142,7 +142,7 @@ spec:
               nominalQuota: 8
 ---
 # nightly 4-host: one slice = 16 chips. Exact, same reason as the 2-host queues.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: tpu-nightly-4h
@@ -157,7 +157,7 @@ spec:
             - name: "google.com/tpu"
               nominalQuota: 16
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: tpu-prgate-1h
@@ -165,7 +165,7 @@ metadata:
 spec:
   clusterQueue: tpu-prgate-1h
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: tpu-prgate-2h
@@ -173,7 +173,7 @@ metadata:
 spec:
   clusterQueue: tpu-prgate-2h
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: tpu-nightly-1h
@@ -181,7 +181,7 @@ metadata:
 spec:
   clusterQueue: tpu-nightly-1h
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: tpu-nightly-2h
@@ -189,7 +189,7 @@ metadata:
 spec:
   clusterQueue: tpu-nightly-2h
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
 metadata:
   name: tpu-nightly-4h
