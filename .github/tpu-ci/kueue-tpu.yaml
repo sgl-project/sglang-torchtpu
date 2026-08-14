@@ -1,100 +1,9 @@
-# Kueue admission for the TPU CI slices. Apply once per cluster, in this order -- the
-# workflows in this PR remove the GitHub-side mutex, so they must not merge before step 3
-# reports both queues Active.
+# Kueue gang-admits the TPU CI JobSets against slice quota.
+# Install, ConfigMap settings and verification: README.md "Enabling Kueue".
 #
-# 1. Install Kueue (needs cluster-admin). JobSet v0.12.0 is already present; Kueue's
-#    integration hooks into it.
-#      kubectl apply --server-side -f \
-#        https://github.com/kubernetes-sigs/kueue/releases/download/v0.18.5/manifests.yaml
-#      kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=180s
-#
-# 2. Confirm the JobSet framework is enabled. If `jobset.x-k8s.io/jobset` is absent from
-#    integrations.frameworks, Kueue IGNORES the queue-name label and every JobSet runs
-#    unmanaged -- no gang admission, no error, nothing in the logs. Silent, and it looks
-#    exactly like success until two JobSets deadlock on one slice.
-#      kubectl -n kueue-system get cm kueue-manager-config \
-#        -o jsonpath='{.data.controller_manager_config\.yaml}' | grep -A12 frameworks
-#    If missing: edit that ConfigMap, then
-#      kubectl -n kueue-system rollout restart deploy/kueue-controller-manager
-#
-# 2b. Fail closed on a missing label. By default Kueue only manages a workload carrying a
-#    valid queue-name label pointing at a LocalQueue in its OWN namespace; a typo, a wrong
-#    namespace, or a new caller that forgets the label means the JobSet runs UNMANAGED --
-#    and since this PR deletes the concurrency mutex, unmanaged means no admission control
-#    at all. Flip the default so an unlabelled JobSet is queued rather than run wild:
-#      manageJobsWithoutQueueName: true
-#      managedJobsNamespaceSelector:
-#        matchLabels:
-#          kubernetes.io/metadata.name: tpu-ci
-#    The namespace selector is NOT optional. Without it this setting is cluster-wide and
-#    Kueue would start suspending Job-shaped workloads in every namespace, including the
-#    haolin-dev and mimo dev pools. Scope it to tpu-ci, then confirm nothing else was
-#    caught:
-#      kubectl get workloads -A
-#
-# 2c. Recover from a wrong quota instead of deadlocking on it. nominalQuota below is a
-#    static number Kueue never reconciles against real nodes, so a node going NotReady
-#    over-states it; Kueue then admits a gang the cluster cannot actually hold and half of
-#    it sits Pending. Same ConfigMap:
-#      waitForPodsReady:
-#        enable: true
-#        timeout: 5m
-#        blockAdmission: true
-#    The workload is evicted and requeued if its pods do not all become ready in time,
-#    and blockAdmission stops further admissions while one is stuck. This does not make
-#    quota self-correcting -- it turns a wrong number into added latency rather than a
-#    nightly that hangs to activeDeadlineSeconds.
-#
-# 3. Apply this file and check admission is live:
-#      kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
-#      kubectl get clusterqueues -o wide        # ACTIVE=True on both
-#      kubectl -n tpu-ci get localqueues
-#
-# 4. The multi-host pool must exist or tpu-multihost workloads queue forever. As of
-#    2026-08-12 `ci-tpu-pool=nightly` does NOT exist -- multi-host nightly jobs sit
-#    Pending with "0/11 nodes matched Pod's node affinity/selector" until their deadline.
-#    Recreate it (flags verified against ci-tpu7x-2x2x1 and tpu7x-2x2x2-haolin-dev):
-#      gcloud compute resource-policies create workload-policy ci-tpu7x-2x2x2-wp \
-#        --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2 --region=us-central1 \
-#        --project=sglang-torchtpu
-#      gcloud container node-pools create ci-tpu7x-2x2x2 \
-#        --cluster=tpu-cluster --zone=us-central1-c --project=sglang-torchtpu \
-#        --machine-type=tpu7x-standard-4t --tpu-topology=2x2x2 \
-#        --placement-policy=ci-tpu7x-2x2x2-wp \
-#        --reservation-affinity=specific \
-#        --reservation=projects/sglang-torchtpu/reservations/ghostfish-u2zcmybntv70q \
-#        --node-labels=ci-tpu-pool=nightly
-#    --type must be HIGH_THROUGHPUT (COMPACT is a different API; HIGH_AVAILABILITY
-#    rejects --accelerator-topology). --num-nodes is inferred from --tpu-topology.
-#    NB: README.md cites reservation ghostfish-7vg0iyvvgks52; the live one is
-#    ghostfish-u2zcmybntv70q.
-#
-# 5. Verify gang admission before merging -- this is the load-bearing assumption, that
-#    Kueue assigns a whole PodSet to ONE ResourceFlavor. Submit two multi-host JobSets at
-#    once and confirm the first admits, the second stays queued (not half-scheduled), and
-#    the admitted one's two pods share a pool:
-#      kubectl -n tpu-ci get workloads
-#      kubectl -n tpu-ci get pods -o wide
-#    If pods from one JobSet ever straddle two pools, this design needs Kueue
-#    Topology-Aware Scheduling instead of flavor-per-slice.
-#
-# WHY: a JobSet asks for HOSTS pods at once, and kube-scheduler places pods one at a
-# time -- it will hand node 1 to JobSet A and node 2 to JobSet B and leave both stuck at
-# half a gang until activeDeadlineSeconds. GitHub concurrency groups were papering over
-# that by allowing only one multi-host job to exist; the group holds one in-progress plus
-# one pending, so a third claimant silently cancelled the pending one. Kueue admits a
-# JobSet only when a whole slice's quota is free, all-or-nothing, before any pod is
-# created -- so the GitHub-side throttles are no longer load-bearing and are removed.
-#
-# ONE FLAVOR PER SLICE. GKE tpu7x nodes carry no per-slice label (only accelerator,
-# topology, nodepool, hostname, zone -- and none of the cloud.google.com/gke-topology-*
-# labels Kueue's Topology-Aware Scheduling needs), so `ci-tpu-pool` is the finest slice
-# selector available. A pool holding two slices could not be split, and a JobSet's pods
-# could straddle both and fail at ICI rendezvous. Add capacity as a NEW pool.
-#
-# Sizing: tpu7x-standard-4t = 4 chips/host.
-#   2x2x1 = 4 chips  = 1 node  -> each ci-tpu7x-2x2x1 node is a whole single-host slice
-#   2x2x2 = 8 chips  = 2 nodes -> one multi-host slice per pool
+# One ResourceFlavor per slice: GKE tpu7x nodes expose no per-slice label, so ci-tpu-pool
+# is the finest slice selector and a pool must hold exactly one slice.
+# tpu7x-standard-4t = 4 chips/host -> 2x2x1 = 1 node, 2x2x2 = 2 nodes.
 ---
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ResourceFlavor
@@ -120,14 +29,9 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# Single-host: ci-tpu7x-2x2x1 is 4 nodes x 4 chips = 16, and each 2x2x1 node is an
-# independent slice. Deliberately quota'd at 12, not 16: nominalQuota is a static number
-# that Kueue never reconciles against real node capacity, so a node going NotReady (repair,
-# upgrade, reclaimed reservation) silently over-states it -- and over-stating is the
-# dangerous direction, because Kueue admits, the extra pod goes Pending inside an ADMITTED
-# workload, the runtime budget starts, and the test fails on a timeout that reads like a
-# test bug. 12 tolerates one node down and still runs 3 concurrent, versus the one job the
-# old tpu-slice-1 group allowed.
+# 4 nodes x 4 chips = 16, each node a whole slice. Quota'd at 12 so one node going
+# NotReady does not over-state it -- an over-stated quota admits a gang the cluster
+# cannot hold, and the extra pod then goes Pending inside an *admitted* workload.
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue
 metadata:
@@ -143,16 +47,9 @@ spec:
             - name: "google.com/tpu"
               nominalQuota: 12
 ---
-# Multi-host: one slice = 8 chips = one concurrent job. Adding a second slice means a new
-# node pool (ci-tpu-pool=nightly-b), a second ResourceFlavor, and one more entry in this
-# flavors list -- parallelism then rises with no workflow change. Kueue assigns a PodSet
-# to a single flavor, which is what keeps a JobSet's two pods inside one slice.
-#
-# Unlike the single-host queue above, this one CANNOT be under-quota'd for headroom: a
-# 2-host job needs exactly 8 chips, so anything below 8 admits nothing. Quota must equal
-# capacity here, which means drift protection has to come from the operational invariant
-# instead -- one slice per pool, and never shrink a slice pool. Shrinking ci-tpu7x-2x2x2
-# below 2 nodes, or growing it above 2, both break this file silently.
+# One slice = 8 chips = one concurrent job. No headroom possible here: a 2-host job needs
+# exactly 8, so any lower value admits nothing. Second slice = new pool + new flavor +
+# one more entry in this list; no workflow change.
 apiVersion: kueue.x-k8s.io/v1beta1
 kind: ClusterQueue
 metadata:

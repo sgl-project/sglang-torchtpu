@@ -54,12 +54,8 @@ permissions:
   id-token: write
 
 concurrency:
-  # Slice admission moved to Kueue (.github/tpu-ci/kueue-tpu.yaml), which gang-admits a
-  # JobSet only when a whole slice's quota is free. This group used to be that mutex, and
-  # it was the wrong primitive: it holds one in-progress plus one pending, so a third
-  # claimant silently cancelled the pending one. Keyed per job now so it never gates --
-  # the callers' workflow-level groups (tpu-slice-nightly, tpu-combo, pr-test-tpu-<PR>)
-  # still stop two runs of the same workflow from stacking.
+  # Keyed per job so it never gates: Kueue owns slice admission now (kueue-tpu.yaml), and
+  # the callers' workflow-level groups already stop a workflow stacking on itself.
   group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
   cancel-in-progress: false
 
@@ -112,9 +108,8 @@ jobs:
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
-          # Kueue creates the JobSet suspended and releases it only when a whole slice's
-          # quota is free, so no pods exist while it is queued. Admission gets its own
-          # budget: queue time must not be charged against the runtime budget below.
+          # A suspended JobSet has no pods, so queue time gets its own budget rather than
+          # eating the runtime one below.
           admit_s=3600
           admit_deadline=$(( $(date +%s) + admit_s ))
           until [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ]; do
@@ -127,9 +122,7 @@ jobs:
             sleep 10
           done
 
-          # Admitted means the gang is placed, but pods still bind and pull the image.
-          # Hold off the runtime budget until one is Running so the pull is not charged
-          # to the test.
+          # Admitted, but pods still bind and pull -- don't charge the pull to the test.
           running_deadline=$(( $(date +%s) + 900 ))
           until kubectl -n tpu-ci get pods -l "$sel" \
                   -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do

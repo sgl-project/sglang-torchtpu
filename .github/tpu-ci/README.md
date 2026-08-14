@@ -193,6 +193,86 @@ _TODO._
 - Namespace `tpu-ci`; KSA `weights-loader` granted `storage.objectViewer` on
   `gs://sglang-torchtpu-gcs-shared` via Workload Identity (no GSA key).
 
+## Enabling Kueue
+
+Once per cluster, in order. `_tpu-test.yml` has no hardware mutex of its own, so it must
+not merge before step 3 reports both queues Active.
+
+**1. Install** (needs cluster-admin). JobSet v0.12.0 is already present.
+
+```bash
+kubectl apply --server-side -f \
+  https://github.com/kubernetes-sigs/kueue/releases/download/v0.18.5/manifests.yaml
+kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=180s
+```
+
+**2. Configure** — three settings in `kueue-manager-config`, then
+`kubectl -n kueue-system rollout restart deploy/kueue-controller-manager`.
+
+```yaml
+integrations:
+  frameworks:
+    - "jobset.x-k8s.io/jobset"      # without this the queue-name label is IGNORED
+manageJobsWithoutQueueName: true    # unlabelled JobSet queues instead of running unmanaged
+managedJobsNamespaceSelector:
+  matchLabels:
+    kubernetes.io/metadata.name: tpu-ci   # NOT optional -- otherwise cluster-wide
+waitForPodsReady:                   # evict + requeue a gang that can't fully place
+  enable: true
+  timeout: 5m
+  blockAdmission: true
+```
+
+Each guards a distinct silent failure. Without the JobSet framework, Kueue ignores the
+label and every JobSet runs with no admission control, logging nothing. Without
+`manageJobsWithoutQueueName`, a typo'd or missing label does the same. Without the
+namespace selector, that setting goes cluster-wide and Kueue starts suspending workloads in
+`haolin-dev` and `mimo`. Without `waitForPodsReady`, an over-stated quota admits a gang the
+cluster can't hold and it hangs to `activeDeadlineSeconds` instead of requeueing.
+
+Then confirm nothing outside `tpu-ci` was caught: `kubectl get workloads -A`.
+
+**3. Apply the quotas.**
+
+```bash
+kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
+kubectl get clusterqueues -o wide        # ACTIVE=True on both
+kubectl -n tpu-ci get localqueues
+```
+
+**4. The multi-host pool must exist**, or `tpu-multihost` workloads queue until the
+admission timeout. Flags verified against `ci-tpu7x-2x2x1` and `tpu7x-2x2x2-haolin-dev`:
+
+```bash
+gcloud compute resource-policies create workload-policy ci-tpu7x-2x2x2-wp \
+  --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2 --region=us-central1 \
+  --project=sglang-torchtpu
+
+gcloud container node-pools create ci-tpu7x-2x2x2 \
+  --cluster=tpu-cluster --zone=us-central1-c --project=sglang-torchtpu \
+  --machine-type=tpu7x-standard-4t --tpu-topology=2x2x2 \
+  --placement-policy=ci-tpu7x-2x2x2-wp \
+  --reservation-affinity=specific \
+  --reservation=projects/sglang-torchtpu/reservations/ghostfish-u2zcmybntv70q \
+  --node-labels=ci-tpu-pool=nightly
+```
+
+`--type` must be `HIGH_THROUGHPUT` — `COMPACT` is a different API and `HIGH_AVAILABILITY`
+rejects `--accelerator-topology`. `--num-nodes` is inferred from `--tpu-topology`.
+
+**5. Verify gang admission** before merging. The design assumes Kueue assigns a whole
+PodSet to one ResourceFlavor; everything about slice isolation rests on it. Submit two
+multi-host JobSets at once — the first should admit, the second stay queued (not
+half-scheduled), and the admitted one's two pods share a pool:
+
+```bash
+kubectl -n tpu-ci get workloads
+kubectl -n tpu-ci get pods -o wide
+```
+
+If pods from one JobSet ever straddle two pools, flavor-per-slice is wrong and this needs
+Topology-Aware Scheduling instead.
+
 ## ⚠️ Required before CI can run (owner actions)
 
 1. **Allowlist `tpu-ci` on the private torch-tpu registry.** The build pulls the

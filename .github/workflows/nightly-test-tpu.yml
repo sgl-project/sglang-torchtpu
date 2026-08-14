@@ -71,8 +71,7 @@ jobs:
       id-token: write
 
   multihost-combo:
-    # Unchained: Kueue queues the hosts=2 jobs against slice quota, so this no longer has
-    # to wait for multi-host to finish just to keep a third claimant off a depth-1 mutex.
+    # Unchained: Kueue queues the hosts=2 jobs, so this need not wait out multi-host.
     needs: build
     if: ${{ contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
     strategy:
