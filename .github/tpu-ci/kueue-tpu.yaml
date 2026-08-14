@@ -32,6 +32,19 @@
 #    caught:
 #      kubectl get workloads -A
 #
+# 2c. Recover from a wrong quota instead of deadlocking on it. nominalQuota below is a
+#    static number Kueue never reconciles against real nodes, so a node going NotReady
+#    over-states it; Kueue then admits a gang the cluster cannot actually hold and half of
+#    it sits Pending. Same ConfigMap:
+#      waitForPodsReady:
+#        enable: true
+#        timeout: 5m
+#        blockAdmission: true
+#    The workload is evicted and requeued if its pods do not all become ready in time,
+#    and blockAdmission stops further admissions while one is stuck. This does not make
+#    quota self-correcting -- it turns a wrong number into added latency rather than a
+#    nightly that hangs to activeDeadlineSeconds.
+#
 # 3. Apply this file and check admission is live:
 #      kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
 #      kubectl get clusterqueues -o wide        # ACTIVE=True on both
