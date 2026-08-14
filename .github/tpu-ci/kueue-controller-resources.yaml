@@ -1,0 +1,26 @@
+# Strategic-merge patch for the Kueue controller's CPU request.
+#
+# Kueue ships requesting 500m, which does not fit system-pool (e2-standard-2, already
+# carrying the JobSet operator and GKE daemons). The pod stays Pending, and because its
+# JobSet webhooks are failurePolicy: Fail, every JobSet creation in the cluster is rejected
+# until it schedules -- a 50-minute outage on 2026-08-14. Growing the pool does not help:
+# GKE's DNS autoscaler put five kube-dns replicas (1350m of 1930m) on the new node within
+# four minutes.
+#
+# Re-apply after every Kueue install or upgrade; the release manifests reset it.
+#   kubectl -n kueue-system patch deploy kueue-controller-manager \
+#     --patch-file .github/tpu-ci/kueue-controller-resources.yaml
+#   kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=240s
+#
+# A patch, not `kubectl apply`: the Deployment is owned by the release manifests, and
+# applying a partial spec would make it the last-applied-configuration and prune fields the
+# release adds later. 100m is ample for five ClusterQueues and a handful of JobSets a day;
+# the 2-core limit is untouched so it can still burst.
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          resources:
+            requests:
+              cpu: 100m

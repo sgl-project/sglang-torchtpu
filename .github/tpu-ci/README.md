@@ -176,6 +176,7 @@ _TODO._
 | `docker/tpu.Dockerfile` | TPU image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
 | `docker/cloudbuild.tpu.yaml` | Cloud Build config; runs **as `tpu-ci`**, token from the metadata server, pushes to AR |
 | `.github/tpu-ci/topology.yaml` | Host count → slice `{topology, pool, queue}` (detection source of truth) |
+| `.github/tpu-ci/kueue-controller-resources.yaml` | Strategic-merge patch dropping the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
@@ -241,18 +242,14 @@ rejected** — including main's PR gate and the nightly. Two consequences:
 
 - **Lower the controller's CPU request immediately after applying.** It ships asking for
   500m, which does not fit `system-pool`, so the pod sits `Pending` and the cluster-wide
-  outage persists (observed 2026-08-14: 50 minutes). This patch is **not in any manifest**
-  — re-running the `kubectl apply` above restores 500m and reproduces the outage, so redo
-  it after every install or upgrade:
+  outage persists (observed 2026-08-14: 50 minutes). The release manifests reset this, so
+  re-apply after every install or upgrade:
 
   ```bash
-  kubectl -n kueue-system patch deploy kueue-controller-manager --type=json \
-    -p '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"100m"}]'
+  kubectl -n kueue-system patch deploy kueue-controller-manager \
+    --patch-file .github/tpu-ci/kueue-controller-resources.yaml
   kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=240s
   ```
-
-  100m is ample — the controller reconciles five ClusterQueues and a handful of JobSets a
-  day, and its 2-core limit is untouched so it can still burst.
 
 - **Growing `system-pool` does not fix this.** GKE's DNS autoscaler scales `kube-dns` with
   node count: a node added to relieve the pressure took five replicas at 270m each (1350m
