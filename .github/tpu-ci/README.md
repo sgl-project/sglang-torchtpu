@@ -17,14 +17,34 @@ PR / nightly ─▶ GitHub-hosted runner
                  │
                  │  _tpu-test.yml    (per run, reusing that digest)
                  │    render_jobset.py → ONE JobSet (slice sized from topology.yaml)
+                 │    labelled for Kueue → created SUSPENDED
                  ▼
             GKE tpu-cluster (us-central1-c)
-                 ├─ ci-tpu7x-2x2x1  (ci-tpu-pool=pr-gate, 2 nodes) ── single-host (run_suite)
+                 │
+                 │  Kueue gang-admits when a whole slice's quota is free
+                 │    LocalQueue → ClusterQueue → ResourceFlavor (≡ one slice)
+                 ▼
+                 ├─ ci-tpu7x-2x2x1  (ci-tpu-pool=pr-gate, 4 nodes) ── single-host (run_suite)
                  └─ ci-tpu7x-2x2x2  (ci-tpu-pool=nightly, 1 slice = 2 hosts) ── multi-host groups
 ```
 
-Everything runs on the `ghostfish-7vg0iyvvgks52` reservation. The PR and nightly
-pools are separate, so PRs and the nightly never contend for hardware.
+Everything runs on the `ghostfish-u2zcmybntv70q` reservation.
+
+**Slice arithmetic.** `tpu7x-standard-4t` is 4 chips per host, so `2x2x1` = 4 chips = 1
+node and `2x2x2` = 8 chips = 2 nodes. Each `ci-tpu7x-2x2x1` node is therefore a *complete*
+single-host slice — the pool's 4 nodes are 4 independent slices — while `ci-tpu7x-2x2x2`
+is one slice spanning two nodes.
+
+**The pools do not fully isolate PR from nightly.** `hosts=1` maps to `pr-gate` for every
+caller, so the nightly's single-host jobs land on the same pool as the PR gate. Only
+`hosts=2` work is nightly-exclusive.
+
+**One pool per slice is an invariant, not a preference.** GKE `tpu7x` nodes carry no
+per-slice label — only accelerator, topology, nodepool, hostname and zone, and none of the
+`cloud.google.com/gke-topology-*` labels Kueue's Topology-Aware Scheduling needs. So
+`ci-tpu-pool` is the finest slice selector available. A pool holding two slices cannot be
+split, and a JobSet's pods could straddle both and hang at ICI rendezvous. Add capacity as
+a **new pool** (`ci-tpu-pool=nightly-b`), never as extra nodes on an existing slice pool.
 
 ### Build-once
 
@@ -39,7 +59,7 @@ container branches on `NNODES` (from GKE's `TPU_WORKER_HOSTNAMES`):
 
 - **single-host** (`hosts=1`) → a 1-pod JobSet; each test self-launches its own server
   (`popen_launch_server`); `run_suite` runs the suite directly.
-- **multi-host** (`hosts≥2`) → an N-pod gang-scheduled JobSet; every host runs the
+- **multi-host** (`hosts≥2`) → an N-pod JobSet, gang-admitted by Kueue; every host runs the
   launch **group's recipe** (which owns model + config), and rank 0 runs each of the
   group's test files in **live-server mode** (`SGLANG_TPU_USE_LIVE_SERVER=1` + `BASE_URL`),
   so tests assert on real results. Workers serve until the leader tears down, exit 0.
@@ -66,25 +86,103 @@ and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a fil
 `MULTIHOST_LAUNCH` dict (+ a recipe) registered to `nightly-tpu-multihost` — discovery
 picks it up and groups it automatically; identical setup joins an existing group's server.
 
+## Pipelines
+
+### Nightly — `nightly-test-tpu.yml`
+
+`on: schedule` (daily) plus `workflow_dispatch` with an `only` filter to run a single leg.
+
+```
+build ─────────────────────────────────┐
+  ├─▶ single-host           (hosts=1)  │  suite: nightly-tpu-4-v7
+  ├─▶ singlehost-combo      (hosts=1)  │  exec: feature_combo singlehost
+  ├─▶ multihost-combo       (hosts=2)  │  exec: feature_combo pd | spec
+  └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
+```
+
+`discover` AST-scans `test/registered/**` for `MULTIHOST_LAUNCH` on files registered to
+`nightly-tpu-multihost`, groups those with an identical `(launch_script, weights_pvc,
+hosts)`, and emits one matrix entry per group — so files sharing a spec share one server
+and the expensive bring-up happens once per group, not once per file.
+
+**Admission.** Every job calls `_tpu-test.yml`, which renders a JobSet labelled
+`kueue.x-k8s.io/queue-name` and creates it suspended. Kueue releases it only once a whole
+slice's quota is free:
+
+| leg | LocalQueue | flavor | quota | concurrent |
+|------|-----------|--------|-------|-----------|
+| `hosts=1` | `tpu-singlehost` | `tpu7x-2x2x1-pr-gate` | 12 of 16 chips | 3 |
+| `hosts=2` | `tpu-multihost` | `tpu7x-2x2x2-nightly` | 8 chips | 1 per slice |
+
+A PodSet is assigned exactly one ResourceFlavor, which is what keeps a multi-host JobSet's
+two pods inside a single slice.
+
+GitHub concurrency groups are **supersession only** — "don't stack two runs of me." They no
+longer ration hardware. That was the old `tpu-slice-<hosts>` mutex, and it was the wrong
+primitive: the group holds one in-progress plus one pending, so a third claimant silently
+cancelled the pending one. Adding a slice now means a new pool, a new ResourceFlavor and one
+quota entry — no workflow change.
+
+**Budgets.** Three phases, kept separate so queue time is never charged as test time:
+
+| phase | budget | covers |
+|-------|--------|--------|
+| admission | 3600s | suspended in Kueue; no pods exist yet |
+| running | 900s | placed, but binding + image pull |
+| runtime | `est_time`×1.5 / 5400 (launch) / 7800 (exec) | the test itself |
+
+**Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
+plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
+registered to `nightly-tpu-multihost` — discovery groups it automatically, and an identical
+spec joins an existing group's server for free.
+
+`est_time` is not decoration: it sizes both the JobSet's `activeDeadlineSeconds` and the CI
+poll budget, so an inflated value pushes a serialized run toward the next day's cron.
+
+**Known gaps.**
+
+- `nominalQuota` is static and never reconciled against real node count. A node going
+  NotReady over-states it; `waitForPodsReady` evicts and requeues instead of deadlocking,
+  but the number is still maintained by hand.
+- No `est_time` refit loop — values are hand-written and have drifted by ~8x.
+- Results land only in the run summary; no digest, no notification.
+
+### PR gate — `pr-test-tpu.yml`
+
+_TODO._
+
+### Combo — `combo-test-tpu.yml`
+
+_TODO._
+
 ## Files
 
 | Path | Purpose |
 |------|---------|
 | `docker/tpu.Dockerfile` | TPU image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
 | `docker/cloudbuild.tpu.yaml` | Cloud Build config; runs **as `tpu-ci`**, token from the metadata server, pushes to AR |
-| `.github/tpu-ci/topology.yaml` | Host count → slice `{topology, pool}` (detection source of truth) |
+| `.github/tpu-ci/topology.yaml` | Host count → slice `{topology, pool, queue}` (detection source of truth) |
+| `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), ClusterQueues and LocalQueues; header carries the cluster apply runbook |
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
 | `.github/tpu-ci/discover_multihost.py` | Scans `MULTIHOST_LAUNCH` decls, groups files by launch spec → matrix JSON |
 | `benchmark/tpu/recipe/*_mh.sh` | Per-model multi-host launch recipes (own `MODEL`/`EP_SIZE`/…, exec `launch_server.sh`) |
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
-| `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → stream logs → gate on JobSet condition |
+| `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
 | `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → single-host + discover → multi-host **matrix** over groups |
 
-## Provisioned infra (already created)
+## Cluster infra (and what is currently missing)
 
-- Nodepools `ci-tpu7x-2x2x1`, `ci-tpu7x-2x2x2` (+ workload policy for the multi-host one).
+- Nodepool `ci-tpu7x-2x2x1` (4 nodes, `ci-tpu-pool=pr-gate`).
+- ⚠️ **`ci-tpu7x-2x2x2` does not currently exist.** It was present as of 2026-08-09 and is
+  gone as of 2026-08-12, so multi-host jobs sit Pending with `0/11 nodes are available:
+  11 node(s) didn't match Pod's node affinity/selector` until their deadline. The recreate
+  command (workload policy `--type=HIGH_THROUGHPUT --accelerator-topology=2x2x2`, then the
+  node pool) is in the header of `kueue-tpu.yaml`. The only other 2x2x2 pools on the cluster
+  are `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` — do not repurpose either.
+- ⚠️ **Kueue is not installed.** Multi-host admission depends on it; the install and
+  verification steps are in the header of `kueue-tpu.yaml`. JobSet v0.12.0 is present.
 - `system-pool` (e2-standard-2) hosting the **JobSet operator v0.12.0** (the e2-medium
   default-pool is CPU-saturated by GKE daemons).
 - Artifact Registry: `us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci`.
