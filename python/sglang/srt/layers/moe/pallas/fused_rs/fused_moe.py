@@ -234,8 +234,19 @@ def moe_gmm_local_rs_nodedup(
     local_group_sizes = jax.lax.dynamic_slice(
         group_sizes, (go_val,), (num_local_experts,)
     )
+    # Metadata aligns each expert against its global row prefix. Pass those
+    # starts explicitly so a nonzero device offset cannot be dropped.
+    global_starts = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.int32),
+            jnp.cumsum(group_sizes)[:-1].astype(jnp.int32),
+        ]
+    )
     local_num_gm = compute_num_gm(
-        local_group_sizes, tile_m, size_lhs_sublane, start_offset=local_start
+        jax.lax.dynamic_slice(global_starts, (go_val,), (num_local_experts,)),
+        local_group_sizes,
+        tile_m,
+        size_lhs_sublane,
     )
     max_num_gm = jax.lax.pmax(local_num_gm, axis_name=ep_axis_name)
 
@@ -261,6 +272,7 @@ def moe_gmm_local_rs_nodedup(
         ep_size=ep_size,
         ep_axis_name=ep_axis_name,
         max_num_gm=max_num_gm,
+        caller_tile_m=tile_m,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
     )

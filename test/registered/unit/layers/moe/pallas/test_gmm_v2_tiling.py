@@ -26,7 +26,17 @@ try:
 except Exception:  # pragma: no cover - depends on JAX/pallas availability
     _HAS_GMM = False
 
+try:
+    from sglang.srt.layers.moe.pallas.fused_rs import (
+        gmm_fused_rs_nodedup as fused_rs_gmm,
+    )
+
+    _HAS_FUSED_RS = True
+except Exception:  # pragma: no cover - depends on JAX/pallas availability
+    _HAS_FUSED_RS = False
+
 _SKIP_REASON = "Requires JAX + the gmm_v2 pallas import chain"
+_FUSED_RS_SKIP_REASON = "Requires JAX + the fused-RS pallas import chain"
 
 # tpu7x geometry plus quantized-config capabilities used below.
 _TPU_INFO = SimpleNamespace(
@@ -34,10 +44,64 @@ _TPU_INFO = SimpleNamespace(
     num_lanes=128,
     fp8_ops_per_second=1,
     int8_ops_per_second=1,
+    vmem_capacity_bytes=128 * 1024 * 1024,
     get_sublane_tiling=lambda _dtype: 8,
 )
 
 _MiB = 1024 * 1024
+
+
+@unittest.skipUnless(_HAS_FUSED_RS, _FUSED_RS_SKIP_REASON)
+class TestFusedRsGmLoopBound(CustomTestCase):
+    def test_global_starts_match_hand_computed_tile_counts(self):
+        cases = (
+            # starts, counts, tile_m, sublane, expected
+            ([0], [128], 128, 8, 1),
+            ([5], [0], 128, 8, 0),
+            ([0, 200], [200, 100], 128, 8, 3),
+            ([7], [1], 128, 8, 1),
+            ([7], [122], 128, 8, 2),
+            ([0], [640], 256, 16, 3),
+            ([3], [509], 256, 16, 2),
+        )
+        for starts, counts, tile_m, sublane, expected in cases:
+            with self.subTest(starts=starts, counts=counts, tile_m=tile_m):
+                actual = fused_rs_gmm.compute_num_gm(
+                    jnp.asarray(starts, dtype=jnp.int32),
+                    jnp.asarray(counts, dtype=jnp.int32),
+                    tile_m,
+                    sublane,
+                )
+                self.assertEqual(int(actual), expected)
+
+    def test_rejects_caller_kernel_tile_m_mismatch_before_lowering(self):
+        block_sizes = SimpleNamespace(tile_m=128)
+        with (
+            mock.patch.object(
+                fused_rs_gmm.pltpu, "get_tpu_info", return_value=_TPU_INFO
+            ),
+            mock.patch.object(
+                fused_rs_gmm,
+                "_select_fused_rs_block_sizes",
+                return_value=block_sizes,
+            ),
+            self.assertRaisesRegex(ValueError, "caller computed max_num_gm"),
+        ):
+            fused_rs_gmm.gmm_v2_fused_rs.__wrapped__(
+                jnp.zeros((8, 16), dtype=jnp.bfloat16),
+                jnp.zeros((1, 16, 32), dtype=jnp.bfloat16),
+                jnp.zeros((1, 16, 16), dtype=jnp.bfloat16),
+                jnp.asarray([8], dtype=jnp.int32),
+                jnp.arange(8, dtype=jnp.int32),
+                jnp.arange(8, dtype=jnp.int32),
+                output_size=8,
+                topk_indices=jnp.zeros((8,), dtype=jnp.int32),
+                ep_size=1,
+                ep_axis_name="model",
+                max_num_gm=jnp.asarray(1, dtype=jnp.int32),
+                caller_tile_m=64,
+                top_k=1,
+            )
 
 
 @unittest.skipUnless(_HAS_GMM, _SKIP_REASON)
