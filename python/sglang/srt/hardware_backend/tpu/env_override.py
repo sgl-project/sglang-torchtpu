@@ -34,6 +34,9 @@ _SPARSE_CORE_OFFLOAD_OVERRIDES = (
     # SparseCore offload for the all-reduce after embed lookup can return
     # wrong values inside compiled regions on TP=8 dense Qwen.
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
+    "--xla_tpu_offload_gather_to_sparsecore=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
 )
 
 _ASSOCIATIVE_SCAN_OVERRIDES = (

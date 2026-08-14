@@ -46,10 +46,10 @@ class TestFusedMoeRsOp(CustomTestCase):
             patch.object(
                 fused_moe_rs_op,
                 "_get_physical_rank_metadata",
-                return_value=(4, (0, 1, 6, 7, 2, 3, 4, 5)),
+                return_value=(4, (0, 1, 4, 5, 6, 7, 2, 3), (0, 1, 6, 7, 2, 3, 4, 5)),
             ),
             patch(
-                "sglang.srt.distributed.parallel_state." "get_moe_expert_parallel_rank",
+                "sglang.srt.distributed.parallel_state.get_moe_expert_parallel_rank",
                 return_value=2,
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
@@ -63,11 +63,11 @@ class TestFusedMoeRsOp(CustomTestCase):
 
         torch.testing.assert_close(
             layer._tpu_fused_rs_physical_order,
-            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64),
+            torch.tensor([0, 1, 4, 5, 6, 7, 2, 3], dtype=torch.int64),
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
-            torch.tensor([32, 4], dtype=torch.int32),
+            torch.tensor([[32, 4, 0, 1, 6, 7, 2, 3, 4, 5]], dtype=torch.int32),
         )
         self.assertIn("_tpu_fused_rs_physical_order", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
@@ -108,7 +108,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk=1,
                 activation="silu",
                 has_post_expert_norm=False,
-                fp8_direct_write=True,
+                fp8_direct_write=False,
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
             )
 
