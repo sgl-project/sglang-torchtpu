@@ -222,7 +222,7 @@ _TODO._
 ## Enabling Kueue
 
 Once per cluster, in order. `_tpu-test.yml` has no hardware mutex of its own, so it must
-not merge before step 3 reports both queues Active.
+not merge before step 3 reports all five queues Active.
 
 **1. Install** (needs cluster-admin). JobSet v0.12.0 is already present.
 
@@ -232,13 +232,17 @@ kubectl apply --server-side -f \
 kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=180s
 ```
 
-**2. Configure** — three settings in `kueue-manager-config`, then
+**2. Configure** — edit `kueue-manager-config`, then
 `kubectl -n kueue-system rollout restart deploy/kueue-controller-manager`.
+
+The v0.18.5 default enables ~17 frameworks including `batch/job`, `pod`, `deployment` and
+`statefulset`. **Replace the whole `integrations.frameworks` list with just `jobset`**, and
+add the three settings below (all commented out in the default):
 
 ```yaml
 integrations:
   frameworks:
-    - "jobset.x-k8s.io/jobset"      # without this the queue-name label is IGNORED
+    - "jobset.x-k8s.io/jobset"      # ONLY jobset -- see why below
 manageJobsWithoutQueueName: true    # unlabelled JobSet queues instead of running unmanaged
 managedJobsNamespaceSelector:
   matchLabels:
@@ -249,14 +253,20 @@ waitForPodsReady:                   # evict + requeue a gang that can't fully pl
   blockAdmission: true
 ```
 
-Each guards a distinct silent failure. Without the JobSet framework, Kueue ignores the
+Each guards a distinct silent failure. If the JobSet framework is missing, Kueue ignores the
 label and every JobSet runs with no admission control, logging nothing. Without
 `manageJobsWithoutQueueName`, a typo'd or missing label does the same. Without the
 namespace selector, that setting goes cluster-wide and Kueue starts suspending workloads in
 `haolin-dev` and `mimo`. Without `waitForPodsReady`, an over-stated quota admits a gang the
 cluster can't hold and it hangs to `activeDeadlineSeconds` instead of requeueing.
 
-Then confirm nothing outside `tpu-ci` was caught: `kubectl get workloads -A`.
+Trimming the frameworks list is load-bearing, not tidiness: with the default list,
+`manageJobsWithoutQueueName` applies to every enabled framework in `tpu-ci` — so the
+`hydrate-deepseek-r1.yaml` weights Job (a plain `batch/Job` in this namespace) and any
+hand-launched debug pod would be suspended forever with no queue to admit them and no
+error anywhere. With only `jobset` enabled, fail-closed applies exactly to what CI submits.
+
+Then confirm nothing outside CI's JobSets was caught: `kubectl get workloads -A`.
 
 **3. Apply the quotas.**
 
