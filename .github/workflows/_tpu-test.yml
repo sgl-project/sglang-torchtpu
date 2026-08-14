@@ -108,6 +108,11 @@ jobs:
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
+          # Quota tracks live capacity, checked here rather than on a timer: it only has to
+          # be right at the moment admission is decided. Fails open -- a stale quota is
+          # survivable (waitForPodsReady evicts and requeues), a blocked test is not.
+          python3 .github/tpu-ci/reconcile_quota.py
+
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
           trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
