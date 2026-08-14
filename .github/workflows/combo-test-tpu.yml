@@ -59,7 +59,7 @@ jobs:
       hosts: 1
       exec_cmd: >-
         ${{ inputs.singlehost_model == 'qwen3-coder-480b'
-            && format('env MODEL=/weights/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 DRAFT_MODEL=/weights/lmsys/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-coder-480b {0}', inputs.singlehost_combo || 'all')
+            && format('env MODEL=/weights/Qwen3-Coder-480B-A35B-Instruct-FP8 DRAFT_MODEL=/weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-coder-480b {0}', inputs.singlehost_combo || 'all')
             || format('python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-1.7b {0}', inputs.singlehost_combo || 'all') }}
       weights_pvc: ${{ inputs.singlehost_model == 'qwen3-coder-480b' && 'model-weights-rox' || '' }}
       run_name: singlehost-combo-test-${{ inputs.singlehost_model || 'qwen3-1.7b' }}-${{ inputs.singlehost_combo || 'all' }}
