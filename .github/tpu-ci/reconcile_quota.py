@@ -13,10 +13,11 @@ cpu and memory are derived from the chip count (pods take 4 chips / 4 cpu / 32Gi
 Fails open: a reconcile that cannot run leaves the existing quota in place and warns,
 rather than blocking the test.
 
-Usage: reconcile_quota.py [--dry-run]
+Usage: reconcile_quota.py [--dry-run] [--pool=<ci-tpu-pool>]
 """
 
 import json
+import re
 import subprocess
 import sys
 
@@ -42,6 +43,45 @@ def ready(node):
     )
 
 
+def nodes_per_slice(node):
+    """How many nodes one slice of this node's topology spans.
+
+    2x2x1 = 4 chips = 1 node (each node its own slice); 2x2x2 = 8 = 2; 2x2x4 = 16 = 4.
+    """
+    labels = node["metadata"]["labels"]
+    dims = labels.get("cloud.google.com/gke-tpu-topology", "")
+    if not re.fullmatch(r"\d+(x\d+)*", dims):
+        return 1
+    chips = 1
+    for d in dims.split("x"):
+        chips *= int(d)
+    per_node = int(labels.get("cloud.google.com/gke-accelerator-count", 4)) or 4
+    return max(1, chips // per_node)
+
+
+def check_single_slice(nodes, pool):
+    """A multi-host pool must hold exactly one slice.
+
+    GKE tpu7x nodes carry no per-slice label -- ci-tpu-pool is the finest selector there
+    is -- so two slices behind one label lets a JobSet's pods straddle them. They start,
+    find no ICI path to each other, and hang until the deadline with no error saying why.
+    Resizing a multi-host pool is the way this happens.
+    """
+    members = [
+        n for n in nodes if n["metadata"].get("labels", {}).get(POOL_LABEL) == pool
+    ]
+    if not members:
+        return
+    want = nodes_per_slice(members[0])
+    if want > 1 and len(members) != want:
+        topo = members[0]["metadata"]["labels"].get("cloud.google.com/gke-tpu-topology")
+        sys.exit(
+            f"pool {pool!r} has {len(members)} nodes but one {topo} slice is {want}. "
+            "Pods could straddle two slices and hang at ICI rendezvous -- add capacity as "
+            "a NEW pool with its own ci-tpu-pool label, never by resizing this one."
+        )
+
+
 def chips_per_pool(nodes):
     chips = {}
     for n in nodes:
@@ -54,10 +94,13 @@ def chips_per_pool(nodes):
 
 def main():
     dry_run = "--dry-run" in sys.argv
+    pool = next((a.split("=", 1)[1] for a in sys.argv if a.startswith("--pool=")), "")
 
     nodes = kget("nodes")
     if not nodes:
         sys.exit("no nodes returned -- refusing to zero every quota")
+    if pool:
+        check_single_slice(nodes, pool)
     chips = chips_per_pool(nodes)
 
     flavor_pool = {
