@@ -8,10 +8,16 @@ import jax.numpy as jnp
 
 from sglang.srt.hardware_backend.tpu.pallas_export import get_pallas_tpu_device_kind
 
-from .v2_fused_rs_tuned_block_sizes import (
-    FUSED_RS_TUNED_BLOCK_SIZES,
-    FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM,
-)
+try:
+    from .v2_fused_rs_tuned_block_sizes import (
+        FUSED_RS_TUNED_BLOCK_SIZES,
+        FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM,
+    )
+except ImportError:
+    from v2_fused_rs_tuned_block_sizes import (
+        FUSED_RS_TUNED_BLOCK_SIZES,
+        FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM,
+    )
 
 logger = logging.getLogger(__name__)
 

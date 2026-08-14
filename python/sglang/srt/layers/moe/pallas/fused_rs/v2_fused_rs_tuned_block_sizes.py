@@ -114,6 +114,10 @@ _H3072_I3072_FP8_XLARGE = (
 )  # M >= 131072 (tile_m=256 wins at very large M) — autotuned 48.6ms
 _H4096_I4096_BF16 = (128, 2048, 2048, 2048, 2048, 2, 2)
 _H3072_I3072_BF16 = (128, 1024, 1024, 1024, 1024, 2, 2)
+_H2048_I768_FP8 = (128, 2048, 768, 768, 2048, 1, 1)
+_H2048_I768_BF16 = (128, 2048, 768, 768, 2048, 1, 1)
+_H6144_I2560_FP8 = (64, 6144, 2560, 2560, 2048, 1, 1)
+_H6144_I2560_BF16 = (64, 6144, 1280, 2560, 1024, 1, 1)
 
 # FP4 (rhs_quant_block_size=16): weights are half FP8 → enough VMEM for
 # num_w1_bufs=2, enabling full W1 caching that FP8 couldn't afford.
@@ -185,6 +189,7 @@ _ALL_M_KEYS = [
     "8192_silu",
     "16384_silu",
     "32768_silu",
+    "40960_silu",
     "65536_silu",
     "131072_silu",
 ]
@@ -398,6 +403,50 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-3072_n-6144_g-32_lhs_quant_rhs_bs-3072"
                 "+k-3072_n-4096_g-32_lhs_quant_rhs_bs-3072"
             ): _h3072_i3072_fp8_size_dependent(),
+            (
+                "k-2048_n-1536_g-16_lhs_quant_rhs_bs-2048"
+                "+k-768_n-2048_g-16_lhs_quant_rhs_bs-2048"
+            ): _all_m(_H2048_I768_FP8),
+            (
+                "k-2048_n-1536_g-16_lhs_quant_rhs_bs-2048"
+                "+k-768_n-2048_g-16_lhs_quant_rhs_bs-768"
+            ): _all_m(_H2048_I768_FP8),
+            (
+                "k-2048_n-1536_g-16_lhs_quant_rhs_bs-768"
+                "+k-768_n-2048_g-16_lhs_quant_rhs_bs-768"
+            ): _all_m(_H2048_I768_FP8),
+            (
+                "k-2048_n-1536_g-16_lhs_quant_rhs_bs-256"
+                "+k-768_n-2048_g-16_lhs_quant_rhs_bs-256"
+            ): _all_m(_H2048_I768_FP8),
+            (
+                "k-2048_n-1536_g-16_lhs_quant_rhs_bs-128"
+                "+k-768_n-2048_g-16_lhs_quant_rhs_bs-128"
+            ): _all_m(_H2048_I768_FP8),
+            (
+                "k-2048_n-1536_g-16_lhs_quant"
+                "+k-768_n-2048_g-16_lhs_quant"
+            ): _all_m(_H2048_I768_FP8),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-6144"
+            ): _all_m(_H6144_I2560_FP8),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
+            ): _all_m(_H6144_I2560_FP8),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-2560"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
+            ): _all_m(_H6144_I2560_FP8),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-256"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-256"
+            ): _all_m(_H6144_I2560_FP8),
+            ("k-6144_n-5120_g-20_lhs_quant" "+k-2560_n-6144_g-20_lhs_quant"): _all_m(
+                _H6144_I2560_FP8
+            ),
+            ("k-6144_n-5120_g-20+k-2560_n-6144_g-20"): _all_m(_H6144_I2560_FP8),
         },
         # ---------------------------------------------------------------------
         # FP4 (lhs bf16 × rhs fp4, rhs_quant_block_size=16)
@@ -473,6 +522,9 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
             # H3072-I3072: H=3072, I=3072, E=256, EP=8 → g=32
             # Smaller tiles for VMEM fit (bf16 uses 2× weight bytes vs fp8).
             "k-3072_n-6144_g-32+k-3072_n-3072_g-32": _all_m(_H3072_I3072_BF16),
+            # H2048-I768: H=2048, I=768, E=128, EP=8 → g=16 (Qwen3-MoE)
+            "k-2048_n-1536_g-16+k-768_n-2048_g-16": _all_m(_H2048_I768_BF16),
+            "k-6144_n-5120_g-20+k-2560_n-6144_g-20": _all_m(_H6144_I2560_BF16),
         },
     }
 }
@@ -501,6 +553,21 @@ FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
                 "k-4096_n-8192_g-32_lhs_quant_rhs_bs-4096"
                 "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-4096"
             ): _h4096_i4096_fp8_fp8comm_size_dependent(),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-6144"
+            ): _all_m(_H6144_I2560_FP8),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
+            ): _all_m(_H6144_I2560_FP8),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-2560"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
+            ): _all_m(_H6144_I2560_FP8),
+            ("k-6144_n-5120_g-20_lhs_quant" "+k-2560_n-6144_g-20_lhs_quant"): _all_m(
+                _H6144_I2560_FP8
+            ),
         },
     },
 }

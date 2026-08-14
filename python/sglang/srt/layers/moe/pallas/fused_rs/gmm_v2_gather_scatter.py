@@ -930,12 +930,15 @@ def dma_gather_gm_start(
     m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
     sls = pltpu.get_tpu_info().get_sublane_tiling(src_ref.dtype)
     m_start_local = m_start % sls
+    total_m = indices_ref.shape[0]
+    num_src_rows = src_ref.shape[0]
 
     def _gather_body(i, _):
-        row = m_start + i
+        row = jnp.minimum(m_start + i, total_m - 1)
         src_row = indices_ref[row]
         if divisor != 1:
             src_row = src_row // divisor
+        src_row = jnp.minimum(src_row, num_src_rows - 1)
         pltpu.make_async_copy(
             src_ref=src_ref.at[pl.ds(src_row, 1), :, :],
             dst_ref=dst_ref.at[pl.ds(m_start_local + i, 1), :, :],
@@ -975,10 +978,13 @@ def dma_scatter_gm_start(src_ref, dst_ref, indices_ref, sem_ref, gm_id, metadata
     m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
     sls = pltpu.get_tpu_info().get_sublane_tiling(src_ref.dtype)
     m_start_local = m_start % sls
+    total_m = indices_ref.shape[0]
+    num_dst_rows = dst_ref.shape[0]
 
     def _scatter_body(i, _):
-        row = m_start + i
+        row = jnp.minimum(m_start + i, total_m - 1)
         dst_row = indices_ref[row]
+        dst_row = jnp.minimum(dst_row, num_dst_rows - 1)
         pltpu.make_async_copy(
             src_ref=src_ref.at[pl.ds(m_start_local + i, 1), :, :],
             dst_ref=dst_ref.at[pl.ds(dst_row, 1), :, :],
