@@ -1,0 +1,161 @@
+# Keeps Kueue nominalQuota equal to real allocatable capacity, so the numbers in
+# kueue-tpu.yaml are a startup default rather than something maintained by hand.
+#
+# Quota above capacity is the dangerous direction: Kueue admits a gang the cluster cannot
+# hold and the extra pod sits Pending inside an *admitted* workload. Reconciling also makes
+# a NotReady node self-healing -- a 2-host slice drops to 4 chips, so its jobs queue instead
+# of being admitted into a slice that cannot hold them, and recover when the node returns.
+#
+# A flavor is skipped unless it selects on ci-tpu-pool, so non-CI ClusterQueues are untouched.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kueue-quota-reconciler
+  namespace: tpu-ci
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kueue-quota-reconciler
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["resourceflavors", "clusterqueues"]
+    verbs: ["get", "list"]
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["clusterqueues"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kueue-quota-reconciler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kueue-quota-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: kueue-quota-reconciler
+    namespace: tpu-ci
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kueue-quota-reconciler
+  namespace: tpu-ci
+data:
+  reconcile.py: |
+    """Set each CI ClusterQueue's nominalQuota from live allocatable TPU chips.
+
+    Talks to the API server with the pod's service-account token -- stdlib only, so the
+    image needs no kubectl and no pip install. cpu and memory are derived from the chip
+    count (pods take 4 chips / 4 cpu / 32Gi, so 1 cpu and 8Gi per chip) to keep TPU the
+    only binding resource.
+    """
+    import json, os, ssl, urllib.request
+
+    ROOT = "/var/run/secrets/kubernetes.io/serviceaccount"
+    HOST = f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ['KUBERNETES_SERVICE_PORT']}"
+    TOKEN = open(f"{ROOT}/token").read()
+    CTX = ssl.create_default_context(cafile=f"{ROOT}/ca.crt")
+    KUEUE = "/apis/kueue.x-k8s.io/v1beta2"
+    POOL_LABEL = "ci-tpu-pool"
+    TPU = "google.com/tpu"
+
+    def api(path, method="GET", body=None, ctype=None):
+        req = urllib.request.Request(HOST + path, method=method)
+        req.add_header("Authorization", f"Bearer {TOKEN}")
+        if body is not None:
+            req.add_header("Content-Type", ctype)
+            body = json.dumps(body).encode()
+        with urllib.request.urlopen(req, body, context=CTX) as r:
+            return json.load(r)
+
+    def ready(node):
+        return any(c["type"] == "Ready" and c["status"] == "True"
+                   for c in node["status"].get("conditions", []))
+
+    nodes = api("/api/v1/nodes")["items"]
+    if not nodes:
+        raise SystemExit("no nodes returned -- refusing to zero every quota")
+
+    # pool -> allocatable chips on Ready nodes
+    chips = {}
+    for n in nodes:
+        pool = n["metadata"].get("labels", {}).get(POOL_LABEL)
+        if pool and ready(n):
+            chips[pool] = chips.get(pool, 0) + int(n["status"]["allocatable"].get(TPU, 0))
+
+    # flavor -> pool, for flavors that select on ci-tpu-pool
+    flavor_pool = {
+        f["metadata"]["name"]: f["spec"]["nodeLabels"][POOL_LABEL]
+        for f in api(f"{KUEUE}/resourceflavors")["items"]
+        if (f.get("spec") or {}).get("nodeLabels", {}).get(POOL_LABEL)
+    }
+
+    for cq in api(f"{KUEUE}/clusterqueues")["items"]:
+        name = cq["metadata"]["name"]
+        groups, changed = [], False
+        for g in cq["spec"].get("resourceGroups", []):
+            flavors = []
+            for fl in g.get("flavors", []):
+                pool = flavor_pool.get(fl["name"])
+                if pool is None:
+                    flavors.append(fl)
+                    continue
+                n = chips.get(pool, 0)
+                want = {TPU: str(n), "cpu": str(n), "memory": f"{n * 8}Gi"}
+                have = {r["name"]: str(r["nominalQuota"]) for r in fl["resources"]}
+                if {k: have.get(k) for k in want} != want:
+                    changed = True
+                    print(f"{name}/{fl['name']} ({pool}): {have} -> {want}", flush=True)
+                flavors.append({"name": fl["name"], "resources": [
+                    {"name": k, "nominalQuota": v} for k, v in want.items()]})
+            groups.append({"coveredResources": g["coveredResources"], "flavors": flavors})
+        if changed:
+            api(f"{KUEUE}/clusterqueues/{name}", "PATCH",
+                {"spec": {"resourceGroups": groups}}, "application/merge-patch+json")
+            print(f"patched {name}", flush=True)
+    print("reconcile done", flush=True)
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: kueue-quota-reconciler
+  namespace: tpu-ci
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          # Kueue manages batch/job only if that framework is enabled; it is not (jobset
+          # only), so this runs unmanaged by design -- it must not queue behind the quota
+          # it exists to set.
+          labels:
+            app: kueue-quota-reconciler
+        spec:
+          serviceAccountName: kueue-quota-reconciler
+          restartPolicy: Never
+          containers:
+            - name: reconcile
+              image: python:3.12-slim
+              command: ["python3", "/opt/reconcile.py"]
+              volumeMounts:
+                - name: script
+                  mountPath: /opt
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+          volumes:
+            - name: script
+              configMap:
+                name: kueue-quota-reconciler

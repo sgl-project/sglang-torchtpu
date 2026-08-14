@@ -4,9 +4,10 @@
 # is the finest selector and a multi-host pool must hold exactly one slice.
 # One ClusterQueue per (lane, hosts), matching topology.yaml's `queue`.
 #
-# Quotas: cpu and memory are derived from the TPU quota (pods take 4 chips / 4 cpu / 32Gi,
-# so 1 cpu and 8Gi per chip) to keep TPU the only binding resource. Every resource a pod
-# requests must appear in coveredResources or nothing is admittable.
+# Quotas here are a startup default: kueue-quota-reconciler.yaml resets them every 10min
+# from live allocatable chips. cpu and memory are derived from the chip count (pods take
+# 4 chips / 4 cpu / 32Gi, so 1 cpu and 8Gi per chip) to keep TPU the only binding resource.
+# Every resource a pod requests must appear in coveredResources or nothing is admittable.
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
@@ -68,8 +69,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# 4 nodes x 4 chips = 16, each node a whole slice. Held at 12 so one node going NotReady
-# does not over-state quota; on resize, set to (nodes-1) * 4.
+# 4 nodes x 4 chips = 16, each node a whole slice.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -83,11 +83,11 @@ spec:
         - name: tpu7x-2x2x1-pr-gate
           resources:
             - name: "google.com/tpu"
-              nominalQuota: 12
+              nominalQuota: 16
             - name: "cpu"
-              nominalQuota: 12
+              nominalQuota: 16
             - name: "memory"
-              nominalQuota: 96Gi
+              nominalQuota: 128Gi
 ---
 # One slice = 8 chips = one concurrent job. No headroom possible: a 2-host job needs
 # exactly 8, so any lower value admits nothing.
@@ -110,8 +110,7 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# 2 nodes x 4 = 8, at full capacity: one node of headroom would cost half the lane, and
-# waitForPodsReady requeues rather than deadlocks if it over-states.
+# 2 nodes x 4 = 8.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
