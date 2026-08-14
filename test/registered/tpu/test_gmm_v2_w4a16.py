@@ -145,14 +145,11 @@ class TestGmmV2W4A16(CustomTestCase):
                 preferred_element_type=dtype,
             )
 
-            a = got.astype(jnp.float32)
-            b = ref.astype(jnp.float32)
-            cos = float(
-                jnp.sum(a * b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b) + 1e-9)
-            )
-            self.assertGreater(
-                cos,
-                0.999,
+            diff = jnp.max(jnp.abs(got.astype(jnp.float32) - ref.astype(jnp.float32)))
+            scale_ = jnp.max(jnp.abs(ref.astype(jnp.float32))) + 1e-9
+            self.assertLess(
+                float(diff / scale_),
+                0.02,
                 f"prepped int4 rhs diverges from the bf16 reference ({dtype})",
             )
 
