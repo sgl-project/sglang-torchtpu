@@ -40,22 +40,48 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+
 from sglang.srt.disaggregation.base.conn import KVArgs
 from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    _ch = logging.StreamHandler()
-    _ch.setFormatter(
-        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    )
-    logger.addHandler(_ch)
 
 
 def _blob_to_tensor(blob: StageBuf | bytes) -> torch.Tensor:
     if isinstance(blob, StageBuf):
         return blob._t
     return torch.frombuffer(blob, dtype=torch.uint8)
+
+
+# A KV head occupies 2 packed slots (its K and V lanes) in the kv_packing axis.
+_SLOTS_PER_HEAD = 2
+
+
+def _view_packed_lane(
+    blob: StageBuf | bytes,
+    num_pages: int,
+    page_size: int,
+    n_lanes: int,
+    kv_packing: int,
+) -> torch.Tensor:
+    """Views a gathered layer blob as its 5D packed layout for slot-axis slicing.
+
+    Reshaping to (num_pages, page_size, n_lanes, kv_packing, slot_bytes) lets a
+    head be sliced on the kv_packing axis instead of the flat page bytes.
+    slot_bytes (head_dim * dtype_size) is inferred; a wrong page_size makes the
+    view raise rather than silently mis-slice.
+
+    Args:
+        blob: Gathered per-layer payload (StageBuf or raw bytes).
+        num_pages: Pages in the blob.
+        page_size: Tokens per KV page.
+        n_lanes: Packed lanes present in the blob.
+        kv_packing: Slots per packed lane.
+
+    Returns:
+        uint8 view of shape (num_pages, page_size, n_lanes, kv_packing, slot_bytes).
+    """
+    return _blob_to_tensor(blob).view(num_pages, page_size, n_lanes, kv_packing, -1)
 
 
 # ``(start, count)`` on the fused buffer's packed-lane axis (dim 2), or None for
@@ -78,7 +104,7 @@ class ReshardDirection(enum.Enum):
 
     Current implementation does prune any traffic. So each prefiller TP will
     send it's data to decoder TP even if there are two TP under same DP group
-    which happend to have duplicate heads."""
+    which happened to have duplicate heads."""
 
     UNSPECIFIED = "unspecified"
     # Prefill attention tp == Decode attention tp.
@@ -108,6 +134,8 @@ class PrefillTransferInfo:
       total_num_head: Total attention head count.
       kv_packing: Kv packing number, for FP8 it's 4.
       n_layers: Number of model layers.
+      page_size: Tokens per KV page (dim 1 of the fused buffer); needed to
+        reshape a gathered blob to its packed layout during odd-head reassembly.
       gather_time_ms: Total D2H gather duration in milliseconds.
       push_time_ms: Total socket push duration in milliseconds.
       push_start_time: Monotonic start timestamp of push.
@@ -123,6 +151,7 @@ class PrefillTransferInfo:
     dst_attn_tp_size: int
     total_num_head: int
     n_layers: int
+    page_size: int
     gather_time_ms: float = 0.0
     push_time_ms: float = 0.0
     push_start_time: float = 0.0
@@ -177,8 +206,14 @@ class PrefillTransferInfo:
 
     @property
     def if_skip_sending(self) -> bool:
-        # FIXME: Always send and always wait across all TP ranks.
-        return False
+        """Skip prefill sending if possible.
+
+        Current only FANIN, multiple prefill -> decode will drop pushing
+        replicated chunks.
+        """
+        return (
+            self.resharding_direction == ReshardDirection.FAN_IN and self.is_src_replica
+        )
 
     @property
     def if_send_aux_data(self) -> bool:
@@ -196,6 +231,12 @@ class PrefillTransferInfo:
     @property
     def require_slicing(self) -> bool:
         return self.n_lane_to_send != self.total_lanes
+
+    @property
+    def gathered_lanes(self) -> int:
+        """Lane count actually present in the gathered blob: the sliced count
+        when a sub-range was gathered, else this rank's full lane set."""
+        return self.n_lane_to_send if self.require_slicing else self.total_lanes
 
     def to_json(self) -> str:
         return json.dumps(dataclasses.asdict(self))
@@ -265,6 +306,13 @@ class PendingChunk:
         info = self.prefill_transfer_info
         if self.from_assemble:
             return False
+        # Same heads-per-rank on both sides => identical packed-lane layout, so a
+        # direct whole-lane copy suffices and any extra prefill ranks are pure GQA
+        # replicas (idempotent overwrite) -- no host repack. Covers e.g.
+        # total_num_head=4, attn_tp 8->4 (1 head each), which is FAN_IN by attn_tp
+        # but needs no resharding.
+        if info.src_heads == info.dst_heads:
+            return False
         if not (
             2 * info.src_heads < info.kv_packing or 2 * info.dst_heads < info.kv_packing
         ):
@@ -274,16 +322,17 @@ class PendingChunk:
         return not (info.src_heads > info.dst_heads and info.src_head_start == 0)
 
     @property
-    def assemble_key(self) -> tuple[str]:
+    def assemble_key(self) -> tuple[int, int]:
         """key used for assemble."""
-        return self.index_start
+        return (self.prefill_transfer_info.room, self.index_start)
 
     @property
     def assemble_min_chunks(self) -> int:
-        """How much chunks will collapse to a new chunk."""
-        return (
-            self.prefill_transfer_info.dst_heads // self.prefill_transfer_info.src_heads
-        )
+        """How many prefill chunks need to be merged into a single decode chunk."""
+        info = self.prefill_transfer_info
+        if info.resharding_direction == ReshardDirection.FAN_IN:
+            return max(1, info.src_attn_tp_size // info.dst_attn_tp_size)
+        return 1
 
     @staticmethod
     def reassemble_chunks(chunks: list[PendingChunk]) -> PendingChunk:
@@ -326,18 +375,28 @@ class PendingChunk:
             )
             num_layers = len(first_chunk.layer_blobs)
             new_layer_blobs: list[bytes] = []
-
+            num_pages, page_size = first_chunk.num_pages, info.page_size
+            n_lanes, kvp = info.gathered_lanes, info.kv_packing
+            # Assumes exactly 1 real head per source: the slice below strips all
+            # but the first slot pair. require_reassemble only routes here when
+            # 2*src_heads < kv_packing, which with the fp8 kv_packing=4 forces
+            # src_heads==1. Guard so a future kv_packing>4 fails loud instead of
+            # silently dropping heads (the fix is slicing :src_heads*_SLOTS_PER_HEAD).
+            assert (
+                info.src_heads == 1
+            ), f"FAN-IN reassembly assumes 1 head/source, got src_heads={info.src_heads}"
             for layer_idx in range(num_layers):
-                parts = []
-                for c in sorted_chunks:
-                    blob = c.layer_blobs[layer_idx]
-                    half_lane_bytes = len(blob) // (first_chunk.num_pages * 2)
-                    t = _blob_to_tensor(blob).view(
-                        first_chunk.num_pages, 2, half_lane_bytes
-                    )
-                    parts.append(t[:, 0, :])
-                merged = torch.stack(parts, dim=1)
-                new_layer_blobs.append(merged.numpy().tobytes())
+                # Each source carries its real head in the lane's first slot pair
+                # (slots [0:2]); concatenate the sources on the kv_packing axis to
+                # fill the decode lane, stripping the trailing dummy slots.
+                heads = [
+                    _view_packed_lane(
+                        c.layer_blobs[layer_idx], num_pages, page_size, n_lanes, kvp
+                    )[:, :, :, :_SLOTS_PER_HEAD, :]
+                    for c in sorted_chunks
+                ]
+                merged = torch.cat(heads, dim=3)
+                new_layer_blobs.append(merged.contiguous().numpy().tobytes())
 
             for c in sorted_chunks:
                 for b in c.layer_blobs:
@@ -355,12 +414,14 @@ class PendingChunk:
                 decode_endpoint=info.decode_endpoint,
                 num_pages=info.num_pages,
                 kv_packing=info.kv_packing,
+                # Synthetic chunk, so use dst rank.
                 src_tp_rank=info.dst_tp_rank,
                 dst_tp_rank=info.dst_tp_rank,
                 src_attn_tp_size=info.dst_attn_tp_size,
                 dst_attn_tp_size=info.dst_attn_tp_size,
                 total_num_head=info.total_num_head,
                 n_layers=info.n_layers,
+                page_size=info.page_size,
             )
 
             new_chunk = PendingChunk(
@@ -379,20 +440,25 @@ class PendingChunk:
             if info.src_head_start == 0:
                 return first_chunk
 
-            # Case 2.2: Head 1 is needed -> extract second half slots and move to front
+            # Case 2.2: Head 1 is needed -> move its slot pair (slots [2:4]) to the
+            # front of the lane, leaving the trailing slots as dummy padding.
             num_layers = len(first_chunk.layer_blobs)
             new_layer_blobs: list[bytes] = []
+            num_pages, page_size = first_chunk.num_pages, info.page_size
+            n_lanes, kvp = info.gathered_lanes, info.kv_packing
 
             for layer_idx in range(num_layers):
-                blob = first_chunk.layer_blobs[layer_idx]
-                half_lane_bytes = len(blob) // (first_chunk.num_pages * 2)
-                t = _blob_to_tensor(blob).view(
-                    first_chunk.num_pages, 2, half_lane_bytes
+                lane = _view_packed_lane(
+                    first_chunk.layer_blobs[layer_idx],
+                    num_pages,
+                    page_size,
+                    n_lanes,
+                    kvp,
                 )
-                h1 = t[:, 1, :]
+                h1 = lane[:, :, :, _SLOTS_PER_HEAD : 2 * _SLOTS_PER_HEAD, :]
                 dummy = torch.zeros_like(h1)
-                merged = torch.stack([h1, dummy], dim=1)
-                new_layer_blobs.append(merged.numpy().tobytes())
+                merged = torch.cat([h1, dummy], dim=3)
+                new_layer_blobs.append(merged.contiguous().numpy().tobytes())
 
             for b in first_chunk.layer_blobs:
                 if isinstance(b, StageBuf):
@@ -403,12 +469,14 @@ class PendingChunk:
                 decode_endpoint=info.decode_endpoint,
                 num_pages=info.num_pages,
                 kv_packing=info.kv_packing,
-                src_tp_rank=info.dst_tp_rank,
+                # Use src as it's the only one.
+                src_tp_rank=info.src_tp_rank,
                 dst_tp_rank=info.dst_tp_rank,
                 src_attn_tp_size=info.dst_attn_tp_size,
                 dst_attn_tp_size=info.dst_attn_tp_size,
                 total_num_head=info.total_num_head,
                 n_layers=info.n_layers,
+                page_size=info.page_size,
             )
 
             new_chunk = PendingChunk(
@@ -434,12 +502,17 @@ class PendingChunk:
     ) -> None:
         """Enqueues or merges an incoming pending chunk into the queue.
 
+        For each decoder, even if itself is replica, it will always receive data
+        from prefill. However, within each DPA group. If prefill TP rank is a
+        replica in FANIN case, it will never send these chunks.
+
         Args:
             pending_queue: Queue of ready chunks for scatter.
             reasm_dict: Dictionary mapping assemble_key to pending un-assembled chunks.
             chunk: Newly received chunk awaiting scatter or reassembly.
             stats: Optional stats recorder for measuring assemble duration.
         """
+        info = chunk.prefill_transfer_info
         if not chunk.require_reassemble:
             pending_queue.append(chunk)
             return
@@ -450,6 +523,14 @@ class PendingChunk:
             merged_chunk = PendingChunk.reassemble_chunks([chunk])
             if stats is not None:
                 stats.record(time.perf_counter() - _t0, merged_chunk.nbytes)
+            logger.info(
+                "[pd_kv_resharding] process_incoming_chunk (single reassemble): "
+                "room=%s index_start=%d input_bytes=%d merged_bytes=%d",
+                info.room,
+                chunk.index_start,
+                chunk.nbytes,
+                merged_chunk.nbytes,
+            )
             pending_queue.append(merged_chunk)
             return
 
@@ -463,12 +544,34 @@ class PendingChunk:
         ):
             bucket.append(chunk)
 
+        logger.info(
+            "[pd_kv_resharding] process_incoming_chunk bucket state: "
+            "room=%s index_start=%d src_tp_rank=%d bucket_len=%d/%d chunk_bytes=%d",
+            info.room,
+            chunk.index_start,
+            info.src_tp_rank,
+            len(bucket),
+            min_chunks,
+            chunk.nbytes,
+        )
+
         if len(bucket) >= min_chunks:
             reasm_dict.pop(key, None)
             _t0 = time.perf_counter()
-            merged_chunk = PendingChunk.reassemble_chunks(bucket[:min_chunks])
+            chunks_to_merge = bucket[:min_chunks]
+            input_bytes_sum = sum(c.nbytes for c in chunks_to_merge)
+            merged_chunk = PendingChunk.reassemble_chunks(chunks_to_merge)
             if stats is not None:
                 stats.record(time.perf_counter() - _t0, merged_chunk.nbytes)
+            logger.info(
+                "[pd_kv_resharding] process_incoming_chunk (merged %d chunks): "
+                "room=%s index_start=%d input_bytes_sum=%d merged_bytes=%d",
+                min_chunks,
+                info.room,
+                chunk.index_start,
+                input_bytes_sum,
+                merged_chunk.nbytes,
+            )
             pending_queue.append(merged_chunk)
 
 
@@ -675,10 +778,8 @@ def scatter_stage_from_host(
             thread already copied the wire — no copy here) or raw bytes /
             memoryviews (staged and copied here). Released to ``pool`` when done.
         pool: Pinned host staging pool to acquire/release staging buffers.
-        dst_lane_slice: ``(start, count)`` writing the KV-head slice into that
-            dim-2 sub-range of each buffer (MHA resharding); None writes the
-            whole page. dtype/shape come from the lane-narrowed targets, so an
-            fp8/bf16 slice reshapes correctly.
+        dst_lane_slice: (lane_start, lane_count) writing the KV-head slice into that
+            dim-2 sub-range of each buffer (MHA resharding)
     """
     if len(layer_buffers) == 0:
         return
@@ -808,6 +909,7 @@ def write_aux_row(kv_args: KVArgs, aux_index: int, blobs: Sequence[bytes]) -> No
     for ptr, item_len, blob in zip(kv_args.aux_data_ptrs, kv_args.aux_item_lens, blobs):
         # Tolerate length drift defensively; both sides build MetadataBuffers
         # identically so this should always be an exact fit.
+        # FIXME: change to assert after tests are stabled,
         n = min(item_len, len(blob))
         dst = (ctypes.c_byte * n).from_address(ptr + item_len * aux_index)
         dst[:] = blob[:n]

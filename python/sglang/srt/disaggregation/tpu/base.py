@@ -309,14 +309,16 @@ class TpuKVManagerBase(CommonKVManager):
         )
         endpoint = _tcp_endpoint(decode_ip, decode_port)
         bucket = self.transfer_infos.setdefault(room, {})
-        bucket[endpoint] = self.record_decode_endpoint(
+        bucket[endpoint] = self.get_prefill_transfer_info(
             room, endpoint, num_pages, dst_tp_rank, decode_attn_tp_size
         )
         self.req_to_decode_prefix_len[room] = prefix_len
         if len(bucket) >= required:
+            logger.info("[pd_kv_resharding] now room: %s, bucket: %s", bucket, room)
             self.update_status(room, KVPoll.WaitingForInput)
+            logger.info("[pd_kv_resharding] request status: %s", self.request_status)
 
-    def record_decode_endpoint(
+    def get_prefill_transfer_info(
         self,
         room: int,
         endpoint: str,
@@ -336,6 +338,7 @@ class TpuKVManagerBase(CommonKVManager):
             dst_attn_tp_size=decode_attn_tp_size,
             total_num_head=self.kv_args.total_kv_head_num,
             n_layers=len(self.layer_buffers),
+            page_size=int(self.layer_buffers[0].shape[1]),
         )
 
     # ---- abstract role + data-plane seam --------------------------------
@@ -410,6 +413,17 @@ class TpuKVManagerBase(CommonKVManager):
             else:
                 got = chunk.nbytes
                 want = self._expected_chunk_bytes(chunk.num_pages, info.n_lane_to_send)
+                logger.info(
+                    "[pd_kv_resharding] process_decode_pending chunk: room=%s index_start=%d "
+                    "got_bytes=%d want_bytes=%d (num_pages=%d num_lanes=%d dst_lane_start=%d)",
+                    room,
+                    chunk.index_start,
+                    got,
+                    want,
+                    chunk.num_pages,
+                    info.n_lane_to_send,
+                    info.dst_lane_idx,
+                )
                 if got != want:
                     fail_reason = (
                         f"[pd_kv_resharding] chunk byte mismatch: got {got} want "
@@ -527,7 +541,12 @@ class TpuKVSenderBase(CommonKVSender):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
-    def send(self, kv_indices, state_indices: list | None = None):
+    def send(
+        self,
+        kv_indices,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
+    ):
         raise NotImplementedError
 
     def _pre_poll(self) -> None:

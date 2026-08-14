@@ -145,6 +145,7 @@ class TestTpuTransferDataPlane(CustomTestCase):
             total_num_head=total_heads,
             kv_packing=kvp,
             n_layers=n_layers,
+            page_size=1,
         )
 
     def test_compute_lane_slice_directions(self):
@@ -474,7 +475,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([0, 11, 4], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=3)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.get_prefill_transfer_info(room, ep, 3)
+        }
 
         # prefill aux row 6 should land in decode aux row 3.
         # gather (main thread) + push (bg); decode bg recv stashes; decode
@@ -497,7 +500,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([10, 0, 6, 2], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=2)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 4)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.get_prefill_transfer_info(room, ep, 4)
+        }
 
         # chunk 0: pages [0:2], not last
         prefill.gather_and_push(room, src_pages[:2], 0, False, aux_index=None)
@@ -525,7 +530,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([10, 0, 6, 2], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=2)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 4)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.get_prefill_transfer_info(room, ep, 4)
+        }
 
         # Push chunk 1 (pages [2:4], IS last, carries aux) FIRST, deliver + scatter.
         prefill.gather_and_push(room, src_pages[2:], 2, True, aux_index=5)
@@ -589,7 +596,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([0, 2, 4], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=2)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.get_prefill_transfer_info(room, ep, 3)
+        }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=5)
         # 2 channels -> 2 messages; route each into the reassembly buffer.
@@ -613,7 +622,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
             room, np.array([0, 1], dtype=np.int64), aux_index=0
         )
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.get_prefill_transfer_info(room, ep, 3)
+        }
         prefill.gather_and_push(room, np.array([2, 5, 9], dtype=np.int64), 0, True, 1)
         decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
@@ -635,7 +646,9 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         dst_pages = np.array([3, 9, 0], dtype=np.int64)
         decode.register_decode_state(room, dst_pages, aux_index=4)
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
-        prefill.transfer_infos[room] = {ep: prefill.record_decode_endpoint(room, ep, 3)}
+        prefill.transfer_infos[room] = {
+            ep: prefill.get_prefill_transfer_info(room, ep, 3)
+        }
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=2)
 
         deadline = time.time() + 5
@@ -698,10 +711,10 @@ class TestTpuReshardingProtocol(CustomTestCase):
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         info_kw = dict(dst_tp_rank=0, decode_attn_tp_size=1)
         p0.transfer_infos[room] = {
-            ep: p0.record_decode_endpoint(room, ep, 3, **info_kw)
+            ep: p0.get_prefill_transfer_info(room, ep, 3, **info_kw)
         }
         p1.transfer_infos[room] = {
-            ep: p1.record_decode_endpoint(room, ep, 3, **info_kw)
+            ep: p1.get_prefill_transfer_info(room, ep, 3, **info_kw)
         }
 
         # Both prefill ranks pass aux_index; only rank0 should actually send it.
@@ -759,14 +772,14 @@ class TestTpuReshardingProtocol(CustomTestCase):
         ep0 = _tcp_endpoint("127.0.0.1", d0.rank_port)
         ep1 = _tcp_endpoint("127.0.0.1", d1.rank_port)
         prefill.transfer_infos[room] = {
-            ep0: prefill.record_decode_endpoint(
+            ep0: prefill.get_prefill_transfer_info(
                 room,
                 ep0,
                 3,
                 dst_tp_rank=0,
                 decode_attn_tp_size=2,
             ),
-            ep1: prefill.record_decode_endpoint(
+            ep1: prefill.get_prefill_transfer_info(
                 room,
                 ep1,
                 3,
@@ -804,6 +817,211 @@ class TestTpuReshardingProtocol(CustomTestCase):
         self.assertTrue(torch.equal(d0aux[0][4], paux[0][6]))
         self.assertTrue(torch.equal(d1aux[0][1], paux[0][6]))
 
+    def test_fan_in_fp8_odd_head_end_to_end(self):
+        # FP8 odd-head FAN-IN over the real gather -> reassemble -> scatter path
+        # with page_size>1 (the production repro). prefill_tp=2 (1 real head/rank
+        # == 1 packed lane, kv_packing=4, dummy slots [2:4]) -> decode_tp=1 (2
+        # heads == 1 full lane). rank0's head must land in decode slots [0:2],
+        # rank1's in [2:4]; the prefill dummy slots must not leak through.
+        layers, page_size, head_dim = 2, 4, 16
+        tail = (1, 4, head_dim)  # 1 lane, kv_packing=4 (fp8)
+        p0pool = _FakePool(16, page_size, tail, layers, torch.bfloat16)
+        p1pool = _FakePool(16, page_size, tail, layers, torch.bfloat16)
+        dpool = _FakePool(16, page_size, tail, layers, torch.bfloat16)
+        _fill_random(p0pool)
+        _fill_random(p1pool)
+        paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
+        daux = [torch.zeros(8, 16, dtype=torch.int32)]
+
+        kw = dict(total_kv_head_num=2)  # 1 real head/rank; shape would infer 2
+        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
+        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
+        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
+
+        room = 902
+        src_pages = np.array([2, 5, 9], dtype=np.int64)
+        dst_pages = np.array([0, 11, 4], dtype=np.int64)
+        decode.register_decode_state(room, dst_pages, aux_index=3)
+        ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
+        info_kw = dict(dst_tp_rank=0, decode_attn_tp_size=1)
+        p0.transfer_infos[room] = {
+            ep: p0.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
+        p1.transfer_infos[room] = {
+            ep: p1.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
+
+        # First source alone must not conclude the room (2 chunks reassemble).
+        p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+        self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
+        p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+
+        self.assertEqual(decode.request_status[room], KVPoll.Success)
+        for li in range(layers):
+            for sp, dp in zip(src_pages, dst_pages):
+                # buffer page: [page_size, n_lane=1, kv_packing=4, head_dim]
+                self.assertTrue(
+                    torch.equal(
+                        p0pool.kv_buffer[li][sp][:, 0, 0:2, :],
+                        dpool.kv_buffer[li][dp][:, 0, 0:2, :],
+                    ),
+                    f"fan-in fp8 layer {li}: rank0 head -> decode slots[0:2]",
+                )
+                self.assertTrue(
+                    torch.equal(
+                        p1pool.kv_buffer[li][sp][:, 0, 0:2, :],
+                        dpool.kv_buffer[li][dp][:, 0, 2:4, :],
+                    ),
+                    f"fan-in fp8 layer {li}: rank1 head -> decode slots[2:4]",
+                )
+        self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
+
+    def test_fan_in_fp8_non_odd_head_end_to_end(self):
+        # FP8 non-odd FAN-IN (path A: no reassembly, just lane-sliced scatter).
+        # prefill_tp=2 (4 heads/rank == 2 packed lanes, no dummy) -> decode_tp=1
+        # (8 heads == 4 lanes). rank0 fills decode lanes [0:2], rank1 [2:4]. Each
+        # source writes a disjoint whole-lane range, so require_reassemble is
+        # False and process_decode_pending scatters directly.
+        layers, page_size, head_dim = 2, 4, 16
+        p0pool = _FakePool(16, page_size, (2, 4, head_dim), layers, torch.bfloat16)
+        p1pool = _FakePool(16, page_size, (2, 4, head_dim), layers, torch.bfloat16)
+        dpool = _FakePool(16, page_size, (4, 4, head_dim), layers, torch.bfloat16)
+        _fill_random(p0pool)
+        _fill_random(p1pool)
+        paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
+        daux = [torch.zeros(8, 16, dtype=torch.int32)]
+
+        kw = dict(total_kv_head_num=8)
+        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 2, 0, **kw)
+        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 2, 1, **kw)
+        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 1, 0, **kw)
+
+        room = 903
+        src_pages = np.array([2, 5, 9], dtype=np.int64)
+        dst_pages = np.array([0, 11, 4], dtype=np.int64)
+        decode.register_decode_state(room, dst_pages, aux_index=3)
+        ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
+        info_kw = dict(dst_tp_rank=0, decode_attn_tp_size=1)
+        p0.transfer_infos[room] = {
+            ep: p0.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
+        p1.transfer_infos[room] = {
+            ep: p1.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
+
+        # Prove this config takes path A (no merge): FAN_IN but not reassembled.
+        info0 = p0.transfer_infos[room][ep]
+        self.assertEqual(info0.resharding_direction, T.ReshardDirection.FAN_IN)
+        probe = PendingChunk(0, 1, [b""], [], info0)
+        self.assertFalse(probe.require_reassemble)
+
+        p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+        self.assertNotEqual(decode.request_status.get(room), KVPoll.Success)
+        p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+
+        self.assertEqual(decode.request_status[room], KVPoll.Success)
+        for li in range(layers):
+            for sp, dp in zip(src_pages, dst_pages):
+                # buffer page: [page_size, n_lanes, kv_packing, head_dim]
+                self.assertTrue(
+                    torch.equal(
+                        p0pool.kv_buffer[li][sp][:, 0:2],
+                        dpool.kv_buffer[li][dp][:, 0:2],
+                    ),
+                    f"fan-in fp8 non-odd layer {li}: rank0 -> decode lanes[0:2]",
+                )
+                self.assertTrue(
+                    torch.equal(
+                        p1pool.kv_buffer[li][sp][:, 0:2],
+                        dpool.kv_buffer[li][dp][:, 2:4],
+                    ),
+                    f"fan-in fp8 non-odd layer {li}: rank1 -> decode lanes[2:4]",
+                )
+        self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
+
+    def test_fan_in_fp8_gqa_replica_no_reassemble(self):
+        # total_num_head=4, prefill_tp=8 -> decode_tp=4: each rank holds exactly 1
+        # head (fp8 lane == [head, dummy]), so src_heads == dst_heads. This is
+        # FAN_IN by attn_tp but needs NO resharding -- a direct whole-lane copy.
+        # The extra prefill rank is a pure GQA replica. Guards the fix that stops
+        # reassembly from packing two replicas into [head, head].
+        layers, page_size, head_dim = 2, 4, 16
+        tail = (1, 4, head_dim)  # 1 lane, kv_packing=4 (fp8)
+        p0pool = _FakePool(16, page_size, tail, layers, torch.bfloat16)
+        p1pool = _FakePool(16, page_size, tail, layers, torch.bfloat16)
+        dpool = _FakePool(16, page_size, tail, layers, torch.bfloat16)
+        _fill_random(p0pool)
+        # rank 1 is a GQA replica of rank 0: identical KV data.
+        for b0, b1 in zip(p0pool.kv_buffer, p1pool.kv_buffer):
+            b1.copy_(b0)
+        paux = [torch.arange(8 * 16, dtype=torch.int32).reshape(8, 16)]
+        daux = [torch.zeros(8, 16, dtype=torch.int32)]
+
+        kw = dict(total_kv_head_num=4)  # 1 head/rank on both sides
+        # prefill ranks 0 and 1 are GQA replicas of head 0 -> decode rank 0.
+        p0 = _bare_manager(DisaggregationMode.PREFILL, p0pool, paux, 8, 0, **kw)
+        p1 = _bare_manager(DisaggregationMode.PREFILL, p1pool, paux, 8, 1, **kw)
+        decode = _bare_manager(DisaggregationMode.DECODE, dpool, daux, 4, 0, **kw)
+
+        room = 904
+        src_pages = np.array([2, 5, 9], dtype=np.int64)
+        dst_pages = np.array([0, 11, 4], dtype=np.int64)
+        decode.register_decode_state(room, dst_pages, aux_index=3)
+        ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
+        info_kw = dict(dst_tp_rank=0, decode_attn_tp_size=4)
+        p0.transfer_infos[room] = {
+            ep: p0.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
+        p1.transfer_infos[room] = {
+            ep: p1.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
+
+        # No repack: FAN_IN but src_heads == dst_heads, so require_reassemble False.
+        info0 = p0.transfer_infos[room][ep]
+        info1 = p1.transfer_infos[room][ep]
+        self.assertEqual(info0.resharding_direction, T.ReshardDirection.FAN_IN)
+        self.assertEqual(info0.src_heads, info0.dst_heads)
+        self.assertFalse(PendingChunk(0, 1, [b""], [], info0).require_reassemble)
+        # rank0 is the group leader; rank1 is the pure GQA replica to be deduped.
+        self.assertFalse(info0.is_src_replica)
+        self.assertTrue(info1.is_src_replica)
+
+        # A single replica fully fills the decode rank (no waiting to merge), and
+        # the whole lane is copied verbatim -- dummy slots [2:4] are NOT polluted
+        # with a second copy of the head.
+        p0.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        decode.process_decode_pending(room)
+        self.assertEqual(decode.request_status[room], KVPoll.Success)
+        for li in range(layers):
+            for sp, dp in zip(src_pages, dst_pages):
+                self.assertTrue(
+                    torch.equal(p0pool.kv_buffer[li][sp], dpool.kv_buffer[li][dp]),
+                    f"gqa-replica layer {li}: decode lane != prefill lane (whole copy)",
+                )
+        self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
+
+        # The replica arriving afterwards is deduped: prefill always sends, but
+        # decode drops it (never enqueued) instead of a redundant re-scatter.
+        p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
+        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
+        with decode.decode_pending_lock:
+            self.assertEqual(len(decode.decode_pending[room]), 0)
+        decode.process_decode_pending(room)
+        for li in range(layers):
+            for sp, dp in zip(src_pages, dst_pages):
+                self.assertTrue(
+                    torch.equal(p0pool.kv_buffer[li][sp], dpool.kv_buffer[li][dp])
+                )
+
 
 class TestTpuReshardTransferTimeFailure(CustomTestCase):
     """An unsupported fp8 reshard is NOT pre-flighted at handshake — a Failed set
@@ -835,7 +1053,9 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
         # The handshake just records the endpoint (no pre-flight); the reshard
         # compatibility is only exercised when gather_and_push resolves the slice.
         ep = _tcp_endpoint("127.0.0.1", m.rank_port)
-        m.transfer_infos[room] = {ep: m.record_decode_endpoint(room, ep, 3, **info_kw)}
+        m.transfer_infos[room] = {
+            ep: m.get_prefill_transfer_info(room, ep, 3, **info_kw)
+        }
         # The sender advances this room to WaitingForInput before send() calls
         # gather; seed it so the terminal Failed lands (update_status won't
         # create a fresh entry for Failed — the anti-resurrection guard). The
@@ -851,7 +1071,7 @@ class TestTpuReshardTransferTimeFailure(CustomTestCase):
         m = self._prefill(attn_tp_size=4, lanes=1, engine_rank=0)
         room = 4240
         ep = _tcp_endpoint("127.0.0.1", 55550)
-        m.record_decode_endpoint(room, ep, 3, dst_tp_rank=0, decode_attn_tp_size=8)
+        m.get_prefill_transfer_info(room, ep, 3, dst_tp_rank=0, decode_attn_tp_size=8)
         self.assertNotIn(room, m.failure_records)
         self.assertNotIn(room, m.request_status)
 
@@ -1120,7 +1340,7 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
     def _recv_and_scatter(self, decode, n_channels, room):
         if n_channels > 1:
             for _ in range(n_channels):
-                decode._handle_kvdata_ch_ch(decode.server_socket.recv_multipart())
+                decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         else:
             decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         decode.process_decode_pending(room)
@@ -1136,7 +1356,7 @@ class TestTpuKVManagerStagingOnDevice(CustomTestCase):
         ep = _tcp_endpoint("127.0.0.1", decode.rank_port)
         n_pages = len(src_pages)
         prefill.transfer_infos[room] = {
-            ep: prefill.record_decode_endpoint(room, ep, n_pages)
+            ep: prefill.get_prefill_transfer_info(room, ep, n_pages)
         }
 
         prefill.gather_and_push(room, src_pages, 0, True, aux_index=6)
@@ -1302,6 +1522,7 @@ class TestPendingChunkReassembly(CustomTestCase):
             dst_attn_tp_size=1,
             total_num_head=2,
             n_layers=2,
+            page_size=1,
         )
         chunk = PendingChunk(
             index_start=0,
@@ -1334,6 +1555,7 @@ class TestPendingChunkReassembly(CustomTestCase):
             dst_attn_tp_size=1,
             total_num_head=2,
             n_layers=1,
+            page_size=1,
         )
         info1 = PrefillTransferInfo(
             room=1,
@@ -1346,6 +1568,7 @@ class TestPendingChunkReassembly(CustomTestCase):
             dst_attn_tp_size=1,
             total_num_head=2,
             n_layers=1,
+            page_size=1,
         )
 
         # 2 pages, 1 lane (valid + dummy = 2 halves), each half = 16 bytes
@@ -1414,6 +1637,7 @@ class TestPendingChunkReassembly(CustomTestCase):
             dst_attn_tp_size=1,
             total_num_head=2,
             n_layers=1,
+            page_size=1,
         )
         info1 = PrefillTransferInfo(
             room=1,
@@ -1426,6 +1650,7 @@ class TestPendingChunkReassembly(CustomTestCase):
             dst_attn_tp_size=1,
             total_num_head=2,
             n_layers=1,
+            page_size=1,
         )
 
         nbytes = 2 * 2 * 16
@@ -1476,6 +1701,7 @@ class TestPendingChunkReassembly(CustomTestCase):
             dst_attn_tp_size=2,
             total_num_head=2,
             n_layers=1,
+            page_size=1,
         )
 
         nbytes = 2 * 2 * 16
@@ -1507,37 +1733,42 @@ class TestPendingChunkReassembly(CustomTestCase):
         print(" [Benchmark] PendingChunk.reassemble_chunks Performance ")
         print("=" * 80)
 
+        # Production RPA v3 fp8 geometry (matches the repro.log): one packed lane
+        # of page_size x kv_packing x head_dim; a source carries 1 real head in
+        # slots [0:2] and dummy in [2:4]. reassemble slices [0:2] (strided) from
+        # 2 sources and concatenates on the kv_packing axis into a full lane.
+        page_size, head_dim, kvp = 128, 128, 4
+        per_page = page_size * kvp * head_dim  # bytes/page for one source (fp8=1B)
         for size_gb in sizes_gb:
             size_bytes = int(size_gb * 1024 * 1024 * 1024)
-            # FP8 RPA v3 layout: reshape(-1, 2, half_lane_bytes)
-            # Ensure size_bytes is divisible by 2
-            half_lane_bytes = 1024 * 64
-            num_pages = size_bytes // (2 * half_lane_bytes)
-            actual_bytes = num_pages * 2 * half_lane_bytes
+            num_pages = max(1, size_bytes // per_page)
+            actual_bytes = num_pages * per_page
 
             info0 = PrefillTransferInfo(
                 room=100,
                 decode_endpoint="127.0.0.1:10000",
                 num_pages=num_pages,
-                kv_packing=4,
+                kv_packing=kvp,
                 src_tp_rank=0,
                 dst_tp_rank=0,
                 src_attn_tp_size=2,
                 dst_attn_tp_size=1,
                 total_num_head=2,
                 n_layers=1,
+                page_size=page_size,
             )
             info1 = PrefillTransferInfo(
                 room=100,
                 decode_endpoint="127.0.0.1:10000",
                 num_pages=num_pages,
-                kv_packing=4,
+                kv_packing=kvp,
                 src_tp_rank=1,
                 dst_tp_rank=0,
                 src_attn_tp_size=2,
                 dst_attn_tp_size=1,
                 total_num_head=2,
                 n_layers=1,
+                page_size=page_size,
             )
 
             # Generate dummy bytes array for layer blob
@@ -1582,6 +1813,96 @@ class TestPendingChunkReassembly(CustomTestCase):
             self.assertEqual(len(out_chunk.layer_blobs[0]), actual_bytes)
 
         print("=" * 80 + "\n")
+
+
+class TestFanInOddHeadReassembleLayout(CustomTestCase):
+    """Regression guard for FP8 odd-head FAN-IN reassembly on the fused 5D packed
+    layout (num_pages, page_size, n_lanes, kv_packing, head_dim).
+
+    A KV head occupies kv_packing slots [0:2] (K,V) per lane; on an odd-head rank
+    slots [2:4] are dummy padding. FAN-IN 2:1 strips each source's dummy and
+    interleaves two ranks' real heads into one decode lane: rank(dst_head_start=0)
+    -> slots [0:2], rank(dst_head_start=1) -> slots [2:4].
+
+    reassemble_chunks must split on the kv_packing (slot) axis, not the flat page
+    bytes — the two coincide only when page_size == 1. The prior flat-half split
+    dropped the second rank's head and leaked dummy bytes for page_size > 1 (every
+    real deployment; the production repro has page_size=128).
+
+    These tests mirror the production repro: src_attn_tp=8 -> dst_attn_tp=4
+    (assemble 2 chunks), kv_packing=4, n_lane_to_send=1, page_size > 1.
+    """
+
+    KVP = 4  # fp8
+    DUMMY = 0xEE
+
+    def setUp(self):
+        self._pool = PinnedHostPool(max_bytes=10 * 1024 * 1024)
+
+    def _fan_in_info(
+        self, src_rank: int, num_pages: int, page_size: int
+    ) -> PrefillTransferInfo:
+        # total_num_head=8, src_attn_tp=8 (1 head/rank), dst_attn_tp=4 (2 heads).
+        # 2 prefill ranks feed each decode rank (assemble_min_chunks=2). ranks
+        # 0 and 1 both map to dst rank 0: rank0->dst_head_start 0, rank1->1.
+        return PrefillTransferInfo(
+            room=1,
+            decode_endpoint="127.0.0.1:10000",
+            num_pages=num_pages,
+            kv_packing=self.KVP,
+            src_tp_rank=src_rank,
+            dst_tp_rank=0,
+            src_attn_tp_size=8,
+            dst_attn_tp_size=4,
+            total_num_head=8,
+            n_layers=1,
+            page_size=page_size,
+        )
+
+    def _generate_input_lane(
+        self, num_pages: int, page_size: int, head_num: int, head_dim: int
+    ):
+        adjusted_head_num = max(1, head_num // 2)
+        total_size = num_pages * page_size * adjusted_head_num * self.KVP * head_dim
+        return np.arange(total_size, dtype=np.uint8).reshape(
+            num_pages, page_size, adjusted_head_num, self.KVP, head_dim
+        )
+
+    def _reassemble(
+        self, num_pages: int, page_size: int, head_num: int, head_dim: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        a0 = self._generate_input_lane(
+            num_pages, page_size, head_num, head_dim
+        ).tobytes()
+        a1 = self._generate_input_lane(
+            num_pages, page_size, head_num, head_dim
+        ).tobytes()
+        info_kw = {"num_pages": num_pages, "page_size": page_size}
+        c0 = PendingChunk(0, num_pages, [a0], [], self._fan_in_info(0, **info_kw))
+        c1 = PendingChunk(0, num_pages, [a1], [], self._fan_in_info(1, **info_kw))
+        merged = PendingChunk.reassemble_chunks([c0, c1])
+        adjusted_head_num = max(1, head_num // 2)
+        out = np.frombuffer(merged.layer_blobs[0], dtype=np.uint8).reshape(
+            num_pages, page_size, adjusted_head_num, self.KVP, head_dim
+        )
+        # Hand-built expected lane: rank0's real head (its slots [0:2]) -> decode
+        # slots [0:2]; rank1's real head -> decode slots [2:4]; dummy stripped.
+        src0 = np.frombuffer(a0, dtype=np.uint8).reshape(out.shape)
+        src1 = np.frombuffer(a1, dtype=np.uint8).reshape(out.shape)
+        exp = np.empty_like(out)
+        exp[:, :, :, 0:2, :] = src0[:, :, :, 0:2, :]
+        exp[:, :, :, 2:4, :] = src1[:, :, :, 0:2, :]
+        return out, exp
+
+    def test_page_size_3_is_correct(self):
+        # Sanity + pinpoint: the flat-half split only coincides with the packed
+        # slot split when page_size == 1, so this configuration is correct today.
+        out, exp = self._reassemble(num_pages=2, page_size=3, head_num=1, head_dim=3)
+        self.assertEqual(
+            int((out == self.DUMMY).sum()), 0, "dummy leaked into decode lane"
+        )
+        print(out)
+        np.testing.assert_array_equal(out, exp)
 
 
 if __name__ == "__main__":
