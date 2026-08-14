@@ -237,13 +237,29 @@ ALL JobSets with `failurePolicy: Fail`, served by the controller pod. From the m
 manifests apply until that pod is Ready, **every JobSet creation in the cluster is
 rejected** — including main's PR gate and the nightly. Two consequences:
 
-- The controller requests 500m CPU and only schedules on `system-pool`. If it sits
-  `Pending` (`Insufficient cpu` — the pool is one e2-standard-2 already near-full with the
-  JobSet operator), grow the pool first; a half-installed Kueue is a cluster-wide CI outage:
-  `gcloud container clusters resize tpu-cluster --node-pool=system-pool --num-nodes=2
-  --zone=us-central1-c --project=sglang-torchtpu --quiet`
+- **Lower the controller's CPU request immediately after applying.** It ships asking for
+  500m, which does not fit `system-pool`, so the pod sits `Pending` and the cluster-wide
+  outage persists (observed 2026-08-14: 50 minutes). This patch is **not in any manifest**
+  — re-running the `kubectl apply` above restores 500m and reproduces the outage, so redo
+  it after every install or upgrade:
+
+  ```bash
+  kubectl -n kueue-system patch deploy kueue-controller-manager --type=json \
+    -p '[{"op":"replace","path":"/spec/template/spec/containers/0/resources/requests/cpu","value":"100m"}]'
+  kubectl -n kueue-system rollout status deploy/kueue-controller-manager --timeout=240s
+  ```
+
+  100m is ample — the controller reconciles five ClusterQueues and a handful of JobSets a
+  day, and its 2-core limit is untouched so it can still burst.
+
+- **Growing `system-pool` does not fix this.** GKE's DNS autoscaler scales `kube-dns` with
+  node count: a node added to relieve the pressure took five replicas at 270m each (1350m
+  of 1930m allocatable) within four minutes, and Kueue still would not fit. Lower the
+  request instead.
+
 - If you need to back out entirely: `kubectl delete -f <same manifests URL>` removes the
-  webhooks with the rest.
+  webhooks with the rest. Do this while the controller is *healthy* — deleting during an
+  outage works but leaves the cluster rejecting JobSets until the webhooks are gone.
 
 **2. Configure** — edit `kueue-manager-config`, then
 `kubectl -n kueue-system rollout restart deploy/kueue-controller-manager`.
@@ -277,6 +293,17 @@ waitForPodsReady:                   # evict + requeue a gang that can't fully pl
   JobSets carries the label. From then on it is the fail-closed guard: a typo'd or missing
   label queues instead of running with no admission control.
 
+  Leaving it `false` is safe *today* only because main still carries its own
+  `tpu-slice-<hosts>` concurrency mutex — an unlabelled multi-host JobSet is protected by
+  that, not by Kueue. This branch deletes that mutex, so after merge an unlabelled
+  multi-host JobSet has **no** protection: two of them can each take one node of a slice
+  and deadlock, which is the original bug. Flipping to `true` is what closes that hole,
+  and forgetting to flip it is a silent regression, not a missing nicety.
+
+  The cost of `true` is that a hand-launched debug JobSet in `tpu-ci` without a label will
+  sit suspended. Give it `kueue.x-k8s.io/queue-name` (see `topology.yaml` for the lane's
+  queue) or run it in another namespace.
+
 Trimming the frameworks list is load-bearing, not tidiness: with the default list, the
 eventual `manageJobsWithoutQueueName: true` would apply to every enabled framework in
 `tpu-ci` — so the `hydrate-deepseek-r1.yaml` weights Job (a plain `batch/Job` in this
@@ -295,6 +322,17 @@ kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
 kubectl get clusterqueues -o wide        # ACTIVE=True on all five
 kubectl -n tpu-ci get localqueues
 ```
+
+`ACTIVE=True` is necessary but not sufficient. A queue is Active as soon as its flavors
+resolve, even if it can never admit anything — so also check that a real workload reaches
+`ADMITTED=True` (step 5). Two ways a live-looking queue admits nothing:
+
+- **A resource the pods request is not in `coveredResources`.** Kueue needs *every*
+  requested resource declared, so TPU alone is not enough — the pods also ask for `cpu` and
+  `memory`, and omitting them fails with `couldn't assign flavors to pod set slice:
+  resource memory unavailable in ClusterQueue`. The quotas here derive cpu and memory from
+  the TPU quota (1 cpu and 8Gi per chip) so TPU stays the only binding resource.
+- **The flavor's pool does not exist** — see step 4.
 
 **4. The pools must exist**, or workloads queue until the admission timeout. A quota whose
 pool is absent is pure fiction — Kueue admits against the number, and the pods then find no
