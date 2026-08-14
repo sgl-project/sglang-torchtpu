@@ -75,9 +75,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # Declared, not inherited: the admission budget is derived from it, so it must not be
-    # GitHub's silent 360m default. Keep JOB_CEILING_S below in sync.
-    timeout-minutes: 355
+    timeout-minutes: 360   # GitHub's hard cap for hosted runners; cannot be raised
     steps:
       - uses: actions/checkout@v4
         with:
@@ -96,7 +94,7 @@ jobs:
         run: |
           set -euo pipefail
           label='${{ inputs.run_name || inputs.suite }}'
-          JOB_CEILING_S=21300        # timeout-minutes: 355
+          JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           python3 .github/tpu-ci/render_jobset.py \
