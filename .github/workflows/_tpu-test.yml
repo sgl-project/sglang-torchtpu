@@ -115,6 +115,27 @@ jobs:
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
+          # Admission control must be ON. Kueue creates a Workload per managed JobSet,
+          # labelled with the JobSet's own uid; no Workload means Kueue ignored this one and
+          # it is about to run with no gang admission at all -- which is silent, and on a
+          # multi-host slice ends as two half-placed gangs deadlocked until their deadline.
+          # Fails closed here instead: missing queue-name label, jobset framework disabled,
+          # LocalQueue in the wrong namespace, or a reverted ConfigMap all land here.
+          uid="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.metadata.uid}')"
+          wl_sel="kueue.x-k8s.io/job-uid=${uid}"
+          for _ in $(seq 1 15); do
+            [ -n "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ] && break
+            sleep 2
+          done
+          if [ -z "$(kubectl -n tpu-ci get workloads -l "$wl_sel" -o name 2>/dev/null)" ]; then
+            echo "❌ ${label}: no Kueue Workload for ${short} -- admission control is OFF."
+            echo "   Check: queue-name label on the JobSet, jobset in integrations.frameworks,"
+            echo "   and that LocalQueue $(grep -o 'queue-name: .*' /tmp/job.yaml | awk '{print $2}') exists in tpu-ci."
+            kubectl -n tpu-ci get localqueues 2>/dev/null || true
+            exit 1
+          fi
+          echo "Kueue Workload present; admission control active."
+
           # A suspended JobSet has no pods, so queue time gets its own budget rather than
           # eating the runtime one below.
           admit_s=3600
