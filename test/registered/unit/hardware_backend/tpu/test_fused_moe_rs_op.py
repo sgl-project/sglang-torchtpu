@@ -61,6 +61,9 @@ class TestFusedMoeRsOp(CustomTestCase):
                 return_value=Mock(rank=2),
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
+            patch.object(
+                fused_moe_rs_op, "_build_fused_moe_rs_gather_op"
+            ) as build_gather,
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
@@ -71,7 +74,7 @@ class TestFusedMoeRsOp(CustomTestCase):
 
         torch.testing.assert_close(
             layer._tpu_fused_rs_physical_order,
-            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64),
+            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int32),
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
@@ -82,26 +85,24 @@ class TestFusedMoeRsOp(CustomTestCase):
         self.assertIn("_tpu_fused_rs_physical_order", layer._non_persistent_buffers_set)
         self.assertIn("_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set)
         self.assertEqual(build.call_count, 2)
+        self.assertEqual(build_gather.call_count, 2)
 
-    def test_gather_reorders_tp_ranks_to_physical_device_order(self):
-        rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
+    def test_gather_uses_separate_compiled_collective(self):
         physical_order_to_tp_rank = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
-        tp_group = Mock(
-            world_size=8,
-            all_gather=Mock(return_value=rank_order_shards),
-        )
         token_shard = torch.zeros(1, 1)
+        expected = torch.arange(8).reshape(8, 1)
 
         with (
-            patch(
-                "sglang.srt.distributed.get_tp_group",
-                return_value=tp_group,
-            ),
             patch.object(
                 fused_moe_rs_op,
                 "fused_moe_rs_call",
                 return_value=token_shard,
-            ),
+            ) as call,
+            patch.object(
+                fused_moe_rs_op,
+                "fused_moe_rs_gather_call",
+                return_value=expected,
+            ) as gather_call,
         ):
             output = fused_moe_rs_op.fused_moe_rs_gather(
                 hidden_states=torch.zeros(8, 1),
@@ -120,62 +121,12 @@ class TestFusedMoeRsOp(CustomTestCase):
                 physical_order_to_tp_rank=physical_order_to_tp_rank,
             )
 
-        torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
-        tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
-
-    def test_large_gather_is_chunked_below_sparsecore_limit(self):
-        tp_size = 8
-        shard_tokens = 400
-        hidden_size = 1024
-        physical_order_to_tp_rank = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
-        token_shard = torch.zeros(shard_tokens, hidden_size, dtype=torch.bfloat16)
-
-        def gather_chunk(chunk, dim):
-            self.assertEqual(dim, 0)
-            self.assertLessEqual(
-                chunk.numel() * chunk.element_size() * tp_size,
-                2304 * 1024,
-            )
-            return torch.cat(
-                [torch.full_like(chunk, rank) for rank in range(tp_size)], dim=0
-            )
-
-        tp_group = Mock(world_size=tp_size, all_gather=Mock(side_effect=gather_chunk))
-        with (
-            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
-            patch.object(
-                fused_moe_rs_op,
-                "fused_moe_rs_call",
-                return_value=token_shard,
-            ),
-        ):
-            output = fused_moe_rs_op.fused_moe_rs_gather(
-                hidden_states=torch.zeros(
-                    tp_size * shard_tokens, hidden_size, dtype=torch.bfloat16
-                ),
-                w1=torch.empty(1),
-                w2=torch.empty(1),
-                w1_scale=torch.empty(1),
-                w2_scale=torch.empty(1),
-                topk_weights=torch.empty(1),
-                topk_ids=torch.empty(1),
-                post_expert_norm_weight=torch.empty(1),
-                group_offset=torch.empty(1),
-                topk=1,
-                activation="silu",
-                has_post_expert_norm=False,
-                fp8_direct_write=True,
-                physical_order_to_tp_rank=physical_order_to_tp_rank,
-            )
-
-        # Three payload-sized chunks are sufficient; do not round this to the
-        # next power of two and add an unnecessary collective per MoE layer.
-        self.assertEqual(tp_group.all_gather.call_count, 3)
-        expected_ranks = physical_order_to_tp_rank.repeat_interleave(shard_tokens)
-        torch.testing.assert_close(output[:, 0].float(), expected_ranks.float())
+        torch.testing.assert_close(output, expected)
+        self.assertNotIn("physical_order_to_tp_rank", call.call_args.kwargs)
+        gather_call.assert_called_once_with(token_shard, physical_order_to_tp_rank)
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
-    def test_sender_payload_tracks_logical_source_and_remote_destinations(self):
+    def test_sender_counts_are_transposed_by_physical_destination(self):
         import jax.numpy as jnp
 
         from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import (
@@ -183,18 +134,16 @@ class TestFusedMoeRsOp(CustomTestCase):
             _transpose_sender_payloads,
         )
 
-        payload = _compute_sender_payload(
+        sender_payload = _compute_sender_payload(
             jnp.asarray([0, 0, 1, 1], dtype=jnp.int32),
             jnp.asarray([0, 1, 2, 3], dtype=jnp.int32),
             expert_shard_id=jnp.int32(0),
             physical_device_id=jnp.int32(0),
             ep_size=4,
         )
-        self.assertEqual(payload.tolist(), [0, 0, 1, 0, 0])
+        self.assertEqual(sender_payload.tolist(), [0, 0, 1, 0, 0])
 
-        # Gather order is physical; receive semaphores are indexed by logical
-        # expert shard, so the leading sender ID controls the transpose.
-        all_payloads = jnp.asarray(
+        all_sender_payloads = jnp.asarray(
             [
                 [2, 5, 6, 7, 8],
                 [0, 9, 10, 11, 12],
@@ -203,8 +152,76 @@ class TestFusedMoeRsOp(CustomTestCase):
             ],
             dtype=jnp.int32,
         )
-        recv_counts = _transpose_sender_payloads(all_payloads, 1, 4)
+        recv_counts = _transpose_sender_payloads(
+            all_sender_payloads, physical_device_id=jnp.int32(1), ep_size=4
+        )
         self.assertEqual(recv_counts.tolist(), [10, 18, 6, 14])
+
+    @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+    def test_decode_routing_exchanges_exact_sender_counts(self):
+        self._configure_export_env()
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import (
+            _compute_rs_routing,
+        )
+
+        topk_indices = jnp.zeros((64, 8), dtype=jnp.int32)
+        gathered_payloads = (
+            jnp.zeros((8, 9), dtype=jnp.int32)
+            .at[:, 0]
+            .set(jnp.arange(8, dtype=jnp.int32))
+        )
+        with patch("jax.lax.all_gather", return_value=gathered_payloads) as all_gather:
+            _, _, _, peer_recv_counts = _compute_rs_routing(
+                topk_indices,
+                num_experts=160,
+                topk=8,
+                ep_size=8,
+                ep_axis_name="model",
+                physical_device_id=jnp.int32(0),
+                expert_shard_id=jnp.int32(0),
+            )
+
+        all_gather.assert_called_once()
+        self.assertEqual(peer_recv_counts.tolist(), [0] * 8)
+
+    @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
+    def test_prefill_routing_transposes_sender_counts_by_physical_destination(self):
+        self._configure_export_env()
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import (
+            _compute_rs_routing,
+        )
+
+        topk_indices = (jnp.arange(512 * 8, dtype=jnp.int32) % 160).reshape(512, 8)
+        gathered_payloads = jnp.asarray(
+            [
+                [0, 1, 2, 3, 4, 5, 6, 7, 8],
+                [1, 9, 10, 11, 12, 13, 14, 15, 16],
+                [2, 17, 18, 19, 20, 21, 22, 23, 24],
+                [3, 25, 26, 27, 28, 29, 30, 31, 32],
+                [4, 33, 34, 35, 36, 37, 38, 39, 40],
+                [5, 41, 42, 43, 44, 45, 46, 47, 48],
+                [6, 49, 50, 51, 52, 53, 54, 55, 56],
+                [7, 57, 58, 59, 60, 61, 62, 63, 64],
+            ],
+            dtype=jnp.int32,
+        )
+        with patch("jax.lax.all_gather", return_value=gathered_payloads) as all_gather:
+            _, _, _, peer_recv_counts = _compute_rs_routing(
+                topk_indices,
+                num_experts=160,
+                topk=8,
+                ep_size=8,
+                ep_axis_name="model",
+                physical_device_id=jnp.int32(1),
+                expert_shard_id=jnp.int32(0),
+            )
+
+        all_gather.assert_called_once()
+        self.assertEqual(peer_recv_counts.tolist(), [2, 10, 18, 26, 34, 42, 50, 58])
 
     @unittest.skipUnless(
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
@@ -213,8 +230,11 @@ class TestFusedMoeRsOp(CustomTestCase):
     def test_unmocked_build_fused_moe_rs_op_exports_mlir(self):
         self._configure_export_env()
         op = fused_moe_rs_op._build_fused_moe_rs_op()
+        gather_op = fused_moe_rs_op._build_fused_moe_rs_gather_op()
         self.assertIsNotNone(op)
+        self.assertIsNotNone(gather_op)
         self.assertTrue(hasattr(torch.ops.sglang_tpu_pallas, "fused_moe_rs"))
+        self.assertTrue(hasattr(torch.ops.sglang_tpu_pallas, "fused_moe_rs_gather"))
 
     @unittest.skipUnless(
         importlib.util.find_spec("torch_tpu"),
@@ -235,7 +255,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 topk_ids: torch.Tensor,
                 post_expert_norm_weight: torch.Tensor,
             ) -> torch.Tensor:
-                return fused_moe_rs_op.fused_moe_rs_call(
+                return fused_moe_rs_op.fused_moe_rs_gather(
                     hidden_states=hidden_states,
                     w1=w1,
                     w2=w2,
@@ -251,9 +271,13 @@ class TestFusedMoeRsOp(CustomTestCase):
                     activation="silu",
                     has_post_expert_norm=False,
                     fp8_direct_write=True,
+                    physical_order_to_tp_rank=torch.arange(
+                        8, dtype=torch.int32, device=hidden_states.device
+                    ),
                 )
 
         fused_moe_rs_op._build_fused_moe_rs_op()
+        fused_moe_rs_op._build_fused_moe_rs_gather_op()
         mod = FusedMoeRsModule()
         tokens = 128
         hidden_size = 6144

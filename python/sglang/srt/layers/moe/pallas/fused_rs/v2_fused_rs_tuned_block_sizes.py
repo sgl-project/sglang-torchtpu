@@ -118,6 +118,41 @@ _H2048_I768_FP8 = (128, 2048, 768, 768, 2048, 1, 1)
 _H2048_I768_BF16 = (128, 2048, 768, 768, 2048, 1, 1)
 _H6144_I2560_FP8 = (64, 6144, 2560, 2560, 2048, 1, 1)
 _H6144_I2560_BF16 = (64, 6144, 1280, 2560, 1024, 1, 1)
+# Keep every W1/W2 tile resident while consecutive tiles use the same expert.
+# A smaller M tile leaves enough VMEM for the full-N weight buffers.
+_H6144_I2560_FP8COMM = (32, 6144, 2560, 2560, 6144, 1, 1)
+
+
+def _h6144_i2560_fp8_size_dependent():
+    out = {}
+    for m_key in _ALL_M_KEYS:
+        m_val = int(m_key.split("_")[0])
+        if m_val >= 32768:
+            # Channelwise scales are small enough for full W1/W2 tiles at
+            # tm128. Retaining the complete expert avoids weight reloads
+            # without increasing the number of row tiles.
+            out[m_key] = (128, 6144, 2560, 2560, 6144, 1, 1)
+        else:
+            out[m_key] = _H6144_I2560_FP8
+    return out
+
+
+def _h6144_i2560_block_fp8_size_dependent():
+    out = {}
+    for m_key in _ALL_M_KEYS:
+        m_val = int(m_key.split("_")[0])
+        if m_val >= 65536:
+            # Full W1/W2 tiles fit at tm64. Keeping one complete expert's
+            # weights resident avoids reloading them for its later GM tiles.
+            out[m_key] = (64, 6144, 2560, 2560, 6144, 1, 1)
+        elif m_val >= 32768:
+            # This bucket has fewer rows per expert, so tm128 reduces GM
+            # overhead while still retaining the complete expert weights.
+            out[m_key] = (128, 6144, 2560, 2560, 6144, 1, 1)
+        else:
+            out[m_key] = _H6144_I2560_FP8
+    return out
+
 
 # FP4 (rhs_quant_block_size=16): weights are half FP8 → enough VMEM for
 # num_w1_bufs=2, enabling full W1 caching that FP8 couldn't afford.
@@ -423,30 +458,36 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-2048_n-1536_g-16_lhs_quant_rhs_bs-128"
                 "+k-768_n-2048_g-16_lhs_quant_rhs_bs-128"
             ): _all_m(_H2048_I768_FP8),
-            ("k-2048_n-1536_g-16_lhs_quant" "+k-768_n-2048_g-16_lhs_quant"): _all_m(
+            ("k-2048_n-1536_g-16_lhs_quant+k-768_n-2048_g-16_lhs_quant"): _all_m(
                 _H2048_I768_FP8
             ),
             # H6144-I2560: H=6144, I=2560, E=160, EP=8 -> g=20 (Qwen3-Coder-480B)
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-6144"
-            ): _all_m(_H6144_I2560_FP8),
+            ): _h6144_i2560_fp8_size_dependent(),
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
-            ): _all_m(_H6144_I2560_FP8),
+            ): _h6144_i2560_fp8_size_dependent(),
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-2560"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
-            ): _all_m(_H6144_I2560_FP8),
+            ): _h6144_i2560_fp8_size_dependent(),
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-256"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-256"
-            ): _all_m(_H6144_I2560_FP8),
-            ("k-6144_n-5120_g-20_lhs_quant" "+k-2560_n-6144_g-20_lhs_quant"): _all_m(
+            ): _h6144_i2560_block_fp8_size_dependent(),
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-128"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-128"
+            ): _h6144_i2560_block_fp8_size_dependent(),
+            ("k-6144_n-5120_g-20_lhs_quant+k-2560_n-6144_g-20_lhs_quant"): _all_m(
                 _H6144_I2560_FP8
             ),
-            ("k-6144_n-5120_g-20+k-2560_n-6144_g-20"): _all_m(_H6144_I2560_FP8),
+            (
+                "k-6144_n-5120_g-20+k-2560_n-6144_g-20"
+            ): _h6144_i2560_fp8_size_dependent(),
         },
         # ---------------------------------------------------------------------
         # FP4 (lhs bf16 × rhs fp4, rhs_quant_block_size=16)
@@ -558,17 +599,17 @@ FUSED_RS_TUNED_BLOCK_SIZES_FP8COMM = {
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-6144"
-            ): _all_m(_H6144_I2560_FP8),
+            ): _all_m(_H6144_I2560_FP8COMM),
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
-            ): _all_m(_H6144_I2560_FP8),
+            ): _all_m(_H6144_I2560_FP8COMM),
             (
                 "k-6144_n-5120_g-20_lhs_quant_rhs_bs-2560"
                 "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-2560"
-            ): _all_m(_H6144_I2560_FP8),
-            ("k-6144_n-5120_g-20_lhs_quant" "+k-2560_n-6144_g-20_lhs_quant"): _all_m(
-                _H6144_I2560_FP8
+            ): _all_m(_H6144_I2560_FP8COMM),
+            ("k-6144_n-5120_g-20_lhs_quant+k-2560_n-6144_g-20_lhs_quant"): _all_m(
+                _H6144_I2560_FP8COMM
             ),
         },
     },

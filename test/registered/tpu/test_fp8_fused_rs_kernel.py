@@ -16,7 +16,13 @@ register_tpu_ci(est_time=600, suite="stage-a-test-tpu-unit")
 
 class TestFp8FusedRsKernel(CustomTestCase):
     def _run_compiled_tp8_kernel(
-        self, *, post_expert_norm: bool, tokens: int, topk: int
+        self,
+        *,
+        post_expert_norm: bool,
+        tokens: int,
+        topk: int,
+        blockwise: bool = False,
+        block_size: int = 512,
     ):
         repo_root = Path(__file__).resolve().parents[3]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
@@ -32,6 +38,8 @@ class TestFp8FusedRsKernel(CustomTestCase):
         for name in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
             env.pop(name, None)
         env["SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM"] = str(int(post_expert_norm))
+        env["SGLANG_TPU_FUSED_RS_TEST_BLOCKWISE"] = str(int(blockwise))
+        env["SGLANG_TPU_FUSED_RS_TEST_BLOCK_SIZE"] = str(block_size)
         env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = str(tokens)
         env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
 
@@ -59,6 +67,8 @@ class TestFp8FusedRsKernel(CustomTestCase):
             result.stdout.count(f"post_norm={post_expert_norm}"),
             8,
         )
+        self.assertEqual(result.stdout.count(f"blockwise={blockwise}"), 8)
+        self.assertEqual(result.stdout.count(f"block_size={block_size}"), 8)
 
     def test_compiled_tp8_kernel_matches_reference(self):
         for post_expert_norm in (False, True):
@@ -70,6 +80,23 @@ class TestFp8FusedRsKernel(CustomTestCase):
 
     def test_compiled_tp8_kernel_pads_routed_rows(self):
         self._run_compiled_tp8_kernel(post_expert_norm=False, tokens=8, topk=1)
+
+    def test_compiled_tp8_block512_kernel_matches_reference(self):
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=8,
+            topk=1,
+            blockwise=True,
+        )
+
+    def test_compiled_tp8_block128_kernel_matches_reference(self):
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=8,
+            topk=1,
+            blockwise=True,
+            block_size=128,
+        )
 
 
 if __name__ == "__main__":

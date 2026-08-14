@@ -9,7 +9,9 @@ import torch
 from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
 _FUSED_MOE_RS_OP = None
+_FUSED_MOE_RS_GATHER_OP = None
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
+_FUSED_MOE_RS_GATHER_OP_NAME = "sglang_tpu_pallas::fused_moe_rs_gather"
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
 
 
@@ -71,7 +73,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
     physical_order_tensor = torch.tensor(
         physical_order,
-        dtype=torch.int64,
+        dtype=torch.int32,
         device=device,
     )
     try:
@@ -94,6 +96,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     )
     layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
     _build_fused_moe_rs_op()
+    _build_fused_moe_rs_gather_op()
 
 
 @functools.cache
@@ -186,9 +189,9 @@ def _build_fused_moe_rs_op():
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
         return result
 
-    # The fused kernel produces one model-axis token shard per rank. Preserve
-    # that sharding through export; marking it replicated would make JAX insert
-    # an all-gather before the explicit Torch-side gather below.
+    # Preserve the reduce-scattered token ownership through the Pallas export.
+    # Keeping the gather out of this program avoids coupling a global HLO
+    # collective to the kernel's remote-DMA synchronization.
     _FUSED_MOE_RS_OP = cpu_export_jax_op(
         _FUSED_MOE_RS_OP_NAME,
         _wrapped,
@@ -211,6 +214,52 @@ def _build_fused_moe_rs_op():
         output_partition_specs=(P("model", None),),
     )
     return _FUSED_MOE_RS_OP
+
+
+def _build_fused_moe_rs_gather_op():
+    global _FUSED_MOE_RS_GATHER_OP
+    if _FUSED_MOE_RS_GATHER_OP is not None:
+        return _FUSED_MOE_RS_GATHER_OP
+
+    import jax
+    from jax.sharding import PartitionSpec as P
+
+    from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+
+    mesh = _get_mesh()
+    ep_size = mesh.shape["model"]
+
+    def _wrapped(
+        token_shard: jax.Array,
+        physical_order_to_tp_rank: jax.Array,
+    ) -> jax.Array:
+        def _gather_local(local_shard, rank_order):
+            gathered = jax.lax.all_gather(
+                local_shard,
+                axis_name="model",
+                axis=0,
+                tiled=True,
+            )
+            local_tokens, hidden_size = local_shard.shape
+            gathered = gathered.reshape(ep_size, local_tokens, hidden_size)
+            return gathered[rank_order].reshape(ep_size * local_tokens, hidden_size)
+
+        return jax.shard_map(
+            _gather_local,
+            mesh=mesh,
+            in_specs=(P("model", None), P()),
+            out_specs=P(),
+            check_vma=False,
+        )(token_shard, physical_order_to_tp_rank)
+
+    _FUSED_MOE_RS_GATHER_OP = cpu_export_jax_op(
+        _FUSED_MOE_RS_GATHER_OP_NAME,
+        _wrapped,
+        mesh=mesh,
+        input_partition_specs=(P("model", None), P()),
+        output_partition_specs=(P(),),
+    )
+    return _FUSED_MOE_RS_GATHER_OP
 
 
 def fused_moe_rs_call(
@@ -246,6 +295,16 @@ def fused_moe_rs_call(
     )
 
 
+def fused_moe_rs_gather_call(
+    token_shard: torch.Tensor,
+    physical_order_to_tp_rank: torch.Tensor,
+) -> torch.Tensor:
+    return _build_fused_moe_rs_gather_op()(
+        token_shard,
+        physical_order_to_tp_rank,
+    )
+
+
 @spmd_safe
 def fused_moe_rs_gather(
     *,
@@ -264,8 +323,6 @@ def fused_moe_rs_gather(
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
 ) -> torch.Tensor:
-    from sglang.srt.distributed import get_tp_group
-
     token_shard = fused_moe_rs_call(
         hidden_states=hidden_states,
         w1=w1,
@@ -281,26 +338,5 @@ def fused_moe_rs_gather(
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
     )
-
-    shard_tokens = token_shard.shape[0]
-    hidden_size = token_shard.shape[1]
-    bytes_per_token = hidden_size * token_shard.element_size()
-    tp_size = physical_order_to_tp_rank.shape[0]
-
-    # Keep the complete gather below the 2.5 MiB SparseCore scratchpad limit,
-    # with 256 KiB of headroom. Compute chunks from whole token rows instead of
-    # rounding their count to a power of two.
-    max_chunk_size = (2304 * 1024) // tp_size
-    max_chunk_tokens = max(1, max_chunk_size // bytes_per_token)
-    num_chunks = max(1, (shard_tokens + max_chunk_tokens - 1) // max_chunk_tokens)
-
-    tp_group = get_tp_group()
-    gathered_chunks = []
-    for chunk in token_shard.chunk(num_chunks, dim=0):
-        gathered_chunk = tp_group.all_gather(chunk, dim=0)
-        gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], -1)[
-            physical_order_to_tp_rank
-        ].contiguous()
-        gathered_chunks.append(gathered_chunk)
-    output = torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)
+    output = fused_moe_rs_gather_call(token_shard, physical_order_to_tp_rank)
     return output[: hidden_states.shape[0]]

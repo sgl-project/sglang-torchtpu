@@ -115,9 +115,9 @@ def _compute_rs_routing(
     lhs_indices = (topk_argsort_indices // topk).astype(jnp.int32)
     topk_slot_indices = (topk_argsort_indices % topk).astype(jnp.int32)
 
-    # Each rank counts the rows produced by its local experts, then exchanges
-    # one compact payload. Receive semaphore slots follow logical expert-shard
-    # IDs; physical IDs are used only for remote-copy destinations.
+    # Exchange each sender's actual counts instead of assuming the routing
+    # tensors are bit-identical on every rank. Receive semaphore slots follow
+    # logical expert-shard IDs; destinations use physical device IDs.
     num_experts_per_shard = num_experts // ep_size
     sorted_experts = topk_indices_flat[topk_argsort_indices]
     source_ep_ranks = (sorted_experts // num_experts_per_shard).astype(jnp.int32)
@@ -201,17 +201,12 @@ def moe_gmm_local_rs_nodedup(
     output_indices = (lhs_indices * topk + topk_slot_indices).astype(jnp.int32)
     size_m = lhs_indices.shape[0]
 
-    # Compute local row range [local_start, local_end) without per-row source
-    # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
-    expert_idx = jnp.arange(num_experts, dtype=jnp.int32)
-    local_start = jnp.sum(jnp.where(expert_idx < go_val, group_sizes, 0))
-    local_end = local_start + jnp.sum(
-        jnp.where(
-            (expert_idx >= go_val) & (expert_idx < go_val + num_local_experts),
-            group_sizes,
-            0,
-        )
+    # Compute the local row start without per-row source materialization.
+    # Avoids the heavy ``jnp.repeat -> scatter_add``.
+    group_row_offsets = jnp.concatenate(
+        [jnp.zeros((1,), dtype=jnp.int32), jnp.cumsum(group_sizes)]
     )
+    local_start = group_row_offsets[go_val]
     # Static loop bound — kernel pads with ``is_active`` gating.
     #
     # ``tile_m`` MUST match the value the kernel picks internally (via
@@ -262,13 +257,35 @@ def moe_gmm_local_rs_nodedup(
         tile_m,
         size_m,
     )
-    local_group_sizes = jax.lax.dynamic_slice(
-        group_sizes, (go_val,), (num_local_experts,)
-    )
-    local_num_gm = compute_num_gm(
-        local_group_sizes, tile_m, size_lhs_sublane, start_offset=local_start
-    )
-    max_num_gm = jax.lax.pmax(local_num_gm, axis_name=ep_axis_name)
+    if size_m <= 2048:
+        # A static per-shard upper bound avoids one cross-chip pmax in every
+        # decode MoE layer. Each local expert can add at most one partial tile;
+        # the remaining tiles are bounded by the total routed rows.
+        max_num_gm = jnp.asarray(
+            num_local_experts + (size_m + tile_m - 1) // tile_m - 1,
+            dtype=jnp.int32,
+        )
+    else:
+        # Routing is replicated, so compute the exact global maximum locally
+        # instead of paying for one pmax collective in every prefill MoE layer.
+        shard_num_gms = []
+        for shard_id in range(ep_size):
+            shard_group_offset = shard_id * num_local_experts
+            shard_start = group_row_offsets[shard_group_offset]
+            shard_group_sizes = jax.lax.dynamic_slice(
+                group_sizes,
+                (shard_group_offset,),
+                (num_local_experts,),
+            )
+            shard_num_gms.append(
+                compute_num_gm(
+                    shard_group_sizes,
+                    tile_m,
+                    size_lhs_sublane,
+                    start_offset=shard_start,
+                )
+            )
+        max_num_gm = jnp.max(jnp.stack(shard_num_gms))
 
     out_buf = gmm_v2_fused_rs_nodedup(
         hidden_states_local,
@@ -381,8 +398,9 @@ def expert_parallel_gmm_rs(
     ep_p_spec = P(expert_axis)
     ep_2d_spec = P(expert_axis, None)
     data_p_spec = P(MLP_DATA)
-    # SGLang enters this kernel with replicated tokens and gathers the returned
-    # expert-axis token shard in the Torch wrapper.
+    # SGLang enters this kernel with replicated tokens. Preserve the fused
+    # kernel's expert-axis output shard through export; the wrapper reconstructs
+    # the replicated model output with a separate compiled gather operation.
     sp_enabled = False
     hidden_in_spec = data_p_spec if sp_enabled else P()
     moe_out_spec = (
@@ -423,13 +441,12 @@ def expert_parallel_gmm_rs(
     else:
         # Ensure 2D (ep_size, 2)
         if group_offset_input.ndim == 1:
-            group_offset = jnp.stack(
-                [
-                    group_offset_input,
-                    jnp.arange(ep_size, dtype=jnp.int32),
-                ],
-                axis=-1,
-            )
+            if group_offset_input.size != ep_size * 2:
+                raise ValueError(
+                    "flat group_offset must contain one (expert, physical) pair "
+                    f"per EP rank, got {group_offset_input.shape} for EP={ep_size}"
+                )
+            group_offset = group_offset_input.reshape(ep_size, 2)
         else:
             group_offset = group_offset_input
     w1_scale_spec = None if w1_scale is None else ep_p_spec
@@ -445,6 +462,7 @@ def expert_parallel_gmm_rs(
         if post_expert_norm_weight is not None
         else jnp.zeros((1,), jnp.bfloat16)
     )
+
     result = jax.shard_map(
         functools.partial(
             _MOE_GMM_LOCAL_RS,
@@ -474,7 +492,7 @@ def expert_parallel_gmm_rs(
         ),
         out_specs=moe_out_spec,
         # SP on: token sharded over data plus the runtime expert axes;
-        # SP off: replicated.
+        # SP off: token sharded over the expert axis.
         check_vma=False,
     )(
         hidden_states,

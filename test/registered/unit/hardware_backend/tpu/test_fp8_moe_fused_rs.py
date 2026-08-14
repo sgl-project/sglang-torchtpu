@@ -60,6 +60,9 @@ class TestFp8MoeFusedRs(CustomTestCase):
     def test_accepts_validated_ep_equals_tp_layout(self):
         self.assertTrue(self._supported())
 
+    def test_accepts_block_quantized_weights(self):
+        self.assertTrue(self._supported(block_quantized=True))
+
     def test_rejects_pipeline_parallel_layout(self):
         self.assertEqual(
             fp8_fused_rs_unsupported_reason(**self._config(pp_size=2, world_size=16)),
@@ -73,7 +76,6 @@ class TestFp8MoeFusedRs(CustomTestCase):
             {"world_size": 16},
             {"reduction_compatible": False},
             {"attn_dp_size": 2},
-            {"block_quantized": True},
             {"gated": False},
             {"activation": "gelu"},
             {"apply_router_weight_on_input": True},
@@ -145,9 +147,10 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
         torch.testing.assert_close(actual.hidden_states, torch.ones_like(x))
         fused_moe_rs.assert_called_once()
+        self.assertFalse(fused_moe_rs.call_args.kwargs["fp8_direct_write"])
 
     def test_small_route_uses_one_fused_rs_launch(self):
-        tokens, hidden = 256, 4
+        tokens, hidden = 64, 4
         x = torch.zeros(tokens, hidden)
         dispatch_output = SimpleNamespace(
             hidden_states=x,
@@ -178,6 +181,44 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
         torch.testing.assert_close(actual.hidden_states, torch.ones_like(x))
         fused_moe_rs.assert_called_once()
+        self.assertFalse(fused_moe_rs.call_args.kwargs["fp8_direct_write"])
+
+    def test_blockwise_path_passes_scale_inv_to_fused_kernel(self):
+        tokens, hidden = 8, 4
+        x = torch.zeros(tokens, hidden)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, 1),
+                torch.zeros(tokens, 1, dtype=torch.int32),
+                None,
+            ),
+        )
+        w13_scale_inv = torch.ones(1, 1, 1, 8)
+        w2_scale_inv = torch.ones(1, 1, 1, 4)
+        layer = SimpleNamespace(
+            weight_block_size=[1, 512],
+            w13_weight=torch.zeros(1, 4, 8),
+            w2_weight=torch.zeros(1, 4, 4),
+            w13_weight_scale_inv=w13_scale_inv,
+            w2_weight_scale_inv=w2_scale_inv,
+            _tpu_fused_rs_physical_order=torch.arange(8),
+            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+        )
+
+        with patch(
+            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            return_value=torch.zeros_like(x),
+        ) as fused:
+            actual = apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+
+        self.assertEqual(actual.hidden_states.shape, x.shape)
+        self.assertIs(fused.call_args.kwargs["w1_scale"], w13_scale_inv)
+        self.assertIs(fused.call_args.kwargs["w2_scale"], w2_scale_inv)
 
     def test_padded_routed_rows_include_topk(self):
         padded_tokens = fused_moe_rs_padded_tokens(682, topk=3, ep_size=8)
