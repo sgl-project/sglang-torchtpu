@@ -1009,10 +1009,10 @@ class TestTpuReshardingProtocol(CustomTestCase):
                 )
         self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
 
-        # The replica arriving afterwards is deduped: prefill always sends, but
-        # decode drops it (never enqueued) instead of a redundant re-scatter.
+        # The replica arriving afterwards is deduped at prefill, so no redundant
+        # message is sent or enqueued for a second scatter.
+        self.assertTrue(info1.if_skip_sending)
         p1.gather_and_push(room, src_pages, 0, True, aux_index=6)
-        decode._handle_kvdata_ch(decode.server_socket.recv_multipart())
         with decode.decode_pending_lock:
             self.assertEqual(len(decode.decode_pending[room]), 0)
         decode.process_decode_pending(room)
