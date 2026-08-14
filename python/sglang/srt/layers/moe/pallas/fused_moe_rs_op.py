@@ -460,6 +460,7 @@ def _register_fused_moe_rs_op(
         chunk_size = (num_tokens + ep_size - 1) // ep_size
         return result[:chunk_size]
 
+    # Bridge the JAX kernel into Torch with model-sharded weights and output.
     custom_op = cpu_export_jax_op(
         op_name,
         _wrapped,

@@ -47,6 +47,8 @@ from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
 )
 from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 
+# TODO(rupliu) when the model is small, latency bound, needs to increase pipeline depth
+
 _IN_KERNEL_RECV_COUNT_MAX_M = 2048
 
 # =============================================================================
@@ -515,6 +517,16 @@ def kernel_main_fused_rs(
         sync_barrier_signal()
         sync_barrier_wait()
 
+    # Zero-init the output buffer (which is ALSO the ICI DMA landing pad for
+    # peers) and WAIT for it BEFORE signaling the entry barrier. A peer only
+    # issues its remote writes after its DEFERRED barrier wait releases, and
+    # that wait cannot release until every chip has signaled -- i.e. after every
+    # chip has finished zeroing. Ordering the zero-init ahead of the signal
+    # therefore guarantees no remote write lands in an out_buf that is still
+    # being zeroed. Previously the signal came first and the async zero-init
+    # raced incoming ICI writes: a received row was nondeterministically
+    # overwritten with 0, dropping one expert's contribution -> wrong output
+    # and greedy-decode divergence.
     zero_src = (
         scatter_fp8_staging_3x_ref.at[0]
         if fp8_direct_write
@@ -1166,6 +1178,9 @@ def kernel_main_fused_rs(
 
             @jax.named_scope("direct_write_ici")
             def _do_direct_write():
+                # Quantize each completed expert row before the direct
+                # write. Remote ICI then moves FP8 payload plus one
+                # fp32 row scale instead of the full bf16 activation row.
                 if fp8_direct_write:
                     # Vectorized tile-level FP8 quantization across the static tile_m on VPU in parallel!
                     tile_f32 = scatter_staging_3x_ref[stg_id, :, :, :].astype(
@@ -1451,6 +1466,8 @@ def kernel_main_fused_rs(
     # local-write semaphores are drained.
     sync_barrier()
 
+    # Drain recv_sem — each incoming remote DMA incremented it by 1.
+    # Must be zero before kernel exit (Mosaic requirement).
     with jax.named_scope("drain_recv_sem"):
         pltpu.make_async_copy(
             src_ref=out_buf_ref.at[pl.ds(0, total_recv), :, :],
@@ -2116,7 +2133,11 @@ def gmm_v2_fused_rs(
                 [jnp.sum(to_this_chip_remote.astype(jnp.int32))], dtype=jnp.int32
             )
 
-    # Output buffer — stores arriving rows for this chip: (output_size * top_k, n2_cols, num_lanes).
+    # Output buffer — also serves as ICI DMA target. In the FP8 direct-write
+    # path this stores quantized payload rows; row scales are returned as a
+    # second output and dequantized immediately after the kernel.
+    # TPU VMEM vector slices must be tile-aligned. Store the scalar row scale
+    # as a padded 128-wide row and use column 0 when dequantizing.
     output_tokens_per_chip = max(chunk_size, 1)
     out_m = output_tokens_per_chip * top_k
     payload_dtype = jnp.float8_e4m3fn if fp8_direct_write else out_dtype

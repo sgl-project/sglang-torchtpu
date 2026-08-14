@@ -25,7 +25,12 @@ EXPERT = "model"
 # SMEM safety guard
 # ============================================================================
 
-# ``gmm_v2_fused_rs`` SMEM budget (v7x): ~1.0 MB.
+# ``gmm_v2_fused_rs`` SMEM budget (v7x): ~1.0 MB. Per-row scalar-prefetch
+# arrays (``lhs_indices``, ``output_indices``, ``topk_weights``, etc.) scale
+# with ``size_m`` as ``4 * size_m`` bytes each, so at ``m = 262144`` the
+# kernel overflows SMEM by ~40 KB. We guard at ``m >= 262144`` (empirical
+# OOM threshold); callers hitting this must reduce ``max-num-batched-tokens``,
+# switch to ``gmm_ep_dma`` / ``gmm_ep_original``, or shard more (tp>1).
 _FUSED_RS_MAX_SAFE_SIZE_M = 262144
 
 
@@ -189,12 +194,15 @@ def moe_gmm_local_rs_nodedup(
     out_3d = out_buf.reshape(chunk_size, topk, hidden_size)
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
     if post_expert_norm_weight is not None:
-        norm_size = post_expert_norm_weight.shape[0]
+        norm_size = post_expert_norm_weight.shape[0]  # actual hidden_size (unpadded)
         pnw_raw = post_expert_norm_weight.astype(jnp.float32) + 1.0
+        # Handle padded hidden: out_3d may have padded_hidden_size > norm_size
         if hidden_size > norm_size:
             col_idx = jnp.arange(hidden_size, dtype=jnp.int32)
+            # Zero out padded columns so they don't affect variance
             valid_mask = (col_idx < norm_size)[None, None, :]
             out_f32 = out_3d.astype(jnp.float32) * valid_mask
+            # Pad PNW to match hidden_size
             pnw = jnp.concatenate(
                 [pnw_raw, jnp.zeros(hidden_size - norm_size, dtype=jnp.float32)]
             )
@@ -202,9 +210,11 @@ def moe_gmm_local_rs_nodedup(
             out_f32 = out_3d.astype(jnp.float32)
             pnw = pnw_raw
         out_f32 = out_f32 * pnw[None, None, :]
+        # Variance computed only over valid (unpadded) elements
         var = jnp.sum(out_f32**2, axis=-1, keepdims=True) / norm_size
         out_3d = (out_f32 * jax.lax.rsqrt(var + 1e-8)).astype(out_3d.dtype)
 
+    # Post-kernel: apply topk weights and reduce over top_k.
     output_size = max(chunk_size, 1)
     logical_rank = go_val // num_local_experts
     my_token_start = logical_rank * output_size
@@ -213,11 +223,14 @@ def moe_gmm_local_rs_nodedup(
     my_weights = (
         topk_weights
         if sp_enabled
+        # SP off: topk_weights is replicated; slice this chip's [chunk_size]
+        # shard to match out_3d (SP on already passes the local shard).
         else jax.lax.dynamic_slice_in_dim(
             topk_weights, clamped_token_start, output_size, axis=0
         )
     )
 
+    # Return the per-chip token shard (reduce-scattered output).
     return jnp.sum(out_3d * my_weights[:, :, None], axis=1).astype(
         hidden_states_local.dtype
     )
