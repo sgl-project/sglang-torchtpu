@@ -83,12 +83,16 @@ spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
   resourceGroups:
-    - coveredResources: ["google.com/tpu"]
+    - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
         - name: tpu7x-2x2x1-pr-gate
           resources:
             - name: "google.com/tpu"
               nominalQuota: 12
+            - name: "cpu"
+              nominalQuota: 12
+            - name: "memory"
+              nominalQuota: 96Gi
 ---
 # pr-gate 2-host: one slice = 8 chips = one concurrent job. No headroom possible: a 2-host
 # job needs exactly 8, so any lower value admits nothing.
@@ -100,12 +104,16 @@ spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
   resourceGroups:
-    - coveredResources: ["google.com/tpu"]
+    - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
         - name: tpu7x-2x2x2-pr-gate
           resources:
             - name: "google.com/tpu"
               nominalQuota: 8
+            - name: "cpu"
+              nominalQuota: 8
+            - name: "memory"
+              nominalQuota: 64Gi
 ---
 # nightly 1-host: 2 nodes x 4 = 8. Taken at full capacity rather than under-stated -- at two
 # nodes, one node of headroom would cost half the lane. waitForPodsReady absorbs the drift
@@ -118,12 +126,16 @@ spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
   resourceGroups:
-    - coveredResources: ["google.com/tpu"]
+    - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
         - name: tpu7x-2x2x1-nightly
           resources:
             - name: "google.com/tpu"
               nominalQuota: 8
+            - name: "cpu"
+              nominalQuota: 8
+            - name: "memory"
+              nominalQuota: 64Gi
 ---
 # nightly 2-host: one slice. A second 2-host slice = new pool + new flavor + one more entry
 # in this flavors list; no workflow change.
@@ -135,12 +147,16 @@ spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
   resourceGroups:
-    - coveredResources: ["google.com/tpu"]
+    - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
         - name: tpu7x-2x2x2-nightly
           resources:
             - name: "google.com/tpu"
               nominalQuota: 8
+            - name: "cpu"
+              nominalQuota: 8
+            - name: "memory"
+              nominalQuota: 64Gi
 ---
 # nightly 4-host: one slice = 16 chips. Exact, same reason as the 2-host queues.
 apiVersion: kueue.x-k8s.io/v1beta2
@@ -151,12 +167,16 @@ spec:
   namespaceSelector: {}
   queueingStrategy: BestEffortFIFO
   resourceGroups:
-    - coveredResources: ["google.com/tpu"]
+    - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
         - name: tpu7x-2x2x4-nightly
           resources:
             - name: "google.com/tpu"
               nominalQuota: 16
+            - name: "cpu"
+              nominalQuota: 16
+            - name: "memory"
+              nominalQuota: 128Gi
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: LocalQueue
