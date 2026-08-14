@@ -194,6 +194,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
+        out_indices_cpu: torch.Tensor = None,
     ):
         assert self.page_size > 1
 
@@ -205,6 +206,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
+        full_alloc_kwargs = {"num_new_pages": num_new_pages}
+        if out_indices_cpu is not None:
+            # TPU speculative decoding preallocates this host output buffer.
+            # Only the full-attention locations are returned to the caller;
+            # the SWA allocator needs its own independently populated indices.
+            assert _is_tpu
+            full_alloc_kwargs["out_indices_cpu"] = out_indices_cpu
+
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -212,7 +221,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
-            num_new_pages=num_new_pages,
+            **full_alloc_kwargs,
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             prefix_lens,

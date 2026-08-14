@@ -7,7 +7,7 @@ last partial page. Fix replaces with get_num_new_pages-based gating.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -66,6 +66,34 @@ def _call(stub, *, prefix_lens_cpu, seq_lens_cpu, extend_num_tokens):
 
 
 class TestSWAAllocExtendPageEstimation(CustomTestCase):
+    def test_tpu_host_output_buffer_is_forwarded_to_full_allocator_only(self):
+        stub = _make_self(page_size=8, full_available=16, swa_available=16)
+        prefix = torch.tensor([7, 7], dtype=torch.int64)
+        seq = torch.tensor([8, 8], dtype=torch.int64)
+        out_indices_cpu = torch.empty(2, dtype=torch.int32)
+
+        with patch("sglang.srt.mem_cache.allocator.swa._is_tpu", True):
+            result = SWATokenToKVPoolAllocator.alloc_extend(
+                stub,
+                prefix_lens=prefix,
+                prefix_lens_cpu=prefix,
+                seq_lens=seq,
+                seq_lens_cpu=seq,
+                last_loc=prefix - 1,
+                extend_num_tokens=2,
+                out_indices_cpu=out_indices_cpu,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertIs(
+            stub.full_attn_allocator.alloc_extend.call_args.kwargs["out_indices_cpu"],
+            out_indices_cpu,
+        )
+        self.assertNotIn(
+            "out_indices_cpu",
+            stub.swa_attn_allocator.alloc_extend.call_args.kwargs,
+        )
+
     def test_zero_new_pages_must_succeed(self):
         # Old: 2 + 2*8 = 18 > 16 -> would refuse.
         # New: prefix 5 -> 6 stays in page 0, 0 new pages.
