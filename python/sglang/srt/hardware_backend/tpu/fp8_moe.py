@@ -15,16 +15,13 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import print_warning_once
 
 
@@ -350,8 +347,8 @@ def apply_tpu_fp8_moe(
 
     global_num_experts = 0
     expert_group_offset = 0
-    ep_size = get_moe_expert_parallel_world_size()
-    ep_rank = get_moe_expert_parallel_rank()
+    ep_size = get_parallel().moe_ep_size
+    ep_rank = get_parallel().moe_ep_rank
     if ep_size > 1:
         global_num_experts = layer.num_local_experts * ep_size
         expert_group_offset = ep_rank * layer.num_local_experts

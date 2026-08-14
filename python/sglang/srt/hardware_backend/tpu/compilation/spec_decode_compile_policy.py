@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 import tqdm
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
@@ -28,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -184,7 +184,7 @@ class SpecDecodeCompilePolicyMixin:
                 desc="Compiling TARGET_VERIFY",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else bs_buckets
         )
         for bs in compile_range:
@@ -201,7 +201,7 @@ class SpecDecodeCompilePolicyMixin:
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self._make_verify_spec_info(),
             )
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
@@ -229,7 +229,7 @@ class SpecDecodeCompilePolicyMixin:
                 desc="Compiling EXTEND(FULL)",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else valid_shapes
         )
         for num_tokens, bs in compile_range:
@@ -242,7 +242,7 @@ class SpecDecodeCompilePolicyMixin:
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self._make_null_spec_info(),
             )
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
@@ -294,14 +294,14 @@ class SpecDecodeCompilePolicyMixin:
     ) -> None:
         compile_range = (
             tqdm.tqdm(items, desc=f"Compiling {desc}", bar_format=_COMPILE_BAR_FORMAT)
-            if get_tensor_model_parallel_rank() == 0
+            if get_parallel().tp_rank == 0
             else items
         )
         for item in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             shape_desc = run(item)
-            if get_tensor_model_parallel_rank() == 0:
+            if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_str = _hbm_delta_str(hbm_before, _get_hbm_usage_mb())
                 compile_range.set_description(

@@ -46,7 +46,7 @@ def fmt_bytes(n: float) -> str:
 class _TraceSpan:
     """Trace span objects. Use slots for minimum memory consumption."""
 
-    __slots__ = ("name", "args")
+    __slots__ = ("args", "name")
 
     def __init__(self, name: str, **kwargs):
         self.name = name

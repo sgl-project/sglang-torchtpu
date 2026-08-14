@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Type
 
 import torch
 
@@ -18,6 +18,7 @@ from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.server_args import ServerArgs
 
 logger = get_logger(__name__)
@@ -73,6 +74,8 @@ class TpuSRTPlatform(SRTPlatform):
     # ------------------------------------------------------------------
 
     def apply_server_args_defaults(self, server_args: ServerArgs) -> None:
+        # Pre-publish resolution writes go through declare_late_resolution.
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
@@ -88,15 +91,19 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         if server_args.dtype is None or server_args.dtype == "auto":
-            server_args.override("tpu.apply_server_args_defaults", dtype="bfloat16")
+            declare_late_resolution(
+                server_args, "tpu.apply_server_args_defaults", dtype="bfloat16"
+            )
 
         if server_args.attention_backend is None:
-            server_args.override(
+            declare_late_resolution(
+                server_args,
                 "tpu.apply_server_args_defaults",
                 attention_backend=self.get_default_attention_backend(),
             )
 
-        server_args.override(
+        declare_late_resolution(
+            server_args,
             "tpu.apply_server_args_defaults",
             disable_cuda_graph=True,
             disable_piecewise_cuda_graph=True,
@@ -113,8 +120,8 @@ class TpuSRTPlatform(SRTPlatform):
         # ``--disable-overlap-schedule``.
 
         if server_args.mem_fraction_static is None:
-            server_args.override(
-                "tpu.apply_server_args_defaults", mem_fraction_static=0.40
+            declare_late_resolution(
+                server_args, "tpu.apply_server_args_defaults", mem_fraction_static=0.40
             )
 
         # raiden's load-back keeps the reloaded prefix's slot indices on CPU
@@ -173,7 +180,9 @@ class TpuSRTPlatform(SRTPlatform):
                 )
 
         if server_args.page_size is None:
-            server_args.override("tpu.apply_server_args_defaults", page_size=64)
+            declare_late_resolution(
+                server_args, "tpu.apply_server_args_defaults", page_size=64
+            )
 
     # ------------------------------------------------------------------
     # Subsystem factory methods
@@ -205,6 +214,23 @@ class TpuSRTPlatform(SRTPlatform):
 
         return TpuGraphRunner
 
+    def get_quantization_config(
+        self, quantization: str
+    ) -> Optional[Type[QuantizationConfig]]:
+        if quantization == "modelopt_fp4":
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                TpuModelOptCompatibleFp4Config,
+            )
+
+            return TpuModelOptCompatibleFp4Config
+        if quantization == "modelopt_mixed":
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                TpuModelOptMixedPrecisionConfig,
+            )
+
+            return TpuModelOptMixedPrecisionConfig
+        return None
+
     def get_mha_kv_pool_cls(self) -> type:
         # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
         # read the flat MHATokenToKVPool. Pick per the resolved attention backend
@@ -225,6 +251,13 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
         return MHATokenToKVPool
+
+    def get_mamba_pool_cls(self) -> type:
+        # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state
+        # in a TPU-native, Pallas-kernel-layout pool.
+        from sglang.srt.hardware_backend.tpu.mamba_pool import TpuMambaPool
+
+        return TpuMambaPool
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
         from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
@@ -255,9 +288,9 @@ class TpuSRTPlatform(SRTPlatform):
         # pallas_tpu_mla uses the paged fused latent layout the MLA v2 kernel
         # addresses; other backends (torch_native reference) keep the flat
         # upstream pool.
-        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.runtime_context import get_exec
 
-        if get_server_args().attention_backend == "pallas_tpu_mla":
+        if get_exec().kernel.attention_backend == "pallas_tpu_mla":
             from sglang.srt.hardware_backend.tpu.kv_pool import (
                 TpuFusedMLATokenToKVPool,
             )
@@ -294,7 +327,7 @@ class TpuSRTPlatform(SRTPlatform):
     def supports_fp8(self) -> bool:
         return False
 
-    def is_pin_memory_available(self) -> bool:
+    def is_pin_memory_available(self, device=None) -> bool:
         return False
 
     def support_cuda_graph(self) -> bool:
@@ -393,8 +426,8 @@ class TpuSRTPlatform(SRTPlatform):
         free, total = torch.accelerator.get_memory_info(device)
         return float(total - free)
 
-    def get_device(self, local_rank: int) -> torch.device:
-        return torch.device("tpu", local_rank)
+    def get_device(self, device_id: int = 0) -> torch.device:
+        return torch.device("tpu", device_id)
 
     def set_device(self, device: torch.device) -> None:
         torch.tpu.set_device(device)

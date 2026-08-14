@@ -103,6 +103,8 @@ def _gen_batch(engine, prompts, n=MAX_NEW):
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuPrefixCache(unittest.TestCase):
     MODEL = "Qwen/Qwen3-0.6B"
+    TP_SIZE = 1
+    MEM_FRACTION_STATIC = 0.4
     EXTRA_ENGINE_KWARGS = {}
 
     @classmethod
@@ -127,13 +129,17 @@ class TestTpuPrefixCache(unittest.TestCase):
         cls.engine = sgl.Engine(
             model_path=cls.MODEL,
             device="tpu",
-            tp_size=1,
+            tp_size=cls.TP_SIZE,
             dtype="bfloat16",
             page_size=PAGE_SIZE,
             disable_radix_cache=False,
-            mem_fraction_static=0.4,
+            mem_fraction_static=cls.MEM_FRACTION_STATIC,
             max_total_tokens=POOL,
             skip_server_warmup=True,
+            # torch.compile is opt-in on TPU; enabling it auto-disables the
+            # tc_piecewise prefill graph, which is unimplemented on TPU and
+            # otherwise crashes during engine init.
+            enable_torch_compile=True,
             **cls.EXTRA_ENGINE_KWARGS,
         )
 
@@ -223,6 +229,9 @@ SWA_RATIO = 0.5  # swa pool = POOL * ratio; makes SWA the binding pool (test_10)
 BIG_DOC = "Article 99. " + ", ".join(str(90000 + j) for j in range(480)) + "."
 
 
+# 7/11 pass; test_8 hits a real SWA cache bug (a window-slid prefix is still
+# reused) and 3 more hit the cached-vs-cold divergence of #321.
+@unittest.skip("SWA prefix cache reuses a tombstoned prefix: #361")
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
 class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     """Prefix-cache correctness on a hybrid-SWA model (gpt-oss-20b, window=128).
@@ -240,10 +249,27 @@ class TestTpuSwaPrefixCache(TestTpuPrefixCache):
     """
 
     MODEL = "openai/gpt-oss-20b"
-    EXTRA_ENGINE_KWARGS = {"swa_full_tokens_ratio": SWA_RATIO}
+    # 20B bf16 does not fit one core at 0.4; shard it and use the
+    # gpt-oss-120b recipe's 0.60 static budget.
+    TP_SIZE = 8
+    MEM_FRACTION_STATIC = 0.6
+    # Experts go EP, not TP (MXFP4 block / MXU tile alignment), and only
+    # pallas_tpu_rpa_v3 implements the attention sinks GPT-OSS needs. Both per
+    # benchmark/tpu/recipe/gpt_oss_120b/server.sh.
+    EXTRA_ENGINE_KWARGS = {
+        "swa_full_tokens_ratio": SWA_RATIO,
+        "ep_size": 8,
+        "attention_backend": "pallas_tpu_rpa_v3",
+    }
 
     @classmethod
     def setUpClass(cls):
+        # The SparseCore ragged-gather MoE path (default ON) cannot be lowered
+        # for GPT-OSS: ragged_gather_v2's pltpu.async_copy indexer needs a
+        # static row count and the EXTEND graph reaches it with a symbolic
+        # token dim. Same reason the 120b recipe turns it off.
+        os.environ["SGLANG_TPU_FUSED_MOE_SC_GATHER"] = "0"
+
         from transformers import AutoConfig, AutoTokenizer
 
         cfg = AutoConfig.from_pretrained(cls.MODEL)

@@ -9,6 +9,10 @@ import torch
 from jax import tree_util
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
+    EagleDraftInput,
+)
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,6 +47,27 @@ class _Model(torch.nn.Module):
         self.state_alias = self.state
 
 
+class _ModelWithRegisteredAlias(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2))
+        self.register_buffer("weight_alias", self.weight, persistent=False)
+        self.register_buffer("second_weight_alias", self.weight, persistent=False)
+
+
+class _ObjectWithTensorState:
+    def __init__(self, value, weight_alias):
+        self.value = value
+        self.weight_alias = weight_alias
+
+
+class _ModelWithObjectTensorState(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2))
+        self.object_state = _ObjectWithTensorState(torch.full((2,), 2.0), self.weight)
+
+
 class _KVPool:
     def __init__(self, value):
         self.value = value
@@ -55,6 +80,161 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
+        model = _ModelWithObjectTensorState()
+        original_value = model.object_state.value
+        original_alias = model.object_state.weight_alias
+        traced_state = []
+
+        def fn(value):
+            traced_state.append(
+                (
+                    model.weight,
+                    model.object_state.value,
+                    model.object_state.weight_alias,
+                )
+            )
+            return (
+                value
+                + model.weight
+                + model.object_state.value
+                + model.object_state.weight_alias
+            )
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+            model_extra_tensor_attrs=(
+                "object_state.value",
+                "object_state.weight_alias",
+            ),
+        )
+        compiler = direct_compile.tpu_torch_compile
+        value = torch.zeros(2)
+        result = torch.full((2,), 6.0)
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda item: isinstance(item, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(compiler, "build_mlir", return_value="module"),
+            patch.object(compiler, "compile_mlir", return_value="executable"),
+            patch.object(compiler, "execute", return_value=[result]) as execute,
+        ):
+            output = compiled(value)
+
+        self.assertTrue(torch.equal(output, result))
+        traced_weight, traced_value, traced_alias = traced_state[0]
+        self.assertIsNot(traced_weight, model.weight)
+        self.assertIsNot(traced_value, original_value)
+        self.assertIs(traced_alias, traced_weight)
+        self.assertIs(model.object_state.value, original_value)
+        self.assertIs(model.object_state.weight_alias, original_alias)
+        runtime_inputs = execute.call_args.args[1]
+        self.assertEqual(len(runtime_inputs), 3)
+        self.assertIs(runtime_inputs[0], model.weight)
+        self.assertIs(runtime_inputs[1], original_value)
+        self.assertIs(runtime_inputs[2], value)
+
+    def test_model_extra_tensor_attrs_require_model_and_tensor_values(self):
+        with self.assertRaisesRegex(ValueError, "requires model"):
+            direct_compile.direct_compile(
+                lambda value: value,
+                specialization_key=lambda value: tuple(value.shape),
+                model_extra_tensor_attrs=("state.value",),
+            )
+
+        model = _ModelWithObjectTensorState()
+        model.object_state.not_a_tensor = "static"
+        compiled = direct_compile.direct_compile(
+            lambda value: value,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+            model_extra_tensor_attrs=("object_state.not_a_tensor",),
+        )
+        with self.assertRaisesRegex(TypeError, "not Tensor"):
+            compiled(torch.ones(2))
+
+    def test_registered_tensor_aliases_are_traced(self):
+        model = _ModelWithRegisteredAlias()
+        traced_state = []
+
+        def fn(value):
+            traced_state.append(
+                (model.weight, model.weight_alias, model.second_weight_alias)
+            )
+            return value + model.weight + model.weight_alias + model.second_weight_alias
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+        )
+        compiler = direct_compile.tpu_torch_compile
+        result = torch.full((2,), 3.0)
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(compiler, "build_mlir", return_value="module"),
+            patch.object(compiler, "compile_mlir", return_value="executable"),
+            patch.object(compiler, "execute", return_value=[result]) as execute,
+        ):
+            output = compiled(torch.zeros(2))
+
+        self.assertTrue(torch.equal(output, result))
+        self.assertIsNot(traced_state[0][0], model.weight)
+        self.assertIs(traced_state[0][0], traced_state[0][1])
+        self.assertIs(traced_state[0][0], traced_state[0][2])
+        runtime_inputs = execute.call_args.args[1]
+        self.assertIs(runtime_inputs[0], model.weight)
+        self.assertEqual(len(runtime_inputs), 2)
+
+    def test_eagle_draft_pytrees_only_expose_hidden_states(self):
+        draft_hidden_states = torch.ones((1, 2))
+        draft_extend_hidden_states = torch.ones((1, 3))
+        inputs = (
+            EagleDraftInput(
+                topk_p=torch.ones((1, 1)),
+                hidden_states=draft_hidden_states,
+            ),
+            EagleDraftExtendInput(
+                hidden_states=draft_extend_hidden_states,
+                input_ids=torch.ones(1, dtype=torch.long),
+            ),
+        )
+
+        leaves, treespec = tree_util.tree_flatten(inputs)
+        rebuilt = tree_util.tree_unflatten(treespec, leaves)
+
+        self.assertEqual(len(leaves), 2)
+        self.assertIs(leaves[0], draft_hidden_states)
+        self.assertIs(leaves[1], draft_extend_hidden_states)
+        self.assertIs(rebuilt[0].hidden_states, draft_hidden_states)
+        self.assertIsNone(rebuilt[0].topk_p)
+        self.assertIs(rebuilt[1].hidden_states, draft_extend_hidden_states)
+        self.assertIsNone(rebuilt[1].input_ids)
+
     def test_artifact_dispatches_and_rebuilds_outputs(self):
         model = _Model()
         kv_pool = _KVPool(torch.zeros(2))
@@ -173,6 +353,25 @@ class TestDirectCompile(CustomTestCase):
             self.assertRaisesRegex(TypeError, "Unsupported.*Tensor"),
         ):
             invalid(torch.ones(2), unexpected)
+
+    def test_artifact_reports_runtime_tensor_structure_changes(self):
+        value = torch.ones(2)
+        artifact = direct_compile._CompiledArtifact(
+            executable=object(),
+            model_inputs=(),
+            kv_pool=None,
+            tensor_inputs_key_paths=(
+                (tree_util.SequenceKey(0), tree_util.SequenceKey(0)),
+            ),
+            output_treespec=None,
+            output_count=0,
+        )
+
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=False),
+            self.assertRaisesRegex(TypeError, r"\[0\]\[0\].*now Tensor"),
+        ):
+            artifact(((value,), {}))
 
 
 if __name__ == "__main__":

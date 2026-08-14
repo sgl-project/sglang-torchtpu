@@ -184,7 +184,9 @@ def main():
     elif a.exec_cmd:
         active_deadline = 7200
     else:
-        active_deadline = 5400
+        # Launch mode: ~30m server bring-up (R1 weight load + compile warmup)
+        # + up to 2 files x `timeout 3600` (jobset-tpu.yaml) + margin.
+        active_deadline = 9000
 
     pvc = a.weights_pvc
     vals = {

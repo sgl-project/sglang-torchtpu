@@ -54,6 +54,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         pin_memory: bool = False,
         device: str = "cpu",
         allocator_type: str = "default",
+        pool_label: str = "kv",
     ):
         # Deliberately do NOT call ``HostKVCache.__init__``: it allocates a
         # torch host buffer via ``init_kv_buffer`` and does a psutil RAM check.
@@ -64,6 +65,7 @@ class TpuRaidenHostKVCache(HostKVCache):
         self.layout = RAIDEN_LAYOUT
         self.pin_memory = pin_memory
         self.device = device
+        self.pool_label = pool_label
 
         self.dtype = device_pool.store_dtype
         self.start_layer = device_pool.start_layer
@@ -179,7 +181,14 @@ class TpuRaidenHostKVCache(HostKVCache):
         return self.transfer.load(host_pages, device_pages)
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft: bool = False,
     ) -> None:
         # The raiden controller issues a single all-layer ``load_all_layer``;
         # the per-layer path must never be reached on this pool.

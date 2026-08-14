@@ -25,16 +25,16 @@ _SRT_ROOT = Path(next(iter(sglang.srt.__path__)))
 # Baselines counted over python/sglang/srt/**/*.py, including each function's
 # own def line. Ratchet: decrease-only.
 _RATCHETS = [
-    # 279 -> 287: the upstream sync merged new call-sites in upstream-owned code
-    # (distributed/device_communicators, npu & mlx backends, dsa indexer); those
-    # are not fork code to migrate here. Fork TPU sites are unchanged.
-    # 287 -> 286: Qwen3MoeAttention now reads server args once through
-    # get_server_args() for the fused qk-norm + RoPE gate.
-    ("get_global_server_args", r"\bget_global_server_args\s*\(", 286),
+    # Upstream migrated every upstream-owned call-site to
+    # runtime_context.get_server_args(), leaving only the shim definition (1).
+    # The remaining 8 are fork-side sites the sync kept: hardware_backend/tpu
+    # (fp8_moe 1, tpu_platform 2), speculative/eagle_info 3, and
+    # layers/quantization (fp8 1, compressed_tensors w8a8_fp8 1).
+    ("get_global_server_args", r"\bget_global_server_args\s*\(", 9),
     (
         "set_global_server_args_for_*",
         r"\bset_global_server_args_for_(?:scheduler|tokenizer)\s*\(",
-        5,
+        4,
     ),
 ]
 

@@ -146,10 +146,12 @@ jobs:
           #   * single-host: scales with the suite's registered est_time (static AST scan in
           #     render_jobset.py -> max(sum(est_time)*1.5, 360s)). run_suite's
           #     --timeout-per-file still bounds each file.
-          #   * multi-host: the JobSet caps the run at activeDeadlineSeconds, and this must
-          #     OUTLAST it so the JobSet -- not this loop -- decides the outcome.
+          #   * multi-host: the JobSet caps the run at activeDeadlineSeconds (9000s for
+          #     launch mode: ~30m bring-up + 2 files x `timeout 3600`, gsm8k on R1 needs
+          #     the full hour), and this must OUTLAST it so the JobSet -- not this loop --
+          #     decides the outcome.
           if [ -n "${{ inputs.launch_script }}" ]; then
-            wait_s=6000          # activeDeadlineSeconds 5400 + streaming/scheduling margin
+            wait_s=9600          # activeDeadlineSeconds 9000 + streaming/scheduling margin
           elif [ -n "${{ inputs.exec_cmd }}" ]; then
             wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
           else

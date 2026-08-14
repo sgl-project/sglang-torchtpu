@@ -82,6 +82,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        allocation_label: Optional[str] = None,
     ):
         # We deliberately do *not* call ``MHATokenToKVPool.__init__`` here:
         # its ``_create_buffers`` allocates the legacy two-buffer (K / V) layout
@@ -113,6 +114,8 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         # and ``kv_packing`` (computed from ``store_dtype`` below) is 4 for fp8.
         # For bf16 this is a no-op (``store_dtype`` already equals ``dtype``).
         self.store_dtype = self.dtype
+        # Accounting tag SWAKVPool passes to its sub-pools ("Full" / "SWA").
+        self.allocation_label = allocation_label
 
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim

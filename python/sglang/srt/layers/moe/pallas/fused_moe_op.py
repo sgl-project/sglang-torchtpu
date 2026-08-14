@@ -90,26 +90,152 @@ def _valid_rows_mask(group_sizes, expert_group_offset, local_num_experts, unsort
     return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
+def _lookup_tile_info(lhs, rhs, rhs_scale, num_total_groups, packed_fp4=False):
+    """Pick a ``TileSizes`` for this gmm_v2 call.
+
+    ``get_tuned_block_sizes`` is a pure-Python lookup keyed on static
+    shapes / dtypes, so it runs at JAX trace time (not at device exec
+    time). On a hit we pin the kernel's tile sizes to the tuned triple;
+    on a miss it returns ``get_default_gmm_block_sizes`` (a heuristic that
+    respects the shapes) — either way this returns a concrete
+    ``TileSizes``.
+
+    ``packed_fp4`` marks a uint8-packed FP4 rhs (stored K is half the real K),
+    so we key the lookup on the real K and the float4 dtype the kernel contracts
+    in -- otherwise packed w2 mismatches lhs K and falls back to the heuristic.
+
+    ``num_current_groups`` is set equal to ``num_total_groups`` because callers
+    pass the LOCAL expert count (``w1.shape[0]``), which under EP is already
+    this rank's share -- so both are the local count and the lookup is correct
+    under expert parallelism as written.
+
+    Keep it that way. The heuristic behind a table miss computes
+    ``tm = round_up_to_multiple_of_128_within_limit(2 * m // g, 512)``, and with
+    the local g (16 under EP16) ``2m/g`` is >= 512 for every prefill bucket, so
+    ``tm`` saturates at 512 and is identical across buckets. Passing the GLOBAL
+    count instead would make ``2m/g`` = 64/128/256 at pad_t 1024/2048/4096 and
+    ``tm`` would become 128/128/256 -- a tiling that silently changes at one
+    bucket and not the others, which is precisely the failure signature we are
+    trying not to have.
+    """
+    import jax.numpy as jnp
+
+    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
+    from sglang.srt.layers.moe.pallas.tuned_block_sizes import (
+        get_tuned_block_sizes,
+    )
+
+    m, k = lhs.shape
+    _g, _k_raw, n = rhs.shape
+    # Packed FP4 stores 2 codes/byte along K, so real K = stored K * 2.
+    _k = _k_raw * 2 if packed_fp4 else _k_raw
+    assert _k == k, f"gmm_v2 lhs/rhs k mismatch: {k=} vs {_k=}"
+    quant_block_size = k if rhs_scale is None else k // rhs_scale.shape[1]
+    rhs_dtype = "float4_e2m1fn" if packed_fp4 else str(jnp.dtype(rhs.dtype).name)
+    tm, tk, tn = get_tuned_block_sizes(
+        m=int(m),
+        k=int(k),
+        n=int(n),
+        num_total_groups=int(num_total_groups),
+        num_current_groups=int(num_total_groups),
+        lhs_dtype=str(jnp.dtype(lhs.dtype).name),
+        rhs_dtype=rhs_dtype,
+        quant_block_size=quant_block_size,
+    )
+    return TileSizes(tile_m=tm, tile_k=tk, tile_n=tn)
+
+
+def _quant_block_compatible(tile_k, quant_block_size):
+    """Whether ``tile_k`` can index whole rhs scale blocks.
+
+    ``IndexMaps.rhs_scale_index_map`` derives the scale window from
+    ``b_id = (k_id * tile_k) // quant_block_size`` and
+    ``b_tile_id = b_id // cdiv(tile_k, quant_block_size)``. That arithmetic is
+    only exact when one of the two sizes divides the other; otherwise a tile
+    straddles a block boundary and every ``k_id >= 1`` reads a window that has
+    drifted behind the one it needs.
+    """
+    if quant_block_size is None:
+        return True
+    return tile_k % quant_block_size == 0 or quant_block_size % tile_k == 0
+
+
+def _largest_compatible_tile_k(size_k, limit, quant_block_size, alignment=128):
+    """Largest ``alignment``-aligned divisor of ``size_k`` that is ``<= limit``
+    and quant-block compatible. Subsumes gmm_v2's
+    ``_largest_aligned_divisor_at_most`` (identical when unquantized).
+    """
+    limit = min(size_k, limit)
+    for candidate in range(limit - (limit % alignment), 0, -alignment):
+        if size_k % candidate == 0 and _quant_block_compatible(
+            candidate, quant_block_size
+        ):
+            return candidate
+    raise ValueError(
+        f"no {alignment}-aligned divisor of size_k={size_k} that is <= {limit} "
+        f"is compatible with quant_block_size={quant_block_size}; pad K to an "
+        "aligned, divisor-rich width at load time"
+    )
+
+
+def _gmm2_tile_source(lhs, w2, w2_scale, num_experts, *, w2_packed):
+    """Pick the gmm2 ``tile_info`` source: tuned lookup for packed FP4 only.
+
+    Packed FP4 w2 stores a halved K, which ``calculate_tiling`` would read as
+    the real K and size tiles against half the contraction dim, so packed w2
+    needs the packed-aware ``_lookup_tile_info`` (it keys on the real K and the
+    float4 dtype the kernel contracts in).
+
+    Every other dtype keeps the kernel's own adaptive ``calculate_tiling``.
+    That is the only path that budgets the rhs tile against ``rhs_vmem_target``
+    -- a pinned ``TileSizes`` is consumed verbatim with no clamp, so routing
+    bf16/FP8 through the lookup would retune stock TPU MoE and could overflow
+    VMEM at an untested shape. Widening this gate is a separate change that
+    needs its own perf data.
+    """
+    from sglang.srt.layers.moe.pallas.gmm_v2 import calculate_tiling
+
+    if not w2_packed:
+        return calculate_tiling
+    return _lookup_tile_info(lhs, w2, w2_scale, num_experts, packed_fp4=True)
+
+
 def _dividing_tile_k(base_tile_info):
     """Wrap a gmm_v2 ``tile_info`` so the resolved ``tile_k`` always divides
-    ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent).
+    ``size_k`` (mirrors the kernel's N-gate, which has no K equivalent) and
+    stays compatible with the rhs quantization block size.
+
+    ``calculate_tiling`` enforces the quant-block constraint itself, but a
+    pinned ``TileSizes`` (compact block-FP8 GMM1) or a tuned-lookup one
+    (``_lookup_tile_info``, which every NVFP4 call reaches because
+    ``TUNED_BLOCK_SIZES`` carries no fp4 entries) bypasses it. A straddling
+    tile_k does not fail -- it silently loads the wrong per-block scales -- so
+    re-apply the constraint here, on whatever tile_k the caller ended up with.
+
+    This is a no-op for every configuration that already worked: unscaled bf16
+    has no block size, channelwise scales have ``quant_block_size == size_k``
+    (any divisor is compatible), block-FP8's 128 divides every 128-aligned
+    tile, and NVFP4 at ``size_k`` a multiple of 2048 resolves ``tile_k=2048``,
+    a multiple of 512. It only fires where the scale indexing would be wrong.
     """
     import dataclasses
 
-    from sglang.srt.layers.moe.pallas.gmm_v2 import (
-        TileSizes,
-        _largest_aligned_divisor_at_most,
-    )
+    from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes
 
     def wrapped(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act=None):
         if isinstance(base_tile_info, TileSizes):
             tiles = base_tile_info
         else:
             tiles = base_tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-        if dims.size_k % tiles.tile_k != 0:
+        quant_block_size = rhs_cfgs.quant_block_size if rhs_cfgs.has_scale else None
+        if dims.size_k % tiles.tile_k != 0 or not _quant_block_compatible(
+            tiles.tile_k, quant_block_size
+        ):
             tiles = dataclasses.replace(
                 tiles,
-                tile_k=_largest_aligned_divisor_at_most(dims.size_k, tiles.tile_k, 128),
+                tile_k=_largest_compatible_tile_k(
+                    dims.size_k, tiles.tile_k, quant_block_size, 128
+                ),
             )
         return tiles
 
@@ -177,6 +303,14 @@ def _fused_moe_jax(
     m, hidden_size = hidden_states.shape
     num_experts = w1.shape[0]
     out_dtype = hidden_states.dtype
+
+    # uint8 rhs = packed FP4 (2 float4 codes/byte along K); gmm_v2 unpacks to
+    # float4_e2m1fn in-kernel when told packed_fp4=True (real K = shape[1] * 2).
+    # This governs *any* packed-float4 rhs: today only NVFP4 emits uint8, but the
+    # MXFP4-native path (not yet wired) would flow through here too — correct
+    # (block size is data-driven from the scale), just untested.
+    w1_packed = w1.dtype == jnp.uint8
+    w2_packed = w2.dtype == jnp.uint8
 
     # gmm_v2 needs the routed-row count ``m*topk`` to be a
     # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
@@ -305,6 +439,7 @@ def _fused_moe_jax(
         # when fused); compact FP8 pins an unfused tile.
         tile_info=gmm1_tiling,
         fuse_act=gmm1_fuse_act,
+        packed_fp4=w1_packed,
     )
     if compact_block_scales:
         gmm1_out = apply_act_fn(
@@ -321,8 +456,9 @@ def _fused_moe_jax(
             f"{gmm1_out.shape[1]}, hidden {hidden_size}) is unsupported: "
             "pad weights AND scales jointly at load time."
         )
-    # Tile sizes are derived by the kernel's own ``calculate_tiling``.
-    gmm2_tiling = _dividing_tile_k(calculate_tiling)
+    gmm2_tiling = _dividing_tile_k(
+        _gmm2_tile_source(gmm1_out, w2, w2_scale, num_experts, w2_packed=w2_packed)
+    )
     gmm2_out = gmm_v2(
         lhs=gmm1_out,
         rhs=w2,
@@ -333,6 +469,7 @@ def _fused_moe_jax(
         zero_initialize=zero_init,
         preferred_element_type=out_dtype,
         tile_info=gmm2_tiling,
+        packed_fp4=w2_packed,
     )[
         :,
         :hidden_size,
@@ -409,14 +546,15 @@ def _fused_moe_jax(
     unsorted = unsorted.reshape(m, topk, hidden_size)
     unsorted = unsorted[:m_orig].astype(out_dtype)
     if no_combine:
-        # Zero the rows this rank did not compute, so it is safe for the
-        # caller to later run the weighted sum.
+        # Zero the rows this rank did not compute, so later post-norm + combine
+        # cannot consume expert-0 placeholder outputs with original router weights.
         if use_group_offset:
             valid_rows_mask = _valid_rows_mask(
                 group_sizes, expert_group_offset, num_experts, unsort_idx
             )[: m_orig * topk].reshape(m_orig, topk, 1)
-            return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
-        return unsorted
+        else:
+            valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
+        return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
 
     weights = topk_weights[:m_orig].reshape(m_orig, topk, 1).astype(unsorted.dtype)
     out = (unsorted * weights).sum(axis=1).astype(out_dtype)

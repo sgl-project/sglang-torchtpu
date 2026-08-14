@@ -12,7 +12,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+from sglang.srt.compilation.support_torch_compile import (
+    NoopCompilePolicy,
+    get_torch_compile_policy,
+    support_torch_compile,
+)
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
@@ -29,6 +33,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -90,15 +95,54 @@ def _target_and_padding(policy):
 
 
 def _run_cases(policy, mode):
-    with patch(
-        "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-        "get_tensor_model_parallel_rank",
-        return_value=1,
-    ):
+    with get_parallel().override(tp_rank=1):
         if mode == ForwardMode.EXTEND:
             policy._precompile_extend()
         else:
             policy._precompile_decode()
+
+
+class TestDirectCompileExtraModelState(CustomTestCase):
+    def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
+        class CustomPolicy(DecoderTpuCompilePolicy):
+            model_extra_tensor_attrs = (
+                "object_state.value",
+                "object_state.weight_alias",
+            )
+
+        model = SimpleNamespace(forward=MagicMock())
+        support_torch_compile(model, policy=CustomPolicy)
+        policy_cls = get_torch_compile_policy(model)
+        self.assertIs(policy_cls, CustomPolicy)
+
+        kv_pool = object()
+        model_runner = SimpleNamespace(
+            model=model,
+            token_to_kv_pool=kv_pool,
+            is_draft_worker=False,
+        )
+        policy = policy_cls(
+            model_runner=model_runner,
+            owner=model,
+            tracer="direct",
+        )
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
+            policy._direct_compile(model.forward)
+
+        compile_module.direct_compile.assert_called_once()
+        kwargs = compile_module.direct_compile.call_args.kwargs
+        self.assertIs(kwargs["model"], model)
+        self.assertEqual(
+            kwargs["model_extra_tensor_attrs"],
+            CustomPolicy.model_extra_tensor_attrs,
+        )
+        self.assertIs(kwargs["kv_pool"], kv_pool)
 
 
 class TestInstallExtendCap(CustomTestCase):
@@ -508,11 +552,7 @@ class TestPrecompileLoops(CustomTestCase):
         policy.extend_bs = 16
         policy._run_one = MagicMock()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy._precompile_extend()
 
         self.assertEqual(policy._run_one.call_count, 2)
@@ -550,11 +590,7 @@ class TestPrecompileLoops(CustomTestCase):
     def test_precompile_combines_extend_and_decode(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile()
         # EXTEND: (8,4), (64,4) = 2. DECODE: (1,1), (4,4) = 2.
         self.assertEqual(mr.model.forward.call_count, 4)
@@ -698,11 +734,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         )
         policy.extend_bs = 16
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy._precompile_extend_full()
 
         self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
@@ -712,16 +744,8 @@ class TestSpecPrecompileLoops(CustomTestCase):
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
         # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
         # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
-        # in spec_decode_compile_policy. Patch the rank helper in both.
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        # in spec_decode_compile_policy. One topology override serves both.
+        with get_parallel().override(tp_rank=1):
             policy.precompile()
         # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
         # TARGET_VERIFY buckets bs: (4,1),(16,4)=2  EXTEND(FULL) 2
@@ -732,11 +756,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
     def test_draft_worker_skips_precompile(self):
         mr = _spec_model_runner(is_draft_worker=True)
         policy = _make_spec_policy(mr)
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile()
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mr.attn_backend.calls, [])
@@ -749,11 +769,7 @@ class TestSpecPrecompileLoops(CustomTestCase):
         draft_backend = SimpleNamespace(attn_backends=decode_backends)
         draft_extend_backend = _FakeAttnBackend()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_backend, draft_extend_backend)
 
         self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
@@ -1178,11 +1194,7 @@ class TestDraftPrecompile(CustomTestCase):
         draft_attn_backend = SimpleNamespace(attn_backends=step_backends)
         draft_extend_attn_backend = _FakeAttnBackend()
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "get_tensor_model_parallel_rank",
-            return_value=1,
-        ):
+        with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
 
         # EXTEND(LAST) 2 token buckets at the bs cap + DECODE 2 bs x 3 steps
@@ -1251,13 +1263,10 @@ def _serving_stubs():
     ), patch(
         "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
         return_value=False,
-    ), patch(
-        "sglang.srt.server_args.get_global_server_args",
-        return_value=SimpleNamespace(
-            speculative_use_rejection_sampling=False,
-            speculative_accept_threshold_single=1.0,
-            speculative_accept_threshold_acc=1.0,
-        ),
+    ), get_context().override_server_args(
+        speculative_use_rejection_sampling=False,
+        speculative_accept_threshold_single=1.0,
+        speculative_accept_threshold_acc=1.0,
     ):
         yield
 
@@ -1301,6 +1310,9 @@ def _make_batch(temperature):
             temperatures=torch.full((BS, 1), temperature or 1.0),
             top_ks=torch.full((BS,), VOCAB_SIZE, dtype=torch.int32),
             top_ps=torch.full((BS,), 0.9),
+            need_top_k_sampling=True,  # top_ks=VOCAB_SIZE makes renorm an identity
+            need_top_p_sampling=True,
+            sampling_seed=None,  # unseeded: keep the pre-seed coin stream
             is_all_greedy=temperature == 0.0,
             acc_additive_penalties=None,
             acc_scaling_penalties=None,

@@ -368,8 +368,16 @@ def test_allocator_device_resident_uses_paged_device_result():
 
 def test_eagle_prepare_for_decode_uses_torch_native_allocator():
     reqs = [
-        SimpleNamespace(kv_allocated_len=2, kv_committed_len=3, decode_batch_idx=0),
-        SimpleNamespace(kv_allocated_len=5, kv_committed_len=1, decode_batch_idx=0),
+        SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=2),
+            kv_committed_len=3,
+            decode_batch_idx=0,
+        ),
+        SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=5),
+            kv_committed_len=1,
+            decode_batch_idx=0,
+        ),
     ]
     req_pool_indices = torch.tensor([2, 3], dtype=torch.int64)
     req_pool_indices_cpu = torch.tensor([2, 3], dtype=torch.int64)

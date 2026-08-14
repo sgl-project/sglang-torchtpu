@@ -45,13 +45,17 @@ What a new backend implements (the seam)
 
 from __future__ import annotations
 
+import abc
+import enum
 import logging
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional
+from typing import cast
 
 import numpy as np
+import torch
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -61,15 +65,24 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
+from sglang.srt.disaggregation.tpu.host_staging import StageBuf
+from sglang.srt.disaggregation.tpu.transfer import (
+    DecodeTransferState,
+    PendingChunk,
+    PrefillTransferInfo,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
-# The decode -> prefill "room R ready; pull from my zmq endpoint" notification.
-# Identical across backends (it is pure control), so it lives in the base; each
-# backend defines its own *data* tag (e.g. KVDATA / KVMETA) in its own module.
-TAG_TRSFR = b"TRSFR"
+
+class MessageTag(bytes, enum.Enum):
+    """ZMQ message tags for TPU P/D disaggregation control & data plane."""
+
+    TRSFR = b"TRSFR"
+    KVDATA_CH = b"KVDATAC"
 
 
 class KVTransferError(Exception):
@@ -97,7 +110,7 @@ class TpuKVManagerBase(CommonKVManager):
         args: KVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
-        is_mla_backend: Optional[bool] = False,
+        is_mla_backend: bool | None = False,
     ):
         # Concrete subclass name, used in logs, error messages, thread names.
         self._name = type(self).__name__
@@ -107,9 +120,8 @@ class TpuKVManagerBase(CommonKVManager):
 
         # Filled in later by the scheduler via attach_kv_pool(); the bootstrap
         # queue owns the pool object and only it knows the concrete tensors.
-        self.kv_pool = None
-        self.layer_buffers: Optional[List] = None
-        self.layer_specs = None
+        self.kv_pool: KVCache | None = None
+        self.layer_buffers: list[torch.Tensor] | None = None
 
         # Per-endpoint send locks (a single zmq PUSH socket must not be used
         # concurrently from multiple sender threads).
@@ -135,18 +147,18 @@ class TpuKVManagerBase(CommonKVManager):
         mode_str = self.disaggregation_mode.value
         if self.attn_dp_size > 1:
             self.trace_pid = (
-                f"tpu-kv-{mode_str}-dp{self.attn_dp_rank}" f"-tp{self.attn_tp_rank}"
+                f"tpu-kv-{mode_str}-dp{self.attn_dp_rank}-tp{self.attn_tp_rank}"
             )
         else:
             self.trace_pid = f"tpu-kv-{mode_str}{self.attn_tp_rank}"
 
     # ---- pool attachment (shared) ---------------------------------------
 
-    def attach_kv_pool(self, kv_pool) -> None:
+    def attach_kv_pool(self, kv_pool: KVCache) -> None:
         """Give the manager the concrete per-layer KV tensors it will transfer.
-        Extracts the block-indexed per-layer buffers + their dtype/shape specs
-        (shared), then defers backend-specific setup to ``_on_pool_attached``.
-        Called once at scheduler init."""
+        Extracts the block-indexed per-layer buffers (shared), then defers
+        backend-specific setup to ``_on_pool_attached``. Called once at scheduler
+        init."""
         if self.kv_pool is not None:
             raise RuntimeError(
                 f"{self._name}: a KV pool is already attached. "
@@ -154,7 +166,6 @@ class TpuKVManagerBase(CommonKVManager):
             )
         self.kv_pool = kv_pool
         self.layer_buffers = tpu_transfer.get_layer_page_buffers(kv_pool)
-        self.layer_specs = tpu_transfer.layer_page_specs(self.layer_buffers)
         self._on_pool_attached()
 
     def _on_pool_attached(self) -> None:
@@ -167,7 +178,7 @@ class TpuKVManagerBase(CommonKVManager):
             len(self.layer_buffers) if self.layer_buffers else 0,
         )
 
-    def _require_pool(self):
+    def _assert_layer_page_buffers(self):
         if self.layer_buffers is None:
             raise RuntimeError(
                 f"{self._name}.attach_kv_pool() was never called; the "
@@ -191,9 +202,20 @@ class TpuKVManagerBase(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart(copy=copy)
-                except Exception as e:  # pragma: no cover - socket teardown
-                    logger.warning("%s recv loop ending: %s", name, e)
+                except zmq.ContextTerminated:
+                    logger.warning("%s recv loop ending: ZMQ context terminated", name)
                     return
+                except zmq.Again:
+                    continue
+                except zmq.ZMQError as e:
+                    if e.errno in (zmq.ETERM, zmq.ENOTSOCK, zmq.EBADF):
+                        logger.warning("%s recv loop ending: %s", name, e)
+                        return
+                    logger.exception("%s unexpected ZMQ exception", name)
+                    continue
+                except Exception as e:  # pragma: no cover - socket teardown
+                    logger.exception("%s unexpected recv exception: %s", name, e)
+                    continue
                 if not msg or bytes(msg[0]) != expected_tag:
                     logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
                     continue
@@ -223,9 +245,20 @@ class TpuKVManagerBase(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart(copy=copy)
-                except Exception as e:  # pragma: no cover - socket teardown
-                    logger.warning("%s recv loop ending: %s", name, e)
+                except zmq.ContextTerminated:
+                    logger.warning("%s recv loop ending: ZMQ context terminated", name)
                     return
+                except zmq.Again:
+                    continue
+                except zmq.ZMQError as e:
+                    if e.errno in (zmq.ETERM, zmq.ENOTSOCK, zmq.EBADF):
+                        logger.warning("%s recv loop ending: %s", name, e)
+                        return
+                    logger.exception("%s unexpected ZMQ exception", name)
+                    continue
+                except Exception as e:  # pragma: no cover - socket teardown
+                    logger.exception("%s unexpected recv exception: %s", name, e)
+                    continue
                 handler = handlers.get(bytes(msg[0])) if msg else None
                 if handler is None:
                     logger.warning("%s recv: unexpected msg tag %r", name, msg[:1])
@@ -241,17 +274,18 @@ class TpuKVManagerBase(CommonKVManager):
             daemon=True,
         ).start()
 
-    def _handle_transfer(self, msg: List[bytes]) -> None:
+    def _handle_transfer(self, msg: list[bytes]) -> None:
         """Prefill side: a decode signalled it is ready for room R. Record the
         decode's control endpoint and advance to WaitingForInput once every
         expected decode rank has reported. Shared across backends; subclasses
         choose what value to stash per endpoint via ``_record_decode_endpoint``."""
         # [TAG, room, decode_ip, decode_port, aux_present, num_pages,
-        #  required_dst_info_num, decode_prefix_len]
-        if len(msg) != 8:
+        #  required_dst_info_num, decode_prefix_len,
+        #  dst_tp_rank, decode_attn_tp_size]
+        if len(msg) != 10:
             raise ValueError(
-                f"Malformed {TAG_TRSFR.decode()} message. "
-                f"Expected 8 frames, got {len(msg)}."
+                f"Malformed {MessageTag.TRSFR.decode()} message. "
+                f"Expected 10 frames, got {len(msg)}."
             )
         room = int(msg[1].decode())
         decode_ip = msg[2].decode()
@@ -259,18 +293,53 @@ class TpuKVManagerBase(CommonKVManager):
         num_pages = int(msg[5].decode())
         required = int(msg[6].decode())
         prefix_len = int(msg[7].decode())
+        dst_tp_rank = int(msg[8].decode())
+        decode_attn_tp_size = int(msg[9].decode())
 
+        logger.info(
+            "[pd_kv_resharding] _handle_transfer room=%s endpoint=%s:%s num_pages=%d "
+            "required=%d dst_tp_rank=%d decode_attn_tp=%d",
+            room,
+            decode_ip,
+            decode_port,
+            num_pages,
+            required,
+            dst_tp_rank,
+            decode_attn_tp_size,
+        )
         endpoint = _tcp_endpoint(decode_ip, decode_port)
         bucket = self.transfer_infos.setdefault(room, {})
-        bucket[endpoint] = self._record_decode_endpoint(room, endpoint, num_pages)
+        bucket[endpoint] = self.get_prefill_transfer_info(
+            room, endpoint, num_pages, dst_tp_rank, decode_attn_tp_size
+        )
         self.req_to_decode_prefix_len[room] = prefix_len
         if len(bucket) >= required:
+            logger.info("[pd_kv_resharding] now room: %s, bucket: %s", bucket, room)
             self.update_status(room, KVPoll.WaitingForInput)
+            logger.info("[pd_kv_resharding] request status: %s", self.request_status)
 
-    def _record_decode_endpoint(self, room: int, endpoint: str, num_pages: int):
-        """Hook: value to store in ``transfer_infos[room][endpoint]``. Default is
-        the endpoint string itself; a backend may store a richer record."""
-        return endpoint
+    def get_prefill_transfer_info(
+        self,
+        room: int,
+        endpoint: str,
+        num_pages: int,
+        dst_tp_rank: int = 0,
+        decode_attn_tp_size: int = 1,
+    ) -> PrefillTransferInfo:
+        # Stash a full record so gather_and_push can read ``.decode_endpoint``.
+        return PrefillTransferInfo(
+            room=room,
+            decode_endpoint=endpoint,
+            num_pages=num_pages,
+            kv_packing=self._kv_packing,
+            src_tp_rank=self.kv_args.engine_rank,
+            dst_tp_rank=dst_tp_rank,
+            src_attn_tp_size=self.attn_tp_size,
+            dst_attn_tp_size=decode_attn_tp_size,
+            total_num_head=self.kv_args.total_kv_head_num,
+            n_layers=len(self.layer_buffers),
+            page_size=int(self.layer_buffers[0].shape[1]),
+        )
 
     # ---- abstract role + data-plane seam --------------------------------
 
@@ -281,12 +350,163 @@ class TpuKVManagerBase(CommonKVManager):
         raise NotImplementedError
 
     def register_decode_state(
-        self, room: int, dst_indices: np.ndarray, aux_index: Optional[int]
+        self, room: int, dst_indices: np.ndarray, aux_index: int | None
     ) -> None:
-        raise NotImplementedError
+        state = DecodeTransferState(
+            np.asarray(dst_indices, dtype=np.int64), aux_index, self._num_lanes_full
+        )
+        with self.decode_states_lock:
+            self.decode_states[room] = state
+        logger.info(
+            "[pd_kv_resharding] register_decode_state room=%s num_pages=%d "
+            "dst_lane_total=%d target=%d",
+            room,
+            state.num_pages,
+            self._num_lanes_full,
+            state.dst_lanes_total,
+        )
 
     def process_decode_pending(self, room: int) -> None:
-        raise NotImplementedError
+        """Runs on the scheduler MAIN thread (from TpuKVReceiver.poll): drain
+        any received chunks for ``room`` and scatter them H2D into the decode KV
+        pool — each into its KV-head lane sub-range under MHA resharding. Marks
+        the room Success once every lane-page unit has landed (a decode rank may
+        be filled by several prefill sources at different lane offsets). The
+        device touch (index_copy_) is serialised with the forward loop."""
+        with self.decode_pending_lock:
+            pending = self.decode_pending.get(room)
+            if not pending:
+                return
+            chunks = list(pending)
+            pending.clear()
+
+        with self.decode_states_lock:
+            state = self.decode_states.get(room)
+        if state is None:
+            logger.warning("decode KVDATA for unknown room %s, dropping", room)
+            return
+
+        self._assert_layer_page_buffers()
+        for i, chunk in enumerate(chunks):
+            info = chunk.prefill_transfer_info
+            dst_pages = state.dst_page_indices[
+                chunk.index_start : chunk.index_start + chunk.num_pages
+            ]
+            fail_reason = None
+            # Validate decode page size.
+            if len(dst_pages) != chunk.num_pages:
+                fail_reason = (
+                    f"page count mismatch: prefill sent {chunk.num_pages} at "
+                    f"offset {chunk.index_start} but decode only has "
+                    f"{len(dst_pages)} dst pages"
+                )
+            # Validate decode lane numbers.
+            elif (
+                info.dst_lane_idx + info.n_lane_to_send > state.dst_lane_per_page_block
+            ):
+                fail_reason = (
+                    f"lane range [{info.dst_lane_idx}:"
+                    f"{info.dst_lane_idx + info.n_lane_to_send}] exceeds this "
+                    f"decode rank's {state.dst_lane_per_page_block} lanes"
+                )
+            # Validate stage buffer size match the chunk.
+            else:
+                got = chunk.nbytes
+                want = self._expected_chunk_bytes(chunk.num_pages, info.n_lane_to_send)
+                logger.info(
+                    "[pd_kv_resharding] process_decode_pending chunk: room=%s index_start=%d "
+                    "got_bytes=%d want_bytes=%d (num_pages=%d num_lanes=%d dst_lane_start=%d)",
+                    room,
+                    chunk.index_start,
+                    got,
+                    want,
+                    chunk.num_pages,
+                    info.n_lane_to_send,
+                    info.dst_lane_idx,
+                )
+                if got != want:
+                    fail_reason = (
+                        f"[pd_kv_resharding] chunk byte mismatch: got {got} want "
+                        f"{want} (num_pages={chunk.num_pages} num_lanes="
+                        f"{info.n_lane_to_send} dst_lane_start={info.dst_lane_idx})"
+                    )
+            if fail_reason is not None:
+                # Hand back staging held by this and every still-undrained chunk
+                # (scatter would otherwise have released them in its finally).
+                for c in chunks[i:]:
+                    self._release_staged(c)
+                self.record_failure(room, fail_reason)
+                self.update_status(room, KVPoll.Failed)
+                return
+
+            # Whole-page (equal attn_tp) fast path uses None to skip the narrow.
+            full = (
+                info.dst_lane_idx == 0
+                and info.n_lane_to_send == state.dst_lane_per_page_block
+            )
+            dst_lane_slice = None if full else (info.dst_lane_idx, info.n_lane_to_send)
+
+            _nbytes = chunk.nbytes
+
+            _t0 = time.perf_counter()
+            pool = self._stage_pool
+            if self.layer_buffers and self.layer_buffers[0].device.type != "cpu":
+                tpu_transfer.scatter_stage_from_host(
+                    self.layer_buffers,
+                    dst_pages,
+                    chunk.layer_blobs,
+                    pool,
+                    dst_lane_slice,
+                )
+            else:
+                tpu_transfer.scatter_pages_from_host(
+                    self.layer_buffers,
+                    dst_pages,
+                    chunk.layer_blobs,
+                    dst_lane_slice,
+                )
+            self._scatter_stats.record(time.perf_counter() - _t0, _nbytes)
+            state.scattered += chunk.num_pages * info.n_lane_to_send
+            # Aux rides the prefill's last chunk only, so its presence — not an
+            # is_last flag — is the signal to write it.
+            if chunk.aux_blobs and state.aux_index is not None:
+                tpu_transfer.write_aux_row(
+                    self.kv_args, state.aux_index, chunk.aux_blobs
+                )
+            # Conclude only once every lane-page unit has landed. The full target
+            # is known up front (the decode allocated exactly these pages and
+            # holds a fixed lane count), so completion doesn't depend on chunk
+            # ordering, source count, or an is_last marker.
+            if state.scattered >= state.dst_lanes_total:
+                self.update_status(room, KVPoll.Success)
+
+    @staticmethod
+    def _release_staged(chunk: PendingChunk) -> None:
+        """Return any pooled StageBufs held by a chunk."""
+        for b in chunk.layer_blobs:
+            if isinstance(b, StageBuf):
+                b.release()
+
+    def _expected_chunk_bytes(self, num_pages: int, num_lanes: int) -> int:
+        """Total expected bytes for a chunk."""
+        total = 0
+        if self.layer_buffers:
+            for buf in self.layer_buffers:
+                page_size = buf.shape[1]
+                per_lane = int(np.prod(buf.shape[3:])) * buf.element_size()
+                total += num_pages * page_size * num_lanes * per_lane
+        return total
+
+    @abc.abstractmethod
+    def gather_and_push(
+        self,
+        room: int,
+        page_indices: np.ndarray,
+        index_start: int,
+        is_last_chunk: bool,
+        aux_index: int | None,
+    ) -> None:
+        """Gather pages from room and push."""
 
 
 class TpuKVSenderBase(CommonKVSender):
@@ -298,10 +518,20 @@ class TpuKVSenderBase(CommonKVSender):
         mgr: TpuKVManagerBase,
         bootstrap_addr: str,
         bootstrap_room: int,
-        dest_tp_ranks: List[int],
+        dest_tp_ranks: list[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            dest_tp_ranks,
+            pp_rank,
+            req_has_disagg_prefill_dp_rank=req_has_disagg_prefill_dp_rank,
+        )
+        # Downcast to TpuKvManagerBase to support typing.
+        self.kv_mgr = cast(TpuKVManagerBase, self.kv_mgr)
         self.conclude_state = None
         self.init_time = time.time()
 
@@ -311,7 +541,12 @@ class TpuKVSenderBase(CommonKVSender):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
-    def send(self, kv_indices, state_indices: Optional[List] = None):
+    def send(
+        self,
+        kv_indices,
+        state_indices: list | None = None,
+        num_kv_tokens: int | None = None,
+    ):
         raise NotImplementedError
 
     def _pre_poll(self) -> None:
@@ -360,7 +595,7 @@ class TpuKVReceiverBase(CommonKVReceiver):
         self,
         mgr: TpuKVManagerBase,
         bootstrap_addr: str,
-        bootstrap_room: Optional[int] = None,
+        bootstrap_room: int | None = None,
     ):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
@@ -368,9 +603,9 @@ class TpuKVReceiverBase(CommonKVReceiver):
     def send_metadata(
         self,
         kv_indices,
-        aux_index: Optional[int] = None,
-        state_indices: Optional[List] = None,
-        decode_prefix_len: Optional[int] = None,
+        aux_index: int | None = None,
+        state_indices: list | None = None,
+        decode_prefix_len: int | None = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -382,14 +617,15 @@ class TpuKVReceiverBase(CommonKVReceiver):
 
         # Record destination pages locally; the decode does its own pull/scatter.
         self.kv_mgr.register_decode_state(self.bootstrap_room, kv_indices, aux_index)
-
+        dst_attn_tp_size = self.kv_mgr.attn_tp_size
+        dst_tp_rank = self.kv_mgr.kv_args.engine_rank % max(1, dst_attn_tp_size)
         num_pages = len(kv_indices)
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
                     [
-                        TAG_TRSFR,
+                        MessageTag.TRSFR,
                         str(self.bootstrap_room).encode(),
                         self.kv_mgr.local_ip.encode(),
                         str(self.kv_mgr.rank_port).encode(),
@@ -397,6 +633,8 @@ class TpuKVReceiverBase(CommonKVReceiver):
                         str(num_pages).encode(),
                         str(self.required_dst_info_num).encode(),
                         str(decode_prefix_len or 0).encode(),
+                        str(dst_tp_rank).encode(),
+                        str(dst_attn_tp_size).encode(),
                     ]
                 )
         self.init_time = time.time()
@@ -443,5 +681,3 @@ class TpuKVReceiverBase(CommonKVReceiver):
 class TpuKVBootstrapServerBase(CommonKVBootstrapServer):
     """Bootstrap (handshake/discovery) HTTP server — fully device-agnostic,
     inherited unchanged from the common implementation by every backend."""
-
-    pass

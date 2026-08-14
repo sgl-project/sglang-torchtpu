@@ -172,13 +172,8 @@ class TestTpuFp8MoE(CustomTestCase):
             # Single-rank EP: no distributed process group in a unit test.
             patch.object(
                 tpu_fp8_moe,
-                "get_moe_expert_parallel_world_size",
-                return_value=1,
-            ),
-            patch.object(
-                tpu_fp8_moe,
-                "get_moe_expert_parallel_rank",
-                return_value=0,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
             ),
             patch.object(
                 tpu_fp8_moe,
@@ -240,13 +235,8 @@ class TestTpuFp8MoE(CustomTestCase):
             patch.object(fp8_mod, "_is_tpu", True),
             patch.object(
                 tpu_fp8_moe,
-                "get_moe_expert_parallel_world_size",
-                return_value=4,
-            ),
-            patch.object(
-                tpu_fp8_moe,
-                "get_moe_expert_parallel_rank",
-                return_value=2,
+                "get_parallel",
+                return_value=SimpleNamespace(moe_ep_size=4, moe_ep_rank=2),
             ),
             patch.object(
                 tpu_fp8_moe,

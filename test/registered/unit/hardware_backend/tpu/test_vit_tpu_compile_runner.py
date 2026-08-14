@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -5,10 +6,14 @@ from unittest.mock import MagicMock, patch
 import torch
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    Qwen3VLVisionTpuCompilePolicy,
+    VisionPaddingContext,
     VisionTpuCompilePolicy,
     ViTTpuCompileRunner,
     _cu_seqlens_to_segment_ids,
+    _Qwen3VLRunContext,
 )
 from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
@@ -17,6 +22,18 @@ from sglang.srt.layers.attention.vision import (
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+
+
+@contextlib.contextmanager
+def _unset(field):
+    """Run with ``field`` unset, restoring whatever was there before.
+
+    ``override`` snapshots and restores on exit, so clearing inside it is safe;
+    the Envs API has no override-to-unset of its own.
+    """
+    with field.override(""):
+        field.clear()
+        yield
 
 
 class _SegmentBlock(nn.Module):
@@ -70,9 +87,99 @@ def _make_vit(block):
     )
 
 
+class _FakeVisionPolicy(VisionTpuCompilePolicy):
+    """Smallest subclass that exercises the base ``run`` seam."""
+
+    def compute_patch_buckets(self):
+        return [4]
+
+    def make_warmup_inputs(self, patch_count):
+        return (torch.zeros(patch_count),)
+
+    def prepare_call(self, x):
+        return (x, torch.tensor([1])), {"real_rows": 2}
+
+    def unpad_outputs(self, result, ctx):
+        return result[: ctx["real_rows"]]
+
+
 class TestViTTpuCompileRunner(unittest.TestCase):
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")
+
+    def test_qwen3_vl_policy_extends_base_and_implements_every_hook(self):
+        # A base hook left unimplemented here would not surface until the policy
+        # is instantiated at install time, i.e. in a serving run.
+        self.assertEqual(Qwen3VLVisionTpuCompilePolicy.platform, "tpu")
+        self.assertTrue(
+            issubclass(Qwen3VLVisionTpuCompilePolicy, VisionTpuCompilePolicy)
+        )
+        self.assertEqual(
+            getattr(Qwen3VLVisionTpuCompilePolicy, "__abstractmethods__", frozenset()),
+            frozenset(),
+        )
+        # The base gate must be permissive: an encoder that does not override it
+        # should compile, not silently fall back to eager.
+        self.assertTrue(
+            VisionTpuCompilePolicy._runner_ready_for_compile(None, object())
+        )
+
+    def test_base_run_drives_prepare_then_compiled_fn_then_unpad(self):
+        policy = _FakeVisionPolicy()
+        with self.assertRaisesRegex(RuntimeError, "before install"):
+            policy.run(torch.zeros(4))
+
+        policy.compiled_fn = MagicMock(side_effect=lambda x, extra: x * 2)
+        result = policy.run(torch.arange(5).float())
+
+        # prepare_call's tuple is splatted into the compiled fn ...
+        self.assertEqual(policy.compiled_fn.call_args.args[1].tolist(), [1])
+        # ... and its ctx drives unpad_outputs on the way back.
+        self.assertEqual(result.tolist(), [0.0, 2.0])
+
+    def test_qwen3_vl_patch_buckets_honor_the_env_override(self):
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
+        sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+
+        with _unset(sizes), _unset(envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES):
+            ladder = policy.compute_patch_buckets()
+        self.assertEqual((ladder[0], ladder[-1]), (196, 4900))
+
+        # Sorted and de-duplicated, and validated against the merge window.
+        with sizes.override("324, 196 ,196"):
+            self.assertEqual(policy.compute_patch_buckets(), [196, 324])
+        # Set but empty disables precompile.
+        with sizes.override(""):
+            self.assertEqual(policy.compute_patch_buckets(), [])
+        with sizes.override("200"), self.assertRaisesRegex(
+            ValueError, "perfect squares"
+        ):
+            policy.compute_patch_buckets()
+
+        # resolve_patch_buckets caches, so a later env change is not picked up.
+        with sizes.override("196"):
+            self.assertEqual(policy.resolve_patch_buckets(), [196])
+        with sizes.override("324"):
+            self.assertEqual(policy.resolve_patch_buckets(), [196])
+
+    def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
+        padded = torch.arange(8).float()
+        # 12 real patches in a 16 bucket, 2x2 merge => 3 real output rows.
+        padding = VisionPaddingContext(
+            real_seq_len=12, bucket_len=16, padded=True, merge_sq=4
+        )
+
+        trimmed = policy.unpad_outputs(
+            padded, _Qwen3VLRunContext(padding=padding, output_indices=None)
+        )
+        self.assertEqual(trimmed.tolist(), [0.0, 1.0, 2.0])
+
+        selected = policy.unpad_outputs(
+            padded,
+            _Qwen3VLRunContext(padding=padding, output_indices=torch.tensor([2, 0])),
+        )
+        self.assertEqual(selected.tolist(), [2.0, 0.0])
 
     def test_segment_ids_are_built_from_host_cumulative_lengths(self):
         cu_seqlens = torch.tensor([0, 2, 5], dtype=torch.int32)

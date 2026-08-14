@@ -41,9 +41,9 @@ def _make_scheduler(*, enable_overlap: bool) -> Scheduler:
     s.draft_worker = None
     s.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(attn_backend=object()))
     s.req_to_token_pool = object()
-    # Passed positionally to decide_needs_cpu_seq_lens (patched in the runner),
-    # so it only needs to exist as a sentinel.
-    s.server_args = object()
+    # Passed to decide_needs_cpu_seq_lens (patched in the runner) and to
+    # decide_needs_confidence_relay, which reads speculative_algorithm.
+    s.server_args = SimpleNamespace(speculative_algorithm=None)
     return s
 
 
@@ -52,7 +52,8 @@ def _run_init_overlap(s: Scheduler, *, use_mlx: bool, supports_streams: bool):
 
     Returns the MagicMock standing in for ``torch.get_device_module(device)`` so
     callers can assert whether stream factories were touched. ``needs_cpu_seq_lens``
-    resolution is pinned to True so these stay focused on stream gating.
+    (True) and ``needs_confidence_relay`` (False) resolution is pinned so these
+    stay focused on stream gating.
     """
     mock_platform = MagicMock()
     mock_platform.supports_overlap_streams.return_value = supports_streams
@@ -60,6 +61,8 @@ def _run_init_overlap(s: Scheduler, *, use_mlx: bool, supports_streams: bool):
     with patch(f"{_SCHED_MOD}.use_mlx", return_value=use_mlx), patch(
         f"{_SCHED_MOD}.current_platform", mock_platform
     ), patch(f"{_SCHED_MOD}.decide_needs_cpu_seq_lens", return_value=True), patch(
+        f"{_SCHED_MOD}.decide_needs_confidence_relay", return_value=False
+    ), patch(
         "torch.get_device_module", return_value=mock_device_module
     ):
         Scheduler.init_overlap(s)
@@ -85,7 +88,10 @@ class TestInitOverlapStreamGating(CustomTestCase):
         # built from (device, req_to_token_pool, needs_cpu_seq_lens).
         self.assertIs(s.future_map, s.spec_algorithm.create_future_map.return_value)
         s.spec_algorithm.create_future_map.assert_called_once_with(
-            s.device, s.req_to_token_pool, needs_cpu_seq_lens=True
+            s.device,
+            s.req_to_token_pool,
+            needs_cpu_seq_lens=True,
+            needs_confidence_relay=False,
         )
         self.assertEqual(s.batch_record_buf, [None, None])
         self.assertEqual(s.batch_record_ct, 0)
@@ -159,8 +165,11 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         # The relay itself (FutureMap stash vs ngram skip) is covered elsewhere;
         # here we only assert it is invoked with this iter's payload.
         s._relay_forward_payload = MagicMock()
-        s.cur_batch = SimpleNamespace(return_logprob=False, return_hidden_states=False)
         return s
+
+    @staticmethod
+    def _make_cur_batch() -> SimpleNamespace:
+        return SimpleNamespace(return_logprob=False, return_hidden_states=False)
 
     def test_single_queue_skips_wait_stream(self):
         # Regression: with overlap streams off, schedule_stream is never created,
@@ -169,7 +178,9 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s = self._make_self(use_overlap_streams=False)
         br = self._make_batch_result()
 
-        Scheduler.launch_batch_sample_if_needed(s, br)  # must not raise
+        Scheduler.launch_batch_sample_if_needed(
+            s, br, self._make_cur_batch()
+        )  # must not raise
 
         br.copy_to_cpu.assert_called_once()
         s._relay_forward_payload.assert_called_once_with(br.future_indices, br)
@@ -182,15 +193,16 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s.schedule_stream = MagicMock()
         br = self._make_batch_result()
 
-        Scheduler.launch_batch_sample_if_needed(s, br)
+        Scheduler.launch_batch_sample_if_needed(s, br, self._make_cur_batch())
 
         s.forward_stream.wait_stream.assert_called_once_with(s.schedule_stream)
         br.copy_to_cpu.assert_called_once()
 
     def test_no_delay_sample_func_is_noop(self):
         s = self._make_self(use_overlap_streams=False)
+        # cur_batch=None proves the early return never touches the batch.
         out = Scheduler.launch_batch_sample_if_needed(
-            s, SimpleNamespace(delay_sample_func=None)
+            s, SimpleNamespace(delay_sample_func=None), None
         )
         self.assertIsNone(out)
         s._relay_forward_payload.assert_not_called()

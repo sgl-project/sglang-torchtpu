@@ -95,5 +95,7 @@ export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$(( 2 * CONCUR * CONTEXT_LEN ))}
 # torch.compile EXTEND-graph transient.
 export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
 
+export EXTRA_ARGS="--tpu-compile-tracer direct${EXTRA_ARGS:+ $EXTRA_ARGS}"
+
 cd "$(dirname "$0")/../.."
 exec ./launch_server.sh "$@"

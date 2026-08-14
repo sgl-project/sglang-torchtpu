@@ -642,6 +642,8 @@ def _patch_support_triton_for_tpu() -> None:
     # Rebind the by-value imports (and the package re-export).
     for modname in (
         "sglang.srt.utils",
+        # write_cache_indices moved out of mem_cache.common into mem_cache.allocation.
+        "sglang.srt.mem_cache.allocation",
         "sglang.srt.mem_cache.common",
         "sglang.srt.model_executor.forward_batch_info",
         "sglang.srt.layers.rotary_embedding.mrope",

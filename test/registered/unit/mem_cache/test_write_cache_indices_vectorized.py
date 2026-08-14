@@ -1,4 +1,4 @@
-"""Unit tests for `_write_req_to_token_vectorized` (mem_cache/common.py).
+"""Unit tests for `_write_req_to_token_vectorized` (mem_cache/allocation.py).
 
 On TPU, `write_cache_indices` can't use the per-request Python-int loop (it bakes
 each request's (slot, len) offsets as HLO constants → per-step recompiles), so it
@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.mem_cache.common import _write_req_to_token_vectorized
+from sglang.srt.mem_cache.allocation import _write_req_to_token_vectorized
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

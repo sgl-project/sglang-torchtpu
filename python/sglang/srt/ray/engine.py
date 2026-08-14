@@ -129,6 +129,14 @@ def _find_engine_bundle(
 class RayEngine(Engine):
     """Engine using Ray actors for scheduler processes."""
 
+    def __init__(self, **kwargs):
+        # Set before super().__init__(): it launches the subprocesses, which need
+        # the group to schedule the scheduler actors onto.
+        self._placement_group = kwargs.pop("placement_group", None)
+        if "log_level" not in kwargs:
+            kwargs["log_level"] = "error"
+        super().__init__(server_args=ServerArgs(**kwargs))
+
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
         for actor in self._scheduler_init_result.scheduler_actors:
@@ -144,6 +152,8 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        *,
+        placement_group=None,
     ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 
@@ -251,7 +261,7 @@ class RayEngine(Engine):
                         server_args, tpu_worker_hostnames=tpu_worker_hostnames
                     )
 
-        pg = ray.util.get_current_placement_group()
+        pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             if server_args.enable_dp_attention:
                 total_gpus = server_args.tp_size * server_args.pp_size
@@ -277,6 +287,7 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
+        is_custom_pg = placement_group is not None
         nnodes = server_args.nnodes
 
         if server_args.use_ray and server_args.device == "tpu" and nnodes > 1:
@@ -374,7 +385,7 @@ class RayEngine(Engine):
                 actor.run_event_loop.remote() for actor in scheduler_actors
             ]
 
-            def wait_for_completion():
+            def block_until_scheduler_exits():
                 try:
                     ray.get(event_loop_refs)
                 except Exception as e:
@@ -383,7 +394,7 @@ class RayEngine(Engine):
             return (
                 RaySchedulerInitResult(
                     scheduler_infos=scheduler_infos,
-                    wait_for_completion=wait_for_completion,
+                    block_until_scheduler_exits=block_until_scheduler_exits,
                     scheduler_actors=scheduler_actors,
                 ),
                 None,
@@ -397,6 +408,7 @@ class RayEngine(Engine):
                     pg,
                     bundle_for_node,
                     rank0_node_ip,
+                    is_custom_pg,
                 ),
                 None,
             )
@@ -409,6 +421,7 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: list,
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
@@ -444,6 +457,7 @@ class RayEngine(Engine):
             pg,
             bundle_for_node,
             rank0_node_ip,
+            is_custom_pg,
         )
 
         # Start the DP controller's event loop in a daemon thread.
@@ -457,12 +471,13 @@ class RayEngine(Engine):
             {
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
             }
         ]
 
         event_loop_refs = controller.event_loop_refs
 
-        def wait_for_completion():
+        def block_until_scheduler_exits():
             try:
                 ray.get(event_loop_refs)
             except Exception as e:
@@ -470,6 +485,6 @@ class RayEngine(Engine):
 
         return RaySchedulerInitResult(
             scheduler_infos=scheduler_infos,
-            wait_for_completion=wait_for_completion,
+            block_until_scheduler_exits=block_until_scheduler_exits,
             scheduler_actors=controller.scheduler_actors,
         )

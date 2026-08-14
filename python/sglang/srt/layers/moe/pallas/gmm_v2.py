@@ -241,6 +241,9 @@ class InputConfigs:
     num_quant_blocks: int = 1
     scale_size_n: int = 0
     scale_block_n: int = 1
+    # dtype of the per-block scale tensor (fp32/bf16/fp8); drives the scale's
+    # share of the cost-model byte estimate. None when the rhs is unscaled.
+    scale_dtype: jnp.dtype | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1080,16 +1083,20 @@ def validate_inputs(
     group_sizes: jax.Array,
     group_offset: jax.Array,
     fuse_act: str | None = None,
+    packed_fp4: bool = False,
 ) -> Dimensions:
     """Validates the inputs for the GMM kernel."""
 
     size_m = lhs.shape[0]
-    size_group, size_k, size_n = rhs.shape
+    size_group, size_k_raw, size_n = rhs.shape
+    # Packed FP4 (NVFP4 / MXFP4-native): rhs is uint8 packed (2 float4 per byte),
+    # so real K = shape[1] * 2.
+    size_k = size_k_raw * 2 if packed_fp4 else size_k_raw
     size_lhs_group = group_sizes.shape[0]
 
     assert size_group <= size_lhs_group
     assert lhs.shape == (size_m, size_k)
-    assert rhs.shape == (size_group, size_k, size_n)
+    assert rhs.shape == (size_group, size_k_raw, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)
     if rhs_scale is not None:
@@ -1140,11 +1147,14 @@ def get_cost_estimate(cfgs: GmmConfigs):
         * jax.dtypes.itemsize_bits(rhs_dtype)
     ) // 8
     if cfgs.rhs_cfgs.has_scale:
+        # Honor the scale's real dtype (fp8/bf16/fp32) so the cost model reflects
+        # a narrower per-block scale stream instead of assuming fp32.
+        scale_itemsize = jnp.dtype(cfgs.rhs_cfgs.scale_dtype or jnp.float32).itemsize
         rhs_bytes += (
             dims.size_group
             * cfgs.rhs_cfgs.num_quant_blocks
             * dims.size_n
-            * jnp.dtype(jnp.float32).itemsize
+            * scale_itemsize
         )
     if cfgs.rhs_cfgs.has_bias:
         rhs_bytes += dims.size_group * dims.size_n * jnp.dtype(jnp.float32).itemsize
@@ -1184,16 +1194,25 @@ def make_gmm_configs(
     maybe_quantize_lhs: bool,
     zero_initialize: bool,
     fuse_act: str | None = None,
+    packed_fp4: bool = False,
 ):
     """Fills the GMM config for the GMM kernel."""
 
     dims = validate_inputs(
-        lhs, rhs, rhs_scale, rhs_bias, group_sizes, group_offset, fuse_act
+        lhs,
+        rhs,
+        rhs_scale,
+        rhs_bias,
+        group_sizes,
+        group_offset,
+        fuse_act,
+        packed_fp4=packed_fp4,
     )
 
     if rhs_scale is not None:
         has_scale = True
-        rhs_quant_dtype = rhs.dtype
+        # Packed FP4: uint8-packed float4, unpacked to float4_e2m1fn in-kernel.
+        rhs_quant_dtype = jnp.float4_e2m1fn.dtype if packed_fp4 else rhs.dtype
         num_blocks = rhs_scale.shape[1]
         scale_size_n = rhs_scale.shape[3]
         block_size = dims.size_k // num_blocks
@@ -1210,8 +1229,8 @@ def make_gmm_configs(
         # When rhs is quantized, pack elements into uint32 along the K axis.
         # In kernel_main we bitcast [G, K, N] -> [G, K//packing, N] uint32,
         # and in inner_kernel we unpack back to the original dtype via
-        # pltpu.bitcast.
-        rhs_packing = 32 // jax.dtypes.itemsize_bits(rhs.dtype)
+        # pltpu.bitcast. Packed FP4 stores 8 float4 codes per uint32.
+        rhs_packing = 8 if packed_fp4 else 32 // jax.dtypes.itemsize_bits(rhs.dtype)
     else:
         has_scale = False
         rhs_quant_dtype = None
@@ -1231,7 +1250,14 @@ def make_gmm_configs(
         num_quant_blocks=num_blocks,
         scale_size_n=scale_size_n,
         scale_block_n=scale_block_n,
+        scale_dtype=rhs_scale.dtype if has_scale else None,
     )
+
+    lhs_quant_block_size = 512
+    if packed_fp4 and block_size != lhs_quant_block_size:
+        raise NotImplementedError(
+            "Packed FP4 GMM requires quantization block size 512, " f"got {block_size}."
+        )
 
     lhs_q_dtype = None
     if maybe_quantize_lhs and rhs_quant_dtype is not None:
@@ -1246,7 +1272,11 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
-    lhs_quant_block_size = 512
+    if packed_fp4 and lhs_q_dtype != jnp.float8_e4m3fn.dtype:
+        raise NotImplementedError(
+            "Packed FP4 GMM requires TPU FP8 activation quantization support."
+        )
+
     if lhs_q_dtype is not None and num_blocks > 1:
         lhs_quant_block_size = min(lhs_quant_block_size, block_size)
 
@@ -1354,6 +1384,7 @@ def get_metadata(cfgs: GmmConfigs):
         "maybe_quantize_lhs",
         "zero_initialize",
         "fuse_act",
+        "packed_fp4",
     ]
 )
 def gmm_v2(
@@ -1372,6 +1403,7 @@ def gmm_v2(
     maybe_quantize_lhs: bool = True,
     zero_initialize: bool = True,
     fuse_act: str | None = None,
+    packed_fp4: bool = False,
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1424,6 +1456,7 @@ def gmm_v2(
         maybe_quantize_lhs=maybe_quantize_lhs,
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
+        packed_fp4=packed_fp4,
     )
     dims = cfgs.dims
     tiles = cfgs.tiles
@@ -1431,7 +1464,12 @@ def gmm_v2(
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
     if rhs_scale is not None:
-        rhs_scale = rhs_scale.astype(jnp.float32)
+        # Keep a narrow (fp8/bf16) per-block scale narrow through HBM/VMEM so its
+        # stream isn't inflated to fp32; the inner kernel upcasts to the
+        # accumulator dtype at multiply time (see ``block_acc *= ...astype``).
+        # fp32 scales are unchanged; any non-float scale normalizes to fp32.
+        if not jnp.issubdtype(rhs_scale.dtype, jnp.floating):
+            rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:
         rhs_bias = rhs_bias.astype(jnp.float32)

@@ -76,12 +76,12 @@ dependencies = [
   # torch-tpu wheels come from a private package server (see the
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
-  "torch-tpu==0.1.1.dev20260804175944",
+  "torch-tpu==0.1.1.dev20260813160135",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
-  "tpu-raiden-torch==0.0.1.dev20260806130316",
-  "libtpu==0.0.42.1",
+  "tpu-raiden-torch==0.0.1.dev20260813160135",
+  "libtpu==0.0.44.1",
   "torch==2.11.0",
   "torchvision==0.26.0",
   "jax==0.10.2",

@@ -125,7 +125,7 @@ ${WEIGHTS_VOLUME}
                         rc=0
                         for f in ${TEST_FILES}; do
                           echo "== live-server test: $f =="
-                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 1800 python3 "$f" || rc=1
+                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 3600 python3 "$f" || rc=1
                         done
                         kill "$spid" 2>/dev/null || true
                         exit $rc

@@ -75,6 +75,42 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
 logger = get_logger("tpu_graph_runner")
 
 
+def _resolve_fused_op_dispatch(model: Any) -> None:
+    """Eagerly resolve ``BaseFusedOp._forward_method`` on model submodules and
+    kernel-registry singletons."""
+    import importlib
+
+    from sglang.kernels.fused_op import BaseFusedOp, get_fused_op_backend
+    from sglang.kernels.registry import registry
+
+    # TODO: drop if upstream resolves the forced-backend sentinel at import
+    # or construction time instead of on first forward.
+    get_fused_op_backend()
+
+    def _resolve(op: BaseFusedOp) -> None:
+        if getattr(op, "_forward_method", object()) is None:
+            op._forward_method = op._resolve_forward_method()
+
+    modules = model.modules() if callable(getattr(model, "modules", None)) else (model,)
+    for module in modules:
+        if isinstance(module, BaseFusedOp):
+            _resolve(module)
+
+    seen = set()
+    for spec in registry.all_specs():
+        mod_name, _, attr = spec.target.partition(":")
+        inst_name = attr.split(".")[0]
+        if not inst_name or (mod_name, inst_name) in seen:
+            continue
+        seen.add((mod_name, inst_name))
+        try:
+            obj = getattr(importlib.import_module(mod_name), inst_name, None)
+        except Exception:
+            continue  # spec modules are import-metadata; skip unloadable ones
+        if isinstance(obj, BaseFusedOp):
+            _resolve(obj)
+
+
 class TpuGraphRunner:
     """Orchestrate ``torch.compile(backend='tpu')`` annotation policies."""
 
@@ -103,13 +139,11 @@ class TpuGraphRunner:
                 "torch.compile install on TPU.",
                 type(self.model).__name__,
             )
-            # Reflect the skip to downstream code that branches on this
-            # flag (kernel_warmup pre-compile loops on the CUDA side;
-            # any future TPU equivalent should follow the same
-            # convention).
-            model_runner.server_args.override(
-                "tpu_graph_runner", enable_torch_compile=False
-            )
+            # Reflect the skip to downstream readers; CaptureFlags is the
+            # designated post-publish writer for this flag (as base_runner).
+            from sglang.srt.runtime_context import get_flags
+
+            get_flags().capture.enable_torch_compile = False
             return
 
         # Raise dynamo's recompile ceiling. torch.compile builds a fresh graph
@@ -136,6 +170,16 @@ class TpuGraphRunner:
             torch._dynamo.config.fail_on_recompile_limit_hit = True
 
         _register_tpu_compile_backend()
+
+        # TODO: remove — TPU does not support CP decode-attn-TP; this only
+        # keeps the singleton's first-call init out of the dynamo trace.
+        from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+
+        get_cp_decode_attn_tp_ctx()
+
+        # TODO: drop if upstream resolves BaseFusedOp dispatch at construction
+        # instead of on first forward (keeps it out of the dynamo trace).
+        _resolve_fused_op_dispatch(self.model)
 
         # TODO: Move policy discovery and installation into a reusable compile
         # runner when a second platform adopts support_torch_compile metadata.
