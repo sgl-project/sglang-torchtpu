@@ -131,6 +131,12 @@ One ClusterQueue per `(lane, hosts)`. The shapes must not share a queue: a 2-hos
 A PodSet is assigned exactly one ResourceFlavor, which is what keeps a multi-host JobSet's
 two pods inside a single slice.
 
+Before creating the JobSet, `_tpu-test.yml` runs `reconcile_quota.py --pool=<pool>`, which
+sets every ClusterQueue's `nominalQuota` from live allocatable chips and refuses to submit
+if the target pool holds more than one slice. After creating it, the workflow asserts Kueue
+produced a `Workload` for that JobSet and fails the job otherwise — so a JobSet running with
+no admission control turns the run red instead of going unnoticed.
+
 GitHub concurrency groups are **supersession only** — "don't stack two runs of me." They no
 longer ration hardware. That was the old `tpu-slice-<hosts>` mutex, and it was the wrong
 primitive: the group holds one in-progress plus one pending, so a third claimant silently
@@ -141,9 +147,16 @@ quota entry — no workflow change.
 
 | phase | budget | covers |
 |-------|--------|--------|
-| admission | 3600s | suspended in Kueue; no pods exist yet |
+| admission | the runner's remaining lifetime (~2h55m launch, 3h25m exec) | suspended in Kueue; no pods exist yet |
 | running | 900s | placed, but binding + image pull |
-| runtime | `est_time`×1.5 / 5400 (launch) / 7800 (exec) | the test itself |
+| runtime | 9600 (launch) / 7800 (exec) / `est_time`×1.5+600 (suite) | the test itself |
+
+One slice runs one multi-host job at a time, so a job's wait is however long everything
+queued ahead of it takes — there is no useful number smaller than "as much of the runner as
+is left". `admit_s` is therefore derived: `timeout-minutes` (360, GitHub's hard cap for
+hosted runners) minus this job's own runtime, the bind/pull window and setup. The runtime
+figure must OUTLAST the JobSet's `activeDeadlineSeconds` so the JobSet — not the poll loop —
+reports the outcome.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
@@ -155,9 +168,9 @@ poll budget, so an inflated value pushes a serialized run toward the next day's 
 
 **Known gaps.**
 
-- `nominalQuota` is static and never reconciled against real node count. A node going
-  NotReady over-states it; `waitForPodsReady` evicts and requeues instead of deadlocking,
-  but the number is still maintained by hand.
+- Worst-case serialized multi-host work (~11.5h at full per-job allowances) exceeds
+  GitHub's 6h hosted-runner cap. Real runtimes are well inside it, but the fix is measured
+  deadlines or a second 2x2x2 slice.
 - No `est_time` refit loop — values are hand-written and have drifted by ~8x.
 - Results land only in the run summary; no digest, no notification.
 
@@ -175,11 +188,12 @@ _TODO._
 |------|---------|
 | `docker/tpu.Dockerfile` | TPU image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
 | `docker/cloudbuild.tpu.yaml` | Cloud Build config; runs **as `tpu-ci`**, token from the metadata server, pushes to AR |
-| `.github/tpu-ci/topology.yaml` | Host count → slice `{topology, pool, queue}` (detection source of truth) |
+| `.github/tpu-ci/topology.yaml` | `(lane, host count)` → slice `{topology, pool, queue}` (detection source of truth) |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Strategic-merge patch dropping the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
+| `.github/tpu-ci/reconcile_quota.py` | Sets each ClusterQueue's `nominalQuota` from live allocatable chips; refuses to run if a multi-host pool holds more than one slice. Run by `_tpu-test.yml` before every submission; `--dry-run` locally |
 | `.github/tpu-ci/discover_multihost.py` | Scans `MULTIHOST_LAUNCH` decls, groups files by launch spec → matrix JSON |
 | `benchmark/tpu/recipe/*_mh.sh` | Per-model multi-host launch recipes (own `MODEL`/`EP_SIZE`/…, exec `launch_server.sh`) |
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
@@ -187,7 +201,7 @@ _TODO._
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
 | `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → single-host + discover → multi-host **matrix** over groups |
 
-## Cluster infra (and what is currently missing)
+## Cluster infra
 
 CI node pools, all on the `ghostfish-u2zcmybntv70q` reservation. Create a new one with
 `--machine-type=tpu7x-standard-4t --reservation-affinity=specific --node-labels=ci-tpu-pool=…
@@ -204,13 +218,12 @@ and passing it takes the multi-host path, which is rejected for this machine typ
 | `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 | 8 |
 | `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | 2x2x4 | 4 | 16 |
 
-Only the `2x2x1` pools are safe to resize — each of their nodes is already a whole slice.
+Only the `2x2x1` pools are safe to resize — each of their nodes is already a whole slice,
+so quota follows automatically via `reconcile_quota.py` and no manifest edit is needed.
 Resizing a multi-host pool puts two slices behind one `ci-tpu-pool` label and a JobSet's
-pods can straddle them: no error, just an ICI rendezvous hang. Resizing `ci-tpu7x-2x2x1`
-also means bumping `tpu-prgate-1h`'s `nominalQuota` to `(nodes-1) * 4`.
+pods can straddle them: no error, just an ICI rendezvous hang. `reconcile_quota.py` refuses
+to submit when it sees that, but the fix is to add capacity as a **new pool**.
 
-- ⚠️ **`nightly-4h` has never run a real workload.** Confirm `2x2x4` is a valid `tpu7x`
-  topology and really is 4 hosts before relying on the `hosts: 4` lane.
 - `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` also exist — not CI, do not repurpose.
 - `system-pool` (e2-standard-2 ×2) hosts the **JobSet operator v0.12.0** and the **Kueue
   controller** (the e2-medium default-pool is CPU-saturated by GKE daemons).
