@@ -18,8 +18,14 @@ of the registered tree sums est_time over the suite's enabled tests -- no sglang
 needed (same technique as discover_multihost.py). The workflow uses it so the poll
 timeout scales with the suite instead of a fixed ceiling.
 
+A third mode renders jobset-tpu-pd.yaml instead: P/D disaggregation across TWO
+slices (one per role). Every pod of both slices runs the --exec command; the
+test file dispatches roles from CI_PD_ROLE + the slice-local TPU worker env.
+
 Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
        render_jobset.py --image <ref> --launch-script <rel> --files "<f>..." --hosts N
+       render_jobset.py --image <ref> --exec "<cmd>" --pd-prefill-hosts N \
+           --pd-decode-hosts N [--weights-pvc <pvc>] [--name <run-name>]
        render_jobset.py --suite <name> --print-wait-seconds
 """
 
@@ -35,6 +41,10 @@ import yaml
 # (approximate) est_time estimates; the floor covers tiny/near-empty suites.
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
+
+# P/D mode: two engines to bring up (weight load + compile warmup on both
+# slices) before the probe + accuracy eval even start.
+_PD_ACTIVE_DEADLINE = 10800
 
 # Positional order of register_*_ci(...) args (mirrors ci_register._PARAM_ORDER) so the
 # scan handles both register_tpu_ci(120, "suite") and register_tpu_ci(est_time=120, ...).
@@ -119,6 +129,10 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
+    # P/D mode: hosts per role, each role on its own slice. Both must be set
+    # (with --exec); --hosts is ignored in this mode.
+    ap.add_argument("--pd-prefill-hosts", type=int, default=0)
+    ap.add_argument("--pd-decode-hosts", type=int, default=0)
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
@@ -138,6 +152,46 @@ def main():
         ap.error("--image is required when rendering")
 
     slices = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["slices"]
+
+    def slice_for(hosts):
+        sl = slices.get(hosts, slices.get(str(hosts)))
+        if not sl:
+            sys.exit(f"no slice for hosts={hosts} in topology.yaml")
+        return sl
+
+    if a.pd_prefill_hosts or a.pd_decode_hosts:
+        if not (a.pd_prefill_hosts >= 1 and a.pd_decode_hosts >= 1):
+            ap.error("P/D mode needs both --pd-prefill-hosts and --pd-decode-hosts")
+        if not a.exec_cmd:
+            ap.error("P/D mode needs --exec")
+        run_name = dns_safe(a.name or "pd")
+        # Pods locate their peer slice by swapping the replicated-job segment
+        # ("-prefill-"/"-decode-") of their own hostname; a run name containing
+        # either word would make that swap ambiguous.
+        for role in ("prefill", "decode"):
+            if role in run_name:
+                sys.exit(f"P/D run name must not contain {role!r}: {run_name}")
+        prefill_slice = slice_for(a.pd_prefill_hosts)
+        decode_slice = slice_for(a.pd_decode_hosts)
+        pvc = a.weights_pvc
+        vals = {
+            "IMAGE": a.image,
+            "ACTIVE_DEADLINE": str(_PD_ACTIVE_DEADLINE),
+            "EXEC_CMD": a.exec_cmd,
+            "RUN_NAME": run_name,
+            "PREFILL_HOSTS": str(a.pd_prefill_hosts),
+            "DECODE_HOSTS": str(a.pd_decode_hosts),
+            "PREFILL_TOPOLOGY": prefill_slice["topology"],
+            "PREFILL_POOL": prefill_slice["pool"],
+            "DECODE_TOPOLOGY": decode_slice["topology"],
+            "DECODE_POOL": decode_slice["pool"],
+            "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
+            "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
+        }
+        tpl = open(f"{a.dir}/jobset-tpu-pd.yaml").read()
+        out = re.sub(r"\$\{(\w+)\}", lambda m: vals.get(m.group(1), m.group(0)), tpl)
+        sys.stdout.write(out)
+        return
 
     if a.launch_script:
         if a.hosts < 1:
@@ -162,9 +216,7 @@ def main():
         run_name = dns_safe(a.suite)
         suite = a.suite
 
-    sl = slices.get(hosts, slices.get(str(hosts)))
-    if not sl:
-        sys.exit(f"no slice for hosts={hosts} in topology.yaml")
+    sl = slice_for(hosts)
 
     # Suite mode runs every registered file sequentially, so its deadline scales
     # with the suite (same est_time formula as _tpu-test's poll budget, keeping the

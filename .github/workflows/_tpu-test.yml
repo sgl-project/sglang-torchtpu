@@ -48,6 +48,17 @@ on:
         required: false
         type: string
         default: ""
+      # --- P/D mode: prefill + decode groups, each on its own slice; needs exec_cmd.
+      # Callers should also pass `hosts` = the per-role slice size so the
+      # concurrency group serializes with other runs contending for the slices.
+      pd_prefill_hosts:
+        required: false
+        type: number
+        default: 0
+      pd_decode_hosts:
+        required: false
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -97,6 +108,8 @@ jobs:
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
+            --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
+            --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
@@ -124,7 +137,9 @@ jobs:
           #     (~30m server bring-up + up to 2 files x `timeout 3600`; gsm8k on R1
           #     needs the full hour). The poll must OUTLAST that so the JobSet -- not
           #     this loop -- decides the outcome, hence 9600s = 9000 + margin.
-          if [ -n "${{ inputs.launch_script }}" ]; then
+          if [ '${{ inputs.pd_prefill_hosts }}' != '0' ]; then
+            wait_s=11400  # outlast P/D mode's activeDeadlineSeconds=10800 + margin
+          elif [ -n "${{ inputs.launch_script }}" ]; then
             wait_s=9600
           elif [ -n "${{ inputs.exec_cmd }}" ]; then
             wait_s=7800   # outlast exec mode's activeDeadlineSeconds=7200 + margin
