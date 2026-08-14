@@ -115,12 +115,9 @@ jobs:
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
-          # Admission control must be ON. Kueue creates a Workload per managed JobSet,
-          # labelled with the JobSet's own uid; no Workload means Kueue ignored this one and
-          # it is about to run with no gang admission at all -- which is silent, and on a
-          # multi-host slice ends as two half-placed gangs deadlocked until their deadline.
-          # Fails closed here instead: missing queue-name label, jobset framework disabled,
-          # LocalQueue in the wrong namespace, or a reverted ConfigMap all land here.
+          # No Workload means Kueue ignored this JobSet and it would run with no gang
+          # admission -- silent, and on a multi-host slice it ends as two half-placed gangs
+          # deadlocked until their deadline. Fail closed instead.
           uid="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.metadata.uid}')"
           wl_sel="kueue.x-k8s.io/job-uid=${uid}"
           for _ in $(seq 1 15); do

@@ -1,15 +1,12 @@
-# Kueue gang-admits the TPU CI JobSets against slice quota.
-# Install, ConfigMap settings and verification: README.md "Enabling Kueue".
-# Pools and their chip counts: provision-pools.sh.
+# Kueue gang-admits the TPU CI JobSets. Install and verification: README "Enabling Kueue".
 #
-# One ResourceFlavor per slice: GKE tpu7x nodes expose no per-slice label, so ci-tpu-pool
-# is the finest slice selector and a multi-host pool must hold exactly one slice.
-# tpu7x-standard-4t = 4 chips/host -> 2x2x1 = 1 node, 2x2x2 = 2 nodes, 2x2x4 = 4 nodes.
+# One ResourceFlavor per slice -- GKE tpu7x nodes expose no per-slice label, so ci-tpu-pool
+# is the finest selector and a multi-host pool must hold exactly one slice.
+# One ClusterQueue per (lane, hosts), matching topology.yaml's `queue`.
 #
-# One ClusterQueue per (lane, host count), matching topology.yaml's `queue`. Shapes must
-# NOT share a queue: a 2-host job needs 8 chips, which a single-host flavor satisfies on
-# quota while being unschedulable, so mixing them would admit a workload that can never run.
-# Lanes are separate so pr-gate and nightly cannot borrow each other's capacity.
+# Quotas: cpu and memory are derived from the TPU quota (pods take 4 chips / 4 cpu / 32Gi,
+# so 1 cpu and 8Gi per chip) to keep TPU the only binding resource. Every resource a pod
+# requests must appear in coveredResources or nothing is admittable.
 ---
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
@@ -71,10 +68,8 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# pr-gate 1-host: 4 nodes x 4 chips = 16, each node a whole slice. Quota'd at 12 so one node
-# going NotReady does not over-state it -- an over-stated quota admits a gang the cluster
-# cannot hold, and the extra pod goes Pending inside an *admitted* workload. If the pool is
-# resized, bump this in the same change (nodes-1) * 4.
+# 4 nodes x 4 chips = 16, each node a whole slice. Held at 12 so one node going NotReady
+# does not over-state quota; on resize, set to (nodes-1) * 4.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -94,8 +89,8 @@ spec:
             - name: "memory"
               nominalQuota: 96Gi
 ---
-# pr-gate 2-host: one slice = 8 chips = one concurrent job. No headroom possible: a 2-host
-# job needs exactly 8, so any lower value admits nothing.
+# One slice = 8 chips = one concurrent job. No headroom possible: a 2-host job needs
+# exactly 8, so any lower value admits nothing.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -115,9 +110,8 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# nightly 1-host: 2 nodes x 4 = 8. Taken at full capacity rather than under-stated -- at two
-# nodes, one node of headroom would cost half the lane. waitForPodsReady absorbs the drift
-# by evicting and requeuing instead of deadlocking.
+# 2 nodes x 4 = 8, at full capacity: one node of headroom would cost half the lane, and
+# waitForPodsReady requeues rather than deadlocks if it over-states.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -137,8 +131,7 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# nightly 2-host: one slice. A second 2-host slice = new pool + new flavor + one more entry
-# in this flavors list; no workflow change.
+# One slice. A second = new pool + new flavor + one more entry here; no workflow change.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -158,7 +151,7 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# nightly 4-host: one slice = 16 chips. Exact, same reason as the 2-host queues.
+# One slice = 16 chips. Exact, same reason as the 2-host queues.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
