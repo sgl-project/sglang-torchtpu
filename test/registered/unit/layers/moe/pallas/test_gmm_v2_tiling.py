@@ -6,6 +6,7 @@ These exercise the pure tile-sizing math, so they need no TPU: ``get_tpu_info``
 skipped gracefully where JAX / the pallas import chain is unavailable.
 """
 
+import inspect
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +28,7 @@ except Exception:  # pragma: no cover - depends on JAX/pallas availability
     _HAS_GMM = False
 
 try:
+    from sglang.srt.layers.moe.pallas.fused_rs import fused_moe as fused_rs_moe
     from sglang.srt.layers.moe.pallas.fused_rs import (
         gmm_fused_rs_nodedup as fused_rs_gmm,
     )
@@ -53,6 +55,43 @@ _MiB = 1024 * 1024
 
 @unittest.skipUnless(_HAS_FUSED_RS, _FUSED_RS_SKIP_REASON)
 class TestFusedRsGmLoopBound(CustomTestCase):
+    def test_routing_uses_raw_token_indices_and_int32_metadata(self):
+        lhs, group_sizes, output, topk_slots = fused_rs_moe._compute_rs_routing(
+            jnp.asarray([[2, 0], [1, 2]], dtype=jnp.int32),
+            num_experts=3,
+            topk=2,
+        )
+
+        self.assertEqual(lhs.tolist(), [0, 1, 0, 1])
+        self.assertEqual(group_sizes.tolist(), [1, 1, 2])
+        self.assertEqual(output.tolist(), lhs.tolist())
+        self.assertEqual(topk_slots.tolist(), [1, 0, 0, 1])
+        for value in (lhs, group_sizes, output, topk_slots):
+            self.assertEqual(value.dtype, jnp.int32.dtype)
+
+    def test_receive_count_is_owned_by_the_kernel_contract(self):
+        signature = inspect.signature(fused_rs_gmm.gmm_v2_fused_rs.__wrapped__)
+        self.assertNotIn("peer_recv_counts", signature.parameters)
+        self.assertIn("use_in_kernel_recv_count", signature.parameters)
+
+    def test_dma_ordering_guards_are_retained(self):
+        source = inspect.getsource(fused_rs_gmm.kernel_main_fused_rs)
+        zero_wait = source.index("zero_out_end_3d")
+        entry_signal = source.index("\n    sync_barrier_signal()", zero_wait)
+        gmm1_compute = source.index("_dispatch(compute_gmm1_tile")
+        rotating_refill = source.index("if step + num_w1_bufs", gmm1_compute)
+        next_expert_prefetch = source.index(
+            "# Prefetch the next gm only after every current-gm GMM1 read",
+            rotating_refill,
+        )
+        final_completion = source.rindex("\n    sync_barrier()")
+        receive_drain = source.index('with jax.named_scope("drain_recv_sem")')
+
+        self.assertLess(zero_wait, entry_signal)
+        self.assertLess(gmm1_compute, rotating_refill)
+        self.assertLess(rotating_refill, next_expert_prefetch)
+        self.assertLess(final_completion, receive_drain)
+
     def test_global_starts_match_hand_computed_tile_counts(self):
         cases = (
             # starts, counts, tile_m, sublane, expected

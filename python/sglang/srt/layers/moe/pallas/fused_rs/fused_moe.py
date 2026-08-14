@@ -81,20 +81,24 @@ def _assert_fused_rs_smem_safe(size_m: int) -> None:
 # ============================================================================
 
 
-def _compute_rs_routing(topk_indices, *, num_experts, topk, ep_size, my_id):
-    """Inline routing for the RS path with full VPU vectorized precomputations.
-    Computes:
+def _compute_rs_routing(topk_indices, *, num_experts, topk):
+    """Inline routing for the RS path. Computes:
       - lhs_indices: int32[size_m] — gather indices (token ID per row)
       - group_sizes: int32[num_experts] — rows per expert
-      - topk_slot_indices: int32[size_m] — topk slot (0..topk-1) per row
-      - peer_recv_counts: int32[ep_size] — incoming row counts per peer
+      - output_indices: int32[size_m] — = lhs_indices for EP
+      - topk_slot_indices: int32[size_m] — top-k slot (0..topk-1) per row
+
+    Two TPU-specific performance optimizations avoid expensive lowered ops:
+
+    1. ``lhs_indices`` and ``topk_slot_indices`` use integer arithmetic instead
+       of gathers.
+    2. ``group_sizes`` uses one-hot + sum instead of a contended scatter_add.
+
+    These arrays must remain int32: Mosaic requires 32-bit signless integers
+    for scalar-prefetch references.
     """
     topk_indices_flat = topk_indices.flatten()
     topk_argsort_indices = jnp.argsort(topk_indices_flat)
-    sorted_experts = topk_indices_flat[topk_argsort_indices]
-    num_experts_per_shard = num_experts // ep_size
-    source_peers = (sorted_experts // num_experts_per_shard).astype(jnp.int32)
-
     expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
     group_sizes = jnp.sum(
         (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
@@ -102,19 +106,8 @@ def _compute_rs_routing(topk_indices, *, num_experts, topk, ep_size, my_id):
     )
     lhs_indices = (topk_argsort_indices // topk).astype(jnp.int32)
     topk_slot_indices = (topk_argsort_indices % topk).astype(jnp.int32)
-
-    num_tokens = topk_indices.shape[0]
-    chunk_size = (num_tokens + ep_size - 1) // ep_size
-    output_tokens_per_chip = max(chunk_size, 1)
-    dest_chips = (lhs_indices // output_tokens_per_chip).astype(jnp.int32)
-
-    is_to_me = (dest_chips == my_id) & (source_peers != my_id)
-    filtered_peers = jnp.where(is_to_me, source_peers, ep_size)
-    peer_recv_counts = jnp.bincount(filtered_peers, length=ep_size + 1)[
-        :ep_size
-    ].astype(jnp.int32)
-
-    return lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts
+    output_indices = lhs_indices
+    return lhs_indices, group_sizes, output_indices, topk_slot_indices
 
 
 # ============================================================================
@@ -155,18 +148,17 @@ def moe_gmm_local_rs_nodedup(
         w2_global_scale = w2_gs
     num_tokens = hidden_states_local.shape[0]
     hidden_size = w2.shape[-1]
-    chunk_size = (num_tokens + ep_size - 1) // ep_size
+    # The shard_map contract pads the token dimension to be EP-divisible.
+    chunk_size = num_tokens // ep_size
     num_experts = w1.shape[0] * ep_size  # global num_experts
     num_local_experts = w1.shape[0]
     go_flat = group_offset.reshape(-1)
     go_val = go_flat[0]
     my_id = go_flat[1] if go_flat.shape[0] > 1 else (go_val // num_local_experts)
 
-    # Routing with vectorized VPU precomputations:
-    lhs_indices, group_sizes, topk_slot_indices, peer_recv_counts = _compute_rs_routing(
-        topk_indices, num_experts=num_experts, topk=topk, ep_size=ep_size, my_id=my_id
+    lhs_indices, group_sizes, output_indices, topk_slot_indices = _compute_rs_routing(
+        topk_indices, num_experts=num_experts, topk=topk
     )
-    output_indices = (lhs_indices * topk + topk_slot_indices).astype(jnp.int32)
     size_m = lhs_indices.shape[0]
     _assert_fused_rs_smem_safe(size_m)
 
@@ -174,13 +166,6 @@ def moe_gmm_local_rs_nodedup(
     # materialization. Avoids the heavy ``jnp.repeat -> scatter_add``.
     expert_idx = jnp.arange(num_experts, dtype=jnp.int32)
     local_start = jnp.sum(jnp.where(expert_idx < go_val, group_sizes, 0))
-    local_end = local_start + jnp.sum(
-        jnp.where(
-            (expert_idx >= go_val) & (expert_idx < go_val + num_local_experts),
-            group_sizes,
-            0,
-        )
-    )
     # Static loop bound — kernel pads with ``is_active`` gating.
     #
     # ``tile_m`` MUST match the value the kernel picks internally (via
@@ -228,7 +213,6 @@ def moe_gmm_local_rs_nodedup(
     tile_m = block_sizes.tile_m
     size_lhs_sublane = min(
         pltpu.get_tpu_info().get_sublane_tiling(hidden_states_local.dtype),
-        tile_m,
         size_m,
     )
     local_group_sizes = jax.lax.dynamic_slice(
@@ -256,15 +240,14 @@ def moe_gmm_local_rs_nodedup(
         w2,
         group_sizes,
         lhs_indices,
-        output_indices,  # <--- MUST BE output_indices!
-        peer_recv_counts=peer_recv_counts,
+        output_indices,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         w1_global_scale=w1_global_scale,
         w2_global_scale=w2_global_scale,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
-        activation=activation,
+        act_fn=activation,
         output_size=num_tokens,
         group_offset=group_offset,
         group_start=jnp.array([local_start], dtype=jnp.int32),
