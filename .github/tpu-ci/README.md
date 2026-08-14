@@ -25,7 +25,7 @@ PR / nightly ─▶ GitHub-hosted runner
                  │    LocalQueue → ClusterQueue → ResourceFlavor (≡ one slice)
                  ▼
                  ├─ pr-gate lane
-                 │    ├─ ci-tpu7x-2x2x1          (pr-gate,    6 nodes = 6 slices)
+                 │    ├─ ci-tpu7x-2x2x1          (pr-gate,    4 nodes = 4 slices)
                  │    └─ ci-tpu7x-2x2x2-prgate   (pr-gate-2h, 1 slice = 2 hosts)
                  └─ nightly lane
                       ├─ ci-tpu7x-2x2x1-nightly  (nightly-1h, 2 nodes = 2 slices)

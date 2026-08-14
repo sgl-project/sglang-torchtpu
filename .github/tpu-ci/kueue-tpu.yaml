@@ -71,9 +71,10 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# pr-gate 1-host: 6 nodes x 4 chips = 24, each node a whole slice. Quota'd at 20 so one node
+# pr-gate 1-host: 4 nodes x 4 chips = 16, each node a whole slice. Quota'd at 12 so one node
 # going NotReady does not over-state it -- an over-stated quota admits a gang the cluster
-# cannot hold, and the extra pod goes Pending inside an *admitted* workload.
+# cannot hold, and the extra pod goes Pending inside an *admitted* workload. If the pool is
+# resized, bump this in the same change (nodes-1) * 4.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -87,7 +88,7 @@ spec:
         - name: tpu7x-2x2x1-pr-gate
           resources:
             - name: "google.com/tpu"
-              nominalQuota: 20
+              nominalQuota: 12
 ---
 # pr-gate 2-host: one slice = 8 chips = one concurrent job. No headroom possible: a 2-host
 # job needs exactly 8, so any lower value admits nothing.

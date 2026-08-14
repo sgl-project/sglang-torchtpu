@@ -7,13 +7,17 @@
 # Target layout (chips: tpu7x-standard-4t = 4 chips/host):
 #
 #   lane      hosts  pool                     ci-tpu-pool   nodes  chips
-#   pr-gate   1      ci-tpu7x-2x2x1           pr-gate       6      24   (resize 4 -> 6)
+#   pr-gate   1      ci-tpu7x-2x2x1           pr-gate       4      16   (pre-existing)
 #   pr-gate   2      ci-tpu7x-2x2x2-prgate    pr-gate-2h    2       8
 #   nightly   1      ci-tpu7x-2x2x1-nightly   nightly-1h    2       8
-#   nightly   2      ci-tpu7x-2x2x2-nightly   nightly       2       8
+#   nightly   2      ci-tpu7x-2x2x2           nightly       2       8   (pre-existing)
 #   nightly   4      ci-tpu7x-2x2x4-nightly   nightly-4h    4      16
-#                                             pr-gate total        32
+#                                             pr-gate total        24
 #                                             nightly total        32
+#
+# Single-host pools carry no --tpu-topology: GKE derives the 2x2x1 node label from the machine
+# type, and passing the flag takes the multi-host path, which implies a placement policy and
+# fails ("...with placement policy is not supported. Use workload policy instead").
 #
 # ONE POOL PER SLICE for multi-host: GKE tpu7x nodes expose no per-slice label, so
 # ci-tpu-pool is the finest slice selector. Resizing a 2x2x2/2x2x4 pool puts two slices
@@ -43,19 +47,21 @@ run() {
 }
 
 # name  label  topology   (2x2x1 needs no placement policy; multi-host does)
+# ci-tpu7x-2x2x2 (ci-tpu-pool=nightly) already exists and serves nightly/2 -- not listed.
 POOLS=(
   "ci-tpu7x-2x2x2-prgate   pr-gate-2h   2x2x2"
   "ci-tpu7x-2x2x1-nightly  nightly-1h   2x2x1"
-  "ci-tpu7x-2x2x2-nightly  nightly      2x2x2"
   "ci-tpu7x-2x2x4-nightly  nightly-4h   2x2x4"
 )
 
 echo "== preflight (read-only) =="
-echo "-- reservation headroom: need 10 more ${MACHINE}"
+echo "-- reservation headroom (CHIPS): reserved / in-use. Need 40 free."
+# Aggregate reservation (VM_FAMILY_CLOUD_TPU_POD_SLICE_TPU7X), so the counts live under
+# aggregateReservation, not specificReservation -- and they count chips, not VMs. Spot pools
+# (tpu7x-2x2x1-i308, tpu7x-2x2x2-mimo) do not draw on it, so in-use < total TPU nodes.
 gcloud compute reservations describe "${RESERVATION##*/}" \
   --zone="$ZONE" --project="$PROJECT" \
-  --format="value(specificReservation.count,specificReservation.inUseCount)" || true
-echo "-- 2x2x4 must be a valid tpu7x topology and be 4 hosts; confirm before creating"
+  --format="value(aggregateReservation.reservedResources[0].accelerator.acceleratorCount,aggregateReservation.inUseResources[0].accelerator.acceleratorCount)" || true
 echo "-- workload-metadata on the existing CI pool (this script assumes ${WORKLOAD_METADATA}):"
 gcloud container node-pools describe ci-tpu7x-2x2x1 --cluster="$CLUSTER" \
   --zone="$ZONE" --project="$PROJECT" \
@@ -68,6 +74,11 @@ echo "== 1. workload policies (multi-host only) =="
 for spec in "${POOLS[@]}"; do
   read -r name _label topo <<<"$spec"
   [ "$topo" = "2x2x1" ] && continue
+  if gcloud compute resource-policies describe "${name}-wp" --region="$REGION" \
+       --project="$PROJECT" >/dev/null 2>&1; then
+    echo "  (exists) ${name}-wp"
+    continue
+  fi
   run gcloud compute resource-policies create workload-policy "${name}-wp" \
     --type=HIGH_THROUGHPUT --accelerator-topology="$topo" \
     --region="$REGION" --project="$PROJECT"
@@ -79,30 +90,44 @@ echo "== 2. node pools =="
 # machine types. 2x2x1 is single-host, so it needs an explicit count.
 for spec in "${POOLS[@]}"; do
   read -r name label topo <<<"$spec"
+  state=$(gcloud container node-pools describe "$name" --cluster="$CLUSTER" --zone="$ZONE" \
+            --project="$PROJECT" --format="value(status)" 2>/dev/null || true)
+  case "$state" in
+    RUNNING)      echo "  (exists) $name"; continue ;;
+    PROVISIONING) echo "  (in progress) $name -- re-run once it is RUNNING"; continue ;;
+    "")           ;;
+    *)            echo "  ⚠️  $name is in state $state -- delete it before retrying:"
+                  echo "      gcloud container node-pools delete $name --cluster=$CLUSTER --zone=$ZONE --project=$PROJECT"
+                  continue ;;
+  esac
   args=(
     gcloud container node-pools create "$name"
     --cluster="$CLUSTER" --zone="$ZONE" --project="$PROJECT"
-    --machine-type="$MACHINE" --tpu-topology="$topo"
+    --machine-type="$MACHINE"
     --reservation-affinity=specific --reservation="$RESERVATION"
     --node-labels="ci-tpu-pool=${label}"
     --workload-metadata="$WORKLOAD_METADATA"
   )
   if [ "$topo" = "2x2x1" ]; then
+    # Single-host: do NOT pass --tpu-topology. GKE derives the 2x2x1 node label from the
+    # machine type, and passing the flag takes the multi-host path, which implies a
+    # placement policy -- rejected as "Creation of a managed instance group with
+    # tpu7x-standard-4t machine type with placement policy is not supported. Use workload
+    # policy instead." The working ci-tpu7x-2x2x1 pool has no topology or placement field
+    # at all, just machineType + node count.
     args+=(--num-nodes=2)
   else
-    args+=(--placement-policy="${name}-wp")
+    args+=(--tpu-topology="$topo" --placement-policy="${name}-wp")
   fi
   run "${args[@]}"
 done
 echo
 
-echo "== 3. grow the existing single-host pool 4 -> 6 =="
-# Safe only because each 2x2x1 node is its own slice.
-run gcloud container clusters resize "$CLUSTER" --node-pool=ci-tpu7x-2x2x1 \
-  --num-nodes=6 --zone="$ZONE" --project="$PROJECT" --quiet
-echo
-
-echo "== 4. verify =="
+echo "== 3. verify =="
 echo "  kubectl get nodes -L ci-tpu-pool,cloud.google.com/gke-tpu-topology"
-echo "  expect: 6 pr-gate, 2 pr-gate-2h, 2 nightly-1h, 2 nightly, 4 nightly-4h"
+echo "  expect: 4 pr-gate, 2 pr-gate-2h, 2 nightly-1h, 2 nightly, 4 nightly-4h"
+# ci-tpu7x-2x2x1 is deliberately left at 4 nodes. Growing it is safe whenever more single-host
+# PR capacity is wanted (each 2x2x1 node is its own slice, so no straddle risk) -- just bump
+# the tpu-prgate-1h nominalQuota in kueue-tpu.yaml to match:
+#   gcloud container clusters resize tpu-cluster --node-pool=ci-tpu7x-2x2x1 --num-nodes=N ...
 [ "$APPLY" = 1 ] || echo -e "\n(dry run -- nothing was created; re-run with --apply)"
