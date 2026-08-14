@@ -4,8 +4,11 @@ Covers the hardware-agnostic contracts with fake pools/futures (no TPU, no
 raiden): the hybrid assembler consults the platform host-pool hook (the bug
 that routed TPU hybrid models to the CUDA host pool), each transfer issues one
 all-layer DMA per pool and its ack completes only when every pool's DMA has
-landed, and load-back keeps index tensors host-resident by rewriting the
-tree-owned PoolTransfer in place.
+landed, load-back keeps index tensors host-resident by rewriting the
+tree-owned PoolTransfer in place, and speculative-decoding draft sidecars ride
+the same rounds (draft DMA issued per transfer, reload ack gates on it, draft
+device pool wired to the whole-batch counter, host pool picked via the
+platform hook).
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -269,6 +272,116 @@ class TestAssemblerPlatformHook(CustomTestCase):
         fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(kv_pool)
         self.assertIsInstance(pool, _RecordingPool)
         self.assertEqual(built["kwargs"]["pool_label"], "swa")
+
+
+class TestDraftSidecar(CustomTestCase):
+    def _controller_with_draft(self):
+        ctrl = _make_controller()
+        draft = _FakeEntry(PoolName.DRAFT, _FakeHostPool(), device_pool=object())
+        ctrl.mem_pool_host.entry_map[PoolName.DRAFT] = draft
+        return ctrl, draft
+
+    def _op_with_draft(self):
+        # The draft sidecar's indices follow the full pool
+        # (SidecarPoolSpec(indices_from_pool=PoolName.KV)).
+        op = _op(n_kv=8, n_swa=4)
+        op.pool_transfers.append(
+            PoolTransfer(
+                name=PoolName.DRAFT,
+                host_indices=torch.arange(8, dtype=torch.int64),
+                device_indices=torch.arange(8, dtype=torch.int64),
+            )
+        )
+        return op
+
+    def test_write_piggybacks_draft_pool(self):
+        # Guards the draft rejection this path used to raise: a spec-decoding
+        # write-back must issue the draft pool's DMA alongside full + SWA.
+        ctrl, draft = self._controller_with_draft()
+        ctrl.write_queue.append(self._op_with_draft())
+        ctrl.start_writing()
+        self.assertEqual(len(draft.host_pool.backups), 1)
+        self.assertIs(draft.host_pool.backups[0][0], draft.device_pool)
+
+    def test_load_ack_gates_on_draft_dma(self):
+        # The whole-batch reload gate must not release before the draft KV
+        # has landed: a target-only conjunction would let the draft forward
+        # read stale draft KV.
+        ctrl, draft = self._controller_with_draft()
+        ctrl.load_queue.append(self._op_with_draft())
+        producer_id = ctrl.start_loading()
+        self.assertGreaterEqual(producer_id, 0)
+        (ack,) = ctrl.ack_load_queue
+        self.assertEqual(len(draft.host_pool.loads), 1)
+        self.assertTrue(draft.host_pool.load_futures[0].synchronized)
+        self.assertTrue(ack.finish_event.query())
+
+
+class TestDraftCounterRegistration(CustomTestCase):
+    def _register(self, name):
+        ctrl = _make_controller()
+        entry = _FakeEntry(name, _FakeHostPool(), device_pool=MagicMock())
+        with patch.object(
+            HybridCacheController, "register_host_pool_entry"
+        ) as base_register:
+            ctrl.register_host_pool_entry(entry)
+        base_register.assert_called_once_with(entry)
+        return ctrl, entry
+
+    def test_draft_entry_gates_on_batch_counter(self):
+        # The draft model's forward gates on its own pool's transfer counter;
+        # without this registration the counter is None and the draft forward
+        # consumes reloaded draft KV without waiting for the DMA.
+        for name in (PoolName.DRAFT, PoolName.DRAFT_SWA):
+            ctrl, entry = self._register(name)
+            entry.device_pool.register_layer_transfer_counter.assert_called_once_with(
+                ctrl.layer_done_counter
+            )
+
+    def test_non_draft_entry_keeps_its_counter_wiring(self):
+        # Target pools get the counter through the SWAKVPool wrapper at
+        # controller init; re-registering per entry would be wrong.
+        ctrl, entry = self._register(PoolName.SWA)
+        entry.device_pool.register_layer_transfer_counter.assert_not_called()
+
+
+class TestDraftSidecarPlatformHook(CustomTestCase):
+    def test_draft_host_pool_consults_platform_hook(self):
+        # Same bug class as build_kv_host_pool above, on the draft-sidecar
+        # path: hard-coding the CUDA host-pool picker gives spec-decoding
+        # draft sidecars a CUDA host pool on TPU raiden.
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+
+        built = {}
+
+        class _RecordingPool:
+            def __init__(self, *args, **kwargs):
+                built["args"] = args
+                built["kwargs"] = kwargs
+
+        class _FakeMHAPool:
+            pass
+
+        fake_platform = MagicMock()
+        fake_platform.get_mha_kv_pool_host_cls = MagicMock(return_value=_RecordingPool)
+
+        pool = _FakeMHAPool()
+        with (
+            patch("sglang.srt.platforms.current_platform", fake_platform),
+            patch("sglang.srt.mem_cache.memory_pool.MHATokenToKVPool", _FakeMHAPool),
+        ):
+            host_pool = hybrid_pool_assembler._build_mha_mla_host_pool(
+                pool=pool,
+                host_to_device_ratio=2.0,
+                page_size=64,
+                layout="page_first_fused",
+                allocator_type="default",
+                pool_label="draft",
+            )
+
+        fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(pool)
+        self.assertIsInstance(host_pool, _RecordingPool)
+        self.assertEqual(built["kwargs"]["pool_label"], "draft")
 
 
 class TestDispatch(CustomTestCase):

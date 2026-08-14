@@ -22,10 +22,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     PoolEntry,
 )
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
-from sglang.srt.mem_cache.pool_host.mha import (
-    MHATokenToKOnlyPoolHost,
-    get_mha_host_pool_cls,
-)
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKOnlyPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel
@@ -922,7 +919,12 @@ def _build_mha_mla_host_pool(
         pool_label=pool_label,
     )
     if isinstance(pool, MHATokenToKVPool):
-        return get_mha_host_pool_cls(pool)(pool, **kwargs)
+        # The MHA host-pool class is a platform decision (TPU substitutes its
+        # fused/raiden host pools); the platform default delegates to
+        # get_mha_host_pool_cls.
+        from sglang.srt.platforms import current_platform
+
+        return current_platform.get_mha_kv_pool_host_cls(pool)(pool, **kwargs)
     return MLATokenToKVPoolHost(
         pool,
         override_kv_cache_dim=pool.kv_cache_dim,

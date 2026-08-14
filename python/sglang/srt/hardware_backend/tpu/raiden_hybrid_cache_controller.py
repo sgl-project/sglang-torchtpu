@@ -30,7 +30,7 @@ from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     RaidenFutureEvent,
 )
 from sglang.srt.managers.cache_controller import BatchDoneCounter, HiCacheAck
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
@@ -65,17 +65,33 @@ class TpuRaidenHybridCacheController(HybridCacheController):
 
             self._load_worker = TpuKvCopyWorker("raiden-hybrid-h2d")
 
-    # ----- unsupported feature guards ---------------------------------------
+    # ----- draft registration guards -----------------------------------------
 
     def set_draft_kv_pool(self, draft_device_pool, draft_host_pool):
+        # Hybrid models register speculative draft KV as a sidecar pool entry
+        # (register_host_pool_entry below); this legacy hook is only reachable
+        # from the non-unified cache, which hybrid models never use.
         raise NotImplementedError(
-            "Draft KV offload is not supported on the TPU raiden hybrid path."
+            "Hybrid draft KV registers as a sidecar pool entry, not through "
+            "the legacy draft hook."
         )
 
     def set_mtp_draft_pools(self, mtp_draft_device_pools):
         raise NotImplementedError(
-            "MTP draft KV offload is not supported on the TPU raiden hybrid " "path."
+            "MTP draft KV offload is not supported on the TPU raiden hybrid path."
         )
+
+    # ----- sidecar registration ----------------------------------------------
+
+    def register_host_pool_entry(self, entry) -> None:
+        super().register_host_pool_entry(entry)
+        # Draft sidecar KV is consumed by the draft model's forward, whose
+        # CompiledForwardShim gates on the draft pool's own transfer counter.
+        # Point it at the same whole-batch counter as the target pools: the
+        # reload ack is a conjunction over every pool's DMA, so the draft KV
+        # has landed by the time the counter releases the batch.
+        if entry.name in (PoolName.DRAFT, PoolName.DRAFT_SWA):
+            entry.device_pool.register_layer_transfer_counter(self.layer_done_counter)
 
     # ----- lifecycle ---------------------------------------------------------
 
