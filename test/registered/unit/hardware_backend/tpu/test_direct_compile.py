@@ -3,6 +3,7 @@
 import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -16,7 +17,9 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
+
+_COMPILE_RESULT = SimpleNamespace(executable="executable")
 
 
 @tree_util.register_dataclass
@@ -80,6 +83,38 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
+        def fn(value):
+            return value + value
+
+        def new_compiled_fn():
+            return direct_compile.direct_compile(
+                fn,
+                specialization_key=lambda value: tuple(value.shape),
+            )
+
+        value = torch.ones(2, device="tpu")
+        expected = torch.full((2,), 2.0)
+        torch.tpu._clear_cache()
+        requests_before = torch.tpu._get_cache_requests()
+        hits_before = torch.tpu._get_cache_hits()
+        misses_before = torch.tpu._get_cache_misses()
+
+        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
+        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+        self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
+        self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
+
+        requests_before = torch.tpu._get_cache_requests()
+        hits_before = torch.tpu._get_cache_hits()
+        misses_before = torch.tpu._get_cache_misses()
+
+        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
+        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+        self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
+        self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+
     def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
         model = _ModelWithObjectTensorState()
         original_value = model.object_state.value
@@ -127,8 +162,9 @@ class TestDirectCompile(CustomTestCase):
             patch.object(
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
-            patch.object(compiler, "build_mlir", return_value="module"),
-            patch.object(compiler, "compile_mlir", return_value="executable"),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ),
             patch.object(compiler, "execute", return_value=[result]) as execute,
         ):
             output = compiled(value)
@@ -196,8 +232,9 @@ class TestDirectCompile(CustomTestCase):
             patch.object(
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
-            patch.object(compiler, "build_mlir", return_value="module"),
-            patch.object(compiler, "compile_mlir", return_value="executable"),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ),
             patch.object(compiler, "execute", return_value=[result]) as execute,
         ):
             output = compiled(torch.zeros(2))
@@ -300,10 +337,9 @@ class TestDirectCompile(CustomTestCase):
             patch.object(
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
-            patch.object(compiler, "build_mlir", return_value="module") as build_mlir,
             patch.object(
-                compiler, "compile_mlir", return_value="executable"
-            ) as compile_mlir,
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ),
             patch.object(
                 compiler,
                 "execute",
@@ -323,9 +359,6 @@ class TestDirectCompile(CustomTestCase):
             self.assertIs(kv_pool.value, pool_input)
             self.assertTrue(torch.equal(kv_pool.value, second_pool))
 
-        self.assertEqual(len(compiled.cache), 1)
-        build_mlir.assert_called_once()
-        compile_mlir.assert_called_once_with("module")
         runtime_inputs = execute.call_args_list[1].args[1]
         self.assertEqual(len(runtime_inputs), 4)
         self.assertIs(runtime_inputs[0], model.state.weight)

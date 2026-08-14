@@ -363,13 +363,13 @@ class CompiledFunction:
             len(output_leaves),
             len(kv_pool_inputs),
         )
-        with dynamo_timed("direct_compile_build_mlir"):
-            module = tpu_torch_compile.build_mlir(result_tensors, graph_inputs)
-        with dynamo_timed("direct_compile_compile_mlir"):
-            executable = tpu_torch_compile.compile_mlir(module)
+        with dynamo_timed("direct_compile_traverse_and_compile"):
+            compile_result = tpu_torch_compile.traverse_and_compile(
+                result_tensors, graph_inputs
+            )
         logger.info("[direct_compile] compilation finished")
         return _CompiledArtifact(
-            executable=executable,
+            executable=compile_result.executable,
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
