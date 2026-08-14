@@ -220,6 +220,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             kv_cache_dtype="auto",
             use_ray=False,
             hicache_io_backend=None,
+            max_total_tokens=None,
             speculative_algorithm=None,
             speculative_eagle_topk=None,
             speculative_use_rejection_sampling=False,

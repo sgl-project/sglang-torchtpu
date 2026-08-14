@@ -146,6 +146,23 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     )
 
 
+def _resolve_num_hidden_layers(server_args) -> int:
+    """Layer count from the model's HF config (lru-cached load), 0 when
+    unresolvable — an unloadable model fails later with its real error, and
+    the prefetch containment stays off rather than guessing."""
+    try:
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        hf_config = get_config(
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
+        return int(getattr(hf_config, "num_hidden_layers", 0))
+    except Exception:
+        return 0
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -174,6 +191,15 @@ class TpuSRTPlatform(SRTPlatform):
         # torch_tpu.
         _prepare_tpu_env(
             server_args.tp_size, setup_slicebuilder=not server_args.use_ray
+        )
+
+        from sglang.srt.hardware_backend.tpu.env_override import (
+            apply_small_kv_pool_vmem_prefetch_override,
+        )
+
+        apply_small_kv_pool_vmem_prefetch_override(
+            max_total_tokens=server_args.max_total_tokens,
+            num_hidden_layers=_resolve_num_hidden_layers(server_args),
         )
 
         if server_args.dtype is None or server_args.dtype == "auto":
