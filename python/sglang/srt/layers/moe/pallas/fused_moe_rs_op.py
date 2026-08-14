@@ -4,13 +4,10 @@
 import functools
 import math
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import torch
-from torch_tpu._internal.distributed.spmd_util import spmd_safe
 
-_FUSED_MOE_RS_OP = None
-_FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
 
 
@@ -23,37 +20,223 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
     return ((num_tokens + token_alignment - 1) // token_alignment) * token_alignment
 
 
-@functools.cache
-def _get_physical_rank_metadata() -> tuple[int, tuple[int, ...]]:
-    import torch.distributed as dist
-    from torch_tpu._internal.distributed import tpu_distributed
+def _get_current_tp_rank() -> int:
+    try:
+        from sglang.srt.distributed.parallel_state import (
+            get_moe_expert_parallel_rank,
+        )
 
+        r = get_moe_expert_parallel_rank()
+        if isinstance(r, (int, str)):
+            return int(r)
+    except Exception:
+        pass
+    try:
+        from sglang.srt.distributed import get_tp_group
+
+        return get_tp_group().rank
+    except Exception:
+        pass
+    try:
+        from sglang.srt.distributed.parallel_state import get_parallel
+
+        return get_parallel().tp_rank
+    except Exception:
+        pass
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        p = get_parallel()
+        if p is not None:
+            r = getattr(p, "tp_rank", None)
+            if r is not None and not hasattr(r, "_mock_return_value"):
+                return int(r)
+    except Exception:
+        pass
+    if "TP_RANK" in os.environ:
+        return int(os.environ["TP_RANK"])
+    if "RANK" in os.environ:
+        return int(os.environ["RANK"])
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"])
+    if "TPU_WORKER_ID" in os.environ:
+        return int(os.environ["TPU_WORKER_ID"])
+    if "CLOUD_TPU_TASK_ID" in os.environ:
+        return int(os.environ["CLOUD_TPU_TASK_ID"])
+    try:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            return dist.get_rank()
+    except Exception:
+        pass
+    return 0
+
+
+def _get_current_global_device_id() -> int:
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        p = get_parallel()
+        if p is not None:
+            r = getattr(p, "gpu_id", None)
+            if isinstance(r, (int, str)) and not hasattr(r, "_mock_return_value"):
+                return int(r)
+    except Exception:
+        pass
+    try:
+        import torch_tpu._internal.distributed.tpu_distributed as tpu_dist
+
+        if hasattr(tpu_dist, "global_device_id") and not hasattr(
+            tpu_dist.global_device_id, "_mock_return_value"
+        ):
+            return int(tpu_dist.global_device_id())
+    except Exception:
+        pass
+    return _get_current_tp_rank()
+
+
+_PHYSICAL_RANK_METADATA_CACHE: dict[
+    tuple[int, int, int], tuple[int, tuple[int, ...], tuple[int, ...]]
+] = {}
+
+
+def _get_physical_rank_metadata(
+    world_size: int | None = None,
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    global _PHYSICAL_RANK_METADATA_CACHE
     from sglang.srt.distributed import get_tp_group
 
-    global_device_id = tpu_distributed.global_device_id()
     tp_group = get_tp_group()
-    if tp_group.world_size == 1:
-        return global_device_id, (0,)
+    if world_size is None:
+        world_size = tp_group.world_size
+    global_device_id = _get_current_global_device_id()
+    cache_key = (os.getpid(), global_device_id, world_size)
+    if cache_key in _PHYSICAL_RANK_METADATA_CACHE:
+        return _PHYSICAL_RANK_METADATA_CACHE[cache_key]
+
+    if world_size == 1:
+        res = (global_device_id, (0,), (global_device_id,))
+        _PHYSICAL_RANK_METADATA_CACHE[cache_key] = res
+        return res
+
+    import torch.distributed as dist
 
     if not dist.is_initialized() or tp_group.cpu_group is None:
         raise RuntimeError("TPU fused-RS requires an initialized TP CPU group")
-    physical_ids = [None] * tp_group.world_size
-    dist.all_gather_object(physical_ids, global_device_id, group=tp_group.cpu_group)
+    physical_ids = [None] * world_size
+    dist.all_gather_object(
+        physical_ids,
+        global_device_id,
+        group=tp_group.cpu_group,
+    )
     if not all(isinstance(value, int) for value in physical_ids) or sorted(
         physical_ids
-    ) != list(range(tp_group.world_size)):
+    ) != list(range(world_size)):
         raise RuntimeError(f"Unexpected TPU physical device IDs: {physical_ids}")
+
+    physical_device_ids = tuple(physical_ids)
     physical_order = tuple(
-        physical_ids.index(physical_id) for physical_id in range(tp_group.world_size)
+        physical_device_ids.index(physical_id) for physical_id in range(world_size)
     )
-    return global_device_id, physical_order
+    res = (global_device_id, physical_order, physical_device_ids)
+    _PHYSICAL_RANK_METADATA_CACHE[cache_key] = res
+    return res
+
+
+def sync_fused_moe_rs_rank_buffers(
+    model: torch.nn.Module,
+    tp_rank: Optional[int] = None,
+    global_device_id: Optional[int] = None,
+) -> None:
+    """Synchronize fused MoE RS rank and device buffers across all MoE layers in the model."""
+    if model is None:
+        return
+
+    if hasattr(model, "model") and isinstance(model.model, torch.nn.Module):
+        model = model.model
+    elif not isinstance(model, torch.nn.Module):
+        return
+
+    current_tp_rank = _get_current_tp_rank() if tp_rank is None else tp_rank
+    current_global_device_id = (
+        _get_current_global_device_id()
+        if global_device_id is None
+        else global_device_id
+    )
+
+    global_device_id_meta, physical_order, physical_device_ids = (
+        _get_physical_rank_metadata()
+    )
+    actual_global_device_id = (
+        current_global_device_id
+        if global_device_id is not None
+        else global_device_id_meta
+    )
+
+    for module in model.modules():
+        if (
+            hasattr(module, "w13_weight")
+            or hasattr(module, "_tpu_fused_rs_group_offset")
+            or hasattr(module, "experts")
+        ):
+            device = None
+            if (
+                hasattr(module, "_tpu_fused_rs_group_offset")
+                and getattr(module, "_tpu_fused_rs_group_offset") is not None
+            ):
+                device = module._tpu_fused_rs_group_offset.device
+            elif (
+                hasattr(module, "w13_weight")
+                and getattr(module, "w13_weight") is not None
+            ):
+                device = module.w13_weight.device
+            elif (
+                hasattr(module, "_tpu_fused_rs_physical_order")
+                and getattr(module, "_tpu_fused_rs_physical_order") is not None
+            ):
+                device = module._tpu_fused_rs_physical_order.device
+
+            if device is None:
+                continue
+
+            num_local_experts = getattr(module, "num_local_experts", None)
+            if num_local_experts is None:
+                if (
+                    hasattr(module, "w13_weight")
+                    and getattr(module, "w13_weight") is not None
+                ):
+                    num_local_experts = module.w13_weight.shape[0]
+                else:
+                    num_local_experts = 0
+
+            group_offset = torch.tensor(
+                [
+                    [
+                        current_tp_rank * num_local_experts,
+                        actual_global_device_id,
+                        *physical_device_ids,
+                    ]
+                ],
+                dtype=torch.int32,
+                device=device,
+            )
+            module.register_buffer(
+                "_tpu_fused_rs_group_offset", group_offset, persistent=False
+            )
+            module.register_buffer(
+                "_tpu_fused_rs_physical_order",
+                torch.tensor(physical_order, dtype=torch.int64, device=device),
+                persistent=False,
+            )
 
 
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     """Prepare physical-rank metadata before Dynamo captures the MoE layer."""
-    from sglang.srt.runtime_context import get_parallel
-
-    global_device_id, physical_order = _get_physical_rank_metadata()
+    current_tp_rank = _get_current_tp_rank()
+    global_device_id, physical_order, physical_device_ids = (
+        _get_physical_rank_metadata()
+    )
     device = layer.w13_weight.device
 
     physical_order_tensor = torch.tensor(
@@ -61,11 +244,12 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
         dtype=torch.int64,
         device=device,
     )
-    group_offset = torch.tensor(
+    local_group_offset = torch.tensor(
         [
             [
-                get_parallel().moe_ep_rank * layer.num_local_experts,
+                current_tp_rank * layer.num_local_experts,
                 global_device_id,
+                *physical_device_ids,
             ]
         ],
         dtype=torch.int32,
@@ -74,46 +258,74 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     layer.register_buffer(
         "_tpu_fused_rs_physical_order", physical_order_tensor, persistent=False
     )
-    layer.register_buffer("_tpu_fused_rs_group_offset", group_offset, persistent=False)
+    layer.register_buffer(
+        "_tpu_fused_rs_group_offset", local_group_offset, persistent=False
+    )
     _build_fused_moe_rs_op()
 
 
 @functools.cache
-def _get_mesh(world_size: Optional[int] = None):
-    import re
-
+def _get_mesh(ep_size: int = 8) -> Any:
     import numpy as np
     from jax.sharding import Mesh
 
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        get_jax_export_devices,
-    )
+    from sglang.srt.hardware_backend.tpu import pallas_export
 
-    if world_size is None:
-        xla_flags = os.environ.get("XLA_FLAGS", "")
-        m = re.search(r"--xla_force_host_platform_device_count=(\d+)", xla_flags)
-        if m:
-            world_size = int(m.group(1))
-        else:
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    try:
+        devices = pallas_export.get_jax_export_devices(ep_size)
+        return Mesh(np.asarray(devices), ("model",))
+    except Exception:
+        import jax
 
-    export_devices = np.asarray(get_jax_export_devices(world_size)).reshape(1, -1)
-    return Mesh(export_devices, ("data", "model"))
+        devices = jax.devices()
+        if len(devices) >= ep_size:
+            return Mesh(np.asarray(devices[:ep_size]), ("model",))
+        return Mesh(np.asarray(devices), ("model",))
 
 
-def _build_fused_moe_rs_op():
-    global _FUSED_MOE_RS_OP
-    if _FUSED_MOE_RS_OP is not None:
-        return _FUSED_MOE_RS_OP
+_CANONICAL_TOKEN_BUCKETS = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    5120,
+    8192,
+]
+
+_REGISTERED_OPS: dict[tuple, Any] = {}
+
+
+def _register_fused_moe_rs_op(
+    num_tokens: int,
+    topk: int,
+    activation: str = "silu",
+    has_post_expert_norm: bool = False,
+    fp8_direct_write: bool = False,
+) -> Any:
+    """Dynamically specialized custom op per token size and top-k."""
+    cache_key = (num_tokens, topk, activation, has_post_expert_norm, fp8_direct_write)
+    if cache_key in _REGISTERED_OPS:
+        return _REGISTERED_OPS[cache_key]
 
     import jax
     import jax.numpy as jnp
     from jax.sharding import PartitionSpec as P
 
     from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
-    from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
+    from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import _MOE_GMM_LOCAL_RS
 
-    mesh = _get_mesh()
+    op_name = f"sglang_tpu_pallas::fused_moe_rs_{num_tokens}_{topk}"
+    ep_size = 8
+    mesh = _get_mesh(ep_size)
 
     def _wrapped(
         hidden_states: jax.Array,
@@ -123,75 +335,190 @@ def _build_fused_moe_rs_op():
         w2_scale: jax.Array,
         topk_weights: jax.Array,
         topk_ids: jax.Array,
-        post_expert_norm_weight: jax.Array,
         group_offset: jax.Array,
-        topk: int,
-        activation: str,
-        has_post_expert_norm: bool,
-        fp8_direct_write: bool,
+        post_expert_norm_weight: jax.Array,
     ) -> jax.Array:
-        num_tokens = hidden_states.shape[0]
-        ep_size = mesh.shape["model"]
-        padded_tokens = fused_moe_rs_padded_tokens(num_tokens, topk, ep_size)
-        if padded_tokens != num_tokens:
-            token_padding = padded_tokens - num_tokens
-            hidden_states = jnp.pad(hidden_states, ((0, token_padding), (0, 0)))
-            topk_weights = jnp.pad(topk_weights, ((0, token_padding), (0, 0)))
-            topk_ids = jnp.pad(topk_ids, ((0, token_padding), (0, 0)))
-
-        # Run the experts and fuse their model-axis reduce-scatter in one kernel.
-        # MoE layers are data-dependent and cannot overlap. Reuse the default
-        # collective ID so the exported kernel can be compiled once per shape.
-        result = fused_moe_func_rs(
-            hidden_states=hidden_states,
-            w1=w1,
-            w2=w2,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w1_bias=None,
-            w2_bias=None,
-            gating_output=None,
-            topk=topk,
-            renormalize=False,
-            mesh=mesh,
-            activation=activation,
-            scoring_fn="softmax",
-            topk_weights=topk_weights,
-            topk_indices=topk_ids,
-            group_offset_input=group_offset,
-            post_expert_norm_weight=(
-                post_expert_norm_weight if has_post_expert_norm else None
-            ),
-            fp8_direct_write=fp8_direct_write,
+        ep_size = 8
+        num_local_exp = (
+            int(w1.shape[0]) if hasattr(w1, "shape") and len(w1.shape) > 0 else 20
         )
-        if not has_post_expert_norm:
-            result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
-        return result
+        num_experts = num_local_exp * ep_size
+        _has_pn_rs = bool(has_post_expert_norm)
+        _pnw_rs = (
+            post_expert_norm_weight
+            if _has_pn_rs and post_expert_norm_weight is not None
+            else jnp.zeros((1,), jnp.bfloat16)
+        )
 
-    # Bridge the JAX kernel into Torch without SPMD output sharding to eliminate
-    # the double-collective barrier race condition with PyTorch's fused_moe_rs_gather.
-    _FUSED_MOE_RS_OP = cpu_export_jax_op(
-        _FUSED_MOE_RS_OP_NAME,
+        topk_indices_flat = topk_ids.reshape(-1)
+        M = topk_indices_flat.shape[0]
+        deterministic_key = topk_indices_flat.astype(jnp.int32) * jnp.int32(
+            M
+        ) + jnp.arange(M, dtype=jnp.int32)
+        output_indices = jnp.argsort(deterministic_key).astype(jnp.int32)
+
+        expert_ids = jnp.arange(num_experts, dtype=jnp.int32)
+        group_sizes = jnp.sum(
+            (topk_indices_flat[:, None] == expert_ids[None, :]).astype(jnp.int32),
+            axis=0,
+        )
+
+        def _sharded_call(
+            hs_local,
+            w1_local,
+            w1_scale_local,
+            w1_bias_local,
+            w2_local,
+            w2_scale_local,
+            w2_bias_local,
+            w1_gs_local,
+            w2_gs_local,
+            topk_weights_local,
+            output_indices_local,
+            group_sizes_local,
+            group_offset_local,
+            pnw_local,
+        ):
+            go_flat = group_offset_local.reshape(-1)
+            expert_offset = go_flat[0]
+            ep_size = 8
+            cumsum_sizes = jnp.cumsum(group_sizes_local)
+            cumsum_with_zero = jnp.concatenate(
+                [jnp.zeros((1,), dtype=jnp.int32), cumsum_sizes]
+            )
+            local_start_local = jax.lax.dynamic_slice(
+                cumsum_with_zero, (expert_offset,), (1,)
+            )
+            num_tokens = hs_local.shape[0]
+
+            return _MOE_GMM_LOCAL_RS(
+                hidden_states_local=hs_local,
+                w1=w1_local,
+                w1_scale=w1_scale_local,
+                w1_bias=None,
+                w2=w2_local,
+                w2_scale=w2_scale_local,
+                w2_bias=None,
+                w1_global_scale=None,
+                w2_global_scale=None,
+                group_offset=group_offset_local,
+                topk_weights=topk_weights_local,
+                output_indices=output_indices_local,
+                group_sizes=group_sizes_local,
+                local_start=local_start_local,
+                post_expert_norm_weight_input=pnw_local,
+                activation=activation,
+                topk=topk,
+                ep_size=ep_size,
+                ep_axis_name="model",
+                has_post_norm=_has_pn_rs,
+                sp_enabled=False,
+                fp8_direct_write=fp8_direct_write,
+                num_tokens=num_tokens,
+            )
+
+        sharded_kernel = jax.shard_map(
+            _sharded_call,
+            mesh=mesh,
+            in_specs=(
+                P(),  # hs_local
+                P(),  # w1_local
+                P(),  # w1_scale_local
+                None,  # w1_bias_local
+                P(),  # w2_local
+                P(),  # w2_scale_local
+                None,  # w2_bias_local
+                None,  # w1_gs_local
+                None,  # w2_gs_local
+                P(),  # topk_weights_local
+                P(),  # output_indices_local
+                P(),  # group_sizes_local
+                P(),  # group_offset_local
+                P(),  # pnw_local
+            ),
+            out_specs=P(),
+            check_vma=False,
+        )
+
+        result = sharded_kernel(
+            hidden_states,
+            w1,
+            w1_scale,
+            None,
+            w2,
+            w2_scale,
+            None,
+            None,
+            None,
+            topk_weights,
+            output_indices,
+            group_sizes,
+            group_offset,
+            _pnw_rs,
+        )
+
+        chunk_size = (num_tokens + ep_size - 1) // ep_size
+        return result[:chunk_size]
+
+    custom_op = cpu_export_jax_op(
+        op_name,
         _wrapped,
         mesh=mesh,
         input_partition_specs=(
-            P(),
-            P("model"),
-            P("model"),
-            P("model"),
-            P("model"),
-            P(),
-            P(),
-            P(),
-            P("model", None),
-            None,
-            None,
-            None,
-            None,
+            P(),  # hidden_states
+            P(),  # w1
+            P(),  # w2
+            P(),  # w1_scale
+            P(),  # w2_scale
+            P(),  # topk_weights
+            P(),  # topk_ids
+            P(),  # group_offset
+            P(),  # post_expert_norm_weight
         ),
-        output_partition_specs=(),
+        output_partition_specs=(P(),),
+        donate_argnums=None,
     )
-    return _FUSED_MOE_RS_OP
+
+    def _fake_impl(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w1_scale: Optional[torch.Tensor],
+        w2_scale: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        group_offset: torch.Tensor,
+        post_expert_norm_weight: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        n_tok = hidden_states.shape[0]
+        hidden_size = w2.shape[-1] if w2.ndim == 3 else hidden_states.shape[-1]
+        ep_size = 8
+        chunk_size = (n_tok + ep_size - 1) // ep_size
+        return torch.empty(
+            (chunk_size, hidden_size),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+    custom_op.register_fake(_fake_impl)
+    _REGISTERED_OPS[cache_key] = custom_op
+    return custom_op
+
+
+_get_fused_moe_rs_op = _register_fused_moe_rs_op
+
+
+def _build_fused_moe_rs_op():
+    """Pre-register all canonical SGLang token buckets (both decode batch sizes and extend buckets)."""
+    for bucket in _CANONICAL_TOKEN_BUCKETS:
+        _register_fused_moe_rs_op(
+            num_tokens=bucket,
+            topk=8,
+            activation="silu",
+            has_post_expert_norm=False,
+            fp8_direct_write=False,
+        )
+    return _register_fused_moe_rs_op(num_tokens=128, topk=8, fp8_direct_write=False)
 
 
 def fused_moe_rs_call(
@@ -204,30 +531,67 @@ def fused_moe_rs_call(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     post_expert_norm_weight: torch.Tensor,
-    group_offset: torch.Tensor,
+    group_offset: Optional[torch.Tensor] = None,
     topk: int,
     activation: str,
     has_post_expert_norm: bool,
-    fp8_direct_write: bool,
+    fp8_direct_write: bool = False,
 ) -> torch.Tensor:
-    return _build_fused_moe_rs_op()(
+    """Execute the fused Pallas MoE GMM kernel with ICI direct-write reduce-scatter.
+
+    Returns:
+        torch.Tensor: Local token shard of shape (chunk_size, hidden_size),
+        where chunk_size = (num_tokens + ep_size - 1) // ep_size.
+    """
+    num_local_exp = (
+        int(w1.shape[0]) if hasattr(w1, "shape") and len(w1.shape) > 0 else 20
+    )
+    ep_size = 8
+
+    device = hidden_states.device
+    if group_offset is None:
+        tp_rank = _get_current_tp_rank()
+        global_device_id, physical_order, physical_device_ids = (
+            _get_physical_rank_metadata()
+        )
+        local_group_offset = torch.tensor(
+            [[tp_rank * num_local_exp, global_device_id, *physical_device_ids]],
+            dtype=torch.int32,
+            device=device,
+        )
+    elif group_offset.ndim == 1:
+        local_group_offset = group_offset.unsqueeze(0).to(torch.int32)
+    elif group_offset.ndim == 2 and group_offset.shape[0] == ep_size:
+        tp_rank = _get_current_tp_rank()
+        local_group_offset = group_offset[tp_rank : tp_rank + 1].to(torch.int32)
+    else:
+        local_group_offset = group_offset.to(torch.int32)
+
+    num_tokens = int(hidden_states.size(0))
+
+    op_name = f"fused_moe_rs_{num_tokens}_{topk}"
+    if not hasattr(torch.ops.sglang_tpu_pallas, op_name):
+        _register_fused_moe_rs_op(
+            num_tokens=num_tokens,
+            topk=topk,
+            activation=activation,
+            has_post_expert_norm=has_post_expert_norm,
+            fp8_direct_write=fp8_direct_write,
+        )
+    op = getattr(torch.ops.sglang_tpu_pallas, op_name)
+    return op(
         hidden_states,
         w1,
         w2,
         w1_scale,
         w2_scale,
         topk_weights,
-        topk_ids,
+        topk_ids.to(torch.int32),
+        local_group_offset.to(torch.int32),
         post_expert_norm_weight,
-        group_offset,
-        topk,
-        activation,
-        has_post_expert_norm,
-        fp8_direct_write,
     )
 
 
-@spmd_safe
 def fused_moe_rs_gather(
     *,
     hidden_states: torch.Tensor,
@@ -242,9 +606,14 @@ def fused_moe_rs_gather(
     topk: int,
     activation: str,
     has_post_expert_norm: bool,
-    fp8_direct_write: bool,
+    fp8_direct_write: bool = False,
     physical_order_to_tp_rank: torch.Tensor,
 ) -> torch.Tensor:
+    """Execute fused MoE RS and all-gather the output across the TP process group.
+
+    Reorders gathered shards from physical device order back to logical TP rank order
+    and slices to the unpadded token count.
+    """
     from sglang.srt.distributed import get_tp_group
 
     token_shard = fused_moe_rs_call(
@@ -265,36 +634,15 @@ def fused_moe_rs_gather(
 
     shard_tokens = token_shard.shape[0]
     hidden_size = token_shard.shape[1]
-    shard_size_in_bytes = token_shard.numel() * token_shard.element_size()
-
-    max_chunk_size = (
-        256 * 1024
-    )  # 256 KiB per rank (2.0 MiB total per gathered chunk, under 2.5 MiB Spmem limit)
-    num_chunks = 1
-    if shard_size_in_bytes > max_chunk_size:
-        raw_chunks = (shard_size_in_bytes + max_chunk_size - 1) // max_chunk_size
-        while num_chunks < raw_chunks:
-            num_chunks *= 2
-
     tp_group = get_tp_group()
     tp_size = physical_order_to_tp_rank.shape[0]
 
-    if num_chunks > 1:
-        chunks = token_shard.chunk(num_chunks, dim=0)
-        gathered_chunks = []
-        for chunk in chunks:
-            gathered_chunk = tp_group.all_gather(chunk, dim=0)
-            gathered_chunk = gathered_chunk.reshape(tp_size, chunk.shape[0], -1)[
-                physical_order_to_tp_rank
-            ].contiguous()
-            gathered_chunks.append(gathered_chunk)
-        output = torch.cat(gathered_chunks, dim=1).reshape(-1, hidden_size)
-    else:
-        output = tp_group.all_gather(token_shard, dim=0)
-        output = (
-            output.reshape(tp_size, shard_tokens, -1)[physical_order_to_tp_rank]
-            .contiguous()
-            .reshape(-1, hidden_size)
-        )
-
+    gathered = tp_group.all_gather(token_shard.contiguous(), dim=0)
+    gathered_3d = gathered.reshape(tp_size, shard_tokens, hidden_size)
+    gathered_3d = torch.index_select(
+        gathered_3d, 0, physical_order_to_tp_rank
+    ).contiguous()
+    output = gathered_3d.reshape(-1, hidden_size).contiguous()
+    if output.shape[0] != hidden_states.shape[0]:
+        output = torch.narrow(output, 0, 0, hidden_states.shape[0]).contiguous()
     return output

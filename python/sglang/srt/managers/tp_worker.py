@@ -329,23 +329,6 @@ class TpModelWorker(BaseTpWorker):
         # Draft worker: the attention backend the algorithm resolved for it.
         self.draft_attention_backend = draft_attention_backend
 
-        # Ensure only TP rank 0 dumps HLO/LLO compiler artifacts to avoid 100+ GB multi-rank duplication
-        tp_rank = getattr(self.ps, "tp_rank", self.gpu_id)
-        if tp_rank != 0:
-            import os
-            if "XLA_FLAGS" in os.environ:
-                filtered_xla = [
-                    a for a in os.environ["XLA_FLAGS"].split()
-                    if not a.startswith("--xla_jf_dump_to") and not a.startswith("--xla_dump_to")
-                ]
-                os.environ["XLA_FLAGS"] = " ".join(filtered_xla)
-            if "LIBTPU_INIT_ARGS" in os.environ:
-                filtered_args = [
-                    a for a in os.environ["LIBTPU_INIT_ARGS"].split()
-                    if not a.startswith("--xla_jf_dump_to") and not a.startswith("--xla_dump_to")
-                ]
-                os.environ["LIBTPU_INIT_ARGS"] = " ".join(filtered_args)
-
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
 

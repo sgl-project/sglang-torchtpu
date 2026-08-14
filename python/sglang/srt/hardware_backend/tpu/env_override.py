@@ -15,12 +15,24 @@ logger = get_logger(__name__)
 
 _LIBTPU_INIT_ARGS = "LIBTPU_INIT_ARGS"
 
-# Append instead of setdefault so caller-supplied flags are preserved.
+# Mirror legacy compilation-cache env vars to their renamed counterparts.
+# TODO(wyzhang): Remove after the TorchTPU upgrade completes.
+_COMPILATION_CACHE_ENV_RENAMES = (
+    (
+        "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
+        "TORCH_TPU_TIER2_COMPILATION_CACHE",
+    ),
+    (
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+    ),
+)
+
 _SPARSE_CORE_OFFLOAD_OVERRIDES = (
-    # TODO(wyzhang): drop after the torchtpu fix.
-    # SparseCore offload for the all-reduce after embed lookup can return
-    # wrong values inside compiled regions on TP=8 dense Qwen.
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
+    "--xla_tpu_offload_gather_to_sparsecore=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=false",
+    "--xla_tpu_enable_sparse_core_collective_offload_reduce_scatter=false",
 )
 
 _ASSOCIATIVE_SCAN_OVERRIDES = (
@@ -43,8 +55,24 @@ def _override_libtpu_flags(flags: tuple[str, ...]) -> list[str]:
     return to_append
 
 
+def _set_renamed_compilation_cache_envs() -> list[str]:
+    added = []
+    for old_name, new_name in _COMPILATION_CACHE_ENV_RENAMES:
+        if old_name in os.environ and new_name not in os.environ:
+            os.environ[new_name] = os.environ[old_name]
+            added.append(new_name)
+    return added
+
+
 def apply_tpu_env_overrides() -> None:
     """Apply TPU env overrides."""
+    added = _set_renamed_compilation_cache_envs()
+    if added:
+        logger.info(
+            "TPU env_override set renamed compilation-cache env var(s): %s",
+            " ".join(added),
+        )
+
     appended = _override_libtpu_flags(
         _SPARSE_CORE_OFFLOAD_OVERRIDES + _ASSOCIATIVE_SCAN_OVERRIDES
     )

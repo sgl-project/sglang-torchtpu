@@ -87,12 +87,12 @@ def _resolve_kernel_path() -> pathlib.Path:
 
     path = _environment_install() or _package_install()
     if path is None:
-        return cur_dir
+        raise RuntimeError("Cannot find sglang.kernels.jit path")
     return path
 
 
 KERNEL_PATH = _resolve_kernel_path()
-DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")] if (KERNEL_PATH / "include").exists() else []
+DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]

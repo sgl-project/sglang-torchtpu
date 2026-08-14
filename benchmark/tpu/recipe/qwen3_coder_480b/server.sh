@@ -32,6 +32,7 @@ export TORCH_COMPILE_MAX_BS=$CONCUR
 export SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=2048
 
 extra_args=(
+  --tpu-compile-tracer direct
   --tpu-fp8-runtime channelwise
   --sampling-defaults openai
   # Fuse the per-head q/k RMSNorms and the rotary embedding into one Pallas op

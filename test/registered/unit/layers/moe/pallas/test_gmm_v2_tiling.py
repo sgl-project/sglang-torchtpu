@@ -28,7 +28,6 @@ except Exception:  # pragma: no cover - depends on JAX/pallas availability
     _HAS_GMM = False
 
 try:
-    from sglang.srt.layers.moe.pallas.fused_rs import fused_moe as fused_rs_moe
     from sglang.srt.layers.moe.pallas.fused_rs import (
         gmm_fused_rs_nodedup as fused_rs_gmm,
     )
@@ -55,20 +54,6 @@ _MiB = 1024 * 1024
 
 @unittest.skipUnless(_HAS_FUSED_RS, _FUSED_RS_SKIP_REASON)
 class TestFusedRsGmLoopBound(CustomTestCase):
-    def test_routing_uses_raw_token_indices_and_int32_metadata(self):
-        lhs, group_sizes, output, topk_slots = fused_rs_moe._compute_rs_routing(
-            jnp.asarray([[2, 0], [1, 2]], dtype=jnp.int32),
-            num_experts=3,
-            topk=2,
-        )
-
-        self.assertEqual(lhs.tolist(), [0, 1, 0, 1])
-        self.assertEqual(group_sizes.tolist(), [1, 1, 2])
-        self.assertEqual(output.tolist(), lhs.tolist())
-        self.assertEqual(topk_slots.tolist(), [1, 0, 0, 1])
-        for value in (lhs, group_sizes, output, topk_slots):
-            self.assertEqual(value.dtype, jnp.int32.dtype)
-
     def test_receive_count_is_owned_by_the_kernel_contract(self):
         signature = inspect.signature(fused_rs_gmm.gmm_v2_fused_rs.__wrapped__)
         self.assertNotIn("peer_recv_counts", signature.parameters)

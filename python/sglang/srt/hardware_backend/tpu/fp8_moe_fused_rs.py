@@ -20,8 +20,7 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 _FUSED_RS_MAX_SIZE_M = 65536
 # The kernel's M dimension is padded_tokens * topk. The serving recipe compiles
 # 1,024- and 2,048-token prefill buckets at top-k 8, which produce M=8,192 and
-# M=16,384. Those block-FP8 boundaries are covered by the compiled TPU test;
-# larger block-FP8 shapes keep the stock MoE + one EP reduction path.
+# M=16,384. Larger block-FP8 shapes keep the stock MoE + one EP reduction path.
 _FUSED_RS_BLOCK_FP8_DECODE_MAX_SIZE_M = 128
 _FUSED_RS_BLOCK_FP8_TOPK8_MAX_SIZE_M = 16_384
 
@@ -143,7 +142,10 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     runner_config = layer.moe_runner_config
     parallel = get_parallel()
     ep_size = parallel.moe_ep_size
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    try:
+        world_size = parallel.world_size
+    except Exception:
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
     unsupported_reason = fp8_fused_rs_unsupported_reason(
         ep_size=ep_size,
         tp_size=get_tp_group().world_size,
@@ -242,6 +244,35 @@ def _apply_fp8_fused_rs(
             hidden_states=moe_expert_parallel_all_reduce(stock_output.hidden_states)
         )
 
+    group_offset = getattr(layer, "_tpu_fused_rs_group_offset", None)
+    if group_offset is None:
+        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+            _get_current_tp_rank,
+            _get_physical_rank_metadata,
+        )
+
+        current_tp_rank = _get_current_tp_rank()
+        global_device_id, physical_order, physical_device_ids = (
+            _get_physical_rank_metadata()
+        )
+        num_local_experts = getattr(
+            layer, "num_local_experts", layer.w13_weight.shape[0]
+        )
+        group_offset = torch.tensor(
+            [
+                [
+                    current_tp_rank * num_local_experts,
+                    global_device_id,
+                    *physical_device_ids,
+                ]
+            ],
+            dtype=torch.int32,
+            device=x.device,
+        )
+        layer.register_buffer(
+            "_tpu_fused_rs_group_offset", group_offset, persistent=False
+        )
+
     # Preserve float32 routing weights for block-FP8. Channelwise FP8 keeps its
     # existing model-dtype routing contract.
     if not block_quantized:
@@ -260,15 +291,15 @@ def _apply_fp8_fused_rs(
     w2_scale = layer.w2_weight_scale_inv if block_quantized else layer.w2_weight_scale
 
     result = fused_moe_rs_gather(
-        hidden_states=x,
+        hidden_states=x.contiguous(),
         w1=layer.w13_weight,
         w2=layer.w2_weight,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        topk_weights=topk_weights,
-        topk_ids=topk_ids,
+        topk_weights=topk_weights.contiguous(),
+        topk_ids=topk_ids.contiguous(),
         post_expert_norm_weight=norm_weight,
-        group_offset=layer._tpu_fused_rs_group_offset,
+        group_offset=group_offset,
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
