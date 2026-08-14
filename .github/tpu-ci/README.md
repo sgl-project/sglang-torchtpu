@@ -263,59 +263,44 @@ rejected** — including main's PR gate and the nightly. Two consequences:
   webhooks with the rest. Do this while the controller is *healthy* — deleting during an
   outage works but leaves the cluster rejecting JobSets until the webhooks are gone.
 
-**2. Configure** — edit `kueue-manager-config`, then
-`kubectl -n kueue-system rollout restart deploy/kueue-controller-manager`.
-
-The v0.18.5 default enables ~17 frameworks including `batch/job`, `pod`, `deployment` and
-`statefulset`. **Replace the whole `integrations.frameworks` list with just `jobset`**, and
-add the settings below (all commented out in the default):
+**2. Configure** — set `kueue-manager-config` to the following, then
+`kubectl -n kueue-system rollout restart deploy/kueue-controller-manager`. The v0.18.5
+default enables ~17 frameworks and comments out everything else, so this is a replacement
+of `integrations`, not an addition to it.
 
 ```yaml
 integrations:
   frameworks:
-    - "jobset.x-k8s.io/jobset"      # ONLY jobset -- see why below
-manageJobsWithoutQueueName: false   # false until this branch MERGES -- see below
-managedJobsNamespaceSelector:       # inert while the above is false; pre-staged for the flip
-  matchLabels:
-    kubernetes.io/metadata.name: tpu-ci   # NOT optional once true -- otherwise cluster-wide
-waitForPodsReady:                   # evict + requeue a gang that can't fully place
+    - "jobset.x-k8s.io/jobset"      # only jobset -- nothing else is ever managed
+waitForPodsReady:                   # evict + requeue a gang that cannot fully place
   enable: true
   timeout: 5m
   blockAdmission: true
+managedJobsNamespaceSelector:       # inert today; scopes the setting below if ever enabled
+  matchLabels:
+    kubernetes.io/metadata.name: tpu-ci
 ```
 
-**`manageJobsWithoutQueueName` is a two-phase setting, keyed to the merge:**
+**`manageJobsWithoutQueueName` is deliberately left unset (`false`).** Kueue therefore
+manages only JobSets that carry a `kueue.x-k8s.io/queue-name` label, and ignores everything
+else. The obvious alternative — set it `true` so an unlabelled JobSet fails closed — is not
+used, because `_tpu-test.yml` already asserts after every create that Kueue produced a
+`Workload` for its JobSet and fails the job otherwise. That covers every JobSet CI submits,
+which is every JobSet that matters for automation, and it fails *loudly* rather than by
+silently queueing. Setting it `true` would add coverage only for hand-launched JobSets,
+while suspending any debug JobSet in `tpu-ci` that lacks a label.
 
-- **`false` while main's workflows are live** (now). Main renders JobSets *without* the
-  queue-name label; with `true`, Kueue would suspend every one of them with no queue to
-  admit them — the PR gate and nightly on main would hang forever. With `false`, unlabelled
-  JobSets pass through untouched: zero change to existing CI, while labelled JobSets (this
-  branch) get gang admission.
-- **`true` in the same window the branch merges**, once every workflow that submits
-  JobSets carries the label. From then on it is the fail-closed guard: a typo'd or missing
-  label queues instead of running with no admission control.
+**So: a hand-launched JobSet in `tpu-ci` that needs a slice must carry the queue label**
+(see `topology.yaml` for the lane's queue). Without one it bypasses admission and can
+deadlock a multi-host slice against a CI job. That is the one gap this design accepts.
 
-  Leaving it `false` is safe *today* only because main still carries its own
-  `tpu-slice-<hosts>` concurrency mutex — an unlabelled multi-host JobSet is protected by
-  that, not by Kueue. This branch deletes that mutex, so after merge an unlabelled
-  multi-host JobSet has **no** protection: two of them can each take one node of a slice
-  and deadlock, which is the original bug. Flipping to `true` is what closes that hole,
-  and forgetting to flip it is a silent regression, not a missing nicety.
+Trimming `integrations.frameworks` to `jobset` is defence in depth for that decision: if
+anyone later sets `manageJobsWithoutQueueName: true` against the stock list, it would
+suspend the `hydrate-deepseek-r1.yaml` weights Job (a plain `batch/Job` in this namespace)
+and any unlabelled pod, deployment or statefulset — with no queue to admit them and no
+error anywhere. With only `jobset` enabled, that mistake cannot reach them.
 
-  The cost of `true` is that a hand-launched debug JobSet in `tpu-ci` without a label will
-  sit suspended. Give it `kueue.x-k8s.io/queue-name` (see `topology.yaml` for the lane's
-  queue) or run it in another namespace.
-
-Trimming the frameworks list is load-bearing, not tidiness: with the default list, the
-eventual `manageJobsWithoutQueueName: true` would apply to every enabled framework in
-`tpu-ci` — so the `hydrate-deepseek-r1.yaml` weights Job (a plain `batch/Job` in this
-namespace) and any hand-launched debug pod would be suspended forever with no queue to
-admit them and no error anywhere. With only `jobset` enabled, fail-closed applies exactly
-to what CI submits.
-
-Then confirm no existing workload was caught (`kubectl get workloads -A` — should be
-empty), and prove main is unaffected with a server-side dry-run: an unlabelled JobSet must
-come back with `suspend` unset, a labelled one with `suspend: true`.
+Then confirm nothing unexpected was caught: `kubectl get workloads -A`.
 
 **3. Apply the quotas.**
 
