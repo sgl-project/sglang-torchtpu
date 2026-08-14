@@ -39,6 +39,10 @@ on:
         required: false
         type: string
         default: ""
+      timeout_per_file:
+        required: false
+        type: number
+        default: 3600
       run_name:
         required: false
         type: string
@@ -98,6 +102,7 @@ jobs:
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
+            --timeout-per-file '${{ inputs.timeout_per_file }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="

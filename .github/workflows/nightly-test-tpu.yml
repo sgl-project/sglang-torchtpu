@@ -22,7 +22,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, multihost, combo, singlehost-combo, multihost-combo]
+        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo]
 
 concurrency:
   group: tpu-slice-nightly
@@ -49,6 +49,23 @@ jobs:
       # gpt-oss-120b lm-eval loads from the ROX weights disk at /weights
       # (test_tpu_gpt_oss_120b.py); harmless for tests that don't use it.
       weights_pvc: model-weights-rox
+    permissions:
+      contents: read
+      id-token: write
+
+  # Registered single-server integration tests. JobSet provisioning and mounted
+  # weights stay in this runner layer; test fixtures only own sgl.Engine lifetime.
+  integration:
+    needs: build
+    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'integration' }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: nightly-tpu-integration
+      nightly: true
+      weights_pvc: model-weights-rox
+      timeout_per_file: 16200
     permissions:
       contents: read
       id-token: write

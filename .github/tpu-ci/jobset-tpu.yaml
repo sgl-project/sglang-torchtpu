@@ -9,6 +9,7 @@
 #   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/)
 #   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
 #   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
+#   TIMEOUT_PER_FILE single-host timeout passed to run_suite.py
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
 #
@@ -99,8 +100,8 @@ ${WEIGHTS_VOLUME}
                       fi
 
                       if [ "$NNODES" -le 1 ]; then
-                        # Single-host: each test self-launches its own server. 3600s/file:
-                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file 3600
+                        # Single-host: each test self-launches its own server.
+                        exec python3 test/run_suite.py --hw tpu --suite ${SUITE} ${NIGHTLY_FLAG} --timeout-per-file ${TIMEOUT_PER_FILE}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).
