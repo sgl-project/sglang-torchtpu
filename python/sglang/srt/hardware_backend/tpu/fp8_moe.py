@@ -16,7 +16,6 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.utils import copy_or_rebind_param
@@ -365,6 +364,13 @@ def apply_tpu_fp8_moe(
     if ep_size > 1:
         global_num_experts = layer.num_local_experts * ep_size
         expert_group_offset = ep_rank * layer.num_local_experts
+
+    # Imported here, not at module scope: the Pallas chain pulls in JAX, which
+    # the hosted CPU CI agents do not have. Keeping it local lets the weight
+    # layout helpers above -- pure host-side torch -- be unit-tested on the CPU
+    # lane. See test/registered/unit/hardware_backend/tpu/
+    # test_fp8_moe_scale_layout.py.
+    from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 
     # TODO(torch_tpu): try native torch._scaled_grouped_mm for channelwise
     # scales and torch._scaled_grouped_mm_v2 for block scales once torch_tpu
