@@ -75,6 +75,9 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Declared, not inherited: the admission budget is derived from it, so it must not be
+    # GitHub's silent 360m default. Keep JOB_CEILING_S below in sync.
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
         with:
@@ -93,6 +96,7 @@ jobs:
         run: |
           set -euo pipefail
           label='${{ inputs.run_name || inputs.suite }}'
+          JOB_CEILING_S=21300        # timeout-minutes: 355
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
           python3 .github/tpu-ci/render_jobset.py \
@@ -138,9 +142,30 @@ jobs:
           fi
           echo "Kueue Workload present; admission control active."
 
-          # A suspended JobSet has no pods, so queue time gets its own budget rather than
-          # eating the runtime one below.
-          admit_s=3600
+          # Runtime budget, computed here because the admission budget is whatever is left
+          # of the runner's lifetime after it.
+          #   * single-host: scales with the suite's registered est_time (static AST scan in
+          #     render_jobset.py -> max(sum(est_time)*1.5, 360s)). run_suite's
+          #     --timeout-per-file still bounds each file.
+          #   * multi-host: the JobSet caps the run at activeDeadlineSeconds, and this must
+          #     OUTLAST it so the JobSet -- not this loop -- decides the outcome.
+          if [ -n "${{ inputs.launch_script }}" ]; then
+            wait_s=6000          # activeDeadlineSeconds 5400 + streaming/scheduling margin
+          elif [ -n "${{ inputs.exec_cmd }}" ]; then
+            wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
+          else
+            wait_s="$(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds)"
+          fi
+
+          # One slice runs one job at a time, so the wait is however long everything queued
+          # ahead finishes in -- there is no useful smaller number. Spend the whole runner
+          # budget on it: ceiling minus this job's own runtime, the bind/pull window and
+          # setup. A fixed 1h was the reason four of five multi-host jobs failed in run
+          # 31834592348 while the slice was busy.
+          admit_s=$(( JOB_CEILING_S - wait_s - 900 - 600 ))
+          echo "budgets for ${label}: admission ${admit_s}s, runtime ${wait_s}s"
+          echo "queued in this ClusterQueue right now:"
+          kubectl -n tpu-ci get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  workloads:"
           admit_deadline=$(( $(date +%s) + admit_s ))
           until [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ]; do
             if [ "$(date +%s)" -ge "$admit_deadline" ]; then
@@ -167,22 +192,7 @@ jobs:
           kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
             --max-log-requests=10 --pod-running-timeout=15m --tail=-1 || true
 
-          # Poll budget = how long we watch the JobSet before declaring a timeout.
-          #   * single-host: scales with the suite's registered est_time (static AST scan
-          #     in render_jobset.py -> max(sum(est_time)*1.5, 360s)) so long suites don't
-          #     hit a fixed ceiling. run_suite's --timeout-per-file still bounds each file.
-          #   * multi-host: the JobSet itself caps the run at activeDeadlineSeconds=5400s
-          #     (~20m server bring-up + up to 2 files x `timeout 1800`). The poll must
-          #     OUTLAST that so the JobSet -- not this loop -- decides the outcome, hence
-          #     6000s = 5400 + streaming/scheduling margin.
-          if [ -n "${{ inputs.launch_script }}" ]; then
-            wait_s=6000
-          elif [ -n "${{ inputs.exec_cmd }}" ]; then
-            wait_s=7800   # outlast exec mode's activeDeadlineSeconds=7200 + margin
-          else
-            wait_s="$(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds)"
-          fi
-          echo "CI poll budget for ${label}: ${wait_s}s"
+          # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
             ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
