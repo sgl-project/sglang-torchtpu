@@ -154,7 +154,10 @@ jobs:
           elif [ -n "${{ inputs.exec_cmd }}" ]; then
             wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
           else
-            wait_s="$(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds)"
+            # +600 for the same reason as the other two modes: the JobSet's deadline is
+            # the same est_time figure, and the poll must outlast it so the JobSet reports
+            # the outcome rather than this loop racing it to a generic timeout.
+            wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds) + 600 ))
           fi
 
           # One slice runs one job at a time, so the wait is however long everything queued
