@@ -35,6 +35,12 @@ on:
         required: false
         type: number
         default: 1
+      # Which lane's pools to use (topology.yaml). Both lanes own 1- and 2-host slices, so
+      # host count alone no longer picks a pool. nightly-test-tpu.yml passes `nightly`.
+      lane:
+        required: false
+        type: string
+        default: pr-gate
       weights_pvc:
         required: false
         type: string
@@ -96,6 +102,7 @@ jobs:
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
+            --lane '${{ inputs.lane }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml

@@ -119,6 +119,9 @@ def main():
     # Plain words only -- the command is inlined into the pod script unquoted.
     ap.add_argument("--exec", dest="exec_cmd", default="")
     ap.add_argument("--hosts", type=int, default=1)
+    # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
+    # host count alone no longer identifies a pool (see topology.yaml).
+    ap.add_argument("--lane", default="pr-gate")
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
@@ -137,7 +140,10 @@ def main():
     if not a.image:
         ap.error("--image is required when rendering")
 
-    slices = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["slices"]
+    lanes = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["lanes"]
+    if a.lane not in lanes:
+        ap.error(f"unknown --lane {a.lane!r}; topology.yaml has {sorted(lanes)}")
+    slices = lanes[a.lane]
 
     if a.launch_script:
         if a.hosts < 1:
@@ -164,7 +170,10 @@ def main():
 
     sl = slices.get(hosts, slices.get(str(hosts)))
     if not sl:
-        sys.exit(f"no slice for hosts={hosts} in topology.yaml")
+        sys.exit(
+            f"no slice for lane={a.lane} hosts={hosts} in topology.yaml "
+            f"(lane has {sorted(slices)})"
+        )
 
     # Suite mode runs every registered file sequentially, so its deadline scales
     # with the suite (same est_time formula as _tpu-test's poll budget, keeping the

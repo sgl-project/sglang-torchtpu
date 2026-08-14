@@ -3,8 +3,9 @@
 #   * multi-host    -> discover_multihost.py finds multi-host test files (MULTIHOST_LAUNCH)
 #                      registered to nightly-tpu-multihost and GROUPS them by launch spec;
 #                      one JobSet per group (launch once, rank-0 runs the group's files).
-# Same-setup files share a server. Groups run on the single 2x2x2 slice, so _tpu-test
-# serializes them (concurrency by host count); single-host runs in parallel on pr-gate.
+# Same-setup files share a server. Every job runs in the `nightly` lane (topology.yaml), so
+# it uses the nightly pools rather than competing with the PR gate, and Kueue queues the
+# groups against that lane's slice quota instead of a GitHub-side mutex.
 name: Nightly Test (TPU)
 
 on:
@@ -44,6 +45,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       suite: nightly-tpu-4-v7
       nightly: true
       # gpt-oss-120b lm-eval loads from the ROX weights disk at /weights
@@ -63,6 +65,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       hosts: 1
       exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
       run_name: singlehost-combo-test
@@ -83,6 +86,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       hosts: 2
       # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
       # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
@@ -129,6 +133,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}
       files: ${{ matrix.group.files }}

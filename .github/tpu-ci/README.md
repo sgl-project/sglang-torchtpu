@@ -24,36 +24,47 @@ PR / nightly ─▶ GitHub-hosted runner
                  │  Kueue gang-admits when a whole slice's quota is free
                  │    LocalQueue → ClusterQueue → ResourceFlavor (≡ one slice)
                  ▼
-                 ├─ ci-tpu7x-2x2x1  (ci-tpu-pool=pr-gate, 4 nodes) ── single-host (run_suite)
-                 └─ ci-tpu7x-2x2x2  (ci-tpu-pool=nightly, 1 slice = 2 hosts) ── multi-host groups
+                 ├─ pr-gate lane
+                 │    ├─ ci-tpu7x-2x2x1          (pr-gate,    6 nodes = 6 slices)
+                 │    └─ ci-tpu7x-2x2x2-prgate   (pr-gate-2h, 1 slice = 2 hosts)
+                 └─ nightly lane
+                      ├─ ci-tpu7x-2x2x1-nightly  (nightly-1h, 2 nodes = 2 slices)
+                      ├─ ci-tpu7x-2x2x2-nightly  (nightly,    1 slice = 2 hosts)
+                      └─ ci-tpu7x-2x2x4-nightly  (nightly-4h, 1 slice = 4 hosts)
 ```
 
-Everything runs on the `ghostfish-u2zcmybntv70q` reservation.
+Everything runs on the `ghostfish-u2zcmybntv70q` reservation. Pool creation:
+`provision-pools.sh`.
 
 **Slice arithmetic.** `tpu7x-standard-4t` is 4 chips per host, so `2x2x1` = 4 chips = 1
-node and `2x2x2` = 8 chips = 2 nodes. Each `ci-tpu7x-2x2x1` node is therefore a *complete*
-single-host slice — the pool's 4 nodes are 4 independent slices — while `ci-tpu7x-2x2x2`
-is one slice spanning two nodes.
+node, `2x2x2` = 8 chips = 2 nodes, `2x2x4` = 16 chips = 4 nodes. Each `2x2x1` node is
+therefore a *complete* single-host slice, which is why those pools may hold several nodes;
+a multi-host pool holds exactly one slice. Totals: **pr-gate 32 chips, nightly 32 chips.**
 
-**The pools do not fully isolate PR from nightly.** `hosts=1` maps to `pr-gate` for every
-caller, so the nightly's single-host jobs land on the same pool as the PR gate. Only
-`hosts=2` work is nightly-exclusive.
+**Lane, not just host count.** Both lanes own 1- and 2-host slices, so a host count alone no
+longer identifies a pool. `topology.yaml` is keyed `(lane, hosts)`, `_tpu-test` takes a
+`lane` input defaulting to `pr-gate`, and `nightly-test-tpu.yml` passes `lane: nightly`. That
+is also what finally isolates the two: before this, `hosts=1` mapped to `pr-gate` for every
+caller, so the nightly's single-host jobs competed with the PR gate.
 
 **One pool per slice is an invariant, not a preference.** GKE `tpu7x` nodes carry no
 per-slice label — only accelerator, topology, nodepool, hostname and zone, and none of the
 `cloud.google.com/gke-topology-*` labels Kueue's Topology-Aware Scheduling needs. So
 `ci-tpu-pool` is the finest slice selector available. A pool holding two slices cannot be
-split, and a JobSet's pods could straddle both and hang at ICI rendezvous. Add capacity as
-a **new pool** (`ci-tpu-pool=nightly-b`), never as extra nodes on an existing slice pool.
+split, and a JobSet's pods could straddle both and hang at ICI rendezvous. Add multi-host
+capacity as a **new pool** (`ci-tpu-pool=nightly-2h-b`), never as extra nodes on an existing
+slice pool. The `2x2x1` pools are the exception — each node is already its own slice, so
+they are safe to resize.
 
 ### Build-once
 
 The image is built **once** (`_tpu-build`) and every run reuses the same digest
 (`_tpu-test`), so a nightly with N runs does **one** build, not N.
 
-### Detection = host count → slice (topology.yaml)
+### Detection = (lane, host count) → slice (topology.yaml)
 
-`topology.yaml` maps a **host count** to a slice `{topology, pool}`. `render_jobset.py`
+`topology.yaml` maps a **lane and host count** to a slice `{topology, pool, queue}`.
+`render_jobset.py`
 renders **one** JobSet template (`jobset-tpu.yaml`) with `completions = hosts`; the
 container branches on `NNODES` (from GKE's `TPU_WORKER_HOSTNAMES`):
 
@@ -111,8 +122,12 @@ slice's quota is free:
 
 | leg | LocalQueue | flavor | quota | concurrent |
 |------|-----------|--------|-------|-----------|
-| `hosts=1` | `tpu-singlehost` | `tpu7x-2x2x1-pr-gate` | 12 of 16 chips | 3 |
-| `hosts=2` | `tpu-multihost` | `tpu7x-2x2x2-nightly` | 8 chips | 1 per slice |
+| `hosts=1` | `tpu-nightly-1h` | `tpu7x-2x2x1-nightly` | 8 chips | 2 |
+| `hosts=2` | `tpu-nightly-2h` | `tpu7x-2x2x2-nightly` | 8 chips | 1 per slice |
+| `hosts=4` | `tpu-nightly-4h` | `tpu7x-2x2x4-nightly` | 16 chips | 1 per slice |
+
+One ClusterQueue per `(lane, hosts)`. The shapes must not share a queue: a 2-host job needs
+8 chips, which a single-host flavor would satisfy on quota while being unschedulable.
 
 A PodSet is assigned exactly one ResourceFlavor, which is what keeps a multi-host JobSet's
 two pods inside a single slice.
@@ -162,7 +177,8 @@ _TODO._
 | `docker/tpu.Dockerfile` | TPU image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
 | `docker/cloudbuild.tpu.yaml` | Cloud Build config; runs **as `tpu-ci`**, token from the metadata server, pushes to AR |
 | `.github/tpu-ci/topology.yaml` | Host count → slice `{topology, pool, queue}` (detection source of truth) |
-| `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), ClusterQueues and LocalQueues; header carries the cluster apply runbook |
+| `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |
+| `.github/tpu-ci/provision-pools.sh` | Creates the CI node pools + their workload policies; prints commands, `--apply` runs them |
 | `.github/tpu-ci/jobset-tpu.yaml` | **Unified** JobSet template (any host count); rendered by `render_jobset.py` |
 | `.github/tpu-ci/render_jobset.py` | Renders the JobSet — single-host suite mode or multi-host group mode |
 | `.github/tpu-ci/discover_multihost.py` | Scans `MULTIHOST_LAUNCH` decls, groups files by launch spec → matrix JSON |
@@ -174,15 +190,25 @@ _TODO._
 
 ## Cluster infra (and what is currently missing)
 
-- Nodepool `ci-tpu7x-2x2x1` (4 nodes, `ci-tpu-pool=pr-gate`).
-- ⚠️ **`ci-tpu7x-2x2x2` does not currently exist.** It was present as of 2026-08-09 and is
-  gone as of 2026-08-12, so multi-host jobs sit Pending with `0/11 nodes are available:
-  11 node(s) didn't match Pod's node affinity/selector` until their deadline. The recreate
-  command (workload policy `--type=HIGH_THROUGHPUT --accelerator-topology=2x2x2`, then the
-  node pool) is in the header of `kueue-tpu.yaml`. The only other 2x2x2 pools on the cluster
-  are `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` — do not repurpose either.
-- ⚠️ **Kueue is not installed.** Multi-host admission depends on it; the install and
-  verification steps are in the header of `kueue-tpu.yaml`. JobSet v0.12.0 is present.
+- Nodepool `ci-tpu7x-2x2x1` — **4 nodes today, target 6** (`ci-tpu-pool=pr-gate`).
+- ⚠️ **Four pools do not exist yet**, so `topology.yaml` and the Kueue quotas describe a
+  target layout, not the cluster. Run `provision-pools.sh` to create them:
+
+  | pool | `ci-tpu-pool` | topology | nodes |
+  |------|---------------|----------|-------|
+  | `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | 2x2x2 | 2 |
+  | `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 2 |
+  | `ci-tpu7x-2x2x2-nightly` | `nightly` | 2x2x2 | 2 |
+  | `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | 2x2x4 | 4 |
+
+  A 2x2x2 CI pool was present as of 2026-08-09 and gone by 2026-08-12, which is why
+  multi-host jobs sit Pending with `0/11 nodes are available: 11 node(s) didn't match Pod's
+  node affinity/selector` until their deadline. The only 2x2x2 pools on the cluster now are
+  `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` — do not repurpose either.
+- ⚠️ **`2x2x4` is unverified.** Confirm it is a valid `tpu7x` topology and really is 4 hosts
+  before creating `ci-tpu7x-2x2x4-nightly`; the `hosts: 4` entry in `topology.yaml` assumes it.
+- ⚠️ **Kueue is not installed.** Multi-host admission depends on it — see "Enabling Kueue".
+  JobSet v0.12.0 is present.
 - `system-pool` (e2-standard-2) hosting the **JobSet operator v0.12.0** (the e2-medium
   default-pool is CPU-saturated by GKE daemons).
 - Artifact Registry: `us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci`.
@@ -236,29 +262,23 @@ Then confirm nothing outside `tpu-ci` was caught: `kubectl get workloads -A`.
 
 ```bash
 kubectl apply -f .github/tpu-ci/kueue-tpu.yaml
-kubectl get clusterqueues -o wide        # ACTIVE=True on both
+kubectl get clusterqueues -o wide        # ACTIVE=True on all five
 kubectl -n tpu-ci get localqueues
 ```
 
-**4. The multi-host pool must exist**, or `tpu-multihost` workloads queue until the
-admission timeout. Flags verified against `ci-tpu7x-2x2x1` and `tpu7x-2x2x2-haolin-dev`:
+**4. The pools must exist**, or workloads queue until the admission timeout. A quota whose
+pool is absent is pure fiction — Kueue admits against the number, and the pods then find no
+matching node. `provision-pools.sh` creates all four missing pools plus their workload
+policies and resizes the existing single-host pool:
 
 ```bash
-gcloud compute resource-policies create workload-policy ci-tpu7x-2x2x2-wp \
-  --type=HIGH_THROUGHPUT --accelerator-topology=2x2x2 --region=us-central1 \
-  --project=sglang-torchtpu
-
-gcloud container node-pools create ci-tpu7x-2x2x2 \
-  --cluster=tpu-cluster --zone=us-central1-c --project=sglang-torchtpu \
-  --machine-type=tpu7x-standard-4t --tpu-topology=2x2x2 \
-  --placement-policy=ci-tpu7x-2x2x2-wp \
-  --reservation-affinity=specific \
-  --reservation=projects/sglang-torchtpu/reservations/ghostfish-u2zcmybntv70q \
-  --node-labels=ci-tpu-pool=nightly
+.github/tpu-ci/provision-pools.sh            # preflight + print, creates nothing
+.github/tpu-ci/provision-pools.sh --apply
 ```
 
-`--type` must be `HIGH_THROUGHPUT` — `COMPACT` is a different API and `HIGH_AVAILABILITY`
-rejects `--accelerator-topology`. `--num-nodes` is inferred from `--tpu-topology`.
+Its preflight checks reservation headroom and the existing pool's `workload-metadata` —
+cluster-level Workload Identity does not apply retroactively, and setting it after creation
+recreates every node in the pool.
 
 **5. Verify gang admission** before merging. The design assumes Kueue assigns a whole
 PodSet to one ResourceFlavor; everything about slice isolation rests on it. Submit two

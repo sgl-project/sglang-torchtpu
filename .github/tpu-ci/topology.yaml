@@ -1,16 +1,27 @@
-# Detection source of truth: the SLICE for a given host count. Both paths size ONE
+# Detection source of truth: the SLICE for a given (lane, host count). Both paths size ONE
 # JobSet template from this:
 #   * single-host suites (run_suite; each test self-launches) -> hosts = 1
 #   * multi-host launch groups (a shared launched server per group; see
 #     discover_multihost.py + MULTIHOST_LAUNCH in the test files) -> hosts from the group
-# A suite/group does NOT pick topology or pool -- it only needs a host count, and the
-# slice (topology + node pool) is looked up here. Keep host counts in sync with the TPU
-# suites in run_suite.py and the multi-host tests' MULTIHOST_LAUNCH.
+# A suite/group does NOT pick topology, pool or queue -- it declares a lane and a host
+# count, and the slice is looked up here. Keep host counts in sync with the TPU suites in
+# run_suite.py and the multi-host tests' MULTIHOST_LAUNCH.
+#
+# LANE, not just host count: pr-gate and nightly each own pools at 1 and 2 hosts, so a
+# host count alone no longer identifies a pool. `_tpu-test` takes `lane` (default pr-gate)
+# and nightly-test-tpu.yml passes `lane: nightly`.
 #
 #   topology : cloud.google.com/gke-tpu-topology node label
-#   pool     : ci-tpu-pool node label
-#   queue    : Kueue LocalQueue in namespace tpu-ci (see kueue-tpu.yaml) -- gang-admits
-#              the JobSet against that slice class's quota
-slices:
-  1: { topology: 2x2x1, pool: pr-gate, queue: tpu-singlehost }   # single-host: PR gate + single-host nightly
-  2: { topology: 2x2x2, pool: nightly, queue: tpu-multihost }    # multi-host: tp = 2 x chips
+#   pool     : ci-tpu-pool node label -- one pool per multi-host slice, see provision-pools.sh
+#   queue    : Kueue LocalQueue in namespace tpu-ci (see kueue-tpu.yaml) -- gang-admits the
+#              JobSet against that slice class's quota. One queue per (lane, hosts): a
+#              2-host job needs 8 chips, which a single-host flavor would satisfy on quota
+#              while being unschedulable, so the shapes must not share a ClusterQueue.
+lanes:
+  pr-gate:
+    1: { topology: 2x2x1, pool: pr-gate,    queue: tpu-prgate-1h }   # 6 nodes = 6 slices
+    2: { topology: 2x2x2, pool: pr-gate-2h, queue: tpu-prgate-2h }   # 1 slice = 2 hosts
+  nightly:
+    1: { topology: 2x2x1, pool: nightly-1h, queue: tpu-nightly-1h }  # 2 nodes = 2 slices
+    2: { topology: 2x2x2, pool: nightly,    queue: tpu-nightly-2h }  # 1 slice = 2 hosts
+    4: { topology: 2x2x4, pool: nightly-4h, queue: tpu-nightly-4h }  # 1 slice = 4 hosts
