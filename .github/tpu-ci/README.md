@@ -25,10 +25,10 @@ PR / nightly ─▶ GitHub-hosted runner
                  │    LocalQueue → ClusterQueue → ResourceFlavor (≡ one slice)
                  ▼
                  ├─ pr-gate lane
-                 │    ├─ ci-tpu7x-2x2x1          (pr-gate,    4 nodes = 4 slices)
+                 │    ├─ ci-tpu7x-2x2x1          (pr-gate,    2 nodes = 2 slices)
                  │    └─ ci-tpu7x-2x2x2-prgate   (pr-gate-2h, 1 slice = 2 hosts)
                  └─ nightly lane
-                      ├─ ci-tpu7x-2x2x1-nightly  (nightly-1h, 2 nodes = 2 slices)
+                      ├─ ci-tpu7x-2x2x1-nightly  (nightly-1h, 3 nodes = 3 slices)
                       ├─ ci-tpu7x-2x2x2          (nightly,    1 slice = 2 hosts)
                       └─ ci-tpu7x-2x2x4-nightly  (nightly-4h, 1 slice = 4 hosts)
 ```
@@ -38,7 +38,7 @@ Everything runs on the `ghostfish-u2zcmybntv70q` reservation.
 **Slice arithmetic.** `tpu7x-standard-4t` is 4 chips per host, so `2x2x1` = 4 chips = 1
 node, `2x2x2` = 8 chips = 2 nodes, `2x2x4` = 16 chips = 4 nodes. Each `2x2x1` node is
 therefore a *complete* single-host slice, which is why those pools may hold several nodes;
-a multi-host pool holds exactly one slice. Totals: **pr-gate 24 chips, nightly 32 chips.**
+a multi-host pool holds exactly one slice. Totals: **pr-gate 16 chips, nightly 36 chips.**
 
 **Lane, not just host count.** Both lanes own 1- and 2-host slices, so a host count alone no
 longer identifies a pool. `topology.yaml` is keyed `(lane, hosts)`, `_tpu-test` takes a
@@ -121,7 +121,7 @@ slice's quota is free:
 
 | leg | LocalQueue | flavor | quota | concurrent |
 |------|-----------|--------|-------|-----------|
-| `hosts=1` | `tpu-nightly-1h` | `tpu7x-2x2x1-nightly` | 8 chips | 2 |
+| `hosts=1` | `tpu-nightly-1h` | `tpu7x-2x2x1-nightly` | 12 chips | 3 |
 | `hosts=2` | `tpu-nightly-2h` | `tpu7x-2x2x2-nightly` | 8 chips | 1 per slice |
 | `hosts=4` | `tpu-nightly-4h` | `tpu7x-2x2x4-nightly` | 16 chips | 1 per slice |
 
@@ -198,9 +198,9 @@ and passing it takes the multi-host path, which is rejected for this machine typ
 
 | pool | `ci-tpu-pool` | topology | nodes | chips |
 |------|---------------|----------|-------|-------|
-| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 4 | 16 |
+| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 2 | 8 |
 | `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | 2x2x2 | 2 | 8 |
-| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 2 | 8 |
+| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 3 | 12 |
 | `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 | 8 |
 | `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | 2x2x4 | 4 | 16 |
 

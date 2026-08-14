@@ -69,7 +69,7 @@ spec:
       operator: Exists
       effect: NoSchedule
 ---
-# 4 nodes x 4 chips = 16, each node a whole slice.
+# 2 nodes x 4 chips = 8, each node a whole slice.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -83,11 +83,11 @@ spec:
         - name: tpu7x-2x2x1-pr-gate
           resources:
             - name: "google.com/tpu"
-              nominalQuota: 16
+              nominalQuota: 8
             - name: "cpu"
-              nominalQuota: 16
+              nominalQuota: 8
             - name: "memory"
-              nominalQuota: 128Gi
+              nominalQuota: 64Gi
 ---
 # One slice = 8 chips = one concurrent job. No headroom possible: a 2-host job needs
 # exactly 8, so any lower value admits nothing.
@@ -110,7 +110,7 @@ spec:
             - name: "memory"
               nominalQuota: 64Gi
 ---
-# 2 nodes x 4 = 8.
+# 3 nodes x 4 = 12.
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
@@ -124,11 +124,11 @@ spec:
         - name: tpu7x-2x2x1-nightly
           resources:
             - name: "google.com/tpu"
-              nominalQuota: 8
+              nominalQuota: 12
             - name: "cpu"
-              nominalQuota: 8
+              nominalQuota: 12
             - name: "memory"
-              nominalQuota: 64Gi
+              nominalQuota: 96Gi
 ---
 # One slice. A second = new pool + new flavor + one more entry here; no workflow change.
 apiVersion: kueue.x-k8s.io/v1beta2
