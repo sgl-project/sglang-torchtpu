@@ -21,7 +21,9 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _get_hbm_usage_mb,
     _hbm_delta_str,
+    _materialize_out,
 )
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -265,6 +267,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         self,
         draft_attn_backend: Any,
         draft_extend_attn_backend: Any,
+        fused_draft_forward: Callable[[ForwardBatch], Any] | None = None,
     ) -> None:
         """Compile every DRAFT-model forward family at server warmup.
 
@@ -285,6 +288,8 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         overall = time.perf_counter()
         self._precompile_draft_prefill_extend()
         self._precompile_draft_decode(draft_attn_backend)
+        if fused_draft_forward is not None:
+            self._precompile_fused_draft_decode(draft_attn_backend, fused_draft_forward)
         self._precompile_draft_extend(draft_extend_attn_backend)
         logger.info(
             "[spec compile policy] DRAFT precompile done in %.1fs.",
@@ -379,6 +384,59 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
 
         self._precompile_shapes("DRAFT DECODE", shapes, run)
 
+    def _precompile_fused_draft_decode(
+        self,
+        draft_attn_backend: Any,
+        fused_draft_forward: Callable[[ForwardBatch], Any],
+    ) -> None:
+        """Compile the fused draft loop for every decode batch bucket."""
+        assert self.b_bucketer is not None
+        bs_buckets = list(self.b_bucketer.buckets)
+        logger.info(
+            "[spec compile policy] FUSED DRAFT: %d shapes (bs=%s)",
+            len(bs_buckets),
+            bs_buckets,
+        )
+
+        def run(bs: int) -> str:
+            args, kwargs = self._make_warmup_inputs(
+                num_tokens=bs * self.speculative_eagle_topk,
+                bs=bs,
+                mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=self._make_fused_draft_decode_spec_info(bs),
+            )
+            forward_batch = kwargs.get("forward_batch", args[2])
+            # A live fused draft reserves one KV output slot per request and
+            # draft step. Generic DECODE warmup only allocates one per request.
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.repeat_interleave(
+                self.speculative_num_steps
+            )
+            self._seed_dummy_req_to_token(forward_batch)
+            if is_dp_attention_enabled():
+                self._set_dp_attention_metadata(
+                    forward_batch,
+                    bs * self.speculative_eagle_topk,
+                    bs,
+                    ForwardMode.DECODE,
+                )
+            self.model_runner.model.prepare_forward_batch(forward_batch)
+            draft_attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.mark_forward_metadata_ready()
+            # The live draft path has consumed this seed before entering the
+            # fused loop. Match its state so Dynamo reuses the warmup graph.
+            forward_batch.input_ids = None
+            with torch.no_grad():
+                out = fused_draft_forward(forward_batch)
+                _materialize_out(
+                    out,
+                    draft_attn_backend.attn_backends[0],
+                    self.model_runner.token_to_kv_pool,
+                )
+            return f"bs={bs}"
+
+        self._precompile_shapes("FUSED DRAFT", bs_buckets, run)
+
     def _precompile_draft_extend(self, attn_backend: Any) -> None:
         """Compile DRAFT_EXTEND_V2(FULL) across the bs buckets."""
         assert self.b_bucketer is not None
@@ -430,6 +488,23 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         )
         spec_info.num_tokens_per_req = self.speculative_eagle_topk
         spec_info.num_tokens_for_logprob_per_req = self.speculative_eagle_topk
+        return spec_info
+
+    def _make_fused_draft_decode_spec_info(self, bs: int) -> EagleDraftInput:
+        """Build the batch-shaped EAGLE seeds consumed by the fused loop."""
+        spec_info = self._make_draft_decode_spec_info()
+        device = self.model_runner.device
+        spec_info.topk_p = torch.ones(
+            (bs, self.speculative_eagle_topk), device=device, dtype=torch.float32
+        )
+        spec_info.topk_index = torch.zeros(
+            (bs, self.speculative_eagle_topk), device=device, dtype=torch.int64
+        )
+        spec_info.hidden_states = torch.zeros(
+            (bs, spec_info.hidden_states.shape[1]),
+            device=device,
+            dtype=self.model_runner.dtype,
+        )
         return spec_info
 
     def _make_draft_extend_spec_info(self) -> EagleDraftExtendInput:

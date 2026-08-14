@@ -512,6 +512,7 @@ class TestDraftPrecompileOrdering(CustomTestCase):
 
         events = []
         worker = object.__new__(EagleDraftWorker)
+        worker.speculative_num_steps = 3
         worker.draft_tp_context = lambda _group: contextlib.nullcontext()
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
@@ -544,6 +545,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         ), patch(
             "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
             return_value=False,
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2._is_tpu",
+            True,
         ):
             worker.init_cuda_graphs()
 
@@ -552,7 +556,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             capture_decode_cuda_graph=False
         )
         worker.draft_runner.compile_policy.precompile_draft.assert_called_once_with(
-            worker.draft_attn_backend, worker.draft_extend_attn_backend
+            worker.draft_attn_backend,
+            worker.draft_extend_attn_backend,
+            worker._fused_draft_forward,
         )
 
 

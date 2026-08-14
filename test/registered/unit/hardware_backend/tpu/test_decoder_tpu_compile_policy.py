@@ -1355,6 +1355,39 @@ class TestDraftPrecompile(CustomTestCase):
 
         self.assertEqual(mr.model.forward.call_count, 0)
 
+    def test_fused_draft_warms_every_batch_bucket(self):
+        mr = _spec_model_runner(is_draft_worker=True, num_steps=3)
+        policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(1, 4))
+        step_backends = [_FakeAttnBackend() for _ in range(3)]
+
+        class FakeDraftBackend:
+            attn_backends = step_backends
+
+            def init_forward_metadata(self, forward_batch):
+                for backend in self.attn_backends:
+                    backend.init_forward_metadata(forward_batch)
+
+        seen_shapes = []
+
+        def fused_draft_forward(forward_batch):
+            seen_shapes.append(
+                (
+                    forward_batch.batch_size,
+                    forward_batch.out_cache_loc.shape[0],
+                    forward_batch.spec_info.topk_p.shape[0],
+                    forward_batch.input_ids,
+                )
+            )
+            return torch.zeros(forward_batch.batch_size)
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_fused_draft_decode(
+                FakeDraftBackend(), fused_draft_forward
+            )
+
+        self.assertEqual(seen_shapes, [(1, 3, 1, None), (4, 12, 4, None)])
+        self.assertEqual([len(backend.calls) for backend in step_backends], [2, 2, 2])
+
 
 # Speculative verification padding fixtures.
 BS = 2

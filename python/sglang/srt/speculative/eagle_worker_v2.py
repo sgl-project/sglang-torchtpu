@@ -242,7 +242,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             self.draft_runner.compile_policy.precompile_draft(
-                self.draft_attn_backend, self.draft_extend_attn_backend
+                self.draft_attn_backend,
+                self.draft_extend_attn_backend,
+                (
+                    self._fused_draft_forward
+                    if _is_tpu and self.speculative_num_steps > 1
+                    else None
+                ),
             )
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
