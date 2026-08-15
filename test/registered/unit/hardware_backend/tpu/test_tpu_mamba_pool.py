@@ -132,8 +132,11 @@ class TestTpuMambaPool(CustomTestCase):
         pool = self._pool()
         num_layers = len(self.LAYERS)
         conv_dim = self.N_KQ * self.D_K * 2 + self.N_V * self.D_V
-        expected = num_layers * (self.SIZE + 1) * 4 * (
-            (self.K - 1) * conv_dim + self.N_V * self.D_K * self.D_V
+        expected = (
+            num_layers
+            * (self.SIZE + 1)
+            * 4
+            * ((self.K - 1) * conv_dim + self.N_V * self.D_K * self.D_V)
         )
         self.assertEqual(int(pool.mamba_cache.mem_usage_bytes()), expected)
 

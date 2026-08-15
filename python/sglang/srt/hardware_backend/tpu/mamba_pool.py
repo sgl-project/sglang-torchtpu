@@ -173,9 +173,7 @@ class TpuMambaPool(MambaPool):
             for _ in range(num_mamba_layers)
         ]
 
-        self.mamba_cache = TpuPerLayerState(
-            conv=conv_state, temporal=temporal_state
-        )
+        self.mamba_cache = TpuPerLayerState(conv=conv_state, temporal=temporal_state)
         self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
         logger.info(
             "TPU Mamba/GDN state cache allocated: max_size=%d, layers=%d, "
