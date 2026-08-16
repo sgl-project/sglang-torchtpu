@@ -343,6 +343,17 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
         # FP8 (lhs bf16 × rhs fp8)
         # ---------------------------------------------------------------------
         "lhs_bfloat16_rhs_float8_e4m3fn": {
+            # Qwen3-Coder-480B FP8, TP8/EP8, 8K-token prefill. The serving
+            # loader converts the checkpoint to channelwise runtime scales.
+            # A larger M tile amortizes the four W1 and four W2 steps while
+            # retaining enough VMEM headroom for double buffering and BF16
+            # direct-write staging.
+            (
+                "k-6144_n-5120_g-20_lhs_quant_rhs_bs-6144"
+                "+k-2560_n-6144_g-20_lhs_quant_rhs_bs-6144"
+            ): {
+                "65536_silu": (256, 6144, 640, 2560, 1536, 2, 2),
+            },
             # H4096-I4096: H=4096, I=4096, E=256, EP=8 → g=32
             # Validated: caching + double-buffered weights.
             # Beats gmm_ep_dma by 11-22% across all M.

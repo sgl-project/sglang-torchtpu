@@ -5,7 +5,8 @@
 Routes the FP8 MoE through the in-tree SGLang-owned fused-RS kernel
 (`fused_moe_rs_gather`) instead of `fused_moe_call` + a separate all-reduce.
 Load-time `prepare_fp8_fused_rs` validates the supported runtime layout and
-caches physical-device ordering. Larger prefills retain the stock FP8 MoE path.
+caches physical-device ordering. Routed M up to 65,536 includes the validated
+Qwen3-Coder-480B 8K prefill bucket.
 """
 
 from __future__ import annotations
@@ -17,10 +18,10 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# TODO: Enable larger M, including prefill, once these issues are resolved:
-# https://github.com/sgl-project/sglang-torchtpu/issues/308
-# https://github.com/google-pytorch/torch_tpu/issues/2794
-_FUSED_RS_MAX_SIZE_M = 1024
+# Qwen3-Coder-480B's largest validated TP8/EP8 prefill bucket is 8K tokens
+# routed to top-8 experts.
+_FUSED_RS_MAX_SIZE_M = 65536
+_FUSED_RS_FP8_DIRECT_WRITE_MAX_SIZE_M = 1024
 
 
 def supports_fp8_fused_rs(
@@ -253,7 +254,9 @@ def _apply_fp8_fused_rs(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
-        fp8_direct_write=True,
+        # FP8 exit communication pays at decode-sized M. At large prefill M,
+        # quantize/dequantize dominates the saved single-host ICI bandwidth.
+        fp8_direct_write=size_m <= _FUSED_RS_FP8_DIRECT_WRITE_MAX_SIZE_M,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])

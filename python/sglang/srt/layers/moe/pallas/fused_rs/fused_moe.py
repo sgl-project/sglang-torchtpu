@@ -154,6 +154,25 @@ def moe_gmm_local_rs_nodedup(
         else jax.lax.axis_index(ep_axis_name)
     )
 
+    # The fused remote-DMA schedule requires every EP rank to route the same
+    # rows. Replicated hidden states can still differ by a rounding bit after
+    # rank-local collective reduction orders, which is enough to change a
+    # close top-k decision. Replicate the compact routing result from physical
+    # device 0 before deriving DMA counts. Expert IDs are exactly representable
+    # in BF16 for the supported models, so IDs and weights share one psum.
+    if not sp_enabled:
+        route_source = my_id == 0
+        routing = jnp.stack(
+            (topk_indices.astype(jnp.bfloat16), topk_weights.astype(jnp.bfloat16)),
+            axis=-1,
+        )
+        routing = jax.lax.psum(
+            jnp.where(route_source, routing, jnp.zeros_like(routing)),
+            axis_name=ep_axis_name,
+        )
+        topk_indices = routing[..., 0].astype(jnp.int32)
+        topk_weights = routing[..., 1].astype(topk_weights.dtype)
+
     # Routing — inlined here so bincount lives in the SAME shard_map as the
     # kernel call. Mirrors v1 where bincount is co-located with the heavy
     # ``hidden_states[token_indices_sorted]`` gather, letting XLA fuse them.
@@ -206,8 +225,14 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
     )
     tile_m = block_sizes.tile_m
+    # Every device must execute the same padded GM loop. Use a static upper
+    # bound based on the number of experts owned by one device: in the worst
+    # case all routed rows land on that device. This is much tighter than the
+    # old global-expert bound while keeping the communication schedule wholly
+    # independent of runtime routing and physical rank order.
     max_num_gm = jnp.array(
-        num_experts + (size_m + tile_m - 1) // tile_m - 1, dtype=jnp.int32
+        num_local_experts + (size_m + tile_m - 1) // tile_m - 1,
+        dtype=jnp.int32,
     )
 
     out_buf = gmm_v2_fused_rs_nodedup(
