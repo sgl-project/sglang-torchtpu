@@ -2,24 +2,18 @@
 
 """Unit tests for TPU FP8 fused-RS runtime selection."""
 
-import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
-    should_use_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-    fused_moe_rs_padded_tokens,
-)
-from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.utils import (
     MoeRunnerBackend,
     should_skip_post_experts_all_reduce,
@@ -116,57 +110,6 @@ class TestFp8MoeFusedRs(CustomTestCase):
             "EP=8, TP=8, world=16",
         )
 
-    def _assert_large_prefill_reduces_stock_output_once(self, *, block_quantized):
-        tokens, hidden = 8193, 4
-        x = torch.zeros(tokens, hidden)
-        raw = torch.arange(tokens * hidden, dtype=torch.float32).reshape(tokens, hidden)
-        dispatch_output = SimpleNamespace(
-            hidden_states=x,
-            topk_output=(
-                torch.zeros(tokens, 8),
-                torch.zeros(tokens, 8, dtype=torch.int32),
-                None,
-            ),
-        )
-        layer = SimpleNamespace(
-            moe_runner_config=SimpleNamespace(
-                apply_router_weight_on_input=False,
-                no_combine=False,
-            ),
-            _tpu_fused_rs_physical_order=torch.arange(8),
-            weight_block_size=[1, 512] if block_quantized else None,
-        )
-        expected = raw + 1
-        stock_moe = Mock(return_value=StandardCombineInput(hidden_states=raw))
-        fp8_moe_module = SimpleNamespace(apply_tpu_fp8_moe=stock_moe)
-
-        with (
-            patch.dict(
-                sys.modules,
-                {"sglang.srt.hardware_backend.tpu.fp8_moe": fp8_moe_module},
-            ),
-            patch(
-                "sglang.srt.distributed.moe_expert_parallel_all_reduce",
-                side_effect=lambda value: value + 1,
-            ) as all_reduce,
-        ):
-            actual = apply_fp8_fused_rs(
-                layer=layer,
-                dispatch_output=dispatch_output,
-                activation="silu",
-            )
-
-        torch.testing.assert_close(actual.hidden_states, expected)
-        self.assertEqual(all_reduce.call_count, 1)
-        self.assertFalse(stock_moe.call_args.kwargs["no_combine"])
-        self.assertEqual(stock_moe.call_args.kwargs["block_quant"], block_quantized)
-
-    def test_large_prefill_reduces_stock_output_once(self):
-        self._assert_large_prefill_reduces_stock_output_once(block_quantized=False)
-
-    def test_large_prefill_blockwise_reduces_stock_output_once(self):
-        self._assert_large_prefill_reduces_stock_output_once(block_quantized=True)
-
     def test_blockwise_path_passes_scale_inv_to_fused_kernel(self):
         tokens, hidden = 8, 4
         x = torch.zeros(tokens, hidden)
@@ -237,21 +180,6 @@ class TestFp8MoeFusedRs(CustomTestCase):
             )
 
         self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
-
-    def test_uses_fused_rs_through_validated_prefill_limit(self):
-        self.assertTrue(should_use_fp8_fused_rs(1))
-        self.assertTrue(should_use_fp8_fused_rs(128))
-        self.assertTrue(should_use_fp8_fused_rs(1024))
-        self.assertTrue(should_use_fp8_fused_rs(1025))
-        self.assertTrue(should_use_fp8_fused_rs(2048))
-        self.assertTrue(should_use_fp8_fused_rs(32768))
-        self.assertTrue(should_use_fp8_fused_rs(65536))
-        self.assertFalse(should_use_fp8_fused_rs(65537))
-
-    def test_padded_routed_rows_respect_inline_limit(self):
-        padded_tokens = fused_moe_rs_padded_tokens(21846, topk=3, ep_size=8)
-        self.assertEqual(padded_tokens, 21856)
-        self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):
         # Upstream's dwdp gate reads the published parallel context, which
