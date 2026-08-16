@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+
 def supports_fp8_fused_rs(
     *,
     ep_size: int,
@@ -179,6 +180,7 @@ def _apply_fp8_fused_rs(
     topk = int(topk_ids.shape[-1])
     block_quantized = getattr(layer, "weight_block_size", None) is not None
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
+
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     valid = topk_ids >= 0

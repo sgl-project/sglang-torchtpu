@@ -43,9 +43,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = str(tokens)
         env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
         env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_ROUTING"] = str(int(divergent_routing))
-        env["SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE"] = str(
-            int(fp8_direct_write)
-        )
+        env["SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE"] = str(int(fp8_direct_write))
 
         try:
             result = subprocess.run(
