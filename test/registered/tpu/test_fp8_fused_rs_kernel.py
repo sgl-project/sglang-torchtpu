@@ -23,6 +23,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         topk: int,
         blockwise: bool = False,
         divergent_routing: bool = False,
+        fp8_direct_write: bool = False,
     ):
         repo_root = Path(__file__).resolve().parents[3]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
@@ -42,6 +43,9 @@ class TestFp8FusedRsKernel(CustomTestCase):
         env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = str(tokens)
         env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
         env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_ROUTING"] = str(int(divergent_routing))
+        env["SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE"] = str(
+            int(fp8_direct_write)
+        )
 
         try:
             result = subprocess.run(
@@ -72,6 +76,10 @@ class TestFp8FusedRsKernel(CustomTestCase):
             result.stdout.count(f"divergent_routing={divergent_routing}"),
             8,
         )
+        self.assertEqual(
+            result.stdout.count(f"fp8_direct_write={fp8_direct_write}"),
+            8,
+        )
 
     def test_compiled_tp8_kernel_matches_reference(self):
         for post_expert_norm in (False, True):
@@ -98,6 +106,14 @@ class TestFp8FusedRsKernel(CustomTestCase):
             tokens=8,
             topk=1,
             blockwise=True,
+        )
+
+    def test_compiled_tp8_fp8_direct_write_matches_reference(self):
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=8,
+            topk=1,
+            fp8_direct_write=True,
         )
 
 

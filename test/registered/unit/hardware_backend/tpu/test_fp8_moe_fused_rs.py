@@ -146,7 +146,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertEqual(actual.hidden_states.shape, x.shape)
         self.assertIs(fused.call_args.kwargs["w1_scale"], w13_scale_inv)
         self.assertIs(fused.call_args.kwargs["w2_scale"], w2_scale_inv)
-        self.assertTrue(fused.call_args.kwargs["fp8_direct_write"])
+        self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
 
     def test_large_fused_prefill_uses_bf16_direct_write(self):
         tokens, hidden, topk = 8192, 4, 8
@@ -160,44 +160,11 @@ class TestFp8MoeFusedRs(CustomTestCase):
             ),
         )
         layer = SimpleNamespace(
-            weight_block_size=[1, 512],
+            weight_block_size=None,
             w13_weight=torch.zeros(1, hidden, 2 * hidden),
             w2_weight=torch.zeros(1, hidden, hidden),
-            w13_weight_scale_inv=torch.ones(1, 1, 1, 2 * hidden),
-            w2_weight_scale_inv=torch.ones(1, 1, 1, hidden),
-            _tpu_fused_rs_physical_order=torch.arange(8),
-            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
-        )
-
-        with patch(
-            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
-            return_value=torch.zeros_like(x),
-        ) as fused:
-            apply_fp8_fused_rs(
-                layer=layer,
-                dispatch_output=dispatch_output,
-                activation="silu",
-            )
-
-        self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
-
-    def test_qwen3_coder_480b_uses_bf16_direct_write_at_small_m(self):
-        tokens, hidden, topk = 8, 6144, 8
-        x = torch.zeros(tokens, hidden)
-        dispatch_output = SimpleNamespace(
-            hidden_states=x,
-            topk_output=(
-                torch.ones(tokens, topk),
-                torch.zeros(tokens, topk, dtype=torch.int32),
-                None,
-            ),
-        )
-        layer = SimpleNamespace(
-            weight_block_size=None,
-            w13_weight=torch.empty(20, 6144, 5120, device="meta"),
-            w2_weight=torch.empty(20, 2560, 6144, device="meta"),
-            w13_weight_scale=torch.empty(20, 1, 1, 5120, device="meta"),
-            w2_weight_scale=torch.empty(20, 1, 1, 6144, device="meta"),
+            w13_weight_scale=torch.ones(1, 1, 1, 2 * hidden),
+            w2_weight_scale=torch.ones(1, 1, 1, hidden),
             _tpu_fused_rs_physical_order=torch.arange(8),
             _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
         )

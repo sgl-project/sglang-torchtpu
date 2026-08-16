@@ -86,6 +86,9 @@ def main():
     test_divergent_routing = (
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_ROUTING", "0") == "1"
     )
+    fp8_direct_write = (
+        os.environ.get("SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE", "0") == "1"
+    )
     tokens = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOKENS", "64"))
     topk = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOPK", "2"))
     hidden_size = intermediate_size = 1024 if test_blockwise else 256
@@ -162,7 +165,7 @@ def main():
             topk=topk,
             activation="silu",
             has_post_expert_norm=test_post_expert_norm,
-            fp8_direct_write=True,
+            fp8_direct_write=fp8_direct_write,
         )
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
@@ -204,7 +207,8 @@ def main():
     print(
         f"FP8_FUSED_RS_KERNEL_PASS rank={rank} physical_id={physical_id} "
         f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm} "
-        f"blockwise={test_blockwise} divergent_routing={test_divergent_routing}"
+        f"blockwise={test_blockwise} divergent_routing={test_divergent_routing} "
+        f"fp8_direct_write={fp8_direct_write}"
     )
     dist.destroy_process_group()
 

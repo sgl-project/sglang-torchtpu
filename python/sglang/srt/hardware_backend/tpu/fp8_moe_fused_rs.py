@@ -16,27 +16,6 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-_FUSED_RS_DEFAULT_FP8_DIRECT_WRITE_MAX_SIZE_M = 1024
-_QWEN3_CODER_480B_TP8_W1_SHAPE = (20, 6144, 5120)
-_QWEN3_CODER_480B_TP8_W2_SHAPE = (20, 2560, 6144)
-
-
-def _use_fp8_direct_write(layer: torch.nn.Module, size_m: int) -> bool:
-    # Qwen3-Coder-480B TP8 with channelwise FP8 is faster with BF16 output
-    # writes across decode and prefill. Its wider output makes quantization and
-    # dequantization cost more than the saved in-kernel ICI traffic. The
-    # subsequent Torch all-gather is BF16 in either case.
-    qwen3_coder_480b_tp8 = (
-        getattr(layer, "weight_block_size", None) is None
-        and tuple(layer.w13_weight.shape) == _QWEN3_CODER_480B_TP8_W1_SHAPE
-        and tuple(layer.w2_weight.shape) == _QWEN3_CODER_480B_TP8_W2_SHAPE
-    )
-    return (
-        not qwen3_coder_480b_tp8
-        and size_m <= _FUSED_RS_DEFAULT_FP8_DIRECT_WRITE_MAX_SIZE_M
-    )
-
-
 def supports_fp8_fused_rs(
     *,
     ep_size: int,
@@ -199,14 +178,7 @@ def _apply_fp8_fused_rs(
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk = int(topk_ids.shape[-1])
     block_quantized = getattr(layer, "weight_block_size", None) is not None
-    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-        fused_moe_rs_gather,
-        fused_moe_rs_padded_tokens,
-    )
-
-    ep_size = int(layer._tpu_fused_rs_physical_order.shape[0])
-    padded_tokens = fused_moe_rs_padded_tokens(x.shape[0], topk, ep_size)
-    size_m = padded_tokens * topk
+    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import fused_moe_rs_gather
     topk_weights = topk_weights.to(x.dtype)
     topk_ids = topk_ids.to(torch.int32)
     valid = topk_ids >= 0
@@ -234,7 +206,10 @@ def _apply_fp8_fused_rs(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
-        fp8_direct_write=_use_fp8_direct_write(layer, size_m),
+        # This wrapper gathers the returned shard in BF16. Enabling FP8 only
+        # for the in-kernel writes adds row quantization and scale DMAs without
+        # reducing the subsequent collective's traffic.
+        fp8_direct_write=False,
         physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
     )
     return StandardCombineInput(hidden_states=result[: x.shape[0]])
