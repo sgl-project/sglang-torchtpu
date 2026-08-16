@@ -34,6 +34,37 @@ _MIN_GATED_SHAPE_SPEEDUP = 1.10
 _MIN_GATED_MEDIAN_SPEEDUP = 1.50
 
 
+class TestTpuVocabShardFullgraphCompile(CustomTestCase):
+    """Guard: TpuVocabShard is constructed inside the torch.compile'd forward
+    (fullgraph=True, so no graph break is possible), so it must be a container
+    Dynamo can instantiate in-graph. The original msgspec.Struct crashed every
+    tp>1 engine precompile with "object.__new__(TpuVocabShard) is not safe"."""
+
+    def test_constructible_under_fullgraph_dynamo(self):
+        import torch
+
+        from sglang.srt.hardware_backend.tpu.top_k import TpuVocabShard
+
+        def build_and_read(values: torch.Tensor) -> torch.Tensor:
+            shard = TpuVocabShard(
+                width=values.shape[-1],
+                global_vocab_size=4 * values.shape[-1],
+                org_vocab_start=0,
+                org_vocab_count=values.shape[-1] - 2,
+                org_vocab_padded_count=values.shape[-1] - 1,
+                added_vocab_start=3 * values.shape[-1],
+                added_vocab_count=1,
+            )
+            return values[..., : shard.org_vocab_count] + shard.added_vocab_count
+
+        values = torch.randn(2, 16)
+        # backend="eager": the guarded property is Dynamo's TRACE of the
+        # construction, which is backend-independent; the default backend on a
+        # TPU host would instead demand TPU-resident tensors.
+        compiled = torch.compile(build_and_read, fullgraph=True, backend="eager")
+        torch.testing.assert_close(compiled(values), build_and_read(values))
+
+
 class TestDistributedTopKSampling(CustomTestCase):
     """Run exactness and paired latency checks on a physical TPU v7 TP8.
     A subprocess owns the complete distributed runtime for test isolation."""

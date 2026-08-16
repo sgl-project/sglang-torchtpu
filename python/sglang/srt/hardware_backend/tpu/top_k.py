@@ -3,8 +3,8 @@
 Sharded reduction communicates only local TopK logits and global token IDs."""
 
 from collections.abc import Callable
+from typing import NamedTuple
 
-import msgspec
 import torch
 
 _TPU_TOP_K_OP: Callable | None = None
@@ -28,9 +28,14 @@ def supports_distributed_tpu_top_k(lm_head, top_k: int) -> bool:
     )
 
 
-class TpuVocabShard(msgspec.Struct, frozen=True):
+class TpuVocabShard(NamedTuple):
     """Describe valid base and added tokens inside one padded LM-head shard.
-    Device kernels use this metadata to mask padding and reconstruct global IDs."""
+    Device kernels use this metadata to mask padding and reconstruct global IDs.
+
+    A NamedTuple rather than the usual msgspec.Struct: it is constructed
+    inside the torch.compile'd forward (fullgraph, so no graph break is
+    possible there), and Dynamo cannot instantiate msgspec's C-level
+    ``__new__`` in-graph while NamedTuples are traced natively."""
 
     width: int
     global_vocab_size: int
