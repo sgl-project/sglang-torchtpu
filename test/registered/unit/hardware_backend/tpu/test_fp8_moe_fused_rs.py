@@ -117,7 +117,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
         )
 
     def _assert_large_prefill_reduces_stock_output_once(self, *, block_quantized):
-        tokens, hidden = 4097, 4
+        tokens, hidden = 8193, 4
         x = torch.zeros(tokens, hidden)
         raw = torch.arange(tokens * hidden, dtype=torch.float32).reshape(tokens, hidden)
         dispatch_output = SimpleNamespace(
@@ -203,20 +203,54 @@ class TestFp8MoeFusedRs(CustomTestCase):
         self.assertEqual(actual.hidden_states.shape, x.shape)
         self.assertIs(fused.call_args.kwargs["w1_scale"], w13_scale_inv)
         self.assertIs(fused.call_args.kwargs["w2_scale"], w2_scale_inv)
+        self.assertTrue(fused.call_args.kwargs["fp8_direct_write"])
 
-    def test_uses_fused_rs_only_through_validated_inline_limit(self):
+    def test_large_fused_prefill_uses_bf16_direct_write(self):
+        tokens, hidden, topk = 8192, 4, 8
+        x = torch.zeros(tokens, hidden)
+        dispatch_output = SimpleNamespace(
+            hidden_states=x,
+            topk_output=(
+                torch.ones(tokens, topk),
+                torch.zeros(tokens, topk, dtype=torch.int32),
+                None,
+            ),
+        )
+        layer = SimpleNamespace(
+            weight_block_size=[1, 512],
+            w13_weight=torch.zeros(1, hidden, 2 * hidden),
+            w2_weight=torch.zeros(1, hidden, hidden),
+            w13_weight_scale_inv=torch.ones(1, 1, 1, 2 * hidden),
+            w2_weight_scale_inv=torch.ones(1, 1, 1, hidden),
+            _tpu_fused_rs_physical_order=torch.arange(8),
+            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+        )
+
+        with patch(
+            "sglang.srt.layers.moe.pallas.fused_moe_rs_op.fused_moe_rs_gather",
+            return_value=torch.zeros_like(x),
+        ) as fused:
+            apply_fp8_fused_rs(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+            )
+
+        self.assertFalse(fused.call_args.kwargs["fp8_direct_write"])
+
+    def test_uses_fused_rs_through_validated_prefill_limit(self):
         self.assertTrue(should_use_fp8_fused_rs(1))
         self.assertTrue(should_use_fp8_fused_rs(128))
         self.assertTrue(should_use_fp8_fused_rs(1024))
-        self.assertFalse(should_use_fp8_fused_rs(1025))
-        self.assertFalse(should_use_fp8_fused_rs(2048))
-        self.assertFalse(should_use_fp8_fused_rs(32768))
-        self.assertFalse(should_use_fp8_fused_rs(32769))
-        self.assertFalse(should_use_fp8_fused_rs(65536))
+        self.assertTrue(should_use_fp8_fused_rs(1025))
+        self.assertTrue(should_use_fp8_fused_rs(2048))
+        self.assertTrue(should_use_fp8_fused_rs(32768))
+        self.assertTrue(should_use_fp8_fused_rs(65536))
+        self.assertFalse(should_use_fp8_fused_rs(65537))
 
     def test_padded_routed_rows_respect_inline_limit(self):
-        padded_tokens = fused_moe_rs_padded_tokens(682, topk=3, ep_size=8)
-        self.assertEqual(padded_tokens, 688)
+        padded_tokens = fused_moe_rs_padded_tokens(21846, topk=3, ep_size=8)
+        self.assertEqual(padded_tokens, 21856)
         self.assertFalse(should_use_fp8_fused_rs(padded_tokens * 3))
 
     def test_skips_only_ep_reduction_for_reduced_expert_output(self):

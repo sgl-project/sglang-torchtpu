@@ -22,6 +22,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         tokens: int,
         topk: int,
         blockwise: bool = False,
+        divergent_routing: bool = False,
     ):
         repo_root = Path(__file__).resolve().parents[3]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
@@ -40,6 +41,7 @@ class TestFp8FusedRsKernel(CustomTestCase):
         env["SGLANG_TPU_FUSED_RS_TEST_BLOCKWISE"] = str(int(blockwise))
         env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = str(tokens)
         env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
+        env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_ROUTING"] = str(int(divergent_routing))
 
         try:
             result = subprocess.run(
@@ -66,6 +68,10 @@ class TestFp8FusedRsKernel(CustomTestCase):
             8,
         )
         self.assertEqual(result.stdout.count(f"blockwise={blockwise}"), 8)
+        self.assertEqual(
+            result.stdout.count(f"divergent_routing={divergent_routing}"),
+            8,
+        )
 
     def test_compiled_tp8_kernel_matches_reference(self):
         for post_expert_norm in (False, True):
@@ -77,6 +83,14 @@ class TestFp8FusedRsKernel(CustomTestCase):
 
     def test_compiled_tp8_kernel_pads_routed_rows(self):
         self._run_compiled_tp8_kernel(post_expert_norm=False, tokens=8, topk=1)
+
+    def test_compiled_tp8_kernel_synchronizes_divergent_routing(self):
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=64,
+            topk=2,
+            divergent_routing=True,
+        )
 
     def test_compiled_tp8_block512_kernel_matches_reference(self):
         self._run_compiled_tp8_kernel(

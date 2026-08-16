@@ -83,6 +83,9 @@ def main():
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_POST_EXPERT_NORM", "0") == "1"
     )
     test_blockwise = os.environ.get("SGLANG_TPU_FUSED_RS_TEST_BLOCKWISE", "0") == "1"
+    test_divergent_routing = (
+        os.environ.get("SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_ROUTING", "0") == "1"
+    )
     tokens = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOKENS", "64"))
     topk = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOPK", "2"))
     hidden_size = intermediate_size = 1024 if test_blockwise else 256
@@ -126,6 +129,13 @@ def main():
     device = torch.device("tpu")
     physical_id = tpu_distributed.global_device_id()
     local_expert = rank
+    kernel_topk_ids = topk_ids
+    if test_divergent_routing and physical_id != 0:
+        # The fused kernel must use physical device 0's routing on every rank.
+        # Deliberately disagree elsewhere to catch mismatched remote-DMA
+        # send/receive schedules, which otherwise halt instead of returning an
+        # ordinary numerical mismatch.
+        kernel_topk_ids = (topk_ids + physical_id) % world_size
 
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         _build_fused_moe_rs_op,
@@ -168,7 +178,7 @@ def main():
         w1_scale_local.to(device),
         w2_scale_local.to(device),
         topk_weights.to(device),
-        topk_ids.to(device),
+        kernel_topk_ids.to(device),
         torch.tensor([local_expert, physical_id], dtype=torch.int32, device=device),
     )
     actual = compiled(
@@ -194,7 +204,7 @@ def main():
     print(
         f"FP8_FUSED_RS_KERNEL_PASS rank={rank} physical_id={physical_id} "
         f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm} "
-        f"blockwise={test_blockwise}"
+        f"blockwise={test_blockwise} divergent_routing={test_divergent_routing}"
     )
     dist.destroy_process_group()
 
