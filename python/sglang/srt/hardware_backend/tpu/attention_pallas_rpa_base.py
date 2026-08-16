@@ -521,15 +521,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # -------------------------------------------------------------- #
         kv_len_bump = 0
         if forward_batch.forward_mode.is_target_verify():
-            # TARGET_VERIFY: the target model verifies draft_token_num
-            # tokens per request.  The KV cache already includes the
-            # draft tokens, so bump seq_lens accordingly.
+            # EAGLE3 and DFlash expose their verification width through
+            # num_tokens_per_req, which can differ from draft_token_num.
             assert forward_batch.spec_info is not None
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            kv_len_bump = draft_token_num
-            seq_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
+            verify_width = forward_batch.spec_info.num_tokens_per_req
+            kv_len_bump = verify_width
+            seq_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
             extend_seq_lens = torch.full(
-                (bs,), draft_token_num, dtype=torch.int32, device=device
+                (bs,), verify_width, dtype=torch.int32, device=device
             )
         elif self._is_draft_extend(forward_batch.forward_mode):
             # DRAFT_EXTEND: batch.prefix_lens may be stale from the
@@ -638,13 +637,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         """
         kv_len_bump = 0
         if forward_batch.forward_mode.is_target_verify():
-            # TARGET_VERIFY: the KV cache already includes the draft tokens,
-            # so bump seq_lens by draft_token_num (shape-stable device add).
             assert forward_batch.spec_info is not None
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            kv_len_bump = draft_token_num
-            kv_lens = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
-            extend_seq_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
+            verify_width = forward_batch.spec_info.num_tokens_per_req
+            kv_len_bump = verify_width
+            kv_lens = (forward_batch.seq_lens + verify_width).to(torch.int32)
+            extend_seq_lens = torch.full((bs,), verify_width, dtype=torch.int32)
         elif self._is_extend_including_draft(forward_batch.forward_mode):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None

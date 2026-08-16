@@ -95,6 +95,10 @@ def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | N
 
 
 class SpecDecodeCompilePolicyMixin:
+    """Marker base for TPU speculative-decoding compile-policy mixins."""
+
+
+class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
     """Add EAGLE3 warmup and batch shaping to a decoder compile policy."""
 
     def __init__(self, **kwargs: Any) -> None:
@@ -820,11 +824,11 @@ class SpecDecodeCompilePolicyMixin:
 
 
 class SpecDecoderTpuCompilePolicy(
-    SpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy
+    Eagle3CompilePolicyMixin, DecoderTpuCompilePolicy
 ):
     """Speculative-decoding policy over the base decoder policy.
 
     The common composition (unannotated spec target models). The runner composes
-    ``SpecDecodeCompilePolicyMixin`` over other annotated base policies
+    ``Eagle3CompilePolicyMixin`` over other annotated base policies
     dynamically via ``TpuGraphRunner._augment_spec_policy``.
     """

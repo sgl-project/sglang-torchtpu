@@ -299,9 +299,9 @@ def _pad_forward_batch_inputs(
         and forward_batch.spec_info is not None
     ):
         # Verify is decode-like: batch follows the bs bucket (not pinned to the
-        # cap), with a fixed draft_token_num query tokens per request.
+        # cap), with a fixed speculative width per request.
         pad_b = b_bucketer.next_bucket(real_b)
-        pad_t = pad_b * forward_batch.spec_info.draft_token_num
+        pad_t = pad_b * forward_batch.spec_info.num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)

@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    Eagle3CompilePolicyMixin,
     SpecDecodeCompilePolicyMixin,
 )
 from sglang.srt.model_executor.tpu_graph_runner import (
@@ -287,6 +288,7 @@ class TestTpuGraphRunner(CustomTestCase):
             ),
         )
         cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, Eagle3CompilePolicyMixin))
         self.assertTrue(issubclass(cls, SpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
         # Idempotent: a policy that already implements spec is left untouched.
@@ -302,6 +304,20 @@ class TestTpuGraphRunner(CustomTestCase):
             DecoderTpuCompilePolicy,
         )
 
+    def test_augment_spec_policy_preserves_explicit_spec_policy(self):
+        class _ExplicitSpecPolicy(
+            SpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy
+        ):
+            pass
+
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="EAGLE3"
+            ),
+        )
+        self.assertIs(_augment_spec_policy(_ExplicitSpecPolicy, mr), _ExplicitSpecPolicy)
+
     def test_augment_spec_policy_is_algorithm_agnostic(self):
         # Any spec run gets the spec mixin regardless of algorithm; the mixin
         # enforces the supported algorithm at construction (non-EAGLE3 raises,
@@ -316,7 +332,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.assertTrue(
             issubclass(
                 _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
-                SpecDecodeCompilePolicyMixin,
+                Eagle3CompilePolicyMixin,
             )
         )
 

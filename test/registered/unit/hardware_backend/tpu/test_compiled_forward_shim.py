@@ -28,7 +28,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    SpecDecodeCompilePolicyMixin,
+    Eagle3CompilePolicyMixin,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -233,18 +233,18 @@ class TestPadForwardBatchInputs(CustomTestCase):
                     )
                     self.assertIn(padded_shape, precompiled_shapes)
 
-    def test_target_verify_pins_token_dim_to_draft_token_num(self):
-        # Verify query dim is cap * draft_token_num (fixed), NOT a token bucket:
-        # the extend branch would over-pad it up to the nearest token bucket.
-        fb = _forward_batch(real_t=8, real_b=2, mode="target_verify")  # bs=2, dtn=4
-        fb.spec_info = SimpleNamespace(draft_token_num=4)
+    def test_target_verify_pins_token_dim_to_spec_width(self):
+        # Verify query dim is cap * num_tokens_per_req, not a token bucket.
+        # The extend branch would otherwise over-pad to the next token bucket.
+        fb = _forward_batch(real_t=8, real_b=2, mode="target_verify")
+        fb.spec_info = SimpleNamespace(draft_token_num=3, num_tokens_per_req=4)
         real_q, real_b = _pad_forward_batch_inputs(
             fb,
             t_bucketer=_bucketer("Token", [64, 128]),  # must NOT be used for verify
             b_bucketer=_bucketer("Bs", [1, 4]),
         )
         self.assertEqual((real_q, real_b), (8, 2))
-        # pad_b = max_val = 4; pad_t = 4 * draft_token_num(4) = 16, not 64.
+        # pad_b = 4 and width = 4, so pad_t = 16 rather than token bucket 64.
         self.assertEqual(fb.input_ids.shape[0], 16)
         self.assertEqual(fb.positions.shape[0], 16)
         self.assertEqual(fb.seq_lens.shape[0], 4)
@@ -378,23 +378,25 @@ class TestPadForwardBatchInputs(CustomTestCase):
         # states, input_logprob_indices = None; from_forward_batch excludes it
         # from extend_return_logprob). So there are no dynamically-pruned states
         # and the guard must let it through even with return_logprob set. The
-        # batch pads to the static verify shape (pad_b * draft_token_num).
+        # batch pads to the static verify shape (pad_b * num_tokens_per_req).
         fb = _forward_batch(
             real_t=6, real_b=3, mode="target_verify", return_logprob=True
         )
-        fb.spec_info = SimpleNamespace(draft_token_num=2, hidden_states=None)
+        fb.spec_info = SimpleNamespace(
+            draft_token_num=1, num_tokens_per_req=2, hidden_states=None
+        )
         real_q, real_b = _pad_forward_batch_inputs(
             fb,
             t_bucketer=_bucketer("Token", [8, 64]),
             b_bucketer=_bucketer("Bs", [4]),
         )
         self.assertEqual((real_q, real_b), (6, 3))
-        self.assertEqual(fb.input_ids.shape[0], 8)  # pad_b(4) * draft_token_num(2)
+        self.assertEqual(fb.input_ids.shape[0], 8)  # pad_b(4) * width(2)
 
 
 class TestSpecDecodeCompilePolicyPadding(CustomTestCase):
     def test_draft_decode_pads_req_pool_indices_cpu_to_bucket(self):
-        policy = object.__new__(SpecDecodeCompilePolicyMixin)
+        policy = object.__new__(Eagle3CompilePolicyMixin)
         policy.b_bucketer = _bucketer("Bs", [1, 2, 4])
         fb = _forward_batch(real_t=3, real_b=3, mode="decode")
 

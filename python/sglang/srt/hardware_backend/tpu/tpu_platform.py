@@ -236,7 +236,8 @@ class TpuSRTPlatform(SRTPlatform):
         # axis. SGLang's global page_size=1 default is valid for token-granular
         # GPU kernels, but is inefficient here: it makes page_indices
         # token-granular and turns KV fetches into many tiny DMAs.
-        # Only EAGLE3 spec decoding is supported on TPU, and only with topk == 1
+        # Builtin TPU speculative decoding currently supports EAGLE3 only.
+        # Registered algorithms own their validation and backend integration.
         spec_algo = server_args.speculative_algorithm
         if spec_algo is not None:
             if server_args.attention_backend == "pallas_tpu_rpa_batched":
@@ -259,10 +260,16 @@ class TpuSRTPlatform(SRTPlatform):
                         "EAGLE3 topk > 1 is not supported on TPU yet."
                     )
             else:
-                raise NotImplementedError(
-                    f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                    "yet (only EAGLE3)."
-                )
+                from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+                # Unknown names may be registered by a plugin after platform
+                # defaults run. The shared speculative registry validates them
+                # later; only reject builtins the TPU backend knows it cannot run.
+                if spec_algo.upper() in SpeculativeAlgorithm.__members__:
+                    raise NotImplementedError(
+                        f"Speculative algorithm {spec_algo!r} is not supported on TPU "
+                        "yet (only EAGLE3 among builtin algorithms)."
+                    )
 
         if server_args.enable_dp_attention:
             attn_tp_size = server_args.tp_size // server_args.dp_size

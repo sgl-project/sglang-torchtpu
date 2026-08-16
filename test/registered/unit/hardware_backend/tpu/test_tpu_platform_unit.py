@@ -297,6 +297,17 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self._apply(args)
         self.assertTrue(args.enable_torch_compile)
 
+    def test_registered_spec_algorithm_name_is_admitted(self):
+        # Plugin registration may happen after platform defaults. Unknown names
+        # pass this backend gate and are validated by the shared registry later.
+        args = self._args(speculative_algorithm="MY_PLUGIN")
+        self._apply(args)
+
+    def test_unsupported_builtin_spec_algorithm_is_rejected(self):
+        args = self._args(speculative_algorithm="NGRAM")
+        with self.assertRaisesRegex(NotImplementedError, "only EAGLE3"):
+            self._apply(args)
+
     def test_dp_attention_requires_dp_lm_head_when_attn_tp_gt_1(self):
         args = self._args(
             enable_dp_attention=True,

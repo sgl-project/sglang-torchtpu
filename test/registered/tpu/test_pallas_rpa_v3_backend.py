@@ -328,7 +328,10 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         )
         self.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
         self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
-        self.spec_info = types.SimpleNamespace(draft_token_num=self.DRAFT_TOKEN_NUM)
+        self.spec_info = types.SimpleNamespace(
+            draft_token_num=self.DRAFT_TOKEN_NUM,
+            num_tokens_per_req=self.DRAFT_TOKEN_NUM,
+        )
 
     def test_target_verify_bumps_kv_lens_and_cu_q_lens(self):
         backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
@@ -352,6 +355,31 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
             torch.equal(
                 meta.distribution,
                 torch.tensor([0, self.bs, self.bs], dtype=torch.int32),
+            )
+        )
+
+    def test_target_verify_uses_algorithm_specific_width(self):
+        backend = _BackendUnderTest(self.PAGE_SIZE, self.req_to_token)
+        verify_width = self.DRAFT_TOKEN_NUM + 1
+        fb = _make_forward_batch(
+            seq_lens=self.seq_lens,
+            req_pool_indices=self.req_pool_indices,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=types.SimpleNamespace(
+                draft_token_num=self.DRAFT_TOKEN_NUM,
+                num_tokens_per_req=verify_width,
+            ),
+        )
+
+        meta = _build_meta(backend, fb)
+
+        self.assertTrue(
+            torch.equal(meta.kv_lens, (self.seq_lens + verify_width).to(torch.int32))
+        )
+        self.assertTrue(
+            torch.equal(
+                meta.cu_q_lens,
+                (torch.arange(self.bs + 1) * verify_width).to(torch.int32),
             )
         )
 

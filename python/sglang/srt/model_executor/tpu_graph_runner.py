@@ -37,6 +37,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
+    Eagle3CompilePolicyMixin,
     SpecDecodeCompilePolicyMixin,
 )
 from sglang.srt.platforms import current_platform
@@ -64,7 +65,9 @@ def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
     if not issubclass(policy_cls, DecoderTpuCompilePolicy):
         return policy_cls
     return type(
-        f"Spec{policy_cls.__name__}", (SpecDecodeCompilePolicyMixin, policy_cls), {}
+        f"{Eagle3CompilePolicyMixin.__name__}{policy_cls.__name__}",
+        (Eagle3CompilePolicyMixin, policy_cls),
+        {},
     )
 
 
@@ -217,10 +220,10 @@ class TpuGraphRunner:
             ):
                 logger.warning(
                     "Speculative decoding is active and %s ships its own compile "
-                    "policy %s; composing the default SpecDecodeCompilePolicyMixin over "
-                    "it.",
+                    "policy %s; composing %s over it.",
                     type(module).__name__,
                     policy_cls.__name__,
+                    Eagle3CompilePolicyMixin.__name__,
                 )
             policy_cls = _augment_spec_policy(policy_cls, model_runner)
 
