@@ -5,8 +5,8 @@
 Routes the FP8 MoE through the in-tree SGLang-owned fused-RS kernel
 (`fused_moe_rs_gather`) instead of `fused_moe_call` + a separate all-reduce.
 Load-time `prepare_fp8_fused_rs` validates the supported runtime layout and
-caches physical-device ordering. Routed M up to 65,536 includes the validated
-Qwen3-Coder-480B 8K prefill bucket.
+caches physical-device ordering. The current rollout envelope covers routed M
+up to 65,536, including Qwen3-Coder-480B's 8K prefill bucket.
 """
 
 from __future__ import annotations
@@ -18,9 +18,11 @@ import torch
 
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-# Qwen3-Coder-480B's largest validated TP8/EP8 prefill bucket is 8K tokens
-# routed to top-8 experts.
-_FUSED_RS_MAX_SIZE_M = 65536
+# Conservative integration guard, not the kernel's architectural limit. The
+# Qwen3-Coder-480B serving recipe currently compiles prefill chunks up to 8K
+# tokens, routed to top-8 experts. Larger routed-M shapes must pass compiled
+# TP8/EP8 numerical and performance validation before expanding this envelope.
+_FUSED_RS_MAX_VALIDATED_SIZE_M = 65536
 _FUSED_RS_FP8_DIRECT_WRITE_MAX_SIZE_M = 1024
 
 
@@ -116,7 +118,7 @@ def fp8_fused_rs_unsupported_reason(
 
 def should_use_fp8_fused_rs(size_m: int) -> bool:
     """Use fused-RS only for validated routed-assignment counts."""
-    return size_m <= _FUSED_RS_MAX_SIZE_M
+    return size_m <= _FUSED_RS_MAX_VALIDATED_SIZE_M
 
 
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
