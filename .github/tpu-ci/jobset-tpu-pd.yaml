@@ -1,0 +1,170 @@
+# P/D disaggregation test workload -- TWO replicated jobs (prefill, decode), each
+# scheduled onto its OWN TPU slice (the exclusive-topology annotation pins every
+# child Job inside one node pool; a GKE multihost TPU node pool is one slice).
+# Rendered by .github/tpu-ci/render_jobset.py --pd-prefill-hosts/--pd-decode-hosts.
+# Render vars (do NOT write them as dollar-brace tokens in these comments -- the
+# renderer would substitute them here too):
+#   IMAGE                digest-pinned image
+#   RUN_NAME             DNS-safe label; must not contain "prefill"/"decode"
+#                        (pods derive peer-slice hostnames by swapping the
+#                        replicated-job segment of their own hostname)
+#   EXEC_CMD             every pod of both slices runs this command; the test
+#                        dispatches roles from CI_PD_ROLE + the slice-local
+#                        TPU worker env, and the prefill leader's exit gates
+#   ACTIVE_DEADLINE      per-Job runtime cap (seconds)
+#   PREFILL_HOSTS / DECODE_HOSTS           pods (= hosts) per slice
+#   PREFILL_TOPOLOGY / PREFILL_POOL        node labels for the prefill slice
+#   DECODE_TOPOLOGY / DECODE_POOL          node labels for the decode slice
+#   WEIGHTS_VOLUME / WEIGHTS_MOUNT         indented YAML blocks (may be empty)
+# Requires the target pools to hold one slice per role (two slices total).
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: tpu-ci-${RUN_NAME}-
+  namespace: tpu-ci
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  ttlSecondsAfterFinished: 7200
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true       # stable pod DNS for cross-slice rendezvous
+  replicatedJobs:
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${PREFILL_HOSTS}
+          parallelism: ${PREFILL_HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: ${PREFILL_TOPOLOGY}
+                ci-tpu-pool: ${PREFILL_POOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+${WEIGHTS_VOLUME}
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: prefill
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      ${EXEC_CMD}
+                      rc=$?
+                      # Only the prefill leader's verdict gates; a teardown
+                      # SIGTERM on any other pod is success.
+                      if [ "${TPU_WORKER_ID:-0}" != "0" ] && [ "$rc" = 143 ]; then
+                        echo "worker teardown SIGTERM; success"; rc=0
+                      fi
+                      exit $rc
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+${WEIGHTS_MOUNT}
+                  securityContext:
+                    privileged: true
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${DECODE_HOSTS}
+          parallelism: ${DECODE_HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: ${DECODE_TOPOLOGY}
+                ci-tpu-pool: ${DECODE_POOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+${WEIGHTS_VOLUME}
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: decode
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      ${EXEC_CMD}
+                      rc=$?
+                      # Decode pods never gate on teardown SIGTERM.
+                      if [ "$rc" = 143 ]; then
+                        echo "worker teardown SIGTERM; success"; rc=0
+                      fi
+                      exit $rc
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+${WEIGHTS_MOUNT}
+                  securityContext:
+                    privileged: true

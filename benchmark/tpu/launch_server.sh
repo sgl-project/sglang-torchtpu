@@ -179,6 +179,8 @@ fi
 
 TP_SIZE=${TP_SIZE:-$DEFAULT_TP}
 EP_SIZE=${EP_SIZE:-}
+DP_SIZE=${DP_SIZE:-}
+ENABLE_DP_ATTENTION=${ENABLE_DP_ATTENTION:-0}
 
 TS=$(date +%Y%m%d_%H%M%S)
 RUN_DIR=${RUN_DIR:-./profile/${MODEL_SLUG}-tpu/$TS}
@@ -379,6 +381,8 @@ args=(
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
+[[ -n "$DP_SIZE" ]] && [[ "$EXTRA_ARGS" != *"--dp-size"* ]] && args+=(--dp-size "$DP_SIZE")
+[[ "$ENABLE_DP_ATTENTION" == "1" ]] && [[ "$EXTRA_ARGS" != *"--enable-dp-attention"* ]] && args+=(--enable-dp-attention)
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
@@ -433,6 +437,8 @@ if [[ "$DUMP_META" == "1" ]]; then
         --set device=tpu \
         --set tp_size="$TP_SIZE" \
         --set ep_size="${EP_SIZE:-}" \
+        --set dp_size="${DP_SIZE:-}" \
+        --set enable_dp_attention="$ENABLE_DP_ATTENTION" \
         --set host="$HOST" \
         --set port="$PORT" \
         --set conc="$CONC" \

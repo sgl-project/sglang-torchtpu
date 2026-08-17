@@ -22,6 +22,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${MODEL:?set MODEL (HF repo or local snapshot dir)}"
 TP_SIZE=${TP_SIZE:-8}
 EP_SIZE=${EP_SIZE:-8}
+DP_SIZE=${DP_SIZE:-}
+ENABLE_DP_ATTENTION=${ENABLE_DP_ATTENTION:-0}
 PAGE_SIZE=${PAGE_SIZE:-64}
 MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.92}
 PORT=${PORT:-30000}
@@ -47,7 +49,7 @@ echo "[decode] model=$MODEL tp=$TP_SIZE ep=$EP_SIZE host_ip=$SGLANG_HOST_IP" \
 # than graph-breaking, which fullgraph=True forbids. Override via env if needed.
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
 
-export MODEL TP_SIZE PAGE_SIZE MEM_FRACTION_STATIC PYTHON HOST PORT
+export MODEL TP_SIZE EP_SIZE DP_SIZE ENABLE_DP_ATTENTION PAGE_SIZE MEM_FRACTION_STATIC PYTHON HOST PORT
 export EXTRA_ARGS="--ep-size $EP_SIZE \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend tpu \

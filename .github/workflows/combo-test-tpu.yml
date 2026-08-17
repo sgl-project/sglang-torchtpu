@@ -1,10 +1,6 @@
-# TPU feature-combination e2e -- both layers of test/manual/tpu/feature_combo/,
-# via _tpu-test's exec mode:
-#   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, pr-gate host)
-#   multihost-combo-test-{pd,spec}: P/D and spec rows across the 2x2x2 slice
-# The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
-# trigger:
-#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] [-f ref=<branch>]
+# TEMPORARY CARRIER (probe branch only, never for merge): dispatches the P/D
+# TP resharding integration JobSet while integration-test-tpu.yml does not exist
+# on the default branch.
 name: Combo Test (TPU)
 
 on:
@@ -13,64 +9,45 @@ on:
       ref:
         description: "Git ref to test"
         required: false
-        default: main
+        default: chenjincheng/test-coverage
       target:
-        description: "Which combo layer/row to run"
+        description: "Which model profile to run (or all)"
         required: false
         default: all
         type: choice
-        options: [all, singlehost, multihost, pd, spec]
+        options: [all, gpt_oss_120b, qwen3_coder_480b]
 
 concurrency:
-  group: tpu-combo
-  cancel-in-progress: false   # let a running combo finish; don't stack them
+  group: tpu-integration-2x2
+  cancel-in-progress: false
 
 jobs:
   build:
     uses: ./.github/workflows/_tpu-build.yml
     with:
-      ref: ${{ inputs.ref || 'main' }}
+      ref: ${{ inputs.ref || 'chenjincheng/test-coverage' }}
     permissions:
       contents: read
       id-token: write
 
-  singlehost-combo:
+  pd-tp-resharding:
     needs: build
-    if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
-    name: singlehost-combo-test
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      hosts: 1
-      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-      run_name: singlehost-combo-test
-    permissions:
-      contents: read
-      id-token: write
-
-  multihost-combo:
-    needs: build
-    if: ${{ contains(fromJSON('["all","multihost","pd","spec"]'), inputs.target || 'all') }}
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        # matrix context is unavailable in job-level `if`; selection shapes the matrix.
-        row: ${{ (inputs.target == 'pd' && fromJSON('["pd"]')) || (inputs.target == 'spec' && fromJSON('["spec"]')) || fromJSON('["pd","spec"]') }}
-    name: multihost-combo-test-${{ matrix.row }}
+        model: ${{ (inputs.target == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]')) || (inputs.target == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]')) || fromJSON('["gpt_oss_120b","qwen3_coder_480b"]') }}
+    name: pd-tp-resharding-${{ matrix.model }}-2p2d
     uses: ./.github/workflows/_tpu-test.yml
     with:
-      ref: ${{ inputs.ref || 'main' }}
+      ref: ${{ inputs.ref || 'chenjincheng/test-coverage' }}
       image: ${{ needs.build.outputs.digest }}
       hosts: 2
-      # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
-      # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
-      exec_cmd: >-
-        ${{ matrix.row == 'pd'
-            && 'env MODEL=/weights/Qwen3-30B-A3B-FP8 python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
-            || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
-      run_name: multihost-combo-test-${{ matrix.row }}
+      run_name: pd-tpreshard-${{ matrix.model }}
     permissions:
       contents: read
       id-token: write

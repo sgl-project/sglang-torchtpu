@@ -48,6 +48,17 @@ on:
         required: false
         type: string
         default: ""
+      # --- P/D mode: prefill + decode groups, each on its own slice; needs exec_cmd.
+      # Callers should also pass `hosts` = the per-role slice size so the
+      # concurrency group serializes with other runs contending for the slices.
+      pd_prefill_hosts:
+        required: false
+        type: number
+        default: 0
+      pd_decode_hosts:
+        required: false
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -97,6 +108,8 @@ jobs:
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
+            --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
+            --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml

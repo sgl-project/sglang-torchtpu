@@ -1,0 +1,94 @@
+# TPU P/D-disaggregation integration tests:
+# 1. pd-prefix-caching-kv-offload (issue #376): multihost prefill + multihost
+#    decode, prefix caching + raiden KV offload on prefill.
+# 2. pd-tp-resharding (issue #378): multihost prefill (TP16EP16) + multihost
+#    decode (DP2TP8EP16) with heterogeneous attention TP resharding.
+#
+# One JobSet per model profile; matrix rows run serially (the roles' slices are
+# shared, scarce capacity). Requires the nightly pool to hold TWO 2x2x2 slices
+# (one per role) or the JobSet stays Pending until its deadline.
+#
+# Trigger:
+#   gh workflow run integration-test-tpu.yml [-f ref=<branch>] \
+#     [-f suite=all|pd_prefix_caching_kv_offload|pd_tp_resharding] \
+#     [-f model=all|gpt_oss_120b|qwen3_coder_480b]
+name: Integration Test (TPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      suite:
+        description: "Which integration test suite to run"
+        required: false
+        default: all
+        type: choice
+        options: [all, pd_prefix_caching_kv_offload, pd_tp_resharding]
+      model:
+        description: "Which model profile(s) to run"
+        required: false
+        default: all
+        type: choice
+        options: [all, gpt_oss_120b, qwen3_coder_480b]
+
+concurrency:
+  group: tpu-integration
+  cancel-in-progress: false   # let a running integration test finish
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  pd-prefix-caching-kv-offload:
+    needs: build
+    if: inputs.suite == 'all' || inputs.suite == 'pd_prefix_caching_kv_offload' || inputs.suite == null
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # both rows contend for the same two slices
+      matrix:
+        model: ${{ (inputs.model == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]')) || (inputs.model == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]')) || fromJSON('["gpt_oss_120b","qwen3_coder_480b"]') }}
+    name: pd-prefix-caching-kv-offload-${{ matrix.model }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
+      weights_pvc: model-weights-rox
+      run_name: pd-kvoff-${{ matrix.model }}
+    permissions:
+      contents: read
+      id-token: write
+
+  pd-tp-resharding:
+    needs: build
+    if: inputs.suite == 'all' || inputs.suite == 'pd_tp_resharding' || inputs.suite == null
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # both rows contend for the same two slices
+      matrix:
+        model: ${{ (inputs.model == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]')) || (inputs.model == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]')) || fromJSON('["gpt_oss_120b","qwen3_coder_480b"]') }}
+    name: pd-tp-resharding-${{ matrix.model }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
+      weights_pvc: model-weights-rox
+      run_name: pd-tpreshard-${{ matrix.model }}
+    permissions:
+      contents: read
+      id-token: write

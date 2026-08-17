@@ -184,6 +184,11 @@ OTHER_SUITES = {
     HWBackend.CPU: [
         "default",
     ],
+    HWBackend.TPU: [
+        # P/D-disaggregation integration rows (integration-test-tpu.yml); the
+        # workflow runs the registered files in exec mode, one profile per run.
+        "tpu-integration",
+    ],
     HWBackend.CUDA: [
         "stress",
         # `stage="weekly"` -- same shape. The three dicts group names for
