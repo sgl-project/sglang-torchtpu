@@ -512,9 +512,7 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
         self.assertEqual(result["residual"].shape, (5, 4))
 
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
-        class _SpecQwenPolicy(
-            Eagle3CompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
-        ):
+        class _SpecQwenPolicy(Eagle3CompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy):
             pass
 
         policy = object.__new__(_SpecQwenPolicy)

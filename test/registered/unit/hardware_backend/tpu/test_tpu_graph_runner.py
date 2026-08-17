@@ -316,7 +316,9 @@ class TestTpuGraphRunner(CustomTestCase):
                 speculative_num_steps=3, speculative_algorithm="EAGLE3"
             ),
         )
-        self.assertIs(_augment_spec_policy(_ExplicitSpecPolicy, mr), _ExplicitSpecPolicy)
+        self.assertIs(
+            _augment_spec_policy(_ExplicitSpecPolicy, mr), _ExplicitSpecPolicy
+        )
 
     def test_augment_spec_policy_is_algorithm_agnostic(self):
         # Any spec run gets the spec mixin regardless of algorithm; the mixin

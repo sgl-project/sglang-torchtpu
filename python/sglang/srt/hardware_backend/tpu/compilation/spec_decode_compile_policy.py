@@ -823,9 +823,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         )
 
 
-class SpecDecoderTpuCompilePolicy(
-    Eagle3CompilePolicyMixin, DecoderTpuCompilePolicy
-):
+class SpecDecoderTpuCompilePolicy(Eagle3CompilePolicyMixin, DecoderTpuCompilePolicy):
     """Speculative-decoding policy over the base decoder policy.
 
     The common composition (unannotated spec target models). The runner composes
