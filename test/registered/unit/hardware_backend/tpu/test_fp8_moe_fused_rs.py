@@ -32,6 +32,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def _config(self, **overrides):
         config = {
+            "num_experts": 160,
             "ep_size": 8,
             "tp_size": 8,
             "pp_size": 1,
@@ -68,6 +69,9 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def test_rejects_unvalidated_layouts_and_runner_modes(self):
         unsupported = (
+            # The routing collective converts IDs to BF16, which represents
+            # every supported expert index 0..255 exactly.
+            {"num_experts": 257},
             {"ep_size": 1, "tp_size": 1, "world_size": 1},
             {"ep_size": 4},
             {"world_size": 16},
@@ -88,6 +92,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def test_reports_rejected_layout(self):
         config = {
+            "num_experts": 160,
             "ep_size": 8,
             "tp_size": 8,
             "pp_size": 1,

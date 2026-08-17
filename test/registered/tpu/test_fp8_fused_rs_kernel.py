@@ -22,7 +22,8 @@ class TestFp8FusedRsKernel(CustomTestCase):
         tokens: int,
         topk: int,
         blockwise: bool = False,
-        divergent_routing: bool = False,
+        divergent_ids: bool = False,
+        divergent_weights: bool = False,
         fp8_direct_write: bool = False,
     ):
         repo_root = Path(__file__).resolve().parents[3]
@@ -42,7 +43,8 @@ class TestFp8FusedRsKernel(CustomTestCase):
         env["SGLANG_TPU_FUSED_RS_TEST_BLOCKWISE"] = str(int(blockwise))
         env["SGLANG_TPU_FUSED_RS_TEST_TOKENS"] = str(tokens)
         env["SGLANG_TPU_FUSED_RS_TEST_TOPK"] = str(topk)
-        env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_ROUTING"] = str(int(divergent_routing))
+        env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_IDS"] = str(int(divergent_ids))
+        env["SGLANG_TPU_FUSED_RS_TEST_DIVERGENT_WEIGHTS"] = str(int(divergent_weights))
         env["SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE"] = str(int(fp8_direct_write))
 
         try:
@@ -71,7 +73,11 @@ class TestFp8FusedRsKernel(CustomTestCase):
         )
         self.assertEqual(result.stdout.count(f"blockwise={blockwise}"), 8)
         self.assertEqual(
-            result.stdout.count(f"divergent_routing={divergent_routing}"),
+            result.stdout.count(f"divergent_ids={divergent_ids}"),
+            8,
+        )
+        self.assertEqual(
+            result.stdout.count(f"divergent_weights={divergent_weights}"),
             8,
         )
         self.assertEqual(
@@ -90,12 +96,22 @@ class TestFp8FusedRsKernel(CustomTestCase):
     def test_compiled_tp8_kernel_pads_routed_rows(self):
         self._run_compiled_tp8_kernel(post_expert_norm=False, tokens=8, topk=1)
 
-    def test_compiled_tp8_kernel_synchronizes_divergent_routing(self):
+    def test_compiled_tp8_kernel_synchronizes_divergent_weights(self):
+        """Non-source routing weights must not affect fused-RS output."""
         self._run_compiled_tp8_kernel(
             post_expert_norm=False,
             tokens=64,
             topk=2,
-            divergent_routing=True,
+            divergent_weights=True,
+        )
+
+    def test_compiled_tp8_kernel_synchronizes_divergent_ids(self):
+        """Non-source expert IDs must not affect fused-RS output."""
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=64,
+            topk=2,
+            divergent_ids=True,
         )
 
     def test_compiled_tp8_block512_kernel_matches_reference(self):

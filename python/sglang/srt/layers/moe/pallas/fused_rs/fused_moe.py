@@ -154,12 +154,17 @@ def moe_gmm_local_rs_nodedup(
         else jax.lax.axis_index(ep_axis_name)
     )
 
-    # The fused remote-DMA schedule requires every EP rank to route the same
-    # rows. Replicated hidden states can still differ by a rounding bit after
-    # rank-local collective reduction orders, which is enough to change a
-    # close top-k decision. Replicate the compact routing result from physical
-    # device 0 before deriving DMA counts. Expert IDs are exactly representable
-    # in BF16 for the supported models, so IDs and weights share one psum.
+    # Compiler workaround for the non-SP fused remote-DMA graph: materialize
+    # IDs and weights from physical device 0 in one BF16 psum and feed both
+    # slices forward. Altering this dataflow can halt the compiled graph. This
+    # should not be interpreted as evidence that routing IDs differ across
+    # ranks; the ablations establish a lowering dependency, not its root cause.
+    # Backend selection limits this path to 256 experts, so IDs 0..255 are
+    # represented exactly in BF16.
+    # TODO: Remove this block once the mixed communicating-Pallas core halt is
+    # fixed at its root cause:
+    # https://github.com/sgl-project/sglang-torchtpu/issues/308
+    # https://github.com/google-pytorch/torch_tpu/issues/2794
     if not sp_enabled:
         route_source = my_id == 0
         routing = jnp.stack(

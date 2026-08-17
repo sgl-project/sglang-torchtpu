@@ -19,6 +19,7 @@ from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 def supports_fp8_fused_rs(
     *,
+    num_experts: int,
     ep_size: int,
     tp_size: int,
     pp_size: int,
@@ -38,6 +39,7 @@ def supports_fp8_fused_rs(
     """Return whether the runtime layout matches the validated fused-RS path."""
     return (
         fp8_fused_rs_unsupported_reason(
+            num_experts=num_experts,
             ep_size=ep_size,
             tp_size=tp_size,
             pp_size=pp_size,
@@ -60,6 +62,7 @@ def supports_fp8_fused_rs(
 
 def fp8_fused_rs_unsupported_reason(
     *,
+    num_experts: int,
     ep_size: int,
     tp_size: int,
     pp_size: int,
@@ -79,6 +82,11 @@ def fp8_fused_rs_unsupported_reason(
     """Return the first reason the fused-RS backend cannot be selected."""
     if ep_size <= 1:
         return f"expert parallel size must be greater than 1, got {ep_size}"
+    if num_experts > 256:
+        return (
+            "BF16 routing materialization supports at most 256 experts, got "
+            f"{num_experts}"
+        )
     if pp_size != 1:
         return f"pipeline parallelism is not supported, got PP={pp_size}"
     if ep_size != tp_size or ep_size != world_size:
@@ -122,6 +130,7 @@ def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> 
     ep_size = parallel.moe_ep_size
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     unsupported_reason = fp8_fused_rs_unsupported_reason(
+        num_experts=layer.num_experts,
         ep_size=ep_size,
         tp_size=get_tp_group().world_size,
         pp_size=parallel.pp_size,
