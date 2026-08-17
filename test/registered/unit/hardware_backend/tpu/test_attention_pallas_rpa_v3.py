@@ -97,7 +97,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         metadata = self._build_metadata(
             backend,
             ForwardMode.TARGET_VERIFY,
-            SimpleNamespace(draft_token_num=self.DRAFT_TOKENS),
+            SimpleNamespace(num_tokens_per_req=self.DRAFT_TOKENS),
         )
         capacity = metadata.cu_kv_lens[1].item()
         self.assertEqual(metadata.kv_lens.item(), self.CONTEXT_LEN + 6)
@@ -114,7 +114,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
                     self._build_metadata(
                         backend,
                         ForwardMode.TARGET_VERIFY,
-                        SimpleNamespace(draft_token_num=self.DRAFT_TOKENS),
+                        SimpleNamespace(num_tokens_per_req=self.DRAFT_TOKENS),
                         seq_len=131194,
                     )
 
