@@ -1659,6 +1659,42 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
         self.assertEqual(state.logical_num_tokens, 2)
         self.assertEqual(state.physical_num_tokens, 4)
 
+    def test_fused_draft_refreshes_dp_metadata_after_inputs_are_consumed(self):
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 8))
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            input_ids=None,
+            seq_lens=torch.ones((8,), dtype=torch.int32),
+            batch_size=8,
+            global_num_tokens_cpu=[3, 8],
+            global_num_tokens_gpu=torch.tensor([3, 8]),
+            global_num_tokens_for_logprob_cpu=[3, 8],
+            global_num_tokens_for_logprob_gpu=torch.tensor([3, 8]),
+            dp_local_start_pos=3,
+            dp_local_num_tokens=8,
+            global_dp_buffer_len=11,
+            is_extend_in_batch=False,
+        )
+
+        with _dp_attention(True), patch(
+            "sglang.srt.layers.dp_attention.set_dp_buffer_len"
+        ) as set_buffer_len, patch(
+            "sglang.srt.layers.dp_attention.set_is_extend_in_batch"
+        ) as set_is_extend:
+            policy.refresh_fused_draft_dp_metadata(forward_batch)
+
+        self.assertEqual(forward_batch.global_num_tokens_cpu, [8, 8])
+        self.assertEqual(forward_batch.global_num_tokens_gpu.tolist(), [8, 8])
+        self.assertEqual(forward_batch.global_num_tokens_for_logprob_cpu, [8, 8])
+        self.assertEqual(
+            forward_batch.global_num_tokens_for_logprob_gpu.tolist(), [8, 8]
+        )
+        self.assertEqual(forward_batch.global_dp_buffer_len, 16)
+        self.assertIsNone(forward_batch.dp_local_start_pos)
+        self.assertIsNone(forward_batch.dp_local_num_tokens)
+        set_buffer_len.assert_called_once_with(16, 8, True, [8, 8])
+        set_is_extend.assert_called_once_with(False)
+
     def test_draft_extend_buckets_to_the_full_tree_width(self):
         policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
         draft_extend_input = EagleDraftExtendInput(

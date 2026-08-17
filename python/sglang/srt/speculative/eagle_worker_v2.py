@@ -552,19 +552,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
-                if self.speculative_num_steps > 1:
-                    self.draft_runner.compile_policy.prepare_spec_forward_batch(
-                        forward_batch
-                    )
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    if not forward_batch.forward_mode.is_idle():
-                        self.draft_attn_backend.init_forward_metadata(forward_batch)
-                        forward_batch.mark_forward_metadata_ready()
-                if (
+                use_fused_draft = (
                     self._should_fuse_draft_steps()
                     and not forward_batch.forward_mode.is_idle()
-                ):
+                )
+                if self.speculative_num_steps > 1:
+                    self._prepare_draft_forward_batch(
+                        forward_batch, refresh_dp_metadata=use_fused_draft
+                    )
+                if use_fused_draft:
                     draft_outputs = self._fused_draft_forward(forward_batch)
                 else:
                     draft_outputs = self.draft_forward(forward_batch)
@@ -608,6 +604,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+
+    def _prepare_draft_forward_batch(
+        self, forward_batch: ForwardBatch, *, refresh_dp_metadata: bool
+    ) -> None:
+        self.draft_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
+        if forward_batch.forward_mode.is_idle():
+            return
+        if refresh_dp_metadata:
+            # The fused loop calls the model directly, bypassing ModelRunner's
+            # normal prepare hook. Publish the final DP bucket metadata after
+            # speculative padding without rebuilding already-consumed inputs.
+            self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
+                forward_batch
+            )
+        self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.mark_forward_metadata_ready()
 
     def _fused_draft_forward(self, forward_batch: ForwardBatch):
         """Run all draft steps in one compiled call."""

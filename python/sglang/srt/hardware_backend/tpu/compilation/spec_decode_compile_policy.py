@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _dp_attn_apply_bucket_metadata,
     _restore_forward_batch_inputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
@@ -202,6 +203,15 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             self._pad_draft_decode(forward_batch)
         elif mode.is_draft_extend_v2():
             self._pad_draft_extend(forward_batch)
+
+    def refresh_fused_draft_dp_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Publish the final padded draft shape before a fused direct call."""
+        if not is_dp_attention_enabled() or forward_batch.forward_mode.is_idle():
+            return
+        padded_batch_size = int(forward_batch.batch_size)
+        _dp_attn_apply_bucket_metadata(
+            forward_batch, padded_batch_size, padded_batch_size
+        )
 
     def _prepare_empty_dp_draft_batch(
         self, forward_batch: ForwardBatch, original_mode: ForwardMode

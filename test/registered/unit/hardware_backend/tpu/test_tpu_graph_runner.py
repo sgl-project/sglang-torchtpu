@@ -562,6 +562,30 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             worker._fused_draft_forward,
         )
 
+    def test_fused_draft_refreshes_dp_metadata_after_spec_padding(self):
+        """The direct fused call must publish its final padded DP shape."""
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        events = []
+        worker = object.__new__(EagleDraftWorker)
+        worker.draft_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(
+                prepare_spec_forward_batch=lambda _batch: events.append("spec"),
+                refresh_fused_draft_dp_metadata=lambda _batch: events.append("dp"),
+            ),
+        )
+        worker.draft_attn_backend = SimpleNamespace(
+            init_forward_metadata=lambda _batch: events.append("metadata")
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            mark_forward_metadata_ready=lambda: events.append("ready"),
+        )
+
+        worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
+
+        self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
+
 
 if __name__ == "__main__":
     unittest.main()

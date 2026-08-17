@@ -153,7 +153,12 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
     )
 
     dp_size = len(forward_batch.global_num_tokens_cpu)
-    device = forward_batch.input_ids.device
+    input_ids = getattr(forward_batch, "input_ids", None)
+    device = (
+        input_ids.device
+        if isinstance(input_ids, torch.Tensor)
+        else forward_batch.seq_lens.device
+    )
 
     forward_batch.global_num_tokens_cpu = [pad_t] * dp_size
     forward_batch.global_num_tokens_gpu = torch.full(
