@@ -34,6 +34,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 import unittest
 import warnings
 
@@ -85,6 +86,9 @@ MODEL_PROFILES = {
             "kv_cache_dtype": "fp8_e4m3",
             "ep_size": 8,
             "tpu_fp8_runtime": "channelwise",
+            "hicache_ratio": HICACHE_RATIO,
+            "hicache_io_backend": "raiden",
+            "hicache_mem_layout": "page_first_fused",
             # Bound compilation to the focused test's request envelope.
             "max_prefill_tokens": 2048,
             "max_running_requests": 16,
@@ -97,6 +101,35 @@ MODEL_PROFILES = {
         # seen with page size 64.
         "dp_engine": {"quantization": "fp8", "kv_cache_dtype": "bf16"},
         # Establish this on hardware before turning it into a regression gate.
+        "accept_length_ref": None,
+    },
+    "gpt-oss-120b": {
+        "model": "openai/gpt-oss-120b",
+        "draft_model": "lmsys/EAGLE3-gpt-oss-120b-bf16",
+        "page_size": 64,
+        "mem_fraction_static": 0.6,
+        "env": {
+            "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+        },
+        "workload": {
+            "max_total_tokens": 8192,
+            "long_prompt_num_integers": 120,
+            "min_cached_pages": 3,
+            "system_repeats": 1,
+            "churn_count": 16,
+        },
+        "base_engine": {
+            "ep_size": 8,
+            "kv_cache_dtype": "fp8_e4m3",
+            "hicache_ratio": HICACHE_RATIO,
+            "hicache_io_backend": "raiden",
+            "hicache_mem_layout": "page_first_fused",
+            "max_prefill_tokens": 2048,
+            "max_running_requests": 16,
+            "tpu_compile_bs": [1, 2, 4],
+            "tpu_compile_tokens": [512, 2048],
+        },
+        "dp_engine": {"kv_cache_dtype": "bf16"},
         "accept_length_ref": None,
     },
 }
@@ -233,6 +266,8 @@ class TestFeatureCombo(unittest.TestCase):
         )
 
         os.environ["SGLANG_PLATFORM"] = "tpu"
+        for k, v in PROFILE.get("env", {}).items():
+            os.environ.setdefault(k, str(v))
         # These are SINGLE-HOST engines, but the multihost dev pods bake
         # TPU_WORKER_ID / TPU_WORKER_HOSTNAMES into the pod env — torch_tpu
         # then expects a 2-host slice and hangs ~30 min waiting for the peer
@@ -451,6 +486,85 @@ class TestFeatureCombo(unittest.TestCase):
             mean_al,
             0.9 * float(ref),
             f"mean accept_length {mean_al:.3f} < 90% of reference {ref}",
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("GSM8K_SCORE_THRESHOLD")
+        or PROFILE.get("gsm8k_score_threshold") is not None,
+        "Requires gsm8k_score_threshold in model profile or GSM8K_SCORE_THRESHOLD env var",
+    )
+    def test_8_gsm8k(self):
+        """Evaluate few-shot GSM8K quality and speculative efficiency."""
+        threshold = float(
+            os.environ.get(
+                "GSM8K_SCORE_THRESHOLD", PROFILE.get("gsm8k_score_threshold")
+            )
+        )
+        num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "20"))
+        if num_questions <= 0:
+            self.skipTest("GSM8K evaluation disabled via GSM8K_NUM_QUESTIONS=0")
+
+        from sglang.test.few_shot_gsm8k_engine import (
+            INVALID,
+            download_and_cache_file,
+            get_answer_value,
+            get_few_shot_examples,
+            get_one_example,
+            read_jsonl,
+        )
+
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        filename = os.environ.get("GSM8K_DATA_PATH") or download_and_cache_file(url)
+        lines = list(read_jsonl(filename))
+
+        num_shots = int(os.environ.get("GSM8K_NUM_SHOTS", "5"))
+        few_shot_prompt = get_few_shot_examples(lines, num_shots)
+        eval_lines = lines[num_shots : num_shots + num_questions]
+
+        prompts = [
+            few_shot_prompt + get_one_example(eval_lines, i, include_answer=False)
+            for i in range(len(eval_lines))
+        ]
+        labels = [get_answer_value(line["answer"]) for line in eval_lines]
+
+        sampling_params = [
+            {
+                "temperature": 0.0,
+                "max_new_tokens": 512,
+                "stop": ["Question:", "Question", "Assistant:", "<|separator|>"],
+            }
+        ] * len(prompts)
+
+        tic = time.perf_counter()
+        outs = self.engine.generate(prompts, sampling_params)
+        duration = time.perf_counter() - tic
+
+        preds = [get_answer_value(out["text"]) for out in outs]
+        correct = sum(
+            p == l and l != INVALID and p != INVALID for p, l in zip(preds, labels)
+        )
+        accuracy = correct / len(prompts) if prompts else 0.0
+
+        total_tokens = sum(
+            out.get("meta_info", {}).get("completion_tokens", 0) for out in outs
+        )
+        throughput = total_tokens / duration if duration > 0 else 0.0
+
+        total_verify_ct = sum(
+            out.get("meta_info", {}).get("spec_verify_ct", 0) for out in outs
+        )
+        mean_al = (total_tokens / total_verify_ct) if total_verify_ct > 0 else 0.0
+
+        spec_stat = f" mean_accept_length={mean_al:.3f}" if self.spec_on else ""
+        print(
+            f"\n[GSM8K Eval] n={len(prompts)} accuracy={accuracy:.3f} ({correct}/{len(prompts)}) "
+            f"throughput={throughput:.1f} tok/s duration={duration:.2f}s{spec_stat}"
+        )
+
+        self.assertGreaterEqual(
+            accuracy,
+            float(threshold),
+            f"GSM8K accuracy {accuracy:.3f} < threshold {threshold}",
         )
 
 
