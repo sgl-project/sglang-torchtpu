@@ -1,6 +1,6 @@
 """On-device test: raiden KV offload piggybacks the speculative draft pool.
 
-Requires a TPU + a built tpu_raiden extension + torch_tpu. NOT a CI unit test
+Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_offload_unit.py for the host-only logic). Run with:
 
     PYTHONPATH=/path/to/sglang-torchtpu/python \

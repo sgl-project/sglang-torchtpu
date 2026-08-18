@@ -11,7 +11,7 @@ backends drive the design:
 
 * the in-tree ``tpu`` backend (``conn.py``) pushes KV page bytes over ZMQ
   (host D2H gather -> network -> H2D scatter); it is the default.
-* an opt-in ``tpu_raiden`` backend (a future ``raiden_conn.py``) hands the
+* an opt-in ``tpu_sync`` backend (a future ``raiden_conn.py``) hands the
   bulk transfer to the standalone Raiden DMA engine and ships only small
   metadata over ZMQ.
 

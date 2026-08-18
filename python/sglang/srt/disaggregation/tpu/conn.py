@@ -14,7 +14,7 @@ H2D into pages it allocated itself. No device pointers ever cross the
 process boundary — see ``transfer.py`` for why that matters on TPU.
 
 For the backend-agnostic control-plane scaffolding and the seam a second
-backend (e.g. ``tpu_raiden``) plugs into, see ``base.py``.
+backend (e.g. ``tpu_sync``) plugs into, see ``base.py``.
 
 Threading model (critical on TPU)
 ---------------------------------

@@ -262,10 +262,10 @@ class RaidenKVManager(CommonKVManager):
         if self._engine is not None or self._kv_caches is None:
             return
         # TPU-only import, deferred so the disaggregation module imports cleanly
-        # on hosts without tpu_raiden. Raiden owns the transport, host staging,
+        # on hosts without tpu_sync. Raiden owns the transport, host staging,
         # D2H/H2D DMA, and completion tracking; it indexes each KV tensor's major
         # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
-        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+        from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         max_blocks = self._max_request_blocks()
         num_slots = self._num_slots()
@@ -748,7 +748,7 @@ class RaidenKVManager(CommonKVManager):
             self._register_receiver_and_signal(room)
 
     def _register_receiver_and_signal(self, room: int) -> None:
-        from tpu_raiden.rpc import raiden_service_pb2 as pb2
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             build_receiver_request,
@@ -840,7 +840,7 @@ class RaidenKVManager(CommonKVManager):
                 self._failed.add(str(room))
 
     def _run_reshard_push(self, room: int) -> None:
-        from tpu_raiden.rpc import raiden_service_pb2 as pb2
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             build_sender_request,

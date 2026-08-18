@@ -113,7 +113,7 @@ class RaidenKVTransfer:
         device_pool: TpuFusedMHATokenToKVPool,
         num_host_pages: int,
     ):
-        from tpu_raiden.api.torch.kv_cache_manager import KVCacheManager
+        from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
         self.device_pool = device_pool
         self.num_host_pages = num_host_pages
