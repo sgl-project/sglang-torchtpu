@@ -57,11 +57,23 @@ jobs:
           filters: |
             tpu:
               - 'python/sglang/srt/hardware_backend/tpu/**'
+              # Pallas is a TPU-only kernel language, and these trees are TPU-only code
+              # that lives outside hardware_backend/. Omitting them meant a PR touching
+              # only Pallas kernels -- an MLA attention re-sync, say -- matched nothing,
+              # so TPU CI skipped and the run still reported success.
+              - 'python/sglang/srt/layers/attention/pallas/**'
+              - 'python/sglang/srt/layers/moe/pallas/**'
+              - 'python/sglang/srt/disaggregation/tpu/**'
+              - 'python/sglang/test/tpu/**'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
               - 'docker/cloudbuild.tpu.yaml'
               - 'test/registered/tpu/**'
+              - 'test/registered/unit/hardware_backend/tpu/**'
+              - 'test/registered/unit/layers/attention/pallas/**'
+              - 'test/registered/unit/layers/moe/pallas/**'
+              - 'test/manual/tpu/**'
               - '.github/tpu-ci/**'
               - '.github/workflows/_tpu-build.yml'
               - '.github/workflows/_tpu-test.yml'
