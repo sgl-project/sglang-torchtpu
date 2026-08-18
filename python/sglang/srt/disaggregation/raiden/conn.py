@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
 from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
     pack_blocks,
@@ -145,6 +146,12 @@ class RaidenKVManager(CommonKVManager):
         self._completed_send: Set[str] = set()
         self._completed_recv: Set[str] = set()
         self._failed: Set[str] = set()
+        # Rooms whose pull is issued and not yet settled. Raiden borrows one
+        # host staging slot per in-flight transfer and rejects a read it cannot
+        # seat, so the decode side admits at most one pull per slot and leaves
+        # the rest in the transfer queue.
+        self._pulling: Optional[SlotAdmission] = None
+        self._engine_max_blocks = 0
         self._engine_lock = threading.Lock()
         self._push_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -284,6 +291,8 @@ class RaidenKVManager(CommonKVManager):
             num_slots=num_slots,
             timeout_s=self._timeout_s,
         )
+        self._pulling = SlotAdmission(num_slots)
+        self._engine_max_blocks = max_blocks
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
             "num_slots=%d",
@@ -304,6 +313,9 @@ class RaidenKVManager(CommonKVManager):
                 num_slots=swa_num_slots,
                 timeout_s=self._timeout_s,
             )
+            # A room occupies a slot in both engines; the tighter pool binds.
+            self._pulling.capacity = min(self._pulling.capacity, swa_num_slots)
+            self._engine_max_blocks = min(self._engine_max_blocks, swa_max_blocks)
             logger.info(
                 "RaidenKVManager rank%d SWA engine up | endpoint=%s "
                 "max_blocks=%d num_slots=%d",
@@ -372,6 +384,7 @@ class RaidenKVManager(CommonKVManager):
                     self._completed_send.update(self._norm_req_id(r) for r in done_send)
                     self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
                     self._failed.update(self._norm_req_id(r) for r in failed)
+                    self._release_pull_slots_locked()
                 if failed:
                     logger.error(
                         "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
@@ -598,10 +611,35 @@ class RaidenKVManager(CommonKVManager):
             local = local[: len(remote)]
         return remote, local
 
+    def _release_pull_slots_locked(self) -> None:
+        """Hand back the slots of transfers that have settled."""
+        if self._pulling is None:
+            return
+        for room in self._pulling.rooms():
+            rid, swa_rid = str(room), self._swa_req_id(room)
+            done = rid in self._completed_recv and (
+                self._swa_engine is None or swa_rid in self._completed_recv
+            )
+            if done or rid in self._failed or swa_rid in self._failed:
+                self._pulling.release(room)
+
+    def _reject_oversized_pull(self, room: int, pages: int) -> None:
+        """Fail a request whose pages cannot fit one host staging slot."""
+        reason = (
+            f"Raiden receive failed: request needs {pages} pages but a host "
+            f"staging slot holds {self._engine_max_blocks}. Lower the context "
+            f"length or raise SGLANG_RAIDEN_MAX_BLOCKS."
+        )
+        self.record_failure(room, reason)
+        with self._state_lock:
+            self._failed.add(str(room))
+        logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+
     def maybe_start_pull(self, room: int) -> bool:
         """Issue the raiden pull once the prefill reply has arrived.
 
-        Returns True if the pull was (or had already been) issued.
+        Returns True if the pull was (or had already been) issued. A False
+        return is a retry: the caller polls again on the next scheduler pass.
         """
         with self._state_lock:
             if (
@@ -633,6 +671,13 @@ class RaidenKVManager(CommonKVManager):
         # which would select the whole list).
         remote, local = self._pair_blocks(remote, local)
         engine = self._ensure_engine()
+        pages = len(set(local))
+        if pages > self._engine_max_blocks:
+            self._reject_oversized_pull(room, pages)
+            return False
+        with self._state_lock:
+            if not self._pulling.admit(room):
+                return False
         engine.start_read(str(room), room, endpoint, remote, local)
         if self._swa_engine is not None:
             remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
@@ -981,6 +1026,8 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if d is not None:
                     d.pop(room, None)
+            if self._pulling is not None:
+                self._pulling.release(room)
             if hasattr(self, "_replied"):
                 self._replied.discard(room)
             for s in (
