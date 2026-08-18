@@ -54,6 +54,17 @@ on:
         required: false
         type: string
         default: ""
+      # --- P/D mode: prefill + decode groups, each on its own slice; needs exec_cmd.
+      # Callers should also pass `hosts` = the per-role slice size so the
+      # concurrency group serializes with other runs contending for the slices.
+      pd_prefill_hosts:
+        required: false
+        type: number
+        default: 0
+      pd_decode_hosts:
+        required: false
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -113,6 +124,8 @@ jobs:
             --hosts '${{ inputs.hosts }}' \
             --lane '${{ inputs.lane }}' \
             --pools "${pools}" \
+            --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
+            --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
@@ -162,7 +175,9 @@ jobs:
           #     launch mode: ~30m bring-up + 2 files x `timeout 3600`, gsm8k on R1 needs
           #     the full hour), and this must OUTLAST it so the JobSet -- not this loop --
           #     decides the outcome.
-          if [ -n "${{ inputs.launch_script }}" ]; then
+          if [ '${{ inputs.pd_prefill_hosts }}' != '0' ]; then
+            wait_s=11400         # outlast P/D mode's activeDeadlineSeconds=10800 + margin
+          elif [ -n "${{ inputs.launch_script }}" ]; then
             wait_s=9600          # activeDeadlineSeconds 9000 + streaming/scheduling margin
           elif [ -n "${{ inputs.exec_cmd }}" ]; then
             wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
@@ -203,6 +218,7 @@ jobs:
             fi
             sleep 5
           done
+          kubectl -n tpu-ci get pods -l "$sel" -o wide || true
 
           # Stream logs from every host (best effort; may restart while pods come up).
           kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
@@ -210,11 +226,41 @@ jobs:
 
           # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
+          auth_fails=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
+            # The workload-identity credentials can expire before very long
+            # runs end; a dead kubectl looks identical to "no condition yet"
+            # with errors suppressed, so track it explicitly instead of
+            # polling blind until the budget runs out.
+            if ! kubectl -n tpu-ci get "$name" >/dev/null 2>&1; then
+              auth_fails=$((auth_fails + 1))
+              if [ "$auth_fails" -ge 12 ]; then
+                echo "❌ ${label}: lost cluster access while polling (credentials likely expired); JobSet outcome unknown"
+                exit 1
+              fi
+              sleep 5; continue
+            fi
+            auth_fails=0
             ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
             bad="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
             [ "$ok" = "True" ]  && { echo "✅ ${label} PASSED"; exit 0; }
-            [ "$bad" = "True" ] && { echo "❌ ${label} FAILED"; kubectl -n tpu-ci describe "$name" | tail -n 80; exit 1; }
+            [ "$bad" = "True" ] && {
+              echo "❌ ${label} FAILED"
+              # Scheduling/admission evidence: pod placement, Kueue workload
+              # state, and recent namespace events tell apart "test failed"
+              # from "pods never got hardware".
+              kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+              # Late-arriving pods never join the initial `logs -f` stream, so
+              # re-collect every pod's tail before the JobSet is deleted.
+              kubectl -n tpu-ci logs -l "$sel" --all-containers --prefix --tail=150 2>/dev/null || true
+              kubectl -n tpu-ci get workloads -o wide 2>/dev/null || true
+              kubectl -n tpu-ci get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+              kubectl -n tpu-ci describe "$name" | tail -n 200
+              exit 1
+            }
             sleep 5
           done
-          echo "❌ ${label} TIMED OUT after ${wait_s}s"; exit 1
+          echo "❌ ${label} TIMED OUT after ${wait_s}s"
+          kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+          kubectl -n tpu-ci describe "$name" | tail -n 120 || true
+          exit 1
