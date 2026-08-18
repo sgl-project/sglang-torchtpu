@@ -175,8 +175,11 @@ class TestTpuFp8MoE(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(moe_ep_size=1, moe_ep_rank=0),
             ),
+            # Patched on the source module: ``apply_tpu_fp8_moe`` imports the
+            # kernel inside its body, so there is no module-level name on
+            # ``tpu_fp8_moe`` to patch.
             patch.object(
-                tpu_fp8_moe,
+                fused_moe_op_module,
                 "fused_moe_call",
                 side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
             ) as fused_moe,
@@ -238,8 +241,11 @@ class TestTpuFp8MoE(CustomTestCase):
                 "get_parallel",
                 return_value=SimpleNamespace(moe_ep_size=4, moe_ep_rank=2),
             ),
+            # Patched on the source module: ``apply_tpu_fp8_moe`` imports the
+            # kernel inside its body, so there is no module-level name on
+            # ``tpu_fp8_moe`` to patch.
             patch.object(
-                tpu_fp8_moe,
+                fused_moe_op_module,
                 "fused_moe_call",
                 side_effect=lambda **kw: torch.zeros_like(kw["hidden_states"]),
             ) as fused_moe,
