@@ -6,6 +6,11 @@
 #              (lane, hosts) can own several interchangeable slices; Kueue picks one via its
 #              ResourceFlavor, and the pod's nodeAffinity restricts it to this set, which is
 #              what keeps CI off the dev pools when Kueue is not managing the JobSet.
+#              A FLOOR, not the whole truth: discover_pools.py unions this with every pool
+#              labelled ci-tpu-lane=<lane> of the same slice shape, so a new slice needs no
+#              edit here. Label a new pool with BOTH ci-tpu-pool (unique) and ci-tpu-lane.
+#              Listing a pool that no longer exists is harmless; omitting a live one that
+#              lacks ci-tpu-lane is not, which is why this stays a floor rather than a cache.
 #   queue    : Kueue LocalQueue in tpu-ci (kueue-tpu.yaml). One per (lane, hosts): a 2-host
 #              job's 8 chips would satisfy a single-host flavor's quota while being
 #              unschedulable, so the shapes must not share a ClusterQueue.

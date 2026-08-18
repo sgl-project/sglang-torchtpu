@@ -97,6 +97,13 @@ jobs:
           JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
+          # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
+          # render time. Unions topology.yaml's list with any pool labelled
+          # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
+          # so adding a slice needs no code change. Fails open to topology.yaml.
+          pools="$(python3 .github/tpu-ci/discover_pools.py \
+                     --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
+          echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
           python3 .github/tpu-ci/render_jobset.py \
             --image '${{ inputs.image }}' \
             --suite '${{ inputs.suite }}' \
@@ -105,6 +112,7 @@ jobs:
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
             --lane '${{ inputs.lane }}' \
+            --pools "${pools}" \
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --name '${{ inputs.run_name }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml

@@ -1,7 +1,8 @@
 # TPU feature-combination e2e -- both layers of test/manual/tpu/feature_combo/,
 # via _tpu-test's exec mode:
-#   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, pr-gate host)
+#   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, nightly host)
 #   multihost-combo-test-{pd,spec}: P/D and spec rows across the 2x2x2 slice
+# Both run in the `nightly` lane (topology.yaml), same pools as nightly-test-tpu.yml.
 # The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
 # trigger:
 #   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] \
@@ -36,7 +37,9 @@ on:
         options: [all, "1", "2", "3"]
 
 concurrency:
-  group: tpu-combo
+  # Keyed on ref so combo runs for different PRs proceed in parallel; the nightly lane has
+  # 3 single-host and 2 two-host slices to absorb them. Same ref still serializes.
+  group: tpu-combo-${{ inputs.ref || github.ref }}
   cancel-in-progress: false   # let a running combo finish; don't stack them
 
 jobs:
@@ -56,6 +59,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       hosts: 1
       exec_cmd: >-
         ${{ inputs.singlehost_model == 'qwen3-coder-480b'
@@ -80,6 +84,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       hosts: 2
       # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
       # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).

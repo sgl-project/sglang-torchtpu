@@ -204,25 +204,40 @@ _TODO._
 ## Cluster infra
 
 CI node pools, all on the `ghostfish-u2zcmybntv70q` reservation. Create a new one with
-`--machine-type=tpu7x-standard-4t --reservation-affinity=specific --node-labels=ci-tpu-pool=…
---workload-metadata=GKE_METADATA`; multi-host also needs `--tpu-topology` plus a
-`workload-policy` resource policy (`--type=HIGH_THROUGHPUT --accelerator-topology=<topo>`).
+`--machine-type=tpu7x-standard-4t --reservation-affinity=specific
+--node-labels=ci-tpu-pool=<unique>,ci-tpu-lane=<lane> --workload-metadata=GKE_METADATA`;
+multi-host also needs `--tpu-topology` plus a `workload-policy` resource policy
+(`--type=HIGH_THROUGHPUT --accelerator-topology=<topo>`).
 Single-host pools take **no** `--tpu-topology` — GKE derives `2x2x1` from the machine type,
 and passing it takes the multi-host path, which is rejected for this machine type.
 
-| pool | `ci-tpu-pool` | topology | nodes | chips |
-|------|---------------|----------|-------|-------|
-| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 2 | 8 |
-| `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | 2x2x2 | 2 | 8 |
-| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 3 | 12 |
-| `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 | 8 |
-| `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | 2x2x4 | 4 | 16 |
+**Both labels matter.** `ci-tpu-pool` must be unique per slice (it is the only selector
+that can pin a gang to one slice — tpu7x exposes no per-slice label). `ci-tpu-lane` is what
+`discover_pools.py` reads to place the pool in a lane without a code change: it unions the
+discovered pools into `topology.yaml`'s list, mints the Kueue `ResourceFlavor`, and attaches
+it to that `(lane, hosts)`'s ClusterQueue. Omit `ci-tpu-lane` and the pool is simply never
+used — no error, so check the `pools for lane=… hosts=…` line in the job log.
+
+| pool | `ci-tpu-pool` | `ci-tpu-lane` | topology | nodes | chips |
+|------|---------------|---------------|----------|-------|-------|
+| `ci-tpu7x-2x2x1` | `pr-gate` | `pr-gate` | 2x2x1 | 2 | 8 |
+| `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | `pr-gate` | 2x2x2 | 2 | 8 |
+| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | `nightly` | 2x2x1 | 3 | 12 |
+| `ci-tpu7x-2x2x2` | `nightly` | `nightly` | 2x2x2 | 2 | 8 |
+| `ci-tpu7x-2x2x2-b` | `nightly-b` | `nightly` | 2x2x2 | 2 | 8 |
+| `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | `nightly` | 2x2x4 | 4 | 16 |
+
+The pools above predate `ci-tpu-lane` and are still carried by `topology.yaml`'s static
+list, so they work whether or not the label is applied; the column records what to set when
+backfilling. Discovery unions rather than replaces precisely so a partial backfill cannot
+shrink the pool set.
 
 Only the `2x2x1` pools are safe to resize — each of their nodes is already a whole slice,
 so quota follows automatically via `reconcile_quota.py` and no manifest edit is needed.
 Resizing a multi-host pool puts two slices behind one `ci-tpu-pool` label and a JobSet's
 pods can straddle them: no error, just an ICI rendezvous hang. `reconcile_quota.py` refuses
-to submit when it sees that, but the fix is to add capacity as a **new pool**.
+to submit when it sees that, but the fix is to add capacity as a **new pool** — which, with
+both labels set, needs no edit to `topology.yaml` or `kueue-tpu.yaml`.
 
 - `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` also exist — not CI, do not repurpose.
 - `system-pool` (e2-standard-2 ×2) hosts the **JobSet operator v0.12.0** and the **Kueue

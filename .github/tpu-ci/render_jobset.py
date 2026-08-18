@@ -138,6 +138,9 @@ def main():
     # Which lane's pools to use. pr-gate and nightly both own 1- and 2-host slices, so a
     # host count alone no longer identifies a pool (see topology.yaml).
     ap.add_argument("--lane", default="pr-gate")
+    # Overrides topology.yaml's `pools` for this (lane, hosts). discover_pools.py supplies
+    # it so a new slice needs no edit there; empty falls back to the static list.
+    ap.add_argument("--pools", default="")
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
@@ -191,6 +194,9 @@ def main():
             f"(lane has {sorted(slices)})"
         )
 
+    # Discovered set when --pools is passed (it already unions in topology.yaml's entry).
+    pools = a.pools.split() or sl["pools"]
+
     # Suite mode runs every registered file sequentially, so its deadline scales
     # with the suite (same est_time formula as _tpu-test's poll budget, keeping the
     # two in agreement). Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
@@ -211,8 +217,8 @@ def main():
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
-        "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(sl["pools"])),
-        "POOL_LIST": " ".join(sl["pools"]),
+        "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(pools)),
+        "POOL_LIST": " ".join(pools),
         "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
