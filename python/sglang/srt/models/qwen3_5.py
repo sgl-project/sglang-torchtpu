@@ -104,9 +104,9 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_server_args,
     get_stream,
 )
-from sglang.srt.server_args import get_global_server_args
 
 # Utils
 from sglang.srt.utils import (
@@ -878,7 +878,7 @@ def _rope_cache_positions(max_position_embeddings: int) -> int:
     """
     if not envs.SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE.get():
         return max_position_embeddings
-    context_length = get_global_server_args().context_length
+    context_length = get_server_args().context_length
     if not context_length:
         return max_position_embeddings
     return min(max_position_embeddings, context_length)
