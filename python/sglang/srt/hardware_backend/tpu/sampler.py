@@ -4,6 +4,7 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -20,6 +21,8 @@ MAX_DISTRIBUTED_TOP_K = 64
 _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
     1, envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE.get()
 )
+# Kill switch for the sort-free top-k/top-p/min-p filtering path.
+_BSEARCH_SAMPLING_ENABLED = os.getenv("SGLANG_TPU_BSEARCH_SAMPLING", "1") == "1"
 
 
 def distributed_top_k_min_batch_size() -> int:
@@ -214,6 +217,25 @@ class TpuSampler(Sampler):
                 index=sampled_top_k_position.to(torch.int64).view(-1, 1),
             ).view(-1)
 
+        if sampling_info.sampling_seed is None and _BSEARCH_SAMPLING_ENABLED:
+            # Sort-free path: the torch fallback below needs a full-vocab sort
+            # plus boolean-mask scatters, which run eagerly on TPU at ~415 ms
+            # per decode step. The binary-search mask is one compiled program;
+            # the remaining multinomial is the cheap tier-2 op.
+            from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+
+            filtered_probs = tpu_filter_probs(
+                probs,
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                sampling_info.need_top_k_sampling,
+                sampling_info.need_top_p_sampling,
+                sampling_info.need_min_p_sampling,
+            )
+            return sampling_from_probs_torch(filtered_probs)
+
+        # Seeded (deterministic) sampling keeps the sort-based reference path.
         return top_k_top_p_min_p_sampling_from_probs_torch(
             probs,
             sampling_info.top_ks,
