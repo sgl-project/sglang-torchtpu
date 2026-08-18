@@ -15,7 +15,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import inspect
 import os
+import sys
 import threading
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -29,6 +31,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     get_raiden_kv_caches,
 )
 from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+from sglang.srt.disaggregation.raiden.serde import MessageTag, unpack_blocks
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -259,6 +262,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._remote_swa_blocks = {room: [4, 5]}
         mgr._remote_endpoint = {room: "127.0.0.1:31020"}
         mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr.chunked_transfer = False
+        mgr._failed = set()
 
         self.assertTrue(mgr.maybe_start_pull(room))
         mgr._engine.start_read.assert_called_once_with(
@@ -271,6 +276,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_a_staging_slot_frees(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = None
@@ -300,6 +306,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _decode_mgr(capacity, full_limit, swa_limit=None):
         mgr = object.__new__(RaidenKVManager)
+        mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock() if swa_limit is not None else None
@@ -491,6 +498,453 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             pool.get_dummy_flat_data_page()
         with self.assertRaises(NotImplementedError):
             pool.set_from_flat_data_page(0, torch.empty(0))
+
+
+class TestRaidenChunkedTransfer(CustomTestCase):
+    """Chunk announcements and pulls on the symmetric pull path."""
+
+    @staticmethod
+    def _prefill():
+        mgr = object.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._push_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._engine.register_read = Mock(return_value=True)
+        mgr._swa_engine = None
+        mgr._local_rank = 3
+        mgr._chunk_seq = {}
+        mgr._uuid_seq = 0
+        mgr._held_chunks = {}
+        mgr._send_total = {}
+        mgr._decode_addr = {}
+        mgr._decode_pages = {}
+        mgr._send_blocks = {}
+        mgr._replied = set()
+        mgr._pending_offer = {}
+        mgr._announce_pages = 16
+        mgr._reshard_req = {}
+        mgr._reshard_finalized = set()
+        mgr.raiden_endpoint = "127.0.0.1:31020"
+        mgr._socket = Mock()
+        mgr._connect = Mock(return_value=mgr._socket)
+        return mgr
+
+    @staticmethod
+    def _pull_req(room, decode_pages):
+        return [
+            MessageTag.PULL_REQ,
+            str(room).encode("ascii"),
+            b"10.0.0.2",
+            b"31002",
+            str(decode_pages).encode("ascii"),
+        ]
+
+    def test_prefill_announces_only_the_pages_the_decode_will_pull(self):
+        room = 31
+        mgr = self._prefill()
+        mgr._on_pull_req(self._pull_req(room, 40))
+        self.assertEqual(mgr._decode_pages[room], 40)
+
+        # 64 prefill pages; the decode already holds the first 24.
+        blocks = list(range(100, 164))
+        mgr.offer_chunk(room, 0, blocks[0:16], 64)
+        mgr._engine.register_read.assert_not_called()
+        mgr._socket.send_multipart.assert_not_called()
+
+        mgr.offer_chunk(room, 16, blocks[16:32], 64)
+        mgr._engine.register_read.assert_called_once()
+        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[24:32])
+        msg = mgr._socket.send_multipart.call_args.args[0]
+        self.assertEqual(msg[0], MessageTag.CHUNK)
+        self.assertEqual(int(msg[4]), 24)
+        self.assertEqual(int(msg[5]), 64)
+        self.assertEqual(unpack_blocks(msg[6]), blocks[24:32])
+
+        mgr.offer_chunk(room, 32, blocks[32:48], 64)
+        self.assertEqual(mgr._engine.register_read.call_count, 2)
+        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[32:48])
+
+    def test_small_chunks_gather_into_one_announcement(self):
+        room = 34
+        mgr = self._prefill()
+        mgr._on_pull_req(self._pull_req(room, 64))
+        blocks = list(range(100, 164))
+        mgr.offer_chunk(room, 0, blocks[0:8], 64)
+        mgr._engine.register_read.assert_not_called()
+        mgr.offer_chunk(room, 8, blocks[8:16], 64)
+        mgr._engine.register_read.assert_called_once()
+        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[0:16])
+        self.assertEqual(int(mgr._socket.send_multipart.call_args.args[0][4]), 0)
+        self.assertNotIn(room, mgr._pending_offer)
+
+    def test_chunks_offered_before_the_pull_request_are_held_then_filtered(self):
+        room = 32
+        mgr = self._prefill()
+        blocks = list(range(100, 164))
+        mgr.offer_chunk(room, 0, blocks[0:16], 64)
+        mgr.offer_chunk(room, 16, blocks[16:32], 64)
+        mgr._engine.register_read.assert_not_called()
+
+        mgr._on_pull_req(self._pull_req(room, 40))
+        self.assertEqual(mgr._engine.register_read.call_count, 1)
+        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[24:32])
+        self.assertNotIn(room, mgr._held_chunks)
+
+    @staticmethod
+    def _decode(room, local, capacity):
+        mgr = object.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._engine.start_read = Mock(return_value=0)
+        mgr._swa_engine = None
+        mgr.chunked_transfer = True
+        mgr._pulling = SlotAdmission(capacity)
+        mgr._engine_max_blocks = 64
+        mgr._local_blocks = {room: local}
+        mgr._remote_total = {room: 64}
+        mgr._chunk_queue = {}
+        mgr._chunk_reads = {}
+        mgr._announced_pages = {}
+        mgr._final_seen = set()
+        mgr._completed_recv = set()
+        mgr._failed = set()
+        return mgr
+
+    def test_closing_read_carries_the_sliding_window_pages(self):
+        room = 35
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(room, local, capacity=4)
+        mgr._swa_engine = Mock()
+        mgr._remote_swa_blocks = {room: [4, 5]}
+        mgr._local_swa_blocks = {room: [7]}
+        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._final_seen.add(room)
+        mgr._chunk_queue[room] = [(str(room), room, 48, remote[48:64], endpoint)]
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_called_once_with(
+            "35", room, endpoint, remote[48:64], local[48:64]
+        )
+        mgr._swa_engine.start_read.assert_called_once_with(
+            "swa:35", room, "127.0.0.1:31022", [5], [7]
+        )
+        mgr._completed_recv.add("35")
+        self.assertFalse(mgr.is_recv_done(room))
+        mgr._completed_recv.add("swa:35")
+        self.assertTrue(mgr.is_recv_done(room))
+
+    def test_decode_keeps_one_chunk_read_in_flight_per_request(self):
+        room = 33
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(room, local, capacity=4)
+        mgr._chunk_queue[room] = [
+            ("33#0", 11, 0, remote[0:16], endpoint),
+            ("33#1", 12, 16, remote[16:32], endpoint),
+        ]
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        mgr._engine.start_read.assert_called_once_with(
+            "33#0", 11, endpoint, remote[0:16], local[0:16]
+        )
+        # The second chunk waits for the first read even though slots are free.
+        self.assertTrue(mgr.maybe_start_pull(room))
+        self.assertEqual(mgr._engine.start_read.call_count, 1)
+        self.assertEqual(len(mgr._pulling), 1)
+        self.assertFalse(mgr.is_recv_done(room))
+
+        with mgr._state_lock:
+            mgr._completed_recv.add("33#0")
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(room))
+        self.assertEqual(mgr._engine.start_read.call_count, 2)
+        self.assertEqual(mgr._engine.start_read.call_args.args[0], "33#1")
+        self.assertEqual(mgr._engine.start_read.call_args.args[4], local[16:32])
+        self.assertEqual(len(mgr._pulling), 1)
+
+
+class _InlineExecutor:
+    """Runs submitted pushes on the calling thread."""
+
+    def submit(self, fn, *args):
+        fn(*args)
+
+
+class _ReadyFuture:
+    def is_ready(self):
+        return True
+
+    def ok(self):
+        return True
+
+
+class _EntryList(list):
+    def add(self):
+        self.append(types.SimpleNamespace())
+        return self[-1]
+
+
+class _ScheduleMap(dict):
+    def __missing__(self, key):
+        self[key] = types.SimpleNamespace(entries=_EntryList())
+        return self[key]
+
+
+class _Pb2:
+    """Stands in for raiden's protobuf module so the real plan builders run."""
+
+    MEMORY_TYPE_DRAM = 1
+    MEMORY_TYPE_HBM = 2
+
+    @staticmethod
+    def StartTransferRequest():
+        return types.SimpleNamespace(shard_push_schedules=_ScheduleMap())
+
+
+def _pb2_modules():
+    rpc = types.ModuleType("tpu_sync.rpc")
+    rpc.raiden_service_pb2 = _Pb2
+    pkg = types.ModuleType("tpu_sync")
+    pkg.rpc = rpc
+    return {
+        "tpu_sync": pkg,
+        "tpu_sync.rpc": rpc,
+        "tpu_sync.rpc.raiden_service_pb2": _Pb2,
+    }
+
+
+def _plan_blocks(req, prefill_rank):
+    """(src, dst) block ids of one source's schedule in a built plan."""
+    entries = req.shard_push_schedules[prefill_rank].entries
+    return [e.src_block_id for e in entries], [e.dst_block_id for e in entries]
+
+
+class TestRaidenChunkedResharding(CustomTestCase):
+    """Chunk announcements and pushes on the resharding path."""
+
+    ROOM = 41
+    PREFILL_BLOCKS = list(range(100, 164))  # 64 pages, 4 chunks of 16
+    DECODE_BLOCKS = list(range(200, 240))  # decode holds the last 40
+
+    @staticmethod
+    def _geometry(src_tp, dst_tp):
+        from sglang.srt.disaggregation.raiden.reshard_schedule import ReshardGeometry
+
+        return ReshardGeometry(src_tp, dst_tp, 1024, 8)
+
+    def _prefill(self):
+        mgr = object.__new__(RaidenKVManager)
+        mgr.chunked_transfer = True
+        mgr._state_lock = threading.Lock()
+        mgr._push_lock = threading.Lock()
+        mgr._reshard_push_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._engine.d2h = Mock(return_value=_ReadyFuture())
+        mgr._swa_engine = None
+        mgr._kv_caches = [object(), object()]
+        mgr.kv_args = Mock(page_size=128)
+        mgr.attn_tp_rank = 1
+        mgr.attn_tp_size = 8
+        mgr._timeout_s = 5
+        mgr._push_executor = _InlineExecutor()
+        mgr._make_geometry = self._geometry
+        mgr._send_blocks = {}
+        mgr._send_swa_blocks = {}
+        mgr._send_aux = {}
+        mgr._send_total = {}
+        mgr._held_chunks = {}
+        mgr._decode_addr = {}
+        mgr._decode_pages = {}
+        mgr._chunk_seq = {}
+        mgr._uuid_seq = 0
+        mgr._reshard_req = {}
+        mgr._reshard_finalized = set()
+        mgr._reshard_replied = set()
+        mgr._reshard_ready = set()
+        mgr._reshard_pushed = set()
+        mgr._reshard_chunks = {}
+        mgr._reshard_announced = {}
+        mgr._pending_offer = {}
+        mgr._announce_pages = 16
+        mgr._reshard_pushes_pending = {}
+        mgr._reshard_final_pushed = set()
+        mgr._completed_send = set()
+        mgr._failed = set()
+        mgr._socket = Mock()
+        mgr._connect = Mock(return_value=mgr._socket)
+        return mgr
+
+    def _reshard_req(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        return [
+            MessageTag.RESHARD_REQ,
+            str(self.ROOM).encode("ascii"),
+            b"10.0.0.2",
+            b"31002",
+            b"10.0.0.2:31000",
+            pack_ints(self.DECODE_BLOCKS),
+            b"4",
+        ]
+
+    def _sent(self, mgr, tag):
+        return [
+            c.args[0]
+            for c in mgr._socket.send_multipart.call_args_list
+            if c.args[0][0] == tag
+        ]
+
+    def test_prefill_announces_chunks_and_pushes_them_on_request(self):
+        from sglang.srt.disaggregation.raiden.serde import unpack_ints
+
+        room, blocks = self.ROOM, self.PREFILL_BLOCKS
+        mgr = self._prefill()
+        # Two chunks commit before the decode has asked for the room.
+        for start in (0, 16):
+            mgr.append_send_blocks(room, blocks[start : start + 16])
+            mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
+        self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK), [])
+
+        mgr._on_reshard_req(self._reshard_req())
+        # The decode holds the first 24 pages: chunk 0 is never announced and
+        # chunk 1 is trimmed to pages 24..32.
+        chunks = self._sent(mgr, MessageTag.RESHARD_CHUNK)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(int(chunks[0][2]), 0)  # first announced chunk index
+        self.assertEqual(int(chunks[0][3]), 24)
+        self.assertEqual(unpack_ints(chunks[0][5]), blocks[24:32])
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk_ready(
+                [MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"777"]
+            )
+            self.assertEqual(mgr._failed, set())
+            mgr._engine.d2h.assert_called_once_with(
+                blocks[24:32], blocks[24:32], [1] * 8
+            )
+            uuid, req = mgr._engine.register_active_plan.call_args.args
+            self.assertEqual((uuid, req.uuid, req.req_id), (777, 777, "41#0"))
+            self.assertEqual(
+                _plan_blocks(req, 0), (blocks[24:32], self.DECODE_BLOCKS[0:8])
+            )
+            self.assertEqual(mgr._engine.push_registered_plan.call_count, 2)
+            mgr._engine.unregister_active_plan.assert_called_once_with(777)
+            self.assertFalse(mgr.is_send_done(room))
+
+            # The prefill finishes; the closing push moves only the rest.
+            mgr.append_send_blocks(room, blocks[32:64])
+            mgr.finalize_send(room, None)
+            self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_BLOCKS)), 1)
+            mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41"])
+            self.assertEqual(mgr._failed, set())
+            uuid, req = mgr._engine.register_active_plan.call_args.args
+            self.assertEqual((uuid, req.req_id), (room, "41"))
+            self.assertEqual(
+                _plan_blocks(req, 0), (blocks[32:64], self.DECODE_BLOCKS[8:40])
+            )
+        self.assertTrue(mgr.is_send_done(room))
+
+    def _decode(self):
+        mgr = object.__new__(RaidenKVManager)
+        mgr.chunked_transfer = True
+        mgr._state_lock = threading.Lock()
+        mgr._push_lock = threading.Lock()
+        mgr._engine = Mock(transfer_address="10.0.0.2:31000")
+        mgr._swa_engine = None
+        mgr.kv_args = Mock(page_size=128)
+        mgr.attn_tp_rank = 0
+        mgr.attn_tp_size = 4
+        mgr._local_rank = 0
+        mgr._uuid_seq = 0
+        mgr._make_geometry = self._geometry
+        mgr._reshard_meta = {
+            self.ROOM: dict(
+                local_blocks=list(self.DECODE_BLOCKS),
+                source_ranks=[0, 1],
+                src_attn_tp=8,
+                aux_index=None,
+                ready_endpoints=["tcp://10.0.0.10:1", "tcp://10.0.0.11:1"],
+            )
+        }
+        mgr._reshard_sources = {self.ROOM: {}}
+        mgr._reshard_registered = set()
+        mgr._reshard_chunk_sources = {}
+        mgr._reshard_chunk_uuids = {}
+        mgr._chunk_reads = {}
+        mgr._chunk_queue = {}
+        mgr._final_seen = set()
+        mgr._announced_pages = {}
+        mgr._remote_total = {}
+        mgr._completed_recv = set()
+        mgr._failed = set()
+        mgr._socket = Mock()
+        mgr._connect = Mock(return_value=mgr._socket)
+        return mgr
+
+    def test_decode_registers_a_plan_per_chunk_once_every_source_announced(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode()
+
+        def chunk(rank):
+            return [
+                MessageTag.RESHARD_CHUNK,
+                b"41",
+                b"0",
+                b"24",
+                b"64",
+                pack_ints(src[rank][24:32]),
+                str(rank).encode("ascii"),
+            ]
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(chunk(0))
+            mgr._engine.register_active_plan.assert_not_called()
+            mgr._on_reshard_chunk(chunk(1))
+            self.assertEqual(mgr._failed, set())
+            uuid, req = mgr._engine.register_active_plan.call_args.args
+            self.assertEqual((req.uuid, req.req_id), (uuid, "41#0"))
+            self.assertEqual(
+                _plan_blocks(req, 0), (src[0][24:32], self.DECODE_BLOCKS[0:8])
+            )
+            self.assertEqual(
+                _plan_blocks(req, 1), (src[1][24:32], self.DECODE_BLOCKS[0:8])
+            )
+            ready = self._sent(mgr, MessageTag.RESHARD_CHUNK_READY)
+            self.assertEqual(len(ready), 2)
+            self.assertEqual([int(ready[0][2]), int(ready[0][3])], [0, uuid])
+            self.assertFalse(mgr.is_recv_done(room))
+
+            # Both sources finish: the closing plan covers only the tail.
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    [
+                        MessageTag.RESHARD_BLOCKS,
+                        b"41",
+                        pack_ints(src[rank]),
+                        str(rank).encode("ascii"),
+                        b"",
+                    ]
+                )
+            uuid, req = mgr._engine.register_active_plan.call_args.args
+            self.assertEqual((uuid, req.req_id), (room, "41"))
+            self.assertEqual(
+                _plan_blocks(req, 0), (src[0][32:64], self.DECODE_BLOCKS[8:40])
+            )
+            self.assertEqual(
+                _plan_blocks(req, 1), (src[1][32:64], self.DECODE_BLOCKS[8:40])
+            )
+            self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_READY)), 2)
+
+        self.assertEqual(mgr._chunk_reads[room], ["41#0", "41"])
+        self.assertFalse(mgr.is_recv_done(room))
+        mgr._completed_recv.update({"41#0", "41"})
+        self.assertTrue(mgr.is_recv_done(room))
 
 
 class _FakeFuture:

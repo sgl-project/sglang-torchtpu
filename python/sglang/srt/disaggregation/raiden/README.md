@@ -19,6 +19,14 @@ decode runs on `done_recving`. Cross-rank gating is the framework's existing
 `poll_and_all_reduce` (min over ranks); no worker-side barrier. Page ids come
 from `kv_to_page_indices` in token order and are raiden block ids directly.
 
+KV moves chunk by chunk: as each chunked-prefill step commits its pages the
+prefill announces them, and the decode pulls each piece as soon as a staging
+slot is free, so only the last chunk's transfer is left after the prefill. The
+closing message carries the aux blob and the remaining pages. A request keeps
+one chunk in flight at a time, and pages the decode already holds from its own
+prefix cache are never announced. A hybrid model's sliding-window pages ride on
+the closing read, since the window is only settled when the prefill ends.
+
 ## Asymmetric attention TP (strided push-resharding)
 
 When decode TP < prefill TP (e.g. 8TP (P) -> 4TP2DP (D)), a decode rank

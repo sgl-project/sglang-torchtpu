@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
 from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
@@ -55,6 +56,12 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# Pages are announced to the decode in pieces of at least this many tokens. A
+# raiden read costs about the same whether it moves 16 pages or 200, so
+# announcing every prefill step would spend more on rendezvous than it hides;
+# pieces of this size keep the overlap while costing a few reads per request.
+CHUNK_ANNOUNCE_TOKENS = 8192
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,10 @@ class RaidenKVManager(CommonKVManager):
         # asymmetric topology then raises) and keep the multi-slot host staging
         # pool instead of the device-shadow sizing the reshard receiver needs.
         self._reshard_enabled = bool(int(os.environ.get("SGLANG_RAIDEN_RESHARD", "1")))
+        # Whether KV moves chunk by chunk as the prefill commits it, or in one
+        # transfer after the whole prefill; decided from the KV layout when the
+        # pool tensors are handed over.
+        self.chunked_transfer = False
 
         # Completion sets, drained from raiden and keyed by str(room). Persist
         # until clear() so repeated poll() calls before the framework advances
@@ -168,6 +179,29 @@ class RaidenKVManager(CommonKVManager):
             self._send_aux: Dict[int, bytes] = {}
             self._decode_addr: Dict[int, Tuple[str, int]] = {}
             self._replied: Set[int] = set()
+            # Chunks announced before the decode asked for the room, held until
+            # a PULL_REQ names it (a resharded room never gets one).
+            self._held_chunks: Dict[int, List[Tuple[int, List[int]]]] = {}
+            self._send_total: Dict[int, int] = {}
+            # Pages the decode allocated for the room, so a chunk it already
+            # holds is never registered or announced.
+            self._decode_pages: Dict[int, int] = {}
+            # Chunks announced to a resharding decode, by chunk index, until it
+            # asks for their push; how far its announcements reach; and the
+            # pushes still running, so the room counts as sent only after the
+            # last one.
+            self._reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = {}
+            self._reshard_announced: Dict[int, int] = {}
+            self._reshard_pushes_pending: Dict[int, int] = {}
+            self._reshard_final_pushed: Set[int] = set()
+            # Committed pages not yet announced, gathered until they make a
+            # piece worth a read.
+            self._pending_offer: Dict[int, Tuple[int, List[int]]] = {}
+            self._announce_pages = max(
+                1, -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
+            )
+            self._chunk_seq: Dict[int, int] = {}
+            self._uuid_seq = 0
         else:
             # room -> local page block-ids, remote page block-ids, endpoint
             self._local_blocks: Dict[int, List[int]] = {}
@@ -177,6 +211,21 @@ class RaidenKVManager(CommonKVManager):
             self._remote_swa_blocks: Dict[int, List[int]] = {}
             self._remote_endpoint: Dict[int, str] = {}
             self._remote_swa_endpoint: Dict[int, str] = {}
+            # Chunk announcements waiting for a staging slot, and the reads
+            # already issued for a room.
+            self._chunk_queue: Dict[int, List[tuple]] = {}
+            self._remote_total: Dict[int, int] = {}
+            self._announced_pages: Dict[int, int] = {}
+            self._chunk_reads: Dict[int, List[str]] = {}
+            self._final_seen: Set[int] = set()
+            # Chunk announcements from each resharding source, by chunk index,
+            # until every source of the room has announced it; the receive
+            # plans registered per chunk, released with the room.
+            self._reshard_chunk_sources: Dict[
+                int, Dict[int, Dict[int, Tuple[int, List[int]]]]
+            ] = {}
+            self._reshard_chunk_uuids: Dict[int, List[int]] = {}
+            self._uuid_seq = 0
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -264,6 +313,10 @@ class RaidenKVManager(CommonKVManager):
         """
         self._kv_caches = list(kv_caches.full)
         self._swa_kv_caches = list(kv_caches.swa)
+        # Full-attention KV moves piece by piece during the prefill. A hybrid
+        # model's sliding-window pool holds only the last window, which is
+        # settled when the prefill ends, so it rides on the closing read.
+        self.chunked_transfer = True
         if not self._kv_caches:
             raise RuntimeError(
                 "Raiden requires at least one full-attention KV cache tensor"
@@ -300,11 +353,12 @@ class RaidenKVManager(CommonKVManager):
         self._engine_max_blocks = max_blocks
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d",
+            "num_slots=%d chunked=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
             max_blocks,
             num_slots,
+            int(self.chunked_transfer),
         )
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
@@ -377,6 +431,21 @@ class RaidenKVManager(CommonKVManager):
     def _swa_req_id(room: int) -> str:
         return f"swa:{room}"
 
+    @staticmethod
+    def _tail_after(blocks: List[int], announced: int) -> Tuple[int, List[int]]:
+        """Pages the closing message of a chunked transfer still has to move.
+
+        The last chunk's pages carry no announcement of their own; they travel
+        with the closing message under the room's own id. That transfer is also
+        what tells the prefill the request is done, so when the last step added
+        no pages the final page is moved again rather than leaving the sender
+        waiting on an id nobody quotes.
+        """
+        start, tail = announced, blocks[announced:]
+        if not tail and blocks:
+            start, tail = len(blocks) - 1, blocks[-1:]
+        return start, tail
+
     def _drain_engine(self) -> None:
         if self._engine is None and self._swa_engine is None:
             return
@@ -414,12 +483,18 @@ class RaidenKVManager(CommonKVManager):
                     self._on_pull_req(msg)
                 elif msg[0] == MessageTag.BLOCKS:
                     self._on_blocks(msg)
+                elif msg[0] == MessageTag.CHUNK:
+                    self._on_chunk(msg)
                 elif msg[0] == MessageTag.RESHARD_REQ:
                     self._on_reshard_req(msg)
                 elif msg[0] == MessageTag.RESHARD_BLOCKS:
                     self._on_reshard_blocks(msg)
                 elif msg[0] == MessageTag.RESHARD_READY:
                     self._on_reshard_ready(msg)
+                elif msg[0] == MessageTag.RESHARD_CHUNK:
+                    self._on_reshard_chunk(msg)
+                elif msg[0] == MessageTag.RESHARD_CHUNK_READY:
+                    self._on_reshard_chunk_ready(msg)
                 else:
                     logger.warning("RaidenKVManager unknown header: %s", msg[0])
             except Exception as e:
@@ -434,13 +509,35 @@ class RaidenKVManager(CommonKVManager):
             )
 
     def _on_pull_req(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.PULL_REQ, 4)
+        self._require_frames(msg, MessageTag.PULL_REQ, 5)
         room = int(msg[1].decode("ascii"))
         decode_ip = msg[2].decode("ascii")
         decode_port = int(msg[3].decode("ascii"))
+        decode_pages = int(msg[4].decode("ascii"))
         with self._state_lock:
             self._decode_addr[room] = (decode_ip, decode_port)
+            self._decode_pages[room] = decode_pages
+            held = self._held_chunks.pop(room, [])
+            total_pages = self._send_total.get(room, 0)
+        for start, block_ids in held:
+            self._announce_chunk(room, start, block_ids, total_pages)
         self._maybe_reply(room)
+
+    def _on_chunk(self, msg: List[bytes]) -> None:
+        self._require_frames(msg, MessageTag.CHUNK, 8)
+        room = int(msg[1].decode("ascii"))
+        req_id = msg[2].decode("ascii")
+        uuid = int(msg[3].decode("ascii"))
+        start = int(msg[4].decode("ascii"))
+        total_pages = int(msg[5].decode("ascii"))
+        blocks = unpack_blocks(msg[6])
+        endpoint = msg[7].decode("ascii")
+        with self._state_lock:
+            self._remote_total[room] = total_pages
+            self._announced_pages[room] = start + len(blocks)
+            self._chunk_queue.setdefault(room, []).append(
+                (req_id, uuid, start, blocks, endpoint)
+            )
 
     def _on_blocks(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.BLOCKS, 7)
@@ -457,6 +554,25 @@ class RaidenKVManager(CommonKVManager):
             self._remote_swa_blocks[room] = remote_swa_blocks
             self._remote_swa_endpoint[room] = swa_endpoint
             aux_index = self._decode_aux_index.get(room)
+            if self.chunked_transfer:
+                announced = self._announced_pages.get(room, 0)
+                total = len(remote_blocks)
+                if self._remote_total.get(room, total) != total:
+                    logger.warning(
+                        "RaidenKVManager rank%d room %s announced %d pages but "
+                        "sent %d",
+                        self.attn_tp_rank,
+                        room,
+                        self._remote_total[room],
+                        total,
+                    )
+                self._remote_total[room] = total
+                tail_start, tail = self._tail_after(remote_blocks, announced)
+                if tail:
+                    self._chunk_queue.setdefault(room, []).append(
+                        (str(room), room, tail_start, tail, endpoint)
+                    )
+                self._final_seen.add(room)
         if aux_index is not None and aux_blob:
             write_aux_blob(
                 self.kv_args.aux_data_ptrs,
@@ -491,11 +607,91 @@ class RaidenKVManager(CommonKVManager):
         room: int,
         block_ids: List[int],
         swa_block_ids: Optional[List[int]] = None,
-    ) -> None:
+    ) -> int:
+        """Records a chunk's pages and returns its start index in the request."""
         with self._state_lock:
-            self._send_blocks.setdefault(room, []).extend(block_ids)
+            accumulated = self._send_blocks.setdefault(room, [])
+            start = len(accumulated)
+            accumulated.extend(block_ids)
             if swa_block_ids is not None:
                 self._send_swa_blocks[room] = list(swa_block_ids)
+        return start
+
+    def offer_chunk(
+        self, room: int, start: int, block_ids: List[int], total_pages: int
+    ) -> None:
+        """Offers one chunked-prefill step's pages to the decode.
+
+        Pages gather until they make a piece of CHUNK_ANNOUNCE_TOKENS; the
+        closing message carries whatever is left. A piece is held until the
+        decode has named the room, with a pull request or a resharding
+        request, since that is what decides which transport it travels by.
+        """
+        if not block_ids:
+            return
+        with self._state_lock:
+            self._send_total[room] = total_pages
+            p_start, p_blocks = self._pending_offer.get(room, (start, []))
+            p_blocks = p_blocks + list(block_ids)
+            if len(p_blocks) < self._announce_pages:
+                self._pending_offer[room] = (p_start, p_blocks)
+                return
+            self._pending_offer.pop(room, None)
+            start, block_ids = p_start, p_blocks
+            if room in self._decode_addr:
+                resharded = False
+            elif room in self._reshard_req:
+                resharded = True
+            else:
+                self._held_chunks.setdefault(room, []).append((start, list(block_ids)))
+                return
+        if resharded:
+            self._announce_reshard_chunk(room, start, list(block_ids), total_pages)
+        else:
+            self._announce_chunk(room, start, list(block_ids), total_pages)
+
+    def _announce_chunk(
+        self, room: int, start: int, block_ids: List[int], total_pages: int
+    ) -> None:
+        """Registers a chunk for reading and tells the decode where it is.
+
+        Only the pages the decode will pull are registered: a page it already
+        holds from its own prefix cache is cut off the front, so no
+        registration is left behind for a read that never comes. The
+        consumer's read blocks on a matching producer registration, so the
+        req_id and uuid the decode will quote are minted here and travel with
+        the announcement.
+        """
+        with self._state_lock:
+            window = chunk_pull_window(
+                start, len(block_ids), total_pages, self._decode_pages[room]
+            )
+            if not window:
+                return
+            start += window.chunk_offset
+            block_ids = block_ids[
+                window.chunk_offset : window.chunk_offset + window.length
+            ]
+            index = self._chunk_seq.get(room, 0)
+            self._chunk_seq[room] = index + 1
+            self._uuid_seq += 1
+            uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+            addr = self._decode_addr[room]
+        req_id = f"{room}#{index}"
+        self._ensure_engine().register_read(req_id, uuid, block_ids)
+        payload = [
+            MessageTag.CHUNK,
+            str(room).encode("ascii"),
+            req_id.encode("ascii"),
+            str(uuid).encode("ascii"),
+            str(start).encode("ascii"),
+            str(total_pages).encode("ascii"),
+            pack_blocks(block_ids),
+            (self.raiden_endpoint or "").encode("ascii"),
+        ]
+        endpoint = f"tcp://{addr[0]}:{addr[1]}"
+        with self._push_lock:
+            self._connect(endpoint).send_multipart(payload)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> None:
         self._ensure_engine()
@@ -596,6 +792,7 @@ class RaidenKVManager(CommonKVManager):
             str(room).encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
+            str(len(local_blocks)).encode("ascii"),
         ]
         for info in bootstrap_infos:
             endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
@@ -637,17 +834,15 @@ class RaidenKVManager(CommonKVManager):
         """Hand back the slots of transfers that have settled."""
         if self._pulling is None:
             return
-        for room in self._pulling.rooms():
-            if not self._pull_settled_locked(room):
-                continue
-            self._pulling.release(room)
-            if room in self._pulling_cleared:
-                # The framework already dropped this room; nothing will read
-                # its completion, so drop it too.
-                self._pulling_cleared.discard(room)
-                for rid in (str(room), self._swa_req_id(room)):
-                    self._completed_recv.discard(rid)
-                    self._failed.discard(rid)
+        for key in self._pulling.rooms():
+            room = int(key.split("#", 1)[0])
+            swa_rid = self._swa_req_id(room)
+            paired = self._swa_engine is not None and "#" not in key
+            done = key in self._completed_recv and (
+                not paired or swa_rid in self._completed_recv
+            )
+            if done or key in self._failed or swa_rid in self._failed:
+                self._pulling.release(key)
 
     def _reject_oversized_pull(
         self, room: int, pages: int, limit: int, env: str
@@ -664,11 +859,72 @@ class RaidenKVManager(CommonKVManager):
         logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
 
     def maybe_start_pull(self, room: int) -> bool:
-        """Issue the raiden pull once the prefill reply has arrived.
+        """Issue whatever of this room's pull is announced and affordable.
 
-        Returns True if the pull was (or had already been) issued. A False
+        Returns True once at least one read is in flight for the room. A False
         return is a retry: the caller polls again on the next scheduler pass.
         """
+        if self.chunked_transfer:
+            return self._start_chunked_pull(room)
+        return self._start_whole_pull(room)
+
+    def _start_chunked_pull(self, room: int) -> bool:
+        """Issue the next announced chunk once a staging slot can be found.
+
+        A request keeps at most one chunk read in flight, so it occupies one
+        staging slot at a time exactly as a single-shot pull does; the next
+        chunk is issued when the previous read has settled. Chunks are taken
+        in prefill order.
+        """
+        engine = self._ensure_engine()
+        while True:
+            with self._state_lock:
+                queue = self._chunk_queue.get(room)
+                reads = self._chunk_reads.get(room, [])
+                started = bool(reads)
+                if not queue or room not in self._local_blocks:
+                    return started
+                if any(rid in self._pulling for rid in reads):
+                    return started
+                local = self._local_blocks[room]
+                total = self._remote_total.get(room, 0)
+                req_id, uuid, start, blocks, endpoint = queue[0]
+                window = chunk_pull_window(start, len(blocks), total, len(local))
+                if not window:
+                    # Pages the decode already holds, or the page it reserved
+                    # for the first decode token.
+                    queue.pop(0)
+                    continue
+                if window.length > self._engine_max_blocks:
+                    oversized = window.length
+                    break
+                if not self._pulling.admit(req_id):
+                    return started
+                queue.pop(0)
+                remote_slice = blocks[
+                    window.chunk_offset : window.chunk_offset + window.length
+                ]
+                local_slice = local[
+                    window.local_offset : window.local_offset + window.length
+                ]
+                self._chunk_reads.setdefault(room, []).append(req_id)
+                closing = req_id == str(room) and self._swa_engine is not None
+                if closing:
+                    remote_swa, local_swa = self._pair_blocks(
+                        list(self._remote_swa_blocks.get(room, [])),
+                        list(self._local_swa_blocks.get(room, [])),
+                    )
+                    swa_endpoint = self._remote_swa_endpoint.get(room, "")
+            engine.start_read(req_id, uuid, endpoint, remote_slice, local_slice)
+            if closing:
+                self._swa_engine.start_read(
+                    self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
+                )
+        self._reject_oversized_pull(room, oversized)
+        return False
+
+    def _start_whole_pull(self, room: int) -> bool:
+        """Issue one read covering the request, once the prefill has replied."""
         with self._state_lock:
             if (
                 room not in self._remote_blocks
@@ -719,7 +975,16 @@ class RaidenKVManager(CommonKVManager):
                 )
                 return False
         with self._state_lock:
-            if not self._pulling.admit(room):
+            # The receiver polls every scheduler pass; a room whose read is
+            # already in flight must not issue again -- a second start_read
+            # under the same uuid replaces the engine's receive entry and
+            # leaks the staging its predecessor held.
+            # Admission is keyed by the read's request id, the same string the
+            # engine reports completion under, so a settled read releases its
+            # own key; a chunked read's key is its chunk id.
+            if str(room) in self._pulling:
+                return True
+            if not self._pulling.admit(str(room)):
                 return False
         engine.start_read(str(room), room, endpoint, remote, local)
         if self._swa_engine is not None:
@@ -796,7 +1061,67 @@ class RaidenKVManager(CommonKVManager):
                 decode_blocks=decode_blocks,
                 dst_attn_tp=dst_attn_tp,
             )
+            held = self._held_chunks.pop(room, [])
+            total_pages = self._send_total.get(room, 0)
+        for start, block_ids in held:
+            self._announce_reshard_chunk(room, start, block_ids, total_pages)
         self._maybe_reshard_reply(room)
+
+    def _announce_reshard_chunk(
+        self, room: int, start: int, block_ids: List[int], total_pages: int
+    ) -> None:
+        """Tells a resharding decode that one chunk's pages are ready.
+
+        Only the pages the decode will receive are announced. The push itself
+        waits until the decode has registered the chunk and asks for it.
+        """
+        with self._state_lock:
+            req = self._reshard_req[room]
+            window = chunk_pull_window(
+                start, len(block_ids), total_pages, len(req["decode_blocks"])
+            )
+            if not window:
+                return
+            start += window.chunk_offset
+            block_ids = block_ids[
+                window.chunk_offset : window.chunk_offset + window.length
+            ]
+            index = self._chunk_seq.get(room, 0)
+            self._chunk_seq[room] = index + 1
+            self._reshard_chunks.setdefault(room, {})[index] = (start, block_ids)
+            self._reshard_announced[room] = start + len(block_ids)
+            addr = req["reply_addr"]
+        payload = [
+            MessageTag.RESHARD_CHUNK,
+            str(room).encode("ascii"),
+            str(index).encode("ascii"),
+            str(start).encode("ascii"),
+            str(total_pages).encode("ascii"),
+            pack_ints(block_ids),
+            str(self.attn_tp_rank).encode("ascii"),
+        ]
+        endpoint = f"tcp://{addr[0]}:{addr[1]}"
+        with self._push_lock:
+            self._connect(endpoint).send_multipart(payload)
+
+    def _on_reshard_chunk_ready(self, msg: List[bytes]) -> None:
+        self._require_frames(msg, MessageTag.RESHARD_CHUNK_READY, 4)
+        room = int(msg[1].decode("ascii"))
+        index = int(msg[2].decode("ascii"))
+        uuid = int(msg[3].decode("ascii"))
+        with self._state_lock:
+            if index not in self._reshard_chunks.get(room, {}):
+                logger.error(
+                    "RaidenKVManager rank%d room %s asked to push unknown chunk %d",
+                    self.attn_tp_rank,
+                    room,
+                    index,
+                )
+                return
+            self._reshard_pushes_pending[room] = (
+                self._reshard_pushes_pending.get(room, 0) + 1
+            )
+        self._push_executor.submit(self._do_reshard_push, room, index, uuid)
 
     def _maybe_reshard_reply(self, room: int) -> None:
         with self._state_lock:
@@ -820,6 +1145,106 @@ class RaidenKVManager(CommonKVManager):
         ]
         with self._push_lock:
             self._connect(endpoint).send_multipart(payload)
+
+    def _on_reshard_chunk(self, msg: List[bytes]) -> None:
+        self._require_frames(msg, MessageTag.RESHARD_CHUNK, 7)
+        room = int(msg[1].decode("ascii"))
+        index = int(msg[2].decode("ascii"))
+        start = int(msg[3].decode("ascii"))
+        total_pages = int(msg[4].decode("ascii"))
+        blocks = unpack_ints(msg[5])
+        src_rank = int(msg[6].decode("ascii"))
+        with self._state_lock:
+            if room not in self._reshard_meta:
+                return
+            per_source = self._reshard_chunk_sources.setdefault(room, {}).setdefault(
+                index, {}
+            )
+            per_source[src_rank] = (start, blocks)
+            self._remote_total[room] = total_pages
+            self._announced_pages[room] = max(
+                self._announced_pages.get(room, 0), start + len(blocks)
+            )
+            if set(per_source) < set(self._reshard_meta[room]["source_ranks"]):
+                return
+            sources_map = self._reshard_chunk_sources[room].pop(index)
+        self._register_reshard_chunk(room, index, total_pages, sources_map)
+
+    def _register_reshard_chunk(
+        self,
+        room: int,
+        index: int,
+        total_pages: int,
+        sources_map: Dict[int, Tuple[int, List[int]]],
+    ) -> None:
+        """Registers the receive plan for one chunk and asks its sources to push.
+
+        Every source of a decode rank holds the same pages of the request, so
+        they announce the same span; the plan pairs each source's slice of it
+        with the decode pages at the same position.
+        """
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            build_receiver_request,
+        )
+
+        spans = {(start, len(blocks)) for start, blocks in sources_map.values()}
+        if len(spans) != 1:
+            logger.error(
+                "RaidenKVManager rank%d room %s chunk %d announced with "
+                "differing spans %s",
+                self.attn_tp_rank,
+                room,
+                index,
+                sorted(spans),
+            )
+            with self._state_lock:
+                self._failed.add(str(room))
+            return
+        start, length = spans.pop()
+        with self._state_lock:
+            meta = self._reshard_meta[room]
+            local_blocks = list(meta["local_blocks"])
+            src_attn_tp = meta["src_attn_tp"]
+            ready_endpoints = list(meta["ready_endpoints"])
+        window = chunk_pull_window(start, length, total_pages, len(local_blocks))
+        if not window:
+            return
+        lo, hi = window.chunk_offset, window.chunk_offset + window.length
+        sources = [
+            (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
+        ]
+        dst = local_blocks[window.local_offset : window.local_offset + window.length]
+        with self._state_lock:
+            self._uuid_seq += 1
+            uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+        req_id = f"{room}#{index}"
+        engine = self._ensure_engine()
+        req = build_receiver_request(
+            pb2,
+            uuid=uuid,
+            req_id=req_id,
+            peer=engine.transfer_address,
+            decode_rank=self.attn_tp_rank,
+            geom=self._make_geometry(src_attn_tp, self.attn_tp_size),
+            sources=sources,
+            dst_block_ids=dst,
+            live_tokens=[self.kv_args.page_size] * window.length,
+        )
+        engine.register_active_plan(uuid, req, is_sender=False)
+        with self._state_lock:
+            self._chunk_reads.setdefault(room, []).append(req_id)
+            self._reshard_chunk_uuids.setdefault(room, []).append(uuid)
+        payload = [
+            MessageTag.RESHARD_CHUNK_READY,
+            str(room).encode("ascii"),
+            str(index).encode("ascii"),
+            str(uuid).encode("ascii"),
+        ]
+        for endpoint in ready_endpoints:
+            with self._push_lock:
+                self._connect(endpoint).send_multipart(payload)
 
     def _on_reshard_blocks(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 5)
@@ -866,13 +1291,39 @@ class RaidenKVManager(CommonKVManager):
 
         geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
         n = len(local_blocks)
-        # A decode prefix hit leaves decode holding fewer (tail) pages than the
-        # prefill produced; keep the last n of each source's blocks so both sides
-        # pair the same pages.
-        sources = []
-        for p_rank in sorted(sources_map):
-            pb = sources_map[p_rank]
-            sources.append((p_rank, pb[-n:] if len(pb) > n else pb))
+        if self.chunked_transfer:
+            # Only the pages no chunk announcement covered are left to move.
+            with self._state_lock:
+                announced = self._announced_pages.get(room, 0)
+                self._final_seen.add(room)
+            any_blocks = next(iter(sources_map.values()))
+            tail_start, tail = self._tail_after(any_blocks, announced)
+            window = chunk_pull_window(tail_start, len(tail), len(any_blocks), n)
+            if not window:
+                for endpoint in ready_endpoints:
+                    payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
+                    with self._push_lock:
+                        self._connect(endpoint).send_multipart(payload)
+                return
+            lo = tail_start + window.chunk_offset
+            sources = [
+                (p_rank, sources_map[p_rank][lo : lo + window.length])
+                for p_rank in sorted(sources_map)
+            ]
+            local_blocks = local_blocks[
+                window.local_offset : window.local_offset + window.length
+            ]
+            n = window.length
+            with self._state_lock:
+                self._chunk_reads.setdefault(room, []).append(str(room))
+        else:
+            # A decode prefix hit leaves decode holding fewer (tail) pages than
+            # the prefill produced; keep the last n of each source's blocks so
+            # both sides pair the same pages.
+            sources = []
+            for p_rank in sorted(sources_map):
+                pb = sources_map[p_rank]
+                sources.append((p_rank, pb[-n:] if len(pb) > n else pb))
         live = [self.kv_args.page_size] * n
 
         engine = self._ensure_engine()
@@ -927,19 +1378,37 @@ class RaidenKVManager(CommonKVManager):
             ):
                 return
             self._reshard_pushed.add(room)
+            self._reshard_pushes_pending[room] = (
+                self._reshard_pushes_pending.get(room, 0) + 1
+            )
         self._push_executor.submit(self._do_reshard_push, room)
 
-    def _do_reshard_push(self, room: int) -> None:
+    def _do_reshard_push(
+        self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
+    ) -> None:
         # A push failure marks the room failed so the sender poll surfaces it
         # instead of the request hanging until the decode-side timeout.
         try:
-            self._run_reshard_push(room)
+            self._run_reshard_push(room, chunk, uuid)
         except Exception as e:
             logger.error("raiden reshard push failed for room %s: %s", room, e)
             with self._state_lock:
                 self._failed.add(str(room))
+        finally:
+            if self.chunked_transfer:
+                # The room is sent once its closing push and every chunk push
+                # asked for before it have finished.
+                with self._state_lock:
+                    left = self._reshard_pushes_pending.get(room, 1) - 1
+                    self._reshard_pushes_pending[room] = left
+                    if chunk is None:
+                        self._reshard_final_pushed.add(room)
+                    if left == 0 and room in self._reshard_final_pushed:
+                        self._completed_send.add(str(room))
 
-    def _run_reshard_push(self, room: int) -> None:
+    def _run_reshard_push(
+        self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
+    ) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
@@ -948,14 +1417,38 @@ class RaidenKVManager(CommonKVManager):
 
         with self._state_lock:
             req_meta = dict(self._reshard_req[room])
-            prefill_blocks = list(self._send_blocks[room])
+            if chunk is None:
+                prefill_blocks = list(self._send_blocks[room])
+                start = self._reshard_announced.get(room, 0)
+            else:
+                start, prefill_blocks = self._reshard_chunks[room].pop(chunk)
+            total_pages = self._send_total.get(room, len(prefill_blocks))
 
         decode_blocks = req_meta["decode_blocks"]
         dst_attn_tp = req_meta["dst_attn_tp"]
         push_endpoint = req_meta["push_endpoint"]
         n = len(decode_blocks)
-        if len(prefill_blocks) > n:
-            prefill_blocks = prefill_blocks[-n:]
+        req_id = str(room)
+        if self.chunked_transfer:
+            if chunk is None:
+                uuid = room
+                start, prefill_blocks = self._tail_after(prefill_blocks, start)
+            else:
+                req_id = f"{room}#{chunk}"
+            window = chunk_pull_window(start, len(prefill_blocks), total_pages, n)
+            if not window:
+                return
+            prefill_blocks = prefill_blocks[
+                window.chunk_offset : window.chunk_offset + window.length
+            ]
+            decode_blocks = decode_blocks[
+                window.local_offset : window.local_offset + window.length
+            ]
+            n = window.length
+        else:
+            uuid = room
+            if len(prefill_blocks) > n:
+                prefill_blocks = prefill_blocks[-n:]
         geom = self._make_geometry(self.attn_tp_size, dst_attn_tp)
         live = [self.kv_args.page_size] * n
 
@@ -983,8 +1476,8 @@ class RaidenKVManager(CommonKVManager):
 
         req = build_sender_request(
             pb2,
-            uuid=room,
-            req_id=str(room),
+            uuid=uuid,
+            req_id=req_id,
             peer=push_endpoint,
             prefill_rank=self.attn_tp_rank,
             decode_rank=self.attn_tp_rank // geom.ratio,
@@ -1008,16 +1501,19 @@ class RaidenKVManager(CommonKVManager):
         # (concurrent pushes to a decode peer corrupt its shared transport); d2h
         # above is internally locked and can overlap.
         with self._reshard_push_lock:
-            engine.register_active_plan(room, req, is_sender=True)
+            engine.register_active_plan(uuid, req, is_sender=True)
             # The receiver's completion barrier is total_blocks * num_layers, and
             # each push counts its blocks once regardless of how many layers it
             # carries, so push one layer per request to deliver every layer.
             for layer_idx in range(len(self._kv_caches)):
                 engine.push_registered_plan(
-                    room, push_endpoint, prefill_blocks, decode_blocks, layer_idx
+                    uuid, push_endpoint, prefill_blocks, decode_blocks, layer_idx
                 )
-        with self._state_lock:
-            self._completed_send.add(str(room))
+            if chunk is not None:
+                engine.unregister_active_plan(uuid)
+        if not self.chunked_transfer:
+            with self._state_lock:
+                self._completed_send.add(str(room))
 
     @staticmethod
     def _monotonic() -> float:
@@ -1032,6 +1528,15 @@ class RaidenKVManager(CommonKVManager):
         )
 
     def is_recv_done(self, room: int) -> bool:
+        if self.chunked_transfer:
+            with self._state_lock:
+                if room not in self._final_seen or self._chunk_queue.get(room):
+                    return False
+                reads = list(self._chunk_reads.get(room, []))
+            return all(rid in self._completed_recv for rid in reads) and (
+                self._swa_engine is None
+                or self._swa_req_id(room) in self._completed_recv
+            )
         rid = str(room)
         return rid in self._completed_recv and (
             self._swa_engine is None or self._swa_req_id(room) in self._completed_recv
@@ -1059,6 +1564,19 @@ class RaidenKVManager(CommonKVManager):
                 self._failed.discard(rid)
                 self._failed.discard(swa_rid)
             for d in (
+                getattr(self, "_chunk_queue", None),
+                getattr(self, "_remote_total", None),
+                getattr(self, "_announced_pages", None),
+                getattr(self, "_chunk_reads", None),
+                getattr(self, "_held_chunks", None),
+                getattr(self, "_send_total", None),
+                getattr(self, "_decode_pages", None),
+                getattr(self, "_chunk_seq", None),
+                getattr(self, "_reshard_chunks", None),
+                getattr(self, "_pending_offer", None),
+                getattr(self, "_reshard_announced", None),
+                getattr(self, "_reshard_pushes_pending", None),
+                getattr(self, "_reshard_chunk_sources", None),
                 getattr(self, "_send_blocks", None),
                 getattr(self, "_send_swa_blocks", None),
                 getattr(self, "_send_aux", None),
@@ -1076,9 +1594,19 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if d is not None:
                     d.pop(room, None)
+            if self._pulling is not None:
+                prefix = f"{room}#"
+                for key in self._pulling.rooms():
+                    if key == rid or key.startswith(prefix):
+                        self._pulling.release(key)
             if hasattr(self, "_replied"):
                 self._replied.discard(room)
+            chunk_uuids = (getattr(self, "_reshard_chunk_uuids", None) or {}).pop(
+                room, []
+            )
             for s in (
+                getattr(self, "_final_seen", None),
+                getattr(self, "_reshard_final_pushed", None),
                 getattr(self, "_reshard_finalized", None),
                 getattr(self, "_reshard_replied", None),
                 getattr(self, "_reshard_ready", None),
@@ -1087,6 +1615,8 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if s is not None:
                     s.discard(room)
+        for uuid in chunk_uuids:
+            self._engine.unregister_active_plan(uuid)
         self._release_host_slot(room)
 
 
@@ -1142,9 +1672,12 @@ class RaidenKVSender(CommonKVSender):
             if state_indices is not None
             else None
         )
-        self.kv_mgr.append_send_blocks(
-            self.bootstrap_room, [int(x) for x in kv_indices], swa_blocks
-        )
+        blocks = [int(x) for x in kv_indices]
+        start = self.kv_mgr.append_send_blocks(self.bootstrap_room, blocks, swa_blocks)
+        if self.kv_mgr.chunked_transfer and not self._last_chunk:
+            self.kv_mgr.offer_chunk(
+                self.bootstrap_room, start, blocks, self.num_kv_indices
+            )
         if self._last_chunk and not self._started:
             self._started = True
             self.kv_mgr.finalize_send(self.bootstrap_room, self.aux_index)
@@ -1214,7 +1747,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         if self.kv_mgr.is_recv_done(self.bootstrap_room):
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
-        if not self._started and self.kv_mgr.maybe_start_pull(self.bootstrap_room):
+        if self.kv_mgr.maybe_start_pull(self.bootstrap_room) and not self._started:
             self._started = True
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Transferring)
         return self.kv_mgr.check_status(self.bootstrap_room)
