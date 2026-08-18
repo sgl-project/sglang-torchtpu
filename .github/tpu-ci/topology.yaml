@@ -2,15 +2,18 @@
 # a host count; topology, pool and queue are looked up here.
 #
 #   topology : cloud.google.com/gke-tpu-topology node label
-#   pool     : ci-tpu-pool node label -- one pool per multi-host slice
+#   pools    : ci-tpu-pool node labels -- one pool per multi-host slice. A list because a
+#              (lane, hosts) can own several interchangeable slices; Kueue picks one via its
+#              ResourceFlavor, and the pod's nodeAffinity restricts it to this set, which is
+#              what keeps CI off the dev pools when Kueue is not managing the JobSet.
 #   queue    : Kueue LocalQueue in tpu-ci (kueue-tpu.yaml). One per (lane, hosts): a 2-host
 #              job's 8 chips would satisfy a single-host flavor's quota while being
 #              unschedulable, so the shapes must not share a ClusterQueue.
 lanes:
   pr-gate:
-    1: { topology: 2x2x1, pool: pr-gate,    queue: tpu-prgate-1h }   # 4 nodes = 4 slices
-    2: { topology: 2x2x2, pool: pr-gate-2h, queue: tpu-prgate-2h }   # 1 slice = 2 hosts
+    1: { topology: 2x2x1, pools: [pr-gate],             queue: tpu-prgate-1h }   # 2 nodes = 2 slices
+    2: { topology: 2x2x2, pools: [pr-gate-2h],          queue: tpu-prgate-2h }   # 1 slice = 2 hosts
   nightly:
-    1: { topology: 2x2x1, pool: nightly-1h, queue: tpu-nightly-1h }  # 2 nodes = 2 slices
-    2: { topology: 2x2x2, pool: nightly,    queue: tpu-nightly-2h }  # 1 slice = 2 hosts
-    4: { topology: 2x2x4, pool: nightly-4h, queue: tpu-nightly-4h }  # 1 slice = 4 hosts
+    1: { topology: 2x2x1, pools: [nightly-1h],          queue: tpu-nightly-1h }  # 3 nodes = 3 slices
+    2: { topology: 2x2x2, pools: [nightly, nightly-b],  queue: tpu-nightly-2h }  # 2 slices x 2 hosts
+    4: { topology: 2x2x4, pools: [nightly-4h],          queue: tpu-nightly-4h }  # 1 slice = 4 hosts

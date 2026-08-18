@@ -113,8 +113,12 @@ jobs:
           # Quota tracks live capacity, checked here rather than on a timer: it only has to
           # be right at the moment admission is decided. Fails open -- a stale quota is
           # survivable (waitForPodsReady evicts and requeues), a blocked test is not.
-          pool="$(grep -o 'ci-tpu-pool: .*' /tmp/job.yaml | head -1 | awk '{print $2}')"
-          python3 .github/tpu-ci/reconcile_quota.py --pool="$pool"
+          # A (lane, hosts) can own several interchangeable slices, so reconcile each of its
+          # pools: --pool drives the one-slice-per-pool guard, and a resized multi-host pool
+          # must fail the job that would have straddled it.
+          for p in $(grep -o '^# ci-tpu-pools: .*' /tmp/job.yaml | cut -d' ' -f3-); do
+            python3 .github/tpu-ci/reconcile_quota.py --pool="$p"
+          done
 
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"

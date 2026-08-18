@@ -60,6 +60,18 @@ spec:
 apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
+  name: tpu7x-2x2x2-nightly-b
+spec:
+  nodeLabels:
+    ci-tpu-pool: nightly-b
+  tolerations:
+    - key: google.com/tpu
+      operator: Exists
+      effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
   name: tpu7x-2x2x4-nightly
 spec:
   nodeLabels:
@@ -142,6 +154,14 @@ spec:
     - coveredResources: ["google.com/tpu", "cpu", "memory"]
       flavors:
         - name: tpu7x-2x2x2-nightly
+          resources:
+            - name: "google.com/tpu"
+              nominalQuota: 8
+            - name: "cpu"
+              nominalQuota: 8
+            - name: "memory"
+              nominalQuota: 64Gi
+        - name: tpu7x-2x2x2-nightly-b
           resources:
             - name: "google.com/tpu"
               nominalQuota: 8

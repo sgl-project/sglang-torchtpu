@@ -48,6 +48,22 @@ WEIGHTS_VOLUME_TMPL = (
     "                    claimName: {pvc}\n"
     "                    readOnly: true"
 )
+# Pod-level nodeAffinity restricting the pod to this (lane, hosts)'s pools. Indented to sit
+# under the pod spec, same level as nodeSelector. Kueue's ResourceFlavor injects the exact
+# ci-tpu-pool via nodeSelector on admission; this is the outer bound, and it is what keeps a
+# JobSet Kueue is NOT managing off the dev pools (manageJobsWithoutQueueName is false).
+POOL_AFFINITY_TMPL = (
+    "              affinity:\n"
+    "                nodeAffinity:\n"
+    "                  requiredDuringSchedulingIgnoredDuringExecution:\n"
+    "                    nodeSelectorTerms:\n"
+    "                      - matchExpressions:\n"
+    "                          - key: ci-tpu-pool\n"
+    "                            operator: In\n"
+    "                            values: [{pools}]"
+)
+
+
 WEIGHTS_MOUNT_TMPL = (
     "                    - name: weights\n"
     "                      mountPath: /weights\n"
@@ -195,7 +211,8 @@ def main():
         "EXEC_CMD": a.exec_cmd,
         "HOSTS": str(hosts),
         "TOPOLOGY": sl["topology"],
-        "POOL": sl["pool"],
+        "POOL_AFFINITY": POOL_AFFINITY_TMPL.format(pools=", ".join(sl["pools"])),
+        "POOL_LIST": " ".join(sl["pools"]),
         "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
