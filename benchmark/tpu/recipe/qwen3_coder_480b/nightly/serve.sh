@@ -75,7 +75,15 @@ esac
 # sglang divides --chunked-prefill-size by dp_size under DP attention, so
 # pre-multiply to land on CHUNKED_PREFILL_PER_RANK per rank.
 export CHUNKED_PREFILL_SIZE=$((CHUNKED_PREFILL_PER_RANK * DP_SIZE))
-export MAX_PREFILL_TOKENS=$CHUNKED_PREFILL_SIZE
+# ...but --max-prefill-tokens is NOT divided the same way. server_args only
+# divides chunked_prefill_size ("chunked prefill size is adjusted from X to
+# X//dp"); max_prefill_tokens is already documented as per-DP-rank ("largest
+# number of tokens a single forward routes through a MoE layer on one (DP)
+# rank") and is what sizes the extend precompile buckets. Passing the
+# pre-multiplied value therefore built buckets dp_size times too large and the
+# XLA compile OOM'd on HBM (99.26G of temporaries vs 94.74G available) after the
+# weights and KV pool were already resident.
+export MAX_PREFILL_TOKENS=$CHUNKED_PREFILL_PER_RANK
 
 # --max-running-requests is divided the same way -- pool_configurator.py does
 #   num_reqs = max_running_requests // attn_dp_size
