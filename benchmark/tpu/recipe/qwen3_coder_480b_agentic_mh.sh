@@ -18,9 +18,10 @@
 # JobSet template.
 #
 # WEIGHTS PREREQUISITE: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8 must exist on
-# the model-weights-rox PVC. As of writing that disk carries MiMo-V2.5-Pro,
-# Qwen3-30B-A3B-FP8 and gpt-oss-120b only, so this recipe needs a hydration pass
-# before its first green run (same mechanism as the other multi-host models).
+# the model-weights-rox PVC. That disk does not carry it yet (its contents list
+# lives in .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl), so this recipe needs a
+# hydration pass before its first green run -- .github/tpu-ci/hydrate-qwen3-coder-480b.yaml,
+# same mechanism as the other multi-host models.
 set -uo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 

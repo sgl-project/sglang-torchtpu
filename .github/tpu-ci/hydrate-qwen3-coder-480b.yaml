@@ -5,38 +5,46 @@
 # WHY THIS COPIES INSTEAD OF APPENDING: model-weights-rox is already converted to
 # READ_ONLY_MANY and that conversion is ONE-WAY (see pvc-model-weights-rox.yaml.tmpl),
 # so the live disk cannot be written to. This Job builds the NEXT generation of the
-# disk: it mounts the live one read-only, copies the three existing models across,
+# disk: it mounts the live one read-only, copies the existing models across,
 # downloads the new one, and leaves a writable disk ready for the ROX conversion.
 # Same shape as the copy Job that consolidated the former per-model disks.
 #
-#   # 1. run it (~1.09TB disk-to-disk copy + ~480GB HF pull; budget ~2h):
+# The copy list below must be EVERY model on the live disk -- it is the contents
+# list in pvc-model-weights-rox.yaml.tmpl, and anything missing from it is dropped
+# when the PV is repointed in step 2, breaking that model's nightly. Re-read the
+# tmpl before running this; the disk gained DeepSeek-R1-0528 and Kimi-K2.6 after
+# this file was first written.
+#
+#   # 1. run it (~2.3TB disk-to-disk copy + ~480GB HF pull; budget ~4h):
 #   kubectl -n tpu-ci apply -f .github/tpu-ci/hydrate-qwen3-coder-480b.yaml
 #   kubectl -n tpu-ci logs -f job/hydrate-qwen3-coder-480b
 #   kubectl -n tpu-ci wait --for=condition=complete job/hydrate-qwen3-coder-480b \
-#     --timeout=3h
+#     --timeout=6h
 #
 #   # 2. convert the hydrated RWO disk to ROX and repoint the shared claim, exactly
 #   #    as pvc-model-weights-rox.yaml.tmpl documents, but reading the handle from
-#   #    the v2 claim:
+#   #    the v3 claim:
 #   HANDLE=$(kubectl -n tpu-ci get pv \
-#     "$(kubectl -n tpu-ci get pvc model-weights-rwo-v2 -o jsonpath='{.spec.volumeName}')" \
+#     "$(kubectl -n tpu-ci get pvc model-weights-rwo-v3 -o jsonpath='{.spec.volumeName}')" \
 #     -o jsonpath='{.spec.csi.volumeHandle}')
-#   kubectl -n tpu-ci delete pvc model-weights-rwo-v2     # SC is Retain: disk survives
+#   kubectl -n tpu-ci delete pvc model-weights-rwo-v3     # SC is Retain: disk survives
 #   kubectl -n tpu-ci delete pvc model-weights-rox        # drop the old claim
-#   kubectl -n tpu-ci delete pv  model-weights-rox-pv     # and its static PV
+#   kubectl -n tpu-ci delete pv  model-weights-v2-rox-pv  # and its static PV
+#   #    (the tmpl's PV keeps that name -- only its volumeHandle moves generation)
 #   sed "s#__VOLUME_HANDLE__#${HANDLE}#" .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl \
 #     | kubectl apply -f -
 #
 #   # 3. once a nightly is green, delete the OLD disk (find it by label; the new one
 #   #    carries the same label, so match on name from step 2's handle first).
 #
-# Sizing: the live disk holds ~1.09TB (Qwen3-30B-A3B-FP8 60GB + gpt-oss-120b 65GB +
-# MiMo-V2.5-Pro 963GB); +480GB lands at ~1.57TB, so 5Ti still fits with room for the
-# next model. Update the contents list in pvc-model-weights-rox.yaml.tmpl after step 2.
+# Sizing: the live disk holds ~2.3TB (Qwen3-30B-A3B-FP8 60GB + gpt-oss-120b 65GB +
+# MiMo-V2.5-Pro 963GB + DeepSeek-R1-0528 641GB + Kimi-K2.6 554GB); +480GB lands at
+# ~2.8TB, so 5Ti still fits with room for one more model of MiMo's size.
+# Update the contents list in pvc-model-weights-rox.yaml.tmpl after step 2.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: model-weights-rwo-v2
+  name: model-weights-rwo-v3
   namespace: tpu-ci
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -54,11 +62,11 @@ metadata:
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 3600
-  # ~1.09TB disk-to-disk copy plus a ~480GB HF pull. hf_transfer sustains a few
-  # hundred MiB/s in this zone, so this is roughly 1-1.5h; 3h leaves room for a slow
+  # ~2.3TB disk-to-disk copy plus a ~480GB HF pull. hf_transfer sustains a few
+  # hundred MiB/s in this zone, so this is roughly 2.5-3.5h; 6h leaves room for a slow
   # mirror without letting a stalled download pin the node forever. (The 30B Job used
   # 3600s for ~30GB and no copy.)
-  activeDeadlineSeconds: 10800
+  activeDeadlineSeconds: 21600
   template:
     spec:
       restartPolicy: Never
@@ -78,7 +86,7 @@ spec:
             readOnly: true
         - name: dst
           persistentVolumeClaim:
-            claimName: model-weights-rwo-v2
+            claimName: model-weights-rwo-v3
       containers:
         - name: hydrate
           image: python:3.12-slim
@@ -96,14 +104,31 @@ spec:
               echo "== source disk =="; ls /src; df -h /src
               echo "== target disk =="; df -h /weights
 
-              # Carry the existing models over. Skipping this would silently drop the
-              # other three multi-host tests when the PV is repointed in step 2.
+              # Carry the existing models over -- this list is the contents list in
+              # pvc-model-weights-rox.yaml.tmpl and must stay equal to it. Skipping
+              # one silently drops that model's multi-host nightly when the PV is
+              # repointed in step 2.
               # NOTE: bare `wait` returns 0 even when a child failed, so each copy is
               # waited on by pid. Without that, a failed cp would leave a model
-              # missing, the Job would report success, and the three other multi-host
+              # missing, the Job would report success, and the other multi-host
               # nightlies would break only after the ROX repoint.
+              CARRY="Qwen3-30B-A3B-FP8 gpt-oss-120b MiMo-V2.5-Pro DeepSeek-R1-0528 Kimi-K2.6"
+              # Fail before copying a single byte if the live disk holds a model this
+              # list does not name: that is exactly how DeepSeek-R1-0528 and Kimi-K2.6
+              # came to be missing here, and a multi-hour copy followed by a one-way
+              # ROX conversion is a slow and unrecoverable way to find out.
+              for d in /src/*/; do
+                [ -d "$d" ] || continue
+                m="$(basename "$d")"
+                # lost+found is ext4's, not a model.
+                [ "$m" = "lost+found" ] && continue
+                case " $CARRY " in *" $m "*) ;; *)
+                  echo "FAIL: /src/$m is on the live disk but not in CARRY -- add it"
+                  exit 1 ;;
+                esac
+              done
               pids=""
-              for m in Qwen3-30B-A3B-FP8 gpt-oss-120b MiMo-V2.5-Pro; do
+              for m in $CARRY; do
                 [ -d "/src/$m" ] || { echo "FAIL: /src/$m missing"; exit 1; }
                 if [ -d "/weights/$m" ]; then
                   echo "== $m already present, skipping copy =="
@@ -119,7 +144,7 @@ spec:
               # Byte-for-byte size check per model: cp can exit 0 on a short write
               # to a full disk in some kernels, and a truncated shard is far worse
               # than a missing one (the loader fails deep in weight loading).
-              for m in Qwen3-30B-A3B-FP8 gpt-oss-120b MiMo-V2.5-Pro; do
+              for m in $CARRY; do
                 a=$(du -sb "/src/$m" | cut -f1); b=$(du -sb "/weights/$m" | cut -f1)
                 [ "$a" = "$b" ] || { echo "FAIL: $m size $b != source $a"; exit 1; }
                 echo "== verified $m ($b bytes) =="

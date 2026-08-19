@@ -63,8 +63,8 @@ REPO_ROOT=$(cd -- "$TPU_BENCH_DIR/../.." && pwd)
 #           overnight run on a slice you own.
 #   ci      what the GKE nightly runs. Same shape as `nightly`, but the sweep and
 #           the context targets are cut to fit the JobSet's budget: the TPU CI
-#           template gives a live-server test file `timeout 1800` and the whole
-#           JobSet activeDeadlineSeconds 5400, most of which the 480B weight load
+#           template gives a live-server test file `timeout 3600` and the whole
+#           JobSet activeDeadlineSeconds 9000, most of which the 480B weight load
 #           + tp=16 compile consumes. See MAX_LEG_SECONDS below.
 #   smoke   plumbing check: 2 concurrency legs, small targets. Minutes.
 #
@@ -224,11 +224,13 @@ case "$PROFILE" in
         LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS_OVERRIDE:-16384}
         ;;
     ci)
-        # Budget: the JobSet gives rank-0's test file `timeout 1800`, so the whole
-        # sweep must land inside ~25 min with margin. Two legs at the extremes of
-        # the contract (lowest and highest concurrency, with and without a
-        # long-context session) is what fits; the numbers are for regression
-        # tracking, not a full pareto curve. Raise SWEEP_* on a slice you own.
+        # Budget: the JobSet gives rank-0's test file `timeout 3600`, of which the
+        # health recheck can take the first 600, so the whole sweep must land
+        # inside ~45 min with margin. The four legs at the extremes of the
+        # contract (lowest and highest concurrency, with and without a
+        # long-context session) fit inside that at MAX_LEG_SECONDS below; the
+        # numbers are for regression tracking, not a full pareto curve. Raise
+        # SWEEP_* on a slice you own.
         LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS_OVERRIDE:-16384}
         SWEEP_BS=${SWEEP_BS_OVERRIDE:-"1 16"}
         SWEEP_LONG=${SWEEP_LONG_OVERRIDE:-"0 1"}

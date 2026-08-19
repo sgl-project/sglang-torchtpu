@@ -49,9 +49,14 @@ RECIPE_DIR = os.path.join(
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
-# Leave headroom under the JobSet's `timeout 1800` per file so the summary still
-# gets written and printed when the sweep itself runs long.
-SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", "1500"))
+# Leave headroom under the JobSet's `timeout 3600` per file so the summary still
+# gets written and printed when the sweep itself runs long. HEALTH_TIMEOUT is
+# spent before this and comes out of the same 3600, hence 600 + 2700 + 300 spare.
+# It must also clear the `ci` profile's own worst case -- 4 legs x
+# MAX_LEG_SECONDS=420 = 1680s -- or the sweep is killed mid-run and the whole
+# file fails on a budget, not on a result. (1500 did not: that was sized when
+# the template gave a file 1800s and the sweep was described as two legs.)
+SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", "2700"))
 PROFILE = os.environ.get("PROFILE", "ci")
 # Fraction of the ACHIEVABLE prefix-cache hit rate a leg must reach. The
 # achievable rate is set by the workload shape, not by the server: round 1 of a
