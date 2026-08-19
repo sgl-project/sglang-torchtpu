@@ -1,9 +1,9 @@
 """TPU KV-cache page transfer primitives for P/D disaggregation.
 
-This module is the *device-specific data plane* for the ``tpu`` transfer
+This module is the *device-specific data plane* for the tpu transfer
 backend. The control plane (bootstrap handshake, ZMQ coordination, the
-``KVPoll`` state machine) is inherited from ``disaggregation/common`` and
-lives in ``conn.py``; everything here is pure tensor / host-buffer movement
+KVPoll state machine) is inherited from disaggregation/common and
+lives in conn.py; everything here is pure tensor / host-buffer movement
 so it can be unit-tested on plain CPU tensors without a TPU attached.
 
 Why a separate data plane at all? GPU backends (mooncake, nixl, mori) RDMA
@@ -15,14 +15,25 @@ host memory (D2H), ship the bytes over the host network (ZMQ, in conn.py),
 and copy them back onto the decode device (H2D) into pages the *decode*
 process allocated itself.
 
-The KV pool used by the default Pallas RPA v3 attention backend
-(``TpuFusedMHATokenToKVPool``) stores one fused 5D buffer per layer with
-shape ``[num_blocks, page_size, num_kv_heads_x2 // kv_packing, kv_packing,
-head_dim]``. The disaggregation scheduler hands us *block ids* (the output
-of ``kv_to_page_indices`` == ``loc // page_size``), which index dim 0
-directly — so a transfer is an ``index_select`` (gather) on the prefill
-side and an ``index_copy_`` (scatter) on the decode side, with the bytes in
-between treated as an opaque dtype-tagged blob.
+TPU 5D Fused KV Cache Memory Layout and Resharding:
+- Logical Shape: [num_blocks, page_size, num_lanes, kv_packing, head_dim]
+  where num_lanes = num_kv_heads_x2 // kv_packing and kv_packing is 4 for FP8
+  (2 for BF16/FP16).
+- TPU Hardware Physical Layout (Minor-to-Major):
+  In TPU XLA/PJRT compilation, 8-bit packing slots within a 32-bit vector word are
+  tiled along the innermost minor dimension. The underlying physical memory order is
+  [num_blocks, page_size, num_lanes, head_dim, kv_packing] (stride 1 along the
+  kv_packing slot axis).
+- DMA Transfer Semantics:
+  batch_transfer_d2h_sync and batch_transfer_h2d_sync copy raw device bytes
+  without XLA layout delinearization. The byte stream transferred to and from the host
+  therefore follows the TPU physical layout (P, S, L, D, K).
+- Host-Side Odd-Head Resharding (Reassembly):
+  When attention TP differs between Prefill and Decode (e.g., Prefill TP=4 with 1 head
+  -> Decode TP=2 with 2 heads in FP8 mode), the host reassembles chunks by viewing flat
+  bytes as (P, S, L, D, K) and slicing / concatenating along dim=-1 (the
+  innermost kv_packing slot dimension). This guarantees that the reassembled bytes
+  match the exact physical layout expected by the decode TPU upon H2D DMA.
 """
 
 from __future__ import annotations
@@ -32,6 +43,8 @@ import dataclasses
 import enum
 import json
 import logging
+import os
+import pickle
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -45,6 +58,91 @@ from sglang.srt.disaggregation.base.conn import KVArgs
 from sglang.srt.disaggregation.tpu.host_staging import PinnedHostPool, StageBuf
 
 logger = logging.getLogger(__name__)
+
+
+def dump_disagg_chunk(
+    room: int | str,
+    role: str,
+    source_tp: int | str,
+    dest_tp: int | str,
+    layer_blobs: Sequence[Any],
+    aux_blobs: Sequence[bytes] | None = None,
+    info: Any = None,
+    index_start: int = 0,
+    num_pages: int = 0,
+    from_assemble: bool = False,
+    extra: dict | None = None,
+    filename: str = "data.pkl",
+) -> None:
+    """Dump KV chunk bytes to /results/disagg/{room}/{role}/{source_TP}/{dest_TP}/{filename}."""
+    try:
+        blobs_bytes: list[bytes] = []
+        for b in layer_blobs:
+            if hasattr(b, "mv"):
+                blobs_bytes.append(bytes(b.mv()))
+            elif isinstance(b, (memoryview, bytearray)):
+                blobs_bytes.append(bytes(b))
+            elif isinstance(b, bytes):
+                blobs_bytes.append(b)
+            elif isinstance(b, torch.Tensor):
+                blobs_bytes.append(b.contiguous().cpu().numpy().tobytes())
+            else:
+                blobs_bytes.append(bytes(b))
+
+        aux_bytes = [bytes(a) for a in aux_blobs] if aux_blobs else []
+
+        payload = {
+            "room": room,
+            "role": role,
+            "source_tp": source_tp,
+            "dest_tp": dest_tp,
+            "index_start": index_start,
+            "num_pages": num_pages,
+            "from_assemble": from_assemble,
+            "layer_blobs": blobs_bytes,
+            "aux_blobs": aux_bytes,
+            "info": (
+                info.to_dict()
+                if hasattr(info, "to_dict")
+                else (
+                    dataclasses.asdict(info)
+                    if dataclasses.is_dataclass(info)
+                    else str(info)
+                )
+            ),
+        }
+        if extra:
+            payload.update(extra)
+
+        dump_root = os.environ.get("SGLANG_DISAGG_DUMP_DIR")
+        if not dump_root:
+            if os.path.exists("/results/disagg") or os.access("/results", os.W_OK):
+                dump_root = "/results/disagg"
+            else:
+                return
+        base_dir = os.path.join(
+            dump_root,
+            str(room),
+            role,
+            str(source_tp),
+            str(dest_tp),
+        )
+        os.makedirs(base_dir, exist_ok=True)
+        file_path = os.path.join(base_dir, filename)
+        with open(file_path, "wb") as f:
+            pickle.dump(payload, f)
+        if filename != "data.pkl":
+            default_path = os.path.join(base_dir, "data.pkl")
+            with open(default_path, "wb") as f:
+                pickle.dump(payload, f)
+        logger.info(
+            "[pd_kv_resharding] Dumped %s chunk to %s (nbytes=%d)",
+            role,
+            file_path,
+            sum(len(b) for b in blobs_bytes),
+        )
+    except Exception as e:
+        logger.warning("[pd_kv_resharding] Failed to dump %s chunk: %s", role, e)
 
 
 def _blob_to_tensor(blob: StageBuf | bytes) -> torch.Tensor:
@@ -64,24 +162,31 @@ def _view_packed_lane(
     n_lanes: int,
     kv_packing: int,
 ) -> torch.Tensor:
-    """Views a gathered layer blob as its 5D packed layout for slot-axis slicing.
+    """Views a gathered layer blob as its 5D TPU physical packed layout for slot slicing.
 
-    Reshaping to (num_pages, page_size, n_lanes, kv_packing, slot_bytes) lets a
-    head be sliced on the kv_packing axis instead of the flat page bytes.
-    slot_bytes (head_dim * dtype_size) is inferred; a wrong page_size makes the
-    view raise rather than silently mis-slice.
+    On TPU (PjRt/XLA), the fused 5D KV tensor has logical shape
+    ``(num_blocks, page_size, num_lanes, kv_packing, head_dim)``, but the underlying
+    hardware physical memory layout (minor-to-major) places ``kv_packing`` (slots) at the
+    innermost dimension (stride 1) and ``head_dim`` at the second-innermost dimension.
+    Because ``batch_transfer`` DMA performs raw byte copy, the host-transferred byte stream
+    strictly follows the TPU physical layout:
+    ``(num_pages, page_size, n_lanes, head_dim, kv_packing)``.
+
+    Reshaping flat uint8 bytes to ``(num_pages, page_size, n_lanes, -1, kv_packing)``
+    places the slot axis at ``dim=-1``, allowing head extraction and reassembly along the
+    innermost slot dimension without corrupting the TPU vector register tiling.
 
     Args:
         blob: Gathered per-layer payload (StageBuf or raw bytes).
         num_pages: Pages in the blob.
         page_size: Tokens per KV page.
         n_lanes: Packed lanes present in the blob.
-        kv_packing: Slots per packed lane.
+        kv_packing: Slots per packed lane (e.g., 4 for FP8).
 
     Returns:
-        uint8 view of shape (num_pages, page_size, n_lanes, kv_packing, slot_bytes).
+        uint8 view of shape (num_pages, page_size, n_lanes, head_dim, kv_packing).
     """
-    return _blob_to_tensor(blob).view(num_pages, page_size, n_lanes, kv_packing, -1)
+    return _blob_to_tensor(blob).view(num_pages, page_size, n_lanes, -1, kv_packing)
 
 
 # ``(start, count)`` on the fused buffer's packed-lane axis (dim 2), or None for
@@ -336,28 +441,27 @@ class PendingChunk:
 
     @staticmethod
     def reassemble_chunks(chunks: list[PendingChunk]) -> PendingChunk:
-        """Merges/extracts chunks based on each chunks's prefill_transfer_chunk.
+        """Merges/extracts chunks based on each chunk's prefill_transfer_info.
 
-        For FP8 cases, if prefill rank only has 1 head, it will still sends
-        decoder 1 lane with half of slots dummy. On the other hand, if decode
-        only has 1 head, its final data will be 1 lane with half of slots dummy.
+        In FP8 mode (kv_packing=4), 1 packed lane holds 2 heads (4 slots: K0, V0, K1, V1).
+        - Prefill TP=4 (1 head/rank): Each prefill rank sends 1 lane where slots [0:2] are
+          valid and trailing slots [2:4] are dummy.
+        - Decode TP=2 (2 heads/rank): Decode expects 1 lane where slots [0:2] come from the
+          first prefill rank and slots [2:4] come from the second prefill rank.
 
-        We only consider 1:2 and 2:1 odd head case here.
+        Because TPU hardware physical layout places the kv_packing (slot) axis at dim=-1
+        (innermost), slicing and concatenation must occur along dim=-1.
 
-        3 cases to be considered here:
-        1. FAN-IN (prefill data have 1 heads), we will combine 2 prefill chunks
-            into a single contiguous chunk (strip out dummy data) and then
-            scatter.
-        2. FAN-OUT (Decode data have 1 heads):
-           2.1 need first 2 slots from prefill, then directly use
-           original chunk.
-           2.2 need second half slots from prefill, then we create a new chunk
-           on host where first 2 slots are the copied from the prefill chunks
-        3. EQUAL (Both sides only have 1 heads):
-            No change.
+        3 cases handled here:
+        1. FAN-IN (Prefill has 1 head -> Decode has 2 heads): Combine 2 prefill chunks by
+           extracting slots [0:2] from each and concatenating on dim=-1.
+        2. FAN-OUT (Prefill has 2 heads -> Decode has 1 head):
+           - Case 2.1 (Head 0 needed): Extract slots [0:2], pad trailing dummy slots [2:4].
+           - Case 2.2 (Head 1 needed): Extract slots [2:4], move to front, pad dummy slots.
+        3. EQUAL: No reassembly needed.
 
         Args:
-            chunks: List of chunks to be assemble to 1 chunk.
+            chunks: List of chunks to assemble into 1 chunk.
         Returns:
             Assembled pending chunk.
         """
@@ -377,25 +481,19 @@ class PendingChunk:
             new_layer_blobs: list[bytes] = []
             num_pages, page_size = first_chunk.num_pages, info.page_size
             n_lanes, kvp = info.gathered_lanes, info.kv_packing
-            # Assumes exactly 1 real head per source: the slice below strips all
-            # but the first slot pair. require_reassemble only routes here when
-            # 2*src_heads < kv_packing, which with the fp8 kv_packing=4 forces
-            # src_heads==1. Guard so a future kv_packing>4 fails loud instead of
-            # silently dropping heads (the fix is slicing :src_heads*_SLOTS_PER_HEAD).
             assert (
                 info.src_heads == 1
             ), f"FAN-IN reassembly assumes 1 head/source, got src_heads={info.src_heads}"
             for layer_idx in range(num_layers):
-                # Each source carries its real head in the lane's first slot pair
-                # (slots [0:2]); concatenate the sources on the kv_packing axis to
-                # fill the decode lane, stripping the trailing dummy slots.
+                # Extract valid slots [:_SLOTS_PER_HEAD] along innermost slot axis (dim=-1)
+                # and concatenate them to build the full packed decode lane.
                 heads = [
                     _view_packed_lane(
                         c.layer_blobs[layer_idx], num_pages, page_size, n_lanes, kvp
-                    )[:, :, :, :_SLOTS_PER_HEAD, :]
+                    )[:, :, :, :, :_SLOTS_PER_HEAD]
                     for c in sorted_chunks
                 ]
-                merged = torch.cat(heads, dim=3)
+                merged = torch.cat(heads, dim=-1)
                 new_layer_blobs.append(merged.contiguous().numpy().tobytes())
 
             for c in sorted_chunks:
@@ -414,7 +512,6 @@ class PendingChunk:
                 decode_endpoint=info.decode_endpoint,
                 num_pages=info.num_pages,
                 kv_packing=info.kv_packing,
-                # Synthetic chunk, so use dst rank.
                 src_tp_rank=info.dst_tp_rank,
                 dst_tp_rank=info.dst_tp_rank,
                 src_attn_tp_size=info.dst_attn_tp_size,
@@ -432,16 +529,28 @@ class PendingChunk:
                 prefill_transfer_info=new_info,
                 from_assemble=True,
             )
+            dump_disagg_chunk(
+                room=info.room,
+                role="decode",
+                source_tp=info.src_attn_tp_size,
+                dest_tp=info.dst_attn_tp_size,
+                layer_blobs=new_layer_blobs,
+                aux_blobs=aux_blobs,
+                info=new_info,
+                index_start=new_chunk.index_start,
+                num_pages=new_chunk.num_pages,
+                from_assemble=True,
+                extra={
+                    "src_tp_rank": new_info.src_tp_rank,
+                    "dst_tp_rank": new_info.dst_tp_rank,
+                    "stage": "reassembled_fan_in",
+                },
+                filename=f"data_reassembled_dst{new_info.dst_tp_rank}_chunk{first_chunk.index_start}.pkl",
+            )
             return new_chunk
 
         # Case 2: FAN-OUT (Decode has 1 head -> Prefill sent 2-head full lane)
         elif direction == ReshardDirection.FAN_OUT:
-            # Case 2.1: Head 0 is needed -> original chunk already has valid Head 0 in front
-            if info.src_head_start == 0:
-                return first_chunk
-
-            # Case 2.2: Head 1 is needed -> move its slot pair (slots [2:4]) to the
-            # front of the lane, leaving the trailing slots as dummy padding.
             num_layers = len(first_chunk.layer_blobs)
             new_layer_blobs: list[bytes] = []
             num_pages, page_size = first_chunk.num_pages, info.page_size
@@ -455,9 +564,12 @@ class PendingChunk:
                     n_lanes,
                     kvp,
                 )
-                h1 = lane[:, :, :, _SLOTS_PER_HEAD : 2 * _SLOTS_PER_HEAD, :]
-                dummy = torch.zeros_like(h1)
-                merged = torch.cat([h1, dummy], dim=3)
+                if info.src_head_start == 0:
+                    h = lane[:, :, :, :, :_SLOTS_PER_HEAD]
+                else:
+                    h = lane[:, :, :, :, _SLOTS_PER_HEAD : 2 * _SLOTS_PER_HEAD]
+                dummy = torch.zeros_like(h)
+                merged = torch.cat([h, dummy], dim=-1)
                 new_layer_blobs.append(merged.contiguous().numpy().tobytes())
 
             for b in first_chunk.layer_blobs:
@@ -469,7 +581,6 @@ class PendingChunk:
                 decode_endpoint=info.decode_endpoint,
                 num_pages=info.num_pages,
                 kv_packing=info.kv_packing,
-                # Use src as it's the only one.
                 src_tp_rank=info.src_tp_rank,
                 dst_tp_rank=info.dst_tp_rank,
                 src_attn_tp_size=info.dst_attn_tp_size,
@@ -486,6 +597,24 @@ class PendingChunk:
                 aux_blobs=first_chunk.aux_blobs,
                 prefill_transfer_info=new_info,
                 from_assemble=True,
+            )
+            dump_disagg_chunk(
+                room=info.room,
+                role="decode",
+                source_tp=info.src_attn_tp_size,
+                dest_tp=info.dst_attn_tp_size,
+                layer_blobs=new_layer_blobs,
+                aux_blobs=first_chunk.aux_blobs,
+                info=new_info,
+                index_start=new_chunk.index_start,
+                num_pages=new_chunk.num_pages,
+                from_assemble=True,
+                extra={
+                    "src_tp_rank": new_info.src_tp_rank,
+                    "dst_tp_rank": new_info.dst_tp_rank,
+                    "stage": "reassembled_fan_out",
+                },
+                filename=f"data_reassembled_dst{new_info.dst_tp_rank}_chunk{first_chunk.index_start}.pkl",
             )
             return new_chunk
 
@@ -692,7 +821,15 @@ def gather_pages_to_host(
         return [tensor_to_bytes(h) for h in host_dsts]
 
     # Per-layer fallback (CPU / batch_transfer unavailable).
-    return [tensor_to_bytes(s.to("cpu")) for s in src_shards]
+    # On CPU, transpose (..., kv_packing, head_dim) to (..., head_dim, kv_packing)
+    # to emulate TPU hardware physical DMA layout in tests.
+    res = []
+    for s in src_shards:
+        t = s.to("cpu")
+        if t.ndim == 5:
+            t = t.transpose(-2, -1).contiguous()
+        res.append(tensor_to_bytes(t))
+    return res
 
 
 def gather_pages_to_stage(
@@ -783,10 +920,6 @@ def scatter_stage_from_host(
     """
     if len(layer_buffers) == 0:
         return
-    bt = _batch_transfer()
-    if bt is None:
-        raise RuntimeError("scatter_stage_from_host requires torch_tpu batch_transfer")
-    _, h2d_sync, _ = bt
     dsts = [_narrow_lanes(buf, dst_lane_slice) for buf in layer_buffers]
     device = layer_buffers[0].device
     n_pages = len(np.asarray(page_indices))
@@ -803,71 +936,39 @@ def scatter_stage_from_host(
             st.view(dst.dtype, (n_pages, *dst.shape[1:]))
             for st, dst in zip(stages, dsts)
         ]
-        dev_shards = [
-            torch.empty((n_pages, *dst.shape[1:]), dtype=dst.dtype, device=device)
-            for dst in dsts
-        ]
-        h2d_sync(host_srcs, dev_shards)
-        for dst, shard in zip(dsts, dev_shards):
-            _index_copy_pages(dst, idx, shard)
+        bt = _batch_transfer() if device.type != "cpu" else None
+        if bt is not None:
+            _, h2d_sync, _ = bt
+            dev_shards = [
+                torch.empty((n_pages, *dst.shape[1:]), dtype=dst.dtype, device=device)
+                for dst in dsts
+            ]
+            h2d_sync(host_srcs, dev_shards)
+            for dst, shard in zip(dsts, dev_shards):
+                _index_copy_pages(dst, idx, shard)
+        else:
+            # Per-layer fallback (CPU / batch_transfer unavailable).
+            # The staging buffer holds TPU physical layout (P, S, L, D, K). On CPU,
+            # transpose back to CPU logical layout (P, S, L, K, D) before copy.
+            for dst, st in zip(dsts, stages):
+                if dst.ndim == 5:
+                    phys_shape = (
+                        n_pages,
+                        dst.shape[1],
+                        dst.shape[2],
+                        dst.shape[4],
+                        dst.shape[3],
+                    )
+                    host_logical = (
+                        st.view(dst.dtype, phys_shape).transpose(-2, -1).contiguous()
+                    )
+                    _index_copy_pages(dst, idx, host_logical.to(device))
+                else:
+                    host = st.view(dst.dtype, (n_pages, *dst.shape[1:]))
+                    _index_copy_pages(dst, idx, host.to(device))
     finally:
         for st in stages:
             st.release()
-
-
-def scatter_pages_from_host(
-    layer_buffers: Sequence[torch.Tensor],
-    page_indices: np.ndarray,
-    layer_blobs: Sequence[bytes],
-    dst_lane_slice: LaneSlice = None,
-) -> None:
-    """H2D scatter of per-layer byte blobs into ``page_indices`` (block ids) of
-    every layer buffer, onto whatever device the buffers live on. Decode side.
-
-    Args:
-        layer_buffers: Per-layer block-indexed KV tensors to scatter into.
-        page_indices: Destination block ids, one per page.
-        layer_blobs: Per-layer raw byte payloads, one per layer buffer.
-        dst_lane_slice: ``(start, count)`` writing the KV-head slice into that
-            dim-2 sub-range of each buffer (MHA resharding); None writes the
-            whole page. dtype/shape come from the lane-narrowed targets.
-    """
-    if len(layer_buffers) == 0:
-        return
-    assert len(layer_blobs) == len(layer_buffers), (
-        f"layer count mismatch: {len(layer_blobs)} blobs vs "
-        f"{len(layer_buffers)} layer buffers"
-    )
-    dsts = [_narrow_lanes(buf, dst_lane_slice) for buf in layer_buffers]
-    device = layer_buffers[0].device
-    n_pages = len(np.asarray(page_indices))
-    idx = torch.as_tensor(np.asarray(page_indices), dtype=torch.long, device=device)
-    host_srcs = [
-        bytes_to_tensor(blob, dst.dtype, (n_pages, *dst.shape[1:]))
-        for blob, dst in zip(layer_blobs, dsts)
-    ]
-    bt = _batch_transfer() if device.type != "cpu" else None
-    if bt is not None:
-        _, h2d_sync, _ = bt
-        # Batched H2D into contiguous device shards (one dispatch, one sync),
-        # then scatter each shard into its block positions on the main thread
-        # (index_copy_ touches the donated kv_buffer — must stay on this thread).
-        # batch_transfer requires >=32B-aligned host buffers; ``frombuffer`` over
-        # a bytearray is unaligned, so clone into the (64B-aligned) torch CPU
-        # allocator first. Phase 2's pinned aligned staging pool removes this copy.
-        aligned_srcs = [h.clone() for h in host_srcs]
-        dev_shards = [
-            torch.empty((n_pages, *dst.shape[1:]), dtype=dst.dtype, device=device)
-            for dst in dsts
-        ]
-        h2d_sync(aligned_srcs, dev_shards)
-        for dst, shard in zip(dsts, dev_shards):
-            _index_copy_pages(dst, idx, shard)
-        return
-
-    # Per-layer fallback (CPU / batch_transfer unavailable).
-    for dst, host in zip(dsts, host_srcs):
-        _index_copy_pages(dst, idx, host.to(device))
 
 
 def _index_copy_pages(buf: torch.Tensor, idx: torch.Tensor, src: torch.Tensor) -> None:
