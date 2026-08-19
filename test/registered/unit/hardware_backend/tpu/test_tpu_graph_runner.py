@@ -513,6 +513,7 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         events = []
         worker = object.__new__(EagleDraftWorker)
         worker.speculative_num_steps = 3
+        worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
         worker.draft_tp_context = lambda _group: contextlib.nullcontext()
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
