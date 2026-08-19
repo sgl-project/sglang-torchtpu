@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TP16/EP16 execution gate for the production NVFP4 fused-RS geometry."""
+"""TP16/EP16 execution and routing-sync gate for production NVFP4 fused-RS."""
 
 import gc
 import os
@@ -96,8 +96,33 @@ def _make_inputs(
     topk_ids = (token_ids * topk + slots * 31) % global_experts
     topk_weights = torch.softmax(
         torch.randn(tokens, topk, generator=generator), dim=-1
-    ).to(torch.bfloat16)
+    ).to(torch.float32)
+    if torch.equal(topk_weights, topk_weights.to(torch.bfloat16).to(torch.float32)):
+        raise AssertionError("router-weight fixture must exercise non-BF16 FP32 bits")
     return hidden_states, topk_ids, topk_weights
+
+
+def _physical_order_to_rank(
+    physical_id: int, world_size: int, device: torch.device
+) -> list[int]:
+    local_id = torch.tensor([physical_id], dtype=torch.int32, device=device)
+    ids_by_rank = [torch.empty_like(local_id) for _ in range(world_size)]
+    dist.all_gather(ids_by_rank, local_id)
+    physical_ids = [int(value.cpu().item()) for value in ids_by_rank]
+    if sorted(physical_ids) != list(range(world_size)):
+        raise AssertionError(f"unexpected physical device IDs: {physical_ids}")
+    return [physical_ids.index(pid) for pid in range(world_size)]
+
+
+def _gather_logical_rows(
+    local_shard: torch.Tensor,
+    physical_order_to_rank: list[int],
+    tokens: int,
+) -> torch.Tensor:
+    shards_by_rank = [torch.empty_like(local_shard) for _ in physical_order_to_rank]
+    dist.all_gather(shards_by_rank, local_shard)
+    physical_order = [shards_by_rank[rank] for rank in physical_order_to_rank]
+    return torch.cat(physical_order, dim=0)[:tokens].cpu()
 
 
 def main() -> None:
@@ -131,10 +156,13 @@ def main() -> None:
     gc.collect()
 
     physical_id = tpu_distributed.global_device_id()
+    physical_order_to_rank = _physical_order_to_rank(physical_id, world_size, device)
     group_offset = torch.tensor(
         [rank * local_experts, physical_id], dtype=torch.int32, device=device
     )
-    no_post_norm = torch.zeros(1, dtype=torch.bfloat16, device=device)
+    post_norm = torch.linspace(
+        -0.25, 0.25, hidden_size, dtype=torch.bfloat16, device=device
+    )
 
     def kernel(hidden_states, topk_weights, topk_ids):
         return fused_moe_rs_op.fused_moe_rs_call(
@@ -145,42 +173,79 @@ def main() -> None:
             w2_scale=layer.w2_weight_scale,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            post_expert_norm_weight=no_post_norm,
+            post_expert_norm_weight=post_norm,
             group_offset=group_offset,
             topk=topk,
             activation="silu",
-            has_post_expert_norm=False,
+            has_post_expert_norm=True,
             fp8_direct_write=False,
+            postprocess_accum_dtype="float32",
         )
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
-    for tokens in (1, 16, 64, 256):
+    for tokens in (1, 16, 64, 256, 1024):
         hidden_states, topk_ids, topk_weights = _make_inputs(
             tokens, hidden_size, global_experts, topk
         )
-        previous = None
-        for iteration in range(2):
-            actual = compiled(
+
+        def run_case(label: str, weights: torch.Tensor) -> torch.Tensor:
+            local_shard = compiled(
                 hidden_states.to(device),
-                topk_weights.to(device),
+                weights.to(device),
                 topk_ids.to(device),
-            ).cpu()
-            if not torch.isfinite(actual).all().item():
-                raise AssertionError(f"non-finite output for tokens={tokens}")
-            checksum = actual.float().abs().sum().item()
-            if checksum == 0:
-                raise AssertionError(f"zero output for tokens={tokens}")
-            if previous is not None:
-                torch.testing.assert_close(actual, previous, rtol=0, atol=0)
-            previous = actual
+            )
+            logical_rows = _gather_logical_rows(
+                local_shard,
+                physical_order_to_rank,
+                tokens,
+            )
             dist.barrier()
             print(
-                "NVFP4_FUSED_RS_EXECUTE_PASS "
+                "NVFP4_FUSED_RS_CASE_PASS "
                 f"rank={rank} physical_id={physical_id} tokens={tokens} "
-                f"iteration={iteration} shape={tuple(actual.shape)} "
-                f"checksum={checksum:.6f}",
+                f"case={label} local_shape={tuple(local_shard.shape)} "
+                f"logical_shape={tuple(logical_rows.shape)}",
                 flush=True,
             )
+            return logical_rows
+
+        reference = run_case("identical", topk_weights)
+        repeated = run_case("identical_repeat", topk_weights)
+
+        # Only non-source physical devices receive deliberately different FP32
+        # weights. The compiled kernel must still consume physical device 0's
+        # exact values, including its sub-BF16 residual.
+        divergent_weights = topk_weights
+        if physical_id != 0:
+            divergent_weights = torch.flip(topk_weights, dims=(1,)) * (physical_id + 1)
+        divergent = run_case("divergent_non_source", divergent_weights)
+
+        # This arm uses the same shape/dtype and compiled function, but removes
+        # only the FP32 bits below the BF16 grid. The production 1024-token
+        # chunk must change after the final BF16 output round, otherwise its
+        # gate is not sensitive to the numerics this patch claims to preserve.
+        rounded_weights = topk_weights.to(torch.bfloat16).to(torch.float32)
+        bf16_grid = run_case("source_bf16_grid", rounded_weights)
+
+        if not torch.isfinite(reference).all().item():
+            raise AssertionError(f"non-finite logical output for tokens={tokens}")
+        checksum = reference.float().abs().sum().item()
+        if checksum == 0:
+            raise AssertionError(f"zero logical output for tokens={tokens}")
+        torch.testing.assert_close(reference, repeated, rtol=0, atol=0)
+        torch.testing.assert_close(reference, divergent, rtol=0, atol=0)
+        low_bit_changed = not torch.equal(reference, bf16_grid)
+        if tokens == 1024 and not low_bit_changed:
+            raise AssertionError(
+                "FP32 router weights and their BF16-grid projection produced "
+                "identical outputs for the production 1024-token chunk"
+            )
+        print(
+            "NVFP4_FUSED_RS_EXECUTE_PASS "
+            f"rank={rank} physical_id={physical_id} tokens={tokens} "
+            f"checksum={checksum:.6f} low_bit_changed={low_bit_changed}",
+            flush=True,
+        )
 
     dist.destroy_process_group()
 

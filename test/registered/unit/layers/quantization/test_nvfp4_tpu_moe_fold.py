@@ -172,6 +172,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
 
         layer = types.SimpleNamespace(
+            num_experts=256,
             moe_ep_size=4,
             allow_backend_reduction=True,
             num_fused_shared_experts=0,
@@ -207,6 +208,13 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     layer, group_size=BLOCK_SIZE, no_combine=False
                 )
             )
+            layer.num_experts = 257
+            self.assertFalse(
+                can_use_tpu_nvfp4_fused_rs(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                )
+            )
+            layer.num_experts = 256
             layer.moe_ep_size = 2
             self.assertFalse(
                 can_use_tpu_nvfp4_fused_rs(
@@ -268,6 +276,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
 
         layer = types.SimpleNamespace(
+            num_experts=256,
             moe_ep_size=4,
             allow_backend_reduction=True,
             num_fused_shared_experts=0,
@@ -310,6 +319,14 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 ),
                 ["no_combine matches the model's post-expert-norm contract"],
             )
+            layer.num_experts = 257
+            self.assertEqual(
+                unmet_tpu_nvfp4_fused_rs_requirements(
+                    layer, group_size=BLOCK_SIZE, no_combine=False
+                ),
+                ["num_experts <= 256 for BF16 routing materialization"],
+            )
+            layer.num_experts = 256
             # Every unmet requirement is reported, not just the first.
             layer.allow_backend_reduction = False
             self.assertEqual(
@@ -458,12 +475,21 @@ class TestNvfp4Block512Contract(CustomTestCase):
             call["physical_order_to_tp_rank"], layer._tpu_fused_rs_physical_order
         )
         self.assertFalse(call["has_post_expert_norm"])
+        self.assertEqual(call["topk_weights"].dtype, torch.float32)
+        self.assertEqual(call["postprocess_accum_dtype"], "float32")
 
     def test_fused_apply_uses_shared_gather_without_fp8_payload(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
         hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
-        topk_weights = torch.rand(3, 2, dtype=torch.bfloat16)
+        topk_weights = torch.tensor(
+            [
+                [0.10012345, 0.89987653],
+                [0.70023453, float("nan")],
+                [0.30034566, 0.69965434],
+            ],
+            dtype=torch.float32,
+        )
         topk_ids = torch.tensor([[0, 1], [1, -1], [0, 1]], dtype=torch.int64)
         dispatch_output = types.SimpleNamespace(
             hidden_states=hidden_states,
@@ -496,10 +522,67 @@ class TestNvfp4Block512Contract(CustomTestCase):
         call = fused_moe_rs_gather.call_args.kwargs
         self.assertFalse(call["fp8_direct_write"])
         self.assertFalse(call["has_post_expert_norm"])
+        self.assertEqual(call["postprocess_accum_dtype"], "float32")
+        self.assertEqual(call["topk_weights"].dtype, torch.float32)
         self.assertNotIn("collective_id", call)
         self.assertEqual(call["topk_ids"][1, 1].item(), 0)
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
+        self.assertEqual(call["topk_weights"][0, 0].item(), topk_weights[0, 0].item())
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
+
+    def test_fused_apply_forwards_postnorm_with_fp32_router_weights(self):
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+        from sglang.srt.layers.moe.pallas import fused_moe_rs_op
+
+        hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
+        topk_weights = torch.tensor([[0.10012345, 0.89987653]] * 3, dtype=torch.float32)
+        topk_ids = torch.tensor([[0, 1]] * 3, dtype=torch.int64)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+        norm_weight = torch.linspace(-0.25, 0.25, HIDDEN_SIZE, dtype=torch.bfloat16)
+        layer._tpu_fused_rs_has_post_expert_norm = True
+        layer._tpu_fused_rs_post_expert_norm_weight = norm_weight
+        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_physical_order = torch.tensor([0], dtype=torch.int64)
+        expert_outputs = torch.randn(3, 2, HIDDEN_SIZE, dtype=torch.bfloat16).float()
+        scaled = expert_outputs * (norm_weight.float() + 1.0)[None, None, :]
+        normalized = scaled * torch.rsqrt(
+            scaled.square().mean(dim=-1, keepdim=True) + 1e-8
+        )
+        reference = torch.sum(normalized * topk_weights[:, :, None], dim=1).bfloat16()
+        padded_reference = torch.cat(
+            [reference, torch.zeros_like(reference[:1])], dim=0
+        )
+        fused_moe_rs_gather = mock.create_autospec(
+            fused_moe_rs_op.fused_moe_rs_gather,
+            return_value=padded_reference,
+        )
+
+        with mock.patch.object(
+            fused_moe_rs_op, "fused_moe_rs_gather", fused_moe_rs_gather
+        ):
+            result = fp4_moe.apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                no_combine=True,
+                use_fused_rs=True,
+            )
+
+        call = fused_moe_rs_gather.call_args.kwargs
+        self.assertTrue(call["has_post_expert_norm"])
+        self.assertIs(call["post_expert_norm_weight"], norm_weight)
+        self.assertEqual(call["topk_weights"].dtype, torch.float32)
+        self.assertEqual(call["postprocess_accum_dtype"], "float32")
+        self.assertNotEqual(
+            topk_weights[0, 0].item(),
+            topk_weights.to(torch.bfloat16).to(torch.float32)[0, 0].item(),
+        )
+        torch.testing.assert_close(result.hidden_states, reference, rtol=0, atol=0)
 
     def test_fused_apply_chunks_large_prefills(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
@@ -534,6 +617,13 @@ class TestNvfp4Block512Contract(CustomTestCase):
             )
 
         self.assertEqual(fused_moe_rs_gather.call_count, 3)
+        self.assertTrue(
+            all(
+                call.kwargs["postprocess_accum_dtype"] == "float32"
+                and call.kwargs["topk_weights"].dtype == torch.float32
+                for call in fused_moe_rs_gather.call_args_list
+            )
+        )
         self.assertEqual(
             [
                 call.kwargs["hidden_states"].shape[0]
@@ -1056,6 +1146,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         *,
         ep_size: int = 4,
         world_size: int = 4,
+        num_experts: int = 256,
         model_contract: bool = False,
         backend: str = "auto",
     ):
@@ -1080,6 +1171,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         )
         # The model has not applied its overrides yet at construction time.
         layer = types.SimpleNamespace(
+            num_experts=num_experts,
             moe_ep_size=ep_size,
             allow_backend_reduction=False,
             num_fused_shared_experts=0,
@@ -1163,6 +1255,21 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
+
+    def test_gate_falls_back_above_bf16_expert_limit(self):
+        _, resolved, prepared, _ = self._run_gate(num_experts=257)
+
+        self.assertFalse(resolved)
+        self.assertFalse(prepared["use_fused_rs"])
+
+    def test_explicit_pallas_backend_rejects_above_bf16_expert_limit(self):
+        with self.assertRaisesRegex(
+            ValueError, "num_experts <= 256 for BF16 routing materialization"
+        ):
+            self._run_gate(
+                num_experts=257,
+                backend="pallas_tpu_fused_rs",
+            )
 
     def test_explicit_pallas_backend_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "Unmet requirements"):

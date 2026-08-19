@@ -11,6 +11,33 @@ from torch_tpu._internal.distributed.spmd_util import spmd_safe
 _FUSED_MOE_RS_OP = None
 _FUSED_MOE_RS_OP_NAME = "sglang_tpu_pallas::fused_moe_rs"
 _FUSED_RS_ROUTED_ROW_ALIGNMENT = 16
+_POSTPROCESS_ACCUM_DTYPES = {
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+
+
+def _validate_postprocess_contract(
+    topk_weights: torch.Tensor, postprocess_accum_dtype: str
+) -> None:
+    if postprocess_accum_dtype not in _POSTPROCESS_ACCUM_DTYPES:
+        supported = ", ".join(sorted(_POSTPROCESS_ACCUM_DTYPES))
+        raise ValueError(
+            f"Unsupported postprocess_accum_dtype={postprocess_accum_dtype!r}; "
+            f"expected one of: {supported}"
+        )
+    if topk_weights.dtype not in _POSTPROCESS_ACCUM_DTYPES.values():
+        raise TypeError(
+            "Fused-RS router weights must be bfloat16 or float32, got "
+            f"{topk_weights.dtype}"
+        )
+    expected_dtype = _POSTPROCESS_ACCUM_DTYPES[postprocess_accum_dtype]
+    if topk_weights.dtype != expected_dtype:
+        raise TypeError(
+            f"postprocess_accum_dtype={postprocess_accum_dtype!r} requires "
+            f"router weights with dtype {expected_dtype}, got "
+            f"{topk_weights.dtype}"
+        )
 
 
 def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
@@ -109,6 +136,7 @@ def _build_fused_moe_rs_op():
         activation: str,
         has_post_expert_norm: bool,
         fp8_direct_write: bool,
+        postprocess_accum_dtype: str,
     ) -> jax.Array:
         num_tokens = hidden_states.shape[0]
         ep_size = mesh.shape["model"]
@@ -143,6 +171,7 @@ def _build_fused_moe_rs_op():
                 post_expert_norm_weight if has_post_expert_norm else None
             ),
             fp8_direct_write=fp8_direct_write,
+            postprocess_accum_dtype=postprocess_accum_dtype,
         )
         if not has_post_expert_norm:
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
@@ -163,6 +192,7 @@ def _build_fused_moe_rs_op():
             P(),
             P(),
             P("model"),
+            None,
             None,
             None,
             None,
@@ -188,7 +218,9 @@ def fused_moe_rs_call(
     activation: str,
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
+    postprocess_accum_dtype: str = "bfloat16",
 ) -> torch.Tensor:
+    _validate_postprocess_contract(topk_weights, postprocess_accum_dtype)
     return _build_fused_moe_rs_op()(
         hidden_states,
         w1,
@@ -203,6 +235,7 @@ def fused_moe_rs_call(
         activation,
         has_post_expert_norm,
         fp8_direct_write,
+        postprocess_accum_dtype,
     )
 
 
@@ -223,6 +256,7 @@ def fused_moe_rs_gather(
     has_post_expert_norm: bool,
     fp8_direct_write: bool,
     physical_order_to_tp_rank: torch.Tensor,
+    postprocess_accum_dtype: str = "bfloat16",
 ) -> torch.Tensor:
     from sglang.srt.distributed import get_tp_group
 
@@ -240,6 +274,7 @@ def fused_moe_rs_gather(
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
         fp8_direct_write=fp8_direct_write,
+        postprocess_accum_dtype=postprocess_accum_dtype,
     )
     output = get_tp_group().all_gather(token_shard, dim=0)
     shard_tokens = token_shard.shape[0]

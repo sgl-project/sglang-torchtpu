@@ -115,6 +115,49 @@ class TestFusedMoeRsOp(CustomTestCase):
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
 
+    def test_call_requires_explicit_matching_postprocess_precision(self):
+        common = dict(
+            hidden_states=torch.empty(1, 1, dtype=torch.bfloat16),
+            w1=torch.empty(1),
+            w2=torch.empty(1),
+            w1_scale=torch.empty(1),
+            w2_scale=torch.empty(1),
+            topk_ids=torch.zeros(1, 1, dtype=torch.int32),
+            post_expert_norm_weight=torch.empty(1),
+            group_offset=torch.empty(1),
+            topk=1,
+            activation="silu",
+            has_post_expert_norm=False,
+            fp8_direct_write=False,
+        )
+        with self.assertRaisesRegex(TypeError, "must be bfloat16 or float32"):
+            fused_moe_rs_op.fused_moe_rs_call(
+                **common,
+                topk_weights=torch.empty(1, 1, dtype=torch.float16),
+            )
+        with self.assertRaisesRegex(TypeError, "requires router weights"):
+            fused_moe_rs_op.fused_moe_rs_call(
+                **common,
+                topk_weights=torch.empty(1, 1, dtype=torch.float32),
+            )
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            fused_moe_rs_op.fused_moe_rs_call(
+                **common,
+                topk_weights=torch.empty(1, 1, dtype=torch.float32),
+                postprocess_accum_dtype="float64",
+            )
+
+        exported_op = Mock(return_value=torch.empty(1, 1, dtype=torch.bfloat16))
+        with patch.object(
+            fused_moe_rs_op, "_build_fused_moe_rs_op", return_value=exported_op
+        ):
+            fused_moe_rs_op.fused_moe_rs_call(
+                **common,
+                topk_weights=torch.empty(1, 1, dtype=torch.float32),
+                postprocess_accum_dtype="float32",
+            )
+        self.assertEqual(exported_op.call_args.args[-1], "float32")
+
 
 if __name__ == "__main__":
     unittest.main()

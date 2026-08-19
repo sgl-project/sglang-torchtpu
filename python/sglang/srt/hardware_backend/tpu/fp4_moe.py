@@ -177,6 +177,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
         (f"group_size == {TPU_NVFP4_GROUP_SIZE}", group_size == TPU_NVFP4_GROUP_SIZE),
         ("expert parallelism enabled", layer.moe_ep_size > 1),
         (
+            "num_experts <= 256 for BF16 routing materialization",
+            layer.num_experts <= 256,
+        ),
+        (
             "moe_ep_size == tp_size == world_size",
             layer.moe_ep_size
             == get_tp_group().world_size
@@ -339,11 +343,13 @@ def apply_tpu_nvfp4_moe(
 
         hidden_states = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
-        topk_weights = topk_weights.to(hidden_states.dtype)
+        # Keep the router's FP32 weights through post-expert normalization and
+        # top-k reduction. The fused-RS boundary performs the sole BF16 round.
+        topk_weights = topk_weights.to(torch.float32)
         topk_ids = topk_ids.to(torch.int32)
         valid = topk_ids >= 0
         topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
-        topk_weights = topk_weights * valid.to(topk_weights.dtype)
+        topk_weights = torch.where(valid, topk_weights, torch.zeros_like(topk_weights))
 
         # Cached by prepare_tpu_fused_rs_post_expert_norm at load time; the
         # can_use_tpu_nvfp4_fused_rs gate guarantees no_combine agrees with it.
@@ -380,6 +386,7 @@ def apply_tpu_nvfp4_moe(
                 # intermediate for no bandwidth win, so keep the bf16 payload.
                 fp8_direct_write=False,
                 physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+                postprocess_accum_dtype="float32",
             )
             outputs.append(output[: token_end - token_start])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
