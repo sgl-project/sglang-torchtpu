@@ -246,7 +246,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_extend_attn_backend,
                 (
                     self._fused_draft_forward
-                    if _is_tpu and self.speculative_num_steps > 1
+                    if self._should_fuse_draft_steps()
                     else None
                 ),
             )
@@ -553,9 +553,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
                 if (
-                    _is_tpu
+                    self._should_fuse_draft_steps()
                     and not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
                 ):
                     draft_outputs = self._fused_draft_forward(forward_batch)
                 else:
@@ -634,6 +633,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             None,
         )
 
+    def _should_fuse_draft_steps(self) -> bool:
+        # The fused outer loop is a Dynamo graph around the compiled model
+        # forwards. The direct tracer deliberately bypasses Dynamo.
+        return (
+            _is_tpu
+            and self.speculative_num_steps > 1
+            and getattr(self.server_args, "tpu_compile_tracer", "dynamo") != "direct"
+        )
+
     def _fused_draft_steps(
         self,
         forward_batch: ForwardBatch,
@@ -659,6 +667,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
             forward_batch.spec_info.hidden_states.copy_(hidden_states)
+            forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             logits_output = model.forward(input_ids, base_positions + i, forward_batch)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)

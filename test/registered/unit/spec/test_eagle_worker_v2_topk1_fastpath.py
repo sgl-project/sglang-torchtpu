@@ -132,6 +132,16 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
+    def test_fused_steps_bypass_direct_tracer(self):
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True):
+            worker.server_args.tpu_compile_tracer = "dynamo"
+            self.assertTrue(worker._should_fuse_draft_steps())
+
+            worker.server_args.tpu_compile_tracer = "direct"
+            self.assertFalse(worker._should_fuse_draft_steps())
+
     def test_fused_steps_thread_per_step_inputs(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
         worker.hot_token_id = None
@@ -141,6 +151,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         def model_forward(input_ids, positions, forward_batch):
             calls.append(
                 (
+                    input_ids.clone(),
+                    forward_batch.input_ids.clone(),
                     forward_batch.spec_info.rpa_draft_kv_lens.clone(),
                     forward_batch.spec_info.hidden_states.clone(),
                     forward_batch.out_cache_loc.clone(),
@@ -156,6 +168,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             model=SimpleNamespace(forward=model_forward)
         )
         forward_batch = SimpleNamespace(
+            input_ids=None,
             positions=torch.tensor([5], device=DEVICE),
             out_cache_loc=None,
             spec_info=SimpleNamespace(
@@ -186,14 +199,16 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
 
         self.assertEqual([token.item() for token in tokens], [100, 101, 102])
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][0].item(), 10)
-        self.assertEqual(calls[1][0].item(), 11)
-        self.assertEqual(calls[0][1].tolist(), [[1.0, 1.0]])
-        self.assertEqual(calls[1][1].tolist(), [[12.0, 12.0]])
-        self.assertEqual(calls[0][2].item(), 20)
-        self.assertEqual(calls[1][2].item(), 21)
-        self.assertEqual(calls[0][3].item(), 5)
-        self.assertEqual(calls[1][3].item(), 6)
+        self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
+        self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
+        self.assertEqual(calls[0][2].item(), 10)
+        self.assertEqual(calls[1][2].item(), 11)
+        self.assertEqual(calls[0][3].tolist(), [[1.0, 1.0]])
+        self.assertEqual(calls[1][3].tolist(), [[12.0, 12.0]])
+        self.assertEqual(calls[0][4].item(), 20)
+        self.assertEqual(calls[1][4].item(), 21)
+        self.assertEqual(calls[0][5].item(), 5)
+        self.assertEqual(calls[1][5].item(), 6)
 
     def test_fused_forward_builds_topk1_chain(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
