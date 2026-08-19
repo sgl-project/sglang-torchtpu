@@ -60,7 +60,9 @@
 #                                  # tensor-parallel within the TP group). For a
 #                                  # MoE model set EP to a divisor of TP_SIZE and
 #                                  # the expert count, e.g. TP=16 -> EP=8 or 16.
-#   DP_SIZE=                       # >1 passes --dp-size N --enable-dp-attention,
+#   DP_SIZE=                       # >1 passes --dp-size N --enable-dp-attention
+#                                  # (plus --enable-dp-lm-head when the resulting
+#                                  # attn_tp > 1, which TPU requires),
 #                                  # giving attention TP = TP_SIZE/DP_SIZE
 #                                  # ("attn_tp"). NOTE sglang then divides
 #                                  # --chunked-prefill-size by DP_SIZE, so pass
@@ -464,7 +466,15 @@ args=(
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
-[[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]] && args+=(--dp-size "$DP_SIZE" --enable-dp-attention)
+# --enable-dp-lm-head is not optional here: tpu_platform.apply_server_args_defaults
+# REJECTS attn_tp > 1 under DP attention without it ("--enable-dp-lm-head must be
+# enabled"), so a tp=16 dp=4 launch dies in prepare_server_args before the server
+# starts. attn_tp == 1 (dp_size == tp_size) is unaffected, so gate on ATTN_TP_SIZE
+# rather than passing it unconditionally.
+if [[ -n "$DP_SIZE" && "$DP_SIZE" != "1" ]]; then
+    args+=(--dp-size "$DP_SIZE" --enable-dp-attention)
+    (( ATTN_TP_SIZE > 1 )) && args+=(--enable-dp-lm-head)
+fi
 [[ -n "$MEM_FRACTION_STATIC" ]] && args+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
 [[ -n "$QUANTIZATION" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$KV_CACHE_DTYPE" ]] && args+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
