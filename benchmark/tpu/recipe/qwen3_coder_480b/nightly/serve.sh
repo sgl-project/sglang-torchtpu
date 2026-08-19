@@ -77,6 +77,14 @@ esac
 export CHUNKED_PREFILL_SIZE=$((CHUNKED_PREFILL_PER_RANK * DP_SIZE))
 export MAX_PREFILL_TOKENS=$CHUNKED_PREFILL_SIZE
 
+# --max-running-requests is divided the same way -- pool_configurator.py does
+#   num_reqs = max_running_requests // attn_dp_size
+# so the value passed must be pre-multiplied to land on MAX_RUNNING per rank.
+# Without this, any sweep whose largest concurrency is below dp_size floors to
+# zero and EVERY scheduler dies with "max_running_request is zero" after the
+# weights are already loaded: PROFILE=smoke sweeps {1,2} against dp=4, so 2//4=0.
+export MAX_RUNNING=$((MAX_RUNNING * DP_SIZE))
+
 export MODEL QUANTIZATION KV_CACHE_DTYPE ATTENTION_BACKEND PAGE_SIZE
 export CONTEXT_LEN MEM_FRACTION_STATIC MAX_RUNNING TORCH_COMPILE_MAX_BS
 export ENABLE_METRICS ENABLE_CACHE_REPORT KV_OFFLOAD HICACHE_RATIO

@@ -267,7 +267,9 @@ esac
 # it is sized for the largest leg and the client's semaphore is what varies. Under
 # DP attention sglang treats this per DP rank (the scheduler reports
 # effective_max_running_requests_per_dp), so the global cap is MAX_RUNNING x dp --
-# deliberately above the client's. Sizing above the sweep only buys extra
+# deliberately above the client's. serve.sh pre-multiplies by DP_SIZE to get
+# there, the same way it does for CHUNKED_PREFILL_PER_RANK; this value is
+# per-rank. Sizing above the sweep only buys extra
 # torch.compile buckets, which is the most expensive thing in a CI bring-up.
 _max_bs=1
 for _b in $SWEEP_BS; do (( _b > _max_bs )) && _max_bs=$_b; done
