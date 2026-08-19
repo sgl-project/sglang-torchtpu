@@ -55,6 +55,12 @@ def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int
     return candidate_width
 
 
+def _use_bsearch_filtering(probs: torch.Tensor) -> bool:
+    """The sort-free mask is a TPU custom op; CPU tensors (unit tests, other
+    devices) keep the generic torch fallback."""
+    return _BSEARCH_SAMPLING_ENABLED and probs.device.type == "tpu"
+
+
 def distributed_top_k_for_batch(
     forward_batch,
     *,
@@ -217,7 +223,7 @@ class TpuSampler(Sampler):
                 index=sampled_top_k_position.to(torch.int64).view(-1, 1),
             ).view(-1)
 
-        if sampling_info.sampling_seed is None and _BSEARCH_SAMPLING_ENABLED:
+        if sampling_info.sampling_seed is None and _use_bsearch_filtering(probs):
             # Sort-free path: the torch fallback below needs a full-vocab sort
             # plus boolean-mask scatters, which run eagerly on TPU at ~415 ms
             # per decode step. The binary-search mask is one compiled program;

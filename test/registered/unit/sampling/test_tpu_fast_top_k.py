@@ -365,6 +365,52 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             positions,
         )
 
+    def test_filtered_sampling_uses_bsearch_mask_on_tpu(self):
+        """On TPU tensors, filtered sampling routes through the sort-free
+        binary-search mask + plain multinomial instead of the torch sort path.
+        The device gate is patched because CPU CI cannot allocate TPU tensors."""
+        sampler = SimpleNamespace()
+        probs = torch.rand(1, 128)
+        positions = torch.tensor([7])
+        info = _forward_batch(uniform_top_k=None).sampling_info
+        filtered = torch.rand(1, 128)
+        expected = torch.tensor([17], dtype=torch.int32)
+
+        with (
+            patch.object(
+                tpu_sampler_module, "_use_bsearch_filtering", return_value=True
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.sampling_mask.tpu_filter_probs",
+                return_value=filtered,
+            ) as filter_probs,
+            patch.object(
+                tpu_sampler_module,
+                "sampling_from_probs_torch",
+                return_value=expected,
+            ) as sample,
+            patch.object(
+                tpu_sampler_module,
+                "top_k_top_p_min_p_sampling_from_probs_torch",
+            ) as generic_sampler,
+        ):
+            actual = TpuSampler._sample_from_probs(
+                sampler, probs, info, positions, simple_sampling_case=False
+            )
+
+        self.assertIs(actual, expected)
+        generic_sampler.assert_not_called()
+        filter_probs.assert_called_once_with(
+            probs,
+            info.top_ks,
+            info.top_ps,
+            info.min_ps,
+            info.need_top_k_sampling,
+            info.need_top_p_sampling,
+            info.need_min_p_sampling,
+        )
+        sample.assert_called_once_with(filtered)
+
     def test_uniform_top_k_uses_post_gather_native_top_k(self):
         sampler = SimpleNamespace()
         probs = torch.rand(1, 128)
