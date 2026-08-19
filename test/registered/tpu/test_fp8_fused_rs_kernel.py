@@ -25,15 +25,25 @@ class TestFp8FusedRsKernel(CustomTestCase):
         divergent_ids: bool = False,
         divergent_weights: bool = False,
         fp8_direct_write: bool = False,
+        layers: int = 1,
+        skewed_routing: bool = False,
     ):
         repo_root = Path(__file__).resolve().parents[3]
         worker = repo_root / "test/manual/tpu/test_fp8_fused_rs_kernel.py"
         wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
+        worker_command = shlex.join(
+            [
+                str(worker),
+                "--layers",
+                str(layers),
+                *(["--skewed-routing"] if skewed_routing else []),
+            ]
+        )
         command = "\n".join(
             (
                 f"eval $(python3 -m {wrapper_module})",
                 "export TORCH_TPU_TOPOLOGY TORCH_TPU_SLICEBUILDER_ADDRESSES WORLD_SIZE",
-                f'torchrun --nproc_per_node="$WORLD_SIZE" {shlex.quote(str(worker))}',
+                f'torchrun --nproc_per_node="$WORLD_SIZE" {worker_command}',
             )
         )
         env = os.environ.copy()
@@ -84,6 +94,11 @@ class TestFp8FusedRsKernel(CustomTestCase):
             result.stdout.count(f"fp8_direct_write={fp8_direct_write}"),
             8,
         )
+        self.assertEqual(result.stdout.count(f"layers={layers}"), 8)
+        self.assertEqual(
+            result.stdout.count(f"skewed_routing={skewed_routing}"),
+            8,
+        )
 
     def test_compiled_tp8_kernel_matches_reference(self):
         for post_expert_norm in (False, True):
@@ -128,6 +143,22 @@ class TestFp8FusedRsKernel(CustomTestCase):
             tokens=8,
             topk=1,
             fp8_direct_write=True,
+        )
+
+    def test_compiled_tp8_stacked_skewed_routing_does_not_leak_dma_semaphores(self):
+        """Stacked skewed calls must not halt when faster ranks finish first.
+
+        Extreme expert imbalance creates rank skew. Without an exit rendezvous,
+        a fast participant can terminate while a peer still owns per-slot DMA
+        semaphore state, surfacing as a Mosaic failure or TPU core halt.
+        """
+        self._run_compiled_tp8_kernel(
+            post_expert_norm=False,
+            tokens=4096,
+            topk=1,
+            fp8_direct_write=True,
+            layers=10,
+            skewed_routing=True,
         )
 
 

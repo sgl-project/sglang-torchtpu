@@ -261,6 +261,7 @@ def moe_gmm_local_rs_nodedup(
         ep_size=ep_size,
         ep_axis_name=ep_axis_name,
         max_num_gm=max_num_gm,
+        caller_tile_m=tile_m,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
     )
