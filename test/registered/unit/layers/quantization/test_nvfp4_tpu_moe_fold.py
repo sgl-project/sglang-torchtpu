@@ -1,4 +1,4 @@
-"""Tests for the TPU block-512 NVFP4 MoE weight contract.
+"""Tests for the TPU block-128/256/512 NVFP4 MoE weight contract.
 
 The assertions are pure torch, but importing `fp4_moe` pulls in the Pallas MoE
 package, which imports JAX eagerly. Register both lanes and skip on hosts
@@ -21,12 +21,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
 
 BLOCK_SIZE = 512
+SUPPORTED_BLOCK_SIZES = (128, 256, BLOCK_SIZE)
 EXPERTS = 2
 HIDDEN_SIZE = 512
 INTERMEDIATE_SIZE = 512
 
 
-def _make_block512_layer(include_unused_params: bool = True) -> torch.nn.Module:
+def _make_block512_layer(
+    include_unused_params: bool = True, group_size: int = BLOCK_SIZE
+) -> torch.nn.Module:
     layer = torch.nn.Module()
     layer.moe_runner_config = types.SimpleNamespace(is_gated=True, activation="silu")
     layer.register_parameter(
@@ -59,7 +62,7 @@ def _make_block512_layer(include_unused_params: bool = True) -> torch.nn.Module:
             torch.rand(
                 EXPERTS,
                 2 * INTERMEDIATE_SIZE,
-                HIDDEN_SIZE // BLOCK_SIZE,
+                HIDDEN_SIZE // group_size,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -71,7 +74,7 @@ def _make_block512_layer(include_unused_params: bool = True) -> torch.nn.Module:
             torch.rand(
                 EXPERTS,
                 HIDDEN_SIZE,
-                INTERMEDIATE_SIZE // BLOCK_SIZE,
+                INTERMEDIATE_SIZE // group_size,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -127,8 +130,23 @@ class TestNvfp4Block512Contract(CustomTestCase):
             prepare_tpu_nvfp4_moe_weights,
         )
 
-        with self.assertRaisesRegex(NotImplementedError, "group_size=512"):
+        with self.assertRaisesRegex(NotImplementedError, "group_size in"):
             prepare_tpu_nvfp4_moe_weights(_make_block512_layer(), group_size=16)
+
+    def test_sub512_rejects_stock_pallas_layout(self):
+        from sglang.srt.hardware_backend.tpu.fp4_moe import (
+            prepare_tpu_nvfp4_moe_weights,
+        )
+
+        for group_size in (128, 256):
+            with (
+                self.subTest(group_size=group_size),
+                self.assertRaisesRegex(NotImplementedError, "requires the fused-RS"),
+            ):
+                prepare_tpu_nvfp4_moe_weights(
+                    _make_block512_layer(group_size=group_size),
+                    group_size=group_size,
+                )
 
     def test_scale_storage_dtype(self):
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
@@ -202,11 +220,13 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 return_value=a2a_backend,
             ),
         ):
-            self.assertTrue(
-                can_use_tpu_nvfp4_fused_rs(
-                    layer, group_size=BLOCK_SIZE, no_combine=False
-                )
-            )
+            for group_size in SUPPORTED_BLOCK_SIZES:
+                with self.subTest(group_size=group_size):
+                    self.assertTrue(
+                        can_use_tpu_nvfp4_fused_rs(
+                            layer, group_size=group_size, no_combine=False
+                        )
+                    )
             layer.moe_ep_size = 2
             self.assertFalse(
                 can_use_tpu_nvfp4_fused_rs(
@@ -263,7 +283,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         per-expert output without declaring the post-expert-norm contract.
         """
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
-            TPU_NVFP4_GROUP_SIZE,
+            TPU_NVFP4_SUPPORTED_GROUP_SIZES,
             unmet_tpu_nvfp4_fused_rs_requirements,
         )
 
@@ -317,7 +337,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     layer, group_size=16, no_combine=True
                 ),
                 [
-                    f"group_size == {TPU_NVFP4_GROUP_SIZE}",
+                    f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
                     "layer allows backend reduction",
                     "no_combine matches the model's post-expert-norm contract",
                 ],
@@ -364,31 +384,48 @@ class TestNvfp4Block512Contract(CustomTestCase):
     def test_fused_backend_prepares_layer_eagerly(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
-        layer = _make_block512_layer()
-        prepare_fused_moe_rs = mock.Mock()
-        fused_rs_module = types.SimpleNamespace(
-            prepare_fused_moe_rs=prepare_fused_moe_rs
-        )
+        for group_size in SUPPORTED_BLOCK_SIZES:
+            with self.subTest(group_size=group_size):
+                layer = _make_block512_layer(group_size=group_size)
+                prepare_fused_moe_rs = mock.Mock()
+                fused_rs_module = types.SimpleNamespace(
+                    prepare_fused_moe_rs=prepare_fused_moe_rs
+                )
 
-        with (
-            mock.patch.dict(
-                sys.modules,
-                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
-            ),
-            mock.patch.object(
-                fp4_moe, "_materialize_packed_fp4", side_effect=lambda value: value
-            ),
-        ):
-            fp4_moe.prepare_tpu_nvfp4_moe_weights(layer, use_fused_rs=True)
+                with (
+                    mock.patch.dict(
+                        sys.modules,
+                        {
+                            "sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module
+                        },
+                    ),
+                    mock.patch.object(
+                        fp4_moe,
+                        "_materialize_packed_fp4",
+                        side_effect=lambda value: value,
+                    ),
+                ):
+                    fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                        layer, group_size=group_size, use_fused_rs=True
+                    )
 
-        prepare_fused_moe_rs.assert_called_once_with(layer)
-        # A layer that does not declare the shared post-expert norm contract
-        # still gets the cached flag, so the apply path never needs getattr.
-        self.assertFalse(layer._tpu_fused_rs_has_post_expert_norm)
-        self.assertEqual(
-            tuple(layer.w13_weight.shape),
-            (EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
-        )
+                prepare_fused_moe_rs.assert_called_once_with(layer)
+                # A layer that does not declare the shared post-expert norm
+                # contract still gets the cached flag, so apply never needs
+                # getattr.
+                self.assertFalse(layer._tpu_fused_rs_has_post_expert_norm)
+                self.assertEqual(
+                    tuple(layer.w13_weight.shape),
+                    (EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                )
+                self.assertEqual(
+                    tuple(layer.w13_weight_scale.shape),
+                    (EXPERTS, HIDDEN_SIZE // group_size, 1, 2 * INTERMEDIATE_SIZE),
+                )
+                self.assertEqual(
+                    tuple(layer.w2_weight_scale.shape),
+                    (EXPERTS, INTERMEDIATE_SIZE // group_size, 1, HIDDEN_SIZE),
+                )
 
     def test_fused_prepare_supplies_every_attribute_apply_reads(self):
         """Producer -> consumer contract for the shared fused-RS attributes.
@@ -624,6 +661,28 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
         torch.testing.assert_close(unpacked, codes.transpose(1, 2))
 
+    def test_fused_rs_selects_expected_activation_mode_by_group_size(self):
+        import jax.numpy as jnp
+        from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
+            get_maybe_quantize_lhs,
+        )
+
+        cases = (
+            (128, 256, False),  # W4A16
+            (256, 256, True),  # W4A8
+            (512, 512, True),  # W4A8
+        )
+        for rhs_group_size, lhs_group_size, expected in cases:
+            with self.subTest(group_size=rhs_group_size):
+                self.assertEqual(
+                    get_maybe_quantize_lhs(
+                        jnp.float4_e2m1fn,
+                        rhs_group_size,
+                        lhs_group_size,
+                    ),
+                    expected,
+                )
+
 
 class TestNvfp4ModelOptTpuGuard(CustomTestCase):
     """ModelOpt FP4 backend contracts that are reachable without JAX."""
@@ -846,7 +905,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 with self.subTest(case=case_name, method=method_cls.__name__):
                     with self.assertRaisesRegex(
                         ValueError,
-                        f"block-512 extension.*{rejected_field}",
+                        f"large-block extension.*{rejected_field}",
                     ):
                         method_cls(config)
 
@@ -905,7 +964,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
             fp8_config=types.SimpleNamespace(is_fp4_experts=False),
             nvfp4_config=unsupported_tpu_config,
         )
-        with self.assertRaisesRegex(NotImplementedError, "block-512"):
+        with self.assertRaisesRegex(NotImplementedError, "group_size in"):
             unsupported_hybrid.get_quant_method(
                 mock.Mock(spec=FusedMoE), "model.layers.0.mlp.experts"
             )
@@ -990,18 +1049,33 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
 
-    def test_tpu_moe_rejects_non_block512_group_sizes(self):
+    def test_tpu_moe_accepts_supported_group_sizes(self):
         from sglang.srt.layers.quantization import modelopt_quant
 
-        for group_size in (16, 256, None):
+        for group_size in SUPPORTED_BLOCK_SIZES:
             config = modelopt_quant.TpuModelOptCompatibleFp4Config(
                 is_checkpoint_nvfp4_serialized=True,
                 group_size=group_size,
                 exclude_modules=[],
             )
             with self.subTest(group_size=group_size):
-                with self.assertRaisesRegex(NotImplementedError, "block-512"):
-                    modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+                method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
+                self.assertEqual(method.quant_config.group_size, group_size)
+
+    def test_tpu_moe_rejects_unsupported_group_sizes(self):
+        from sglang.srt.layers.quantization import modelopt_quant
+
+        for group_size in (16, 64, 1024, None):
+            config = modelopt_quant.TpuModelOptCompatibleFp4Config(
+                is_checkpoint_nvfp4_serialized=True,
+                group_size=group_size,
+                exclude_modules=[],
+            )
+            with (
+                self.subTest(group_size=group_size),
+                self.assertRaisesRegex(NotImplementedError, "group_size in"),
+            ):
+                modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
 
     def test_folded_scale_checkpoint_skips_unused_auxiliary_parameters(self):
         from sglang.srt.layers.quantization import modelopt_quant
@@ -1058,6 +1132,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         world_size: int = 4,
         model_contract: bool = False,
         backend: str = "auto",
+        group_size: int = BLOCK_SIZE,
     ):
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.quantization import modelopt_quant
@@ -1067,7 +1142,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 "quant_method": "modelopt",
                 "quantization": {
                     "quant_algo": "NVFP4",
-                    "group_size": BLOCK_SIZE,
+                    "group_size": group_size,
                     "exclude_modules": ["self_attn", "lm_head"],
                 },
             }
@@ -1137,11 +1212,17 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         return constructed, method.handles_moe_reduction, prepared, layer
 
     def test_gate_sees_overrides_applied_after_construction(self):
-        constructed, resolved, prepared, _ = self._run_gate()
+        for group_size in SUPPORTED_BLOCK_SIZES:
+            with self.subTest(group_size=group_size):
+                constructed, resolved, prepared, _ = self._run_gate(
+                    group_size=group_size
+                )
 
-        self.assertFalse(constructed, "gate must not be decided in the constructor")
-        self.assertTrue(resolved)
-        self.assertTrue(prepared["use_fused_rs"])
+                self.assertFalse(
+                    constructed, "gate must not be decided in the constructor"
+                )
+                self.assertTrue(resolved)
+                self.assertTrue(prepared["use_fused_rs"])
 
     def test_gate_accepts_post_expert_norm_contract(self):
         _, resolved, prepared, layer = self._run_gate(model_contract=True)
@@ -1163,6 +1244,18 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
 
         self.assertFalse(resolved)
         self.assertFalse(prepared["use_fused_rs"])
+
+    def test_sub512_auto_backend_fails_closed_on_unsupported_layout(self):
+        for group_size in (128, 256):
+            with (
+                self.subTest(group_size=group_size),
+                self.assertRaisesRegex(ValueError, "requires the fused-RS"),
+            ):
+                self._run_gate(
+                    ep_size=2,
+                    world_size=4,
+                    group_size=group_size,
+                )
 
     def test_explicit_pallas_backend_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "Unmet requirements"):

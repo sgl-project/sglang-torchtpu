@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU NVFP4 (``modelopt_fp4``) MoE helpers.
 
-Serves block-512 NVFP4 MoE weights via the packed-FP4 path of the Pallas
-``gmm_v2`` kernel. Checkpoint global scales are folded into the per-block scales.
-No native fp4 MXU on TPU. For block-512 weights, gmm_v2 online-quantizes
-activations to FP8 and uses the W4A8 path. Smaller quantization blocks are not
-supported because they regress performance. The static ``input_scale`` is unused.
+Serves block-128/256/512 NVFP4 MoE weights via the packed-FP4 path of the Pallas
+``gmm_v2`` kernels. Checkpoint global scales are folded into the per-block
+scales. No native fp4 MXU on TPU. Block-512 and block-256 weights use W4A8;
+block-128 uses W4A16. Blocks below 512 require the fused-RS kernel because the
+stock Pallas packed-FP4 path supports block-512 only. The static ``input_scale``
+is unused.
 """
 
 from __future__ import annotations
@@ -22,10 +23,11 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 
-# Block-512 matches the FP8 activation quantization block, enabling a 512-deep
-# W4A8 MXU contraction. Block-16 fragments the contraction or requires bf16
-# dequantization and measured slower than bf16, so it is intentionally rejected.
+# Block-512 matches the original FP8 activation quantization block. The fused-RS
+# kernel additionally supports block-256 with W4A8 and block-128 with W4A16.
+# Keep the singular constant as the default/alignment contract for compatibility.
 TPU_NVFP4_GROUP_SIZE = 512
+TPU_NVFP4_SUPPORTED_GROUP_SIZES = (128, 256, TPU_NVFP4_GROUP_SIZE)
 PACKING = 2  # two FP4 codes per uint8 byte
 
 # Models with post-expert normalization opt in and provide the semantic hooks;
@@ -174,7 +176,10 @@ def unmet_tpu_nvfp4_fused_rs_requirements(
     parallel = get_parallel()
     runner_config = layer.moe_runner_config
     requirements = (
-        (f"group_size == {TPU_NVFP4_GROUP_SIZE}", group_size == TPU_NVFP4_GROUP_SIZE),
+        (
+            f"group_size in {TPU_NVFP4_SUPPORTED_GROUP_SIZES}",
+            group_size in TPU_NVFP4_SUPPORTED_GROUP_SIZES,
+        ),
         ("expert parallelism enabled", layer.moe_ep_size > 1),
         (
             "moe_ep_size == tp_size == world_size",
@@ -244,10 +249,17 @@ def prepare_tpu_nvfp4_moe_weights(
       * ``w2_weight``        (E, H, I/2) u8   -> (E, I_pad/2, H) u8
       * ``w2_weight_scale``  (E, H, I/G) f8   -> (E, I_pad/G, 1, H) scale_dtype
     """
-    if group_size != TPU_NVFP4_GROUP_SIZE:
+    if group_size not in TPU_NVFP4_SUPPORTED_GROUP_SIZES:
         raise NotImplementedError(
-            f"TPU NVFP4 MoE requires group_size={TPU_NVFP4_GROUP_SIZE}, "
+            "TPU NVFP4 MoE requires group_size in "
+            f"{TPU_NVFP4_SUPPORTED_GROUP_SIZES}, "
             f"got {group_size}."
+        )
+    if group_size != TPU_NVFP4_GROUP_SIZE and not use_fused_rs:
+        raise NotImplementedError(
+            f"TPU NVFP4 MoE group_size={group_size} requires the fused-RS "
+            "backend; the stock Pallas packed-FP4 path supports only "
+            f"group_size={TPU_NVFP4_GROUP_SIZE}."
         )
 
     if not layer.moe_runner_config.is_gated:
@@ -374,10 +386,10 @@ def apply_tpu_nvfp4_moe(
                 topk=int(topk_ids.shape[-1]),
                 activation=activation,
                 has_post_expert_norm=has_post_expert_norm,
-                # NVFP4 weights already force the W4A8 path, so GMM2 consumes an
-                # fp8-quantized activation regardless. Writing the fused-RS
-                # payload as fp8 as well would re-quantize an already-lossy
-                # intermediate for no bandwidth win, so keep the bf16 payload.
+                # Keep the fused-RS payload in bf16. Block-128 uses W4A16, while
+                # block-256/512 already quantize the GMM activation on their W4A8
+                # path; fp8 direct-write would either change the block-128 mode or
+                # re-quantize an already-lossy intermediate.
                 fp8_direct_write=False,
                 physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
             )
