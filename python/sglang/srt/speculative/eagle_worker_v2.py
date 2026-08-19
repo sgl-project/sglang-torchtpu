@@ -613,16 +613,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             self._compiled_fused_steps = steps_fn
 
-        # Keep one backend active and pass each step's KV lengths separately.
-        with forward_context(ForwardContext(attn_backend=attn_backends[0])):
-            token_list = steps_fn(
-                forward_batch,
-                topk_p,
-                topk_index,
-                hidden_states,
-                kv_lens_stack,
-                out_cache_loc,
-            )
+        # Draft decode is never a prefill-only operation. A request completing
+        # chunked prefill may retain that scheduler marker. Pin the whole fused
+        # loop to decode while preserving the scheduler-owned value afterward.
+        orig_prefill_only = forward_batch.is_prefill_only
+        forward_batch.is_prefill_only = False
+        try:
+            with forward_context(ForwardContext(attn_backend=attn_backends[0])):
+                token_list = steps_fn(
+                    forward_batch,
+                    topk_p,
+                    topk_index,
+                    hidden_states,
+                    kv_lens_stack,
+                    out_cache_loc,
+                )
+        finally:
+            forward_batch.is_prefill_only = orig_prefill_only
         spec_info.rpa_draft_kv_lens = None
 
         bs = token_list[0].shape[0]

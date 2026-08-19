@@ -217,7 +217,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 )
 
     def _precompile_extend_full(self) -> None:
-        """Compile EXTEND with CaptureHiddenMode.FULL at the fixed batch cap."""
+        """Compile target prefill with and without speculative input state."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
@@ -420,6 +420,10 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                     bs,
                     ForwardMode.DECODE,
                 )
+            # Serving buckets and marks the draft input before attention
+            # metadata is built. Keep padded outputs at their physical width
+            # for every model call in the fused loop.
+            self.prepare_spec_forward_batch(forward_batch)
             self.model_runner.model.prepare_forward_batch(forward_batch)
             draft_attn_backend.init_forward_metadata(forward_batch)
             forward_batch.mark_forward_metadata_ready()

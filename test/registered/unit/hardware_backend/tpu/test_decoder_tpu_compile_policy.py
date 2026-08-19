@@ -1376,6 +1376,7 @@ class TestDraftPrecompile(CustomTestCase):
                     forward_batch.out_cache_loc.shape[0],
                     forward_batch.spec_info.topk_p.shape[0],
                     forward_batch.input_ids,
+                    forward_batch.spec_info.keep_outputs_padded,
                 )
             )
             return torch.zeros(forward_batch.batch_size)
@@ -1385,7 +1386,10 @@ class TestDraftPrecompile(CustomTestCase):
                 FakeDraftBackend(), fused_draft_forward
             )
 
-        self.assertEqual(seen_shapes, [(1, 3, 1, None), (4, 12, 4, None)])
+        self.assertEqual(
+            seen_shapes,
+            [(1, 3, 1, None, True), (4, 12, 4, None, True)],
+        )
         self.assertEqual([len(backend.calls) for backend in step_backends], [2, 2, 2])
 
 

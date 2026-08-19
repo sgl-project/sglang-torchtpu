@@ -222,7 +222,13 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         tokens = tuple(
             torch.full((2, 1), i, dtype=torch.long, device=DEVICE) for i in range(3)
         )
-        worker._compiled_fused_steps = MagicMock(return_value=tokens)
+        observed_prefill_only = []
+
+        def compiled_fused_steps(*args):
+            observed_prefill_only.append(args[0].is_prefill_only)
+            return tokens
+
+        worker._compiled_fused_steps = MagicMock(side_effect=compiled_fused_steps)
         worker.draft_attn_backend = SimpleNamespace(
             attn_backends=[
                 SimpleNamespace(
@@ -243,6 +249,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             spec_info=spec_info,
             out_cache_loc=torch.arange(6, device=DEVICE),
             batch_size=2,
+            is_prefill_only=True,
         )
         per_step_cache = torch.arange(4, device=DEVICE).reshape(2, 2)
 
@@ -265,6 +272,8 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         self.assertEqual(draft_tokens.tolist(), [[0, 1, 2], [0, 1, 2]])
         self.assertIsNone(draft_probs)
         self.assertIsNone(spec_info.rpa_draft_kv_lens)
+        self.assertEqual(observed_prefill_only, [False])
+        self.assertTrue(forward_batch.is_prefill_only)
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
