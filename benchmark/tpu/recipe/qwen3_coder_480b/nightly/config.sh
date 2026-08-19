@@ -155,10 +155,16 @@ ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
 # short early rounds of a session.
 PAGE_SIZE=${PAGE_SIZE:-128}
 
-# HBM split. 480B FP8 weights are ~480 GB, so at tp=16 each rank holds ~30 GB of
-# weights and the KV pool wants everything that is left; 0.85 leaves headroom
-# for activations at an 8k chunk. Lower this first if the server OOMs at launch.
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
+# HBM split. MEASURED on a 2x2x2 tpu7x slice (94.74 GB HBM/rank, weights 30.90 GB
+# at tp=16), not estimated:
+#   0.85 -> XLA compile OOM, 99.26 GB of HLO temporaries vs 94.74 GB available
+#   0.70 -> OOM during precompile, a 585 MB alloc with 406 MB free
+#   0.60 -> starts; KV pool 877,440 tokens/rank, ~37.9 GB left for temporaries
+# 0.60 is the largest value observed to start. The old 0.85 was a reasoned
+# estimate that had never been run and cannot boot this model. Sized for the
+# smoke sweep; a larger sweep changes the activation profile, so re-measure
+# before trusting it for PROFILE=ci/full.
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.60}
 
 # Host KV pool = HICACHE_RATIO x device KV pool. With the 16k normal target the
 # offload pressure comes from the long sessions and the replayed prefixes, not
@@ -166,7 +172,13 @@ MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
 # ~0.5M of normal context, and 3x the device pool covers that once the device
 # pool overflows -- the case KV offload exists for. Costs host RAM: ratio x
 # device pool bytes, so check the pod's memory limit before raising it.
-HICACHE_RATIO=${HICACHE_RATIO:-3}
+# MEASURED: raiden pins its host pool eagerly, and at ratio 3 that is 8 ranks x
+# 3 x the ~26 GB device pool ~= 624 GB, which OOMKilled the pod (node has 963 GB
+# allocatable and jobset-tpu.yaml requests only 32Gi). Ratio 1 (~208 GB) starts.
+# Raising this back toward 3 needs the pod's memory request raised with it --
+# and note the unmerged upstream fix that derives raiden's host staging from a
+# memory budget rather than from the context length.
+HICACHE_RATIO=${HICACHE_RATIO:-1}
 # TPU KV-offload io backend: raiden (default) or torch_tpu. See serve.sh for why
 # raiden -- torch_tpu's precompile_kv_offload stages a pow2-rounded whole-pool
 # D2H needing ~2x the KV pool in HBM.
