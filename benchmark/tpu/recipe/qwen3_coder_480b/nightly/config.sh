@@ -297,7 +297,18 @@ MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' 
 # LONG_TARGET_CONTEXT default no request actually goes past the native window.
 # Throughput is unaffected either way; set ENABLE_LONG_ROPE=0 to serve at the
 # native rope when no leg needs the extrapolation.
-ROPE_SCALING_JSON=${ROPE_SCALING_JSON:-'{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}'}
+# rope_theta MUST be restated here. transformers 5.x folds rope_scaling into
+# rope_parameters, and sglang's get_rope_config() then reads
+# rope_params["rope_theta"] unconditionally -- so an override that omits it
+# REPLACES the checkpoint's rope_parameters with a dict that has no theta, and
+# every scheduler dies at model init with `KeyError: 'rope_theta'` before a
+# single weight is loaded. Verified against transformers 5.8.1 on the real
+# checkpoint: the override without rope_theta fails, with it resolves to
+# {'rope_type': 'yarn', 'factor': 4.0, 'original_max_position_embeddings':
+# 262144, 'rope_theta': 10000000}.
+# Must match the checkpoint's own config.json rope_theta (10000000 here).
+ROPE_THETA=${ROPE_THETA:-10000000}
+ROPE_SCALING_JSON=${ROPE_SCALING_JSON:-"{\"rope_scaling\":{\"rope_type\":\"yarn\",\"factor\":4.0,\"original_max_position_embeddings\":262144,\"rope_theta\":$ROPE_THETA}}"}
 ENABLE_LONG_ROPE=${ENABLE_LONG_ROPE:-1}
 if (( CONTEXT_LEN > 262144 )) && [[ "$ENABLE_LONG_ROPE" == "1" ]]; then
     JSON_MODEL_OVERRIDE=${JSON_MODEL_OVERRIDE:-$ROPE_SCALING_JSON}
