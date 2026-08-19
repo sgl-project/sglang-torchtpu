@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -100,6 +101,7 @@ from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -1828,6 +1830,29 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             loaded_params.add(name)
 
         return loaded_params
+
+
+if current_platform.supports_torch_compile():
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+    # Annotate the decoder boundary so TpuGraphRunner installs torch.compile on
+    # it. Both serving paths hold this same module -- Qwen3_5TextForCausalLM as
+    # `self.model`, the multimodal wrapper as `language_model_cls` -- so
+    # annotating here rather than at either wrapper is what makes both compile
+    # (Qwen3_5MoeForCausalLM inherits the attribute). Qwen3.5 does not use
+    # `Qwen3LLMModel`, the only decoder qwen3_vl annotates, so without this the
+    # decoder runs eager on both entries even with --enable-torch-compile -- the
+    # multimodal one still compiles its vision tower, the text-only one nothing.
+    #
+    # Qwen3VLDecoderTpuCompilePolicy subclasses the plain decoder policy and
+    # only diverges when the owner exposes the VL input_embeds path
+    # (`_uses_input_embeds`), so it is correct for both.
+    support_torch_compile(
+        Qwen3_5ForCausalLM,
+        policy=Qwen3VLDecoderTpuCompilePolicy,
+    )
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
