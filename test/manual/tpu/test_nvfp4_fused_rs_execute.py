@@ -136,6 +136,9 @@ def main() -> None:
         prepare_tpu_nvfp4_moe_weights,
     )
     from sglang.srt.layers.moe.pallas import fused_moe_rs_op
+    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+        _build_fused_moe_rs_op,
+    )
 
     global_experts = 256
     local_experts = global_experts // world_size
@@ -163,6 +166,11 @@ def main() -> None:
     post_norm = torch.linspace(
         -0.25, 0.25, hidden_size, dtype=torch.bfloat16, device=device
     )
+
+    # Export the JAX/Pallas op before Dynamo captures the torch wrapper. JAX's
+    # backend initialization takes a process lock that cannot execute inside a
+    # fullgraph torch.compile trace.
+    _build_fused_moe_rs_op()
 
     def kernel(hidden_states, topk_weights, topk_ids):
         return fused_moe_rs_op.fused_moe_rs_call(
