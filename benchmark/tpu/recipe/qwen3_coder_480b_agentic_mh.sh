@@ -17,11 +17,11 @@
 # HOST / PORT / ENABLE_PROFILER_ENDPOINT / ENABLE_COMPILE_CACHE come from the
 # JobSet template.
 #
-# WEIGHTS PREREQUISITE: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8 must exist on
-# the model-weights-rox PVC. That disk does not carry it yet (its contents list
-# lives in .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl), so this recipe needs a
-# hydration pass before its first green run -- .github/tpu-ci/hydrate-qwen3-coder-480b.yaml,
-# same mechanism as the other multi-host models.
+# WEIGHTS: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8 is already on the shared
+# model-weights-rox PVC (verified on the live disk: 449GiB, 49 safetensors
+# shards, config + tokenizer + index), alongside the EAGLE3 draft the combo test
+# uses. No hydration pass is needed. The disk's contents list lives in
+# .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl.
 set -uo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 

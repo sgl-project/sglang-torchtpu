@@ -17,9 +17,9 @@ that the run is trustworthy at all:
   * the server admitted the work without retracting or aborting requests
 Those are the invariants that make a number mean what it says.
 
-First-run watch items: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8 must be
-hydrated onto the model-weights-rox PVC (see the recipe header), and the tp=16
-dp=4 DP-attention decode precompile -- attn_tp=4 is the shape PR #279 fixed.
+First-run watch items: the tp=16 dp=4 DP-attention decode precompile --
+attn_tp=4 is the shape PR #279 fixed. The weights are already on the shared
+model-weights-rox PVC, so no hydration step is needed.
 """
 
 import json
