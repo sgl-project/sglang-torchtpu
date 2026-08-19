@@ -167,6 +167,10 @@ MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}
 # pool overflows -- the case KV offload exists for. Costs host RAM: ratio x
 # device pool bytes, so check the pod's memory limit before raising it.
 HICACHE_RATIO=${HICACHE_RATIO:-3}
+# TPU KV-offload io backend: raiden (default) or torch_tpu. See serve.sh for why
+# raiden -- torch_tpu's precompile_kv_offload stages a pow2-rounded whole-pool
+# D2H needing ~2x the KV pool in HBM.
+HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-raiden}
 
 # Normal-session replay depth. During a leg with long sessions, the short
 # sessions finish sooner than the long ones; without replays the leg spends
@@ -357,7 +361,7 @@ log_config() {
   torch_compile_max_bs   = $TORCH_COMPILE_MAX_BS
   --- features ---
   prefix_caching         = $([[ "$PREFIX_CACHE" == "1" ]] && echo ENABLED || echo disabled)
-  kv_offload (hicache)   = $([[ "$KV_OFFLOAD" == "1" ]] && echo "ENABLED (io=torch_tpu, layout=page_first_fused, host/device ratio=$HICACHE_RATIO)" || echo disabled)
+  kv_offload (hicache)   = $([[ "$KV_OFFLOAD" == "1" ]] && echo "ENABLED (io=$HICACHE_IO_BACKEND, layout=page_first_fused, host/device ratio=$HICACHE_RATIO)" || echo disabled)
   chunked_prefill        = ENABLED
   metrics endpoint       = $([[ "$ENABLE_METRICS" == "1" ]] && echo ENABLED || echo disabled)
   cache report           = $([[ "$ENABLE_CACHE_REPORT" == "1" ]] && echo ENABLED || echo disabled)

@@ -111,7 +111,6 @@ export DISABLE_RADIX_CACHE=0
 # pow2-ROUNDED whole-pool D2H (next_power_of_2(device_blocks)), needing ~2x the
 # KV pool in HBM; measured on a 480B tp=16 slice it asked for 31 GB and forced
 # mem-fraction-static down to 0.45 to fit. raiden skips it entirely.
-HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-raiden}
 export HICACHE_IO_BACKEND
 export HICACHE_MEM_LAYOUT=page_first_fused
 
