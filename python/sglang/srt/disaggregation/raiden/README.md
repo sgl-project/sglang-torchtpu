@@ -19,21 +19,34 @@ decode runs on `done_recving`. Cross-rank gating is the framework's existing
 `poll_and_all_reduce` (min over ranks); no worker-side barrier. Page ids come
 from `kv_to_page_indices` in token order and are raiden block ids directly.
 
-## Asymmetric attention TP (strided push-resharding)
+## Asymmetric attention TP (controller-planned resharding)
 
 When decode TP < prefill TP (e.g. 8TP (P) -> 4TP2DP (D)), a decode rank
 holds a wider kv-head slice than any single prefill rank, so the whole-block pull
-cannot place it. That case uses raiden's push-resharding (on by default; set
-`SGLANG_RAIDEN_RESHARD=0` to disable): decode rank `r` is fed by prefill ranks
-`r*ratio`(`ratio = src_tp // dst_tp`). The strided interleave lands on the decode
-receiver, which then auto-H2Ds the assembled host staging into HBM.
+cannot place it. That case is planned by a **raiden controller** shared by the
+prefill and decode instances (`SGLANG_RAIDEN_CONTROLLER_ADDR` on both; without
+one, asymmetric TP raises). Decode rank `r` is fed by prefill ranks
+`r*ratio .. (r+1)*ratio-1` (`ratio = src_tp // dst_tp`).
 
-Handshake (decode-initiated, data flows prefill→decode): `RESHARD_REQ` (decode
-endpoint + blocks + tp) → `RESHARD_BLOCKS` (prefill blocks) → decode registers its
-receiver plan → `RESHARD_READY` → prefill `d2h`-stages and `push_registered_plan`.
-Schedules are built in `reshard_schedule.py` (unit-tested in
-`test/manual/kv_transfer/test_reshard_schedule.py`). Requires `ratio` to divide
-the total kv-head count evenly; the byte granule is one kv-head's contiguous K+V.
+At startup each rank registers a **pool table** over its KV tensors — one pool
+per layer, all tagged `kv`, so a transfer naming the tag moves every layer — plus
+a layout fingerprint the controller matches across the transfer's peers
+(`pool_manifest.py`).
+
+Per request (decode-initiated, data flows prefill→decode): `RESHARD_REQ` (decode
+work unit + pages + attn TP) → each prefill rank declares the **byte spans** it
+contributes (`reshard_schedule.py`, unit-tested in
+`test/manual/kv_transfer/test_reshard_schedule.py`) → the group's first rank asks
+the controller to run the transfer → the controller builds the strided schedule,
+arms the decode receiver, then dispatches every sender. Raiden stages
+device→host and auto-H2Ds into decode HBM on its own; both sides observe
+completion through `poll_stats()`. The first rank also forwards the aux/first
+token blob over `RESHARD_AUX`.
+
+Requires `ratio` to divide the total kv-head count evenly; the byte granule is
+one kv-head's contiguous K+V. The sources of a decode rank must claim its bytes
+exactly once, so when kv-heads are replicated across prefill ranks (total kv-head
+count < prefill TP) only the first replica of each head declares them.
 
 DP-attention replicas that co-locate on a decode host get distinct raiden control
 ports via `base + 4*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to
@@ -50,26 +63,28 @@ second engine over the SWA sub-pool's layers. The full engine pulls the whole
 sequence's pages; the SWA engine pulls just the window's pages, using the
 per-side SWA page ids both schedulers already derive for `StateType.SWA`
 (`_swa_payload` in prefill.py/decode.py). The extra block list and endpoint
-ride in the existing `BLOCKS` reply. Symmetric attn TP only: asymmetric TP
-(push-resharding) rejects hybrid models, since the reshard plan carries a
-single block-id space.
+ride in the existing `BLOCKS` reply. Symmetric attn TP only: resharding rejects
+hybrid models, since one rank registers a single pool table today. Giving the
+sliding-window layers their own pool tag is the natural way to lift this.
 
 ## Scope (v1)
 
 Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
 sliding-window at symmetric TP), decode in chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
-push-resharding path above. Needs `tpu_raiden` built against the same `torch_tpu`
-as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP, Mamba/NSA,
-hybrid-SWA under push-resharding, speculative draft KV, decode prefix-cache
-reuse, `dst_tp > src_tp`.
+controller-planned path above. Needs `tpu_raiden` built against the same
+`torch_tpu` as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP,
+Mamba/NSA, hybrid-SWA under resharding, speculative draft KV, decode
+prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*(dp_rank*tp_size + tp_rank)` (data = `+1`, SWA engine control/data = `+2`/`+3`) |
-| `SGLANG_RAIDEN_RESHARD` | `1` | on by default; activates only for asymmetric attn TP (`dst_tp < src_tp`) — symmetric traffic is unaffected. Set `0` to disable (asymmetric TP then raises) and keep the multi-slot host pool instead of the reshard device-shadow sizing. |
+| `SGLANG_RAIDEN_CONTROLLER_ADDR` | *(unset)* | raiden controller `host:port`, shared by the prefill and decode instances. Required for asymmetric attn TP (`dst_tp < src_tp`); symmetric traffic never uses it. |
+| `SGLANG_RAIDEN_PEER_ATTN_TP` | `0` | prefill only: the decode instance's attention TP. Fixes how many prefill ranks form one source set, which the controller admits at startup. |
+| `SGLANG_RAIDEN_JOB_NAME` | `sglang` | prefix of the raiden work-unit job name; distinguishes PD pairs sharing one controller. |
 | `SGLANG_RAIDEN_NUM_SLOTS` | `16` | raiden host-pool transfer slots |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |

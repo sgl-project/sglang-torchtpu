@@ -1,4 +1,4 @@
-"""Strided KV resharding schedules for heterogeneous attention-TP disaggregation.
+"""Strided KV resharding declarations for heterogeneous attention-TP disaggregation.
 
 When prefill attention-TP > decode attention-TP (e.g. 8TP prefill -> 4TP decode
 under DP-attention), a decode rank's kv-head slice spans several prefill ranks.
@@ -9,8 +9,9 @@ Which prefill bytes land where depends on ``total_kv_heads``:
     ``ratio = src_tp // dst_tp`` prefill ranks (writers land at offsets 0, w, 2w…).
   * total_kv_heads < src_tp (e.g. 4 kv-heads at 8TP): kv-heads are REPLICATED
     across prefill ranks, so a decode rank's head is available whole from any of
-    its prefill sources; each writer lands the same head at the same offset
-    (redundant but idempotent).
+    its prefill sources. Only the lowest-numbered replica of each head group
+    declares it (``declares_spans``), because the destination bytes must be
+    claimed exactly once.
 
 Both are captured by ``head_slice_params`` (the same math as sglang's
 ``common.staging_buffer.compute_head_slice_params``), reimplemented here so this
@@ -21,13 +22,15 @@ kv_packing, padded_head_dim]`` tensor per layer. One kv-head's K and V are a
 single contiguous run (``kv_packing`` is outer to ``padded_head_dim``), so a
 per-token head slice is a contiguous ``num_heads * head_pair_bytes`` granule that
 lands strided (period ``dst_heads_per_rank * head_pair_bytes``) in the decode
-token. These builders turn that geometry into
-``raiden_service_pb2.StartTransferRequest`` push schedules.
+token. These builders turn that geometry into the byte spans each prefill rank
+declares to the raiden controller, which plans and arms the transfer from them.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Protocol, Sequence, Tuple
+from typing import List, Protocol, Sequence, Tuple
+
+import msgspec
 
 
 class FusedKVLayerTensor(Protocol):
@@ -38,6 +41,34 @@ class FusedKVLayerTensor(Protocol):
     shape: Sequence[int]
 
     def element_size(self) -> int: ...
+
+
+class PoolByteSpan(msgspec.Struct, frozen=True):
+    """One uniformly strided byte copy between one source and one destination block.
+
+    ``src_block_ordinal`` indexes the declaring rank's own ``block_ids`` list;
+    ``dst_block_index`` indexes the transfer's destination block list. Neither
+    is a physical page id -- the controller binds both when it plans.
+    """
+
+    src_block_ordinal: int
+    src_offset_bytes: int
+    dst_block_index: int
+    dst_offset_bytes: int
+    size_bytes: int
+    src_stride_bytes: int = 0
+    dst_stride_bytes: int = 0
+    count: int = 1
+
+
+class PoolSpanRegistration(msgspec.Struct, frozen=True):
+    """One rank's declared byte contribution to one pool tag."""
+
+    tag: str
+    block_ids: tuple[int, ...]
+    spans: tuple[PoolByteSpan, ...]
+    declared_bytes: int
+    dst_space_version: int = 0
 
 
 def reshard_ratio(src_tp: int, dst_tp: int) -> int:
@@ -140,6 +171,16 @@ class ReshardGeometry:
         self.ratio = reshard_ratio(src_tp, dst_tp)
         self.hp_bytes = hp_bytes
         self.total_kv_heads = total_kv_heads
+        self.replicas_per_head = max(1, src_tp // total_kv_heads)
+
+    def declares_spans(self, prefill_rank: int) -> bool:
+        """Whether ``prefill_rank`` is the rank that claims its head group's bytes.
+
+        With fewer kv-heads than prefill ranks the same head lives on several
+        ranks; the destination bytes must be claimed exactly once, so only the
+        lowest-numbered replica declares them.
+        """
+        return (prefill_rank % self.src_tp) % self.replicas_per_head == 0
 
     def entry_bytes(self, prefill_rank: int, decode_rank: int):
         """Byte (src_offset, size, src_stride, dst_offset, dst_stride) for the
@@ -156,136 +197,52 @@ class ReshardGeometry:
         )
 
 
-def _add_entry(
-    schedule: Any,
+def build_span_registration(
     *,
-    peer: str,
-    src_block_id: int,
-    dst_block_id: int,
-    dst_shard_idx: int,
-    src_offset: int,
-    dst_offset: int,
-    size: int,
-    src_stride: int,
-    dst_stride: int,
-    count: int,
-) -> None:
-    entry = schedule.entries.add()
-    entry.dst_peer = peer
-    entry.dst_shard_idx = dst_shard_idx
-    entry.src_block_id = src_block_id
-    entry.dst_block_id = dst_block_id
-    entry.src_offset_bytes = src_offset
-    entry.dst_offset_bytes = dst_offset
-    entry.size_bytes = size
-    entry.src_stride_bytes = src_stride
-    entry.dst_stride_bytes = dst_stride
-    entry.count = count
-
-
-def build_sender_request(
-    pb2,
-    *,
-    uuid: int,
-    req_id: str,
-    peer: str,
+    tag: str,
+    geom: ReshardGeometry,
     prefill_rank: int,
     decode_rank: int,
-    geom: ReshardGeometry,
     src_block_ids: Sequence[int],
-    dst_block_ids: Sequence[int],
     live_tokens: Sequence[int],
-):
-    """Sender-side StartTransferRequest for one prefill rank pushing to one decode peer.
+) -> PoolSpanRegistration:
+    """Byte spans one prefill rank contributes to one decode rank's pages.
 
-    ``src_block_ids``/``dst_block_ids`` are physical page ids on each side, paired
-    by token order; ``live_tokens[i]`` is the token count (``count``) of page ``i``.
+    ``src_block_ids[i]`` is this rank's physical page holding the same tokens as
+    the transfer's destination page ``i``, and ``live_tokens[i]`` is how many of
+    that page's tokens carry KV. A rank that is a redundant head replica
+    declares no spans, so the union over the decode rank's sources covers each
+    destination page exactly once.
     """
-    if not (len(src_block_ids) == len(dst_block_ids) == len(live_tokens)):
-        raise ValueError(
-            "src_block_ids, dst_block_ids, live_tokens must be equal length"
-        )
-    src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-        prefill_rank, decode_rank
-    )
-    req = pb2.StartTransferRequest()
-    req.uuid = uuid
-    req.req_id = req_id
-    req.is_sender = True
-    req.dst_mem_type = pb2.MEMORY_TYPE_DRAM  # push reads the sender host staging pool
-    req.use_block_chunks = True
-    schedule = req.shard_push_schedules[0]
-    for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
-        if n <= 0:
-            continue
-        _add_entry(
-            schedule,
-            peer=peer,
-            src_block_id=int(src_b),
-            dst_block_id=int(dst_b),
-            dst_shard_idx=0,
-            src_offset=src_off,
-            dst_offset=dst_off,
-            size=size,
-            src_stride=src_stride,
-            dst_stride=dst_stride,
-            count=int(n),
-        )
-    return req
+    if len(src_block_ids) != len(live_tokens):
+        raise ValueError("src_block_ids and live_tokens must be equal length")
 
-
-def build_receiver_request(
-    pb2,
-    *,
-    uuid: int,
-    req_id: str,
-    peer: str,
-    decode_rank: int,
-    geom: ReshardGeometry,
-    sources: List[Tuple[int, Sequence[int]]],
-    dst_block_ids: Sequence[int],
-    live_tokens: Sequence[int],
-    expected_block_count: Optional[int] = None,
-):
-    """Receiver-side StartTransferRequest assembling all sources into decode HBM.
-
-    ``sources`` is ``[(prefill_rank, src_block_ids), ...]`` for the prefill ranks
-    feeding this decode rank; each gets its own shard schedule with its strided
-    dst placement. The receiver selects a source's schedule by the pushing node's
-    id (``header.remote_id``), so each schedule is keyed by its ``prefill_rank``
-    (the sender engine's ``node_id``), not by writer position. ``dst_mem_type =
-    HBM`` makes the receiver auto-H2D the assembled host staging into HBM.
-    """
-    req = pb2.StartTransferRequest()
-    req.uuid = uuid
-    req.req_id = req_id
-    req.is_sender = False
-    req.dst_mem_type = pb2.MEMORY_TYPE_HBM  # auto-H2D host staging -> decode HBM
-    req.use_block_chunks = True
-    total = 0
-    for prefill_rank, src_block_ids in sources:
+    spans: List[PoolByteSpan] = []
+    declared_bytes = 0
+    if geom.declares_spans(prefill_rank):
         src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
             prefill_rank, decode_rank
         )
-        schedule = req.shard_push_schedules[prefill_rank]
-        for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
-            if n <= 0:
+        for ordinal, tokens in enumerate(live_tokens):
+            if tokens <= 0:
                 continue
-            _add_entry(
-                schedule,
-                peer=peer,
-                src_block_id=int(src_b),
-                dst_block_id=int(dst_b),
-                dst_shard_idx=0,
-                src_offset=src_off,
-                dst_offset=dst_off,
-                size=size,
-                src_stride=src_stride,
-                dst_stride=dst_stride,
-                count=int(n),
+            spans.append(
+                PoolByteSpan(
+                    src_block_ordinal=ordinal,
+                    src_offset_bytes=src_off,
+                    dst_block_index=ordinal,
+                    dst_offset_bytes=dst_off,
+                    size_bytes=size,
+                    src_stride_bytes=src_stride,
+                    dst_stride_bytes=dst_stride,
+                    count=int(tokens),
+                )
             )
-            total += 1
-    req.expected_block_count = (
-        total if expected_block_count is None else int(expected_block_count)
+            declared_bytes += size * int(tokens)
+
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(b) for b in src_block_ids),
+        spans=tuple(spans),
+        declared_bytes=declared_bytes,
     )
-    return req

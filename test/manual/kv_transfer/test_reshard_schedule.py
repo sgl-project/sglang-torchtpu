@@ -1,8 +1,7 @@
-"""Unit tests for the asymmetric-TP KV resharding schedule builder.
+"""Unit tests for the asymmetric-TP KV resharding byte-span declarations.
 
-Pure byte-math and protobuf construction (the proto is mocked), so these run
-anywhere -- no TPU / torch_tpu / tpu_raiden required. The on-device push path is
-validated separately on a TPU VM.
+Pure byte-math, so these run anywhere -- no TPU / torch_tpu / tpu_raiden
+required. The on-device transfer is validated separately on a TPU VM.
 
 Run: python -m pytest test/manual/kv_transfer/test_reshard_schedule.py
 """
@@ -10,44 +9,6 @@ Run: python -m pytest test/manual/kv_transfer/test_reshard_schedule.py
 import unittest
 
 from sglang.srt.disaggregation.raiden import reshard_schedule as rs
-
-
-# ---- mock protobuf StartTransferRequest --------------------------------------
-class _Entry:
-    pass
-
-
-class _EntryList(list):
-    def add(self):
-        e = _Entry()
-        self.append(e)
-        return e
-
-
-class _Schedule:
-    def __init__(self):
-        self.entries = _EntryList()
-
-
-class _ScheduleMap(dict):
-    def __getitem__(self, k):
-        if k not in self:
-            self[k] = _Schedule()
-        return dict.__getitem__(self, k)
-
-
-class _Req:
-    def __init__(self):
-        self.shard_push_schedules = _ScheduleMap()
-
-
-class _Pb2:
-    MEMORY_TYPE_DRAM = 1
-    MEMORY_TYPE_HBM = 2
-
-    @staticmethod
-    def StartTransferRequest():
-        return _Req()
 
 
 # ---- mock fused tensor [num_blocks, page, kv_heads_packed, kv_packing, hd] ----
@@ -60,9 +21,39 @@ class _Tensor:
         return self._itemsize
 
 
+def _covered_intervals(registrations, dst_block_index):
+    """Every byte interval the given declarations write to one destination page."""
+    intervals = []
+    for registration in registrations:
+        for span in registration.spans:
+            if span.dst_block_index != dst_block_index:
+                continue
+            for repeat in range(span.count):
+                start = span.dst_offset_bytes + repeat * span.dst_stride_bytes
+                intervals.append((start, start + span.size_bytes))
+    return sorted(intervals)
+
+
+def _declare_all_sources(geom, decode_rank, src_block_ids, live_tokens):
+    """Declarations from every prefill rank feeding one decode rank."""
+    return [
+        rs.build_span_registration(
+            tag="kv",
+            geom=geom,
+            prefill_rank=prefill_rank,
+            decode_rank=decode_rank,
+            src_block_ids=src_block_ids,
+            live_tokens=live_tokens,
+        )
+        for prefill_rank in rs.source_ranks_for(decode_rank, geom.ratio)
+    ]
+
+
 class ReshardGeometryTest(unittest.TestCase):
     def test_head_pair_bytes_matches_both_sides(self):
-        # hd=128 (bf16, kv_packing=2): head-pair = 2*128*2 = 512B.
+        # hd=128 (bf16, kv_packing=2): head-pair = 2*128*2 = 512B. The granule
+        # must be independent of the per-rank head count, since the two sides of
+        # a reshard hold different head counts.
         prefill_t = _Tensor((100, 1024, 1, 2, 128), 2)
         decode_t = _Tensor((100, 1024, 2, 2, 128), 2)
         self.assertEqual(rs.head_pair_bytes(prefill_t), 512)
@@ -85,7 +76,7 @@ class ReshardGeometryTest(unittest.TestCase):
     def test_geometry_8_to_4_replication_qwen3(self):
         # total_kv_heads=4 < src_tp=8: heads replicated across prefill ranks. Both
         # of decode rank r's sources hold the SAME head, landing at offset 0 with
-        # dst per-token width 512 (1 head/token). Whole-block, idempotent.
+        # dst per-token width 512 (1 head/token).
         geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4)
         for p, r in [(0, 0), (1, 0), (6, 3), (7, 3)]:
             src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(p, r)
@@ -107,112 +98,109 @@ class ReshardGeometryTest(unittest.TestCase):
             rs.reshard_ratio(8, 3)
 
 
-class SenderRequestTest(unittest.TestCase):
-    def test_sender_concat_dst_placement(self):
-        # 8 kv-heads: prefill rank 1 -> decode rank 0, second writer at offset 512.
+class DeclaringRankTest(unittest.TestCase):
+    def test_every_rank_declares_when_heads_are_distinct(self):
         geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
-        req = rs.build_sender_request(
-            _Pb2,
-            uuid=42,
-            req_id="42",
-            peer="10.0.0.9:30001",
+        self.assertTrue(all(geom.declares_spans(rank) for rank in range(8)))
+
+    def test_only_the_first_replica_declares(self):
+        # 4 kv-heads over 8 prefill ranks: each head lives on two ranks. The
+        # destination bytes may be claimed only once, so the odd ranks stay out.
+        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4)
+        self.assertEqual(
+            [rank for rank in range(8) if geom.declares_spans(rank)], [0, 2, 4, 6]
+        )
+        silent = rs.build_span_registration(
+            tag="kv",
+            geom=geom,
             prefill_rank=1,
             decode_rank=0,
+            src_block_ids=[5, 6],
+            live_tokens=[1024, 1024],
+        )
+        self.assertEqual(silent.spans, ())
+        self.assertEqual(silent.declared_bytes, 0)
+        # The block ids still ride along: the controller admits a source set only
+        # when every one of its ranks has registered.
+        self.assertEqual(silent.block_ids, (5, 6))
+
+
+class SpanCoverageTest(unittest.TestCase):
+    """The rule the controller enforces: the sources of one decode rank must
+    tile each destination page exactly once -- no gap, no overlap."""
+
+    def _assert_tiles(self, registrations, num_pages, live_tokens, dst_token_bytes):
+        for page in range(num_pages):
+            intervals = _covered_intervals(registrations, page)
+            self.assertTrue(intervals, f"page {page} has no coverage")
+            covered_until = 0
+            for start, end in intervals:
+                self.assertEqual(start, covered_until, f"page {page} is not a tiling")
+                covered_until = end
+            self.assertEqual(covered_until, live_tokens[page] * dst_token_bytes)
+
+    def test_concat_sources_tile_each_page(self):
+        # 8 kv-heads, 8TP -> 4TP: two writers of one head each fill a 2-head
+        # decode token.
+        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
+        live_tokens = [1024, 1024, 300]
+        registrations = _declare_all_sources(
+            geom, decode_rank=0, src_block_ids=[5, 6, 7], live_tokens=live_tokens
+        )
+        self._assert_tiles(registrations, 3, live_tokens, dst_token_bytes=1024)
+
+    def test_replicated_sources_tile_each_page(self):
+        # 4 kv-heads, 8TP -> 4TP: only the first replica declares, so the single
+        # head still tiles the 1-head decode token exactly once.
+        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4)
+        live_tokens = [1024, 700]
+        registrations = _declare_all_sources(
+            geom, decode_rank=2, src_block_ids=[1, 2], live_tokens=live_tokens
+        )
+        self._assert_tiles(registrations, 2, live_tokens, dst_token_bytes=512)
+
+    def test_declared_bytes_matches_spans(self):
+        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
+        registration = rs.build_span_registration(
+            tag="kv",
             geom=geom,
+            prefill_rank=1,
+            decode_rank=0,
             src_block_ids=[5, 6, 7],
-            dst_block_ids=[50, 60, 70],
             live_tokens=[1024, 1024, 300],
         )
-        self.assertTrue(req.is_sender)
-        self.assertEqual(req.dst_mem_type, _Pb2.MEMORY_TYPE_DRAM)
-        entries = req.shard_push_schedules[0].entries
-        self.assertEqual(len(entries), 3)
-        e = entries[0]
-        self.assertEqual((e.src_block_id, e.dst_block_id), (5, 50))
-        self.assertEqual(
-            (e.src_offset_bytes, e.size_bytes, e.src_stride_bytes), (0, 512, 512)
+        self.assertEqual(registration.declared_bytes, 512 * (1024 + 1024 + 300))
+        first = registration.spans[0]
+        self.assertEqual((first.src_block_ordinal, first.dst_block_index), (0, 0))
+        self.assertEqual(first.dst_offset_bytes, 512)
+        self.assertEqual(first.dst_stride_bytes, 1024)
+        self.assertEqual(registration.spans[2].count, 300)  # tail page
+
+    def test_empty_page_is_not_declared(self):
+        # A page with no live token must claim no destination bytes, or the
+        # controller sees an overlap against the rank that does own them.
+        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
+        registration = rs.build_span_registration(
+            tag="kv",
+            geom=geom,
+            prefill_rank=0,
+            decode_rank=0,
+            src_block_ids=[5, 6],
+            live_tokens=[1024, 0],
         )
-        self.assertEqual(e.dst_offset_bytes, 512)
-        self.assertEqual(e.dst_stride_bytes, 1024)
-        self.assertEqual(e.count, 1024)
-        self.assertEqual(entries[2].count, 300)  # tail page
+        self.assertEqual([span.dst_block_index for span in registration.spans], [0])
 
     def test_length_mismatch_raises(self):
         geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
         with self.assertRaises(ValueError):
-            rs.build_sender_request(
-                _Pb2,
-                uuid=1,
-                req_id="1",
-                peer="p",
+            rs.build_span_registration(
+                tag="kv",
+                geom=geom,
                 prefill_rank=0,
                 decode_rank=0,
-                geom=geom,
                 src_block_ids=[1, 2],
-                dst_block_ids=[1],
-                live_tokens=[1024, 1024],
+                live_tokens=[1024],
             )
-
-
-class ReceiverRequestTest(unittest.TestCase):
-    def test_receiver_concat_two_writers_8heads(self):
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=8)
-        req = rs.build_receiver_request(
-            _Pb2,
-            uuid=42,
-            req_id="42",
-            peer="10.0.0.5:30001",
-            decode_rank=0,
-            geom=geom,
-            sources=[(0, [5, 6, 7]), (1, [5, 6, 7])],
-            dst_block_ids=[50, 60, 70],
-            live_tokens=[1024, 1024, 300],
-        )
-        self.assertFalse(req.is_sender)
-        self.assertEqual(req.dst_mem_type, _Pb2.MEMORY_TYPE_HBM)
-        self.assertEqual(req.expected_block_count, 6)  # 2 writers * 3 pages
-        self.assertEqual(req.shard_push_schedules[0].entries[0].dst_offset_bytes, 0)
-        self.assertEqual(req.shard_push_schedules[1].entries[0].dst_offset_bytes, 512)
-        self.assertEqual(req.shard_push_schedules[0].entries[0].dst_stride_bytes, 1024)
-
-    def test_receiver_replication_two_writers_qwen3(self):
-        # 4 kv-heads: both writers land the same head at offset 0 (idempotent).
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4)
-        req = rs.build_receiver_request(
-            _Pb2,
-            uuid=7,
-            req_id="7",
-            peer="10.0.0.5:30001",
-            decode_rank=0,
-            geom=geom,
-            sources=[(0, [5]), (1, [5])],
-            dst_block_ids=[50],
-            live_tokens=[1024],
-        )
-        self.assertEqual(req.expected_block_count, 2)  # 2 writers * 1 page
-        self.assertEqual(req.shard_push_schedules[0].entries[0].dst_offset_bytes, 0)
-        self.assertEqual(req.shard_push_schedules[1].entries[0].dst_offset_bytes, 0)
-        self.assertEqual(req.shard_push_schedules[0].entries[0].dst_stride_bytes, 512)
-
-    def test_receiver_schedule_keyed_by_source_node_id(self):
-        # Decode rank 2 is fed by prefill ranks 4 and 5. The receiver picks a
-        # source's schedule by the pushing node's id, so the schedules must be
-        # keyed by prefill rank (4, 5), not by writer position (0, 1).
-        geom = rs.ReshardGeometry(src_tp=8, dst_tp=4, hp_bytes=512, total_kv_heads=4)
-        req = rs.build_receiver_request(
-            _Pb2,
-            uuid=9,
-            req_id="9",
-            peer="10.0.0.5:30001",
-            decode_rank=2,
-            geom=geom,
-            sources=[(4, [1]), (5, [1])],
-            dst_block_ids=[1],
-            live_tokens=[1024],
-        )
-        self.assertEqual(set(req.shard_push_schedules.keys()), {4, 5})
-        self.assertEqual(req.shard_push_schedules[4].entries[0].src_block_id, 1)
-        self.assertEqual(req.shard_push_schedules[5].entries[0].dst_block_id, 1)
 
 
 if __name__ == "__main__":

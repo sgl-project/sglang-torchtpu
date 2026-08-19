@@ -13,11 +13,13 @@ existing ZMQ rank sockets and HTTP bootstrap server from ``CommonKVManager`` are
 reused unchanged for the rendezvous.
 
 When decode TP < prefill TP (e.g. 8TP->4TP2DP), a decode rank's kv-head slice
-spans several prefill ranks, so a whole-block pull cannot place them.
-That case switches to raiden's strided push-resharding. Each prefill source
-stages its blocks device->host, then pushes its head-slice strided
-into the decode block's sub-region; the decode receiver auto-H2Ds the assembled
-host staging into HBM. Schedules are built in ``reshard_schedule.py``.
+spans several prefill ranks, so a whole-block pull cannot place them. That case
+is planned by the raiden controller: every rank registers a tagged pool table
+over its KV tensors, each prefill rank declares the byte spans it contributes to
+the decode pages, and the controller builds the strided schedule, arms the
+decode receiver, and dispatches the senders. Raiden stages device->host and
+auto-H2Ds into decode HBM on its own. Span geometry is built in
+``reshard_schedule.py``; the pool table in ``pool_manifest.py``.
 """
 
 from __future__ import annotations
@@ -45,15 +47,23 @@ from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
     pack_blocks,
     pack_ints,
+    pack_unit,
     read_aux_blob,
     unpack_blocks,
     unpack_ints,
+    unpack_unit,
     write_aux_blob,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# Bounds the wait for the other prefill ranks of a group to publish their span
+# declarations. The controller rejects a plan whose sources are not all
+# registered, and that rejection happens before any receiver is armed, so it is
+# retried; every other failure surfaces immediately.
+_MISSING_REGISTRATION_ERROR = "Missing producer block registration"
 
 
 @dataclass(frozen=True)
@@ -131,13 +141,22 @@ class RaidenKVManager(CommonKVManager):
         self._local_rank = self.attn_dp_rank * self.attn_tp_size + self.attn_tp_rank
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
-        # Strided push-resharding for asymmetric TP (decode TP < prefill TP),
-        # on by default and auto-engaged per request only when a
-        # decode rank is fed by several prefill ranks; symmetric traffic never
-        # enters this path. Set SGLANG_RAIDEN_RESHARD=0 to disable it (an
-        # asymmetric topology then raises) and keep the multi-slot host staging
-        # pool instead of the device-shadow sizing the reshard receiver needs.
-        self._reshard_enabled = bool(int(os.environ.get("SGLANG_RAIDEN_RESHARD", "1")))
+
+        # Resharding for asymmetric TP (decode TP < prefill TP) is planned by a
+        # raiden controller shared by the prefill and decode instances. Without
+        # one, only the symmetric pull path is available.
+        self._controller_addr = os.environ.get(
+            "SGLANG_RAIDEN_CONTROLLER_ADDR", ""
+        ).strip()
+        self._job_name = os.environ.get("SGLANG_RAIDEN_JOB_NAME", "sglang").strip()
+        self._reshard_enabled = bool(self._controller_addr)
+        # Prefill only: the decode instance's attention TP. It fixes how many
+        # prefill ranks feed one decode rank, which the controller admits at
+        # work-unit registration, long before the first request names a peer.
+        self._peer_attn_tp = int(os.environ.get("SGLANG_RAIDEN_PEER_ATTN_TP", "0"))
+        self._manifest: Optional[Any] = None
+        self._facade: Optional[Any] = None
+        self._work_unit: Optional[Any] = None
 
         # Completion sets, drained from raiden and keyed by str(room). Persist
         # until clear() so repeated poll() calls before the framework advances
@@ -166,79 +185,80 @@ class RaidenKVManager(CommonKVManager):
             self._remote_endpoint: Dict[int, str] = {}
             self._remote_swa_endpoint: Dict[int, str] = {}
 
-        # Asymmetric-TP resharding state, populated lazily on the push path.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # room -> decode meta from RESHARD_REQ
             self._reshard_req: Dict[int, dict] = {}
             self._reshard_finalized: Set[int] = set()  # send accumulation complete
-            self._reshard_replied: Set[int] = set()  # RESHARD_BLOCKS sent
-            self._reshard_ready: Set[int] = set()  # rooms cleared to push
-            self._reshard_pushed: Set[int] = set()
-            # Push (d2h wait + per-layer push_registered_plan) runs off the
-            # _listen dispatch thread. raiden runs SyncPush unlocked, so
-            # _reshard_push_lock serializes register+push across workers.
+            self._reshard_registered: Set[int] = set()  # spans declared to controller
+            self._reshard_submitted: Set[int] = set()
+            # Declaring spans and submitting the plan are blocking control-plane
+            # RPCs, so they run off the _listen dispatch thread.
             self._push_executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=max(
                     1, int(os.environ.get("SGLANG_RAIDEN_PUSH_WORKERS", "1"))
                 ),
-                thread_name_prefix="raiden-reshard-push",
+                thread_name_prefix="raiden-reshard-submit",
             )
-            self._reshard_push_lock = threading.Lock()
-        else:
-            # room -> {src_prefill_rank: prefill_block_ids} and per-room meta.
-            self._reshard_sources: Dict[int, Dict[int, List[int]]] = {}
-            self._reshard_meta: Dict[int, dict] = {}
-            self._reshard_registered: Set[int] = set()
-        # Round-robin host staging slots for the push path (device->host stage on
-        # prefill; host staging on decode is written by raiden's receiver).
-        self._reshard_slot_rooms: List[Optional[int]] = [None] * max(
-            1, int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "16"))
-        )
-        self._reshard_slot_of: Dict[int, int] = {}
 
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
 
-    # ----- resharding geometry / host-slot helpers --------------------------
+    # ----- resharding topology / identity -----------------------------------
+
+    def _reshard_ratio(self) -> int:
+        """Prefill ranks feeding one decode rank, from the configured peer TP."""
+        from sglang.srt.disaggregation.raiden.reshard_schedule import reshard_ratio
+
+        if self._peer_attn_tp <= 0:
+            raise RuntimeError(
+                "Raiden resharding needs the decode instance's attention TP on "
+                "the prefill side: set SGLANG_RAIDEN_PEER_ATTN_TP."
+            )
+        return reshard_ratio(self.attn_tp_size, self._peer_attn_tp)
+
+    def _work_unit_fields(self) -> Dict[str, Any]:
+        role = (
+            "prefill"
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else "decode"
+        )
+        return dict(
+            job_name=f"{self._job_name}-{role}",
+            job_replica_id=str(self.attn_dp_rank),
+            data_name="kv_cache",
+            data_replica_idx=int(self.attn_tp_rank),
+        )
+
+    def _source_units(self) -> List[Any]:
+        """Work units of the prefill ranks feeding this rank's decode rank."""
+        from tpu_raiden.rpc.raiden_controller import RaidenId
+
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            decode_rank_for,
+            source_ranks_for,
+        )
+
+        ratio = self._reshard_ratio()
+        decode_rank = decode_rank_for(self.attn_tp_rank, ratio)
+        fields = self._work_unit_fields()
+        return [
+            RaidenId(**{**fields, "data_replica_idx": rank})
+            for rank in source_ranks_for(decode_rank, ratio)
+        ]
 
     def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int):
         """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, sized from
-        the local fused KV tensor (the K+V head-pair granule matches on both
+        the registered pool manifest (the K+V head-pair granule matches on both
         sides) and the global kv-head count.
         """
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
-            ReshardGeometry,
-            head_pair_bytes,
-        )
+        from sglang.srt.disaggregation.raiden.reshard_schedule import ReshardGeometry
 
-        tensor = self._kv_caches[0]
-        hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
-        return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
-
-    def _host_slot_blocks(self, room: int, n: int) -> List[int]:
-        """Host staging block-ids for ``room`` (n blocks) in a round-robin slot.
-
-        Slot ``s`` owns host blocks ``[s*max_blocks, s*max_blocks + n)``; reused
-        once the room is cleared. Raises if all slots are in flight.
-        """
-        slot = self._reshard_slot_of.get(room)
-        if slot is None:
-            try:
-                slot = self._reshard_slot_rooms.index(None)
-            except ValueError:
-                raise RuntimeError("raiden reshard: no free host staging slot")
-            self._reshard_slot_rooms[slot] = room
-            self._reshard_slot_of[room] = slot
-        base = slot * self._max_request_blocks()
-        return [base + i for i in range(n)]
-
-    def _release_host_slot(self, room: int) -> None:
-        slot = self._reshard_slot_of.pop(room, None)
-        if slot is not None:
-            self._reshard_slot_rooms[slot] = None
+        return ReshardGeometry(
+            src_attn_tp, dst_attn_tp, self._manifest.head_pair_bytes, total_kv_heads
+        )
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -269,14 +289,8 @@ class RaidenKVManager(CommonKVManager):
 
         max_blocks = self._max_request_blocks()
         num_slots = self._num_slots()
-        # Reshard staging is indexed 1-to-1 by device block id. Size it to
-        # the fused tensor's block count with a single slot.
-        if self._reshard_enabled:
-            num_blocks = int(self._kv_caches[0].shape[0])
-            max_blocks = num_blocks
-            num_slots = 1
         self.raiden_endpoint = f"{self.local_ip}:{self._control_port}"
-        self._engine = KVCacheManager(
+        kwargs = dict(
             kv_caches=self._kv_caches,
             node_id=self._local_rank,
             local_control_port=self._control_port,
@@ -284,6 +298,14 @@ class RaidenKVManager(CommonKVManager):
             num_slots=num_slots,
             timeout_s=self._timeout_s,
         )
+        if self._reshard_enabled:
+            # The controller arms this rank over the native listener, and reads
+            # back its parallelism when it admits a plan's source set.
+            kwargs.update(
+                listener_port=0,
+                parallelism=self._transfer_parallelism(),
+            )
+        self._engine = KVCacheManager(**kwargs)
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
             "num_slots=%d",
@@ -292,6 +314,8 @@ class RaidenKVManager(CommonKVManager):
             max_blocks,
             num_slots,
         )
+        if self._reshard_enabled:
+            self._register_pools_and_work_unit()
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
             swa_max_blocks = self._max_request_blocks()
@@ -312,6 +336,67 @@ class RaidenKVManager(CommonKVManager):
                 swa_max_blocks,
                 swa_num_slots,
             )
+
+    def _transfer_parallelism(self) -> int:
+        """Ranks the controller admits as one source set for a reshard plan."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return self._reshard_ratio()
+        return 1
+
+    def _transfer_rank(self) -> int:
+        """This rank's position in its source set (contiguous from zero)."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return self.attn_tp_rank % self._reshard_ratio()
+        return 0
+
+    def _register_pools_and_work_unit(self) -> None:
+        """Publish this rank's block pools and transfer identity to the controller.
+
+        The pool table gives raiden a byte-level address space over the KV
+        tensors -- one pool per layer, all under one tag, so a transfer that
+        names the tag moves every layer. The controller matches the layout
+        fingerprint and pool tags across a transfer's peers before it plans.
+        """
+        from tpu_raiden.rpc.raiden_controller import (
+            RaidenControllerClientFacade,
+            RaidenId,
+        )
+
+        from sglang.srt.disaggregation.raiden.pool_manifest import build_pool_manifest
+
+        manifest = build_pool_manifest(
+            self._kv_caches, total_kv_heads=int(self.kv_args.total_kv_head_num)
+        )
+        summary = self._engine.register_pools(manifest.pool_dicts())
+
+        unit = RaidenId(**self._work_unit_fields())
+        facade = RaidenControllerClientFacade(self._controller_addr)
+        facade.register_work_unit(
+            unit=unit,
+            shards=[self._engine.transfer_address],
+            control_plane_rpc_address=self._engine.listener_address,
+            pool_manifest=manifest.pool_dicts(),
+            layout_fingerprint=manifest.layout_fingerprint,
+            page_tokens=manifest.page_tokens,
+            transfer_parallelism=self._transfer_parallelism(),
+            transfer_rank=self._transfer_rank(),
+        )
+        self._manifest = manifest
+        self._facade = facade
+        self._work_unit = unit
+        logger.info(
+            "RaidenKVManager rank%d registered with controller=%s | unit=%s "
+            "data=%s listener=%s pools=%s rank=%d/%d fingerprint=%s",
+            self.attn_tp_rank,
+            self._controller_addr,
+            unit,
+            self._engine.transfer_address,
+            self._engine.listener_address,
+            summary,
+            self._transfer_rank(),
+            self._transfer_parallelism(),
+            manifest.layout_fingerprint,
+        )
 
     def _max_request_blocks(self) -> int:
         override = int(os.environ.get("SGLANG_RAIDEN_MAX_BLOCKS", "0"))
@@ -338,7 +423,7 @@ class RaidenKVManager(CommonKVManager):
 
     @staticmethod
     def _norm_req_id(rid: str) -> str:
-        # Resharded (push) transfers surface as "resharded_transfer_<room>" from
+        # Resharded transfers surface as "resharded_transfer_<room>" from
         # poll_stats; strip the prefix so completion maps back to str(room).
         prefix = "resharded_transfer_"
         return rid[len(prefix) :] if rid.startswith(prefix) else rid
@@ -385,10 +470,8 @@ class RaidenKVManager(CommonKVManager):
                     self._on_blocks(msg)
                 elif msg[0] == MessageTag.RESHARD_REQ:
                     self._on_reshard_req(msg)
-                elif msg[0] == MessageTag.RESHARD_BLOCKS:
-                    self._on_reshard_blocks(msg)
-                elif msg[0] == MessageTag.RESHARD_READY:
-                    self._on_reshard_ready(msg)
+                elif msg[0] == MessageTag.RESHARD_AUX:
+                    self._on_reshard_aux(msg)
                 else:
                     logger.warning("RaidenKVManager unknown header: %s", msg[0])
             except Exception as e:
@@ -478,10 +561,10 @@ class RaidenKVManager(CommonKVManager):
             self._reshard_finalized.add(room)
             is_reshard = room in self._reshard_req
         # The request type is selected by the decode handshake, not by whether
-        # reshard support is globally enabled. Symmetric TP uses PULL_REQ even
-        # when resharding is available; asymmetric TP uses RESHARD_REQ.
+        # resharding is globally available. Symmetric TP uses PULL_REQ even when
+        # a controller is configured; asymmetric TP uses RESHARD_REQ.
         if is_reshard:
-            self._maybe_reshard_reply(room)
+            self._maybe_declare_spans(room)
         else:
             self._maybe_reply(room)
 
@@ -535,8 +618,8 @@ class RaidenKVManager(CommonKVManager):
                     "symmetric attention TP for prefill and decode."
                 )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
-            # decode rank is fed by several prefill ranks, each pushing its
-            # head-slice strided into the wider decode block.
+            # decode rank is fed by several prefill ranks, each declaring its
+            # head-slice into the wider decode block.
             if self._reshard_enabled:
                 if not local_blocks:
                     # Full prefix-cache hit: decode already holds every page,
@@ -544,16 +627,14 @@ class RaidenKVManager(CommonKVManager):
                     with self._state_lock:
                         self._completed_recv.add(str(room))
                     return
-                self._register_reshard_request(
-                    room, local_blocks, aux_index, bootstrap_infos
-                )
+                self._request_reshard(room, local_blocks, aux_index, bootstrap_infos)
                 self.update_status(room, KVPoll.WaitingForInput)
                 return
             raise NotImplementedError(
                 "Raiden asymmetric attention TP (got "
                 f"{len(bootstrap_infos)} prefill sources for one decode rank) "
-                "needs strided push-resharding, but it is disabled "
-                "(SGLANG_RAIDEN_RESHARD=0); unset it to enable."
+                "is planned by a raiden controller, but none is configured; "
+                "set SGLANG_RAIDEN_CONTROLLER_ADDR on both instances."
             )
         with self._state_lock:
             self._local_blocks[room] = local_blocks
@@ -628,43 +709,26 @@ class RaidenKVManager(CommonKVManager):
             )
         return True
 
-    # ----- asymmetric-TP resharding (producer-push) -------------------------
+    # ----- asymmetric-TP resharding (controller-planned push) ---------------
     #
     # Data flows prefill -> decode. Handshake (decode-initiated), per decode rank
     # r fed by prefill ranks {r*ratio .. (r+1)*ratio-1}:
-    #   1. decode -> each source: RESHARD_REQ (decode push endpoint + blocks + tp)
-    #   2. source -> decode: RESHARD_BLOCKS (its blocks + rank + aux)
-    #   3. decode registers its receiver plan, then -> sources: RESHARD_READY
-    #   4. source: d2h stage -> register sender plan -> push_registered_plan
-    # The strided head-interleave is realized on the receive side; the decode
-    # receiver auto-H2Ds host staging into HBM (dst_mem_type=HBM).
+    #   1. decode -> each source: RESHARD_REQ (its work unit + pages + attn TP)
+    #   2. each source declares its byte spans to the controller
+    #   3. the group's first source asks the controller to run the transfer; the
+    #      controller arms the decode receiver, then dispatches every sender
+    #   4. senders stage device->host and push; the receiver auto-H2Ds into HBM
+    # The first source also forwards the aux/first-token blob over RESHARD_AUX.
+    # Both sides observe completion through poll_stats().
 
-    def _register_reshard_request(
+    def _request_reshard(
         self,
         room: int,
         local_blocks: List[int],
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
-        # bootstrap_infos is ordered by the decode->prefill target_tp_ranks
-        # (range(r*ratio, (r+1)*ratio)); ratio == number of prefill sources.
-        ratio = len(bootstrap_infos)
-        src_attn_tp = self.attn_tp_size * ratio
-        r = self.kv_args.engine_rank % self.attn_tp_size
-        source_ranks = list(range(r * ratio, (r + 1) * ratio))
-        push_endpoint = self._ensure_engine().transfer_address
-        ready_endpoints = [
-            f"tcp://{info['rank_ip']}:{info['rank_port']}" for info in bootstrap_infos
-        ]
         with self._state_lock:
-            self._reshard_meta[room] = dict(
-                local_blocks=list(local_blocks),
-                source_ranks=list(source_ranks),
-                src_attn_tp=int(src_attn_tp),
-                aux_index=aux_index,
-                ready_endpoints=ready_endpoints,
-            )
-            self._reshard_sources[room] = {}
             if aux_index is not None:
                 self._decode_aux_index[room] = aux_index
         payload = [
@@ -672,7 +736,7 @@ class RaidenKVManager(CommonKVManager):
             str(room).encode("ascii"),
             self.local_ip.encode("ascii"),
             str(self.rank_port).encode("ascii"),
-            push_endpoint.encode("ascii"),
+            pack_unit(self._work_unit_fields()),
             pack_ints(list(local_blocks)),
             str(self.attn_tp_size).encode("ascii"),
         ]
@@ -686,57 +750,24 @@ class RaidenKVManager(CommonKVManager):
         room = int(msg[1].decode("ascii"))
         decode_ip = msg[2].decode("ascii")
         decode_port = int(msg[3].decode("ascii"))
-        push_endpoint = msg[4].decode("ascii")
+        decode_unit_fields = unpack_unit(msg[4])
         decode_blocks = unpack_ints(msg[5])
         dst_attn_tp = int(msg[6].decode("ascii"))
         with self._state_lock:
             self._reshard_req[room] = dict(
                 reply_addr=(decode_ip, decode_port),
-                push_endpoint=push_endpoint,
+                decode_unit_fields=decode_unit_fields,
                 decode_blocks=decode_blocks,
                 dst_attn_tp=dst_attn_tp,
             )
-        self._maybe_reshard_reply(room)
+        self._maybe_declare_spans(room)
 
-    def _maybe_reshard_reply(self, room: int) -> None:
-        with self._state_lock:
-            # Only reply once, and only after send() finished accumulating this
-            # room's blocks (a RESHARD_REQ may arrive mid-accumulation).
-            if room in self._reshard_replied:
-                return
-            if room not in self._reshard_req or room not in self._reshard_finalized:
-                return
-            self._reshard_replied.add(room)
-            addr = self._reshard_req[room]["reply_addr"]
-            blocks = list(self._send_blocks.get(room, []))
-            aux_blob = self._send_aux.get(room, b"")
-        endpoint = f"tcp://{addr[0]}:{addr[1]}"
-        payload = [
-            MessageTag.RESHARD_BLOCKS,
-            str(room).encode("ascii"),
-            pack_ints(blocks),
-            str(self.attn_tp_rank).encode("ascii"),
-            aux_blob,
-        ]
-        with self._push_lock:
-            self._connect(endpoint).send_multipart(payload)
-
-    def _on_reshard_blocks(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 5)
+    def _on_reshard_aux(self, msg: List[bytes]) -> None:
+        self._require_frames(msg, MessageTag.RESHARD_AUX, 3)
         room = int(msg[1].decode("ascii"))
-        prefill_blocks = unpack_ints(msg[2])
-        src_rank = int(msg[3].decode("ascii"))
-        aux_blob = msg[4]
-        ready = False
-        aux_index = None
+        aux_blob = msg[2]
         with self._state_lock:
-            if room not in self._reshard_meta:
-                return
-            self._reshard_sources[room][src_rank] = prefill_blocks
-            aux_index = self._reshard_meta[room].get("aux_index")
-            have = set(self._reshard_sources[room])
-            need = set(self._reshard_meta[room]["source_ranks"])
-            ready = have >= need
+            aux_index = self._decode_aux_index.get(room)
         if aux_index is not None and aux_blob:
             write_aux_blob(
                 self.kv_args.aux_data_ptrs,
@@ -744,180 +775,130 @@ class RaidenKVManager(CommonKVManager):
                 aux_index,
                 aux_blob,
             )
-        if ready:
-            self._register_receiver_and_signal(room)
 
-    def _register_receiver_and_signal(self, room: int) -> None:
-        from tpu_raiden.rpc import raiden_service_pb2 as pb2
+    def _maybe_declare_spans(self, room: int) -> None:
+        """Declare this rank's byte contribution once its pages are final.
 
-        from sglang.srt.disaggregation.raiden.reshard_schedule import (
-            build_receiver_request,
-        )
-
+        A RESHARD_REQ can arrive while ``send()`` is still accumulating pages,
+        so both halves gate the declaration.
+        """
         with self._state_lock:
             if room in self._reshard_registered:
                 return
-            self._reshard_registered.add(room)
-            meta = self._reshard_meta[room]
-            local_blocks = list(meta["local_blocks"])
-            src_attn_tp = meta["src_attn_tp"]
-            ready_endpoints = list(meta["ready_endpoints"])
-            sources_map = dict(self._reshard_sources[room])
-
-        geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
-        n = len(local_blocks)
-        # A decode prefix hit leaves decode holding fewer (tail) pages than the
-        # prefill produced; keep the last n of each source's blocks so both sides
-        # pair the same pages.
-        sources = []
-        for p_rank in sorted(sources_map):
-            pb = sources_map[p_rank]
-            sources.append((p_rank, pb[-n:] if len(pb) > n else pb))
-        live = [self.kv_args.page_size] * n
-
-        engine = self._ensure_engine()
-        req = build_receiver_request(
-            pb2,
-            uuid=room,
-            req_id=str(room),
-            peer=engine.transfer_address,
-            decode_rank=self.attn_tp_rank,
-            geom=geom,
-            sources=sources,
-            dst_block_ids=local_blocks,
-            live_tokens=live,
-        )
-        # register_active_plan (dst_mem_type=HBM) arms the completion barrier from
-        # the schedule (one block-push per (block, layer) across all writers) and
-        # supplies the strided receive + auto-H2D-to-HBM geometry.
-        for widx, (p_rank, pb) in enumerate(sources):
-            logger.debug(
-                "reshard recv room=%s decode_rank=%s writer=%s src_rank=%s "
-                "n_src=%d src[:4]=%s dst n=%d dst[:4]=%s",
-                room,
-                self.attn_tp_rank,
-                widx,
-                p_rank,
-                len(pb),
-                pb[:4],
-                len(local_blocks),
-                local_blocks[:4],
-            )
-        engine.register_active_plan(room, req, is_sender=False)
-
-        for endpoint in ready_endpoints:
-            payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
-            with self._push_lock:
-                self._connect(endpoint).send_multipart(payload)
-
-    def _on_reshard_ready(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_READY, 2)
-        room = int(msg[1].decode("ascii"))
-        with self._state_lock:
-            self._reshard_ready.add(room)
-        self._maybe_reshard_push(room)
-
-    def _maybe_reshard_push(self, room: int) -> None:
-        with self._state_lock:
-            if (
-                room not in self._reshard_ready
-                or room not in self._reshard_req
-                or room not in self._send_blocks
-                or room in self._reshard_pushed
-            ):
+            if room not in self._reshard_req or room not in self._reshard_finalized:
                 return
-            self._reshard_pushed.add(room)
-        self._push_executor.submit(self._do_reshard_push, room)
+            self._reshard_registered.add(room)
+        self._push_executor.submit(self._declare_and_submit, room)
 
-    def _do_reshard_push(self, room: int) -> None:
-        # A push failure marks the room failed so the sender poll surfaces it
-        # instead of the request hanging until the decode-side timeout.
+    def _declare_and_submit(self, room: int) -> None:
+        # A control-plane failure marks the room failed so the sender poll
+        # surfaces it instead of the request hanging until the decode timeout.
         try:
-            self._run_reshard_push(room)
+            self._declare_spans(room)
+            self._maybe_submit_transfer(room)
         except Exception as e:
-            logger.error("raiden reshard push failed for room %s: %s", room, e)
+            logger.error("raiden reshard failed for room %s: %s", room, e)
             with self._state_lock:
                 self._failed.add(str(room))
 
-    def _run_reshard_push(self, room: int) -> None:
-        from tpu_raiden.rpc import raiden_service_pb2 as pb2
-
+    def _declare_spans(self, room: int) -> None:
+        from sglang.srt.disaggregation.raiden.pool_manifest import TAG_KV
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
-            build_sender_request,
+            build_span_registration,
         )
 
+        if self._facade is None:
+            raise RuntimeError(
+                "A decode rank asked this prefill rank to reshard, but no "
+                "raiden controller is configured here: set "
+                "SGLANG_RAIDEN_CONTROLLER_ADDR on the prefill instance too."
+            )
         with self._state_lock:
             req_meta = dict(self._reshard_req[room])
             prefill_blocks = list(self._send_blocks[room])
+            aux_blob = self._send_aux.get(room, b"")
 
         decode_blocks = req_meta["decode_blocks"]
-        dst_attn_tp = req_meta["dst_attn_tp"]
-        push_endpoint = req_meta["push_endpoint"]
+        geom = self._make_geometry(self.attn_tp_size, req_meta["dst_attn_tp"])
+        # A decode prefix hit leaves decode holding fewer (tail) pages than the
+        # prefill produced; keep the last n so both sides pair the same pages.
         n = len(decode_blocks)
         if len(prefill_blocks) > n:
             prefill_blocks = prefill_blocks[-n:]
-        geom = self._make_geometry(self.attn_tp_size, dst_attn_tp)
-        live = [self.kv_args.page_size] * n
 
-        engine = self._ensure_engine()
-        # push_registered_plan streams from the host staging pool; the pool is
-        # sized as a full device shadow (see _build_engine) and indexed 1-to-1 by
-        # device block id, so stage each device block into the host block at the
-        # SAME id. The receiver matches on this same src_block_id (the prefill
-        # device blocks it learned via RESHARD_BLOCKS).
-        fut = engine.d2h(prefill_blocks, prefill_blocks, [1] * n)
-        deadline = self._monotonic() + self._timeout_s
-        while fut is not None and not fut.is_ready():
-            if self._monotonic() > deadline:
-                raise TimeoutError(
-                    f"raiden reshard D2H stage for room {room} timed out"
-                )
-            time.sleep(0.0005)
-        # is_ready() is true even for a ready-with-error future, so check ok()
-        # before pushing -- otherwise a failed d2h would push stale staging.
-        if fut is not None and not fut.ok():
-            raise RuntimeError(
-                f"raiden reshard D2H stage for room {room} failed: "
-                f"{fut.error_message()}"
-            )
-
-        req = build_sender_request(
-            pb2,
-            uuid=room,
-            req_id=str(room),
-            peer=push_endpoint,
+        registration = build_span_registration(
+            tag=TAG_KV,
+            geom=geom,
             prefill_rank=self.attn_tp_rank,
             decode_rank=self.attn_tp_rank // geom.ratio,
-            geom=geom,
             src_block_ids=prefill_blocks,
-            dst_block_ids=decode_blocks,
-            live_tokens=live,
+            live_tokens=[self.kv_args.page_size] * len(prefill_blocks),
+        )
+        self._facade.register_request_blocks(
+            req_id=str(room),
+            uuid=room,
+            unit=self._work_unit,
+            block_ids=prefill_blocks,
+            pool_spans=[registration],
         )
         logger.debug(
-            "reshard push room=%s prefill_rank=%s decode_rank=%s peer=%s "
-            "n=%d src[:4]=%s dst[:4]=%s",
+            "reshard declare room=%s prefill_rank=%s decode_rank=%s n=%d "
+            "src[:4]=%s dst[:4]=%s spans=%d bytes=%d",
             room,
             self.attn_tp_rank,
             self.attn_tp_rank // geom.ratio,
-            push_endpoint,
             len(prefill_blocks),
             prefill_blocks[:4],
             decode_blocks[:4],
+            len(registration.spans),
+            registration.declared_bytes,
         )
-        # raiden runs SyncPush unlocked, so serialize register+push across workers
-        # (concurrent pushes to a decode peer corrupt its shared transport); d2h
-        # above is internally locked and can overlap.
-        with self._reshard_push_lock:
-            engine.register_active_plan(room, req, is_sender=True)
-            # The receiver's completion barrier is total_blocks * num_layers, and
-            # each push counts its blocks once regardless of how many layers it
-            # carries, so push one layer per request to deliver every layer.
-            for layer_idx in range(len(self._kv_caches)):
-                engine.push_registered_plan(
-                    room, push_endpoint, prefill_blocks, decode_blocks, layer_idx
-                )
+        if self._transfer_rank() == 0:
+            endpoint = "tcp://{}:{}".format(*req_meta["reply_addr"])
+            payload = [MessageTag.RESHARD_AUX, str(room).encode("ascii"), aux_blob]
+            with self._push_lock:
+                self._connect(endpoint).send_multipart(payload)
+
+    def _maybe_submit_transfer(self, room: int) -> None:
+        """Ask the controller to plan and run the transfer for one decode page set.
+
+        Only the group's first source submits: one plan covers every source, and
+        the controller arms the decode receiver before it dispatches any sender.
+        """
+        if self._transfer_rank() != 0:
+            return
         with self._state_lock:
-            self._completed_send.add(str(room))
+            if room in self._reshard_submitted:
+                return
+            self._reshard_submitted.add(room)
+            req_meta = dict(self._reshard_req[room])
+
+        from tpu_raiden.rpc.raiden_controller import RaidenId, RaidenMemoryType
+
+        from sglang.srt.disaggregation.raiden.pool_manifest import TAG_KV
+
+        dst_unit = RaidenId(**req_meta["decode_unit_fields"])
+        kwargs = dict(
+            src_units=self._source_units(),
+            dst_units=[dst_unit],
+            req_id=str(room),
+            uuid=room,
+            dst_device_block_ids=list(req_meta["decode_blocks"]),
+            dst_mem_type=RaidenMemoryType.HBM,
+            use_block_chunks=True,
+            is_sender=True,
+            transfer_pool_tags=[TAG_KV],
+        )
+        deadline = self._monotonic() + self._timeout_s
+        while True:
+            try:
+                self._facade.start_transfer(**kwargs)
+                return
+            except RuntimeError as exc:
+                expired = self._monotonic() >= deadline
+                if expired or _MISSING_REGISTRATION_ERROR not in str(exc):
+                    raise
+                time.sleep(0.001)
 
     @staticmethod
     def _monotonic() -> float:
@@ -943,6 +924,7 @@ class RaidenKVManager(CommonKVManager):
     def clear_room(self, room: int) -> None:
         rid = str(room)
         swa_rid = self._swa_req_id(room)
+        was_reshard = False
         with self._state_lock:
             self._completed_send.discard(rid)
             self._completed_send.discard(swa_rid)
@@ -950,6 +932,8 @@ class RaidenKVManager(CommonKVManager):
             self._completed_recv.discard(swa_rid)
             self._failed.discard(rid)
             self._failed.discard(swa_rid)
+            if hasattr(self, "_reshard_registered"):
+                was_reshard = room in self._reshard_registered
             for d in (
                 getattr(self, "_send_blocks", None),
                 getattr(self, "_send_swa_blocks", None),
@@ -963,8 +947,6 @@ class RaidenKVManager(CommonKVManager):
                 getattr(self, "_remote_endpoint", None),
                 getattr(self, "_remote_swa_endpoint", None),
                 getattr(self, "_reshard_req", None),
-                getattr(self, "_reshard_meta", None),
-                getattr(self, "_reshard_sources", None),
             ):
                 if d is not None:
                     d.pop(room, None)
@@ -972,14 +954,24 @@ class RaidenKVManager(CommonKVManager):
                 self._replied.discard(room)
             for s in (
                 getattr(self, "_reshard_finalized", None),
-                getattr(self, "_reshard_replied", None),
-                getattr(self, "_reshard_ready", None),
-                getattr(self, "_reshard_pushed", None),
                 getattr(self, "_reshard_registered", None),
+                getattr(self, "_reshard_submitted", None),
             ):
                 if s is not None:
                     s.discard(room)
-        self._release_host_slot(room)
+        if was_reshard:
+            # Vote this rank terminal so the controller can retire the request's
+            # declarations once every source has finished with them. It is a
+            # control-plane RPC, so it stays off the scheduler thread.
+            self._push_executor.submit(self._complete_request_blocks, room)
+
+    def _complete_request_blocks(self, room: int) -> None:
+        try:
+            self._facade.complete_request_blocks(str(room), room, self._work_unit)
+        except Exception as e:
+            logger.error(
+                "raiden reshard completion vote failed for room %s: %s", room, e
+            )
 
 
 class RaidenKVSender(CommonKVSender):

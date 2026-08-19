@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import ctypes
 import enum
+import json
 import struct
-from typing import List
+from typing import Any, Dict, List
 
 import numpy as np
 
@@ -27,9 +28,8 @@ class MessageTag(bytes, enum.Enum):
     BLOCKS = b"RAIDEN_BLOCKS"  # prefill -> decode: block-ids + endpoint + aux
 
     # Asymmetric-TP push-resharding path (decode TP < prefill TP).
-    RESHARD_REQ = b"RAIDEN_RESHARD_REQ"  # decode -> prefill: endpoint + blocks + tp
-    RESHARD_BLOCKS = b"RAIDEN_RESHARD_BLOCKS"  # prefill -> decode: blocks + rank + aux
-    RESHARD_READY = b"RAIDEN_RESHARD_READY"  # decode -> prefill: registered, push now
+    RESHARD_REQ = b"RAIDEN_RESHARD_REQ"  # decode -> prefill: work unit + blocks + tp
+    RESHARD_AUX = b"RAIDEN_RESHARD_AUX"  # prefill -> decode: aux blob
 
 
 def pack_ints(values: List[int]) -> bytes:
@@ -46,6 +46,15 @@ def pack_blocks(block_ids: List[int]) -> bytes:
 
 def unpack_blocks(buf: bytes) -> List[int]:
     return np.frombuffer(buf, dtype=np.int64).tolist()
+
+
+def pack_unit(fields: Dict[str, Any]) -> bytes:
+    """Serialize the raiden work-unit fields identifying one rank's KV cache."""
+    return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def unpack_unit(buf: bytes) -> Dict[str, Any]:
+    return json.loads(buf.decode("utf-8"))
 
 
 def read_aux_blob(
