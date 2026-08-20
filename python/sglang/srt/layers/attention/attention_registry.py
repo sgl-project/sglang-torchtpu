@@ -414,11 +414,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
                     TpuGDNAttnBackend,
                 )
-
-                logger.info(
-                    "Using TPU Pallas GDN linear-attention backend for hybrid GDN models."
+                from sglang.srt.hardware_backend.tpu.gdn_pcp_setup import (
+                    build_pcp_gdn_backend,
                 )
-                linear_attn_backend = TpuGDNAttnBackend(runner)
+
+                # Under prefix context parallelism the recurrence runs over a
+                # head shard rather than a token shard, which is a different
+                # kernel and a different state layout, so it is a different
+                # backend rather than a branch inside this one.
+                linear_attn_backend = build_pcp_gdn_backend(runner)
+                if linear_attn_backend is None:
+                    logger.info(
+                        "Using TPU Pallas GDN linear-attention backend for hybrid GDN models."
+                    )
+                    linear_attn_backend = TpuGDNAttnBackend(runner)
             else:
                 logger.info(
                     "Using hybrid linear attention backend for hybrid GDN models."

@@ -70,7 +70,9 @@ def _validate_pcp_platform_config(server_args) -> None:
             "PCP streaming (--cp-strategy pcp) cannot run on a decode node: "
             "its KV cache is filled by the prefill node's transfer, which "
             "does not carry PCP's per-rank page striping. Run PCP on the "
-            "prefill node (--disaggregation-mode prefill)."
+            "prefill node (--disaggregation-mode prefill). Hybrid "
+            "linear-attention models are refused there too, separately, "
+            "because their recurrent state is not transferred."
         )
     if server_args.disaggregation_mode == "null":
         logger.warning(

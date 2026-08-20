@@ -355,6 +355,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        # Set by the context-parallel GDN backend after the model is built
+        # (see attach_to_model). A plain attribute rather than a lookup, so the
+        # compiled forward reads a constant instead of walking a registry.
+        self._pcp_gdn_backend = None
+
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
@@ -607,7 +612,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             with torch.cuda.stream(self.alt_stream):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
             current_stream.wait_stream(self.alt_stream)
-        elif self._fused_input_proj_cpu_enabled.value:
+        # Gate on the module-level ``_is_cpu`` first so Dynamo folds this
+        # branch away off CPU and never guards on the LazyValue. It memoises
+        # by setting ``_creator = None``, and the guard Dynamo installs is on
+        # ``_creator.__code__``: the first call after memoisation fails it with
+        # "Not a function" and forces a recompile, which is fatal once warmup
+        # freezes torch.compile with set_stance('fail_on_recompile'). The
+        # LazyValue's own predicate already starts with ``_is_cpu``, so this
+        # changes nothing on CPU.
+        elif _is_cpu and self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
                 torch.ops.sgl_kernel.fused_input_proj_cpu(
                     hidden_states,
@@ -654,6 +667,41 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
+    def _forward_pcp_gdn(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Context-parallel forward.
+
+        The fused kernel performs the QKVZ projection itself -- it needs the
+        unprojected hidden states so it can overlap that GEMM with the
+        head-shard exchange -- so ``in_proj_qkvz`` is not applied here and the
+        Z it would have produced comes back from the kernel instead. Only the
+        small BA projection stays outside.
+        """
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        nv_tp = self.num_v_heads // self.attn_tp_size
+        b, a = projected_states_ba.split([nv_tp, nv_tp], dim=-1)
+
+        proj = self.in_proj_qkvz
+        core_attn_out, z = self._pcp_gdn_backend.forward_gdn_pcp(
+            layer=self.attn,
+            hidden_states=hidden_states,
+            b=b.contiguous(),
+            a=a.contiguous(),
+            # The channelwise requantisation leaves the fp8 weight stored
+            # [in, out]; the kernel indexes it [out, in]. The scale it writes
+            # is [out, 1] and the kernel asserts rank 1.
+            qkvz_weight=proj.weight.t(),
+            qkvz_weight_scale=proj.weight_scale.reshape(-1),
+        )
+
+        z_shape_og = z.shape
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -665,6 +713,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        # Gate on the per-forward flag as well as the backend: an idle
+        # forward clears pcp_attn_active and runs with unsharded inputs, and
+        # at batch_size 0 it also drops the attention metadata, so taking the
+        # CP path there would exchange unsharded rows and scatter state into
+        # the previous batch's slots.
+        if self._pcp_gdn_backend is not None and forward_batch.pcp_attn_active:
+            return self._forward_pcp_gdn(hidden_states)
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )

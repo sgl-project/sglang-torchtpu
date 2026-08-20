@@ -36,6 +36,19 @@ _SPARSE_CORE_OFFLOAD_OVERRIDES = (
     "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false",
 )
 
+_SMEM_NEGOTIATION_OVERRIDES = (
+    # Let libtpu size SMEM to what a kernel's scheduling metadata actually
+    # needs. The Gated-DeltaNet kernel keeps its per-tile plan
+    # (p_id_to_s_idx / _r_base / _r_size / _is_first_tile / _is_last_tile) in
+    # SMEM, sized by the padded token count, so a long prefill overflows the
+    # static budget and the arrays spill. Measured on v7-8 at Qwen3.5-397B
+    # per-rank geometry (2 kq / 8 v heads, head dim 128), a 32768-token
+    # prefill costs 11.96 ms/layer without this flag and 1.93 ms with it --
+    # 6.2x, or roughly 450 ms per step across the 45 linear layers. Shapes up
+    # to 16384 tokens fit the static budget and are unaffected.
+    "--xla_tpu_use_dynamic_smem_negotiation=true",
+)
+
 _ASSOCIATIVE_SCAN_OVERRIDES = (
     # TODO: drop once google-pytorch/torch_tpu#2898 is fixed.
     # libtpu >= 0.0.44 miscompiles `scan(..., is_associative=true)`, so every
@@ -75,7 +88,9 @@ def apply_tpu_env_overrides() -> None:
         )
 
     appended = _override_libtpu_flags(
-        _SPARSE_CORE_OFFLOAD_OVERRIDES + _ASSOCIATIVE_SCAN_OVERRIDES
+        _SPARSE_CORE_OFFLOAD_OVERRIDES
+        + _ASSOCIATIVE_SCAN_OVERRIDES
+        + _SMEM_NEGOTIATION_OVERRIDES
     )
     if appended:
         logger.info(

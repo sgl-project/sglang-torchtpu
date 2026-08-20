@@ -96,12 +96,20 @@ class TpuMambaPool(MambaPool):
         # TPU does not use NVLink custom mem pools.
         self.enable_custom_mem_pool = False
         self.custom_mem_pool = None
-        # ReplaySSM is disabled on TPU (guarded above); keep the attrs the
-        # shared backend-metadata path reads.
+        # ReplaySSM is disabled on TPU (guarded above), but the shared paths
+        # read these unconditionally -- HybridReqToTokenPool.alloc does a bare
+        # ``self.mamba_pool.replayssm_cache_base is not None`` on every extend,
+        # so a missing attr is an AttributeError on the first request rather
+        # than a disabled feature. Mirror the disabled-state attrs the unified
+        # pool sets for the same reason (see unified_memory_pool.py).
         self.enable_linear_replayssm = False
+        self.enable_linear_replayssm_spec = False
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         self.replayssm_is_kda = False
         self.replayssm_write_pos = None
+        self.replayssm_spec_fold = False
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
 
         # ssm (recurrent) fp32 is NOT a TPU-specific choice: mainline defaults
         # the ssm state to fp32 too (mamba_utils.get_mamba2_state_dtype), since

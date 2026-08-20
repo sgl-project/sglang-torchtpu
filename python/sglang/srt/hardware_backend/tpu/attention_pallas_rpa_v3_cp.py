@@ -188,20 +188,40 @@ def _reject_linear_attention_under_pcp(model_runner: "ModelRunner") -> None:
     layers, and the failure mode is plausible-looking wrong output, not a
     crash -- nothing downstream would flag it.
 
-    Making these layers work needs a token-shard to head-shard exchange around
-    the recurrence, so that each rank takes all tokens for 1/cp_size of the
-    heads. Until that exists, refuse.
+    The fused context-parallel GDN path supplies exactly that exchange -- each
+    rank takes all tokens for 1/cp_size of the heads -- so a hybrid model is
+    accepted when that path is available and refused when it is not.
     """
     from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.hardware_backend.tpu.gdn_pcp_setup import pcp_gdn_active
 
     if mambaish_config(model_runner.model_config) is None:
         return
+    if pcp_gdn_active():
+        # The context-parallel GDN state lives in its own pooled buffer, which
+        # nothing registers for PD transfer. A decode node would resume every
+        # request from a zeroed recurrent state and continue plausibly and
+        # wrongly, so refuse the split deployment until the buffer is wired
+        # into the transfer manifest.
+        from sglang.srt.server_args import get_global_server_args
+
+        if get_global_server_args().disaggregation_mode != "null":
+            raise NotImplementedError(
+                "Context-parallel Gated-DeltaNet does not support "
+                "disaggregated serving yet: its recurrent state is not "
+                "registered for PD transfer, so the decode node would resume "
+                "from a zeroed state. Serve this model aggregated, or drop "
+                "--cp-strategy pcp."
+            )
+        return
     raise NotImplementedError(
         "PCP streaming (--cp-strategy pcp) does not support hybrid "
-        "linear-attention models. Context parallelism shards the token axis, "
-        "but a linear-attention layer's recurrence runs along that axis, so "
-        "each rank would integrate over a disjoint token shard and silently "
-        "produce wrong output. Drop --cp-strategy pcp for this model."
+        "linear-attention models in this configuration. Context parallelism "
+        "shards the token axis, but a linear-attention layer's recurrence "
+        "runs along that axis, so each rank would integrate over a disjoint "
+        "token shard and silently produce wrong output. The context-parallel "
+        "GDN path supplies the head-shard exchange that fixes this; it needs "
+        "--attn-cp-size > 1 with the pcp strategy active."
     )
 
 

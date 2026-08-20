@@ -37,6 +37,21 @@ class HybridLayerType(enum.Enum):
     linear_attention = "linear_attention"
 
 
+def _gdn_state_cp_shards() -> int:
+    """Extra head-shard factor the context-parallel GDN path introduces.
+
+    1 unless the PCP strategy is active, so every other configuration keeps
+    the state shapes it has today.
+    """
+    from sglang.srt.layers.cp.base import is_pcp
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+    from sglang.srt.runtime_context import get_parallel
+
+    if not (enable_cp_v2() and is_pcp()):
+        return 1
+    return max(1, int(get_parallel().attn_cp_size))
+
+
 class Qwen3NextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`Qwen3NextModel`]. It is used to instantiate a
@@ -297,8 +312,15 @@ class Qwen3NextConfig(PretrainedConfig):
         # decode with different attn_tp_size (see _send_mamba_state_slice).
         key_dim = self.linear_key_head_dim * self.linear_num_key_heads
         value_dim = self.linear_value_head_dim * self.linear_num_value_heads
+        # Under prefix context parallelism the recurrence is parallelised over
+        # heads, not tokens: each rank runs the scan for 1/attn_cp_size of the
+        # key and value heads over the whole sequence, so its state covers only
+        # that head shard. The state therefore shards over attn_tp x attn_cp,
+        # not attn_tp alone. conv_shard_groups above stays at the full
+        # sub-block dims so PD transfer still describes the unsharded layout.
+        state_world_size = get_parallel().attn_tp_size * _gdn_state_cp_shards()
         shape = Mamba2StateShape.create(
-            tp_world_size=get_parallel().attn_tp_size,
+            tp_world_size=state_world_size,
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,

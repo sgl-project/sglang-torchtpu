@@ -10,7 +10,9 @@ layout and slot bookkeeping that the fused Pallas GDN kernel depends on:
   the GPU ``[..., n_v, d_v, d_k]``);
 * slot 0 is reserved; ``alloc``/``free`` cycle real slots ``1..size``;
 * ``clear_slots`` is a no-op (kernel masks stale slots via
-  ``has_initial_state``) and ``copy_from`` raises (radix CoW unsupported).
+  ``has_initial_state``) and ``copy_from`` raises (radix CoW unsupported);
+* ReplaySSM is disabled here, but its flags must still be *present* --
+  the shared req-slot alloc path reads them without a hasattr guard.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,6 +29,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
 )
 from sglang.srt.hardware_backend.tpu.mamba_pool import TpuMambaPool
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -62,6 +65,46 @@ class TestTpuMambaPool(CustomTestCase):
             cache_params=cp,
             mamba_layer_ids=self.LAYERS,
             device="cpu",
+        )
+
+    def test_disabled_replayssm_surface_covers_base(self):
+        """Disabling ReplaySSM must mean "present and inert", not "absent".
+
+        ``HybridReqToTokenPool.alloc`` resets the ReplaySSM ring on every
+        freshly assigned slot and reads the pool's flags with bare attribute
+        access -- ``self.mamba_pool.replayssm_cache_base is not None`` -- with
+        no hasattr guard. A pool that simply omits an attribute it does not
+        use therefore raises AttributeError on the first prefill of any hybrid
+        model, long after startup has reported success.
+
+        Comparing against a live ``MambaPool`` rather than a hardcoded name
+        list is deliberate: the failure mode this guards is "the base grew
+        another disabled-state flag and the TPU pool was not updated", which a
+        fixed list would not catch.
+        """
+        cp = _make_cache_params(
+            self.N_KQ, self.N_V, self.D_K, self.D_V, self.K, self.LAYERS
+        )
+        common = dict(
+            size=self.SIZE,
+            spec_state_size=0,
+            cache_params=cp,
+            mamba_layer_ids=self.LAYERS,
+            device="cpu",
+        )
+        base_attrs = {n for n in vars(MambaPool(**common)) if "replayssm" in n}
+        tpu_attrs = {n for n in vars(TpuMambaPool(**common)) if "replayssm" in n}
+        self.assertTrue(
+            base_attrs,
+            "no ReplaySSM attributes found on MambaPool -- this test has "
+            "drifted from the base pool and no longer guards anything.",
+        )
+        self.assertEqual(
+            set(),
+            base_attrs - tpu_attrs,
+            "TpuMambaPool is missing ReplaySSM attributes that MambaPool "
+            "defines; unconditional readers such as "
+            "HybridReqToTokenPool.alloc will raise AttributeError.",
         )
 
     def test_kernel_native_buffer_layout(self):
