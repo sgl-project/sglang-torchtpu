@@ -19,6 +19,9 @@ The strategy implementation is split across:
 * ``base.py``: base ABC, base metadata dataclass, enums, and singleton helpers.
 * ``zigzag.py``: former in-seq-split strategy and zigzag metadata.
 * ``interleave.py``: former round-robin-split strategy and interleave metadata.
+* ``pcp_streaming.py``: TPU Prefill-Context-Parallel via the PCP streaming
+  Pallas kernel, plus its rank-major compact-Q layout planner in
+  ``pcp_sequence_layout.py``.
 * ``utils.py``: public re-exports for import convenience.
 """
 
@@ -42,6 +45,10 @@ class ContextParallelStrategyKind(IntEnum):
     NONE = 0
     ZIGZAG = 1
     INTERLEAVE = 2
+    # Prefill-Context-Parallel: each rank keeps a page-striped shard of the KV
+    # cache and streams KV pages around a ring while computing attention for
+    # its local query tokens. See :mod:`sglang.srt.layers.cp.pcp_streaming`.
+    PCP_STREAMING = 3
 
     @classmethod
     def from_string(cls, value: str) -> ContextParallelStrategyKind:
@@ -49,9 +56,11 @@ class ContextParallelStrategyKind(IntEnum):
             return cls.ZIGZAG
         if value == "interleave":
             return cls.INTERLEAVE
+        if value == "pcp":
+            return cls.PCP_STREAMING
         raise ValueError(
             f"Unknown cp_strategy={value!r}; expected one of "
-            "{'zigzag', 'interleave'}"
+            "{'zigzag', 'interleave', 'pcp'}"
         )
 
     @property
@@ -60,6 +69,7 @@ class ContextParallelStrategyKind(IntEnum):
             ContextParallelStrategyKind.NONE: "none",
             ContextParallelStrategyKind.ZIGZAG: "zigzag",
             ContextParallelStrategyKind.INTERLEAVE: "interleave",
+            ContextParallelStrategyKind.PCP_STREAMING: "pcp",
         }[self]
 
 
@@ -69,6 +79,10 @@ class CPAttentionBackendKind(IntEnum):
     FLASH_ATTENTION = 0
     DSA = 1
     TRTLLM_MHA = 2
+    # Pallas RPA v3 CP backend on torch_tpu. The PCP_STREAMING strategy uses
+    # this: ``TpuPallasRpaV3CpAttnBackend._forward_pcp`` invokes the PCP
+    # streaming kernel via ``pcp_streaming_attention``.
+    PALLAS_TPU_RPA_V3_CP = 3
 
     @classmethod
     def from_string(cls, value: str) -> CPAttentionBackendKind:
@@ -78,9 +92,12 @@ class CPAttentionBackendKind(IntEnum):
             return cls.DSA
         if value == "trtllm_mha":
             return cls.TRTLLM_MHA
+        if value == "pallas_tpu_rpa_v3_cp":
+            return cls.PALLAS_TPU_RPA_V3_CP
         raise ValueError(
             f"Unsupported attention_backend={value!r} for CP strategy; expected one "
-            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha'}"
+            "of {'fa3', 'fa4', 'flashinfer', 'dsa', 'trtllm_mha', "
+            "'pallas_tpu_rpa_v3_cp'}"
         )
 
 
@@ -107,6 +124,37 @@ class ContextParallelStrategy(ABC):
     @property
     def per_layer_attn_cp_comm(self) -> bool:
         return _is_dsa_active()
+
+    @property
+    def supports_decode(self) -> bool:
+        """Whether this strategy also shards decode batches.
+
+        Zigzag and Interleave are prefill-only, so ``is_cp_v2_active`` gates
+        them on ``is_context_parallel_extend()``. PCP runs prefill and decode
+        through the same kernel and overrides this to ``True``.
+        """
+        return False
+
+    @property
+    def local_compile_token_multiple(self) -> int:
+        """Kernel lockstep floor for per-rank token counts. Only PCP overrides."""
+        raise NotImplementedError(
+            f"{self.name} strategy does not expose local_compile_token_multiple"
+        )
+
+    def build_extra_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        seq_lens_cpu: Optional[List[int]],
+        extend_lens_cpu: Optional[List[int]],
+    ) -> None:
+        """Optional per-forward preparation beyond ``build_metadata``.
+
+        PCP overrides this to materialise the sequence-layout plan and the
+        Dynamo-safe plain-scalar mirrors on ForwardBatch. Zigzag / Interleave
+        leave it as a no-op.
+        """
+        del forward_batch, seq_lens_cpu, extend_lens_cpu
 
     @abstractmethod
     def can_apply(self, num_tokens: int, forward_batch: ForwardBatch) -> bool:
@@ -267,6 +315,10 @@ def init_cp_strategy(server_args: ServerArgs) -> None:
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 
         _STRATEGY = InterleaveCPStrategy(cp_size=cp_size)
+    elif kind == ContextParallelStrategyKind.PCP_STREAMING:
+        from sglang.srt.layers.cp.pcp_streaming import PCPStreamingCPStrategy
+
+        _STRATEGY = PCPStreamingCPStrategy(cp_size=cp_size)
     else:
         raise ValueError(
             f"Unsupported cp_strategy kind {kind} for "
@@ -313,3 +365,7 @@ def is_zigzag() -> bool:
 
 def is_interleave() -> bool:
     return get_cp_strategy_kind() == ContextParallelStrategyKind.INTERLEAVE
+
+
+def is_pcp() -> bool:
+    return get_cp_strategy_kind() == ContextParallelStrategyKind.PCP_STREAMING

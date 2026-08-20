@@ -1150,6 +1150,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            **current_platform.get_mha_kv_pool_extra_kwargs(self.server_args),
         )
         return token_to_kv_pool
 
@@ -1275,6 +1276,11 @@ class KVCacheConfigurator:
             full_attention_layer_ids=self.model_config.full_attention_layer_ids,
             device=self.device,
             token_to_kv_pool_class=PoolCls,
+            # SWAKVPool forwards **kwargs into both sub-pools. Under PCP this
+            # carries cp_group_size, which sizes each rank's shard to
+            # size / cp_group_size; without it both sub-pools would allocate
+            # the full, unsharded size on every rank.
+            **current_platform.get_mha_kv_pool_extra_kwargs(self.server_args),
         )
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:

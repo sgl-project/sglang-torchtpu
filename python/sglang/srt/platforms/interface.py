@@ -105,6 +105,18 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform consumes annotation-driven compile policies."""
         return False
 
+    def supports_attn_cp(self) -> bool:
+        """Whether --attn-cp-size > 1 is wired up here.
+
+        True by default: the CP-v2 strategies and their collectives are
+        platform-generic. A platform that cannot run them overrides this.
+        """
+        return True
+
+    def get_mha_kv_pool_extra_kwargs(self, server_args) -> dict:
+        """Extra constructor kwargs for the MHA KV pool. None by default."""
+        return {}
+
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError

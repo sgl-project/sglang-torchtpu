@@ -402,6 +402,9 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
             _tpu_real_b=2,
             batch_size=4,
             seq_lens=torch.zeros(4, dtype=torch.int32),
+            # Mirrors the ForwardBatch default. Under PCP the raw-tensor unpad
+            # is skipped, so this must be present for the truncation to run.
+            pcp_attn_active=False,
         )
 
     def test_slices_raw_hidden_states_before_logits_processing(self):
@@ -785,6 +788,38 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
+
+    def test_materialize_out_syncs_pp_proxy_tensors(self):
+        """PPProxyTensors branch: non-last PP rank returns a proxy whose
+        .tensors dict values need to be synced too. Precompile HBM
+        accounting only works if the sync waits on the same tensors the
+        actual forward would produce."""
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        hs = torch.zeros(1)
+        residual = torch.ones(1) * 3
+        proxy = PPProxyTensors({"hidden_states": hs, "residual": residual})
+        attn_backend = SimpleNamespace(requires_kv_sync_after_compile=False)
+
+        tt = ModuleType("torch_tpu")
+        tt._internal = ModuleType("torch_tpu._internal")
+        tt._internal.sync = ModuleType("torch_tpu._internal.sync")
+        tt._internal.sync.sync = ModuleType("torch_tpu._internal.sync.sync")
+        tt._internal.sync.sync.synchronize = MagicMock()
+        stubs = {
+            "torch_tpu": tt,
+            "torch_tpu._internal": tt._internal,
+            "torch_tpu._internal.sync": tt._internal.sync,
+            "torch_tpu._internal.sync.sync": tt._internal.sync.sync,
+        }
+        with patch.dict(sys.modules, stubs), patch(
+            "torch_tpu._internal.sync.sync.synchronize"
+        ) as sync:
+            _materialize_out(proxy, attn_backend, SimpleNamespace())
+        sync.assert_called_once()
+        (tensors,), kwargs = sync.call_args
+        self.assertEqual(set(id(t) for t in tensors), {id(hs), id(residual)})
+        self.assertEqual(kwargs, {"wait": True})
 
 
 def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):

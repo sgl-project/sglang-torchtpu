@@ -223,6 +223,15 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_algorithm=None,
             speculative_eagle_topk=None,
             speculative_use_rejection_sampling=False,
+            # Context-parallel fields, mirroring the ServerArgs defaults
+            # (attn_cp_size=1 / enable_prefill_cp=False / cp_strategy=None).
+            # The CP block in apply_server_args_defaults is a no-op at these
+            # values, so the non-CP expectations below are unaffected.
+            attn_cp_size=1,
+            enable_prefill_cp=False,
+            cp_strategy=None,
+            pp_size=1,
+            disaggregation_mode="null",
         )
         defaults.update(overrides)
         args = SimpleNamespace(**defaults)
@@ -427,6 +436,65 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
     def test_piecewise_backend_raises(self):
         with self.assertRaises(NotImplementedError):
             self.platform.get_piecewise_backend_cls()
+
+
+class TestPcpServerArgRefusals(CustomTestCase):
+    """``_validate_pcp_platform_config`` rejects unsupported combinations.
+
+    Each of these is silently-wrong-output territory rather than a crash, so
+    the refusal is the only thing standing between a misconfiguration and a
+    bad answer.
+    """
+
+    def _args(self, **overrides):
+        args = SimpleNamespace(
+            pp_size=1,
+            page_size=128,
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            disable_radix_cache=True,
+        )
+        args.__dict__.update(overrides)
+        return args
+
+    def _validate(self, **overrides):
+        from sglang.srt.hardware_backend.tpu.tpu_platform import (
+            _validate_pcp_platform_config,
+        )
+
+        _validate_pcp_platform_config(self._args(**overrides))
+
+    def test_baseline_config_is_accepted(self):
+        self._validate()
+
+    def test_pipeline_parallelism_rejected(self):
+        with self.assertRaises(NotImplementedError):
+            self._validate(pp_size=2)
+
+    def test_decode_node_rejected(self):
+        # A decode node's cache arrives via KV transfer, which carries no
+        # per-rank page striping.
+        with self.assertRaises(NotImplementedError):
+            self._validate(disaggregation_mode="decode")
+
+    def test_prefill_node_accepted(self):
+        # The intended deployment.
+        self._validate(disaggregation_mode="prefill")
+
+    def test_hierarchical_cache_rejected(self):
+        with self.assertRaises(NotImplementedError):
+            self._validate(enable_hierarchical_cache=True)
+
+    def test_radix_cache_rejected(self):
+        with self.assertRaises(NotImplementedError):
+            self._validate(disable_radix_cache=False)
+
+    def test_interleave_size_must_divide_page_size(self):
+        from sglang.srt.environ import envs
+
+        with envs.SGLANG_TPU_PCP_INTERLEAVE_SIZE.override(48):
+            with self.assertRaises(ValueError):
+                self._validate(page_size=128)
 
 
 if __name__ == "__main__":

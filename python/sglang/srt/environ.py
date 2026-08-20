@@ -1416,6 +1416,47 @@ class Envs:
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
 
+    # Prefill-Context-Parallel (PCP) streaming — TPU CP-v2. See
+    # sglang.srt.layers.cp.pcp_streaming and the kernel at
+    # sglang.srt.layers.attention.pallas.pcp_streaming_rpa.
+    #   SGLANG_TPU_PCP_INTERLEAVE_SIZE: ring-ownership granularity, in
+    #     tokens. Ownership deals chunks round-robin: rank r owns
+    #     [k*cycle + r*interleave, k*cycle + (r+1)*interleave) where
+    #     cycle = pcp_size * interleave_size. Must be <= page_size and
+    #     divide it. It governs two independent coordinates:
+    #       - query ownership, on the BATCH-FLAT coordinate (a row's index
+    #         in the packed batch, i.e. cu_q_lens[req] + offset), and
+    #       - KV-cache ownership, on the REQUEST-ABSOLUTE position within a
+    #         virtual page of page_size * pcp_size tokens.
+    #     Default 0 means "use page_size", the coarsest legal setting (whole
+    #     KV pages per rank), which is also what TpuPcpFusedMHATokenToKVPool
+    #     reserves storage for. Do not lower it without measuring: a ring page
+    #     group spans one owner cycle, so the ring step count scales as
+    #     page_size / interleave_size. Measured on v7-8 / pcp=8 / page_size=64,
+    #     interleave 1 costs 37x at ISL 4096 and 87x at ISL 16384 against
+    #     interleave == page_size. Resolve it through
+    #     ``sglang.srt.layers.cp.pcp_sequence_layout.resolve_pcp_interleave_size``
+    #     rather than reading this value directly.
+    SGLANG_TPU_PCP_INTERLEAVE_SIZE = EnvInt(0)
+    #   SGLANG_TPU_PCP_RING_TILE_TOKENS: local Q rows that share one trip
+    #     around the PCP ring, and the compile-bucket floor (the global padded
+    #     token count must be a multiple of pcp_size * this). The kernel loops
+    #     (Q tile, ring group) with the ring inside, so the causal history is
+    #     re-streamed once per Q tile and ring traffic scales as
+    #     (tiles + 1) / 2. Bigger is better until VMEM and register spills bite,
+    #     which happens at roughly tile * local_q_heads > 16384. Default 0 =
+    #     derive from the model's Q-head count; resolve it through
+    #     ``layers.cp.pcp_sequence_layout.resolve_pcp_ring_tile_tokens``.
+    SGLANG_TPU_PCP_RING_TILE_TOKENS = EnvInt(0)
+    #   SGLANG_TPU_PCP_ENABLE_NONCP_COMPILE: also run the non-CP
+    #     extend/decode precompile passes when PCP is active. Under
+    #     ``--enable-prefill-cp`` every forward routes through the CP-v2
+    #     branch, so the non-CP graphs are unreachable and their compiles
+    #     (30-60s each on 30B, minutes on 480B) are wasted warm cost.
+    #     Default False. Set to 1 for mixed workloads that also serve
+    #     non-CP traffic through the same policy.
+    SGLANG_TPU_PCP_ENABLE_NONCP_COMPILE = EnvBool(False)
+
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")

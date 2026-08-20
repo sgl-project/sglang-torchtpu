@@ -62,6 +62,24 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_tpu = is_tpu()
 
+
+def _reset_cp_v2_state(forward_batch: ForwardBatch) -> None:
+    """Clear all CP-v2 mirrors on a ForwardBatch that isn't CP-v2 active.
+
+    ForwardBatch instances are pooled/reused across forwards; leaving stale
+    CP-v2 mirrors here (msgspec metadata + plain-scalar Dynamo-safe copies)
+    lets the next non-CP forward wrongly enter the ``moe_cp_allgather``
+    branch or the PCP attention dispatch. All 6 fields must be reset — the
+    2 msgspec/optional objects PLUS the 4 plain-scalar defaults.
+    """
+    forward_batch.attn_cp_metadata = None
+    forward_batch.pcp_layout_plan = None
+    forward_batch.pcp_attn_active = False
+    forward_batch.moe_cp_active = False
+    forward_batch.moe_cp_pad_max_tokens = 0
+    forward_batch.moe_cp_local_tokens = 0
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -239,9 +257,21 @@ class EagerRunner(BaseRunner):
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
+        # PCP shards the KV cache by page (page p lives on rank p % cp_size),
+        # so a decode forward that skipped the CP path would only see
+        # 1/cp_size of the cache. Zigzag / Interleave reject decode in
+        # is_cp_v2_active and fall through to the plain forward below.
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+        else:
+            _reset_cp_v2_state(forward_batch)
+
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
+            if cp_v2_active:
+                return self._execute_cp_v2(forward_batch, kwargs)
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -291,7 +321,7 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         if not cp_v2_active:
-            forward_batch.attn_cp_metadata = None
+            _reset_cp_v2_state(forward_batch)
 
         category = (
             "target_verify"
@@ -327,7 +357,7 @@ class EagerRunner(BaseRunner):
                         **kwargs,
                     )
             elif cp_v2_active:
-                ret = self._execute_extend_cp_v2(forward_batch, kwargs)
+                ret = self._execute_cp_v2(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,
@@ -337,11 +367,15 @@ class EagerRunner(BaseRunner):
                 )
         return ret
 
-    def _execute_extend_cp_v2(
+    def _execute_cp_v2(
         self, forward_batch: ForwardBatch, kwargs: dict
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        """CP-v2 extend: shard inputs at the model boundary, run the body on the
-        rank-local slice, then gather hidden states before the logits step.
+        """CP-v2 forward: shard inputs at the model boundary, run the body on
+        the rank-local slice, then gather hidden states before the logits step.
+
+        Shared by extend and decode. Zigzag / Interleave only reach this from
+        extend; PCP reaches it from both, because its KV cache is page-striped
+        across ranks and decode has to stream the ring too.
         """
         model = self.model_runner.model
 
@@ -372,21 +406,34 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        # torch.cuda.current_stream() raises on TPU builds, where CUDA isn't
+        # compiled in. Zigzag / Interleave use the stream on CUDA; PCP ignores
+        # the argument entirely.
+        gather_stream = (
+            torch.cuda.current_stream() if torch.cuda.is_available() else None
+        )
         hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
+            hidden_states, forward_batch, gather_stream
         )
         logits_kwargs = {}
         # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_before_norm = hidden_states
             logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
-        return model.logits_processor(
+        ret = model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
             **logits_kwargs,
+        )
+        # This path drives model.model() + logits_processor() directly, so it
+        # bypasses CompiledForwardShim, which is what normally applies the
+        # policy's output unpadding. Without this, padded ghost slots leak into
+        # the sampler and the next concurrent batch indexes out of range.
+        return self.model_runner.compile_policy.finalize_forward_batch(
+            ret, forward_batch
         )
 
     def _execute_idle(
@@ -401,6 +448,13 @@ class EagerRunner(BaseRunner):
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
+
+        # Idle forwards are never CP-v2 (no attention over KV). Clear the
+        # CP-v2 plain-scalar mirrors so a stale ``pcp_attn_active=True`` /
+        # ``moe_cp_active=True`` from a prior CP-v2 forward doesn't leak
+        # into the compiled model.forward (which would re-enter _forward_pcp
+        # without a valid pcp_op / layout plan).
+        _reset_cp_v2_state(forward_batch)
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
         with device_timer_ctx(model_runner.device_timer, "idle"):

@@ -24,6 +24,7 @@ from sglang.srt.layers.cp.base import (
     init_cp_strategy,
     is_cp_enabled,
     is_interleave,
+    is_pcp,
     is_zigzag,
 )
 from sglang.srt.layers.cp.interleave import (
@@ -51,5 +52,6 @@ __all__ = [
     "init_cp_strategy",
     "is_cp_enabled",
     "is_interleave",
+    "is_pcp",
     "is_zigzag",
 ]

@@ -140,12 +140,14 @@ def is_cp_v2_active(forward_batch) -> bool:
     """Return whether the current forward batch is running through CP-v2."""
     if not enable_cp_v2():
         return False
-    forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is None or not forward_mode.is_context_parallel_extend():
-        return False
-
     strategy = get_cp_strategy()
     if strategy is None:
+        return False
+
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None:
+        return False
+    if not forward_mode.is_context_parallel_extend() and not strategy.supports_decode:
         return False
 
     input_ids = getattr(forward_batch, "input_ids", None)
@@ -173,6 +175,17 @@ def prepare_cp_forward(forward_batch) -> None:
             num_tokens=num_tokens,
             seqs_len=seq_lens_cpu,
             extend_seqs_len=extend_lens_cpu,
+        )
+        # build_extra_metadata runs first: PCP's layout planner is what fills
+        # per_rank_actual_token, which the padding pass below reads. (Zigzag
+        # and Interleave fill it in build_metadata and leave this hook a
+        # no-op, so the order is immaterial for them.) PCP's counts are
+        # already equal and bucket-aligned, so the padding pass is then a
+        # no-op that just records per_rank_logical_token / max_rank_len.
+        strategy.build_extra_metadata(
+            forward_batch=forward_batch,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_lens_cpu=extend_lens_cpu,
         )
         pad_logical_token_to_physical(forward_batch.attn_cp_metadata)
 

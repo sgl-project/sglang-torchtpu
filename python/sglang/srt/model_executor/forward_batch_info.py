@@ -599,6 +599,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
+    # Plain scalar mirrors for the PCP streaming path. Populated by the
+    # PCP strategy's ``build_extra_metadata`` (lands with the PCP
+    # infrastructure PR). Reading msgspec.Struct attributes inside a
+    # compiled PCP forward produces non-deterministic wrong output on TPU
+    # (see memory/pcp_compile_msgspec.md), so the attention backend + moe
+    # communicator read these plain fields instead of touching
+    # ``attn_cp_metadata``.
+    pcp_attn_active: bool = False
+    moe_cp_active: bool = False
+    moe_cp_pad_max_tokens: int = 0
+    moe_cp_local_tokens: int = 0
+    # PcpSequenceLayoutPlan; declared as Any because the concrete type
+    # lives under layers/cp/pcp_sequence_layout.py which we don't want
+    # to import at forward_batch construction time.
+    pcp_layout_plan: Optional[Any] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
