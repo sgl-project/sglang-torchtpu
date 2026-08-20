@@ -11,6 +11,7 @@ import torch
 from sglang.srt.hardware_backend.tpu.fp8_moe_fused_rs import (
     apply_fp8_fused_rs,
     fp8_fused_rs_unsupported_reason,
+    prepare_fp8_fused_rs,
     supports_fp8_fused_rs,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -60,6 +61,19 @@ class TestFp8MoeFusedRs(CustomTestCase):
 
     def test_accepts_block_quantized_weights(self):
         self.assertTrue(self._supported(block_quantized=True))
+
+    def test_disables_fused_rs_for_speculative_decoding(self):
+        layer = SimpleNamespace()
+        with patch(
+            "sglang.srt.runtime_context.get_server_args",
+            return_value=SimpleNamespace(speculative_algorithm="EAGLE3"),
+        ):
+            self.assertFalse(prepare_fp8_fused_rs(layer))
+
+        self.assertEqual(
+            layer._tpu_fused_rs_unsupported_reason,
+            "speculative decoding is not supported",
+        )
 
     def test_rejects_pipeline_parallel_layout(self):
         self.assertEqual(
