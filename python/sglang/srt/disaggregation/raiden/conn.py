@@ -294,7 +294,7 @@ class RaidenKVManager(CommonKVManager):
         )
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
-            swa_max_blocks = self._max_request_blocks()
+            swa_max_blocks = self._swa_max_request_blocks()
             swa_num_slots = self._num_slots()
             self._swa_engine = KVCacheManager(
                 kv_caches=self._swa_kv_caches,
@@ -321,6 +321,19 @@ class RaidenKVManager(CommonKVManager):
             os.environ.get("SGLANG_RAIDEN_MAX_MODEL_LEN", "8192")
         )
         return max(1, math.ceil(max_len / self.kv_args.page_size))
+
+    def _swa_max_request_blocks(self) -> int:
+        override = int(os.environ.get("SGLANG_RAIDEN_SWA_MAX_BLOCKS", "0"))
+        if override > 0:
+            return override
+        window_size = self.kv_args.sliding_window_size
+        if window_size is None or window_size <= 0:
+            raise RuntimeError(
+                "Raiden SWA KV caches require a positive sliding-window size"
+            )
+        # SWA transfer payloads round their window start down to a page boundary.
+        max_tokens = window_size + self.kv_args.page_size - 1
+        return max(1, math.ceil(max_tokens / self.kv_args.page_size))
 
     def _num_slots(self) -> int:
         return max(1, int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "16")))

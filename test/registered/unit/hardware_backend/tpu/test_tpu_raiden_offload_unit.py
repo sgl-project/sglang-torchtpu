@@ -14,9 +14,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import inspect
+import os
 import threading
 import unittest
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -132,6 +134,29 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         groups = get_raiden_kv_caches(_Pool())
         self.assertEqual(groups.full, [_Pool.buffers[0], _Pool.buffers[2]])
         self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
+
+    def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
+        mgr = object.__new__(RaidenKVManager)
+        mgr.kv_args = SimpleNamespace(page_size=128, sliding_window_size=4096)
+
+        with patch.dict(
+            os.environ,
+            {"SGLANG_RAIDEN_SWA_MAX_BLOCKS": "0"},
+        ):
+            self.assertEqual(mgr._swa_max_request_blocks(), 33)
+
+    def test_hybrid_swa_max_blocks_override_is_independent(self):
+        mgr = object.__new__(RaidenKVManager)
+        mgr.kv_args = SimpleNamespace(page_size=128, sliding_window_size=4096)
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_RAIDEN_MAX_BLOCKS": "7",
+                "SGLANG_RAIDEN_SWA_MAX_BLOCKS": "11",
+            },
+        ):
+            self.assertEqual(mgr._swa_max_request_blocks(), 11)
 
     def test_symmetric_pull_rendezvous_works_with_reshard_enabled(self):
         class _Engine:
