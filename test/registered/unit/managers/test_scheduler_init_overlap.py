@@ -141,12 +141,14 @@ class TestInitOverlapStreamGating(CustomTestCase):
 
 class TestLaunchBatchSampleStreamGating(CustomTestCase):
     """``launch_batch_sample_if_needed`` runs inside ``forward_stream_ctx`` and
-    cross-waits the schedule stream — but that wait is only valid when
-    ``use_overlap_streams`` is set. On a single-queue backend ``schedule_stream``
-    is never created (see ``test_single_queue_skips_streams``), so an unguarded
-    ``wait_stream`` raises AttributeError on the delayed-sample (spec-V2) path.
-    Basic inference returns early (``delay_sample_func is None``) and never hits
-    it, so this path needs its own coverage."""
+    cross-waits two streams — the schedule stream before sampling, the copy
+    stream before the D2H copy — but both waits are only valid when
+    ``use_overlap_streams`` is set. On a single-queue backend neither
+    ``schedule_stream`` nor ``copy_stream`` is created (see
+    ``test_single_queue_skips_streams``), so an unguarded ``wait_stream`` raises
+    AttributeError on the delayed-sample (spec-V2) path. Basic inference returns
+    early (``delay_sample_func is None``) and never hits it, so this path needs
+    its own coverage."""
 
     @staticmethod
     def _make_batch_result():
@@ -162,6 +164,9 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.use_overlap_streams = use_overlap_streams
         s.forward_stream_ctx = nullcontext()
+        # The D2H copy runs on its own stream, so the single-queue backend gets
+        # the same nullcontext __init__ installs for it and never a copy_stream.
+        s.copy_stream_ctx = nullcontext()
         # The relay itself (FutureMap stash vs ngram skip) is covered elsewhere;
         # here we only assert it is invoked with this iter's payload.
         s._relay_forward_payload = MagicMock()
@@ -185,17 +190,22 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         br.copy_to_cpu.assert_called_once()
         s._relay_forward_payload.assert_called_once_with(br.future_indices, br)
         self.assertIsNone(br.delay_sample_func)  # closure released
+        # Neither cross-stream wait ran: no schedule_stream, no copy_stream.
+        self.assertFalse(hasattr(s, "copy_stream"))
 
     def test_multi_stream_waits_on_schedule_stream(self):
         # The multi-stream (GPU) path still cross-waits the schedule stream.
         s = self._make_self(use_overlap_streams=True)
         s.forward_stream = MagicMock()
         s.schedule_stream = MagicMock()
+        s.copy_stream = MagicMock()
         br = self._make_batch_result()
 
         Scheduler.launch_batch_sample_if_needed(s, br, self._make_cur_batch())
 
         s.forward_stream.wait_stream.assert_called_once_with(s.schedule_stream)
+        # The D2H copy is ordered behind the sample it copies out.
+        s.copy_stream.wait_stream.assert_called_once_with(s.forward_stream)
         br.copy_to_cpu.assert_called_once()
 
     def test_delayed_sample_releases_global_top_k_tensors(self):
