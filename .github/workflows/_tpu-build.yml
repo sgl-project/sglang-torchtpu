@@ -47,9 +47,12 @@ jobs:
           # Tag the image with the ref we actually checked out and built (inputs.ref),
           # not the workflow's github.sha (the caller's commit, which can differ).
           INPUT_REF: ${{ inputs.ref }}
-          # Passed via env, not inline interpolation, so the value can never be
-          # shell-interpreted.
-          TRIGGER_ACTOR: ${{ github.actor }}
+          # Both actors, passed via env rather than inline interpolation so neither
+          # can be shell-interpreted. They differ on a re-run: triggering_actor is
+          # whoever pressed re-run, actor stays the original initiator (and is the
+          # identity whose privileges -- and OIDC claims -- the re-run uses).
+          TRIGGER_ACTOR: ${{ github.triggering_actor }}
+          ORIGIN_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           tokfile="${RUNNER_TEMP}/tpu-ci.token"
@@ -62,8 +65,17 @@ jobs:
           # the CreateBuild entry (Admin Activity, 400-day locked retention) otherwise
           # names only the service account. This also threads the actor into the image
           # tag itself, so a running pod's image traces back to a person.
-          safe_actor="$(printf '%s' "$TRIGGER_ACTOR" | tr -c 'A-Za-z0-9_.-' '-')"
-          tag="$(date -u +%Y%m%d)-${safe_actor:0:20}-${safe_ref:0:12}-${{ github.run_id }}"
+          # Each re-run produces its own build, so the tag names whoever caused THIS
+          # build (triggering_actor). When a re-run was started by someone other than
+          # the original initiator, both are recorded as "<trigger>-rr-<origin>" --
+          # they answer different questions and an audit needs both.
+          safe_trigger="$(printf '%s' "$TRIGGER_ACTOR" | tr -c 'A-Za-z0-9_.-' '-')"
+          safe_origin="$(printf '%s' "$ORIGIN_ACTOR" | tr -c 'A-Za-z0-9_.-' '-')"
+          who="${safe_trigger:0:20}"
+          if [ "$safe_trigger" != "$safe_origin" ]; then
+            who="${safe_trigger:0:20}-rr-${safe_origin:0:20}"
+          fi
+          tag="$(date -u +%Y%m%d)-${who}-${safe_ref:0:12}-${{ github.run_id }}"
           bucket="${GCP_PROJECT}_cloudbuild"
           object="source/${tag}.tgz"
           # `gcloud builds submit` runs a client-side staging/service-usage pre-flight
