@@ -101,7 +101,7 @@ def _gen_batch(engine, prompts, n=MAX_NEW):
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
-class TestTpuPrefixCache(unittest.TestCase):
+class TestTpuQwen306bSinglehostPrefixCache(unittest.TestCase):
     MODEL = "Qwen/Qwen3-0.6B"
     TP_SIZE = 1
     MEM_FRACTION_STATIC = 0.4
@@ -233,7 +233,7 @@ BIG_DOC = "Article 99. " + ", ".join(str(90000 + j) for j in range(480)) + "."
 # reused) and 3 more hit the cached-vs-cold divergence of #321.
 @unittest.skip("SWA prefix cache reuses a tombstoned prefix: #361")
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
-class TestTpuSwaPrefixCache(TestTpuPrefixCache):
+class TestTpuQwen306bSinglehostSwaPrefixCache(TestTpuQwen306bSinglehostPrefixCache):
     """Prefix-cache correctness on a hybrid-SWA model (gpt-oss-20b, window=128).
 
     Runs every scenario of :class:`TestTpuPrefixCache` against ``SWARadixCache``

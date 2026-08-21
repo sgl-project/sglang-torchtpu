@@ -1,10 +1,4 @@
-"""Qwen3-30B-A3B (FP8) multi-host serving smoke (live-server mode).
-
-Its MULTIHOST_LAUNCH differs from the 0.6B files (different launch script + weights), so
-the CI puts it in its own launch group -> its own JobSet + server, tp=16 / EP=8, weights
-from the ReadOnlyMany Hyperdisk at /weights. Live-server: connect only. The CI runs this
-file against the server rank-0 brought up; skips unless a live server is provided.
-"""
+"""Qwen3-30B-A3B (FP8) multi-host serving smoke (live-server mode)."""
 
 import os
 import unittest
@@ -30,7 +24,7 @@ BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
     os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
     "multi-host live-server not provided (the JobSet launches the server)",
 )
-class TestTpu30BMultihost(CustomTestCase):
+class TestTpuQwen330bMultihostSmoke(CustomTestCase):
     """The tp=16 Qwen3-30B-A3B-FP8 server serves coherent, correct inference."""
 
     def _generate(self, text, max_new_tokens=16):
@@ -55,6 +49,33 @@ class TestTpu30BMultihost(CustomTestCase):
     def test_arithmetic(self):
         # A cheap coherence check that the 30B MoE routing produced sane output.
         self.assertIn("4", self._generate("2 + 2 = "))
+
+
+    def test_respects_max_new_tokens(self):
+        resp = requests.post(
+            f"{BASE_URL}/generate",
+            json={
+                "text": "Count up from one:",
+                "sampling_params": {"max_new_tokens": 12, "temperature": 0},
+            },
+            timeout=180,
+        )
+        self.assertEqual(resp.status_code, 200)
+        out = resp.json()
+        self.assertTrue(out["text"])
+        self.assertLessEqual(out["meta_info"]["completion_tokens"], 12)
+
+    def test_batch_of_prompts(self):
+        resp = requests.post(
+            f"{BASE_URL}/generate",
+            json={
+                "text": ["Hello,", "The opposite of hot is"],
+                "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            },
+            timeout=180,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 2)
 
 
 if __name__ == "__main__":

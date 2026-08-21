@@ -9,6 +9,7 @@ import os
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 
+register_tpu_ci(est_time=3600, suite="stage-b-test-tpu-4-v7")
 register_tpu_ci(est_time=3600, suite="nightly-tpu-4-v7", nightly=True)
 
 SERVED_MODEL_NAME = "qwen3-coder-480b"
@@ -18,9 +19,9 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 GSM8K_ACCURACY = 0.65
 
 LAUNCH_ENV = {
-    "MODEL": "/weights/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+    "MODEL": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
     "DRAFT_MODEL": (
-        "/weights/lmsys/"
+        "/weights/"
         "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI"
     ),
     "ISL": "4096",
@@ -37,7 +38,7 @@ LAUNCH_ENV = {
         f"--served-model-name {SERVED_MODEL_NAME} "
         "--speculative-algorithm EAGLE3 "
         "--speculative-draft-model-path "
-        "/weights/lmsys/"
+        "/weights/"
         "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI "
         "--speculative-num-steps 3 "
         "--speculative-eagle-topk 1 "

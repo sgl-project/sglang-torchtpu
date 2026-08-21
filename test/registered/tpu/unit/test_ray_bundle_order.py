@@ -18,8 +18,8 @@ CPU-side logic that the Ray engine relies on for correct TPU launch:
 * ``detect_tpu_nnodes`` -- auto-detect node count from the live Ray cluster.
 
 Usage:
-    python -m pytest test/registered/tpu/test_ray_bundle_order.py -v
-    python test/registered/tpu/test_ray_bundle_order.py
+    python -m pytest test/registered/tpu/unit/test_ray_bundle_order.py -v
+    python test/registered/tpu/unit/test_ray_bundle_order.py
 """
 
 import os

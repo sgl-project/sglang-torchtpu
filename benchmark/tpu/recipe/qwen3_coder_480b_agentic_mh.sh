@@ -2,7 +2,7 @@
 # Multi-host CI recipe: Qwen3-Coder-480B-A35B-Instruct-FP8 colocated agentic
 # benchmark server -- tp=16, ep=16, dp=4 -> attention_tp = 16/4 = 4, across 2 hosts.
 #
-# Declared by test/registered/tpu/test_tpu_qwen3_coder_480b_agentic.py via
+# Declared by test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_multihost_agentic.py via
 # MULTIHOST_LAUNCH; the TPU CI JobSet runs this on EVERY host (one global TP group)
 # and rank-0 then runs that test file against the resulting server. GKE injects
 # TPU_WORKER_ID / TPU_WORKER_HOSTNAMES, so launch_server.sh auto-derives NNODES,
