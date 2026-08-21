@@ -47,6 +47,9 @@ jobs:
           # Tag the image with the ref we actually checked out and built (inputs.ref),
           # not the workflow's github.sha (the caller's commit, which can differ).
           INPUT_REF: ${{ inputs.ref }}
+          # Passed via env, not inline interpolation, so the value can never be
+          # shell-interpreted.
+          TRIGGER_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           tokfile="${RUNNER_TEMP}/tpu-ci.token"
@@ -54,7 +57,13 @@ jobs:
           trap 'rm -f "$tokfile"' EXIT
           # Docker tags allow only [A-Za-z0-9_.-], so slugify the ref before using it.
           safe_ref="$(printf '%s' "$INPUT_REF" | tr -c 'A-Za-z0-9_.-' '-')"
-          tag="$(date -u +%Y%m%d)-${safe_ref:0:12}-${{ github.run_id }}"
+          # The actor belongs in the tag because it is the only place the triggering
+          # human reaches Cloud Audit Logs: everything downstream runs as tpu-ci@, so
+          # the CreateBuild entry (Admin Activity, 400-day locked retention) otherwise
+          # names only the service account. This also threads the actor into the image
+          # tag itself, so a running pod's image traces back to a person.
+          safe_actor="$(printf '%s' "$TRIGGER_ACTOR" | tr -c 'A-Za-z0-9_.-' '-')"
+          tag="$(date -u +%Y%m%d)-${safe_actor:0:20}-${safe_ref:0:12}-${{ github.run_id }}"
           bucket="${GCP_PROJECT}_cloudbuild"
           object="source/${tag}.tgz"
           # `gcloud builds submit` runs a client-side staging/service-usage pre-flight
