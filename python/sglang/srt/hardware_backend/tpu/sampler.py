@@ -32,10 +32,17 @@ def distributed_top_k_for_batch(
 
     if sampling_backend != "tpu":
         return None
-    if forward_batch is None or getattr(forward_batch, "sampling_info", None) is None:
+    if forward_batch is None:
         return None
     spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
     has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
+    # Speculative decoding never uses the distributed TopK path. Check this
+    # before sampling_info so compiled speculative forwards do not specialize
+    # on request-specific sampling state.
+    if has_speculative_decode:
+        return None
+    if getattr(forward_batch, "sampling_info", None) is None:
+        return None
     batch_size = getattr(
         forward_batch,
         "_tpu_real_b",
@@ -43,7 +50,6 @@ def distributed_top_k_for_batch(
     )
     if (
         getattr(forward_batch, "return_logprob", False)
-        or has_speculative_decode
         or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
     ):
         return None
