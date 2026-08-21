@@ -1774,6 +1774,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(
                 _view(moe_runner_backend="pallas_tpu_fused_rs")
             )
+        with self.assertRaises(ValueError):
+            _moe_runner_backend_quant_constraints(
+                _view(moe_runner_backend="pallas_tpu")
+            )
+        self.assertEqual(
+            _moe_runner_backend_quant_constraints(
+                _view(device="tpu", moe_runner_backend="pallas_tpu")
+            ),
+            {},
+        )
         self.assertEqual(
             _moe_runner_backend_quant_constraints(
                 _view(device="tpu", moe_runner_backend="pallas_tpu_fused_rs")

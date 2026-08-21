@@ -112,6 +112,7 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    PALLAS_TPU = "pallas_tpu"
     PALLAS_TPU_FUSED_RS = "pallas_tpu_fused_rs"
 
     def is_auto(self):
@@ -119,6 +120,9 @@ class MoeRunnerBackend(Enum):
 
     def is_hpc_ops(self):
         return self == MoeRunnerBackend.HPC_OPS
+
+    def is_pallas_tpu(self):
+        return self == MoeRunnerBackend.PALLAS_TPU
 
     def is_pallas_tpu_fused_rs(self):
         return self == MoeRunnerBackend.PALLAS_TPU_FUSED_RS

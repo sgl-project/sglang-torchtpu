@@ -123,13 +123,7 @@ def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
     from sglang.srt.distributed import get_tp_group
     from sglang.srt.layers.moe import get_moe_a2a_backend
-    from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-
-    if get_server_args().speculative_algorithm is not None:
-        layer.__dict__["_tpu_fused_rs_unsupported_reason"] = (
-            "speculative decoding is not supported"
-        )
-        return False
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
     runner_config = layer.moe_runner_config
     parallel = get_parallel()

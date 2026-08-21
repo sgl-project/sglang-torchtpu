@@ -1156,6 +1156,12 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         self.assertTrue(resolved)
         self.assertTrue(prepared["use_fused_rs"])
 
+    def test_explicit_legacy_pallas_backend_disables_fused_rs(self):
+        _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu")
+
+        self.assertFalse(resolved)
+        self.assertFalse(prepared["use_fused_rs"])
+
     def test_gate_still_declines_an_unsupported_layout(self):
         # EP 2 inside a world of 4 is the mixed TP/EP shape the requirement
         # list rejects; deferring the decision must not soften the gate.
