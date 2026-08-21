@@ -702,7 +702,12 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 )
 
     def _precompile_extend_full(self) -> None:
-        """Compile target prefill with and without speculative input state."""
+        """Compile target prefill with and without speculative input state.
+
+        A new request reaches the target with ``spec_info=None``. A continued
+        speculative request may carry an ``EagleDraftInput``. Dynamo guards on
+        both object states, so precompile both before recompiles are disabled.
+        """
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
