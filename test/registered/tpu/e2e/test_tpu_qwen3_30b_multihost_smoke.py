@@ -50,7 +50,6 @@ class TestTpuQwen330bMultihostSmoke(CustomTestCase):
         # A cheap coherence check that the 30B MoE routing produced sane output.
         self.assertIn("4", self._generate("2 + 2 = "))
 
-
     def test_respects_max_new_tokens(self):
         resp = requests.post(
             f"{BASE_URL}/generate",

@@ -131,3 +131,28 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+  # Aggregator finish job for branch protection / required status checks.
+  # If tests are skipped (non-TPU PR), this finishes green immediately.
+  # If tests are run, it blocks until all TPU stages finish and fails if any fail.
+  pr-test-tpu-finish:
+    needs: [decide, build, integration, feature]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all TPU job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "TPU CI job '$job' failed or was cancelled."
+              exit 1
+            fi
+          done
+          echo "All TPU CI jobs completed successfully (or were intentionally skipped)."
+          exit 0
+
