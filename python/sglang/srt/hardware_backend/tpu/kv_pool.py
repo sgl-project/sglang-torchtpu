@@ -274,20 +274,50 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         """Copy the KV rows at ``indices`` from host to device.
 
-        Inverse of `get_cpu_copy`.
+        Inverse of `get_cpu_copy`. Rows are written a whole page at a time
+        through `write_pages_torch`, which updates the layer buffer in place.
+        A page that ``indices`` only partly covers is read back first and
+        merged on device.
         """
-        # Indices might be on host and need to be copied to device.
-        indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
+        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        page = self.page_size
+        blocks = indices // page
+        offsets = indices % page
+        uniq_blocks, block_pos = torch.unique(blocks, return_inverse=True)
+        full = torch.bincount(block_pos, minlength=uniq_blocks.numel()) == page
+        full_rows = full[block_pos]
+        # Position of each row's page within the full / partial page batches.
+        full_pos = torch.cumsum(full.long(), 0) - 1
+        part_pos = torch.cumsum((~full).long(), 0) - 1
+        device = self.kv_buffer[0].device
+        full_blocks = uniq_blocks[full].to(device)
+        part_blocks = uniq_blocks[~full].to(device)
+        full_page_pos = full_pos[block_pos][full_rows]
+        full_offsets = offsets[full_rows]
+        part_page_pos = part_pos[block_pos][~full_rows].to(device)
+        part_offsets = offsets[~full_rows].to(device)
+
         self.device_module.synchronize()
-        chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
-            layer_kv = self.kv_buffer[layer_id].flatten(0, 1)
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
-                assert kv_cpu.shape[0] == len(chunk_indices)
-                kv_chunk = kv_cpu.to(layer_kv.device, non_blocking=True)
-                layer_kv.index_copy_(0, chunk_indices, kv_chunk)
+            rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
+            assert rows.shape[0] == indices.numel()
+            dst = self.kv_buffer[layer_id]
+            if full_blocks.numel():
+                pages = torch.empty(
+                    (full_blocks.numel(), page, *rows.shape[1:]), dtype=rows.dtype
+                )
+                pages[full_page_pos, full_offsets] = rows[full_rows]
+                write_pages_torch(full_blocks, pages.to(device, non_blocking=True), dst)
+            if part_blocks.numel():
+                pages = dst[part_blocks]
+                pages[part_page_pos, part_offsets] = rows[~full_rows].to(
+                    device, non_blocking=True
+                )
+                write_pages_torch(part_blocks, pages, dst)
         self.device_module.synchronize()
 
     def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):

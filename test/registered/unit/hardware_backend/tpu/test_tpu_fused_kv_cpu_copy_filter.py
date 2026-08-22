@@ -15,6 +15,13 @@ import unittest
 
 import torch
 
+try:
+    import jax  # noqa: F401
+
+    _HAS_JAX = True
+except Exception:
+    _HAS_JAX = False
+
 from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -113,6 +120,60 @@ class TestFusedPoolFilterCpuCopy(CustomTestCase):
         filtered = pool.filter_cpu_copy(kv_cpu, torch.tensor([False, True]))
         self.assertEqual(len(filtered[0]), 1)
         self.assertEqual(_row_values(filtered[0][0], [0]), [2.0])
+
+    def test_fused_pool_load_partial_pages_keeps_neighbours(self):
+        pool = _make_fused_pool(size=32, page_size=4, layer_num=2)
+        _fill_rows(_fused_rows(pool))
+        # Rows 6..13 span a partial page (6, 7), a full page (8..11) and
+        # another partial page (12, 13).
+        src = torch.arange(6, 14)
+        kv_cpu = pool.get_cpu_copy(src)
+
+        _fill_rows(_fused_rows(pool), offset=SWA_OFFSET)
+        dst = torch.arange(18, 26)
+        pool.load_cpu_copy(kv_cpu, dst)
+        for layer, buf in enumerate(_fused_rows(pool)):
+            self.assertEqual(
+                _row_values(buf, dst),
+                [layer * LAYER_STRIDE + r for r in src.tolist()],
+            )
+            untouched = [16, 17, 26, 27]
+            self.assertEqual(
+                _row_values(buf, untouched),
+                [SWA_OFFSET + layer * LAYER_STRIDE + r for r in untouched],
+            )
+
+    def test_fused_pool_load_unordered_indices(self):
+        pool = _make_fused_pool(size=16, page_size=4, layer_num=1)
+        _fill_rows(_fused_rows(pool))
+        src = torch.tensor([9, 2, 11, 3])
+        kv_cpu = pool.get_cpu_copy(src)
+        _fill_rows(_fused_rows(pool), offset=SWA_OFFSET)
+        dst = torch.tensor([5, 13, 4, 12])
+        pool.load_cpu_copy(kv_cpu, dst)
+        buf = _fused_rows(pool)[0]
+        self.assertEqual(_row_values(buf, dst), [9.0, 2.0, 11.0, 3.0])
+        self.assertEqual(
+            _row_values(buf, [6, 7, 14, 15]), [SWA_OFFSET + r for r in [6, 7, 14, 15]]
+        )
+
+
+class TestKvPageWriteKernel(CustomTestCase):
+    @unittest.skipUnless(_HAS_JAX, "jax not installed")
+    def test_kernel_writes_only_listed_blocks(self):
+        import jax.numpy as jnp
+
+        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages
+
+        kv = jnp.arange(6 * 4 * 2 * 1 * 8, dtype=jnp.float32).reshape(6, 4, 2, 1, 8)
+        kv = kv.astype(jnp.bfloat16)
+        pages = -jnp.ones((2, 4, 2, 1, 8), jnp.bfloat16)
+        block_ids = jnp.array([4, 1], jnp.int32)
+        out = write_pages(block_ids, pages, kv, interpret=True)
+        for b in (1, 4):
+            self.assertTrue(bool((out[b] == pages[0]).all()))
+        for b in (0, 2, 3, 5):
+            self.assertTrue(bool((out[b] == kv[b]).all()))
 
 
 class TestMhaPoolFilterCpuCopy(CustomTestCase):
