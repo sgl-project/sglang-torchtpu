@@ -290,6 +290,28 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
                 layer_kv.index_copy_(0, chunk_indices, kv_chunk)
         self.device_module.synchronize()
 
+    def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
+        """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
+
+        Each layer's chunks are single fused KV tensors with the token axis
+        first; the rows are masked along that axis and re-split into
+        ``cpu_offloading_chunk_size`` chunks, the format `load_cpu_copy` reads.
+        """
+        chunk_size = self.cpu_offloading_chunk_size
+        filtered = []
+        for layer_chunks in kv_cache_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+            layer_kv = torch.cat(layer_chunks, dim=0)[row_mask]
+            filtered.append(
+                [
+                    layer_kv[i : i + chunk_size]
+                    for i in range(0, len(layer_kv), chunk_size)
+                ]
+            )
+        return filtered
+
     # ``get_fused_kv_buffer`` is the canonical accessor on TPU; the Pallas
     # backend uses it directly.
     def get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:

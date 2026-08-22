@@ -1762,6 +1762,16 @@ class KVCache(abc.ABC):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError()
 
+    def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
+        """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
+
+        ``row_mask`` is a bool tensor over the token rows of the payload, in
+        copy order. The result is a payload that `load_cpu_copy` accepts for
+        an index tensor of ``row_mask.sum()`` entries, in this pool's own host
+        format and chunking.
+        """
+        raise NotImplementedError()
+
     def get_kv_cache_quant_method(self) -> Any:
         """Return the concrete KV quant method, unwrapping composite KV pools."""
         fallback = None
@@ -2318,6 +2328,29 @@ class MHATokenToKVPool(KVCache):
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
         current_platform.synchronize()
+
+    def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
+        """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
+
+        Each layer's chunks are ``[K, V]`` pairs sharing the token axis; K and
+        V are masked separately and re-split into ``cpu_offloading_chunk_size``
+        chunks, the format `load_cpu_copy` reads.
+        """
+        chunk_size = self.cpu_offloading_chunk_size
+        filtered = []
+        for layer_chunks in kv_cache_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)[row_mask]
+            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)[row_mask]
+            filtered.append(
+                [
+                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
+                    for i in range(0, len(k_cpu), chunk_size)
+                ]
+            )
+        return filtered
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
