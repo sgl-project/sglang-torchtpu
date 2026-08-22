@@ -574,11 +574,15 @@ def reconcile_tpu_batch_limits(
         )
         if limit is not None
     ]
-    tcmb = (
-        max(explicit_compile_limits)
-        if explicit_compile_limits
-        else DEFAULT_TPU_COMPILE_MAX_BS
-    )
+    if explicit_compile_limits:
+        tcmb = max(explicit_compile_limits)
+    elif max_running_requests is not None:
+        # The scheduler never batches more than max_running_requests, so
+        # buckets above it are dead shapes: they cost compile time and, for
+        # long contexts, SMEM for the attention page table.
+        tcmb = max_running_requests
+    else:
+        tcmb = DEFAULT_TPU_COMPILE_MAX_BS
 
     if max_running_requests is not None:
         tcmb = max(tcmb, max_running_requests)

@@ -56,6 +56,20 @@ def _get_pages_per_seq(max_context_len: int, page_size: int) -> int:
     return (max_context_len + page_size - 1) // page_size
 
 
+# Scoped SMEM available to one Pallas kernel invocation on TPU.
+_SCOPED_SMEM_BYTES = 1 << 20
+
+
+def _page_table_smem_bytes(max_num_seqs: int, pages_per_seq: int) -> int:
+    """Bytes of SMEM the kernel's page table occupies for ``max_num_seqs``.
+
+    The page table is a scalar-prefetch operand: ``max_num_seqs * pages_per_seq``
+    int32 entries, padded to a multiple of 128 entries.
+    """
+    entries = max_num_seqs * pages_per_seq
+    return ((entries + 127) // 128) * 128 * 4
+
+
 def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
     if max_kv_len > capacity:
         raise ValueError(
@@ -338,6 +352,22 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "RPA context capacity exceeds the request-to-token table width: "
                 f"required={self.max_context_len}, available={req_to_token_width}."
             )
+        max_bs = getattr(model_runner.server_args, "torch_compile_max_bs", None)
+        if max_bs:
+            pages_per_seq = _get_pages_per_seq(self.max_context_len, self.page_size)
+            table_bytes = _page_table_smem_bytes(max_bs, pages_per_seq)
+            if table_bytes > _SCOPED_SMEM_BYTES:
+                logger.warning(
+                    "RPA page table for %d sequences x %d pages needs %.2f MiB of "
+                    "SMEM, above the %.0f MiB scoped budget; the kernel compile "
+                    "will fail. Lower --torch-compile-max-bs (<= %d at this "
+                    "context length) or raise --page-size.",
+                    max_bs,
+                    pages_per_seq,
+                    table_bytes / 2**20,
+                    _SCOPED_SMEM_BYTES / 2**20,
+                    max(1, (_SCOPED_SMEM_BYTES // 4 - 128) // pages_per_seq),
+                )
 
         # Hybrid-SWA models keep two KV sub-pools and need a
         # second page_indices tensor with indices translated into the SWA

@@ -686,6 +686,11 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         # --max-running-requests 128 -> grid ceiling 128, served (not clamped 64).
         self.assertEqual(self._r(max_running_requests=128), (128, None, 128))
 
+    def test_max_running_requests_below_default_caps_grid(self):
+        # --max-running-requests 4 with no explicit compile limit -> the grid
+        # stops at 4 instead of compiling dead shapes up to 64.
+        self.assertEqual(self._r(max_running_requests=4), (4, None, 4))
+
     def test_tpu_compile_bs_sets_ceiling_and_concurrency(self):
         tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8])
         self.assertEqual((tcmb, mrr, bs), (8, 8, [1, 8]))

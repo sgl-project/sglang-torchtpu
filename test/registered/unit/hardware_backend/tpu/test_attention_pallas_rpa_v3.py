@@ -16,6 +16,27 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    _SCOPED_SMEM_BYTES,
+    _get_pages_per_seq,
+    _page_table_smem_bytes,
+)
+
+
+class TestPageTableSmemBudget(unittest.TestCase):
+    def test_1m_context_default_batch_cap_exceeds_smem(self):
+        # 1,052,672 tokens at page 64 -> 16,448 pages/seq; the default compile
+        # cap of 64 sequences needs 4.2 MB, far above the 1 MiB scoped SMEM.
+        pages = _get_pages_per_seq(1052672, 64)
+        self.assertEqual(pages, 16448)
+        self.assertGreater(_page_table_smem_bytes(64, pages), _SCOPED_SMEM_BYTES)
+        self.assertLessEqual(_page_table_smem_bytes(8, pages), _SCOPED_SMEM_BYTES)
+
+    def test_entries_padded_to_128(self):
+        self.assertEqual(_page_table_smem_bytes(1, 1), 128 * 4)
+        self.assertEqual(_page_table_smem_bytes(2, 100), 256 * 4)
+
+
 class TestAttentionPallasRpaV3(unittest.TestCase):
     CONTEXT_LEN = 131072
     POOL_WIDTH = 262144
