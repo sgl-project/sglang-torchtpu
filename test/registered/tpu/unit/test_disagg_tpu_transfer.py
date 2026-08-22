@@ -948,7 +948,9 @@ class TestTpuReshardingProtocol(CustomTestCase):
                 )
         self.assertTrue(torch.equal(daux[0][3], paux[0][6]))
 
-    @unittest.skip("Resource temporarily unavailable in CI due to zmq socket contention")
+    @unittest.skip(
+        "Resource temporarily unavailable in CI due to zmq socket contention"
+    )
     def test_fan_in_fp8_gqa_replica_no_reassemble(self):
         # total_num_head=4, prefill_tp=8 -> decode_tp=4: each rank holds exactly 1
         # head (fp8 lane == [head, dummy]), so src_heads == dst_heads. This is
