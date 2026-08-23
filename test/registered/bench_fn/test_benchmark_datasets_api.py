@@ -1490,10 +1490,6 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             self.assertNotIn(forbidden, stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestRandomIdsSendsIds(unittest.TestCase):
     def _args(self, **kw):
         base = dict(
@@ -1511,6 +1507,10 @@ class TestRandomIdsSendsIds(unittest.TestCase):
     def test_random_ids_on_sglang_backend_sends_ids(self):
         self.assertFalse(RandomDataset.from_args(self._args()).return_text)
 
+    def test_random_ids_on_sglang_native_backend_sends_ids(self):
+        args = self._args(backend="sglang-native")
+        self.assertFalse(RandomDataset.from_args(args).return_text)
+
     def test_random_ids_on_other_backend_sends_text(self):
         self.assertTrue(RandomDataset.from_args(self._args(backend="vllm")).return_text)
 
@@ -1522,3 +1522,7 @@ class TestRandomIdsSendsIds(unittest.TestCase):
     def test_tokenize_prompt_forces_ids(self):
         args = self._args(dataset_name="random", tokenize_prompt=True)
         self.assertFalse(RandomDataset.from_args(args).return_text)
+
+
+if __name__ == "__main__":
+    unittest.main()

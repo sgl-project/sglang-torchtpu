@@ -22,15 +22,14 @@ def _sends_token_ids(args: Namespace) -> bool:
 
     Text prompts are re-tokenized by the server and come back a few percent
     longer than requested, so the random-ids dataset sends ids wherever the
-    backend accepts them (the sglang /generate API); --tokenize-prompt forces
-    ids for every dataset on that backend.
+    backend accepts them (the sglang /generate API, under either backend
+    alias); --tokenize-prompt forces ids for every dataset on that backend.
     """
     if getattr(args, "tokenize_prompt", False):
         return True
-    return (
-        getattr(args, "dataset_name", "") == "random-ids"
-        and getattr(args, "backend", "") == "sglang"
-    )
+    return getattr(args, "dataset_name", "") == "random-ids" and getattr(
+        args, "backend", ""
+    ) in ("sglang", "sglang-native")
 
 
 @dataclass
