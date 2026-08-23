@@ -188,25 +188,12 @@ class MiniLoadBalancer:
                 sock_connect=300,
             )  # Add timeout for request reliability
         )
-        try:
-            # Both servers answer the headers before any token is produced, so
-            # a request either server rejects is known here, before the
-            # streaming response (and its 200 status) is committed.
-            prefill_response, decode_response = await asyncio.gather(
-                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                session.post(f"{decode_server}/{endpoint}", json=modified_request),
-            )
-            for response in (prefill_response, decode_response):
-                if response.status != 200:
-                    body = await response.read()
-                    return Response(
-                        content=body,
-                        status_code=response.status,
-                        media_type=response.content_type,
-                    )
-        except BaseException:
+        responses = []
+
+        async def close_upstreams():
+            for response in responses:
+                response.close()
             await session.close()
-            raise
 
         async def stream_results():
             try:
@@ -244,12 +231,37 @@ class MiniLoadBalancer:
                     ):
                         yield chunk
             finally:
-                await session.close()
+                await close_upstreams()
 
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-        )
+        # The session and both upstream responses stay open only for an
+        # accepted request, whose stream_results() closes them when the
+        # stream ends; every other exit closes them here.
+        streaming = False
+        try:
+            # Both servers answer the headers before any token is produced, so
+            # a request either server rejects is known here, before the
+            # streaming response (and its 200 status) is committed.
+            prefill_response, decode_response = await asyncio.gather(
+                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+            )
+            responses.extend((prefill_response, decode_response))
+            for response in responses:
+                if response.status != 200:
+                    body = await response.read()
+                    return Response(
+                        content=body,
+                        status_code=response.status,
+                        media_type=response.content_type,
+                    )
+            streaming = True
+            return StreamingResponse(
+                stream_results(),
+                media_type="text/event-stream",
+            )
+        finally:
+            if not streaming:
+                await close_upstreams()
 
 
 app = FastAPI()

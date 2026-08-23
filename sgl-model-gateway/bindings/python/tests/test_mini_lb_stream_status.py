@@ -1,10 +1,12 @@
 """The mini load balancer must return an upstream rejection with its own
-status instead of wrapping it in a 200 event stream."""
+status instead of wrapping it in a 200 event stream, and must close its
+upstream session however a request ends."""
 
 import asyncio
 import json
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from aiohttp import web
 from sglang_router.mini_lb import MiniLoadBalancer
@@ -52,9 +54,20 @@ def _lb(prefill_url, decode_url):
     return MiniLoadBalancer(args)
 
 
-async def _run(prefill_handler, decode_handler):
+async def _run(prefill_handler, decode_handler, max_chunks=None):
+    """Issue one streaming request through MiniLB and read up to
+    `max_chunks` of its body; returns the response, the chunks read and the
+    upstream sessions MiniLB opened."""
+    sessions = []
+    real_session = aiohttp.ClientSession
+
+    def recording_session(*args, **kwargs):
+        sessions.append(real_session(*args, **kwargs))
+        return sessions[-1]
+
     prefill_runner, prefill_url = await _serve(prefill_handler)
     decode_runner, decode_url = await _serve(decode_handler)
+    aiohttp.ClientSession = recording_session
     try:
         lb = _lb(prefill_url, decode_url)
         response = await lb.generate_stream(
@@ -64,31 +77,51 @@ async def _run(prefill_handler, decode_handler):
         if hasattr(response, "body_iterator"):
             async for chunk in response.body_iterator:
                 chunks.append(chunk)
-        return response, chunks
+                if max_chunks is not None and len(chunks) >= max_chunks:
+                    await response.body_iterator.aclose()
+                    break
+        return response, chunks, sessions
     finally:
+        aiohttp.ClientSession = real_session
         await prefill_runner.cleanup()
         await decode_runner.cleanup()
 
 
+def _assert_sessions_closed(sessions):
+    assert len(sessions) == 1
+    assert sessions[0].closed
+
+
 @pytest.mark.unit
 def test_rejected_request_keeps_upstream_status():
-    response, chunks = asyncio.run(_run(_reject, _reject))
+    response, chunks, sessions = asyncio.run(_run(_reject, _reject))
     assert response.status_code == 400
     assert b"longer than the context length" in response.body
     assert chunks == []
+    _assert_sessions_closed(sessions)
 
 
 @pytest.mark.unit
 def test_prefill_rejection_is_reported_even_if_decode_streams():
-    response, chunks = asyncio.run(_run(_reject, _stream))
+    response, chunks, sessions = asyncio.run(_run(_reject, _stream))
     assert response.status_code == 400
     assert chunks == []
+    _assert_sessions_closed(sessions)
 
 
 @pytest.mark.unit
 def test_accepted_request_streams_decode_output():
-    response, chunks = asyncio.run(_run(_stream, _stream))
+    response, chunks, sessions = asyncio.run(_run(_stream, _stream))
     assert response.status_code == 200
     body = b"".join(chunks)
     assert body.count(b'"text"') == 3
     assert body.endswith(b"data: [DONE]\n\n")
+    _assert_sessions_closed(sessions)
+
+
+@pytest.mark.unit
+def test_abandoned_stream_closes_session():
+    response, chunks, sessions = asyncio.run(_run(_stream, _stream, max_chunks=1))
+    assert response.status_code == 200
+    assert len(chunks) == 1
+    _assert_sessions_closed(sessions)
