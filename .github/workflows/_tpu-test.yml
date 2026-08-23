@@ -198,12 +198,68 @@ jobs:
           # budget on it: ceiling minus this job's own runtime, the bind/pull window and
           # setup. A fixed 1h was the reason four of five multi-host jobs failed in run
           # 31834592348 while the slice was busy.
+          # The kubeconfig holds a one-hour access token minted at job start,
+          # and the org policy does not allow longer ones. A job that queues
+          # behind other PRs on the slice outlives it, so re-mint the token
+          # from a fresh GitHub OIDC token (the same exchange the auth action
+          # does) and swap it into the kubeconfig before it can expire.
+          refresh_cluster_token() {
+            local oidc sts sa_token user
+            oidc="$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://iam.googleapis.com/${WIF_PROVIDER}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')" || return 1
+            sts="$(curl -sSf -X POST https://sts.googleapis.com/v1/token \
+              -H 'Content-Type: application/json' \
+              -d "{\"audience\":\"//iam.googleapis.com/${WIF_PROVIDER}\",
+                   \"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",
+                   \"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",
+                   \"scope\":\"https://www.googleapis.com/auth/cloud-platform\",
+                   \"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",
+                   \"subjectToken\":\"${oidc}\"}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')" || return 1
+            # userinfo.email is required: without it GKE sees a numeric id and RBAC denies.
+            sa_token="$(curl -sSf -X POST \
+              "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${CI_SA}:generateAccessToken" \
+              -H "Authorization: Bearer ${sts}" -H 'Content-Type: application/json' \
+              -d '{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')" || return 1
+            user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
+            kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
+            echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
+          }
+
+
           admit_s=$(( JOB_CEILING_S - wait_s - 900 - 600 ))
           echo "budgets for ${label}: admission ${admit_s}s, runtime ${wait_s}s"
           echo "queued in this ClusterQueue right now:"
           kubectl -n tpu-ci get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  workloads:"
           admit_deadline=$(( $(date +%s) + admit_s ))
-          until [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ]; do
+          next_refresh=$(( $(date +%s) + 2400 ))
+          auth_fails=0
+          while true; do
+            # A dead kubectl looks identical to "no pods yet" with errors
+            # suppressed, so track it explicitly and recover the credentials
+            # instead of reporting NOT ADMITTED with an expired kubeconfig.
+            if pods="$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>&1)"; then
+              auth_fails=0
+              [ -n "$pods" ] && break
+            else
+              auth_fails=$((auth_fails + 1))
+              if [ "$auth_fails" -ge 3 ]; then
+                refresh_cluster_token || echo "credential refresh failed; will retry"
+                auth_fails=0
+              fi
+            fi
+            if [ "$(date +%s)" -ge "$next_refresh" ]; then
+              if refresh_cluster_token; then
+                next_refresh=$(( $(date +%s) + 2400 ))
+              else
+                # The current token dies at the hour mark; retry well before
+                # then rather than running blind for another 40 minutes.
+                echo "credential refresh failed; retrying in 45s"
+                next_refresh=$(( $(date +%s) + 45 ))
+              fi
+            fi
             if [ "$(date +%s)" -ge "$admit_deadline" ]; then
               echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- slice quota never freed"
               kubectl -n tpu-ci get workloads 2>/dev/null | grep -- "${short}" || true
@@ -225,6 +281,9 @@ jobs:
           done
           kubectl -n tpu-ci get pods -l "$sel" -o wide || true
 
+          # The stream below can outlive the token it starts with; start it fresh.
+          refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+
           # Stream logs from every host (best effort; may restart while pods come up).
           # Tee'd because the pod log is the ONLY egress from a JobSet: a benchmark
           # test emits its results JSON into it, and the next step lifts that out.
@@ -235,13 +294,24 @@ jobs:
           # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
           auth_fails=0
+          # The stream may have run for a long time; poll with a fresh token.
+          refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+          next_refresh=$(( $(date +%s) + 2400 ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            # The workload-identity credentials can expire before very long
-            # runs end; a dead kubectl looks identical to "no condition yet"
-            # with errors suppressed, so track it explicitly instead of
-            # polling blind until the budget runs out.
+            if [ "$(date +%s)" -ge "$next_refresh" ]; then
+              if refresh_cluster_token; then
+                next_refresh=$(( $(date +%s) + 2400 ))
+              else
+                echo "credential refresh failed; retrying in 45s"
+                next_refresh=$(( $(date +%s) + 45 ))
+              fi
+            fi
+            # A dead kubectl looks identical to "no condition yet" with errors
+            # suppressed, so track it explicitly instead of polling blind until
+            # the budget runs out; try one refresh before giving up.
             if ! kubectl -n tpu-ci get "$name" >/dev/null 2>&1; then
               auth_fails=$((auth_fails + 1))
+              [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
               if [ "$auth_fails" -ge 12 ]; then
                 echo "❌ ${label}: lost cluster access while polling (credentials likely expired); JobSet outcome unknown"
                 exit 1
