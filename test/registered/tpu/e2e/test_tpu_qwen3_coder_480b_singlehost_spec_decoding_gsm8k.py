@@ -9,7 +9,6 @@ import os
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 
-register_tpu_ci(est_time=3600, suite="stage-b-test-tpu-4-v7")
 register_tpu_ci(est_time=3600, suite="nightly-tpu-4-v7", nightly=True)
 
 SERVED_MODEL_NAME = "qwen3-coder-480b"
