@@ -225,11 +225,11 @@ class RaidenKVManager(CommonKVManager):
             self._final_seen: Set[int] = set()
             # Chunk announcements from each resharding source, by chunk index,
             # until every source of the room has announced it; the receive
-            # plan registered per chunk, by the chunk's request id.
+            # plans registered for the room, by their request id.
             self._reshard_chunk_sources: Dict[
                 int, Dict[int, Dict[int, Tuple[int, List[int]]]]
             ] = {}
-            self._reshard_chunk_plans: Dict[int, Dict[str, int]] = {}
+            self._reshard_plans: Dict[int, Dict[str, int]] = {}
             self._uuid_seq = 0
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
@@ -542,7 +542,11 @@ class RaidenKVManager(CommonKVManager):
         endpoint = msg[7].decode("ascii")
         with self._state_lock:
             self._remote_total[room] = total_pages
-            self._announced_pages[room] = start + len(blocks)
+            # Chunks are announced from two threads and can cross on the wire,
+            # so the announced reach is the furthest chunk end, not the last.
+            self._announced_pages[room] = max(
+                self._announced_pages.get(room, 0), start + len(blocks)
+            )
             self._chunk_queue.setdefault(room, []).append(
                 (req_id, uuid, start, blocks, endpoint)
             )
@@ -941,8 +945,29 @@ class RaidenKVManager(CommonKVManager):
                     queue.pop(0)
                     continue
                 if window.length > self._engine_max_blocks:
-                    oversized = window.length
+                    oversized = (
+                        window.length,
+                        self._engine_max_blocks,
+                        "SGLANG_RAIDEN_MAX_BLOCKS",
+                    )
                     break
+                # The closing read also carries the sliding-window pages, on
+                # the engine that stages them against its own limit.
+                closing = req_id == str(room) and self._swa_engine is not None
+                if closing:
+                    remote_swa, local_swa = self._pair_blocks(
+                        list(self._remote_swa_blocks.get(room, [])),
+                        list(self._local_swa_blocks.get(room, [])),
+                    )
+                    swa_endpoint = self._remote_swa_endpoint.get(room, "")
+                    swa_pages = len(set(local_swa))
+                    if swa_pages > self._swa_engine_max_blocks:
+                        oversized = (
+                            swa_pages,
+                            self._swa_engine_max_blocks,
+                            "SGLANG_RAIDEN_SWA_MAX_BLOCKS",
+                        )
+                        break
                 if not self._pulling.admit(req_id):
                     return started
                 queue.pop(0)
@@ -953,19 +978,12 @@ class RaidenKVManager(CommonKVManager):
                     window.local_offset : window.local_offset + window.length
                 ]
                 self._chunk_reads.setdefault(room, []).append(req_id)
-                closing = req_id == str(room) and self._swa_engine is not None
-                if closing:
-                    remote_swa, local_swa = self._pair_blocks(
-                        list(self._remote_swa_blocks.get(room, [])),
-                        list(self._local_swa_blocks.get(room, [])),
-                    )
-                    swa_endpoint = self._remote_swa_endpoint.get(room, "")
             engine.start_read(req_id, uuid, endpoint, remote_slice, local_slice)
             if closing:
                 self._swa_engine.start_read(
                     self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
                 )
-        self._reject_oversized_pull(room, oversized)
+        self._reject_oversized_pull(room, *oversized)
         return False
 
     def _start_whole_pull(self, room: int) -> bool:
@@ -1134,7 +1152,9 @@ class RaidenKVManager(CommonKVManager):
             index = self._chunk_seq.get(room, 0)
             self._chunk_seq[room] = index + 1
             self._reshard_chunks.setdefault(room, {})[index] = (start, block_ids)
-            self._reshard_announced[room] = start + len(block_ids)
+            self._reshard_announced[room] = max(
+                self._reshard_announced.get(room, 0), start + len(block_ids)
+            )
             addr = req["reply_addr"]
         payload = [
             MessageTag.RESHARD_CHUNK,
@@ -1280,7 +1300,7 @@ class RaidenKVManager(CommonKVManager):
         engine.register_active_plan(uuid, req, is_sender=False)
         with self._state_lock:
             self._chunk_reads.setdefault(room, []).append(req_id)
-            self._reshard_chunk_plans.setdefault(room, {})[req_id] = uuid
+            self._reshard_plans.setdefault(room, {})[req_id] = uuid
         payload = [
             MessageTag.RESHARD_CHUNK_READY,
             str(room).encode("ascii"),
@@ -1400,6 +1420,8 @@ class RaidenKVManager(CommonKVManager):
                 local_blocks[:4],
             )
         engine.register_active_plan(room, req, is_sender=False)
+        with self._state_lock:
+            self._reshard_plans.setdefault(room, {})[str(room)] = room
 
         for endpoint in ready_endpoints:
             payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
@@ -1444,12 +1466,14 @@ class RaidenKVManager(CommonKVManager):
                 # The room is sent once its closing push and every chunk push
                 # asked for before it have finished.
                 with self._state_lock:
-                    left = self._reshard_pushes_pending.get(room, 1) - 1
-                    self._reshard_pushes_pending[room] = left
-                    if chunk is None:
-                        self._reshard_final_pushed.add(room)
-                    if left == 0 and room in self._reshard_final_pushed:
-                        self._completed_send.add(str(room))
+                    # A room cleared while its push ran has nothing to finish.
+                    if room in self._reshard_pushes_pending:
+                        left = self._reshard_pushes_pending[room] - 1
+                        self._reshard_pushes_pending[room] = left
+                        if chunk is None:
+                            self._reshard_final_pushed.add(room)
+                        if left == 0 and room in self._reshard_final_pushed:
+                            self._completed_send.add(str(room))
 
     def _run_reshard_push(
         self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
@@ -1461,6 +1485,8 @@ class RaidenKVManager(CommonKVManager):
         )
 
         with self._state_lock:
+            if room not in self._reshard_req:
+                return  # the room was cleared before the push ran
             req_meta = dict(self._reshard_req[room])
             if chunk is None:
                 prefill_blocks = list(self._send_blocks[room])
@@ -1554,8 +1580,8 @@ class RaidenKVManager(CommonKVManager):
                 engine.push_registered_plan(
                     uuid, push_endpoint, prefill_blocks, decode_blocks, layer_idx
                 )
-            if chunk is not None:
-                engine.unregister_active_plan(uuid)
+            # The push is synchronous; the plan has done its work.
+            engine.unregister_active_plan(uuid)
         if not self.chunked_transfer:
             with self._state_lock:
                 self._completed_send.add(str(room))
@@ -1620,7 +1646,7 @@ class RaidenKVManager(CommonKVManager):
                     self._pulling_cleared.add(key)
                     held.update((key, self._paired_swa_read(key) or key))
             settled_plans = []
-            plans = (getattr(self, "_reshard_chunk_plans", None) or {}).pop(room, {})
+            plans = (getattr(self, "_reshard_plans", None) or {}).pop(room, {})
             for req_id, uuid in plans.items():
                 if req_id in self._completed_recv or req_id in self._failed:
                     settled_plans.append(uuid)
