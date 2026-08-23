@@ -174,6 +174,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr = object.__new__(RaidenKVManager)
                 mgr._state_lock = threading.Lock()
                 mgr._push_lock = threading.Lock()
+                mgr._announce_lock = threading.Lock()
                 mgr._send_blocks = {}
                 mgr._send_aux = {}
                 mgr._decode_addr = {}
@@ -214,6 +215,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.kv_args = Mock(state_types=[StateType.SWA])
         mgr._state_lock = threading.Lock()
         mgr._push_lock = threading.Lock()
+        mgr._announce_lock = threading.Lock()
         mgr._send_blocks = {}
         mgr._send_swa_blocks = {}
         mgr._send_aux = {}
@@ -508,6 +510,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr = object.__new__(RaidenKVManager)
         mgr._state_lock = threading.Lock()
         mgr._push_lock = threading.Lock()
+        mgr._announce_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.register_read = Mock(return_value=True)
         mgr._swa_engine = None
@@ -939,6 +942,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
         mgr._push_lock = threading.Lock()
+        mgr._announce_lock = threading.Lock()
         mgr._reshard_push_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.d2h = Mock(return_value=_ReadyFuture())
@@ -1004,6 +1008,19 @@ class TestRaidenChunkedResharding(CustomTestCase):
             if c.args[0][0] == tag
         ]
 
+    def test_chunk_racing_the_closing_reply_is_skipped(self):
+        # A chunk announced after the reply would arrive after it and outlive
+        # the room's completion; its pages ride the closing transfer instead.
+        mgr = self._prefill()
+        mgr._ensure_engine = Mock()
+        room = self.ROOM
+        mgr._decode_addr[room] = ("10.0.0.2", 5555)
+        mgr._decode_pages[room] = 40
+        mgr._replied = {room}
+        mgr._announce_chunk(room, 0, list(range(16)), 64)
+        mgr._ensure_engine.assert_not_called()
+        mgr._socket.send_multipart.assert_not_called()
+
     def test_prefill_announces_chunks_and_pushes_them_on_request(self):
         from sglang.srt.disaggregation.raiden.serde import unpack_ints
 
@@ -1059,6 +1076,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
         mgr._push_lock = threading.Lock()
+        mgr._announce_lock = threading.Lock()
         mgr._engine = Mock(transfer_address="10.0.0.2:31000")
         mgr._swa_engine = None
         mgr.kv_args = Mock(page_size=128)

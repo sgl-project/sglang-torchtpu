@@ -174,6 +174,11 @@ class RaidenKVManager(CommonKVManager):
         self._engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
+        # Orders chunk announcements against the closing reply. Both travel
+        # the same socket, so whatever is sent first also arrives first; this
+        # lock decides that order, and an announcement that loses the race is
+        # skipped -- its pages then ride the closing transfer.
+        self._announce_lock = threading.Lock()
         self._push_lock = threading.Lock()
         self._state_lock = threading.Lock()
 
@@ -674,36 +679,43 @@ class RaidenKVManager(CommonKVManager):
         req_id and uuid the decode will quote are minted here and travel with
         the announcement.
         """
-        with self._state_lock:
-            window = chunk_pull_window(
-                start, len(block_ids), total_pages, self._decode_pages[room]
-            )
-            if not window:
-                return
-            start += window.chunk_offset
-            block_ids = block_ids[
-                window.chunk_offset : window.chunk_offset + window.length
+        with self._announce_lock:
+            with self._state_lock:
+                if room in self._replied or room not in self._decode_pages:
+                    # The closing reply is out (or the room is gone): these
+                    # pages travel with the closing transfer instead. A late
+                    # announcement must never follow the reply -- the sender
+                    # counts the room done when the closing read completes.
+                    return
+                window = chunk_pull_window(
+                    start, len(block_ids), total_pages, self._decode_pages[room]
+                )
+                if not window:
+                    return
+                start += window.chunk_offset
+                block_ids = block_ids[
+                    window.chunk_offset : window.chunk_offset + window.length
+                ]
+                index = self._chunk_seq.get(room, 0)
+                self._chunk_seq[room] = index + 1
+                self._uuid_seq += 1
+                uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+                addr = self._decode_addr[room]
+            req_id = f"{room}#{index}"
+            self._ensure_engine().register_read(req_id, uuid, block_ids)
+            payload = [
+                MessageTag.CHUNK,
+                str(room).encode("ascii"),
+                req_id.encode("ascii"),
+                str(uuid).encode("ascii"),
+                str(start).encode("ascii"),
+                str(total_pages).encode("ascii"),
+                pack_blocks(block_ids),
+                (self.raiden_endpoint or "").encode("ascii"),
             ]
-            index = self._chunk_seq.get(room, 0)
-            self._chunk_seq[room] = index + 1
-            self._uuid_seq += 1
-            uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
-            addr = self._decode_addr[room]
-        req_id = f"{room}#{index}"
-        self._ensure_engine().register_read(req_id, uuid, block_ids)
-        payload = [
-            MessageTag.CHUNK,
-            str(room).encode("ascii"),
-            req_id.encode("ascii"),
-            str(uuid).encode("ascii"),
-            str(start).encode("ascii"),
-            str(total_pages).encode("ascii"),
-            pack_blocks(block_ids),
-            (self.raiden_endpoint or "").encode("ascii"),
-        ]
-        endpoint = f"tcp://{addr[0]}:{addr[1]}"
-        with self._push_lock:
-            self._connect(endpoint).send_multipart(payload)
+            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            with self._push_lock:
+                self._connect(endpoint).send_multipart(payload)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> None:
         self._ensure_engine()
@@ -740,21 +752,22 @@ class RaidenKVManager(CommonKVManager):
             addr = self._decode_addr[room]
             aux_blob = self._send_aux.get(room, b"")
             self._replied.add(room)
-        if self._swa_engine is not None:
-            self._swa_engine.register_read(self._swa_req_id(room), room, swa_blocks)
-        self._ensure_engine().register_read(str(room), room, blocks)
-        endpoint = f"tcp://{addr[0]}:{addr[1]}"
-        payload = [
-            MessageTag.BLOCKS,
-            str(room).encode("ascii"),
-            pack_blocks(blocks),
-            (self.raiden_endpoint or "").encode("ascii"),
-            pack_blocks(swa_blocks),
-            (self.swa_raiden_endpoint or "").encode("ascii"),
-            aux_blob,
-        ]
-        with self._push_lock:
-            self._connect(endpoint).send_multipart(payload)
+        with self._announce_lock:
+            if self._swa_engine is not None:
+                self._swa_engine.register_read(self._swa_req_id(room), room, swa_blocks)
+            self._ensure_engine().register_read(str(room), room, blocks)
+            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            payload = [
+                MessageTag.BLOCKS,
+                str(room).encode("ascii"),
+                pack_blocks(blocks),
+                (self.raiden_endpoint or "").encode("ascii"),
+                pack_blocks(swa_blocks),
+                (self.swa_raiden_endpoint or "").encode("ascii"),
+                aux_blob,
+            ]
+            with self._push_lock:
+                self._connect(endpoint).send_multipart(payload)
 
     # ----- decode side -------------------------------------------------------
 
@@ -1227,15 +1240,18 @@ class RaidenKVManager(CommonKVManager):
             )
             per_source[src_rank] = (start, blocks)
             self._remote_total[room] = total_pages
-            self._announced_pages[room] = max(
-                self._announced_pages.get(room, 0), start + len(blocks)
-            )
             # Sources are keyed by the sender's raiden engine id; its
             # attention-TP rank is the id within its replica.
             src_attn_tp = self._reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in per_source}
             if have < set(self._reshard_meta[room]["source_ranks"]):
                 return
+            # The frontier moves only once every source announced the chunk,
+            # so a closing transfer can never skip a span only part of the
+            # source group has delivered.
+            self._announced_pages[room] = max(
+                self._announced_pages.get(room, 0), start + len(blocks)
+            )
             sources_map = self._reshard_chunk_sources[room].pop(index)
         self._register_reshard_chunk(room, index, total_pages, sources_map)
 
@@ -1360,10 +1376,14 @@ class RaidenKVManager(CommonKVManager):
             engine.register_active_plan(uuid, req, is_sender=False)
         except Exception as e:
             reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
-            self.record_failure(room, reason)
-            with self._state_lock:
-                self._failed.add(str(room))
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                if room not in self._reshard_meta:
+                    # Cleared while registering: nothing reads a failure for
+                    # this room any more, so record none.
+                    return False
+                self._failed.add(str(room))
+            self.record_failure(room, reason)
             return False
         with self._state_lock:
             if room in self._reshard_meta:
@@ -1406,6 +1426,8 @@ class RaidenKVManager(CommonKVManager):
             tail_start, tail = self._tail_after(any_blocks, announced)
             window = chunk_pull_window(tail_start, len(tail), len(any_blocks), n)
             with self._state_lock:
+                if room not in self._reshard_meta:
+                    return  # cleared while the tail was computed
                 # The closing read is owed from the moment the room can look
                 # complete: it is recorded before _final_seen so completion
                 # can never be inferred while its registration is pending.
