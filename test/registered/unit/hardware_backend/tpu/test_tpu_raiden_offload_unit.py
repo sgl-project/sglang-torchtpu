@@ -1223,6 +1223,41 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertNotIn(room, mgr._reshard_pushes_pending)
         self.assertFalse(mgr._completed_send)
 
+    def test_room_cleared_during_plan_registration_is_not_resurrected(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode()
+
+        # clear_room() lands while register_active_plan runs outside the lock.
+        def clears_midway(uuid, req, is_sender):
+            mgr.clear_room(room)
+
+        mgr._engine.register_active_plan = Mock(side_effect=clears_midway)
+
+        def chunk(rank):
+            return [
+                MessageTag.RESHARD_CHUNK,
+                b"41",
+                b"0",
+                b"24",
+                b"64",
+                pack_ints(src[rank][24:32]),
+                str(rank).encode("ascii"),
+            ]
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(chunk(0))
+            mgr._on_reshard_chunk(chunk(1))
+        # The plan is dropped again, nothing is recreated, no push is asked for.
+        uuid = mgr._engine.register_active_plan.call_args.args[0]
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        self.assertEqual(mgr._chunk_reads.get(room, []), [])
+        self.assertEqual(mgr._reshard_plans.get(room, {}), {})
+        self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
+        self.assertFalse(mgr.is_failed(room))
+
     def test_failed_plan_registration_fails_the_room(self):
         from sglang.srt.disaggregation.raiden.serde import pack_ints
 

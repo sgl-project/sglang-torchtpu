@@ -1337,10 +1337,12 @@ class RaidenKVManager(CommonKVManager):
     def _publish_reshard_plan(self, room: int, req_id: str, uuid: int, req) -> bool:
         """Registers a receive plan and publishes it if the room is still live.
 
-        Registration can fail when raiden cannot stage the plan; the plan is
-        recorded -- and READY may be sent -- only when it registered, and a
-        failed registration fails the room instead of leaving a chunk the
-        completion check never waits for.
+        Registration runs outside the state lock and can fail when raiden
+        cannot stage the plan; the room can also be cleared meanwhile. The
+        plan is recorded -- and READY may be sent -- only when both went
+        well: a failed registration fails the room, and a plan registered
+        for a cleared room is dropped again, so a sender is never asked to
+        push into pages the room no longer owns.
         """
         engine = self._ensure_engine()
         try:
@@ -1353,9 +1355,12 @@ class RaidenKVManager(CommonKVManager):
             logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             return False
         with self._state_lock:
-            self._chunk_reads.setdefault(room, []).append(req_id)
-            self._reshard_plans.setdefault(room, {})[req_id] = uuid
-        return True
+            if room in self._reshard_meta:
+                self._chunk_reads.setdefault(room, []).append(req_id)
+                self._reshard_plans.setdefault(room, {})[req_id] = uuid
+                return True
+        self._unregister_plan(uuid)
+        return False
 
     def _register_receiver_and_signal(self, room: int) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
