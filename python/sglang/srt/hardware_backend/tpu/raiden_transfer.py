@@ -5,13 +5,16 @@ transfer path can't be ported. This module drives tpu-raiden's
 ``KVCacheManager``: ``D2h`` / ``H2d`` do direct PJRT raw-buffer DMA between the
 fused device KV buffer and raiden's DMA-pinned host pool, returning a pollable
 ``RaidenFuture``. A raiden "block" is one page of the fused buffer, and a single
-``D2h`` / ``H2d`` call covers all registered layers. Completion is poll-only
-(``is_ready()``; never ``Await()``, which can deadlock the running model).
+``D2h`` / ``H2d`` call covers all registered layers; raiden issues the copies
+on its own background thread, so the call returns before anything is submitted.
+Completion is poll-only (``is_ready()``; never ``Await()``, which can deadlock
+the running model), and a DMA that completes with an error raises at the poll.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List
 
@@ -39,11 +42,19 @@ class RaidenFutureEvent:
     def __init__(self, future):
         self._future = future
 
+    def _raise_if_failed(self) -> None:
+        """Surface a ready DMA's error; ``ok()`` is a non-blocking probe."""
+        if not self._future.ok():
+            raise RuntimeError(f"raiden DMA failed: {self._future.error_message()}")
+
     def query(self) -> bool:
         """Non-blocking completion poll. ``True`` once the DMA has landed."""
         if self._future is None:
             return True
-        return self._future.is_ready()
+        if not self._future.is_ready():
+            return False
+        self._raise_if_failed()
+        return True
 
     def synchronize(self) -> None:
         """Block until complete by POLLING ``is_ready`` — never ``Await``.
@@ -61,6 +72,7 @@ class RaidenFutureEvent:
             if time.monotonic() > deadline:
                 raise TimeoutError(f"raiden DMA did not complete within {timeout_s}s")
             time.sleep(self._POLL_INTERVAL_S)
+        self._raise_if_failed()
 
     def record(self, *args, **kwargs) -> None:  # noqa: D401 - event-API no-op
         return None
@@ -125,6 +137,11 @@ class RaidenKVTransfer:
             [device_pool.get_fused_kv_buffer(device_pool.start_layer + i)]
             for i in range(self.layer_num)
         ]
+        # raiden issues ``d2h`` / ``h2d`` copies on a background thread only
+        # when this variable is set; otherwise the calls block the scheduler
+        # thread until every per-layer copy has been submitted. The manager
+        # reads it in its constructor.
+        os.environ["RAIDEN_ENABLE_ASYNC_DISPATCH"] = "1"
         # Local offload has no control plane; port 0 opens no control listener.
         self._mgr = KVCacheManager(
             self._device_tensors,

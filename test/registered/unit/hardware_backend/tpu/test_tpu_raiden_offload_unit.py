@@ -354,14 +354,21 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
 
 class _FakeFuture:
-    def __init__(self, ready_after=0):
+    def __init__(self, ready_after=0, error=None):
         self._calls = 0
         self._ready_after = ready_after
+        self._error = error
 
     def is_ready(self):
         ready = self._calls >= self._ready_after
         self._calls += 1
         return ready
+
+    def ok(self):
+        return self._error is None
+
+    def error_message(self):
+        return self._error or ""
 
 
 class TestRaidenFutureEvent(CustomTestCase):
@@ -384,6 +391,17 @@ class TestRaidenFutureEvent(CustomTestCase):
         ev = RaidenFutureEvent(_FakeFuture())
         ev.record()
         ev.wait()
+
+    def test_failed_dma_raises_at_poll(self):
+        # Dispatch runs on raiden's background thread, so a bad transfer is
+        # reported through the future; treating a failed-but-ready future as
+        # landed would hand the forward garbage KV.
+        ev = RaidenFutureEvent(_FakeFuture(ready_after=1, error="bad offsets"))
+        self.assertFalse(ev.query())  # still pending: no error yet
+        with self.assertRaisesRegex(RuntimeError, "bad offsets"):
+            ev.query()
+        with self.assertRaisesRegex(RuntimeError, "bad offsets"):
+            RaidenFutureEvent(_FakeFuture(error="bad offsets")).synchronize()
 
 
 class TestCombinedFutureEvent(CustomTestCase):
@@ -447,8 +465,6 @@ def _make_controller(*, draft_pool=None):
     ctl.mem_pool_device_draft = None
     ctl.mem_pool_host_draft = None
     ctl.layer_done_counter = _FakeBatchCounter()
-    ctl._async_h2d = False
-    ctl._load_worker = None
     if draft_pool is not None:
         ctl.has_draft = True
         ctl.mem_pool_device_draft = object()

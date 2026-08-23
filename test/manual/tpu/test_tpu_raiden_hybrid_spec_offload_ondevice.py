@@ -124,8 +124,6 @@ def _make_controller(anchor, swa, draft):
     controller.mem_pool_device_draft = None
     controller.mem_pool_host_draft = None
     controller.layer_done_counter = BatchDoneCounter()
-    controller._async_h2d = False
-    controller._load_worker = None
     controller.write_queue = []
     controller.load_queue = []
     controller.ack_write_queue = []

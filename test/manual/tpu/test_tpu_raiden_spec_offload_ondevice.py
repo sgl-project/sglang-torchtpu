@@ -102,8 +102,6 @@ def _make_controller(target_dev, target_host, draft_dev, draft_host):
     controller.mem_pool_host_draft = None
     controller.layer_done_counter = BatchDoneCounter()
     target_dev.register_layer_transfer_counter(controller.layer_done_counter)
-    controller._async_h2d = False
-    controller._load_worker = None
     controller.write_queue = []
     controller.load_queue = []
     controller.ack_write_queue = []

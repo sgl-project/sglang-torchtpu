@@ -141,13 +141,13 @@ class BatchDoneCounter:
     """Batch-granular counterpart to LayerDoneCounter.
 
     Gates the whole forward at once (no layer-wise overlap), so each slot just
-    holds the reload's TpuKvCopyWorker completion event; the forward waits on its batch's slot. Same interface as LayerDoneCounter (the per-batch handle is an
+    holds the reload's completion event; the forward waits on its batch's slot. Same interface as LayerDoneCounter (the per-batch handle is an
     int slot index), so the shim / cache_controller are unchanged.
     """
 
     def __init__(self, num_counters: int = 2):
         self.num_counters = num_counters
-        # Each slot holds a reload's _ThreadDoneEvent (None before first use).
+        # Each slot holds a reload's completion event (None before first use).
         self.events = [None] * num_counters
         self.producer_index = -1
         self.consumer_index = -1
