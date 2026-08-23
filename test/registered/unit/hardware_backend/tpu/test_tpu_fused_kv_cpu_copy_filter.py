@@ -167,11 +167,18 @@ class TestKvPageWriteKernel(CustomTestCase):
 
         kv = jnp.arange(6 * 4 * 2 * 1 * 8, dtype=jnp.float32).reshape(6, 4, 2, 1, 8)
         kv = kv.astype(jnp.bfloat16)
-        pages = -jnp.ones((2, 4, 2, 1, 8), jnp.bfloat16)
+        # Distinct values per source page, so a swapped or repeated page write
+        # is caught.
+        pages = jnp.stack(
+            [
+                -jnp.ones((4, 2, 1, 8), jnp.bfloat16),
+                -2 * jnp.ones((4, 2, 1, 8), jnp.bfloat16),
+            ]
+        )
         block_ids = jnp.array([4, 1], jnp.int32)
         out = write_pages(block_ids, pages, kv, interpret=True)
-        for b in (1, 4):
-            self.assertTrue(bool((out[b] == pages[0]).all()))
+        self.assertTrue(bool((out[4] == pages[0]).all()))
+        self.assertTrue(bool((out[1] == pages[1]).all()))
         for b in (0, 2, 3, 5):
             self.assertTrue(bool((out[b] == kv[b]).all()))
 
