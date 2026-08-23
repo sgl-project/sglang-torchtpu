@@ -1009,17 +1009,97 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_sources = {self.ROOM: {}}
         mgr._reshard_registered = set()
         mgr._reshard_chunk_sources = {}
-        mgr._reshard_chunk_uuids = {}
+        mgr._reshard_chunk_plans = {}
+        mgr._cleared_plans = {}
+        mgr._pulling = None
+        mgr._pulling_cleared = set()
         mgr._chunk_reads = {}
         mgr._chunk_queue = {}
         mgr._final_seen = set()
         mgr._announced_pages = {}
         mgr._remote_total = {}
+        mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._socket = Mock()
         mgr._connect = Mock(return_value=mgr._socket)
+        # clear_room sweeps the reshard bookkeeping too.
+        mgr._reshard_slot_of = {}
+        mgr._reshard_slot_rooms = [None]
         return mgr
+
+    def _decode_with_chunk_plan(self):
+        """A decode whose sources have both announced chunk 0 of ROOM, so its
+        receive plan is registered and the push is in flight."""
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        mgr = self._decode()
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_chunk(
+                    [
+                        MessageTag.RESHARD_CHUNK,
+                        b"41",
+                        b"0",
+                        b"24",
+                        b"64",
+                        pack_ints(list(range(124, 132))),
+                        str(rank).encode("ascii"),
+                    ]
+                )
+        uuid = mgr._engine.register_active_plan.call_args.args[0]
+        self.assertEqual(mgr._reshard_chunk_plans, {self.ROOM: {"41#0": uuid}})
+        return mgr, uuid
+
+    def test_aborted_room_keeps_its_chunk_plan_until_the_push_settles(self):
+        mgr, uuid = self._decode_with_chunk_plan()
+        mgr._completed_send.add("41#0")
+
+        # The framework aborts the request while the sources are still pushing.
+        mgr.clear_room(self.ROOM)
+        mgr._engine.unregister_active_plan.assert_not_called()
+        self.assertEqual(mgr._cleared_plans, {"41#0": uuid})
+        self.assertNotIn(self.ROOM, mgr._reshard_chunk_plans)
+        self.assertFalse(mgr._completed_send)
+
+        # An unrelated completion does not touch it.
+        mgr._engine.poll_stats = Mock(return_value=([], ["7#0"], []))
+        mgr._drain_engine()
+        mgr._engine.unregister_active_plan.assert_not_called()
+
+        # The push lands late: the plan goes, exactly once, with its record.
+        mgr._engine.poll_stats = Mock(return_value=([], ["41#0"], []))
+        mgr._drain_engine()
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        self.assertEqual(mgr._cleared_plans, {})
+        self.assertNotIn("41#0", mgr._completed_recv)
+        mgr._drain_engine()
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+
+    def test_aborted_room_drops_its_chunk_plan_when_the_push_times_out(self):
+        mgr, uuid = self._decode_with_chunk_plan()
+        mgr.clear_room(self.ROOM)
+
+        # Raiden reports the timeout and has already dropped the plan itself.
+        mgr._engine.unregister_active_plan = Mock(
+            side_effect=RuntimeError(
+                f"KVCacheManager unregister_active_plan failed: Plan with "
+                f"UUID {uuid} is not registered"
+            )
+        )
+        mgr._engine.poll_stats = Mock(return_value=([], [], ["41#0"]))
+        mgr._drain_engine()
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        self.assertEqual(mgr._cleared_plans, {})
+        self.assertFalse(mgr._failed)
+
+    def test_clearing_a_room_drops_its_settled_chunk_plan_at_once(self):
+        mgr, uuid = self._decode_with_chunk_plan()
+        mgr._completed_recv.add("41#0")
+        mgr.clear_room(self.ROOM)
+        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        self.assertEqual(mgr._cleared_plans, {})
+        self.assertFalse(mgr._completed_recv)
 
     def test_decode_registers_a_plan_per_chunk_once_every_source_announced(self):
         from sglang.srt.disaggregation.raiden.serde import pack_ints

@@ -166,6 +166,11 @@ class RaidenKVManager(CommonKVManager):
         # flight. Raiden cannot cancel a read, so the read keeps its admission
         # until the engine reports it settled.
         self._pulling_cleared: Set[str] = set()
+        # Receiver plans of rooms the framework dropped while their push was
+        # still in flight, by request id. Raiden cannot cancel a push and
+        # keeps delivering into the plan, so the plan stays registered until
+        # the engine reports the push settled.
+        self._cleared_plans: Dict[str, int] = {}
         self._engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
@@ -220,11 +225,11 @@ class RaidenKVManager(CommonKVManager):
             self._final_seen: Set[int] = set()
             # Chunk announcements from each resharding source, by chunk index,
             # until every source of the room has announced it; the receive
-            # plans registered per chunk, released with the room.
+            # plan registered per chunk, by the chunk's request id.
             self._reshard_chunk_sources: Dict[
                 int, Dict[int, Dict[int, Tuple[int, List[int]]]]
             ] = {}
-            self._reshard_chunk_uuids: Dict[int, List[int]] = {}
+            self._reshard_chunk_plans: Dict[int, Dict[str, int]] = {}
             self._uuid_seq = 0
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
@@ -459,6 +464,9 @@ class RaidenKVManager(CommonKVManager):
                     self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
                     self._failed.update(self._norm_req_id(r) for r in failed)
                     self._release_pull_slots_locked()
+                    settled_plans = self._settled_cleared_plans_locked()
+                for uuid in settled_plans:
+                    self._unregister_plan(uuid)
                 if failed:
                     logger.error(
                         "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
@@ -837,6 +845,33 @@ class RaidenKVManager(CommonKVManager):
                 swa_rid in self._completed_recv or swa_rid in self._failed
             )
         return settled
+
+    def _settled_cleared_plans_locked(self) -> List[int]:
+        """Plan uuids of cleared rooms whose push the engine has now settled.
+
+        Their completion bookkeeping is dropped here, as nothing else will
+        read it; the caller unregisters the plans outside the lock.
+        """
+        uuids = []
+        for req_id, uuid in list(self._cleared_plans.items()):
+            if req_id in self._completed_recv or req_id in self._failed:
+                del self._cleared_plans[req_id]
+                self._completed_recv.discard(req_id)
+                self._failed.discard(req_id)
+                uuids.append(uuid)
+        return uuids
+
+    def _unregister_plan(self, uuid: int) -> None:
+        """Drops a receiver plan whose push has settled.
+
+        Raiden drops a timed-out plan itself, so one it no longer knows has
+        already been dropped.
+        """
+        try:
+            self._engine.unregister_active_plan(uuid)
+        except RuntimeError as e:
+            if "not registered" not in str(e):
+                raise
 
     def _release_pull_slots_locked(self) -> None:
         """Hand back the slots of reads that have settled."""
@@ -1245,7 +1280,7 @@ class RaidenKVManager(CommonKVManager):
         engine.register_active_plan(uuid, req, is_sender=False)
         with self._state_lock:
             self._chunk_reads.setdefault(room, []).append(req_id)
-            self._reshard_chunk_uuids.setdefault(room, []).append(uuid)
+            self._reshard_chunk_plans.setdefault(room, {})[req_id] = uuid
         payload = [
             MessageTag.RESHARD_CHUNK_READY,
             str(room).encode("ascii"),
@@ -1571,7 +1606,8 @@ class RaidenKVManager(CommonKVManager):
             return key == rid or key == swa_rid or key.startswith(chunk_prefix)
 
         with self._state_lock:
-            # A read raiden still holds keeps its admission, and the
+            # A read raiden still holds keeps its admission, and a push it is
+            # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
             held: Set[str] = set()
             if self._pulling is not None:
@@ -1583,6 +1619,14 @@ class RaidenKVManager(CommonKVManager):
                         continue
                     self._pulling_cleared.add(key)
                     held.update((key, self._paired_swa_read(key) or key))
+            settled_plans = []
+            plans = (getattr(self, "_reshard_chunk_plans", None) or {}).pop(room, {})
+            for req_id, uuid in plans.items():
+                if req_id in self._completed_recv or req_id in self._failed:
+                    settled_plans.append(uuid)
+                    continue
+                self._cleared_plans[req_id] = uuid
+                held.add(req_id)
             self._completed_send.difference_update(
                 [k for k in self._completed_send if belongs(k)]
             )
@@ -1621,9 +1665,6 @@ class RaidenKVManager(CommonKVManager):
                     d.pop(room, None)
             if hasattr(self, "_replied"):
                 self._replied.discard(room)
-            chunk_uuids = (getattr(self, "_reshard_chunk_uuids", None) or {}).pop(
-                room, []
-            )
             for s in (
                 getattr(self, "_final_seen", None),
                 getattr(self, "_reshard_final_pushed", None),
@@ -1635,8 +1676,8 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if s is not None:
                     s.discard(room)
-        for uuid in chunk_uuids:
-            self._engine.unregister_active_plan(uuid)
+        for uuid in settled_plans:
+            self._unregister_plan(uuid)
         self._release_host_slot(room)
 
 
