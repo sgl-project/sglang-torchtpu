@@ -1223,6 +1223,38 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertNotIn(room, mgr._reshard_pushes_pending)
         self.assertFalse(mgr._completed_send)
 
+    def test_failed_plan_registration_fails_the_room(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode()
+        mgr.record_failure = Mock()
+        mgr._engine.register_active_plan = Mock(
+            side_effect=RuntimeError("RESOURCE_EXHAUSTED: no host blocks")
+        )
+
+        def chunk(rank):
+            return [
+                MessageTag.RESHARD_CHUNK,
+                b"41",
+                b"0",
+                b"24",
+                b"64",
+                pack_ints(src[rank][24:32]),
+                str(rank).encode("ascii"),
+            ]
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(chunk(0))
+            mgr._on_reshard_chunk(chunk(1))
+        self.assertTrue(mgr.is_failed(room))
+        self.assertIn("RESOURCE_EXHAUSTED", mgr.record_failure.call_args.args[1])
+        # The chunk is not admitted anywhere a completion could be faked from.
+        self.assertEqual(mgr._chunk_reads.get(room, []), [])
+        self.assertEqual(mgr._reshard_plans.get(room, {}), {})
+        self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
+
     def test_decode_registers_a_plan_per_chunk_once_every_source_announced(self):
         from sglang.srt.disaggregation.raiden.serde import pack_ints
 

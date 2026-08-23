@@ -1285,22 +1285,19 @@ class RaidenKVManager(CommonKVManager):
             self._uuid_seq += 1
             uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
         req_id = f"{room}#{index}"
-        engine = self._ensure_engine()
         req = build_receiver_request(
             pb2,
             uuid=uuid,
             req_id=req_id,
-            peer=engine.transfer_address,
+            peer=self._ensure_engine().transfer_address,
             decode_rank=self.attn_tp_rank,
             geom=self._make_geometry(src_attn_tp, self.attn_tp_size),
             sources=sources,
             dst_block_ids=dst,
             live_tokens=[self.kv_args.page_size] * window.length,
         )
-        engine.register_active_plan(uuid, req, is_sender=False)
-        with self._state_lock:
-            self._chunk_reads.setdefault(room, []).append(req_id)
-            self._reshard_plans.setdefault(room, {})[req_id] = uuid
+        if not self._publish_reshard_plan(room, req_id, uuid, req):
+            return
         payload = [
             MessageTag.RESHARD_CHUNK_READY,
             str(room).encode("ascii"),
@@ -1336,6 +1333,29 @@ class RaidenKVManager(CommonKVManager):
             )
         if ready:
             self._register_receiver_and_signal(room)
+
+    def _publish_reshard_plan(self, room: int, req_id: str, uuid: int, req) -> bool:
+        """Registers a receive plan and publishes it if the room is still live.
+
+        Registration can fail when raiden cannot stage the plan; the plan is
+        recorded -- and READY may be sent -- only when it registered, and a
+        failed registration fails the room instead of leaving a chunk the
+        completion check never waits for.
+        """
+        engine = self._ensure_engine()
+        try:
+            engine.register_active_plan(uuid, req, is_sender=False)
+        except Exception as e:
+            reason = f"Raiden receive failed: cannot stage plan {req_id}: {e}"
+            self.record_failure(room, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            return False
+        with self._state_lock:
+            self._chunk_reads.setdefault(room, []).append(req_id)
+            self._reshard_plans.setdefault(room, {})[req_id] = uuid
+        return True
 
     def _register_receiver_and_signal(self, room: int) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
@@ -1379,8 +1399,6 @@ class RaidenKVManager(CommonKVManager):
                 window.local_offset : window.local_offset + window.length
             ]
             n = window.length
-            with self._state_lock:
-                self._chunk_reads.setdefault(room, []).append(str(room))
         else:
             # A decode prefix hit leaves decode holding fewer (tail) pages than
             # the prefill produced; keep the last n of each source's blocks so
@@ -1391,12 +1409,11 @@ class RaidenKVManager(CommonKVManager):
                 sources.append((p_rank, pb[-n:] if len(pb) > n else pb))
         live = [self.kv_args.page_size] * n
 
-        engine = self._ensure_engine()
         req = build_receiver_request(
             pb2,
             uuid=room,
             req_id=str(room),
-            peer=engine.transfer_address,
+            peer=self._ensure_engine().transfer_address,
             decode_rank=self.attn_tp_rank,
             geom=geom,
             sources=sources,
@@ -1419,9 +1436,8 @@ class RaidenKVManager(CommonKVManager):
                 len(local_blocks),
                 local_blocks[:4],
             )
-        engine.register_active_plan(room, req, is_sender=False)
-        with self._state_lock:
-            self._reshard_plans.setdefault(room, {})[str(room)] = room
+        if not self._publish_reshard_plan(room, str(room), room, req):
+            return
 
         for endpoint in ready_endpoints:
             payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
