@@ -1553,7 +1553,14 @@ class RaidenKVManager(CommonKVManager):
         )
 
     def is_failed(self, room: int) -> bool:
-        return str(room) in self._failed or self._swa_req_id(room) in self._failed
+        """Whether any transfer of the room -- whole, sliding-window, or one of
+        its chunks -- has failed."""
+        rid, swa_rid, chunk_prefix = str(room), self._swa_req_id(room), f"{room}#"
+        with self._state_lock:
+            return any(
+                key == rid or key == swa_rid or key.startswith(chunk_prefix)
+                for key in self._failed
+            )
 
     def clear_room(self, room: int) -> None:
         rid = str(room)

@@ -670,6 +670,29 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertEqual(mgr._engine.start_read.call_args.args[4], local[16:32])
         self.assertEqual(len(mgr._pulling), 1)
 
+    def test_failed_chunk_read_fails_the_request(self):
+        room = 42
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(room, local, capacity=4)
+        mgr._chunk_queue[room] = [
+            ("42#0", 11, 0, remote[0:16], endpoint),
+            ("42#1", 12, 16, remote[16:32], endpoint),
+        ]
+        self.assertTrue(mgr.maybe_start_pull(room))
+        self.assertFalse(mgr.is_failed(room))
+
+        with mgr._state_lock:
+            mgr._failed.add("42#0")
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.is_failed(room))
+        self.assertFalse(mgr.is_failed(420))
+        self.assertEqual(len(mgr._pulling), 0)
+
+        mgr.clear_room(room)
+        self.assertFalse(mgr._failed)
+
     def test_cleared_room_keeps_its_slot_until_the_chunk_read_settles(self):
         first, second = 36, 37
         local = list(range(200, 264))
