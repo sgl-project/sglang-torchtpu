@@ -606,8 +606,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._chunk_reads = {}
         mgr._announced_pages = {}
         mgr._final_seen = set()
+        mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._pulling_cleared = set()
+        # clear_room sweeps the reshard bookkeeping too.
+        mgr._reshard_slot_of = {}
+        mgr._reshard_slot_rooms = [None]
         return mgr
 
     def test_closing_read_carries_the_sliding_window_pages(self):
@@ -664,6 +669,115 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertEqual(mgr._engine.start_read.call_args.args[0], "33#1")
         self.assertEqual(mgr._engine.start_read.call_args.args[4], local[16:32])
         self.assertEqual(len(mgr._pulling), 1)
+
+    def test_cleared_room_keeps_its_slot_until_the_chunk_read_settles(self):
+        first, second = 36, 37
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(first, local, capacity=1)
+        mgr._local_blocks[second] = local
+        mgr._remote_total[second] = 64
+        mgr._chunk_queue[first] = [("36#0", 11, 0, remote[0:16], endpoint)]
+        mgr._chunk_queue[second] = [("37#0", 21, 0, remote[0:16], endpoint)]
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        mgr._completed_send.add("36#0")
+        # The framework aborts the request while raiden still holds the read.
+        mgr.clear_room(first)
+        self.assertFalse(mgr.maybe_start_pull(second))
+        self.assertEqual(mgr._engine.start_read.call_count, 1)
+
+        with mgr._state_lock:
+            mgr._completed_recv.add("36#0")
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(second))
+        self.assertEqual(mgr._engine.start_read.call_args.args[0], "37#0")
+        self.assertFalse(mgr._pulling_cleared)
+        self.assertNotIn("36#0", mgr._completed_recv)
+        self.assertNotIn("36#0", mgr._completed_send)
+
+    def test_clearing_a_room_drops_its_settled_chunk_ids(self):
+        room = 38
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(room, local, capacity=4)
+        mgr._chunk_queue[room] = [
+            ("38#0", 11, 0, remote[0:16], endpoint),
+            ("38#1", 12, 16, remote[16:32], endpoint),
+        ]
+        self.assertTrue(mgr.maybe_start_pull(room))
+        with mgr._state_lock:
+            mgr._completed_recv.add("38#0")
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(room))
+        with mgr._state_lock:
+            mgr._completed_recv.update(("38#1", "380#0"))
+            mgr._release_pull_slots_locked()
+
+        mgr.clear_room(room)
+        self.assertEqual(len(mgr._pulling), 0)
+        # Only the cleared room's ids go; room 380 shares the prefix digits.
+        self.assertEqual(mgr._completed_recv, {"380#0"})
+
+    def test_hybrid_closing_read_holds_its_slot_until_both_engines_settle(self):
+        first, second = 39, 40
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(first, local, capacity=1)
+        mgr._swa_engine = Mock()
+        mgr._remote_swa_blocks = {first: [4, 5], second: [4, 5]}
+        mgr._local_swa_blocks = {first: [7], second: [7]}
+        mgr._remote_swa_endpoint = {first: "127.0.0.1:31022", second: "127.0.0.1:31022"}
+        mgr._local_blocks[second] = local
+        mgr._remote_total[second] = 64
+        mgr._chunk_queue[first] = [(str(first), first, 48, remote[48:64], endpoint)]
+        mgr._chunk_queue[second] = [(str(second), second, 48, remote[48:64], endpoint)]
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        # The full-attention read fails while the sliding-window read is
+        # still in flight on the other engine.
+        with mgr._state_lock:
+            mgr._failed.add(str(first))
+            mgr._release_pull_slots_locked()
+        self.assertFalse(mgr.maybe_start_pull(second))
+        self.assertEqual(mgr._engine.start_read.call_count, 1)
+
+        with mgr._state_lock:
+            mgr._completed_recv.add(mgr._swa_req_id(first))
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(second))
+        self.assertEqual(mgr._engine.start_read.call_args.args[0], str(second))
+        self.assertEqual(mgr._swa_engine.start_read.call_count, 2)
+
+    def test_cleared_hybrid_room_drops_both_reads_when_they_settle(self):
+        room = 41
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(room, local, capacity=1)
+        mgr._swa_engine = Mock()
+        mgr._remote_swa_blocks = {room: [4, 5]}
+        mgr._local_swa_blocks = {room: [7]}
+        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._chunk_queue[room] = [(str(room), room, 48, remote[48:64], endpoint)]
+
+        self.assertTrue(mgr.maybe_start_pull(room))
+        with mgr._state_lock:
+            mgr._completed_recv.add(str(room))
+            mgr._release_pull_slots_locked()
+        mgr.clear_room(room)
+        self.assertEqual(len(mgr._pulling), 1)
+        self.assertIn(str(room), mgr._completed_recv)
+
+        with mgr._state_lock:
+            mgr._completed_recv.add(mgr._swa_req_id(room))
+            mgr._release_pull_slots_locked()
+        self.assertEqual(len(mgr._pulling), 0)
+        self.assertFalse(mgr._pulling_cleared)
+        self.assertFalse(mgr._completed_recv)
 
 
 class _InlineExecutor:

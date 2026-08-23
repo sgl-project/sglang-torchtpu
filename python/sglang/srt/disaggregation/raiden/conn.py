@@ -162,10 +162,10 @@ class RaidenKVManager(CommonKVManager):
         # seat, so the decode side admits at most one pull per slot and leaves
         # the rest in the transfer queue.
         self._pulling: Optional[SlotAdmission] = None
-        # Rooms the framework dropped while their read was still in flight.
-        # Raiden cannot cancel a read, so the room keeps its admission until
-        # the engine reports the read settled.
-        self._pulling_cleared: Set[int] = set()
+        # Reads of rooms the framework dropped while they were still in
+        # flight. Raiden cannot cancel a read, so the read keeps its admission
+        # until the engine reports it settled.
+        self._pulling_cleared: Set[str] = set()
         self._engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
@@ -813,36 +813,46 @@ class RaidenKVManager(CommonKVManager):
             local = local[: len(remote)]
         return remote, local
 
-    def _pull_settled_locked(self, room: int) -> bool:
-        """Whether every engine has reported the room's read done or failed.
+    def _paired_swa_read(self, key: str) -> Optional[str]:
+        """The sliding-window read issued alongside the read ``key``, if any.
+
+        A whole-room read and the closing read of a chunked transfer carry the
+        sliding-window pages on the second engine; earlier chunks do not.
+        """
+        if self._swa_engine is None or "#" in key:
+            return None
+        return self._swa_req_id(int(key))
+
+    def _pull_settled_locked(self, key: str) -> bool:
+        """Whether every engine has reported the read ``key`` done or failed.
 
         Raiden holds a read's host staging until it completes or times out,
-        whichever engine it is on, so the room's admission stays claimed until
-        both the full-attention and (for a hybrid model) the sliding-window
-        read have settled.
+        whichever engine it is on, so the read's admission stays claimed until
+        both it and its paired sliding-window read have settled.
         """
-        rid, swa_rid = str(room), self._swa_req_id(room)
-        full_settled = rid in self._completed_recv or rid in self._failed
-        swa_settled = (
-            self._swa_engine is None
-            or swa_rid in self._completed_recv
-            or swa_rid in self._failed
-        )
-        return full_settled and swa_settled
+        settled = key in self._completed_recv or key in self._failed
+        swa_rid = self._paired_swa_read(key)
+        if swa_rid is not None:
+            settled = settled and (
+                swa_rid in self._completed_recv or swa_rid in self._failed
+            )
+        return settled
 
     def _release_pull_slots_locked(self) -> None:
-        """Hand back the slots of transfers that have settled."""
+        """Hand back the slots of reads that have settled."""
         if self._pulling is None:
             return
         for key in self._pulling.rooms():
-            room = int(key.split("#", 1)[0])
-            swa_rid = self._swa_req_id(room)
-            paired = self._swa_engine is not None and "#" not in key
-            done = key in self._completed_recv and (
-                not paired or swa_rid in self._completed_recv
-            )
-            if done or key in self._failed or swa_rid in self._failed:
-                self._pulling.release(key)
+            if not self._pull_settled_locked(key):
+                continue
+            self._pulling.release(key)
+            if key in self._pulling_cleared:
+                # The framework already dropped this read's room; nothing will
+                # read its completion, so drop it too.
+                self._pulling_cleared.discard(key)
+                for rid in (key, self._paired_swa_read(key) or key):
+                    self._completed_recv.discard(rid)
+                    self._failed.discard(rid)
 
     def _reject_oversized_pull(
         self, room: int, pages: int, limit: int, env: str
@@ -1548,21 +1558,29 @@ class RaidenKVManager(CommonKVManager):
     def clear_room(self, room: int) -> None:
         rid = str(room)
         swa_rid = self._swa_req_id(room)
+        chunk_prefix = f"{room}#"
+
+        def belongs(key: str) -> bool:
+            return key == rid or key == swa_rid or key.startswith(chunk_prefix)
+
         with self._state_lock:
-            if self._pulling is not None and room in self._pulling.rooms():
-                if self._pull_settled_locked(room):
-                    self._pulling.release(room)
-                else:
-                    # Raiden cannot cancel the read and keeps its host staging
-                    # until it settles; the admission follows the staging.
-                    self._pulling_cleared.add(room)
-            self._completed_send.discard(rid)
-            self._completed_send.discard(swa_rid)
-            if room not in self._pulling_cleared:
-                self._completed_recv.discard(rid)
-                self._completed_recv.discard(swa_rid)
-                self._failed.discard(rid)
-                self._failed.discard(swa_rid)
+            # A read raiden still holds keeps its admission, and the
+            # completion that will settle it, until the engine reports it.
+            held: Set[str] = set()
+            if self._pulling is not None:
+                for key in self._pulling.rooms():
+                    if not belongs(key):
+                        continue
+                    if self._pull_settled_locked(key):
+                        self._pulling.release(key)
+                        continue
+                    self._pulling_cleared.add(key)
+                    held.update((key, self._paired_swa_read(key) or key))
+            self._completed_send.difference_update(
+                [k for k in self._completed_send if belongs(k)]
+            )
+            for ids in (self._completed_recv, self._failed):
+                ids.difference_update([k for k in ids if belongs(k) and k not in held])
             for d in (
                 getattr(self, "_chunk_queue", None),
                 getattr(self, "_remote_total", None),
@@ -1594,11 +1612,6 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if d is not None:
                     d.pop(room, None)
-            if self._pulling is not None:
-                prefix = f"{room}#"
-                for key in self._pulling.rooms():
-                    if key == rid or key.startswith(prefix):
-                        self._pulling.release(key)
             if hasattr(self, "_replied"):
                 self._replied.discard(room)
             chunk_uuids = (getattr(self, "_reshard_chunk_uuids", None) or {}).pop(
