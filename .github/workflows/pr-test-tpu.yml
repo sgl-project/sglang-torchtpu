@@ -121,10 +121,9 @@ jobs:
       contents: read
       id-token: write
 
-  # Runs only after stage-a passes
   e2e:
     name: e2e-test
-    needs: [build, unit]
+    needs: build
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
