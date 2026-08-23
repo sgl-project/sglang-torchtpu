@@ -1163,7 +1163,7 @@ class RaidenKVManager(CommonKVManager):
             str(start).encode("ascii"),
             str(total_pages).encode("ascii"),
             pack_ints(block_ids),
-            str(self.attn_tp_rank).encode("ascii"),
+            str(self._local_rank).encode("ascii"),
         ]
         endpoint = f"tcp://{addr[0]}:{addr[1]}"
         with self._push_lock:
@@ -1205,7 +1205,7 @@ class RaidenKVManager(CommonKVManager):
             MessageTag.RESHARD_BLOCKS,
             str(room).encode("ascii"),
             pack_ints(blocks),
-            str(self.attn_tp_rank).encode("ascii"),
+            str(self._local_rank).encode("ascii"),
             aux_blob,
         ]
         with self._push_lock:
@@ -1230,7 +1230,11 @@ class RaidenKVManager(CommonKVManager):
             self._announced_pages[room] = max(
                 self._announced_pages.get(room, 0), start + len(blocks)
             )
-            if set(per_source) < set(self._reshard_meta[room]["source_ranks"]):
+            # Sources are keyed by the sender's raiden engine id; its
+            # attention-TP rank is the id within its replica.
+            src_attn_tp = self._reshard_meta[room]["src_attn_tp"]
+            have = {nid % src_attn_tp for nid in per_source}
+            if have < set(self._reshard_meta[room]["source_ranks"]):
                 return
             sources_map = self._reshard_chunk_sources[room].pop(index)
         self._register_reshard_chunk(room, index, total_pages, sources_map)
@@ -1321,7 +1325,8 @@ class RaidenKVManager(CommonKVManager):
                 return
             self._reshard_sources[room][src_rank] = prefill_blocks
             aux_index = self._reshard_meta[room].get("aux_index")
-            have = set(self._reshard_sources[room])
+            src_attn_tp = self._reshard_meta[room]["src_attn_tp"]
+            have = {nid % src_attn_tp for nid in self._reshard_sources[room]}
             need = set(self._reshard_meta[room]["source_ranks"])
             ready = have >= need
         if aux_index is not None and aux_blob:

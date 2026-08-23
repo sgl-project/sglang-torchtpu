@@ -947,6 +947,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.kv_args = Mock(page_size=128)
         mgr.attn_tp_rank = 1
         mgr.attn_tp_size = 8
+        mgr._local_rank = 1
         mgr._timeout_s = 5
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
@@ -1222,6 +1223,41 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertFalse(mgr._failed)
         self.assertNotIn(room, mgr._reshard_pushes_pending)
         self.assertFalse(mgr._completed_send)
+
+    def test_schedules_are_keyed_by_the_sender_engine_id(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        room = self.ROOM
+        src = {8: list(range(100, 164)), 9: list(range(300, 364))}
+        mgr = self._decode()
+
+        def chunk(sender_id):
+            return [
+                MessageTag.RESHARD_CHUNK,
+                b"41",
+                b"0",
+                b"24",
+                b"64",
+                pack_ints(src[sender_id][24:32]),
+                str(sender_id).encode("ascii"),
+            ]
+
+        # The sources sit on the prefill's second attention-DP replica, so
+        # their engine ids are 8 and 9 while their attention-TP ranks (what
+        # the decode expects announcements from) are 0 and 1.
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(chunk(8))
+            mgr._engine.register_active_plan.assert_not_called()
+            mgr._on_reshard_chunk(chunk(9))
+            self.assertEqual(mgr._failed, set())
+            uuid, req = mgr._engine.register_active_plan.call_args.args
+            self.assertEqual(set(req.shard_push_schedules), {8, 9})
+            self.assertEqual(
+                _plan_blocks(req, 8), (src[8][24:32], self.DECODE_BLOCKS[0:8])
+            )
+            self.assertEqual(
+                _plan_blocks(req, 9), (src[9][24:32], self.DECODE_BLOCKS[0:8])
+            )
 
     def test_room_cleared_during_plan_registration_is_not_resurrected(self):
         from sglang.srt.disaggregation.raiden.serde import pack_ints

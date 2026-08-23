@@ -206,7 +206,7 @@ def build_sender_request(
             "src_block_ids, dst_block_ids, live_tokens must be equal length"
         )
     src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-        prefill_rank, decode_rank
+        prefill_rank % geom.src_tp, decode_rank
     )
     req = pb2.StartTransferRequest()
     req.uuid = uuid
@@ -249,12 +249,13 @@ def build_receiver_request(
 ):
     """Receiver-side StartTransferRequest assembling all sources into decode HBM.
 
-    ``sources`` is ``[(prefill_rank, src_block_ids), ...]`` for the prefill ranks
+    ``sources`` is ``[(sender_id, src_block_ids), ...]`` for the prefill engines
     feeding this decode rank; each gets its own shard schedule with its strided
     dst placement. The receiver selects a source's schedule by the pushing node's
-    id (``header.remote_id``), so each schedule is keyed by its ``prefill_rank``
-    (the sender engine's ``node_id``), not by writer position. ``dst_mem_type =
-    HBM`` makes the receiver auto-H2D the assembled host staging into HBM.
+    id (``header.remote_id``), so each schedule is keyed by the sender engine's
+    full id, while the byte geometry uses the engine's attention-TP rank within
+    its replica (``sender_id % src_tp``). ``dst_mem_type = HBM`` makes the
+    receiver auto-H2D the assembled host staging into HBM.
     """
     req = pb2.StartTransferRequest()
     req.uuid = uuid
@@ -263,11 +264,11 @@ def build_receiver_request(
     req.dst_mem_type = pb2.MEMORY_TYPE_HBM  # auto-H2D host staging -> decode HBM
     req.use_block_chunks = True
     total = 0
-    for prefill_rank, src_block_ids in sources:
+    for sender_id, src_block_ids in sources:
         src_off, size, src_stride, dst_off, dst_stride = geom.entry_bytes(
-            prefill_rank, decode_rank
+            sender_id % geom.src_tp, decode_rank
         )
-        schedule = req.shard_push_schedules[prefill_rank]
+        schedule = req.shard_push_schedules[sender_id]
         for src_b, dst_b, n in zip(src_block_ids, dst_block_ids, live_tokens):
             if n <= 0:
                 continue
