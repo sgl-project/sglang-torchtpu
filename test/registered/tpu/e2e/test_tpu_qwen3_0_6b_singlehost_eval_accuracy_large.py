@@ -21,7 +21,7 @@ register_tpu_ci(
     disabled="TPU PR runners are not provisioned yet",
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 TPU_BENCH_DIR = REPO_ROOT / "benchmark" / "tpu"
 
 

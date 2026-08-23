@@ -42,7 +42,7 @@ MULTIHOST_LAUNCH = {
     "weights_pvc": "model-weights-rox",
 }
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))
 RECIPE_DIR = os.path.join(
     REPO_ROOT, "benchmark", "tpu", "recipe", "qwen3_coder_480b", "nightly"
 )
