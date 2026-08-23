@@ -328,6 +328,8 @@ class TpuKVManager(TpuKVManagerBase):
             plans: list[PrefillTransferInfo] = []
             total_lanes = 0
             for info in bucket.values():
+                if info._reshard_error is not None:
+                    raise KVTransferError(room, info._reshard_error)
                 if not info.if_skip_sending:
                     plans.append(info)
                     total_lanes += len(page_indices) * info.n_lane_to_send
