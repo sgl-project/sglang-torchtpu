@@ -105,7 +105,8 @@ jobs:
       id-token: write
 
   # Per-commit TPU suite on a single-host 2x2x1 slice (sized from topology.yaml).
-  integration:
+  unit:
+    name: unit-test
     needs: build
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -121,13 +122,15 @@ jobs:
       id-token: write
 
   # Runs only after stage-a passes
-  feature:
-    needs: [build, integration]
+  e2e:
+    name: e2e-test
+    needs: [build, unit]
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      weights_pvc: model-weights-rox
     permissions:
       contents: read
       id-token: write
@@ -136,7 +139,7 @@ jobs:
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
-    needs: [decide, build, integration, feature]
+    needs: [decide, build, unit, e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
