@@ -1300,17 +1300,13 @@ class RaidenKVManager(CommonKVManager):
             dst_block_ids=dst,
             live_tokens=[self.kv_args.page_size] * window.length,
         )
-        if not self._publish_reshard_plan(room, req_id, uuid, req):
-            return
         payload = [
             MessageTag.RESHARD_CHUNK_READY,
             str(room).encode("ascii"),
             str(index).encode("ascii"),
             str(uuid).encode("ascii"),
         ]
-        for endpoint in ready_endpoints:
-            with self._push_lock:
-                self._connect(endpoint).send_multipart(payload)
+        self._publish_reshard_plan(room, req_id, uuid, req, payload, ready_endpoints)
 
     def _on_reshard_blocks(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 5)
@@ -1339,15 +1335,25 @@ class RaidenKVManager(CommonKVManager):
         if ready:
             self._register_receiver_and_signal(room)
 
-    def _publish_reshard_plan(self, room: int, req_id: str, uuid: int, req) -> bool:
-        """Registers a receive plan and publishes it if the room is still live.
+    def _publish_reshard_plan(
+        self,
+        room: int,
+        req_id: str,
+        uuid: int,
+        req,
+        ready_payload: List[bytes],
+        ready_endpoints: List[str],
+        record_read: bool = True,
+    ) -> bool:
+        """Registers a receive plan and, if the room is still live, publishes
+        it and asks its sources to push, as one step.
 
         Registration runs outside the state lock and can fail when raiden
         cannot stage the plan; the room can also be cleared meanwhile. The
-        plan is recorded -- and READY may be sent -- only when both went
-        well: a failed registration fails the room, and a plan registered
-        for a cleared room is dropped again, so a sender is never asked to
-        push into pages the room no longer owns.
+        plan is recorded and the push requested only under the lock that
+        clearing takes, so a sender is never asked to push into pages the
+        room no longer owns: a failed registration fails the room, and a
+        plan registered for a cleared room is dropped again.
         """
         engine = self._ensure_engine()
         try:
@@ -1361,8 +1367,14 @@ class RaidenKVManager(CommonKVManager):
             return False
         with self._state_lock:
             if room in self._reshard_meta:
-                self._chunk_reads.setdefault(room, []).append(req_id)
+                if record_read:
+                    self._chunk_reads.setdefault(room, []).append(req_id)
                 self._reshard_plans.setdefault(room, {})[req_id] = uuid
+                # Sent under the lock: after a clear wins it, no push can be
+                # requested for the pages the room gave back.
+                for endpoint in ready_endpoints:
+                    with self._push_lock:
+                        self._connect(endpoint).send_multipart(ready_payload)
                 return True
         self._unregister_plan(uuid)
         return False
@@ -1390,10 +1402,16 @@ class RaidenKVManager(CommonKVManager):
             # Only the pages no chunk announcement covered are left to move.
             with self._state_lock:
                 announced = self._announced_pages.get(room, 0)
-                self._final_seen.add(room)
             any_blocks = next(iter(sources_map.values()))
             tail_start, tail = self._tail_after(any_blocks, announced)
             window = chunk_pull_window(tail_start, len(tail), len(any_blocks), n)
+            with self._state_lock:
+                # The closing read is owed from the moment the room can look
+                # complete: it is recorded before _final_seen so completion
+                # can never be inferred while its registration is pending.
+                if window:
+                    self._chunk_reads.setdefault(room, []).append(str(room))
+                self._final_seen.add(room)
             if not window:
                 for endpoint in ready_endpoints:
                     payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
@@ -1446,13 +1464,15 @@ class RaidenKVManager(CommonKVManager):
                 len(local_blocks),
                 local_blocks[:4],
             )
-        if not self._publish_reshard_plan(room, str(room), room, req):
-            return
-
-        for endpoint in ready_endpoints:
-            payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
-            with self._push_lock:
-                self._connect(endpoint).send_multipart(payload)
+        self._publish_reshard_plan(
+            room,
+            str(room),
+            room,
+            req,
+            [MessageTag.RESHARD_READY, str(room).encode("ascii")],
+            ready_endpoints,
+            record_read=not self.chunked_transfer,
+        )
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.RESHARD_READY, 2)

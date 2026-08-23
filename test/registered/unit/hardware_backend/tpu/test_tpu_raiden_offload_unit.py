@@ -1163,6 +1163,35 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._failed)
 
+    def test_room_is_not_complete_while_closing_registration_is_pending(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        mgr, _ = self._decode_with_chunk_plan()
+        mgr._completed_recv.add("41#0")
+        seen_complete = []
+
+        def registers_slowly(uuid, req, is_sender):
+            # While the closing plan registers, the room must not look done:
+            # its closing read is already owed.
+            seen_complete.append(mgr.is_recv_done(self.ROOM))
+
+        mgr._engine.register_active_plan = Mock(side_effect=registers_slowly)
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    [
+                        MessageTag.RESHARD_BLOCKS,
+                        b"41",
+                        pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
+                        str(rank).encode("ascii"),
+                        b"",
+                    ]
+                )
+        self.assertEqual(seen_complete, [False])
+        self.assertFalse(mgr.is_recv_done(self.ROOM))
+        mgr._completed_recv.add("41")
+        self.assertTrue(mgr.is_recv_done(self.ROOM))
+
     def test_closing_plan_is_dropped_once_its_push_settles(self):
         from sglang.srt.disaggregation.raiden.serde import pack_ints
 
