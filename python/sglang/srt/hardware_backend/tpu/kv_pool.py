@@ -248,12 +248,31 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # CPU offload / restore
     # ------------------------------------------------------------------ #
 
+    def _raiden_backup(self):
+        """The pool's retraction backup, built once when budgeted."""
+        if not hasattr(self, "_raiden_backup_obj"):
+            from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+                maybe_build_backup,
+            )
+
+            self._raiden_backup_obj = maybe_build_backup(self)
+        return self._raiden_backup_obj
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         """Copy the KV rows at ``indices`` out to host.
 
         Overrides the base version, which stores K and V in two separate
-        tensors, while this pool uses one fused KV tensor per layer.
+        tensors, while this pool uses one fused KV tensor per layer. With a
+        raiden retraction budget, whole pages go to pinned host staging by
+        DMA instead and come back the same way; rows that do not fill their
+        pages sequentially use the row path.
         """
+        backup = self._raiden_backup()
+        if backup is not None:
+            self.device_module.synchronize()
+            handle = backup.try_save(indices)
+            if handle is not None:
+                return handle
         # Indices might be on host and need to be copied to device.
         indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
         self.device_module.synchronize()
@@ -274,12 +293,22 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         """Copy the KV rows at ``indices`` from host to device.
 
-        Inverse of `get_cpu_copy`. Rows are written a whole page at a time
-        through `write_pages_torch`, which updates the layer buffer in place.
-        A page that ``indices`` only partly covers is read back first and
-        merged on device.
+        Inverse of `get_cpu_copy`. A raiden-staged payload DMAs straight
+        back into the pages holding ``indices``. Row payloads are written a
+        whole page at a time through `write_pages_torch`, which updates the
+        layer buffer in place; a page that ``indices`` only partly covers is
+        read back first and merged on device.
         """
         from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
+        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            RaidenKVBackupHandle,
+        )
+
+        if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
+            self.device_module.synchronize()
+            self._raiden_backup().restore(kv_cache_cpu, indices)
+            self.device_module.synchronize()
+            return
 
         indices = indices.to(device="cpu", dtype=torch.long)
         if indices.numel() == 0:
@@ -322,6 +351,10 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
 
     def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
         """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
+
+        Raiden-staged payloads are whole pages and are never filtered: only
+        the sliding-window pool's payload goes through here, and that pool
+        stays on the row path.
 
         Each layer's chunks are single fused KV tensors with the token axis
         first; the rows are masked along that axis and re-split into

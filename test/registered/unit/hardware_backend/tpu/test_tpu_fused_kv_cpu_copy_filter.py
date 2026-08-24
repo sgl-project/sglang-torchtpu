@@ -183,6 +183,127 @@ class TestKvPageWriteKernel(CustomTestCase):
             self.assertTrue(bool((out[b] == kv[b]).all()))
 
 
+class _FakeTransfer:
+    """Copies pages between the pool tensor and an in-memory host store, the
+    way raiden's D2H/H2D moves them, so the whole backup contract runs."""
+
+    def __init__(self, device_pool, num_host_pages):
+        self.pool = device_pool
+        self.host = {}
+
+    def _pages(self, layer_id):
+        return self.pool.get_fused_kv_buffer(self.pool.start_layer + layer_id)
+
+    def backup(self, device_page_ids, host_page_ids):
+        for d, h in zip(device_page_ids, host_page_ids):
+            self.host[h] = [
+                self._pages(l)[d].clone() for l in range(self.pool.layer_num)
+            ]
+        return _Ready()
+
+    def load(self, host_page_ids, device_page_ids):
+        for h, d in zip(host_page_ids, device_page_ids):
+            for l, page in enumerate(self.host[h]):
+                self._pages(l)[d] = page
+        return _Ready()
+
+
+class _Ready:
+    def synchronize(self):
+        pass
+
+
+class TestRaidenRetractionBackup(CustomTestCase):
+    def _pool_with_backup(self, size=64 * 8, page=8, layers=2, pages=16):
+        from sglang.srt.hardware_backend.tpu import raiden_kv_backup
+
+        pool = _make_fused_pool(size=size, page_size=page, layer_num=layers)
+        backup = raiden_kv_backup.RaidenKVBackup.__new__(
+            raiden_kv_backup.RaidenKVBackup
+        )
+        backup._transfer = _FakeTransfer(pool, pages)
+        backup._page_size = page
+        backup._free = list(range(pages))
+        pool._raiden_backup_obj = backup
+        return pool, backup
+
+    def test_sequential_page_runs(self):
+        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            sequential_page_runs,
+        )
+
+        # A retracted request: page-aligned sequential rows, partial tail.
+        self.assertEqual(
+            sequential_page_runs(torch.arange(16, 16 + 11), 8), ([2, 3], 0, 11)
+        )
+        # Full single page.
+        self.assertEqual(sequential_page_runs(torch.arange(8), 8), ([0], 0, 8))
+        # A gap makes it irregular.
+        self.assertIsNone(
+            sequential_page_runs(torch.tensor([0, 1, 2, 4, 5, 6, 7, 8]), 8)
+        )
+        # Sequential across a page gap is fine (pages need not be adjacent),
+        # but starting mid-page is reported so the caller can fall back.
+        self.assertEqual(
+            sequential_page_runs(torch.tensor([6, 7, 16, 17]), 8), ([0, 2], 6, 4)
+        )
+        # A page change before the boundary is irregular.
+        self.assertIsNone(sequential_page_runs(torch.tensor([5, 6, 16, 17]), 8))
+        self.assertIsNone(sequential_page_runs(torch.tensor([], dtype=torch.long), 8))
+
+    def test_round_trip_into_new_pages(self):
+        pool, backup = self._pool_with_backup()
+        _fill_rows(_fused_rows(pool))
+        saved_indices = torch.arange(16, 16 + 21)  # pages 2..4, tail of 5 rows
+        rows_before = [
+            _fused_rows(pool)[l].flatten(0, 1)[saved_indices].clone()
+            for l in range(pool.layer_num)
+        ]
+        handle = pool.get_cpu_copy(saved_indices)
+        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            RaidenKVBackupHandle,
+        )
+
+        self.assertIsInstance(handle, RaidenKVBackupHandle)
+        self.assertEqual(len(handle.host_pages), 3)
+
+        # The pool moves on while the request is retracted.
+        _fill_rows(_fused_rows(pool), offset=SWA_OFFSET)
+
+        # Resume lands at different, freshly allocated pages.
+        new_indices = torch.arange(40, 40 + 21)  # pages 5..7
+        pool.load_cpu_copy(handle, new_indices)
+        for l in range(pool.layer_num):
+            rows_now = _fused_rows(pool)[l].flatten(0, 1)[new_indices]
+            self.assertTrue(torch.equal(rows_now, rows_before[l]))
+        # The handle returned its host pages.
+        self.assertEqual(sorted(backup._free), list(range(16)))
+
+    def test_irregular_rows_fall_back_to_the_row_path(self):
+        pool, backup = self._pool_with_backup()
+        _fill_rows(_fused_rows(pool))
+        irregular = torch.tensor([3, 4, 5, 11, 12, 19])
+        payload = pool.get_cpu_copy(irregular)
+        self.assertIsInstance(payload, list)  # the row path's format
+        _fill_rows(_fused_rows(pool), offset=SWA_OFFSET)
+        pool.load_cpu_copy(payload, irregular)
+        buf = _fused_rows(pool)[0].flatten(0, 1)
+        self.assertEqual(_row_values(_fused_rows(pool)[0], [3, 12])[0], 3.0)
+
+    def test_exhausted_pool_falls_back(self):
+        pool, backup = self._pool_with_backup(pages=1)
+        _fill_rows(_fused_rows(pool))
+        payload = pool.get_cpu_copy(torch.arange(0, 24))  # needs 3 pages
+        self.assertIsInstance(payload, list)
+
+    def test_restore_shape_mismatch_raises(self):
+        pool, backup = self._pool_with_backup()
+        _fill_rows(_fused_rows(pool))
+        handle = pool.get_cpu_copy(torch.arange(16, 16 + 21))
+        with self.assertRaisesRegex(ValueError, "shape mismatch"):
+            pool.load_cpu_copy(handle, torch.arange(40, 40 + 20))
+
+
 class TestMhaPoolFilterCpuCopy(CustomTestCase):
     def test_mha_pool_filter_round_trip(self):
         pool = _make_mha_pool(size=32, layer_num=2)
