@@ -1985,6 +1985,7 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
         )
 
         self.assertIsNotNone(padding)
+        self.assertEqual(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertEqual(batch.seq_lens.shape, (1,))
         self.assertEqual(verify_input.draft_token.shape, (DRAFT_TOKEN_NUM,))
         self.assertEqual(verify_input.retrieve_index.shape, (1, DRAFT_TOKEN_NUM))
@@ -1998,6 +1999,7 @@ class TestSpecVerifyPaddingRecord(CustomTestCase):
             (None, None),
         )
         predict, accept_lens, accept_index = verify_result
+        self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
         self.assertEqual(predict.shape, (0,))
         self.assertEqual(accept_lens.shape, (0,))
         self.assertEqual(accept_index.shape, (0, DRAFT_TOKEN_NUM))

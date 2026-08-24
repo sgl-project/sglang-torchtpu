@@ -57,6 +57,7 @@ class _SpecVerifyPadding:
     state: SpecPaddingState
     batch: Any
     verify_input: SpecInput
+    forward_mode: ForwardMode
     seq_lens: torch.Tensor
     draft_token: torch.Tensor
     retrieve_index: torch.Tensor
@@ -1350,6 +1351,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             state=state,
             batch=batch,
             verify_input=verify_input,
+            forward_mode=batch.forward_mode,
             seq_lens=batch.seq_lens,
             draft_token=verify_input.draft_token,
             retrieve_index=verify_input.retrieve_index,
@@ -1384,6 +1386,11 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         )
 
         # Publish padded tensors only while eagle_sample runs.
+        # A logically idle DP peer must take the same sampling/bookkeeping
+        # path as its active peer after its tensors have been materialized.
+        # Restore IDLE before scheduler bookkeeping observes the batch again.
+        if batch.forward_mode.is_idle():
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.seq_lens = seq_lens
         verify_input.draft_token = draft_token
         verify_input.retrieve_index = retrieve_index
@@ -1410,6 +1417,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         predict, accept_lens, accept_index = verify_result
         new_seq_lens, bonus_tokens = bookkeeping_result
         sampling_info = padding.batch.sampling_info
+        padding.batch.forward_mode = padding.forward_mode
         padding.batch.seq_lens = padding.seq_lens
         padding.verify_input.draft_token = padding.draft_token
         padding.verify_input.retrieve_index = padding.retrieve_index
