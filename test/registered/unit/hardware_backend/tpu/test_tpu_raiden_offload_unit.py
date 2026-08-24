@@ -971,6 +971,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_pushed = set()
         mgr._reshard_chunks = {}
         mgr._reshard_announced = {}
+        mgr._reshard_decode_frontier = {}
         mgr._pending_offer = {}
         mgr._announce_pages = 16
         mgr._reshard_pushes_pending = {}
@@ -1007,6 +1008,27 @@ class TestRaidenChunkedResharding(CustomTestCase):
             for c in mgr._socket.send_multipart.call_args_list
             if c.args[0][0] == tag
         ]
+
+    def test_closing_push_slices_from_the_decode_frontier(self):
+        # This source announced one chunk more than the group completed; the
+        # decode's echoed frontier, not the local count, decides the closing
+        # span so every source pushes the same pages.
+        mgr = self._prefill()
+        room = self.ROOM
+        mgr._reshard_announced[room] = 48
+        mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41", b"32"])
+        self.assertEqual(mgr._reshard_decode_frontier[room], 32)
+
+    def test_reshard_chunk_racing_the_closing_message_is_skipped(self):
+        mgr = self._prefill()
+        room = self.ROOM
+        mgr._reshard_req[room] = dict(
+            reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(40))
+        )
+        mgr._reshard_replied.add(room)
+        mgr._announce_reshard_chunk(room, 0, list(range(16)), 64)
+        self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK), [])
+        self.assertNotIn(room, mgr._reshard_announced)
 
     def test_chunk_racing_the_closing_reply_is_skipped(self):
         # A chunk announced after the reply would arrive after it and outlive
@@ -1062,7 +1084,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             mgr.append_send_blocks(room, blocks[32:64])
             mgr.finalize_send(room, None)
             self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_BLOCKS)), 1)
-            mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41"])
+            mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41", b"32"])
             self.assertEqual(mgr._failed, set())
             uuid, req = mgr._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))

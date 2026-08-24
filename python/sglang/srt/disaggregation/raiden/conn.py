@@ -242,6 +242,8 @@ class RaidenKVManager(CommonKVManager):
             # room -> decode meta from RESHARD_REQ
             self._reshard_req: Dict[int, dict] = {}
             self._reshard_finalized: Set[int] = set()  # send accumulation complete
+            # Closing-transfer start per room, echoed by the decode.
+            self._reshard_decode_frontier: Dict[int, int] = {}
             self._reshard_replied: Set[int] = set()  # RESHARD_BLOCKS sent
             self._reshard_ready: Set[int] = set()  # rooms cleared to push
             self._reshard_pushed: Set[int] = set()
@@ -1151,36 +1153,42 @@ class RaidenKVManager(CommonKVManager):
         Only the pages the decode will receive are announced. The push itself
         waits until the decode has registered the chunk and asks for it.
         """
-        with self._state_lock:
-            req = self._reshard_req[room]
-            window = chunk_pull_window(
-                start, len(block_ids), total_pages, len(req["decode_blocks"])
-            )
-            if not window:
-                return
-            start += window.chunk_offset
-            block_ids = block_ids[
-                window.chunk_offset : window.chunk_offset + window.length
+        with self._announce_lock:
+            with self._state_lock:
+                if room in self._reshard_replied or room not in self._reshard_req:
+                    # The closing message is out (or the room is gone): these
+                    # pages travel with the closing transfer, whose span the
+                    # decode decides from the chunks that did arrive.
+                    return
+                req = self._reshard_req[room]
+                window = chunk_pull_window(
+                    start, len(block_ids), total_pages, len(req["decode_blocks"])
+                )
+                if not window:
+                    return
+                start += window.chunk_offset
+                block_ids = block_ids[
+                    window.chunk_offset : window.chunk_offset + window.length
+                ]
+                index = self._chunk_seq.get(room, 0)
+                self._chunk_seq[room] = index + 1
+                self._reshard_chunks.setdefault(room, {})[index] = (start, block_ids)
+                self._reshard_announced[room] = max(
+                    self._reshard_announced.get(room, 0), start + len(block_ids)
+                )
+                addr = req["reply_addr"]
+            payload = [
+                MessageTag.RESHARD_CHUNK,
+                str(room).encode("ascii"),
+                str(index).encode("ascii"),
+                str(start).encode("ascii"),
+                str(total_pages).encode("ascii"),
+                pack_ints(block_ids),
+                str(self._local_rank).encode("ascii"),
             ]
-            index = self._chunk_seq.get(room, 0)
-            self._chunk_seq[room] = index + 1
-            self._reshard_chunks.setdefault(room, {})[index] = (start, block_ids)
-            self._reshard_announced[room] = max(
-                self._reshard_announced.get(room, 0), start + len(block_ids)
-            )
-            addr = req["reply_addr"]
-        payload = [
-            MessageTag.RESHARD_CHUNK,
-            str(room).encode("ascii"),
-            str(index).encode("ascii"),
-            str(start).encode("ascii"),
-            str(total_pages).encode("ascii"),
-            pack_ints(block_ids),
-            str(self._local_rank).encode("ascii"),
-        ]
-        endpoint = f"tcp://{addr[0]}:{addr[1]}"
-        with self._push_lock:
-            self._connect(endpoint).send_multipart(payload)
+            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            with self._push_lock:
+                self._connect(endpoint).send_multipart(payload)
 
     def _on_reshard_chunk_ready(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.RESHARD_CHUNK_READY, 4)
@@ -1209,20 +1217,25 @@ class RaidenKVManager(CommonKVManager):
                 return
             if room not in self._reshard_req or room not in self._reshard_finalized:
                 return
-            self._reshard_replied.add(room)
             addr = self._reshard_req[room]["reply_addr"]
             blocks = list(self._send_blocks.get(room, []))
             aux_blob = self._send_aux.get(room, b"")
-        endpoint = f"tcp://{addr[0]}:{addr[1]}"
-        payload = [
-            MessageTag.RESHARD_BLOCKS,
-            str(room).encode("ascii"),
-            pack_ints(blocks),
-            str(self._local_rank).encode("ascii"),
-            aux_blob,
-        ]
-        with self._push_lock:
-            self._connect(endpoint).send_multipart(payload)
+        with self._announce_lock:
+            with self._state_lock:
+                if room not in self._reshard_req:
+                    return
+                # Committed under the order lock: no announcement can follow.
+                self._reshard_replied.add(room)
+            endpoint = f"tcp://{addr[0]}:{addr[1]}"
+            payload = [
+                MessageTag.RESHARD_BLOCKS,
+                str(room).encode("ascii"),
+                pack_ints(blocks),
+                str(self._local_rank).encode("ascii"),
+                aux_blob,
+            ]
+            with self._push_lock:
+                self._connect(endpoint).send_multipart(payload)
 
     def _on_reshard_chunk(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.RESHARD_CHUNK, 7)
@@ -1276,16 +1289,16 @@ class RaidenKVManager(CommonKVManager):
 
         spans = {(start, len(blocks)) for start, blocks in sources_map.values()}
         if len(spans) != 1:
-            logger.error(
-                "RaidenKVManager rank%d room %s chunk %d announced with "
-                "differing spans %s",
-                self.attn_tp_rank,
-                room,
-                index,
-                sorted(spans),
+            reason = (
+                f"Raiden receive failed: room {room} chunk {index} announced "
+                f"with differing spans {sorted(spans)}"
             )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
             with self._state_lock:
+                if room not in self._reshard_meta:
+                    return
                 self._failed.add(str(room))
+                self.record_failure(room, reason)
             return
         start, length = spans.pop()
         with self._state_lock:
@@ -1382,8 +1395,11 @@ class RaidenKVManager(CommonKVManager):
                     # Cleared while registering: nothing reads a failure for
                     # this room any more, so record none.
                     return False
+                # State and reason land as one step, so a poll can never see
+                # the failure without its reason and a concurrent clear can
+                # never leave either behind.
                 self._failed.add(str(room))
-            self.record_failure(room, reason)
+                self.record_failure(room, reason)
             return False
         with self._state_lock:
             if room in self._reshard_meta:
@@ -1436,11 +1452,16 @@ class RaidenKVManager(CommonKVManager):
                 self._final_seen.add(room)
             if not window:
                 for endpoint in ready_endpoints:
-                    payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
+                    payload = [
+                        MessageTag.RESHARD_READY,
+                        str(room).encode("ascii"),
+                        str(announced).encode("ascii"),
+                    ]
                     with self._push_lock:
                         self._connect(endpoint).send_multipart(payload)
                 return
             lo = tail_start + window.chunk_offset
+            closing_start = announced
             sources = [
                 (p_rank, sources_map[p_rank][lo : lo + window.length])
                 for p_rank in sorted(sources_map)
@@ -1450,6 +1471,7 @@ class RaidenKVManager(CommonKVManager):
             ]
             n = window.length
         else:
+            closing_start = 0
             # A decode prefix hit leaves decode holding fewer (tail) pages than
             # the prefill produced; keep the last n of each source's blocks so
             # both sides pair the same pages.
@@ -1491,15 +1513,25 @@ class RaidenKVManager(CommonKVManager):
             str(room),
             room,
             req,
-            [MessageTag.RESHARD_READY, str(room).encode("ascii")],
+            [
+                MessageTag.RESHARD_READY,
+                str(room).encode("ascii"),
+                str(closing_start).encode("ascii"),
+            ],
             ready_endpoints,
             record_read=not self.chunked_transfer,
         )
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_READY, 2)
+        self._require_frames(msg, MessageTag.RESHARD_READY, 3)
         room = int(msg[1].decode("ascii"))
         with self._state_lock:
+            # The pages the decode's closing transfer starts at. The decode
+            # counts a chunk announced only when every source delivered it,
+            # so its frontier is the one all sources must slice the closing
+            # push by -- a source's own count can run ahead by a chunk the
+            # group never completed.
+            self._reshard_decode_frontier[room] = int(msg[2].decode("ascii"))
             self._reshard_ready.add(room)
         self._maybe_reshard_push(room)
 
@@ -1558,7 +1590,9 @@ class RaidenKVManager(CommonKVManager):
             req_meta = dict(self._reshard_req[room])
             if chunk is None:
                 prefill_blocks = list(self._send_blocks[room])
-                start = self._reshard_announced.get(room, 0)
+                start = self._reshard_decode_frontier.get(
+                    room, self._reshard_announced.get(room, 0)
+                )
             else:
                 start, prefill_blocks = self._reshard_chunks[room].pop(chunk)
             total_pages = self._send_total.get(room, len(prefill_blocks))
@@ -1738,6 +1772,7 @@ class RaidenKVManager(CommonKVManager):
                 getattr(self, "_reshard_chunks", None),
                 getattr(self, "_pending_offer", None),
                 getattr(self, "_reshard_announced", None),
+                getattr(self, "_reshard_decode_frontier", None),
                 getattr(self, "_reshard_pushes_pending", None),
                 getattr(self, "_reshard_chunk_sources", None),
                 getattr(self, "_send_blocks", None),
