@@ -405,6 +405,60 @@ def read_bench_point(out_dir: str, point: Dict[str, Any]) -> Optional[Dict[str, 
     return record
 
 
+# Every numeric field bench_serving writes per sweep point, and how to read it.
+# Dumped in full because the JSONL never leaves the pod and the job log expires at
+# ~90 days: a field not recorded tonight cannot be back-filled later without
+# re-running the sweep. The cost is a few hundred bytes a night.
+#
+# Config echoes in the same record (backend, dataset_name, tag, server_info, the
+# random_* shape, request_rate) are deliberately NOT dumped -- they are settings,
+# not measurements, and the dashboard already captures them from the config block
+# bench_serving.sh prints.
+_HIGHER_IS_BETTER = (
+    "request_throughput",
+    "input_throughput",
+    "output_throughput",
+    "total_throughput",
+    "max_output_tokens_per_s",
+    "accept_length",  # speculative decoding; absent otherwise
+)
+_LOWER_IS_BETTER = tuple(
+    f"{stat}_{family}"
+    for family in ("ttft_ms", "tpot_ms", "itl_ms", "e2e_latency_ms")
+    for stat in ("mean", "median", "std", "p90", "p95", "p99")
+) + ("duration",)
+# Counters worth keeping but not worth judging. `completed` should equal the
+# expected request count exactly -- more is not better, which is why it is not
+# higher_is_better; the gate checks it instead. Cache counters are only
+# meaningful against a run's own cache setting: this sweep disables prefix
+# caching on purpose, so a rise would mean the cache leaked in, not that things
+# improved.
+_INFORMATIONAL = (
+    "completed",
+    "total_input_tokens",
+    "total_input_text_tokens",
+    "total_input_vision_tokens",
+    "total_output_tokens",
+    "total_output_tokens_retokenized",
+    "total_prompt_tokens",
+    "total_cached_tokens",
+    "device_cached_tokens",
+    "host_cached_tokens",
+    "storage_cached_tokens",
+    "cache_hit_rate_pct",
+    "max_concurrent_requests",
+)
+
+_BENCH_METRICS = {
+    **{f: "higher_is_better" for f in _HIGHER_IS_BETTER},
+    **{f: "lower_is_better" for f in _LOWER_IS_BETTER},
+    **{f: "informational" for f in _INFORMATIONAL},
+}
+
+# The one series per model a reader should look at first.
+_HEADLINE_METRIC = "total_throughput"
+
+
 def bench_serving_runner(
     sweep: List[Dict[str, Any]],
     test_name: str,
@@ -480,17 +534,43 @@ def bench_serving_runner(
                 flush=True,
             )
             # Built-in backends dump their own metrics; a runner must do its own.
-            dump_metric(
-                f"{test_name}.{point['workload']}.total_throughput",
-                total,
-                labels={
-                    # model keys the dashboard's series and ties the point back to
-                    # the server/bench config captured for the same model.
+            # Everything bench_serving measured is dumped, not just the headline:
+            # the [METRIC] line is the ONLY thing that survives -- the JSONL dies
+            # with the pod and the log expires at ~90 days, so a field not dumped
+            # tonight cannot be charted later without re-running the sweep. The
+            # cost of carrying all of them is a few hundred bytes a night.
+            stem = f"{test_name}.{point['workload']}"
+            for field, direction in _BENCH_METRICS.items():
+                value = record.get(field)
+                if not isinstance(value, (int, float)):
+                    continue
+                # model keys the dashboard's series and ties the point back to the
+                # server/bench config captured for the same model. `direction` says
+                # which way is an improvement, because a regression check that
+                # assumes higher-is-better reads a TTFT drop as a win.
+                labels = {
                     "model": model or test_name,
-                    "workload": point["workload"],
                     "c": point["concurrency"],
-                },
-            )
+                    "direction": direction,
+                }
+                if field == _HEADLINE_METRIC:
+                    # `workload` is what routes a metric to the Performance tab, so
+                    # only the headline carries it. The other 40-odd land as
+                    # "unclassified": stored in the dashboard's archive forever, but
+                    # charted nowhere -- which is the point. Recording them costs a
+                    # few hundred bytes a night and cannot be done retroactively once
+                    # the job log expires; charting them all would bury the one
+                    # number anyone opens the page for under forty series.
+                    #
+                    # To chart one later: give it `workload` here, or teach the
+                    # dashboard to treat kind="bench_detail" as performance -- the
+                    # latter lights up every night already recorded, retroactively.
+                    labels["workload"] = point["workload"]
+                    labels["headline"] = "1"
+                else:
+                    labels["kind"] = "bench_detail"
+                    labels["workload_name"] = point["workload"]
+                dump_metric(f"{stem}.{field}", value, labels=labels)
 
         return {
             "score": headline or 0.0,
