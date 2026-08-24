@@ -33,6 +33,12 @@ Top level
                   Defaults to `model`.
     variant       Distinguishes launch configs of the same model in reports, e.g.
                   "TP8+EP8". Cosmetic while a model has one config.
+    dashboard     "accuracy" -> each non-sweep gate's score is dumped as
+                  `[METRIC] {label}={score}` with kind=accuracy, which is what puts
+                  it on the CI dashboard's accuracy tab. Absent -> the gates still
+                  gate, but nothing is plotted: a feature-validation test cannot
+                  land on the tab by accident. (The performance tab works the same
+                  way off the sweep gate's own workload labels.)
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
@@ -106,7 +112,15 @@ from sglang.test.tpu.eval_support import (
 
 _TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
 
-_CONFIG_KEYS = {"model", "test_name", "variant", "launch", "gates", "skip_unless"}
+_CONFIG_KEYS = {
+    "model",
+    "test_name",
+    "variant",
+    "launch",
+    "gates",
+    "dashboard",
+    "skip_unless",
+}
 _LAUNCH_KEYS = {"recipe", "env", "tag", "health_timeout", "external"}
 # Gate keys that map straight onto AccuracyTestParams.
 _GATE_PASSTHROUGH = {
@@ -167,10 +181,19 @@ def _build_launcher(launch: Dict[str, Any]):
 
 
 def _build_gate(
-    gate: Dict[str, Any], test_name: str = "", model: str = ""
+    gate: Dict[str, Any],
+    test_name: str = "",
+    model: str = "",
+    dashboard: Optional[str] = None,
 ) -> AccuracyTestParams:
     _reject_unknown(gate, _GATE_PASSTHROUGH | _GATE_TRANSLATED, "gate")
     kwargs = {k: v for k, v in gate.items() if k in _GATE_PASSTHROUGH}
+
+    if dashboard == "accuracy" and "sweep" not in gate:
+        # The dashboard plots only metrics that declare kind=accuracy; the stamp
+        # is per-config so a copied gate cannot reach the tab undeclared. A sweep
+        # gate is excluded: its points carry their own performance labels.
+        kwargs["metric_labels"] = {"model": test_name, "kind": "accuracy"}
 
     if "baseline" in gate:
         kwargs["baseline_accuracy"] = gate["baseline"]
@@ -216,7 +239,13 @@ def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
     """Expand the ``gates`` list. Split out so tests can assert on it directly."""
     model = str(config.get("model", ""))
     test_name = str(config.get("test_name", model))
-    return [_build_gate(g, test_name=test_name, model=model) for g in config["gates"]]
+    dashboard = config.get("dashboard")
+    if dashboard not in (None, "accuracy"):
+        raise ValueError(f'dashboard must be "accuracy" or absent, got {dashboard!r}')
+    return [
+        _build_gate(g, test_name=test_name, model=model, dashboard=dashboard)
+        for g in config["gates"]
+    ]
 
 
 def build_model(config: Dict[str, Any]) -> TpuModelLaunchSettings:

@@ -43,6 +43,11 @@ class AccuracyTestParams:
     # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
     # of letting _run_sgl_eval infer it from the model name.
     sgl_eval_thinking: Optional[bool] = None
+    # When set, run_accuracy_test dumps the measured score as `[METRIC] {name}=score`
+    # with these labels, whatever backend scored it. This is the one channel that
+    # feeds dashboards, so only declared gates are ever plotted; the backends' own
+    # dump_metric calls stay as stored-but-unplotted detail.
+    metric_labels: Optional[dict] = None
 
     @property
     def name(self) -> str:
@@ -587,6 +592,11 @@ def run_accuracy_test(
     if score is None:
         score = metrics.get("accuracy", 0.0)
     latency = metrics.get("latency")
+
+    # Dump per gate, not after the aggregate verdict: a sibling gate failing the
+    # file must not cost this one its datapoint.
+    if params.metric_labels is not None and score is not None:
+        dump_metric(params.name, score, labels=params.metric_labels)
 
     if "_passed" in metrics:
         # The runner gated itself (it owns thresholds we cannot see from here).

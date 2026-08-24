@@ -1,0 +1,64 @@
+# TPU accuracy gates -- test/registered/tpu/nightly-accuracy/ via run_suite, ONE
+# JOB PER MODEL so they take separate slices and run in parallel, exactly like
+# perf-test-tpu.yml. The same jobs run nightly (nightly-test-tpu.yml); this action
+# is the isolated trigger, for collecting a datapoint on demand without waiting
+# for a nightly:
+#   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
+name: Accuracy Test (TPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      model:
+        description: "Which model to gate"
+        required: false
+        default: all
+        type: choice
+        options: [all, gpt-oss-120b]
+
+concurrency:
+  # Keyed on ref so runs for different branches proceed in parallel; same ref
+  # still serializes, so a re-dispatch cannot race the previous run's scores.
+  group: tpu-accuracy-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  accuracy:
+    needs: build
+    strategy:
+      # A broken model must not cancel the others' scores.
+      fail-fast: false
+      matrix:
+        # matrix context is unavailable in job-level `if`, so selection shapes the
+        # matrix instead -- same trick as perf-test-tpu.yml. One model today; the
+        # next one adds a choice above and a branch here.
+        suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-accuracy-gpt-oss-120b"]'))
+                || fromJSON('["nightly-tpu-accuracy-gpt-oss-120b"]') }}
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      nightly: true
+      # gpt-oss-120b serves from the shared ROX disk at /weights.
+      weights_pvc: model-weights-rox
+      # est_time 2400 (GPQA at 8 repeats + MMLU at 2000 examples) plus bring-up.
+      timeout_per_file: 3600
+    permissions:
+      contents: read
+      id-token: write

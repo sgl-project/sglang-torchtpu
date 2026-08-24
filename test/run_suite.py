@@ -196,6 +196,8 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-qwen3-30b",
         "nightly-tpu-perf-gpt-oss-120b",
         "nightly-perf-tpu",
+        # One suite per accuracy model, for the same fan-out.
+        "nightly-tpu-accuracy-gpt-oss-120b",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",

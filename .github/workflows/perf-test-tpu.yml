@@ -1,5 +1,5 @@
-# TPU throughput sweeps -- test/manual/tpu/perf/test_tpu_perf.py via _tpu-test's
-# exec mode, ONE JOB PER MODEL so they take separate slices and run in parallel.
+# TPU throughput sweeps -- test/registered/tpu/nightly-perf/ via run_suite, ONE
+# JOB PER MODEL so they take separate slices and run in parallel.
 # A model that fails costs the others nothing, and each gets its own
 # --timeout-per-file rather than sharing one with every other model.
 # The same jobs run nightly (nightly-test-tpu.yml); this action is the isolated
