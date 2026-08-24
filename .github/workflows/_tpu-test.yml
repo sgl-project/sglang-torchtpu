@@ -133,6 +133,7 @@ jobs:
             --weights-pvc '${{ inputs.weights_pvc }}' \
             --timeout-per-file '${{ inputs.timeout_per_file }}' \
             --name '${{ inputs.run_name }}' \
+            --service-account '${{ vars.TPU_CI_POD_KSA }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head

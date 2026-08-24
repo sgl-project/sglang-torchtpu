@@ -405,6 +405,75 @@ Topology-Aware Scheduling instead.
 Qwen3-0.6B **OOMs at tp>1** on tpu7x (a bug: ~151G HLO temporaries > 94G HBM) — do not
 use it as a multi-host launch model. Multi-host tests use Qwen3-30B-A3B-FP8.
 
+## Dashboard — making a new test show up
+
+The nightly dashboard is generated **outside this repo** (`ci-monitor/src/tpu_ci.py`
+and `tpu_dashboard.py` in `radixark/keel`, reusing the same parsers as the upstream
+sglang CI dashboard). Nothing here renders it, and nothing here needs to change to add
+a test to it — its **only** input is the job log this repo already prints. What follows
+is the contract that log has to satisfy.
+
+**Correctness (overview + history tabs) is free.** Register the file the usual way and
+the parser picks it up from `run_suite.py`'s `Test Summary` / `TIMINGS` block, or from
+the multi-host loop's per-file records:
+
+```python
+register_tpu_ci(est_time=3000, suite="nightly-tpu-4-v7", nightly=True)
+```
+
+Only **scheduled** nightlies are ingested; a `workflow_dispatch` run is not a data point.
+
+**Accuracy and performance tabs are driven by `dump_metric` labels.** A metric lands in
+a tab because the test said so, never because the dashboard pattern-matched its name:
+
+```python
+from sglang.test.test_utils import dump_metric
+
+# -> accuracy tab
+dump_metric("mmlu_score", 0.82, labels={"model": MODEL, "eval": "simple-evals"})
+
+# -> performance tab
+dump_metric(f"{test_name}.{workload}.total_throughput", tok_s,
+            labels={"model": MODEL, "workload": workload, "c": concurrency})
+```
+
+Resolution order, highest first:
+
+| what the test passes | tab |
+|---|---|
+| `labels={"kind": "accuracy"}` or `{"kind": "performance"}` | that one, unconditionally |
+| `labels={"workload": ...}` | performance |
+| `labels={"eval": ...}` | accuracy |
+| none of the above | **neither** — the build prints a `warning: N metric(s) carry no kind` naming them |
+
+Use the explicit `kind` for anything that is not a throughput sweep or an eval score;
+the other two rows are just the shapes the existing emitters already happen to pass.
+`labels["model"]` is what keys a chart's series, so keep it stable — a model that is
+sometimes an HF id and sometimes a mount path becomes two unrelated trends.
+
+**Server / bench config panels come free** for a perf test that launches through
+`RecipeLauncher` and measures with `benchmark/tpu/bench_serving.sh`. The launcher
+prints its exact boot env, the script echoes the settings it resolved, and the
+dashboard reassembles both into the two collapsed commands under each chart. A test
+that boots a server by hand gets a chart with no reproduce commands.
+
+**Multi-host tests must let the job name its files.** `jobset-tpu.yaml` prints
+`== test files: ... ==` before the server boots. A job that dies during bring-up has
+no test to blame otherwise, and it would land on the dashboard as a row named after
+the job. Keep that line ahead of anything that can fail.
+
+Sanity-check a new test's log against the parser before waiting a night for it:
+
+```bash
+# from a keel checkout, against nightlies that already ran (needs repo read scope)
+export GITHUB_TOKEN=$(gh auth token)
+python3 ci-monitor/src/tpu_ci.py sync --limit 3 --db-dir /tmp/tpu-ci
+python3 ci-monitor/src/tpu_dashboard.py --db-dir /tmp/tpu-ci --out /tmp/tpu-ci.html
+```
+
+`sync` is idempotent — records are keyed by run, so re-running over the same window
+converges instead of duplicating.
+
 ## Local validation helpers
 
 Render + dry-run exactly as the workflow does (no live build needed):

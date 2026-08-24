@@ -11,7 +11,8 @@ Two modes:
 
 The SLICE (topology + pool) is looked up by host count in topology.yaml. Only the render
 vars are substituted; the container's own $spid / ${TPU_WORKER_ID} stay literal.
-${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT} expand to indented YAML blocks (empty when no PVC).
+${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT} expand to indented YAML blocks (empty when no PVC),
+as does ${SERVICE_ACCOUNT} (empty -> namespace default KSA).
 
 Also computes the CI poll budget for a suite (--print-wait-seconds): a static AST scan
 of the registered tree sums est_time over the suite's enabled tests -- no sglang import
@@ -79,6 +80,9 @@ WEIGHTS_MOUNT_TMPL = (
     "                      mountPath: /weights\n"
     "                      readOnly: true"
 )
+# serviceAccountName sits under `spec:` of the pod template, at 14 spaces. Empty unless
+# --service-account is given, so the pod keeps using the namespace default.
+SERVICE_ACCOUNT_TMPL = "              serviceAccountName: {sa}"
 
 
 def dns_safe(name):
@@ -157,6 +161,11 @@ def main():
     ap.add_argument("--pd-decode-hosts", type=int, default=0)
     ap.add_argument("--weights-pvc", default="")
     ap.add_argument("--timeout-per-file", type=int, default=3600)
+    ap.add_argument(
+        "--service-account",
+        default="",
+        help="KSA for the pod; Workload Identity uses it to read weights from GCS.",
+    )
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
@@ -310,12 +319,21 @@ def main():
         "QUEUE": sl["queue"],
         "RUN_NAME": run_name,
         "SUITE": suite,
-        "NIGHTLY_FLAG": "--nightly" if a.nightly else "",
+        # --continue-on-error only on the nightly, matching the CUDA nightly: a
+        # scheduled run should report every file's verdict, where the PR gate still
+        # fast-fails to give the slice back. Without it the suite stops at the first
+        # failure and the files behind it never report at all.
+        "NIGHTLY_FLAG": "--nightly --continue-on-error" if a.nightly else "",
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
         "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
         "TIMEOUT_PER_FILE": str(a.timeout_per_file),
+        "SERVICE_ACCOUNT": (
+            SERVICE_ACCOUNT_TMPL.format(sa=a.service_account)
+            if a.service_account
+            else ""
+        ),
     }
 
     tpl = open(f"{a.dir}/jobset-tpu.yaml").read()

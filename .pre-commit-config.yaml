@@ -15,9 +15,10 @@ repos:
         # only after substitution, so they don't parse as standalone YAML:
         #   * Helm chart templates -- Go template syntax ({{- ... -}}); validated
         #     by `helm template` / `helm lint`.
-        #   * .github/tpu-ci/jobset-tpu*.yaml -- ${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT}
-        #     block placeholders substituted by render_jobset.py; validated when
-        #     `kubectl create` applies the rendered JobSet.
+        #   * .github/tpu-ci/jobset-tpu*.yaml -- ${WEIGHTS_VOLUME}/${WEIGHTS_MOUNT}/
+        #     ${SERVICE_ACCOUNT} block placeholders substituted by render_jobset.py;
+        #     validated when `kubectl create` applies the rendered JobSet. An editor that
+        #     does not honour this exclude will flag the first column-0 placeholder.
         exclude: ^(experimental/sgl-router/helm/.*/templates/.*\.(yaml|tpl)|\.github/tpu-ci/jobset-tpu(-pd)?\.yaml)$
       - id: check-toml
       - id: check-ast
