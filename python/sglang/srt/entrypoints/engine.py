@@ -1294,8 +1294,16 @@ class Engine(EngineScoreMixin, EngineBase):
         self.shutdown()
         return False
 
-    def flush_cache(self):
-        return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+    def flush_cache(self, timeout_s: Optional[float] = None):
+        """Flush every scheduler's cache.
+
+        A positive timeout lets busy schedulers defer the flush until they are
+        idle. The default preserves the existing immediate, best-effort
+        behavior.
+        """
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.flush_cache(timeout_s=timeout_s)
+        )
 
     def open_session(
         self,

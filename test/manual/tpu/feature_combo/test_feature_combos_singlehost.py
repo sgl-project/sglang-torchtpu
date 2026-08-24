@@ -270,8 +270,12 @@ class TestFeatureCombo(unittest.TestCase):
         if getattr(cls, "engine", None) is not None:
             cls.engine.shutdown()
 
+    def _flush_cache(self):
+        result = self.engine.flush_cache(timeout_s=60.0)
+        self.assertTrue(result.success, result.message)
+
     def setUp(self):
-        self.engine.flush_cache()
+        self._flush_cache()
 
     # ---- helpers ----
     def _gen(self, prompt, max_new=MAX_NEW, *, routed_dp_rank=None):
@@ -370,7 +374,7 @@ class TestFeatureCombo(unittest.TestCase):
 
     def test_4_flush_then_repopulate(self):
         self._gen(COUNT_LONG)
-        self.engine.flush_cache()
+        self._flush_cache()
         self._prime_all_ranks(COUNT_LONG)
         _, c2, _, _ = self._gen(COUNT_LONG)
         self.assertGreaterEqual(c2, MIN_CACHED_TOKENS)

@@ -298,12 +298,13 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        result = (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
-        )[0]
-        if result.success and self.mm_processor is not None:
+        results = await self.flush_cache_communicator(
+            FlushCacheReqInput(timeout_s=timeout_s)
+        )
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        if all_success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
-        return result
+        return FlushCacheReqOutput(success=all_success, message=all_message)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
