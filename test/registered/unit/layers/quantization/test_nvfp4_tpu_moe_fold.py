@@ -663,6 +663,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
 
     def test_fused_rs_selects_expected_activation_mode_by_group_size(self):
         import jax.numpy as jnp
+
         from sglang.srt.layers.moe.pallas.fused_rs.gmm_v2_gather_scatter import (
             get_maybe_quantize_lhs,
         )
