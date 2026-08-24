@@ -28,6 +28,26 @@ LAUNCH_ENV = {
     "TPU_COMPILE_BS": "1 2 4 16",
     "MAX_TOTAL_TOKENS": "8192",
     "ENABLE_PROFILER_ENDPOINT": "0",
+    # TODO(tpu): remove once the TPU distributed top-k path is precompiled for
+    # the same token buckets as the decoder. Today it is not, and the mismatch
+    # kills the run outright: TPU_COMPILE_TOKENS above asks for 512/2048/4096 and
+    # the decoder policy honours it, but logits_processor's
+    # get_tpu_distributed_top_k_for_batch guards on its own shapes and has only
+    # seen 512 and 4096. The first real request at 2048 tokens trips
+    #
+    #   RuntimeError: Detected recompile when torch.compile stance is
+    #   'fail_on_recompile' ... size mismatch at index 0. expected 4096, actual 2048
+    #
+    # which raises inside run_batch, takes every TP rank's scheduler down, and
+    # leaves the eval retrying against a dead server -- gsm8k scores 0.0 with no
+    # hint that the cause was a compile guard. Observed on run 32692936982.
+    #
+    # This flag is the escape hatch scheduler._maybe_arm_fail_on_recompile already
+    # provides for speculative decoding: recompile instead of dying. It costs tens
+    # of seconds on the first unseen shape (est_time has room) and it does NOT
+    # hide the bug -- the recompile is still logged, and the real fix is to make
+    # the top-k path cover the decoder's buckets.
+    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "
