@@ -97,7 +97,19 @@ LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",
     "EXTRA_ARGS": f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}",
     "KV_CACHE_DTYPE": "",
-    "MAX_TOTAL_TOKENS": "",
+    # Was "" so server.sh's `${MAX_TOTAL_TOKENS-...}` passed through empty and let
+    # sglang size the pool from mem_fraction. That was written for bf16 KV, where
+    # the recipe's formula would have claimed most of the budget. The KV cache is
+    # fp8_e4m3 now (see the pool log), so the same mem_fraction buys ~25x more
+    # tokens than the run can use: 13,183,232 tokens / 113 GB of pool, leaving the
+    # XLA compile with 142.23 G of HLO temporaries against 94.74 G of HBM. The
+    # server is SIGKILLed 92s in, so the gate reports neither gpqa nor mmlu.
+    #
+    # 2 * CONCUR * CONTEXT_LEN is the recipe's own formula and covers every
+    # resident prefix at this shape (32 x 16384 in flight). Capping the pool
+    # changes capacity, not arithmetic -- no request is truncated or rejected at
+    # this concurrency, so the scores are unaffected.
+    "MAX_TOTAL_TOKENS": str(2 * 32 * 16384),
     "PAGE_SIZE": "128",
     "DISABLE_RADIX_CACHE": "1",
     "MEM_FRACTION_STATIC": "0.60",
