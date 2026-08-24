@@ -28,7 +28,6 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
     Eagle3CompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
-from sglang.srt.hardware_backend.tpu.sampler import distributed_top_k_for_batch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -150,9 +149,8 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
 
-    def test_specialization_uses_the_models_final_top_k_capability(self):
+    def test_specialization_key_uses_normalized_candidate_width(self):
         model_runner = _model_runner()
-        model_runner.server_args.sampling_backend = "tpu"
         selector = MagicMock(return_value=None)
         model_runner.model.logits_processor = SimpleNamespace(
             get_tpu_distributed_top_k_for_batch=selector
@@ -171,7 +169,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             torch.arange(64),
             forward_batch,
         )
-        selector.return_value = 50
+        selector.return_value = 64
         candidate_key = policy._direct_compile_specialization_key(
             None,
             torch.arange(64),
@@ -180,37 +178,59 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
 
         self.assertIsNone(fallback_key[-1])
-        self.assertEqual(candidate_key[-1], 50)
-        selector.assert_called_with(forward_batch, model_runner.model.lm_head)
+        self.assertEqual(candidate_key[-1], 64)
+        self.assertEqual(fallback_key[:-1], candidate_key[:-1])
 
-    def test_warmup_at_default_cutoff_selects_candidate_specialization(self):
+    def test_warmup_covers_both_logits_modes_at_the_default_cutoff(self):
         model_runner = _model_runner()
-        model_runner.server_args.sampling_backend = "tpu"
-        selector = MagicMock(
-            side_effect=lambda batch, _lm_head: distributed_top_k_for_batch(
-                batch, sampling_backend="tpu"
-            )
-        )
         model_runner.model.logits_processor = SimpleNamespace(
-            get_tpu_distributed_top_k_for_batch=selector
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
         )
-        model_runner.model.lm_head = object()
+        model_runner.model.lm_head = SimpleNamespace(
+            enable_tp=True,
+            num_embeddings=202_048,
+            num_embeddings_per_partition=202_048 // 16,
+            shard_indices=object(),
+        )
         policy = _make_policy(model_runner, bs_buckets=(1, 64))
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.sampler."
+            "distributed_top_k_min_batch_size",
+            return_value=64,
+        ):
+            self.assertEqual(policy._sampling_warmup_variants(1), ("full_vocab",))
+            self.assertEqual(
+                policy._sampling_warmup_variants(64),
+                ("candidates", "full_vocab"),
+            )
+
+    def test_mode_selection_uses_the_padded_physical_batch(self):
+        model_runner = _model_runner()
+        model_runner.model.logits_processor = SimpleNamespace(
+            use_tpu_distributed_top_k=True,
+            do_tensor_parallel_all_gather=True,
+            do_tensor_parallel_all_gather_dp_attn=False,
+        )
+        model_runner.model.lm_head = SimpleNamespace(
+            enable_tp=True,
+            num_embeddings=202_048,
+            num_embeddings_per_partition=202_048 // 16,
+            shard_indices=object(),
+        )
+        policy = _make_policy(model_runner, token_buckets=(64,), bs_buckets=(64,))
         forward_batch = policy._make_dummy_forward_batch(
-            num_tokens=64,
-            bs=64,
-            mode=ForwardMode.DECODE,
+            num_tokens=1, bs=1, mode=ForwardMode.DECODE
         )
 
-        key = policy._direct_compile_specialization_key(
-            None,
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-        )
+        policy.prepare_forward_batch(forward_batch)
 
-        self.assertEqual(key[-1], 50)
-        selector.assert_called_once_with(forward_batch, model_runner.model.lm_head)
+        self.assertEqual(forward_batch._tpu_real_b, 1)
+        self.assertEqual(forward_batch.batch_size, 64)
+        self.assertEqual(forward_batch.sampling_info.uniform_top_k, 64)
+        self.assertEqual(forward_batch.sampling_info.top_ks[0].item(), 50)
 
 
 class TestDecoderOutputUnpadding(CustomTestCase):

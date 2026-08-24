@@ -22,6 +22,36 @@ _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
 )
 
 
+def distributed_top_k_min_batch_size() -> int:
+    return _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+
+
+def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int]:
+    """Return the fixed candidate width supported by a TPU model layout."""
+
+    if (
+        not getattr(logits_processor, "use_tpu_distributed_top_k", False)
+        or not getattr(logits_processor, "do_tensor_parallel_all_gather", False)
+        or getattr(logits_processor, "do_tensor_parallel_all_gather_dp_attn", False)
+    ):
+        return None
+
+    from sglang.srt.hardware_backend.tpu.top_k import (
+        supports_distributed_tpu_top_k,
+    )
+
+    candidate_width = min(
+        MAX_DISTRIBUTED_TOP_K,
+        int(getattr(lm_head, "num_embeddings", 0)),
+        int(getattr(lm_head, "num_embeddings_per_partition", 0)),
+    )
+    if candidate_width <= 1 or not supports_distributed_tpu_top_k(
+        lm_head, candidate_width
+    ):
+        return None
+    return candidate_width
+
+
 def distributed_top_k_for_batch(
     forward_batch,
     *,
@@ -43,11 +73,9 @@ def distributed_top_k_for_batch(
         return None
     if getattr(forward_batch, "sampling_info", None) is None:
         return None
-    batch_size = getattr(
-        forward_batch,
-        "_tpu_real_b",
-        getattr(forward_batch, "batch_size", 0),
-    )
+    # Mode selection happens after TPU padding, so use the physical batch size.
+    # The logical size must not become a compile-time guard.
+    batch_size = getattr(forward_batch, "batch_size", 0)
     if (
         getattr(forward_batch, "return_logprob", False)
         or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
@@ -90,10 +118,20 @@ def distributed_top_k_for_batch(
 def sample_from_global_top_k_logits(
     global_top_k_logits: torch.Tensor,
     temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Normalize temperature-scaled global TopK logits and sample a position.
     Returned positions index global TopK token IDs, not the full vocabulary."""
 
+    if top_ks is not None:
+        positions = torch.arange(
+            global_top_k_logits.shape[-1],
+            dtype=top_ks.dtype,
+            device=global_top_k_logits.device,
+        )
+        global_top_k_logits = global_top_k_logits.masked_fill(
+            positions.unsqueeze(0) >= top_ks.unsqueeze(1), -torch.inf
+        )
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
     return sampling_from_probs_torch(global_top_k_probs)
 
@@ -130,6 +168,7 @@ class TpuSampler(Sampler):
         sampled_top_k_position = sample_from_global_top_k_logits(
             logits_output.next_token_global_top_k_logits,
             sampling_info.temperatures,
+            sampling_info.top_ks,
         )
         batch_next_token_ids = torch.gather(
             logits_output.next_token_global_top_k_token_ids,
