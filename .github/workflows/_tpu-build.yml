@@ -20,7 +20,7 @@ permissions:
 env:
   GCP_PROJECT: sglang-torchtpu
   AR_IMAGE: us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu
-  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
   CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
 
 jobs:
@@ -47,6 +47,12 @@ jobs:
           # Tag the image with the ref we actually checked out and built (inputs.ref),
           # not the workflow's github.sha (the caller's commit, which can differ).
           INPUT_REF: ${{ inputs.ref }}
+          # Both actors, passed via env rather than inline interpolation so neither
+          # can be shell-interpreted. They differ on a re-run: triggering_actor is
+          # whoever pressed re-run, actor stays the original initiator (and is the
+          # identity whose privileges -- and OIDC claims -- the re-run uses).
+          TRIGGER_ACTOR: ${{ github.triggering_actor }}
+          ORIGIN_ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           tokfile="${RUNNER_TEMP}/tpu-ci.token"
@@ -54,7 +60,22 @@ jobs:
           trap 'rm -f "$tokfile"' EXIT
           # Docker tags allow only [A-Za-z0-9_.-], so slugify the ref before using it.
           safe_ref="$(printf '%s' "$INPUT_REF" | tr -c 'A-Za-z0-9_.-' '-')"
-          tag="$(date -u +%Y%m%d)-${safe_ref:0:12}-${{ github.run_id }}"
+          # The actor belongs in the tag because it is the only place the triggering
+          # human reaches Cloud Audit Logs: everything downstream runs as tpu-ci@, so
+          # the CreateBuild entry (Admin Activity, 400-day locked retention) otherwise
+          # names only the service account. This also threads the actor into the image
+          # tag itself, so a running pod's image traces back to a person.
+          # Each re-run produces its own build, so the tag names whoever caused THIS
+          # build (triggering_actor). When a re-run was started by someone other than
+          # the original initiator, both are recorded as "<trigger>-rr-<origin>" --
+          # they answer different questions and an audit needs both.
+          safe_trigger="$(printf '%s' "$TRIGGER_ACTOR" | tr -c 'A-Za-z0-9_.-' '-')"
+          safe_origin="$(printf '%s' "$ORIGIN_ACTOR" | tr -c 'A-Za-z0-9_.-' '-')"
+          who="${safe_trigger:0:20}"
+          if [ "$safe_trigger" != "$safe_origin" ]; then
+            who="${safe_trigger:0:20}-rr-${safe_origin:0:20}"
+          fi
+          tag="$(date -u +%Y%m%d)-${who}-${safe_ref:0:12}-${{ github.run_id }}"
           bucket="${GCP_PROJECT}_cloudbuild"
           object="source/${tag}.tgz"
           # `gcloud builds submit` runs a client-side staging/service-usage pre-flight

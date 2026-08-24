@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Numerical TP8/EP8 test for the compiled FP8 fused-RS Pallas kernel."""
 
+import argparse
 import os
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -73,6 +74,11 @@ def _reference(
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--layers", type=int, default=1)
+    parser.add_argument("--skewed-routing", action="store_true")
+    args = parser.parse_args()
+
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -92,6 +98,9 @@ def main():
     fp8_direct_write = (
         os.environ.get("SGLANG_TPU_FUSED_RS_TEST_FP8_DIRECT_WRITE", "0") == "1"
     )
+    layers = args.layers
+    skewed_routing = args.skewed_routing
+    assert layers >= 1
     tokens = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOKENS", "64"))
     topk = int(os.environ.get("SGLANG_TPU_FUSED_RS_TEST_TOPK", "2"))
     hidden_size = intermediate_size = 1024 if test_blockwise else 256
@@ -116,21 +125,33 @@ def main():
         w1_dequantized = w1_quantized.float() * w1_scale.float()[:, None, :]
         w2_dequantized = w2_quantized.float() * w2_scale.float()[:, None, :]
 
-    token_ids = torch.arange(tokens, dtype=torch.int32)[:, None]
-    slots = torch.arange(topk, dtype=torch.int32)[None, :]
-    topk_ids = (token_ids + slots) % world_size
+    if skewed_routing:
+        routed_rows = tokens * topk
+        heavy_rows = int(routed_rows * 0.9)
+        flattened_ids = torch.empty(routed_rows, dtype=torch.int32)
+        flattened_ids[:heavy_rows] = 0
+        flattened_ids[heavy_rows:] = 1 + (
+            torch.arange(routed_rows - heavy_rows, dtype=torch.int32) % (world_size - 1)
+        )
+        topk_ids = flattened_ids.reshape(tokens, topk)
+    else:
+        token_ids = torch.arange(tokens, dtype=torch.int32)[:, None]
+        slots = torch.arange(topk, dtype=torch.int32)[None, :]
+        topk_ids = (token_ids + slots) % world_size
     topk_weights = torch.full((tokens, topk), 1 / topk, dtype=torch.bfloat16)
     post_expert_norm_weight = torch.linspace(
         -0.2, 0.2, hidden_size, dtype=torch.bfloat16
     )
-    expected = _reference(
-        hidden_states,
-        w1_dequantized,
-        w2_dequantized,
-        topk_weights,
-        topk_ids,
-        post_expert_norm_weight if test_post_expert_norm else None,
-    )
+    expected = None
+    if layers == 1:
+        expected = _reference(
+            hidden_states,
+            w1_dequantized,
+            w2_dequantized,
+            topk_weights,
+            topk_ids,
+            post_expert_norm_weight if test_post_expert_norm else None,
+        )
 
     device = torch.device("tpu")
     physical_id = tpu_distributed.global_device_id()
@@ -160,21 +181,29 @@ def main():
         valid = ids >= 0
         ids = torch.where(valid, ids, torch.zeros_like(ids))
         weights = weights * valid.to(weights.dtype)
-        return fused_moe_rs_call(
-            hidden_states=x,
-            w1=w1,
-            w2=w2,
-            w1_scale=s1,
-            w2_scale=s2,
-            topk_weights=weights,
-            topk_ids=ids,
-            post_expert_norm_weight=norm_weight,
-            group_offset=group_offset,
-            topk=topk,
-            activation="silu",
-            has_post_expert_norm=test_post_expert_norm,
-            fp8_direct_write=fp8_direct_write,
-        )
+        outputs = []
+        for layer in range(layers):
+            # Make every invocation data-distinct so compiler CSE cannot fold
+            # the stacked calls into one Pallas kernel execution.
+            layer_input = x + layer * 0.001
+            outputs.append(
+                fused_moe_rs_call(
+                    hidden_states=layer_input,
+                    w1=w1,
+                    w2=w2,
+                    w1_scale=s1,
+                    w2_scale=s2,
+                    topk_weights=weights,
+                    topk_ids=ids,
+                    post_expert_norm_weight=norm_weight,
+                    group_offset=group_offset,
+                    topk=topk,
+                    activation="silu",
+                    has_post_expert_norm=test_post_expert_norm,
+                    fp8_direct_write=fp8_direct_write,
+                )
+            )
+        return outputs[0] if layers == 1 else tuple(outputs)
 
     compiled = torch.compile(kernel, fullgraph=True, dynamic=False)
     w1_scale_local = w1_scale[local_expert : local_expert + 1]
@@ -192,32 +221,43 @@ def main():
         kernel_topk_ids.to(device),
         torch.tensor([local_expert, physical_id], dtype=torch.int32, device=device),
     )
-    actual = compiled(
+    actual_outputs = compiled(
         *kernel_args,
         (
             post_expert_norm_weight.to(device)
             if test_post_expert_norm
             else torch.zeros(1, dtype=torch.bfloat16, device=device)
         ),
-    ).cpu()
+    )
+    if layers == 1:
+        actual_outputs = (actual_outputs,)
+
+    assert len(actual_outputs) == layers
 
     padded_tokens = fused_moe_rs_padded_tokens(tokens, topk, world_size)
-    if padded_tokens != tokens:
+    if expected is not None and padded_tokens != tokens:
         expected = torch.nn.functional.pad(expected, (0, 0, 0, padded_tokens - tokens))
     shard_size = padded_tokens // world_size
     shard = slice(physical_id * shard_size, (physical_id + 1) * shard_size)
-    torch.testing.assert_close(
-        actual,
-        expected[shard],
-        rtol=0.10 if test_post_expert_norm else 0.08,
-        atol=0.15 if test_post_expert_norm else 0.03,
-    )
+    for layer, actual in enumerate(actual_outputs):
+        actual = actual.cpu()
+        if layers == 1:
+            assert expected is not None
+            torch.testing.assert_close(
+                actual,
+                expected[shard],
+                rtol=0.10 if test_post_expert_norm else 0.08,
+                atol=0.15 if test_post_expert_norm else 0.03,
+            )
+        else:
+            assert actual.shape == (shard_size, hidden_size), layer
     print(
         f"FP8_FUSED_RS_KERNEL_PASS rank={rank} physical_id={physical_id} "
         f"shape={tuple(actual.shape)} post_norm={test_post_expert_norm} "
         f"blockwise={test_blockwise} divergent_ids={test_divergent_ids} "
         f"divergent_weights={test_divergent_weights} "
-        f"fp8_direct_write={fp8_direct_write}"
+        f"fp8_direct_write={fp8_direct_write} layers={layers} "
+        f"skewed_routing={skewed_routing}"
     )
     dist.destroy_process_group()
 

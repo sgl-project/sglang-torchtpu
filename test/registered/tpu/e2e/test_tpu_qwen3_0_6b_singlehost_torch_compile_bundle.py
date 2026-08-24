@@ -20,7 +20,7 @@ register_tpu_ci(est_time=180, suite="stage-b-test-tpu-4-v7")
 MODEL = "Qwen/Qwen3-0.6B"
 
 
-class TestTorchCompileBundle(CustomTestCase):
+class TestTpuQwen306bSinglehostTorchCompileBundle(CustomTestCase):
     def test_save_then_load(self):
         common_args = [
             "--dtype",

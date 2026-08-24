@@ -70,7 +70,7 @@ class TestDistributedTopKSampling(CustomTestCase):
     A subprocess owns the complete distributed runtime for test isolation."""
 
     def test_tp8_exactness_and_speed_regression(self):
-        repo_root = Path(__file__).resolve().parents[3]
+        repo_root = Path(__file__).resolve().parents[4]
         worker = Path(__file__).resolve()
         wrapper_module = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
         python = shlex.quote(sys.executable)

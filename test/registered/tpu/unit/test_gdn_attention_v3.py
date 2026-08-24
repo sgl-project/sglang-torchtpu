@@ -26,7 +26,7 @@ otherwise. They do **not** depend on torch_tpu or the SGLang server runtime.
 Adapted from torchtpu-vllm ``tests/kernels/test_gdn_attention_v3.py``.
 
 Usage:
-    python test/registered/tpu/test_gdn_attention_v3.py
+    python test/registered/tpu/unit/test_gdn_attention_v3.py
 """
 
 from __future__ import annotations

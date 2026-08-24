@@ -21,11 +21,13 @@ register_tpu_ci(
     disabled="TPU PR runners are not provisioned yet",
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 TPU_BENCH_DIR = REPO_ROOT / "benchmark" / "tpu"
 
 
-class TestTPUEvalAccuracyLarge(CustomTestCase, MMLUMixin, HumanEvalMixin, MGSMEnMixin):
+class TestTpuQwen306bSinglehostEvalAccuracyLarge(
+    CustomTestCase, MMLUMixin, HumanEvalMixin, MGSMEnMixin
+):
     model = os.environ.get("MODEL", DEFAULT_MODEL_NAME_FOR_TEST)
     base_url = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
     health_timeout = int(os.environ.get("HEALTH_TIMEOUT", "1800"))

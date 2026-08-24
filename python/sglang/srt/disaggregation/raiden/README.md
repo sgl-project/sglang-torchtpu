@@ -75,6 +75,8 @@ reuse, `dst_tp > src_tp`.
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
 
+A decode rank issues at most one pull per host staging slot; requests past that stay in the transfer queue and are retried as slots free, so the batch size does not have to fit the slot count.
+
 ## Launch (one host each, equal TP)
 
 ```bash

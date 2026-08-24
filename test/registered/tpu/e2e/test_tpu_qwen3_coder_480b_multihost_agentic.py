@@ -42,7 +42,7 @@ MULTIHOST_LAUNCH = {
     "weights_pvc": "model-weights-rox",
 }
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))
 RECIPE_DIR = os.path.join(
     REPO_ROOT, "benchmark", "tpu", "recipe", "qwen3_coder_480b", "nightly"
 )
@@ -122,7 +122,7 @@ def _achievable_prefix_hit_rate(config):
     os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
     "multi-host live-server not provided (the JobSet launches the server)",
 )
-class TestTpuQwen3Coder480BAgentic(CustomTestCase):
+class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
     """Agentic sweep against the 2-host tp=16 dp=4 Qwen3-Coder-480B server."""
 
     base_url = BASE_URL

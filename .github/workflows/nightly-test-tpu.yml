@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo]
+        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo, perf]
 
 concurrency:
   group: tpu-slice-nightly
@@ -113,6 +113,31 @@ jobs:
             || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
       weights_pvc: model-weights-rox
       run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Throughput sweeps, one job per model so they take separate slices and run in
+  # parallel -- same exec-mode shape as the combo layers above. Also dispatchable
+  # on its own (perf-test-tpu.yml) to collect a datapoint without a full nightly.
+  perf:
+    needs: build
+    if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [nightly-tpu-perf-qwen3-30b, nightly-tpu-perf-gpt-oss-120b]
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      nightly: true
+      weights_pvc: model-weights-rox
+      timeout_per_file: 1800
     permissions:
       contents: read
       id-token: write

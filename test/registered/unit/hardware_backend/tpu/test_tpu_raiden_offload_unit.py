@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVSender,
     get_raiden_kv_caches,
 )
+from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -249,6 +250,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
+        mgr._pulling = SlotAdmission(1)
+        mgr._engine_max_blocks = 2
         mgr._local_blocks = {room: [8, 9]}
         mgr._local_swa_blocks = {room: [7]}
         mgr._remote_blocks = {room: [1, 2, 3]}
@@ -262,6 +265,34 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
         mgr._swa_engine.start_read.assert_called_once_with(
             mgr._swa_req_id(room), room, "127.0.0.1:31022", [5], [7]
+        )
+
+    def test_decode_defers_pull_until_a_staging_slot_frees(self):
+        first, second = 29, 30
+        mgr = object.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._engine = Mock()
+        mgr._swa_engine = None
+        mgr._pulling = SlotAdmission(1)
+        mgr._engine_max_blocks = 4
+        mgr._completed_recv = set()
+        mgr._failed = set()
+        mgr._local_blocks = {first: [8], second: [9]}
+        mgr._local_swa_blocks = {}
+        mgr._remote_blocks = {first: [1], second: [2]}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_endpoint = {r: "127.0.0.1:31020" for r in (first, second)}
+        mgr._remote_swa_endpoint = {}
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        self.assertFalse(mgr.maybe_start_pull(second))
+        self.assertEqual(mgr._engine.start_read.call_count, 1)
+
+        mgr._completed_recv.add(str(first))
+        mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(second))
+        mgr._engine.start_read.assert_called_with(
+            str(second), second, "127.0.0.1:31020", [2], [9]
         )
 
     def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):

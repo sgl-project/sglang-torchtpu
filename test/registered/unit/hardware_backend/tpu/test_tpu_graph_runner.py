@@ -297,7 +297,8 @@ class TestTpuGraphRunner(CustomTestCase):
     def test_augment_spec_policy_noop_without_spec(self):
         # No speculative decoding -> plain (unmixed) policy.
         no_spec = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.NONE, server_args=SimpleNamespace()
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            server_args=SimpleNamespace(),
         )
         self.assertIs(
             _augment_spec_policy(DecoderTpuCompilePolicy, no_spec),
@@ -320,22 +321,16 @@ class TestTpuGraphRunner(CustomTestCase):
             _augment_spec_policy(_ExplicitSpecPolicy, mr), _ExplicitSpecPolicy
         )
 
-    def test_augment_spec_policy_is_algorithm_agnostic(self):
-        # Any spec run gets the spec mixin regardless of algorithm; the mixin
-        # enforces the supported algorithm at construction (non-EAGLE3 raises,
-        # covered in test_decoder_tpu_compile_policy), rather than silently
-        # falling back to a non-spec policy here.
+    def test_augment_spec_policy_noop_for_other_algorithm(self):
         ngram = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.NGRAM,
             server_args=SimpleNamespace(
                 speculative_num_steps=3, speculative_algorithm="NGRAM"
             ),
         )
-        self.assertTrue(
-            issubclass(
-                _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
-                Eagle3CompilePolicyMixin,
-            )
+        self.assertIs(
+            _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
+            DecoderTpuCompilePolicy,
         )
 
     def test_precompile_called_for_installed_policy(self):

@@ -20,7 +20,7 @@ EAGLE3_MODEL = "Qwen/Qwen3-1.7B"
 EAGLE3_DRAFT_MODEL = "AngelSlim/Qwen3-1.7B_eagle3"
 
 
-class TestTpuCompileTracer(CustomTestCase):
+class TestTpuQwen306bSinglehostCompileTracer(CustomTestCase):
     def _run_server(
         self,
         tracer,

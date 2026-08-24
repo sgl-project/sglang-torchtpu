@@ -467,9 +467,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         fn = torch.no_grad()(fn)
         model = self.model_runner.model
-        ignored_spec_inputs = (
-            () if self.model_runner.is_draft_worker else ("forward_batch.spec_info",)
-        )
 
         def trace_forward(
             attention_metadata: Any,
@@ -500,7 +497,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 # Pallas consumes these host mirrors before the compiled model.
                 "forward_batch.req_pool_indices_cpu",
                 "forward_batch.seq_lens_cpu",
-                *ignored_spec_inputs,
+                *self._extra_ignored_argnames(),
             ),
         )
 
@@ -514,6 +511,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def _extra_ignored_argnames(self) -> tuple[str, ...]:
+        if self.model_runner.is_draft_worker:
+            return ()
+        return ("forward_batch.spec_info",)
 
     def get_model_extra_tensor_attrs(self) -> tuple[str, ...]:
         """Returns paths to non-param non-buffer Tensor attrs on the model.

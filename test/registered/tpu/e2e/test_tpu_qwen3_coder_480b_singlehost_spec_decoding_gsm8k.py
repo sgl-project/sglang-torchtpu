@@ -18,10 +18,9 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 GSM8K_ACCURACY = 0.65
 
 LAUNCH_ENV = {
-    "MODEL": "/weights/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+    "MODEL": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
     "DRAFT_MODEL": (
-        "/weights/lmsys/"
-        "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI"
+        "/weights/" "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI"
     ),
     "ISL": "4096",
     "OSL": "512",
@@ -37,7 +36,7 @@ LAUNCH_ENV = {
         f"--served-model-name {SERVED_MODEL_NAME} "
         "--speculative-algorithm EAGLE3 "
         "--speculative-draft-model-path "
-        "/weights/lmsys/"
+        "/weights/"
         "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI "
         "--speculative-num-steps 3 "
         "--speculative-eagle-topk 1 "

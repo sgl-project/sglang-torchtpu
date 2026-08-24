@@ -4,6 +4,8 @@ set -uo pipefail
 
 export ISL=${ISL:-8192}
 export OSL=${OSL:-1024}
+# Workload name shown in the dashboard's Workload dropdown for this test's shape.
+export WORKLOAD=${WORKLOAD:-8k1k}
 CONCUR=${CONCUR:-64}
 # 10 prompts per concurrency slot, matching the InferenceX benchmark client.
 export NUM_PROMPTS=${NUM_PROMPTS:-$((CONCUR * 10))}

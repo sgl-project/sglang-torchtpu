@@ -1,10 +1,6 @@
-"""Integration test for TPU eager-mode inference.
+"""Smoke test for single-host TPU serving.
 
-Requires TPU hardware and torch_tpu. Launches a server with Qwen3-0.6B
-on a single TPU chip and verifies basic inference works.
-
-Usage:
-    SGLANG_PLATFORM=tpu python test/registered/tpu/test_tpu_basic_inference.py
+Launches a server with Qwen3-0.6B on a single TPU chip and verifies basic inference.
 """
 
 import os
@@ -21,8 +17,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Runs on the TPU PR gate (single-host 4-chip / "4-v7").
 register_tpu_ci(est_time=300, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(est_time=300, suite="nightly-tpu-4-v7", nightly=True)
 
 MODEL = "Qwen/Qwen3-0.6B"
 
@@ -39,7 +35,7 @@ def _skip_if_no_tpu():
 
 
 @unittest.skipIf(_skip_if_no_tpu(), "torch_tpu not available")
-class TestTpuBasicInference(CustomTestCase):
+class TestTpuQwen306bSinglehostSmoke(CustomTestCase):
     """Launch a TPU server and verify completions + chat endpoints."""
 
     @classmethod

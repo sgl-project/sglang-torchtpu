@@ -47,16 +47,14 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-def _spec_enabled(model_runner: ModelRunner) -> bool:
-    """Whether speculative decoding is active for this runner."""
-    return not model_runner.spec_algorithm.is_none()
+def _eagle3_enabled(model_runner: ModelRunner) -> bool:
+    """Whether this runner uses the in-tree EAGLE3 implementation."""
+    return model_runner.spec_algorithm.is_eagle3()
 
 
 def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
-    """Compose spec-decode compile behavior over ``policy_cls`` when spec decoding
-    is active.
-    """
-    if not _spec_enabled(model_runner) or not issubclass(
+    """Compose EAGLE3 compile behavior over a decoder policy."""
+    if not _eagle3_enabled(model_runner) or not issubclass(
         policy_cls, DecoderCompilePolicy
     ):
         return policy_cls
@@ -211,10 +209,9 @@ class TpuGraphRunner:
                     f"method {method_name!r}, but the module has no such method."
                 )
 
-            # Compose the default spec behavior over the model's own policy when
-            # spec decoding is active and the policy doesn't already implement spec.
+            # Compose EAGLE3 behavior over the model's own decoder policy.
             if (
-                _spec_enabled(model_runner)
+                _eagle3_enabled(model_runner)
                 and issubclass(policy_cls, DecoderCompilePolicy)
                 and not issubclass(policy_cls, SpecDecodeCompilePolicyMixin)
             ):

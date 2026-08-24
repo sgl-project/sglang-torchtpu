@@ -5,7 +5,7 @@ attaches to it and scores one gate:
 
   GSM8K  0.930  run_eval, 100 questions, single pass
 
-Mirrors test_tpu_deepseek_r1_0528_multihost.py. GSM8K is a text gate: it proves
+Mirrors test_tpu_deepseek_r1_0528_multihost_gsm8k.py. GSM8K is a text gate: it proves
 the 2-host TP16 serve, the int4 MoE path and decode are sane, and it is cheap
 enough for a nightly. It does NOT touch MoonViT -- a vision gate (MMMU-Pro) is
 the follow-up once the vision path is merged and its cost is known.
