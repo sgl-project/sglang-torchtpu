@@ -469,6 +469,10 @@ def bench_serving_runner(
                     f"{label}: {record.get('completed')} of {expected} requests "
                     "completed; the rest errored, so its throughput is not comparable"
                 )
+                # And for the same reason it must not be published: a partial
+                # point charted next to complete ones poisons the trend (the
+                # 2026-08-24 gsm8k 0.0 was exactly this shape of bug).
+                continue
             total = record.get("total_throughput")
             if not total or total <= 0:
                 failures.append(f"{label}: total_throughput is {total}")

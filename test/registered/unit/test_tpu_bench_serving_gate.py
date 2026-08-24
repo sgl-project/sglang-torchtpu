@@ -135,6 +135,19 @@ class TestGate(CustomTestCase):
         self.assertFalse(result["_passed"])
         self.assertIn("159 of 160", " ".join(result["_failures"]))
 
+    def test_dropped_requests_do_not_publish(self):
+        """Bug regression (2026-08-24 gsm8k 0.0): the incomplete branch recorded
+        its failure, then fell through and dumped the point anyway -- putting a
+        number from a half-dead server on the chart, indistinguishable from a
+        measured one. An incomplete point must dump NO [METRIC] lines."""
+        dumped = []
+        with patch.object(
+            eval_support, "dump_metric", side_effect=lambda *a, **k: dumped.append(a)
+        ):
+            result = _run_gate(self.tmp, {**COMPLETE, "completed": 159})
+        self.assertFalse(result["_passed"])
+        self.assertEqual(dumped, [])
+
     def test_zero_throughput_fails(self):
         result = _run_gate(self.tmp, {**COMPLETE, "total_throughput": 0.0})
         self.assertFalse(result["_passed"])
