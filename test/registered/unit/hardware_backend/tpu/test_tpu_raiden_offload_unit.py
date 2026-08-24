@@ -971,7 +971,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_pushed = set()
         mgr._reshard_chunks = {}
         mgr._reshard_announced = {}
-        mgr._reshard_decode_frontier = {}
+        mgr._reshard_chunk_acked = {}
         mgr._pending_offer = {}
         mgr._announce_pages = 16
         mgr._reshard_pushes_pending = {}
@@ -1009,15 +1009,23 @@ class TestRaidenChunkedResharding(CustomTestCase):
             if c.args[0][0] == tag
         ]
 
-    def test_closing_push_slices_from_the_decode_frontier(self):
-        # This source announced one chunk more than the group completed; the
-        # decode's echoed frontier, not the local count, decides the closing
-        # span so every source pushes the same pages.
+    def test_only_acknowledged_chunks_leave_the_closing_span(self):
+        # An announced but never-acknowledged chunk keeps its pages in the
+        # closing transfer: the frontier moves only when the decode asks for
+        # the chunk's push, and a duplicate request moves nothing twice.
         mgr = self._prefill()
         room = self.ROOM
-        mgr._reshard_announced[room] = 48
-        mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41", b"32"])
-        self.assertEqual(mgr._reshard_decode_frontier[room], 32)
+        mgr._reshard_req[room] = dict(
+            reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(64))
+        )
+        mgr._reshard_chunks[room] = {0: (0, list(range(16))), 1: (16, list(range(16)))}
+        mgr._push_executor = Mock()  # hold the push; only the accounting matters
+        mgr._on_reshard_chunk_ready([MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"7"])
+        self.assertEqual(mgr._reshard_announced[room], 16)
+        mgr._on_reshard_chunk_ready([MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"7"])
+        self.assertEqual(mgr._reshard_announced[room], 16)
+        self.assertEqual(mgr._reshard_pushes_pending[room], 1)
+        self.assertEqual(mgr._push_executor.submit.call_count, 1)
 
     def test_reshard_chunk_racing_the_closing_message_is_skipped(self):
         mgr = self._prefill()
@@ -1084,7 +1092,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             mgr.append_send_blocks(room, blocks[32:64])
             mgr.finalize_send(room, None)
             self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_BLOCKS)), 1)
-            mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41", b"32"])
+            mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41"])
             self.assertEqual(mgr._failed, set())
             uuid, req = mgr._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))
@@ -1119,6 +1127,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_sources = {self.ROOM: {}}
         mgr._reshard_registered = set()
         mgr._reshard_chunk_sources = {}
+        mgr._reshard_chunk_registering = {}
         mgr._reshard_plans = {}
         mgr._cleared_plans = {}
         mgr._pulling = None
@@ -1456,6 +1465,99 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertFalse(mgr.is_recv_done(room))
         mgr._completed_recv.update({"41#0", "41"})
         self.assertTrue(mgr.is_recv_done(room))
+
+    def test_partial_source_chunk_is_folded_into_the_closing_plan(self):
+        """A source that loses its chunk/final race sends no chunk.  The other
+        source's unacknowledged announcement must not leave a hole."""
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode()
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_chunk(
+                [
+                    MessageTag.RESHARD_CHUNK,
+                    b"41",
+                    b"0",
+                    b"24",
+                    b"64",
+                    pack_ints(src[0][24:32]),
+                    b"0",
+                ]
+            )
+            self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
+
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    [
+                        MessageTag.RESHARD_BLOCKS,
+                        b"41",
+                        pack_ints(src[rank]),
+                        str(rank).encode("ascii"),
+                        b"",
+                    ]
+                )
+
+        uuid, req = mgr._engine.register_active_plan.call_args.args
+        self.assertEqual((uuid, req.req_id), (room, "41"))
+        self.assertEqual(_plan_blocks(req, 0), (src[0][24:64], self.DECODE_BLOCKS))
+        self.assertEqual(_plan_blocks(req, 1), (src[1][24:64], self.DECODE_BLOCKS))
+        self.assertNotIn(room, mgr._reshard_chunk_sources)
+        self.assertEqual(mgr._chunk_reads[room], ["41"])
+
+    def test_closing_plan_waits_for_chunk_registration_to_publish(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints
+
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode()
+        seen_during_chunk_registration = []
+
+        def register_with_final_arrival(uuid, req, is_sender):
+            if req.req_id != "41#0":
+                return
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    [
+                        MessageTag.RESHARD_BLOCKS,
+                        b"41",
+                        pack_ints(src[rank]),
+                        str(rank).encode("ascii"),
+                        b"",
+                    ]
+                )
+            seen_during_chunk_registration.append(
+                (
+                    room in mgr._reshard_registered,
+                    mgr.is_recv_done(room),
+                )
+            )
+
+        mgr._engine.register_active_plan = Mock(side_effect=register_with_final_arrival)
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_chunk(
+                    [
+                        MessageTag.RESHARD_CHUNK,
+                        b"41",
+                        b"0",
+                        b"24",
+                        b"64",
+                        pack_ints(src[rank][24:32]),
+                        str(rank).encode("ascii"),
+                    ]
+                )
+
+        self.assertEqual(seen_during_chunk_registration, [(False, False)])
+        self.assertEqual(
+            [c.args[1].req_id for c in mgr._engine.register_active_plan.call_args_list],
+            ["41#0", "41"],
+        )
+        self.assertEqual(mgr._chunk_reads[room], ["41#0", "41"])
+        self.assertNotIn(room, mgr._reshard_chunk_registering)
 
 
 class _FakeFuture:
