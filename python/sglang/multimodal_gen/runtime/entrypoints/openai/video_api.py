@@ -390,6 +390,12 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "use_system_prompt": _extra_value(request, "use_system_prompt"),
         "use_guardrails": _extra_value(request, "use_guardrails"),
         "enable_teacache": request.enable_teacache,
+        "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
+        "cache_dit_params": _extra_value(request, "cache_dit_params"),
+        "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
+        "attention_backend_override": _extra_value(
+            request, "attention_backend_override"
+        ),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -425,14 +431,17 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
 # extract metadata which http_server needs to know
 def _video_job_from_sampling(
-    request_id: str, req: VideoGenerationsRequest, sampling: SamplingParams
+    request_id: str,
+    req: VideoGenerationsRequest,
+    sampling: SamplingParams,
+    served_model_name: str,
 ) -> Dict[str, Any]:
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
     return {
         "id": request_id,
         "object": "video",
-        "model": req.model or "sora-2",
+        "model": req.model or served_model_name,
         "status": "queued",
         "progress": 0,
         "created_at": int(time.time()),
@@ -680,6 +689,15 @@ async def create_video(
             selected = value if value is not None else extra_from_form.get(name)
             return _parse_form_extra_value(selected)
 
+        def form_text_value(name: str, value: Any) -> Any:
+            """Resolve a text field without JSON-decoding it.
+
+            Some models take a serialized JSON object as the prompt text, which
+            ``_parse_form_extra_value`` would turn back into a dict and fail
+            request validation.
+            """
+            return value if value is not None else extra_from_form.get(name)
+
         request_field_names = set(VideoGenerationsRequest.model_fields)
         extra_request_fields = {
             key: value
@@ -705,7 +723,7 @@ async def create_video(
             num_frames=num_frames_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
-            negative_prompt=form_value("negative_prompt", negative_prompt),
+            negative_prompt=form_text_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),
             guidance_scale_2=form_value("guidance_scale_2", guidance_scale_2),
@@ -841,7 +859,12 @@ async def create_video(
         scheduler_batches = sampling_params.expand_video_request_outputs_for_queue(
             batch
         )
-        job = _video_job_from_sampling(request_id, req, sampling_params)
+        job = _video_job_from_sampling(
+            request_id,
+            req,
+            sampling_params,
+            server_args.served_model_name,
+        )
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
     except Exception as e:

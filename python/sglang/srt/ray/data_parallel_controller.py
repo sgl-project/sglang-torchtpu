@@ -29,8 +29,22 @@ from sglang.srt.entrypoints.engine import (
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
+<<<<<<< HEAD
 from sglang.srt.ray.engine import _actor_options
 from sglang.srt.ray.scheduler_actor import SchedulerActor
+=======
+from sglang.srt.ray.engine import (
+    _compute_world_size,
+    _create_scheduler_actor,
+    _get_bundle_node_ip,
+    _resolve_bundle_indices,
+)
+from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_pp_size,
+    get_parallel,
+)
+>>>>>>> upstream/main
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import bind_port, get_zmq_socket, get_zmq_socket_on_host
 
@@ -74,7 +88,7 @@ class RayDataParallelController(DataParallelController):
         sockets = []
         dp_port_args_list = []
 
-        for dp_rank in range(server_args.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -97,7 +111,7 @@ class RayDataParallelController(DataParallelController):
             sock.close()
 
         # Create actors for each DP rank sequentially
-        for dp_rank in range(server_args.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             self._launch_ray_tp_group(server_args, dp_port_args_list[dp_rank], dp_rank)
 
     def launch_dp_attention_schedulers(
@@ -108,7 +122,7 @@ class RayDataParallelController(DataParallelController):
         # rank-0 node IP instead of tcp://* to avoid exposing unauthenticated
         # ZMQ sockets (CVE-2026-3060).
         worker_ports = []
-        for dp_rank in range(server_args.dp_size):
+        for dp_rank in range(get_parallel().dp_size):
             worker_port, worker_socket = get_zmq_socket_on_host(
                 self.context, zmq.PUSH, host=self.rank0_node_ip
             )
@@ -139,11 +153,27 @@ class RayDataParallelController(DataParallelController):
         nnodes = server_args.nnodes
         batch_start_idx = len(self.scheduler_actors)
 
+<<<<<<< HEAD
         for node_idx in range(nnodes):
             bundle_idx = self.bundle_for_node[node_idx]
             pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
                 nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
             )
+=======
+        if not self.is_custom_pg:
+            for node_idx in range(nnodes):
+                bundle_idx = self.bundle_for_node[node_idx]
+                pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
+                    nnodes,
+                    configured_pp_size(),
+                    server_args.tp_size,
+                    node_rank=node_idx,
+                )
+                for pp_rank in pp_range:
+                    for tp_rank in tp_range:
+                        rank_port_args = port_args
+                        actual_dp_rank = dp_rank
+>>>>>>> upstream/main
 
             for pp_rank in pp_range:
                 for tp_rank in tp_range:
@@ -159,8 +189,39 @@ class RayDataParallelController(DataParallelController):
                             server_args.dp_size,
                             server_args.attn_cp_size,
                         )
+<<<<<<< HEAD
                         rank_port_args = PortArgs.init_new(
                             server_args, actual_dp_rank, worker_ports
+=======
+
+                        if get_parallel().enable_dp_attention:
+                            _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
+                                get_parallel().enable_dp_attention,
+                                tp_rank,
+                                server_args.tp_size,
+                                get_parallel().dp_size,
+                                configured_attn_cp_size(),
+                            )
+                            rank_port_args = PortArgs.init_new(
+                                server_args, actual_dp_rank, worker_ports
+                            )
+                            # All DP ranks share the same NCCL port (reuse TP group)
+                            rank_port_args.nccl_port = port_args.nccl_port
+                            rank_port_args.instance_id = port_args.instance_id
+                            # The detokenizer and tokenizer bind using the
+                            # original port_args addresses (127.0.0.1 when
+                            # dist_init_addr is unset).  Scheduler actors must
+                            # connect to the same addresses.
+                            rank_port_args.detokenizer_ipc_name = (
+                                port_args.detokenizer_ipc_name
+                            )
+                            rank_port_args.tokenizer_ipc_name = (
+                                port_args.tokenizer_ipc_name
+                            )
+
+                        dist_init_addr = (
+                            f"{self.rank0_node_ip}:{rank_port_args.nccl_port}"
+>>>>>>> upstream/main
                         )
                         # All DP ranks share the same NCCL port (reuse TP group)
                         rank_port_args.nccl_port = port_args.nccl_port
@@ -173,8 +234,46 @@ class RayDataParallelController(DataParallelController):
                         )
                         rank_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
+<<<<<<< HEAD
                     local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
                         tp_rank % tp_per_node
+=======
+        else:
+            world_size = _compute_world_size(server_args)
+            bundle_indices = _resolve_bundle_indices(self.pg, world_size)
+
+            ranks_per_tp_group = server_args.tp_size * configured_pp_size()
+            if dp_rank is not None:
+                start_rank = dp_rank * ranks_per_tp_group
+                end_rank = start_rank + ranks_per_tp_group
+                # Each DP group must use its own local rank-0's node IP for
+                # NCCL rendezvous, not the world rank-0's node IP.
+                local_rank0_bundle_idx = bundle_indices[start_rank]
+                local_rank0_node_ip = _get_bundle_node_ip(
+                    self.pg, local_rank0_bundle_idx
+                )
+            else:
+                start_rank = 0
+                end_rank = world_size
+                local_rank0_node_ip = self.rank0_node_ip
+
+            for global_rank in range(start_rank, end_rank):
+                local_rank = global_rank % ranks_per_tp_group
+                pp_rank = local_rank // server_args.tp_size
+                tp_rank = local_rank % server_args.tp_size
+                rank_port_args = port_args
+                actual_dp_rank = dp_rank
+
+                bundle_idx = bundle_indices[global_rank]
+
+                if get_parallel().enable_dp_attention:
+                    _, _, actual_dp_rank, _ = compute_dp_attention_world_info(
+                        get_parallel().enable_dp_attention,
+                        tp_rank,
+                        server_args.tp_size,
+                        get_parallel().dp_size,
+                        configured_attn_cp_size(),
+>>>>>>> upstream/main
                     )
 
                     attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(

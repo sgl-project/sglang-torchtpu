@@ -9,7 +9,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     ModelLaunchSettings,
-    dump_metric,
     popen_launch_server,
     write_github_step_summary,
 )
@@ -32,6 +31,7 @@ class AccuracyTestParams:
     top_k: Optional[int] = None
     repeat: Optional[int] = None
     api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
+<<<<<<< HEAD
     atol: float = 0.0  # floor = baseline_accuracy - atol
     # Replaces the dataset dispatch, so a caller can plug in a harness this module
     # has no dependency on. Returning "_passed" means it gated itself and
@@ -49,6 +49,12 @@ class AccuracyTestParams:
         if self.baseline_accuracy is None:
             return None
         return self.baseline_accuracy - self.atol
+=======
+    seed: Optional[int] = None  # pin for reproducibility when temperature > 0
+    # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
+    # of letting _run_sgl_eval infer it from the model name.
+    sgl_eval_thinking: Optional[bool] = None
+>>>>>>> upstream/main
 
 
 @dataclass
@@ -136,7 +142,12 @@ def _run_simple_eval(
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
     api: Optional[str] = None,
+<<<<<<< HEAD
     extra_eval_args: Optional[dict] = None,
+=======
+    seed: Optional[int] = None,
+    sgl_eval_thinking: Optional[bool] = None,
+>>>>>>> upstream/main
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
@@ -176,8 +187,16 @@ def _run_simple_eval(
         if repeat is not None:
             args.repeat = repeat
 
+<<<<<<< HEAD
         for key, value in (extra_eval_args or {}).items():
             setattr(args, key, value)
+=======
+        if seed is not None:
+            args.seed = seed
+
+        if sgl_eval_thinking is not None:
+            args.sgl_eval_thinking = sgl_eval_thinking
+>>>>>>> upstream/main
 
         result = run_eval(args)
 
@@ -194,6 +213,7 @@ def _run_simple_eval(
         return False, f"Accuracy test exception: {str(e)}", None
 
 
+<<<<<<< HEAD
 # Cached uv venv for NeMo Skills (persists across variants within a process).
 _nemo_venv_dir: Optional[str] = None
 _nemo_data_prepared: set = set()
@@ -526,6 +546,8 @@ def _dispatch_eval(
     )
 
 
+=======
+>>>>>>> upstream/main
 def run_accuracy_test(
     model: ModelLaunchSettings,
     params: AccuracyTestParams,
@@ -550,8 +572,28 @@ def run_accuracy_test(
         print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
     print(f"{'='*60}\n")
 
+<<<<<<< HEAD
     with served(model, base_url):
         success, error, metrics = _dispatch_eval(model, params, base_url)
+=======
+    success, error, metrics = _run_simple_eval(
+        model=model,
+        base_url=base_url,
+        dataset=params.dataset,
+        num_examples=params.num_examples,
+        num_threads=params.num_threads,
+        max_tokens=params.max_tokens,
+        return_latency=params.return_latency,
+        thinking_mode=params.thinking_mode,
+        temperature=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        repeat=params.repeat,
+        api=params.api,
+        seed=params.seed,
+        sgl_eval_thinking=params.sgl_eval_thinking,
+    )
+>>>>>>> upstream/main
 
     if not success:
         print(f"✗ Accuracy test failed for {model.model_path}: {error}")
