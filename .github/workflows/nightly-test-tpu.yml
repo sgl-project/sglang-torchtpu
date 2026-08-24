@@ -126,7 +126,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [nightly-tpu-perf-qwen3-30b, nightly-tpu-perf-gpt-oss-120b]
+        # qwen3-30b was retired: its 480B sibling's perf source is the agentic
+        # sweep in the multi-host job, which dumps its own workload metrics.
+        suite: [nightly-tpu-perf-gpt-oss-120b]
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:

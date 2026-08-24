@@ -3,7 +3,7 @@
 ADDING A MODEL: copy this file, and change five things.
 
   1. the filename and its `suite=` -- ONE FILE AND ONE SUITE PER MODEL, exactly as
-     the perf tests (see test/registered/tpu/nightly-perf/test_tpu_perf_qwen3_30b.py):
+     the perf tests (see test/registered/tpu/nightly-perf/test_tpu_perf_gpt_oss_120b.py):
      separate nightly jobs on separate slices, so a broken model costs the others
      nothing. Add the new suite name to run_suite.py's TPU list and to the
      matrices in accuracy-test-tpu.yml and nightly-test-tpu.yml. The filename is

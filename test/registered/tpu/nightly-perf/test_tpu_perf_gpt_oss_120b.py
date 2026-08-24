@@ -1,13 +1,48 @@
 """Throughput sweep for gpt-oss-120b on the 8k1k workload.
 
-One file and one suite per model, so the models run as separate nightly jobs on
-separate slices. See test_tpu_perf_qwen3_30b.py for the protocol on adding one.
+ADDING A MODEL: copy this file, and change five things.
 
-This model differs from that one in two ways worth knowing before copying it: it
-serves from a mounted checkpoint rather than an HF id, so the served name has to
-be set explicitly in both the launch and the bench; and its recipe derives its
-whole shape from ISL/OSL/CONCUR, so those go in `env` rather than a context
-length being computed here.
+  1. the filename and its `suite=` -- ONE FILE AND ONE SUITE PER MODEL. That is
+     what makes the models run as separate nightly jobs on separate slices; a
+     shared suite would put them back into one sequential job, where a slow model
+     delays the others and a failing one costs them their measurement entirely.
+     Add the new suite name to run_suite.py's TPU list and to the matrices in
+     perf-test-tpu.yml and nightly-test-tpu.yml.
+  2. `est_time` -- one bring-up (weight load + per-shape compile) plus the sweep.
+     It drives the JobSet poll budget, so an under-estimate kills the run. Not
+     auto-refreshed: update_est_time.py omits tpu.
+  3. `MODEL` and `launch.recipe` -- point at the recipe that already knows how to
+     serve this model, then list ONLY the deltas the measurement needs in `env`.
+  4. the shape (ISL/OSL/CONCUR/WORKLOAD), if this model is measured at a
+     different one. `WORKLOAD` is the name the dashboard's dropdown shows.
+  5. `launch.tag` -- what the boot line is labelled with in the log.
+
+Deliberately duplicated rather than shared across perf files: the point of one of
+these is that you can read how a model is served without jumping between files,
+and what would actually be shared is three integers.
+
+WHY ITS OWN SERVER, not the accuracy nightly's: an accuracy recipe pins whatever
+makes its score reproducible -- for gpt-oss that is bf16 KV, a 16384 context and
+a 4096 prefill chunk so a GPQA prompt fits. A throughput run wants fp8 KV, a
+context sized to the workload, and a chunk that swallows an 8k prompt whole. A
+throughput number measured on an accuracy server is one nobody would quote, and
+one that tuning work would not move in the expected direction.
+
+NO THROUGHPUT FLOOR. The dashboard's trend is the regression detector; a
+threshold invented before any nightly has run would either never fire or fire on
+noise. What the gate does check -- that the measurement is COMPLETE -- lives in
+bench_serving_runner, and is what separates "slower" from "the server served
+nothing".
+
+This model serves from a mounted checkpoint rather than an HF id, so the served
+name has to be set explicitly in both the launch and the bench; and its recipe
+derives its whole shape from ISL/OSL/CONCUR, so those go in `env` rather than a
+context length being computed here.
+
+(Qwen3-Coder-480B is measured elsewhere: its perf source is the multi-turn
+agentic sweep in e2e/test_tpu_qwen3_coder_480b_multihost_agentic.py, which runs
+in the multi-host nightly and dumps its own workload-labelled metrics. Its
+predecessor here, test_tpu_perf_qwen3_30b.py, was retired with it.)
 """
 
 import os

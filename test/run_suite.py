@@ -193,7 +193,6 @@ NIGHTLY_SUITES = {
         "nightly-tpu-multihost",
         # One suite per perf model, so the nightly can fan them out as separate
         # jobs on separate slices instead of one sequential single-host job.
-        "nightly-tpu-perf-qwen3-30b",
         "nightly-tpu-perf-gpt-oss-120b",
         "nightly-perf-tpu",
         # One suite per accuracy model, for the same fan-out.

@@ -31,7 +31,7 @@ import unittest
 import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
+from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
 
 register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
@@ -73,6 +73,48 @@ MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
 # a run artifact + the job summary.
 RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
 RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
+
+# Dashboard series key. The canonical HF id, not the mount path the recipe serves
+# from -- remounting the weights elsewhere must not split the trend in two.
+MODEL_LABEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+
+
+def _direction(field: str) -> str:
+    """Which way is an improvement, so a regression check that assumes
+    higher-is-better does not read a TTFT drop as a win."""
+    if "throughput" in field:
+        return "higher_is_better"
+    if any(s in field for s in ("ttft", "itl", "latency", "duration")):
+        return "lower_is_better"
+    return "informational"
+
+
+def _dump_leg_metrics(leg):
+    """One [METRIC] line per number, same label contract as bench_serving_runner.
+
+    Only the per-leg output_throughput carries `workload`, which is what routes it
+    to the dashboard's performance tab; everything else the leg measured is dumped
+    as kind=bench_detail -- stored in the dashboard's archive forever (a field not
+    recorded tonight cannot be back-filled once the job log expires), charted
+    nowhere. The leg tag is in the metric name because several legs share a run,
+    and the dashboard keys a night's point on (test_file, metric_name, model).
+    """
+    tag = leg["tag"]
+    numbers = {
+        **(leg.get("metrics") or {}),
+        **{f"derived.{k}": v for k, v in (leg.get("derived") or {}).items()},
+    }
+    for field, value in sorted(numbers.items()):
+        if not isinstance(value, (int, float)):
+            continue
+        labels = {"model": MODEL_LABEL, "direction": _direction(field)}
+        if field == "output_throughput":
+            labels["workload"] = tag
+            labels["headline"] = "1"
+        else:
+            labels["kind"] = "bench_detail"
+            labels["workload_name"] = tag
+        dump_metric(f"{tag}.{field}", value, labels=labels)
 
 
 def _achievable_prefix_hit_rate(config):
@@ -283,7 +325,7 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
 
     def test_throughput_recorded(self):
         """Not a performance gate -- just proves the numbers the dashboard ingests
-        are present and non-zero."""
+        are present and non-zero, then dumps them for it."""
         for leg in self._legs():
             metrics = leg.get("metrics") or {}
             derived = leg.get("derived") or {}
@@ -300,6 +342,19 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
                 f"ITL p50 {metrics.get('median_itl_ms'):.1f} ms",
                 flush=True,
             )
+            # Publish only legs that finished and had no retract/abort recompute.
+            # A failed prefix-hit gate still reds the job but does not stop the
+            # dump; the trend reader sees the red run either way.
+            counters = leg.get("feature_counters") or {}
+            clean = leg["status"] == "ok" and not any(
+                counters.get(k)
+                for k in (
+                    "sglang:num_retracted_requests_total",
+                    "sglang:num_aborted_requests_total",
+                )
+            )
+            if clean:
+                _dump_leg_metrics(leg)
 
 
 if __name__ == "__main__":
