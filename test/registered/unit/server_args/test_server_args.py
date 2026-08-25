@@ -1390,6 +1390,30 @@ class TestHiCacheArgs(unittest.TestCase):
 
         args._handle_cache_compatibility()
 
+    def test_tpu_host_pool_retraction_requires_fused_layout_and_tpu_io(self):
+        # Regression: a TPU decode server that reached the host-pool retraction
+        # path with the default layout/io crashed every scheduler rank at boot
+        # on the TPU host pool's `layout == "page_first_fused"` assertion.
+        args = self._make_args(
+            device="tpu",
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "page_first_fused"):
+            args._handle_cache_compatibility()
+
+    def test_tpu_host_pool_retraction_accepts_coherent_hicache_config(self):
+        args = self._make_args(
+            device="tpu",
+            disaggregation_mode="decode",
+            disaggregation_decode_retraction_backup="host_pool",
+            hicache_io_backend="raiden",
+            hicache_mem_layout="page_first_fused",
+        )
+
+        args._handle_cache_compatibility()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):

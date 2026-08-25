@@ -8296,6 +8296,21 @@ class ServerArgs:
                 "--disaggregation-decode-retraction-backup=host_pool requires "
                 "--disable-priority-preemption when priority scheduling is enabled."
             )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.device == "tpu"
+            and (
+                self.hicache_io_backend not in ("torch_tpu", "raiden")
+                or self.hicache_mem_layout != "page_first_fused"
+            )
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool on TPU "
+                "builds the TPU host pool, which requires --hicache-mem-layout "
+                "page_first_fused and --hicache-io-backend torch_tpu or raiden; "
+                f"got layout {self.hicache_mem_layout!r} and io backend "
+                f"{self.hicache_io_backend!r}."
+            )
 
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
