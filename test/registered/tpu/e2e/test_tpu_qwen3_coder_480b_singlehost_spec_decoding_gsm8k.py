@@ -29,11 +29,12 @@ LAUNCH_ENV = {
     "ISL": "4096",
     "OSL": "512",
     "CONCUR": "16",
+    "DP_SIZE": "2",
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": "8192",
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 16",
+    "TPU_COMPILE_BS": "1 2 4 8 16",
     "DISABLE_RADIX_CACHE": "0",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "EXTRA_ARGS": (
@@ -50,13 +51,13 @@ LAUNCH_ENV = {
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
-    "test_name": "qwen3-coder-480b-spec-decoding-gsm8k",
-    "variant": "TP8+EP8+EAGLE3",
+    "test_name": "qwen3-coder-480b-spec-decoding-hybrid-dp-gsm8k",
+    "variant": "TP8+EP8+DP2+EAGLE3",
     "launch": {
         "recipe": "recipe/qwen3_coder_480b/server.sh",
         "env": LAUNCH_ENV,
         "health_timeout": HEALTH_TIMEOUT,
-        "tag": "qwen3-coder-480b-spec-gsm8k-e2e",
+        "tag": "qwen3-coder-480b-spec-dp-gsm8k-e2e",
     },
     "gates": [
         {
