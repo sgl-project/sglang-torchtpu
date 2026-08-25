@@ -122,7 +122,7 @@ class PodTopology:
         self.group_hostnames = group_hostnames
 
     @property
-    def is_leader(self) -> bool:
+    def is_prefill_leader(self) -> bool:
         return self.role == Role.PREFILL.value and self.group_rank == 0
 
     @classmethod
@@ -429,7 +429,7 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
 
 def serve_role(topology: PodTopology, role: Role) -> int:
     """Dispatch and execute service behavior according to role and rank."""
-    if topology.is_leader:
+    if topology.is_prefill_leader:
         return _serve_prefill_leader(topology)
     return _serve_worker(topology, role)
 
@@ -514,7 +514,7 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             }
         )
         self.assertEqual(get_role(leader_topo), Role.PREFILL)
-        self.assertTrue(leader_topo.is_leader)
+        self.assertTrue(leader_topo.is_prefill_leader)
 
         worker_topo = PodTopology.from_env(
             {
@@ -524,7 +524,7 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             }
         )
         self.assertEqual(get_role(worker_topo), Role.PREFILL)
-        self.assertFalse(worker_topo.is_leader)
+        self.assertFalse(worker_topo.is_prefill_leader)
 
         decode_topo = PodTopology.from_env(
             {
@@ -534,7 +534,7 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             }
         )
         self.assertEqual(get_role(decode_topo), Role.DECODE)
-        self.assertFalse(decode_topo.is_leader)
+        self.assertFalse(decode_topo.is_prefill_leader)
 
     def test_benchmark_directory_resolves(self) -> None:
         self.assertTrue(
