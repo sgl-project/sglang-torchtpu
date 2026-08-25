@@ -35,8 +35,8 @@ on:
         options: [all, qwen3_coder_480b, gpt_oss_120b]
 
 concurrency:
-  group: tpu-integration
-  cancel-in-progress: false   # let a running integration test finish
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:

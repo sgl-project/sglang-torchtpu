@@ -26,8 +26,8 @@ on:
         options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e]
 
 concurrency:
-  group: tpu-slice-nightly
-  cancel-in-progress: false   # let a running nightly finish; don't stack them
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:

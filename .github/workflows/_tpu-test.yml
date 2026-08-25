@@ -75,9 +75,9 @@ permissions:
   id-token: write
 
 concurrency:
-  # Keyed per job so it never gates: Kueue owns slice admission now (kueue-tpu.yaml), and
-  # the callers' workflow-level groups already stop a workflow stacking on itself.
-  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
+  # P/D jobs need both 2x2x2 slices in the cluster and must serialize globally to prevent deadlocks.
+  # Non-P/D jobs are isolated per-run and dispatched directly to Kueue.
+  group: ${{ (inputs.pd_prefill_hosts != 0 || inputs.pd_decode_hosts != 0) && 'tpu-pd-lock' || format('tpu-test-{0}-{1}', github.run_id, inputs.run_name || inputs.suite) }}
   cancel-in-progress: false
 
 env:
