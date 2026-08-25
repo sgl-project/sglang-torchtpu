@@ -3089,12 +3089,18 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
         moe_runner_backend = get_moe_runner_backend()
         if not (
-            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+            moe_runner_backend.is_auto()
+            or moe_runner_backend.is_pallas_tpu()
+            or moe_runner_backend.is_pallas_tpu_fused_rs()
         ):
             raise ValueError(
-                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
-                "pallas_tpu_fused_rs"
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto, "
+                "pallas_tpu, or pallas_tpu_fused_rs"
             )
+
+        if moe_runner_backend.is_pallas_tpu():
+            self.handles_moe_reduction = False
+            return
 
         unmet_requirements = unmet_tpu_nvfp4_fused_rs_requirements(
             layer,
@@ -3142,11 +3148,13 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if not (
-            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+            moe_runner_backend.is_auto()
+            or moe_runner_backend.is_pallas_tpu()
+            or moe_runner_backend.is_pallas_tpu_fused_rs()
         ):
             raise ValueError(
-                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
-                "pallas_tpu_fused_rs"
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto, "
+                "pallas_tpu, or pallas_tpu_fused_rs"
             )
         # Compatibility is resolved after model setup in _resolve_fused_rs.
 

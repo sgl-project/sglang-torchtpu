@@ -1007,6 +1007,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             sampling_info=sampling_info,
             spec_info=spec_info,
+            # Serving copies this process-wide value from ModelRunner. Keep
+            # warmup on the same speculative/non-speculative selector branch.
+            spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
 

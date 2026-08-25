@@ -64,6 +64,11 @@ def distributed_top_k_for_batch(
         return None
     if forward_batch is None:
         return None
+    # Draft and verify forwards carry spec_info even when their spec_algorithm
+    # field differs between precompile and serving. Return before reading either
+    # spec_algorithm or sampling_info so Dynamo does not guard those fields.
+    if getattr(forward_batch, "spec_info", None) is not None:
+        return None
     spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
     has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
     # Speculative decoding never uses the distributed TopK path. Check this

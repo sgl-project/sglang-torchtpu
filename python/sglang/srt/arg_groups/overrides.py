@@ -2457,15 +2457,24 @@ def _dp_lm_head_validation(view: Any) -> dict:
 
 @register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
-    """The quantization-driven moe_runner_backend resolutions at the head of
-    _handle_moe_kernel_config. The backend-compatibility asserts and the
-    disable_shared_experts_fusion writes (post-publish writers exist for that
-    field) stay in the handler."""
+    """Resolve MoE backend defaults and validate platform constraints."""
     moe_runner_backend = view.moe_runner_backend
-    if moe_runner_backend == "pallas_tpu_fused_rs" and view.device != "tpu":
+    if (
+        moe_runner_backend in ("pallas_tpu", "pallas_tpu_fused_rs")
+        and view.device != "tpu"
+    ):
         raise ValueError(
-            "--moe-runner-backend pallas_tpu_fused_rs requires --device tpu"
+            f"--moe-runner-backend {moe_runner_backend} requires --device tpu"
         )
+    # TODO(sglang-torchtpu#308): Remove this fallback once fused-RS supports
+    # speculative decoding.
+    if (
+        view.device == "tpu"
+        and getattr(view, "speculative_algorithm", None) is not None
+        and moe_runner_backend == "auto"
+    ):
+        moe_runner_backend = "pallas_tpu"
+        logger.info("Speculative decoding on TPU: moe_runner_backend=pallas_tpu.")
     if view.quantization == "nvfp4_online":
         if not is_sm100_supported():
             raise ValueError(

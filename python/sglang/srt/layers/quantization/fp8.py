@@ -2529,8 +2529,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-        elif moe_runner_backend.is_pallas_tpu_fused_rs() and not _is_tpu:
-            raise ValueError("pallas_tpu_fused_rs is only available on TPU")
+        elif (
+            moe_runner_backend.is_pallas_tpu()
+            or moe_runner_backend.is_pallas_tpu_fused_rs()
+        ) and not _is_tpu:
+            raise ValueError(f"{moe_runner_backend.value} is only available on TPU")
 
         if (
             moe_runner_backend.is_deep_gemm()

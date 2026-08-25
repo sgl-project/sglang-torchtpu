@@ -191,6 +191,22 @@ class TestDistributedTopKEligibility(CustomTestCase):
             distributed_top_k_for_batch(SpecBatch(), sampling_backend="tpu")
         )
 
+    def test_draft_batch_does_not_inspect_sampling_state(self):
+        class DraftBatch:
+            spec_info = object()
+
+            @property
+            def spec_algorithm(self):
+                raise AssertionError("draft TopK gate read spec_algorithm")
+
+            @property
+            def sampling_info(self):
+                raise AssertionError("draft TopK gate read sampling_info")
+
+        self.assertIsNone(
+            distributed_top_k_for_batch(DraftBatch(), sampling_backend="tpu")
+        )
+
     def test_environment_can_raise_the_pre_gather_cutoff(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
         self.assertEqual(cutoff.default, 64)

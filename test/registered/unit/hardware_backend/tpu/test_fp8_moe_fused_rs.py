@@ -26,8 +26,13 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 class TestFp8MoeFusedRs(CustomTestCase):
     def test_exposes_first_class_moe_runner_backend(self):
+        legacy_backend = MoeRunnerBackend("pallas_tpu")
+        self.assertTrue(legacy_backend.is_pallas_tpu())
+        self.assertFalse(legacy_backend.is_pallas_tpu_fused_rs())
+
         backend = MoeRunnerBackend("pallas_tpu_fused_rs")
         self.assertTrue(backend.is_pallas_tpu_fused_rs())
+        self.assertFalse(backend.is_pallas_tpu())
         self.assertFalse(backend.is_auto())
 
     def _config(self, **overrides):

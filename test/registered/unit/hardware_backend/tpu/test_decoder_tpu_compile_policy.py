@@ -43,6 +43,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -76,6 +77,7 @@ def _model_runner(device="cpu"):
         token_to_kv_pool_allocator=SimpleNamespace(
             free_pages=torch.arange(4, dtype=torch.int32)
         ),
+        spec_algorithm=SpeculativeAlgorithm.NONE,
         server_args=SimpleNamespace(page_size=1, dp_size=1),
     )
 
@@ -828,6 +830,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
         model_config=SimpleNamespace(hidden_size=16),
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
+        spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         server_args=SimpleNamespace(
             speculative_num_steps=num_steps,
             # topk=1 chain: verify width == num_steps + 1.
@@ -868,7 +871,30 @@ class TestSpecPrecompileLoops(CustomTestCase):
         with get_parallel().override(tp_rank=1):
             policy._precompile_extend_full()
 
-        self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
+        self.assertEqual(
+            mr.attn_backend.calls,
+            [(1024, 16), (1024, 16), (4096, 16), (4096, 16)],
+        )
+
+    def test_extend_full_precompiles_both_spec_info_states(self):
+        mr = _spec_model_runner(num_steps=3)
+        policy = _make_spec_policy(mr, token_buckets=(8,), bs_buckets=(4,))
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_extend_full()
+
+        batches = [call.args[2] for call in mr.model.forward.call_args_list]
+        self.assertEqual(len(batches), 2)
+        self.assertIsNone(batches[0].spec_info)
+        self.assertIsInstance(batches[1].spec_info, EagleDraftInput)
+        self.assertEqual(
+            [batch.capture_hidden_mode for batch in batches],
+            [CaptureHiddenMode.FULL, CaptureHiddenMode.FULL],
+        )
+        self.assertEqual(
+            [batch.spec_algorithm for batch in batches],
+            [SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.EAGLE3],
+        )
 
     def test_target_precompiles_all_spec_modes(self):
         mr = _spec_model_runner(num_steps=3)  # draft_token_num = 4
@@ -879,8 +905,9 @@ class TestSpecPrecompileLoops(CustomTestCase):
         with get_parallel().override(tp_rank=1):
             policy.precompile()
         # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
-        # TARGET_VERIFY buckets bs: (4,1),(16,4)=2  EXTEND(FULL) 2
-        self.assertEqual(mr.model.forward.call_count, 8)
+        # TARGET_VERIFY buckets bs: (4,1),(16,4)=2. EXTEND(FULL) covers two
+        # token buckets and both real serving spec-info states, so 4.
+        self.assertEqual(mr.model.forward.call_count, 10)
         self.assertIn((16, 4), mr.attn_backend.calls)
         self.assertIn((4, 1), mr.attn_backend.calls)
 
@@ -1425,8 +1452,25 @@ def _serving_stubs():
     This suite runs on CPU CI, where platform detection would otherwise leave
     ``verify_tree_greedy_func`` without a CPU implementation and its mutable
     outputs unwritten. Production TPU selects this torch-native path itself.
+
+    Keep the penalty helper eager as production TPU startup does. This makes a
+    manual run inside a TPU image exercise the CPU unit-test math instead of
+    sending its CPU tensors through the TPU-only ``dynamic=True`` compiler.
     """
-    with patch("sglang.srt.speculative.eagle_utils._use_torch_native", True), patch(
+    from sglang.srt.sampling.penaltylib import repetition_penalty
+
+    compiled_scaling_penalties = repetition_penalty.apply_scaling_penalties
+    eager_scaling_penalties = getattr(
+        compiled_scaling_penalties,
+        "__wrapped__",
+        compiled_scaling_penalties,
+    )
+
+    with patch.object(
+        repetition_penalty,
+        "apply_scaling_penalties",
+        eager_scaling_penalties,
+    ), patch("sglang.srt.speculative.eagle_utils._use_torch_native", True), patch(
         "sglang.srt.distributed.get_tp_group",
         return_value=SimpleNamespace(world_size=1),
     ), patch(

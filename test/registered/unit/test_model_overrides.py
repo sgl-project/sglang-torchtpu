@@ -1746,7 +1746,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
         def _view(**kw):
-            defaults = dict(device="cuda", quantization=None, moe_runner_backend="auto")
+            defaults = dict(
+                device="cuda",
+                quantization=None,
+                moe_runner_backend="auto",
+                speculative_algorithm=None,
+            )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
@@ -1776,11 +1781,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(
                 _view(moe_runner_backend="pallas_tpu_fused_rs")
             )
+        with self.assertRaises(ValueError):
+            _moe_runner_backend_quant_constraints(
+                _view(moe_runner_backend="pallas_tpu")
+            )
+        self.assertEqual(
+            _moe_runner_backend_quant_constraints(
+                _view(device="tpu", moe_runner_backend="pallas_tpu")
+            ),
+            {},
+        )
         self.assertEqual(
             _moe_runner_backend_quant_constraints(
                 _view(device="tpu", moe_runner_backend="pallas_tpu_fused_rs")
             ),
             {},
+        )
+        self.assertEqual(
+            _moe_runner_backend_quant_constraints(
+                _view(device="tpu", speculative_algorithm="EAGLE3")
+            ),
+            {"moe_runner_backend": "pallas_tpu"},
         )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
