@@ -258,6 +258,11 @@ def main():
             "POOL_LIST": " ".join(pd_pools),
             "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",
             "WEIGHTS_MOUNT": WEIGHTS_MOUNT_TMPL if pvc else "",
+            "SERVICE_ACCOUNT": (
+                SERVICE_ACCOUNT_TMPL.format(sa=a.service_account)
+                if a.service_account
+                else ""
+            ),
         }
         tpl = open(f"{a.dir}/jobset-tpu-pd.yaml").read()
         out = re.sub(r"\$\{(\w+)\}", lambda m: vals.get(m.group(1), m.group(0)), tpl)

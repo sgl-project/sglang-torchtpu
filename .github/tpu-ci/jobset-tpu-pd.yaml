@@ -1,16 +1,17 @@
-# P/D disaggregation test workload -- TWO replicated jobs (prefill, decode), each
-# scheduled onto its OWN TPU slice (the exclusive-topology annotation pins every
-# child Job inside one node pool; a GKE multihost TPU node pool is one slice).
+# P/D disaggregation test workload -- THREE replicated jobs (router, prefill, decode).
+# Prefill and decode are scheduled onto their OWN TPU slices (the exclusive-topology
+# annotation pins every child Job inside one node pool; a GKE multihost TPU node pool is one slice).
+# Router is a CPU pod that connects to both slices via mini-LB and runs the evaluation.
 # Rendered by .github/tpu-ci/render_jobset.py --pd-prefill-hosts/--pd-decode-hosts.
 # Render vars (do NOT write them as dollar-brace tokens in these comments -- the
 # renderer would substitute them here too):
 #   IMAGE                digest-pinned image
-#   RUN_NAME             DNS-safe label; must not contain "prefill"/"decode"
-#                        (pods derive peer-slice hostnames by swapping the
+#   RUN_NAME             DNS-safe label; must not contain "prefill"/"decode"/"router"
+#                        (pods derive peer hostnames by swapping the
 #                        replicated-job segment of their own hostname)
-#   EXEC_CMD             every pod of both slices runs this command; the test
+#   EXEC_CMD             every pod of all slices runs this command; the test
 #                        dispatches roles from CI_PD_ROLE + the slice-local
-#                        TPU worker env, and the prefill leader's exit gates
+#                        TPU worker env, and the router's exit gates
 #   ACTIVE_DEADLINE      per-Job runtime cap (seconds)
 #   PREFILL_HOSTS / DECODE_HOSTS           pods (= hosts) per slice
 #   PREFILL_TOPOLOGY / PREFILL_POOL        node labels for the prefill slice
@@ -33,9 +34,67 @@ spec:
   ttlSecondsAfterFinished: 7200
   failurePolicy:
     maxRestarts: 0
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - router
   network:
     enableDNSHostnames: true       # stable pod DNS for cross-slice rendezvous
   replicatedJobs:
+    - name: router
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: 1
+          parallelism: 1
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+${SERVICE_ACCOUNT}
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: router
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=0"
+                      ${EXEC_CMD}
+                  resources:
+                    requests:
+                      cpu: "4"
+                      memory: 16Gi
+                    limits:
+                      cpu: "8"
+                      memory: 32Gi
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                  securityContext:
+                    privileged: true
     - name: prefill
       replicas: 1
       template:
@@ -50,6 +109,7 @@ spec:
                 app: tpu-ci
             spec:
               restartPolicy: Never
+${SERVICE_ACCOUNT}
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
                 cloud.google.com/gke-tpu-topology: ${PREFILL_TOPOLOGY}
@@ -93,9 +153,8 @@ ${WEIGHTS_VOLUME}
                       echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
                       ${EXEC_CMD}
                       rc=$?
-                      # Only the prefill leader's verdict gates; a teardown
-                      # SIGTERM on any other pod is success.
-                      if [ "${TPU_WORKER_ID:-0}" != "0" ] && [ "$rc" = 143 ]; then
+                      # Prefill worker pods exit 0 on teardown SIGTERM.
+                      if [ "$rc" = 143 ]; then
                         echo "worker teardown SIGTERM; success"; rc=0
                       fi
                       exit $rc
@@ -126,6 +185,7 @@ ${WEIGHTS_MOUNT}
                 app: tpu-ci
             spec:
               restartPolicy: Never
+${SERVICE_ACCOUNT}
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
                 cloud.google.com/gke-tpu-topology: ${DECODE_TOPOLOGY}
@@ -169,7 +229,7 @@ ${WEIGHTS_VOLUME}
                       echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
                       ${EXEC_CMD}
                       rc=$?
-                      # Decode pods never gate on teardown SIGTERM.
+                      # Decode pods exit 0 on teardown SIGTERM.
                       if [ "$rc" = 143 ]; then
                         echo "worker teardown SIGTERM; success"; rc=0
                       fi

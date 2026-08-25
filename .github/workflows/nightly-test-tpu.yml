@@ -23,7 +23,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy]
+        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e]
 
 concurrency:
   group: tpu-slice-nightly
@@ -113,6 +113,26 @@ jobs:
             || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
       weights_pvc: model-weights-rox
       run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # P/D Disaggregation multihost accuracy E2E tests on Nightly lane.
+  pd-e2e:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-e2e"]'), inputs.only || 'all') }}
+    name: pd-e2e-gpt-oss-120b-gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_multihost_pd_gsm8k.py integration
+      weights_pvc: model-weights-rox
+      run_name: pd-gpt-oss-120b-gsm8k
     permissions:
       contents: read
       id-token: write
