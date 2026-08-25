@@ -55,7 +55,8 @@ LAUNCH_ENV = {
         "--speculative-draft-model-path lmsys/EAGLE3-gpt-oss-120b-bf16 "
         "--speculative-num-steps 3 "
         "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4"
+        "--speculative-num-draft-tokens 4 "
+        "--tpu-compile-tracer dynamo"
     ),
 }
 
