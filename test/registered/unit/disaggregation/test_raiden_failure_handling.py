@@ -38,10 +38,12 @@ def _prefill_manager():
     mgr.failure_records = {}
     mgr.failure_lock = threading.Lock()
     mgr._state_lock = threading.Lock()
+    mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
     mgr._completed_send = set()
     mgr._completed_recv = set()
     mgr._failed = set()
+    mgr._native_failed = set()
     mgr._swa_engine = None
     mgr._send_blocks = {}
     mgr._send_swa_blocks = {}
@@ -66,9 +68,12 @@ def _prefill_manager():
     # Chunked-transfer send state swept by _drop_room_state.
     mgr._held_chunks = {}
     mgr._send_total = {}
+    mgr._send_reads = {}
+    mgr._timeout_s = 120.0
     mgr._decode_pages = {}
     mgr._reshard_chunks = {}
-    mgr._reshard_announced = {}
+    mgr._reshard_covered = {}
+    mgr._reshard_ready_pages = {}
     mgr._reshard_pushes_pending = {}
     mgr._reshard_final_pushed = set()
     mgr._pending_offer = {}
@@ -119,13 +124,24 @@ class TestPrefillAbortHandling(unittest.TestCase):
         self.assertNotIn(ROOM, mgr.failure_records)
         self.assertIn(ROOM, mgr._send_blocks)
 
-    def test_abort_for_unknown_room_is_ignored(self):
+    def test_abort_for_unknown_room_tombstones_it(self):
+        """ABORT and PULL_REQ travel on different sockets, so the abort can
+        arrive first; it must still win, or the prefill would admit and
+        compute a request the decode already gave up on, holding its pages
+        until the waiting timeout."""
         mgr = _prefill_manager()
 
         mgr._dispatch(_abort_frame(ROOM))
 
         self.assertEqual(mgr.request_status, {})
         self.assertEqual(mgr.failure_records, {})
+        self.assertTrue(mgr.is_aborted(ROOM))
+
+        # The delayed pull request finds the tombstone and is dropped.
+        mgr._dispatch(
+            [MessageTag.PULL_REQ, str(ROOM).encode(), b"10.0.0.2", b"5555", b"4"]
+        )
+        self.assertNotIn(ROOM, mgr._decode_addr)
 
     def test_malformed_abort_is_ignored(self):
         mgr = _prefill_manager()
@@ -207,6 +223,8 @@ def _decode_manager_stub(**overrides):
         waiting_timeout=300,
         _state_lock=threading.Lock(),
         _aborted={},
+        _failed=set(),
+        _native_failed=set(),
         room_has_active_io=lambda room: False,
     )
     fields.update(overrides)
@@ -214,6 +232,7 @@ def _decode_manager_stub(**overrides):
     mgr._mark_aborted_locked = types.MethodType(
         RaidenKVManager._mark_aborted_locked, mgr
     )
+    mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
     mgr.check_status = lambda room: mgr.request_status[room]
     mgr.record_failure = lambda room, reason: mgr.failure_records.__setitem__(
         room, reason
@@ -239,6 +258,69 @@ def _receiver(mgr):
 
 
 class TestReceiverFailurePaths(unittest.TestCase):
+    def test_failed_status_is_sticky_against_late_progress(self):
+        mgr = CommonKVManager.__new__(CommonKVManager)
+        mgr.request_status = {ROOM: KVPoll.Failed}
+
+        mgr.update_status(ROOM, KVPoll.Transferring)
+
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+
+    def test_abort_while_start_read_blocks_cannot_be_overwritten(self):
+        from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+
+        started = threading.Event()
+        resume = threading.Event()
+        engine = Mock()
+
+        def blocking_start(*_args):
+            started.set()
+            self.assertTrue(resume.wait(5))
+
+        engine.start_read.side_effect = blocking_start
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.request_status = {ROOM: KVPoll.WaitingForInput}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
+        mgr._aborted = {}
+        mgr._failed = set()
+        mgr._native_failed = set()
+        mgr._remote_blocks = {ROOM: [11, 12]}
+        mgr._remote_endpoint = {ROOM: "peer"}
+        mgr._local_blocks = {ROOM: [21, 22]}
+        mgr._local_swa_blocks = {}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_swa_endpoint = {}
+        mgr._swa_engine = None
+        mgr.chunked_transfer = False
+        mgr._full_engine_max_blocks = 4
+        mgr._swa_engine_max_blocks = 0
+        mgr._pulling = SlotAdmission(1)
+        mgr._ensure_engine = lambda: engine
+        mgr._drain_engine = lambda: None
+        mgr.is_failed = lambda room: False
+        mgr.is_recv_done = lambda room: False
+        mgr.room_has_active_io = lambda room: str(room) in mgr._pulling
+        recv = _receiver(mgr)
+        polls = []
+        thread = threading.Thread(target=lambda: polls.append(recv.poll()))
+
+        with patch.object(RaidenKVReceiver, "_send_abort_notification"):
+            thread.start()
+            try:
+                self.assertTrue(started.wait(5))
+                recv.abort()
+                self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+            finally:
+                resume.set()
+                thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(polls, [KVPoll.Transferring])
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+
     def test_poll_fails_after_waiting_timeout_and_notifies_prefill(self):
         mgr = _decode_manager_stub(waiting_timeout=1)
         recv = _receiver(mgr)
@@ -299,8 +381,11 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             _reshard_ready=set(),
             _reshard_req={},
             _reshard_replied_at={},
+            _failed=set(),
+            _native_failed=set(),
             sender_has_active_io=lambda room: False,
         )
+        mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
         mgr.fail_decode_silence = types.MethodType(
             RaidenKVManager.fail_decode_silence, mgr
         )
@@ -518,15 +603,126 @@ class TestGroupFailureDrainGate(unittest.TestCase):
 
     def test_failed_is_withheld_while_any_rank_is_undrained(self):
         poller = SimpleNamespace(
-            group_failure_requires_drain=True, drained=lambda: False
+            group_failure_requires_drain=True,
+            quiesce_group_failure=Mock(),
+            drained=lambda: False,
         )
         self.assertEqual(self._gate([KVPoll.Failed], [poller]), [KVPoll.Transferring])
+        poller.quiesce_group_failure.assert_called_once_with()
 
     def test_failed_lands_once_drained(self):
         poller = SimpleNamespace(
-            group_failure_requires_drain=True, drained=lambda: True
+            group_failure_requires_drain=True,
+            quiesce_group_failure=Mock(),
+            drained=lambda: True,
         )
         self.assertEqual(self._gate([KVPoll.Failed], [poller]), [KVPoll.Failed])
+
+    def test_every_rank_quiesces_before_its_drain_bit_is_sampled(self):
+        events = []
+        poller = SimpleNamespace(
+            group_failure_requires_drain=True,
+            quiesce_group_failure=lambda: events.append("quiesce"),
+            drained=lambda: events.append("drained") or True,
+        )
+
+        self._gate([KVPoll.Failed], [poller])
+
+        self.assertEqual(events, ["quiesce", "drained"])
+
+    def test_tp_and_cp_status_reduce_before_quiesce(self):
+        from sglang.srt.disaggregation.utils import (
+            poll_and_all_reduce_attn_cp_tp_group,
+        )
+
+        tp_group, cp_group = object(), object()
+        events = []
+        poller = SimpleNamespace(
+            group_failure_requires_drain=True,
+            poll=lambda: KVPoll.Success,
+            quiesce_group_failure=lambda: events.append("quiesce"),
+            drained=lambda: events.append("drained") or True,
+        )
+        reduce_count = 0
+
+        def all_reduce(tensor, op=None, group=None):
+            nonlocal reduce_count
+            reduce_count += 1
+            events.append(("reduce", group))
+            # A CP peer contributes the failure on the second status leg.
+            if reduce_count == 2:
+                tensor.fill_(int(KVPoll.Failed))
+
+        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
+            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+            return_value=[int(KVPoll.Success)],
+        ):
+            dist.all_reduce = all_reduce
+            polls = poll_and_all_reduce_attn_cp_tp_group([poller], cp_group, tp_group)
+
+        self.assertEqual(polls, [KVPoll.Failed])
+        self.assertEqual(
+            events,
+            [
+                ("reduce", tp_group),
+                ("reduce", cp_group),
+                "quiesce",
+                "drained",
+                ("reduce", tp_group),
+                ("reduce", cp_group),
+            ],
+        )
+
+    def test_decode_metadata_gate_precedes_tp_cp_status_and_drain_votes(self):
+        from sglang.srt.disaggregation.utils import poll_and_all_reduce
+
+        tp_group, cp_group = object(), object()
+        events = []
+        poller = SimpleNamespace(
+            group_failure_requires_drain=True,
+            poll=lambda: KVPoll.Success,
+            quiesce_group_failure=lambda: events.append("quiesce"),
+            drained=lambda: events.append("drained") or True,
+        )
+        reduce_count = 0
+
+        def all_reduce(tensor, op=None, group=None):
+            nonlocal reduce_count
+            reduce_count += 1
+            events.append(("reduce", group))
+            if reduce_count == 2:
+                tensor.fill_(int(KVPoll.Failed))
+
+        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
+            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+            return_value=[int(KVPoll.Success)],
+        ), patch(
+            "sglang.srt.disaggregation.utils._apply_metadata_gate",
+            side_effect=lambda *args: events.append("metadata"),
+        ):
+            dist.all_reduce = all_reduce
+            polls = poll_and_all_reduce(
+                [poller],
+                tp_group,
+                decode_reqs=[object()],
+                metadata_buffers=object(),
+                server_args=object(),
+                additional_groups=[cp_group],
+            )
+
+        self.assertEqual(polls, [KVPoll.Failed])
+        self.assertEqual(
+            events,
+            [
+                "metadata",
+                ("reduce", tp_group),
+                ("reduce", cp_group),
+                "quiesce",
+                "drained",
+                ("reduce", tp_group),
+                ("reduce", cp_group),
+            ],
+        )
 
     def test_pollers_without_the_capability_keep_todays_behavior(self):
         poller = SimpleNamespace()
@@ -535,6 +731,41 @@ class TestGroupFailureDrainGate(unittest.TestCase):
     def test_raiden_pollers_declare_the_capability(self):
         self.assertTrue(RaidenKVSender.group_failure_requires_drain)
         self.assertTrue(RaidenKVReceiver.group_failure_requires_drain)
+        self.assertTrue(callable(RaidenKVSender.quiesce_group_failure))
+        self.assertTrue(callable(RaidenKVReceiver.quiesce_group_failure))
+
+
+class TestGroupFailureQuiescesRaiden(unittest.TestCase):
+    def test_sender_tombstones_and_retains_accepted_read_lease(self):
+        mgr = _prefill_manager()
+        _populate_send_state(mgr, ROOM)
+        mgr._send_reads[ROOM] = {f"{ROOM}#0"}
+        sender = RaidenKVSender.__new__(RaidenKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = ROOM
+        sender.conclude_state = KVPoll.Success
+
+        sender.quiesce_group_failure()
+
+        self.assertIn(ROOM, mgr._aborted)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertIsNone(sender.conclude_state)
+        self.assertNotIn(ROOM, mgr._send_blocks)
+        self.assertEqual(set(mgr._send_reads[ROOM]), {f"{ROOM}#0"})
+        self.assertFalse(sender.drained())
+
+    def test_receiver_tombstones_and_overrides_cached_success(self):
+        mgr = _decode_manager_stub()
+        recv = _receiver(mgr)
+        recv.conclude_state = KVPoll.Success
+
+        with patch.object(RaidenKVReceiver, "_send_abort_notification") as notify:
+            recv.quiesce_group_failure()
+
+        self.assertIn(ROOM, mgr._aborted)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertEqual(recv.conclude_state, KVPoll.Failed)
+        notify.assert_called_once_with()
 
 
 class TestAdmissionRespectsTheTombstone(unittest.TestCase):
@@ -546,7 +777,8 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
         mgr._engine = Mock()
         mgr._swa_engine = None
         mgr._pulling = SlotAdmission(4)
-        mgr._engine_max_blocks = 8
+        mgr._full_engine_max_blocks = 8
+        mgr._swa_engine_max_blocks = 0
         mgr._local_blocks = {ROOM: [8]}
         mgr._local_swa_blocks = {}
         mgr._remote_blocks = {ROOM: [1]}
@@ -561,6 +793,41 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
 
 
 class TestSenderLeases(unittest.TestCase):
+    def test_registered_read_holds_room_until_poll_stats_settles_it(self):
+        mgr = _prefill_manager()
+        mgr._engine = Mock()
+        mgr._engine.register_read.return_value = True
+
+        mgr._register_sender_read(ROOM, mgr._engine, "7#0", 17, [1, 2])
+        self.assertTrue(mgr.sender_has_active_io(ROOM))
+
+        with mgr._state_lock:
+            mgr._completed_send.add("7#0")
+            mgr._settle_sender_reads_locked()
+        self.assertFalse(mgr.sender_has_active_io(ROOM))
+
+    def test_register_read_exception_terminalizes_the_room(self):
+        mgr = _prefill_manager()
+        mgr.request_status[ROOM] = KVPoll.Transferring
+        mgr._engine = Mock()
+        mgr._engine.register_read.side_effect = RuntimeError("registration broke")
+
+        with self.assertRaisesRegex(RuntimeError, "registration broke"):
+            mgr._register_sender_read(ROOM, mgr._engine, str(ROOM), ROOM, [1, 2])
+
+        self.assertIn(ROOM, mgr._aborted)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertIn("register_read failed", mgr.failure_records[ROOM])
+        self.assertNotIn(ROOM, mgr._send_reads)
+        self.assertFalse(mgr.sender_has_active_io(ROOM))
+
+    def test_registered_read_lease_survives_room_cleanup(self):
+        mgr = _prefill_manager()
+        mgr._send_reads[ROOM] = {"7#0"}
+        mgr._drop_room_state(ROOM)
+        self.assertEqual(set(mgr._send_reads[ROOM]), {"7#0"})
+        self.assertTrue(mgr.sender_has_active_io(ROOM))
+
     def test_drop_keeps_the_push_lease_until_the_worker_returns_it(self):
         mgr = _prefill_manager()
         mgr._reshard_pushes_pending[ROOM] = 1
@@ -579,6 +846,39 @@ class TestSenderLeases(unittest.TestCase):
         self.assertTrue(mgr.sender_has_active_io(ROOM))
         self.assertFalse(mgr.sender_has_active_io(ROOM + 1))
 
+    def test_explicit_sender_abort_waits_for_native_read(self):
+        mgr = _prefill_manager()
+        mgr.request_status[ROOM] = KVPoll.Transferring
+        mgr._send_reads[ROOM] = {"7#0"}
+        sender = RaidenKVSender.__new__(RaidenKVSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = ROOM
+        sender.conclude_state = None
+
+        sender.abort()
+
+        self.assertIn(ROOM, mgr._aborted)
+        self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
+        self.assertIsNone(sender.conclude_state)
+
+
+class TestSenderLeaseSettlement(unittest.TestCase):
+    def test_unserved_read_holds_until_native_settlement(self):
+        # A read the decode never comes for is expired by raiden at its own
+        # deadline; no local timer may drop the lease while the read could
+        # still pull the room's pages.
+        mgr = _prefill_manager()
+        mgr._timeout_s = 0.0
+        mgr._send_reads[ROOM] = {str(ROOM)}
+        self.assertTrue(mgr.sender_has_active_io(ROOM))
+        # raiden reports the read settled: the lease is released.
+        mgr._failed.add(str(ROOM))
+        mgr._native_failed.add(str(ROOM))
+        with mgr._state_lock:
+            mgr._settle_sender_reads_locked()
+        self.assertFalse(mgr.sender_has_active_io(ROOM))
+        self.assertNotIn(ROOM, mgr._send_reads)
+
 
 class TestFailureWaitsForActiveIo(unittest.TestCase):
     def test_failed_room_is_not_concluded_while_its_read_is_in_flight(self):
@@ -588,6 +888,7 @@ class TestFailureWaitsForActiveIo(unittest.TestCase):
         mgr._swa_engine = None
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr._pulling = SlotAdmission(4)
         mgr._pulling.admit(str(ROOM))
         mgr._swa_req_id = lambda room: f"swa:{room}"
@@ -608,6 +909,7 @@ class TestFailureWaitsForActiveIo(unittest.TestCase):
 
             # The read settles: the failure is delivered.
             mgr._failed.add(str(ROOM))
+            mgr._native_failed.add(str(ROOM))
             self.assertEqual(recv.poll(), KVPoll.Failed)
             self.assertEqual(recv.conclude_state, KVPoll.Failed)
 
@@ -629,6 +931,21 @@ class TestReceiverFailureRecords(unittest.TestCase):
         # the same id cannot surface a stale reason.
         mgr.record_failure(ROOM, "unconsumed reason")
         mgr.clear_room(ROOM)
+        self.assertNotIn(ROOM, mgr.failure_records)
+
+    def test_clear_removes_the_failure_record_under_the_room_state_lock(self):
+        mgr = _prefill_manager()
+        observed = []
+
+        class FailureRecords(dict):
+            def pop(records, key, default=None):
+                observed.append(mgr._state_lock.locked())
+                return super().pop(key, default)
+
+        mgr.failure_records = FailureRecords({ROOM: "unconsumed reason"})
+        mgr.clear_room(ROOM)
+
+        self.assertEqual(observed, [True])
         self.assertNotIn(ROOM, mgr.failure_records)
 
 
@@ -665,6 +982,91 @@ class TestSendRevalidatesTheSocket(unittest.TestCase):
         new_sock.send_multipart.assert_called_once_with([b"PING"])
 
 
+class TestConnectDefersStaleSocketClose(unittest.TestCase):
+    def test_stale_socket_close_waits_for_the_send_lock(self):
+        """_connect used to close a monitor-flagged socket under _socket_lock
+        alone, which could close it under a sender inside send_multipart on
+        another thread; the close must wait on the endpoint send lock."""
+
+        class FakeSocket:
+            def __init__(self):
+                self.closed = False
+
+            def close(self, linger=None):
+                self.closed = True
+
+        class FakeMonitor(FakeSocket):
+            def recv_multipart(self, *args):
+                return [b"disconnected"]
+
+        endpoint = "tcp://10.0.0.1:4444"
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._socket_lock = threading.Lock()
+        stale, monitor = FakeSocket(), FakeMonitor()
+        mgr._socket_cache = {endpoint: stale}
+        mgr._monitor_cache = {endpoint: monitor}
+        send_lock = threading.Lock()
+        mgr._socket_send_locks = {endpoint: send_lock}
+        mgr._zmq_ctx = Mock()
+
+        # A send in progress holds the endpoint lock; the close waits for it,
+        # while the fresh socket is already published for new senders.
+        with send_lock:
+            t = threading.Thread(target=mgr._connect, args=(endpoint,))
+            t.start()
+            t.join(0.2)
+            self.assertTrue(t.is_alive())
+            self.assertFalse(stale.closed)
+            self.assertIs(mgr._socket_cache[endpoint], mgr._zmq_ctx.socket.return_value)
+        t.join(2)
+
+        self.assertFalse(t.is_alive())
+        self.assertTrue(stale.closed)
+        self.assertTrue(monitor.closed)
+
+
+class TestHeartbeatPrunesRoomTracker(unittest.TestCase):
+    def test_heartbeat_success_drops_settled_rooms_from_the_tracker(self):
+        """The tracker gains one entry per request and is only consumed when
+        a prefill dies; without the heartbeat prune it grows for the process
+        lifetime."""
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.addr_to_rooms_tracker = {"10.0.0.1:8998": {ROOM, OTHER_ROOM}}
+        mgr.request_status = {ROOM: KVPoll.Transferring}
+
+        mgr._on_heartbeat_success("10.0.0.1:8998")
+
+        self.assertEqual(mgr.addr_to_rooms_tracker["10.0.0.1:8998"], {ROOM})
+
+
+class TestNodeFailureSkipsClearedRooms(unittest.TestCase):
+    def test_cleared_room_is_not_recorded_when_check_status_defaults(self):
+        """NIXL's check_status returns WaitingForInput for a missing room
+        instead of raising, so the node-failure sweep must test membership
+        itself or every historical room of the dead prefill would gain a
+        stale failure record."""
+
+        class DefaultingManager(CommonKVManager):
+            def check_status(self, bootstrap_room):
+                return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
+
+        mgr = DefaultingManager.__new__(DefaultingManager)
+        mgr.connection_lock = threading.Lock()
+        mgr.connection_pool = {}
+        mgr.prefill_info_table = {}
+        mgr.addr_to_rooms_tracker = {"10.0.0.1:8998": {ROOM, OTHER_ROOM}}
+        mgr.request_status = {ROOM: KVPoll.Transferring}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+
+        mgr._handle_node_failure("10.0.0.1:8998")
+
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        self.assertIn(ROOM, mgr.failure_records)
+        self.assertNotIn(OTHER_ROOM, mgr.failure_records)
+        self.assertNotIn(OTHER_ROOM, mgr.request_status)
+
+
 class TestNodeFailureEvictsSockets(unittest.TestCase):
     def test_sockets_to_the_dead_prefill_are_closed_under_the_send_lock(self):
         class FakeSocket:
@@ -676,6 +1078,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
         mgr.connection_pool = {
             "10.0.0.1:8998_0_0_0": [{"rank_ip": "10.0.0.1", "rank_port": 4444}],
@@ -711,6 +1115,126 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         self.assertFalse(other.closed)
         self.assertNotIn(endpoint, mgr._socket_cache)
         self.assertNotIn(endpoint, mgr._monitor_cache)
+
+    def test_heartbeat_failure_serializes_with_native_progress_publication(self):
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
+        mgr.connection_lock = threading.Lock()
+        mgr.connection_pool = {}
+        mgr.request_status = {ROOM: KVPoll.WaitingForInput}
+
+        failure_published = threading.Event()
+        release_failure = threading.Event()
+
+        def base_handler(self_, addr):
+            self_.update_status(ROOM, KVPoll.Failed)
+            failure_published.set()
+            self.assertTrue(release_failure.wait(2))
+
+        with patch.object(CommonKVManager, "_handle_node_failure", base_handler):
+            failure = threading.Thread(
+                target=mgr._handle_node_failure, args=("10.0.0.1:8998",)
+            )
+            failure.start()
+            self.assertTrue(failure_published.wait(2))
+
+            def publish_progress():
+                with mgr._state_lock:
+                    mgr.update_status(ROOM, KVPoll.Transferring)
+
+            progress = threading.Thread(target=publish_progress)
+            progress.start()
+            progress.join(0.2)
+            self.assertTrue(progress.is_alive())
+            release_failure.set()
+            failure.join(2)
+            progress.join(2)
+
+        self.assertFalse(failure.is_alive())
+        self.assertFalse(progress.is_alive())
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+
+    def test_status_transaction_serializes_unlocked_waiting_with_failure(self):
+        inspected_waiting = threading.Event()
+        release_waiting = threading.Event()
+        test_case = self
+
+        class PausingStatus(dict):
+            paused = False
+
+            def __getitem__(self, room):
+                value = super().__getitem__(room)
+                if threading.current_thread().name == "waiting" and not self.paused:
+                    self.paused = True
+                    inspected_waiting.set()
+                    test_case.assertTrue(release_waiting.wait(2))
+                return value
+
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._status_lock = threading.Lock()
+        mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
+
+        waiting = threading.Thread(
+            name="waiting",
+            target=mgr.update_status,
+            args=(ROOM, KVPoll.WaitingForInput),
+        )
+        waiting.start()
+        self.assertTrue(inspected_waiting.wait(2))
+
+        failure = threading.Thread(target=mgr.update_status, args=(ROOM, KVPoll.Failed))
+        failure.start()
+        failure.join(0.2)
+        self.assertTrue(failure.is_alive())
+        release_waiting.set()
+        waiting.join(2)
+        failure.join(2)
+
+        self.assertFalse(waiting.is_alive())
+        self.assertFalse(failure.is_alive())
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+
+    def test_clear_status_joins_the_status_transaction(self):
+        inspected_waiting = threading.Event()
+        release_waiting = threading.Event()
+        test_case = self
+
+        class PausingStatus(dict):
+            paused = False
+
+            def __getitem__(self, room):
+                value = super().__getitem__(room)
+                if threading.current_thread().name == "waiting" and not self.paused:
+                    self.paused = True
+                    inspected_waiting.set()
+                    test_case.assertTrue(release_waiting.wait(2))
+                return value
+
+        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._status_lock = threading.Lock()
+        mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
+
+        waiting = threading.Thread(
+            name="waiting",
+            target=mgr.update_status,
+            args=(ROOM, KVPoll.WaitingForInput),
+        )
+        waiting.start()
+        self.assertTrue(inspected_waiting.wait(2))
+
+        clear = threading.Thread(target=mgr.clear_status, args=(ROOM,))
+        clear.start()
+        clear.join(0.2)
+        self.assertTrue(clear.is_alive())
+
+        release_waiting.set()
+        waiting.join(2)
+        clear.join(2)
+
+        self.assertFalse(waiting.is_alive())
+        self.assertFalse(clear.is_alive())
+        self.assertNotIn(ROOM, mgr.request_status)
 
 
 if __name__ == "__main__":

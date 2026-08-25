@@ -241,6 +241,11 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                # This PP-specialized loop bypasses both batch getters that
+                # normally run the chunk-abort hook. Drive it once per
+                # microbatch so a locally aborted Raiden sender keeps polling
+                # and releases its retained pages when native reads drain.
+                self.process_pending_chunked_abort()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)

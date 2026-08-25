@@ -8,6 +8,9 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    HiCacheRestoreGatedKVReceiver,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
@@ -30,7 +33,95 @@ class FakeReceiver:
         return None
 
 
+class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
+    def test_group_failure_lifecycle_is_forwarded_to_inner_receiver(self):
+        inner = SimpleNamespace(
+            group_failure_requires_drain=True,
+            quiesce_group_failure=MagicMock(),
+            drained=MagicMock(return_value=False),
+        )
+        wrapper = HiCacheRestoreGatedKVReceiver(SimpleNamespace(kv_receiver=inner))
+
+        self.assertTrue(wrapper.group_failure_requires_drain)
+        wrapper.quiesce_group_failure()
+        self.assertFalse(wrapper.drained())
+
+        inner.quiesce_group_failure.assert_called_once_with()
+        inner.drained.assert_called_once_with()
+
+    def test_non_drain_backend_keeps_capability_disabled(self):
+        wrapper = HiCacheRestoreGatedKVReceiver(
+            SimpleNamespace(kv_receiver=SimpleNamespace())
+        )
+
+        self.assertFalse(wrapper.group_failure_requires_drain)
+
+    def test_decode_poll_keeps_hicache_gate_and_reduces_tp_then_cp(self):
+        tp_group, cp_group = object(), object()
+        inner = SimpleNamespace(group_failure_requires_drain=True)
+        decode_req = SimpleNamespace(kv_receiver=inner)
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.gloo_group = tp_group
+        queue.attn_cp_cpu_group = cp_group
+        queue.metadata_buffers = object()
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=True,
+            server_args=object(),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+            return_value=[KVPoll.Transferring],
+        ) as reduce:
+            queue._poll_with_metadata_gate()
+
+        pollers = reduce.call_args.args[0]
+        self.assertIsInstance(pollers[0], HiCacheRestoreGatedKVReceiver)
+        self.assertIs(pollers[0].decode_req, decode_req)
+        self.assertIs(reduce.call_args.args[1], tp_group)
+        self.assertEqual(reduce.call_args.kwargs["additional_groups"], [cp_group])
+
+
 class TestDecodeQueueCleanup(CustomTestCase):
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_prealloc_waiting_row_still_enters_tp_cp_vote(self, reduce):
+        tp_group, cp_group = object(), object()
+        receiver = SimpleNamespace(conclude_state=None)
+        decode_req = SimpleNamespace(
+            waiting_for_input=True,
+            kv_receiver=receiver,
+            req=SimpleNamespace(time_stats=MagicMock()),
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.pp_size = 1
+        queue.gloo_group = tp_group
+        queue.attn_cp_cpu_group = cp_group
+        reduce.return_value = [KVPoll.WaitingForInput]
+
+        queue._update_handshake_waiters()
+
+        reduce.assert_called_once_with(
+            [receiver], tp_group, additional_groups=[cp_group]
+        )
+
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_prealloc_without_cp_keeps_all_waiting_shortcut(self, reduce):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [
+            SimpleNamespace(
+                waiting_for_input=True,
+                kv_receiver=SimpleNamespace(conclude_state=None),
+            )
+        ]
+        queue.pp_size = 1
+        queue.attn_cp_cpu_group = None
+
+        queue._update_handshake_waiters()
+
+        reduce.assert_not_called()
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.

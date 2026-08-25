@@ -1377,6 +1377,10 @@ class Scheduler(
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
             )
 
+            decode_attn_cp_cpu_group = (
+                self.attn_cp_cpu_group if self.ps.attn_cp_size > 1 else None
+            )
+
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
@@ -1385,6 +1389,7 @@ class Scheduler(
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
                 tree_cache=self.tree_cache,
+                attn_cp_cpu_group=decode_attn_cp_cpu_group,
             )
 
             # The decode requests pending for pre-allocation
@@ -1407,6 +1412,7 @@ class Scheduler(
                 pp_rank=self.ps.pp_rank,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                attn_cp_cpu_group=decode_attn_cp_cpu_group,
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3034,6 +3040,7 @@ class Scheduler(
         is excluded from streaming and its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
+        self._drain_deferred_chunked_sender_aborts()
         req = self._pending_chunked_abort_req
         if req is None:
             return
@@ -3048,20 +3055,52 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
+            defer_page_release = (
+                getattr(req.disagg_kv_sender, "group_failure_requires_drain", False)
+                and hasattr(req.disagg_kv_sender, "drained")
+                and not req.disagg_kv_sender.drained()
+            )
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
+        else:
+            defer_page_release = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if defer_page_release:
+            pending = getattr(self, "_deferred_chunked_sender_aborts", None)
+            if pending is None:
+                pending = self._deferred_chunked_sender_aborts = []
+            if all(held is not req for held in pending):
+                pending.append(req)
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
+
+    def _drain_deferred_chunked_sender_aborts(self) -> None:
+        """Release locally-aborted prefill pages after raiden relinquishes them."""
+        pending = getattr(self, "_deferred_chunked_sender_aborts", None)
+        if not pending:
+            return
+        still_held = []
+        for req in pending:
+            sender = req.disagg_kv_sender
+            # Poll through the public transfer interface: Raiden drains native
+            # completions here, while any future drain-aware backend can own
+            # its progress mechanism without exposing manager internals.
+            sender.poll()
+            if not sender.drained():
+                still_held.append(req)
+                continue
+            sender.clear()
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        self._deferred_chunked_sender_aborts = still_held
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""

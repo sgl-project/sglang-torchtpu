@@ -332,6 +332,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        attn_cp_cpu_group: ProcessGroup | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -346,6 +347,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.gloo_group = gloo_group
         # Destinations visible to prefill but not yet on the transfer queue.
         self._num_published_destinations = 0
+        self.attn_cp_cpu_group = attn_cp_cpu_group
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.dp_size = dp_size
@@ -803,10 +805,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> None:
         if not self.queue:
             return
+        attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
 
-        # Still poll if any receiver was aborted, otherwise it stays stuck.
+        # With CP, every row must enter the TP -> CP vote even when this row is
+        # already waiting; a peer may still be Bootstrapping. Without CP, keep
+        # the old shortcut, except when an aborted receiver still needs to be
+        # observed.
         if (
             self.pp_size <= 1
+            and attn_cp_cpu_group is None
             and all(decode_req.waiting_for_input for decode_req in self.queue)
             and not any(
                 decode_req.kv_receiver.conclude_state == KVPoll.Failed
@@ -824,7 +831,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         else:
             polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+                [decode_req.kv_receiver for decode_req in self.queue],
+                self.gloo_group,
+                additional_groups=(
+                    [attn_cp_cpu_group] if attn_cp_cpu_group is not None else None
+                ),
             )
 
         for decode_req, poll in zip(self.queue, polls):
@@ -1828,9 +1839,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
         tree_cache: BasePrefixCache,
+        attn_cp_cpu_group: ProcessGroup | None = None,
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
+        self.attn_cp_cpu_group = attn_cp_cpu_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.metadata_buffers = metadata_buffers
@@ -2019,21 +2032,29 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if self.scheduler.enable_decode_hicache
             else [dr.kv_receiver for dr in self.queue]
         )
+        attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
         return poll_and_all_reduce(
             pollers,
             self.gloo_group,
             decode_reqs=self.queue,
             metadata_buffers=self.metadata_buffers,
             server_args=self.scheduler.server_args,
+            additional_groups=(
+                [attn_cp_cpu_group] if attn_cp_cpu_group is not None else None
+            ),
         )
 
     def _poll_with_staging(self) -> list:
+        attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
         return poll_and_all_reduce_with_staging(
             self.queue,
             self.staging_handler,
             self.gloo_group,
             metadata_buffers=self.metadata_buffers,
             server_args=self.scheduler.server_args,
+            additional_groups=(
+                [attn_cp_cpu_group] if attn_cp_cpu_group is not None else None
+            ),
         )
 
     def _init_staging_handler(self, kv_manager):

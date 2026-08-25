@@ -203,14 +203,15 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
 
 
 def _gate_group_failure_on_drain(polls, pollers, groups):
-    """Deliver a group-wide Failed only once every rank has drained.
+    """Quiesce a group-wide failure, then deliver it once every rank drains.
 
     The MIN reduction lets one rank's Failed (== 0) override peers that
-    still run native transfers into their pages; a backend whose poller
-    sets ``group_failure_requires_drain`` keeps the verdict at
-    Transferring until every rank's ``drained()`` is true over ``groups``,
-    so no rank frees pages a peer's transfer still uses. Backends without
-    the attribute keep today's behavior exactly.
+    still run native transfers into their pages. Before sampling drain state,
+    every participant seals the request locally; this tombstone is the phase
+    boundary that prevents a late control frame from admitting fresh work
+    after a rank has reported itself drained. The drain-bit reduction is the
+    second phase, and withholds Failed until every rank is quiescent. Backends
+    without the capability keep today's behavior exactly.
     """
     gated = [
         i
@@ -220,6 +221,14 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
     ]
     if not gated:
         return polls
+    for i in gated:
+        quiesce = getattr(pollers[i], "quiesce_group_failure", None)
+        if quiesce is None:
+            raise RuntimeError(
+                "A drain-gated transfer poller must implement "
+                "quiesce_group_failure()"
+            )
+        quiesce()
     drained = torch.tensor(
         [1 if pollers[i].drained() else 0 for i in gated],
         dtype=torch.uint8,
@@ -233,12 +242,21 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
     return polls
 
 
+def _reduce_status_and_gate_group_failure(polls, pollers, groups):
+    """Reduce transfer status before applying the group-wide drain gate."""
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    for group in groups:
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return _gate_group_failure_on_drain(tensor_to_reduce.tolist(), pollers, groups)
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    additional_groups: Optional[Iterable[dist.ProcessGroup]] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -250,11 +268,8 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return _gate_group_failure_on_drain(
-        tensor_to_reduce.tolist(), pollers, [gloo_group]
-    )
+    groups = [gloo_group, *(additional_groups or [])]
+    return _reduce_status_and_gate_group_failure(polls, pollers, groups)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -262,22 +277,16 @@ def poll_and_all_reduce_attn_cp_tp_group(
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
 ):
-    # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
-    # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
-
-    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
-    # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
+    # Reduce the status across the complete TPxCP group before applying the
+    # drain gate. Gating after the TP leg would turn Failed into Transferring
+    # before CP peers saw it, so those peers would not tombstone until the
+    # original TP shard drained and surfaced Failed again.
     # The drain bit must cover both groups: a TP-drained failure can still
     # race a CP peer's active transfer.
-    return _gate_group_failure_on_drain(
-        tensor_to_reduce.tolist(), pollers, [attn_tp_cpu_group, attn_cp_cpu_group]
+    return _reduce_status_and_gate_group_failure(
+        _poll_with_failure_injection(pollers),
+        pollers,
+        [attn_tp_cpu_group, attn_cp_cpu_group],
     )
 
 
@@ -287,6 +296,7 @@ def poll_and_all_reduce_with_staging(
     gloo_group: dist.ProcessGroup,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    additional_groups: Optional[Iterable[dist.ProcessGroup]] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
     for decode_req in decode_reqs:
@@ -314,9 +324,8 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return _gate_group_failure_on_drain(poll_tensor.tolist(), receivers, [gloo_group])
+    groups = [gloo_group, *(additional_groups or [])]
+    return _reduce_status_and_gate_group_failure(raw_polls, receivers, groups)
 
 
 #########################

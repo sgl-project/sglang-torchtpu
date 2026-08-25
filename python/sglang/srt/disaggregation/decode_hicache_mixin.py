@@ -157,6 +157,31 @@ class HiCacheRestoreGatedKVReceiver:
     def __init__(self, decode_req: DecodeRequest):
         self.decode_req = decode_req
 
+    @property
+    def group_failure_requires_drain(self) -> bool:
+        """Preserve the wrapped transport's group-failure safety contract."""
+        return bool(
+            getattr(
+                self.decode_req.kv_receiver,
+                "group_failure_requires_drain",
+                False,
+            )
+        )
+
+    def quiesce_group_failure(self) -> None:
+        quiesce = getattr(self.decode_req.kv_receiver, "quiesce_group_failure", None)
+        if quiesce is None:
+            raise RuntimeError(
+                "The wrapped drain-gated receiver has no " "quiesce_group_failure()"
+            )
+        quiesce()
+
+    def drained(self) -> bool:
+        drained = getattr(self.decode_req.kv_receiver, "drained", None)
+        if drained is None:
+            raise RuntimeError("The wrapped drain-gated receiver has no drained()")
+        return bool(drained())
+
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
         if (

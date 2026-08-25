@@ -331,12 +331,21 @@ class CommonKVManager(BaseKVManager):
                 return
             self.request_status[bootstrap_room] = status
         else:
+            # Failed is terminal. In particular, a backend may admit native
+            # work under its state lock and then publish Transferring while a
+            # concurrent heartbeat/abort is failing the same room. Never let
+            # that later progress update revive a terminal request.
+            if self.request_status[bootstrap_room] == KVPoll.Failed:
+                return
             if status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
                 self.request_status[bootstrap_room] = max(
                     self.request_status[bootstrap_room], status
                 )
+
+    def clear_status(self, bootstrap_room: int) -> None:
+        self.request_status.pop(bootstrap_room, None)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -775,6 +784,8 @@ class CommonKVManager(BaseKVManager):
         )
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
+        stale_sock = None
+        stale_monitor = None
         with self._socket_lock:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
@@ -790,11 +801,14 @@ class CommonKVManager(BaseKVManager):
                         disconnected = True
                 if not disconnected:
                     return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
+                # Only unpublish here: a sender that fetched this socket may
+                # be inside send_multipart under the endpoint send lock, and
+                # zmq sockets must not be closed while another thread uses
+                # them. The close waits for that lock below.
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
+                stale_sock = sock
+                stale_monitor = monitor
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -812,7 +826,12 @@ class CommonKVManager(BaseKVManager):
                 zmq.EVENT_DISCONNECTED
             )
             self._socket_send_locks.setdefault(endpoint, threading.Lock())
-            return sock
+        if stale_sock is not None:
+            with self._socket_send_locks[endpoint]:
+                if stale_monitor is not None:
+                    stale_monitor.close()
+                stale_sock.close(linger=0)
+        return sock
 
     def _send_multipart_locked(
         self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
@@ -1077,10 +1096,18 @@ class CommonKVManager(BaseKVManager):
 
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
+            # A room no longer in request_status has been cleared and is not
+            # affected. Backends whose check_status defaults a missing room
+            # (NIXL) rely on the membership test; backends whose check_status
+            # raises (Raiden) can still lose the room to a concurrent clear
+            # between the two lookups.
+            if room not in self.request_status:
+                continue
+            try:
+                status = self.check_status(room)
+            except KeyError:
+                continue
+            if status != KVPoll.Success:
                 self.record_failure(
                     room,
                     f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
@@ -1261,7 +1288,7 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.clear_status(self.bootstrap_room)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
@@ -1522,7 +1549,7 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.clear_status(self.bootstrap_room)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 

@@ -159,6 +159,11 @@ class RaidenKVManager(CommonKVManager):
         self._completed_send: Set[str] = set()
         self._completed_recv: Set[str] = set()
         self._failed: Set[str] = set()
+        # Transfer ids the engine reported failed. Only these mean raiden has
+        # released the transfer's staging; a room failed for a logical reason
+        # (abort, timeout, peer death) shares its id with its closing read, so
+        # room failure must never read as native settlement.
+        self._native_failed: Set[str] = set()
         # Rooms whose pull is issued and not yet settled. Raiden borrows one
         # host staging slot per in-flight transfer and rejects a read it cannot
         # seat, so the decode side admits at most one pull per slot and leaves
@@ -182,6 +187,9 @@ class RaidenKVManager(CommonKVManager):
         self._full_engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
+        # Serializes every request_status read/update/clear for this manager,
+        # so a terminal Failed can never interleave with a progress update.
+        self._status_lock = threading.Lock()
         # Orders chunk announcements against the closing reply. Both travel
         # the same socket, so whatever is sent first also arrives first; this
         # lock decides that order, and an announcement that loses the race is
@@ -196,6 +204,13 @@ class RaidenKVManager(CommonKVManager):
             self._send_aux: Dict[int, bytes] = {}
             self._decode_addr: Dict[int, Tuple[str, int]] = {}
             self._replied: Set[int] = set()
+            # Reads registered for the decode to pull, by request id and
+            # publish time. A lease is the room's claim on its pages: it
+            # starts before the (possibly blocking) registration, settles
+            # when the engine reports the read served or failed, and ages
+            # out after the transfer deadline for a read the decode never
+            # comes for.
+            self._send_reads: Dict[int, Set[str]] = {}
             # Chunks announced before the decode asked for the room, held until
             # a PULL_REQ names it (a resharded room never gets one).
             self._held_chunks: Dict[int, List[Tuple[int, List[int]]]] = {}
@@ -208,7 +223,13 @@ class RaidenKVManager(CommonKVManager):
             # pushes still running, so the room counts as sent only after the
             # last one.
             self._reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = {}
-            self._reshard_announced: Dict[int, int] = {}
+            # Page spans whose chunk plan this decode registered; the
+            # closing plan covers exactly the pages outside their union, so a
+            # chunk that lost its race anywhere in the range is not skipped.
+            self._reshard_covered: Dict[int, List[Tuple[int, int]]] = {}
+            # Pages each decode declared for its closing push, from its
+            # RESHARD_READY. The closing push moves exactly these.
+            self._reshard_ready_pages: Dict[int, List[int]] = {}
             self._reshard_pushes_pending: Dict[int, int] = {}
             self._reshard_final_pushed: Set[int] = set()
             # Committed pages not yet announced, gathered until they make a
@@ -234,7 +255,11 @@ class RaidenKVManager(CommonKVManager):
             # already issued for a room.
             self._chunk_queue: Dict[int, List[tuple]] = {}
             self._remote_total: Dict[int, int] = {}
-            self._announced_pages: Dict[int, int] = {}
+            # Page spans covered by chunk announcements, as (start, end).
+            # Chunks are announced from two threads and can cross on the wire,
+            # so a later span can arrive first and the covered set can have
+            # holes; the closing read pulls exactly the uncovered pages.
+            self._announced_spans: Dict[int, List[Tuple[int, int]]] = {}
             self._chunk_reads: Dict[int, List[str]] = {}
             self._final_seen: Set[int] = set()
             # Chunk announcements from each resharding source, by chunk index,
@@ -484,8 +509,11 @@ class RaidenKVManager(CommonKVManager):
                 with self._state_lock:
                     self._completed_send.update(self._norm_req_id(r) for r in done_send)
                     self._completed_recv.update(self._norm_req_id(r) for r in done_recv)
-                    self._failed.update(self._norm_req_id(r) for r in failed)
+                    norm_failed = {self._norm_req_id(r) for r in failed}
+                    self._native_failed.update(norm_failed)
+                    self._failed.update(norm_failed)
                     self._release_pull_slots_locked()
+                    self._settle_sender_reads_locked()
                     settled_plans = self._settled_cleared_plans_locked()
                 for uuid in settled_plans:
                     self._unregister_plan(uuid)
@@ -493,6 +521,38 @@ class RaidenKVManager(CommonKVManager):
                     logger.error(
                         "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
                     )
+
+    def check_status(self, bootstrap_room: int) -> KVPoll:
+        with self._status_lock:
+            return super().check_status(bootstrap_room)
+
+    def update_status(self, bootstrap_room: int, status: KVPoll) -> None:
+        """Make CommonKVManager's sticky terminal transition atomic for Raiden."""
+        with self._status_lock:
+            return super().update_status(bootstrap_room, status)
+
+    def clear_status(self, bootstrap_room: int) -> None:
+        """Serialize room cleanup with every Raiden status transition."""
+        with self._status_lock:
+            return super().clear_status(bootstrap_room)
+
+    def _fail_room_locked(
+        self, room: int, reason: str, *, preserve_reason: bool = False
+    ) -> None:
+        """Publish a room failure while holding ``_state_lock``.
+
+        ``clear_room`` takes the same lock while removing both the transfer
+        marker and its diagnostic. Keeping the failure record write inside
+        this transaction means a poll can never observe ``_failed`` before
+        its reason exists, and a late writer cannot recreate a record after
+        clear.
+        """
+        if preserve_reason:
+            with self.failure_lock:
+                self.failure_records.setdefault(room, reason)
+        else:
+            self.record_failure(room, reason)
+        self._failed.add(str(room))
 
     def _handle_node_failure(self, failed_bootstrap_addr: str) -> None:
         """Fail the rooms of a prefill the heartbeat declared down and close
@@ -507,9 +567,23 @@ class RaidenKVManager(CommonKVManager):
                     ip, port = info.get("rank_ip"), info.get("rank_port")
                     if ip and port:
                         stale.add(NetworkAddress(ip, int(port)).to_tcp())
-        super()._handle_node_failure(failed_bootstrap_addr)
+        # Native admission and progress publication use _state_lock. Publish
+        # the heartbeat failure under that same lock so update_status cannot
+        # observe the old state, lose a race to Failed, and then revive the
+        # room with a later Transferring write.
+        with self._state_lock:
+            super()._handle_node_failure(failed_bootstrap_addr)
         for endpoint in stale:
             self._disconnect_endpoint(endpoint)
+
+    def _on_heartbeat_success(self, bootstrap_addr: str) -> None:
+        """Drop settled rooms from the room tracker, which otherwise keeps
+        one entry per request served by ``bootstrap_addr`` for the process
+        lifetime and is only consumed when that prefill dies."""
+        tracked = self.addr_to_rooms_tracker[bootstrap_addr].copy()
+        for room in tracked:
+            if room not in self.request_status:
+                self.addr_to_rooms_tracker[bootstrap_addr].discard(room)
 
     def _send_multipart_locked(
         self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
@@ -615,6 +689,20 @@ class RaidenKVManager(CommonKVManager):
             self._announce_chunk(room, start, block_ids, total_pages)
         self._maybe_reply(room)
 
+    @staticmethod
+    def _uncovered_pages(total: int, spans: List[Tuple[int, int]]) -> List[int]:
+        """Pages of ``[0, total)`` no span covers, in order.
+
+        A chunk announcement can be skipped when it loses the race with the
+        closing reply, so the covered set is not a prefix: whatever it misses
+        anywhere in the range rides the closing transfer.
+        """
+        covered = [False] * total
+        for lo, hi in spans:
+            for pg in range(max(lo, 0), min(hi, total)):
+                covered[pg] = True
+        return [pg for pg in range(total) if not covered[pg]]
+
     def _on_chunk(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.CHUNK, 8)
         room = int(msg[1].decode("ascii"))
@@ -628,13 +716,17 @@ class RaidenKVManager(CommonKVManager):
             if room in self._aborted:
                 return
             self._remote_total[room] = total_pages
-            # Chunks are announced from two threads and can cross on the wire,
-            # so the announced reach is the furthest chunk end, not the last.
-            self._announced_pages[room] = max(
-                self._announced_pages.get(room, 0), start + len(blocks)
+            self._announced_spans.setdefault(room, []).append(
+                (start, start + len(blocks))
             )
             self._chunk_queue.setdefault(room, []).append(
-                (req_id, uuid, start, blocks, endpoint)
+                (
+                    req_id,
+                    uuid,
+                    list(range(start, start + len(blocks))),
+                    blocks,
+                    endpoint,
+                )
             )
 
     def _on_abort(self, msg: List[bytes]) -> None:
@@ -642,26 +734,33 @@ class RaidenKVManager(CommonKVManager):
 
         The room's send state is dropped and later send calls for it are
         ignored, so a prefill still computing the request cannot register a
-        read nobody will pull. A room that already succeeded, or that this
-        rank never tracked, is left untouched.
+        read nobody will pull. A room that already succeeded is left
+        untouched; a room this rank does not know yet is tombstoned, so an
+        abort that outruns the pull request (they travel on different
+        sockets) or the sender's creation still wins.
         """
         try:
             room = int(msg[1].decode("ascii"))
-        except Exception as e:
+        except (IndexError, ValueError) as e:
             logger.debug("RaidenKVManager ignoring malformed abort: %s", e)
             return
-        if room not in self.request_status or self.check_status(room) == KVPoll.Success:
-            logger.debug(
-                "RaidenKVManager abort for room %d ignored (completed or unknown)",
-                room,
-            )
-            return
-        self.record_failure(room, "Aborted by decode-side abort notification.")
         with self._state_lock:
-            # The tombstone and the Failed status land as one step, so a
-            # concurrent finalize either sees the tombstone or its
-            # Transferring update lands first and is overwritten here.
+            # The status check, the tombstone, the failure record, and the
+            # Failed status land as one step. A concurrent finalize either
+            # sees the tombstone or is overwritten here; a concurrent clear
+            # pops the status before its locked sweep, so an abort either
+            # sees no status and only tombstones, or writes its records
+            # before the sweep that removes them.
+            try:
+                status = self.check_status(room)
+            except KeyError:
+                status = None
+            if status == KVPoll.Success:
+                return
             self._mark_aborted_locked(room)
+            if status is None:
+                return
+            self._fail_room_locked(room, "Aborted by decode-side abort notification.")
             self.update_status(room, KVPoll.Failed)
         self._drop_room_state(room)
 
@@ -695,7 +794,7 @@ class RaidenKVManager(CommonKVManager):
             self._remote_swa_endpoint[room] = swa_endpoint
             aux_index = self._decode_aux_index.get(room)
             if self.chunked_transfer:
-                announced = self._announced_pages.get(room, 0)
+                spans = self._announced_spans.get(room, [])
                 total = len(remote_blocks)
                 if self._remote_total.get(room, total) != total:
                     logger.warning(
@@ -707,10 +806,16 @@ class RaidenKVManager(CommonKVManager):
                         total,
                     )
                 self._remote_total[room] = total
-                tail_start, tail = self._tail_after(remote_blocks, announced)
-                if tail:
+                missing = self._uncovered_pages(total, spans)
+                if missing:
                     self._chunk_queue.setdefault(room, []).append(
-                        (str(room), room, tail_start, tail, endpoint)
+                        (
+                            str(room),
+                            room,
+                            missing,
+                            [remote_blocks[p] for p in missing],
+                            endpoint,
+                        )
                     )
                 self._final_seen.add(room)
             # Written under the lock: a room failing concurrently frees its
@@ -839,7 +944,15 @@ class RaidenKVManager(CommonKVManager):
                 uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
                 addr = self._decode_addr[room]
             req_id = f"{room}#{index}"
-            self._ensure_engine().register_read(req_id, uuid, block_ids)
+            self._register_sender_read(
+                room, self._ensure_engine(), req_id, uuid, block_ids
+            )
+            with self._state_lock:
+                # Registration may block while an abort seals the room. Keep
+                # the native lease, but never publish a fresh pull after the
+                # tombstone is visible.
+                if room in self._aborted:
+                    return
             payload = [
                 MessageTag.CHUNK,
                 str(room).encode("ascii"),
@@ -919,21 +1032,75 @@ class RaidenKVManager(CommonKVManager):
             if started is None or time.time() - started < timeout:
                 return False
             self._mark_aborted_locked(room)
+            self._fail_room_locked(
+                room,
+                f"Request {room} timed out after {time.time() - since:.1f}s "
+                "waiting for the decode to ask for its KV",
+            )
             self.update_status(room, KVPoll.Failed)
-        self.record_failure(
-            room,
-            f"Request {room} timed out after {time.time() - since:.1f}s "
-            "waiting for the decode to ask for its KV",
-        )
         return True
 
-    def sender_has_active_io(self, room: int) -> bool:
-        """Whether this side still stages or pushes the room's KV.
+    def _register_sender_read(
+        self, room: int, engine: Any, req_id: str, uuid: int, block_ids: List[int]
+    ) -> None:
+        """Register one producer read while retaining its source-page lease.
 
-        While it does, the room's pages must not be handed back -- the copy
-        or push would read them under their next owner.
+        ``register_read`` publishes physical device block ids to raiden. The
+        consumer may not pull them until later, so the lease starts before
+        the potentially blocking registration and ends only when poll_stats
+        reports the request id settled: raiden expires a read nobody pulls at
+        its own deadline and reports it, so no second timer runs here. A
+        false return means raiden accepted no work, so no lease is left
+        behind; a registration failure fails the room.
         """
         with self._state_lock:
+            if room in self._aborted:
+                return
+            self._send_reads.setdefault(room, set()).add(req_id)
+        try:
+            accepted = bool(engine.register_read(req_id, uuid, block_ids))
+        except Exception as exc:
+            with self._state_lock:
+                self._discard_sender_read_locked(room, req_id)
+                if room not in self._aborted:
+                    self._mark_aborted_locked(room)
+                    self._fail_room_locked(
+                        room, f"Raiden register_read failed for {req_id}: {exc}"
+                    )
+                    self.update_status(room, KVPoll.Failed)
+            raise
+        if not accepted:
+            with self._state_lock:
+                self._discard_sender_read_locked(room, req_id)
+
+    def _discard_sender_read_locked(self, room: int, req_id: str) -> None:
+        reads = self._send_reads.get(room)
+        if reads is None:
+            return
+        reads.discard(req_id)
+        if not reads:
+            self._send_reads.pop(room, None)
+
+    def _settle_sender_reads_locked(self) -> None:
+        settled = self._completed_send | self._native_failed
+        for room, reads in list(self._send_reads.items()):
+            reads -= settled
+            if not reads:
+                self._send_reads.pop(room, None)
+
+    def sender_has_active_io(self, room: int) -> bool:
+        """Whether the room's pages may still be under a transfer this side
+        serves: a registered read the decode can pull any moment, a running
+        push, or a parked staging copy.
+
+        While any holds, the pages must not be handed back -- the transfer
+        would read them under their next owner. A read the decode never
+        comes for is expired by raiden at its own deadline and settles
+        through poll_stats like any other.
+        """
+        with self._state_lock:
+            if self._send_reads.get(room):
+                return True
             if getattr(self, "_reshard_pushes_pending", {}).get(room, 0) > 0:
                 return True
             for entry in getattr(self, "_stale_plans", []):
@@ -960,8 +1127,12 @@ class RaidenKVManager(CommonKVManager):
             self._replied.add(room)
         with self._announce_lock:
             if self._swa_engine is not None:
-                self._swa_engine.register_read(self._swa_req_id(room), room, swa_blocks)
-            self._ensure_engine().register_read(str(room), room, blocks)
+                self._register_sender_read(
+                    room, self._swa_engine, self._swa_req_id(room), room, swa_blocks
+                )
+            self._register_sender_read(
+                room, self._ensure_engine(), str(room), room, blocks
+            )
             with self._state_lock:
                 # The room can fail while its reads register; the decode is
                 # gone and its own handlers drop frames for the room.
@@ -1064,11 +1235,11 @@ class RaidenKVManager(CommonKVManager):
         whichever engine it is on, so the read's admission stays claimed until
         both it and its paired sliding-window read have settled.
         """
-        settled = key in self._completed_recv or key in self._failed
+        settled = key in self._completed_recv or key in self._native_failed
         swa_rid = self._paired_swa_read(key)
         if swa_rid is not None:
             settled = settled and (
-                swa_rid in self._completed_recv or swa_rid in self._failed
+                swa_rid in self._completed_recv or swa_rid in self._native_failed
             )
         return settled
 
@@ -1080,10 +1251,11 @@ class RaidenKVManager(CommonKVManager):
         """
         uuids = []
         for req_id, uuid in list(self._cleared_plans.items()):
-            if req_id in self._completed_recv or req_id in self._failed:
+            if req_id in self._completed_recv or req_id in self._native_failed:
                 del self._cleared_plans[req_id]
                 self._completed_recv.discard(req_id)
                 self._failed.discard(req_id)
+                self._native_failed.discard(req_id)
                 uuids.append(uuid)
         return uuids
 
@@ -1114,6 +1286,7 @@ class RaidenKVManager(CommonKVManager):
                 for rid in (key, self._paired_swa_read(key) or key):
                     self._completed_recv.discard(rid)
                     self._failed.discard(rid)
+                    self._native_failed.discard(rid)
 
     def _reject_oversized_pull(
         self,
@@ -1164,16 +1337,22 @@ class RaidenKVManager(CommonKVManager):
                     return started
                 local = self._local_blocks[room]
                 total = self._remote_total.get(room, 0)
-                req_id, uuid, start, blocks, endpoint = queue[0]
-                window = chunk_pull_window(start, len(blocks), total, len(local))
-                if not window:
-                    # Pages the decode already holds, or the page it reserved
-                    # for the first decode token.
+                req_id, uuid, pages, blocks, endpoint = queue[0]
+                # The decode holds the last len(local) pages; pages below that
+                # base were already here, or reserved for the first decode
+                # token, and are not pulled.
+                base = total - len(local)
+                pairs = [
+                    (blk, local[pg - base])
+                    for pg, blk in zip(pages, blocks)
+                    if pg >= base
+                ]
+                if not pairs:
                     queue.pop(0)
                     continue
-                if window.length > self._full_engine_max_blocks:
+                if len(pairs) > self._full_engine_max_blocks:
                     oversized = (
-                        window.length,
+                        len(pairs),
                         self._full_engine_max_blocks,
                         "full-attention",
                         "SGLANG_RAIDEN_MAX_BLOCKS",
@@ -1202,13 +1381,13 @@ class RaidenKVManager(CommonKVManager):
                     return started
                 if not self._pulling.admit(req_id):
                     return started
+                # Status moves with the admission, under the same lock an
+                # abort takes: a Transferring write can never follow the
+                # abort's Failed.
+                self.update_status(room, KVPoll.Transferring)
                 queue.pop(0)
-                remote_slice = blocks[
-                    window.chunk_offset : window.chunk_offset + window.length
-                ]
-                local_slice = local[
-                    window.local_offset : window.local_offset + window.length
-                ]
+                remote_slice = [blk for blk, _ in pairs]
+                local_slice = [loc for _, loc in pairs]
                 self._chunk_reads.setdefault(room, []).append(req_id)
             engine.start_read(req_id, uuid, endpoint, remote_slice, local_slice)
             if closing:
@@ -1284,6 +1463,9 @@ class RaidenKVManager(CommonKVManager):
                 return True
             if room in self._aborted or not self._pulling.admit(str(room)):
                 return False
+            # Status moves with the admission, under the same lock an abort
+            # takes: a Transferring write can never follow the abort's Failed.
+            self.update_status(room, KVPoll.Transferring)
         engine.start_read(str(room), room, endpoint, remote, local)
         if self._swa_engine is not None:
             self._swa_engine.start_read(
@@ -1417,6 +1599,8 @@ class RaidenKVManager(CommonKVManager):
         index = int(msg[2].decode("ascii"))
         uuid = int(msg[3].decode("ascii"))
         with self._state_lock:
+            if room in self._aborted:
+                return
             chunk = self._reshard_chunks.get(room, {}).get(index)
             if chunk is None:
                 logger.error(
@@ -1430,12 +1614,6 @@ class RaidenKVManager(CommonKVManager):
             if index in acked:
                 return
             acked.add(index)
-            start, block_ids = chunk
-            # Only an acknowledged chunk -- one the decode registered and
-            # asked for -- leaves the closing transfer's span.
-            self._reshard_announced[room] = max(
-                self._reshard_announced.get(room, 0), start + len(block_ids)
-            )
             self._reshard_pushes_pending[room] = (
                 self._reshard_pushes_pending.get(room, 0) + 1
             )
@@ -1508,13 +1686,11 @@ class RaidenKVManager(CommonKVManager):
                     registering.discard(index)
                     if not registering:
                         self._reshard_chunk_registering.pop(room, None)
-                # The frontier moves only for a chunk whose plan is published
-                # and whose push was asked for, so the closing transfer keeps
-                # every span the sources still owe.
+                # A span is covered only once its chunk plan is published,
+                # so the closing transfer keeps every span the sources still
+                # owe -- including one that lost its race mid-range.
                 if accepted_end is not None and room in self._reshard_meta:
-                    self._announced_pages[room] = max(
-                        self._announced_pages.get(room, 0), accepted_end
-                    )
+                    self._reshard_covered.setdefault(room, []).append(accepted_end)
         self._maybe_register_reshard_final(room)
 
     def _register_reshard_chunk(
@@ -1591,7 +1767,7 @@ class RaidenKVManager(CommonKVManager):
             room, req_id, uuid, req, payload, ready_endpoints
         ):
             return None
-        return start + window.chunk_offset + window.length
+        return (start, start + length)
 
     def _on_reshard_blocks(self, msg: List[bytes]) -> None:
         self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 5)
@@ -1725,35 +1901,41 @@ class RaidenKVManager(CommonKVManager):
         geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
         n = len(local_blocks)
         if self.chunked_transfer:
-            # Only the pages no chunk announcement covered are left to move.
-            with self._state_lock:
-                announced = self._announced_pages.get(room, 0)
+            # Only the pages no registered chunk plan covers are left to
+            # move. The covered set is not a prefix -- a chunk can lose its
+            # race anywhere in the range -- so the closing plan is its exact
+            # complement, and the READY tells the sources to push just that.
             any_blocks = next(iter(sources_map.values()))
-            tail_start, tail = self._tail_after(any_blocks, announced)
-            window = chunk_pull_window(tail_start, len(tail), len(any_blocks), n)
+            total = len(any_blocks)
+            base = total - n
+            with self._state_lock:
+                covered = list(self._reshard_covered.get(room, []))
+            missing = [pg for pg in self._uncovered_pages(total, covered) if pg >= base]
             with self._state_lock:
                 if room not in self._reshard_meta:
-                    return  # cleared while the tail was computed
+                    return  # cleared while the complement was computed
                 # The closing read is owed from the moment the room can look
                 # complete: it is recorded before _final_seen so completion
                 # can never be inferred while its registration is pending.
-                if window:
+                if missing:
                     self._chunk_reads.setdefault(room, []).append(str(room))
                 self._final_seen.add(room)
-            if not window:
+            payload_pages = pack_ints(missing)
+            if not missing:
                 for endpoint in ready_endpoints:
-                    payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
+                    payload = [
+                        MessageTag.RESHARD_READY,
+                        str(room).encode("ascii"),
+                        payload_pages,
+                    ]
                     self._send_multipart_locked(endpoint, payload)
                 return
-            lo = tail_start + window.chunk_offset
             sources = [
-                (p_rank, sources_map[p_rank][lo : lo + window.length])
+                (p_rank, [sources_map[p_rank][pg] for pg in missing])
                 for p_rank in sorted(sources_map)
             ]
-            local_blocks = local_blocks[
-                window.local_offset : window.local_offset + window.length
-            ]
-            n = window.length
+            local_blocks = [local_blocks[pg - base] for pg in missing]
+            n = len(missing)
         else:
             # A decode prefix hit leaves decode holding fewer (tail) pages than
             # the prefill produced; keep the last n of each source's blocks so
@@ -1791,27 +1973,41 @@ class RaidenKVManager(CommonKVManager):
                 len(local_blocks),
                 local_blocks[:4],
             )
+        ready_payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
+        if self.chunked_transfer:
+            ready_payload.append(pack_ints(missing))
         self._publish_reshard_plan(
             room,
             str(room),
             room,
             req,
-            [MessageTag.RESHARD_READY, str(room).encode("ascii")],
+            ready_payload,
             ready_endpoints,
             record_read=not self.chunked_transfer,
         )
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_READY, 2)
+        # Two frames from a plain reshard; a chunked one appends the pages
+        # its closing plan covers.
+        if len(msg) not in (2, 3):
+            raise ValueError(
+                f"malformed RESHARD_READY message: expected 2 or 3 frames, "
+                f"got {len(msg)}"
+            )
         room = int(msg[1].decode("ascii"))
+        pages = unpack_ints(msg[2]) if len(msg) > 2 else []
         with self._state_lock:
+            if room in self._aborted:
+                return
             self._reshard_ready.add(room)
+            self._reshard_ready_pages[room] = pages
         self._maybe_reshard_push(room)
 
     def _maybe_reshard_push(self, room: int) -> None:
         with self._state_lock:
             if (
-                room not in self._reshard_ready
+                room in self._aborted
+                or room not in self._reshard_ready
                 or room not in self._reshard_req
                 or room not in self._send_blocks
                 or room in self._reshard_pushed
@@ -1833,7 +2029,7 @@ class RaidenKVManager(CommonKVManager):
         except Exception as e:
             logger.error("raiden reshard push failed for room %s: %s", room, e)
             with self._state_lock:
-                self._failed.add(str(room))
+                self._fail_room_locked(room, f"Raiden reshard push failed: {e}")
         finally:
             # The pending count is this push's lease on the room's pages;
             # it is handed back here in every mode and on every outcome.
@@ -1865,12 +2061,13 @@ class RaidenKVManager(CommonKVManager):
         )
 
         with self._state_lock:
-            if room not in self._reshard_req:
-                return  # the room was cleared before the push ran
+            if room in self._aborted or room not in self._reshard_req:
+                return  # the room failed or was cleared before the push ran
             req_meta = dict(self._reshard_req[room])
             if chunk is None:
                 prefill_blocks = list(self._send_blocks[room])
-                start = self._reshard_announced.get(room, 0)
+                ready_pages = list(self._reshard_ready_pages.get(room, []))
+                start = 0
             else:
                 start, prefill_blocks = self._reshard_chunks[room].pop(chunk)
             total_pages = self._send_total.get(room, len(prefill_blocks))
@@ -1882,20 +2079,28 @@ class RaidenKVManager(CommonKVManager):
         req_id = str(room)
         if self.chunked_transfer:
             if chunk is None:
+                # The decode declared exactly which pages its closing plan
+                # covers; pushing this side's frontier instead could skip a
+                # chunk that lost its race mid-range on the decode.
                 uuid = room
-                start, prefill_blocks = self._tail_after(prefill_blocks, start)
+                if not ready_pages:
+                    return
+                base = total_pages - n
+                prefill_blocks = [prefill_blocks[pg] for pg in ready_pages]
+                decode_blocks = [decode_blocks[pg - base] for pg in ready_pages]
+                n = len(ready_pages)
             else:
                 req_id = f"{room}#{chunk}"
-            window = chunk_pull_window(start, len(prefill_blocks), total_pages, n)
-            if not window:
-                return
-            prefill_blocks = prefill_blocks[
-                window.chunk_offset : window.chunk_offset + window.length
-            ]
-            decode_blocks = decode_blocks[
-                window.local_offset : window.local_offset + window.length
-            ]
-            n = window.length
+                window = chunk_pull_window(start, len(prefill_blocks), total_pages, n)
+                if not window:
+                    return
+                prefill_blocks = prefill_blocks[
+                    window.chunk_offset : window.chunk_offset + window.length
+                ]
+                decode_blocks = decode_blocks[
+                    window.local_offset : window.local_offset + window.length
+                ]
+                n = window.length
         else:
             uuid = room
             if len(prefill_blocks) > n:
@@ -2022,7 +2227,10 @@ class RaidenKVManager(CommonKVManager):
                     if belongs(key) and not self._pull_settled_locked(key):
                         return True
             for req_id in (getattr(self, "_reshard_plans", None) or {}).get(room, {}):
-                if req_id not in self._completed_recv and req_id not in self._failed:
+                if (
+                    req_id not in self._completed_recv
+                    and req_id not in self._native_failed
+                ):
                     return True
         return False
 
@@ -2032,13 +2240,11 @@ class RaidenKVManager(CommonKVManager):
         An abort tombstone survives the room: frames for it can still arrive
         and must stay rejected. Tombstones age out on their own.
         """
-        self._drop_room_state(room)
-        # An unconsumed failure reason goes with the room, so a later room
-        # with the same id can never surface it.
-        with self.failure_lock:
-            self.failure_records.pop(room, None)
+        self._drop_room_state(room, clear_failure_record=True)
 
-    def _drop_room_state(self, room: int) -> None:
+    def _drop_room_state(
+        self, room: int, *, clear_failure_record: bool = False
+    ) -> None:
         rid = str(room)
         swa_rid = self._swa_req_id(room)
         chunk_prefix = f"{room}#"
@@ -2065,7 +2271,7 @@ class RaidenKVManager(CommonKVManager):
             settled_plans = []
             plans = (getattr(self, "_reshard_plans", None) or {}).pop(room, {})
             for req_id, uuid in plans.items():
-                if req_id in self._completed_recv or req_id in self._failed:
+                if req_id in self._completed_recv or req_id in self._native_failed:
                     settled_plans.append(uuid)
                     continue
                 self._cleared_plans[req_id] = uuid
@@ -2073,12 +2279,12 @@ class RaidenKVManager(CommonKVManager):
             self._completed_send.difference_update(
                 [k for k in self._completed_send if belongs(k)]
             )
-            for ids in (self._completed_recv, self._failed):
+            for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
             for d in (
                 getattr(self, "_chunk_queue", None),
                 getattr(self, "_remote_total", None),
-                getattr(self, "_announced_pages", None),
+                getattr(self, "_announced_spans", None),
                 getattr(self, "_chunk_reads", None),
                 getattr(self, "_held_chunks", None),
                 getattr(self, "_send_total", None),
@@ -2086,7 +2292,8 @@ class RaidenKVManager(CommonKVManager):
                 getattr(self, "_chunk_seq", None),
                 getattr(self, "_reshard_chunks", None),
                 getattr(self, "_pending_offer", None),
-                getattr(self, "_reshard_announced", None),
+                getattr(self, "_reshard_covered", None),
+                getattr(self, "_reshard_ready_pages", None),
                 getattr(self, "_reshard_chunk_acked", None),
                 getattr(self, "_reshard_chunk_registering", None),
                 getattr(self, "_reshard_chunk_sources", None),
@@ -2120,6 +2327,11 @@ class RaidenKVManager(CommonKVManager):
             ):
                 if s is not None:
                     s.discard(room)
+            if clear_failure_record:
+                # Failure publication takes _state_lock before failure_lock as
+                # well, so clear and publication have one total order.
+                with self.failure_lock:
+                    self.failure_records.pop(room, None)
         for uuid in settled_plans:
             self._unregister_plan(uuid)
         self._release_host_slot(room)
@@ -2235,6 +2447,42 @@ class RaidenKVSender(CommonKVSender):
         """No transfer of this room still runs on this rank."""
         return not self.kv_mgr.sender_has_active_io(self.bootstrap_room)
 
+    def quiesce_group_failure(self) -> None:
+        """Seal this rank before the group snapshots its native drain bit."""
+        with self.kv_mgr._state_lock:
+            self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
+            self.kv_mgr._fail_room_locked(
+                self.bootstrap_room,
+                "Raiden transfer failed on another attention TP/CP rank.",
+                preserve_reason=True,
+            )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        # A local Success may have been cached before a peer contributed the
+        # group failure. Re-enter the failure poll path after this collective.
+        self.conclude_state = None
+        # State that could admit new work is discarded, while the leases added
+        # for already accepted reads/stages/pushes intentionally survive.
+        self.kv_mgr._drop_room_state(self.bootstrap_room)
+
+    def abort(self) -> None:
+        """Seal a local abort, but do not conclude it over retained source KV.
+
+        The scheduler may recycle the request's blocks as soon as this sender
+        is terminal. Keep ``conclude_state`` unset until every native read /
+        stage / push lease has settled; the normal poll path then publishes
+        Failed.
+        """
+        with self.kv_mgr._state_lock:
+            self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
+            self.kv_mgr._fail_room_locked(self.bootstrap_room, "Aborted by AbortReq.")
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        self.kv_mgr._drop_room_state(self.bootstrap_room)
+        self.conclude_state = (
+            None
+            if self.kv_mgr.sender_has_active_io(self.bootstrap_room)
+            else KVPoll.Failed
+        )
+
     def failure_exception(self):
         """Drop the room's state, then raise the recorded failure reason."""
         with self.kv_mgr.failure_lock:
@@ -2306,23 +2554,37 @@ class RaidenKVReceiver(CommonKVReceiver):
         if self._check_waiting_timeout() is not None:
             return self._conclude_failed()
         if self.kv_mgr.maybe_start_pull(self.bootstrap_room) and not self._started:
+            # The manager turned the room Transferring inside the admission.
             self._started = True
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Transferring)
             return KVPoll.Transferring
         return self.kv_mgr.check_status(self.bootstrap_room)
 
     def abort(self):
         """Explicit local abort: same terminal path as any failure, so active
         transfers keep the room's pages until they settle."""
-        self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self._conclude_failed()
+        self._conclude_failed(reason="Aborted by AbortReq.")
 
     def drained(self) -> bool:
         """No transfer of this room still runs on this rank."""
         return not self.kv_mgr.room_has_active_io(self.bootstrap_room)
 
-    def _conclude_failed(self, notify: bool = True) -> KVPoll:
+    def quiesce_group_failure(self) -> None:
+        """Tombstone this rank before the group snapshots its drain bit."""
+        # A local Success can race a peer failure. Clear it so the sticky
+        # Failed state below owns every subsequent local poll, and notify the
+        # corresponding prefill rank to stop publishing work for this room.
+        self.conclude_state = None
+        self._conclude_failed(
+            reason="Raiden transfer failed on another attention TP/CP rank.",
+            preserve_reason=True,
+        )
+
+    def _conclude_failed(
+        self,
+        notify: bool = True,
+        reason: Optional[str] = None,
+        preserve_reason: bool = False,
+    ) -> KVPoll:
         """Terminalize the room: tombstone it so late frames cannot rebuild
         it, and tell the prefill to release it.
 
@@ -2332,7 +2594,15 @@ class RaidenKVReceiver(CommonKVReceiver):
         already stops anything new; the settled room fails on a later poll.
         """
         with self.kv_mgr._state_lock:
+            # Tombstone and terminal status are one transaction with native
+            # admission. A read admitted first becomes a drain obligation;
+            # otherwise admission observes the tombstone and does nothing.
             self.kv_mgr._mark_aborted_locked(self.bootstrap_room)
+            if reason is not None:
+                self.kv_mgr._fail_room_locked(
+                    self.bootstrap_room, reason, preserve_reason=preserve_reason
+                )
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         if notify:
             self._notify_prefill_abort()
         if self.kv_mgr.room_has_active_io(self.bootstrap_room):

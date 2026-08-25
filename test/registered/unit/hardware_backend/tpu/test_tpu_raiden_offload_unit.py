@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     get_raiden_kv_caches,
 )
 from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
-from sglang.srt.disaggregation.raiden.serde import MessageTag, unpack_blocks
+from sglang.srt.disaggregation.raiden.serde import MessageTag, pack_ints, unpack_blocks
 from sglang.srt.disaggregation.utils import KVClassType, TransferBackend
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
@@ -227,6 +227,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
@@ -241,6 +242,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
@@ -266,13 +268,17 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
                 mgr._aborted = {}
+                mgr._send_reads = {}
                 mgr.failure_records = {}
                 mgr.failure_lock = threading.Lock()
                 mgr.request_status = {}
                 mgr._state_lock = threading.Lock()
+                mgr._status_lock = threading.Lock()
                 mgr._announce_lock = threading.Lock()
                 mgr._send_blocks = {}
+                mgr._read_leases = {}
                 mgr._aborted = {}
+                mgr._send_reads = {}
                 mgr._send_aux = {}
                 mgr._decode_addr = {}
                 mgr._replied = set()
@@ -317,14 +323,18 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr.kv_args = Mock(state_types=[StateType.SWA])
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._send_blocks = {}
+        mgr._read_leases = {}
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr._send_swa_blocks = {}
         mgr._send_aux = {}
         mgr._decode_addr = {}
@@ -368,10 +378,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         room = 29
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
         mgr._pulling = SlotAdmission(1)
@@ -385,6 +397,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
         mgr.chunked_transfer = False
         mgr._failed = set()
+        mgr._native_failed = set()
 
         self.assertTrue(mgr.maybe_start_pull(room))
         mgr._engine.start_read.assert_called_once_with(
@@ -411,10 +424,16 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = Mock()
         mgr._pulling = SlotAdmission(1)
         mgr._pulling_cleared = set()
+        mgr._aborted = {}
+        mgr._send_reads = {}
+        mgr._status_lock = threading.Lock()
+        mgr.request_status = {}
+        mgr._failed_reasons = {}
         mgr._full_engine_max_blocks = full_max_blocks
         mgr._swa_engine_max_blocks = swa_max_blocks
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr.record_failure = Mock()
         mgr._local_blocks = {room: list(range(1000, 1000 + full_pages))}
         mgr._local_swa_blocks = {room: list(range(2000, 2000 + swa_pages))}
@@ -480,11 +499,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = None
         mgr._pulling = SlotAdmission(1)
@@ -492,6 +513,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._full_engine_max_blocks = 4
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr._local_blocks = {first: [8], second: [9]}
         mgr._local_swa_blocks = {}
         mgr._remote_blocks = {first: [1], second: [2]}
@@ -514,11 +536,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def _decode_mgr(capacity, full_limit, swa_limit=None):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock() if swa_limit is not None else None
         mgr._pulling = SlotAdmission(capacity)
@@ -528,6 +552,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr._local_blocks = {}
         mgr._local_swa_blocks = {}
         mgr._remote_blocks = {}
@@ -577,6 +602,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self._announce(mgr, first, full_pages=2)
         self._announce(mgr, second, full_pages=2)
         mgr._send_blocks = {}
+        mgr._read_leases = {}
 
         self.assertTrue(mgr.maybe_start_pull(first))
         # The framework aborts the request while raiden still holds the read.
@@ -596,6 +622,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self._announce(mgr, first, full_pages=2)
         self._announce(mgr, second, full_pages=2)
         mgr._send_blocks = {}
+        mgr._read_leases = {}
 
         self.assertTrue(mgr.maybe_start_pull(first))
         mgr._completed_recv.add(str(first))
@@ -613,6 +640,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         # The full-attention read fails while the sliding-window read is
         # still in flight on the other engine.
         mgr._failed.add(str(first))
+        mgr._native_failed.add(str(first))
         with mgr._state_lock:
             mgr._release_pull_slots_locked()
         self.assertFalse(mgr.maybe_start_pull(second))
@@ -625,6 +653,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
@@ -722,10 +751,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.register_read = Mock(return_value=True)
@@ -738,6 +769,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._decode_addr = {}
         mgr._decode_pages = {}
         mgr._send_blocks = {}
+        mgr._read_leases = {}
         mgr._replied = set()
         mgr._pending_offer = {}
         mgr._announce_pages = 16
@@ -820,10 +852,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     def _decode(room, local, capacity):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.start_read = Mock(return_value=0)
         mgr._swa_engine = None
@@ -837,11 +871,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._remote_total = {room: 64}
         mgr._chunk_queue = {}
         mgr._chunk_reads = {}
-        mgr._announced_pages = {}
+        mgr._announced_spans = {}
         mgr._final_seen = set()
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr._pulling_cleared = set()
         # clear_room sweeps the reshard bookkeeping too.
         mgr._reshard_slot_of = {}
@@ -859,7 +894,9 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._local_swa_blocks = {room: [7]}
         mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
         mgr._final_seen.add(room)
-        mgr._chunk_queue[room] = [(str(room), room, 48, remote[48:64], endpoint)]
+        mgr._chunk_queue[room] = [
+            (str(room), room, list(range(48, 48 + 16)), remote[48:64], endpoint)
+        ]
 
         self.assertTrue(mgr.maybe_start_pull(room))
         mgr._engine.start_read.assert_called_once_with(
@@ -880,8 +917,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
         mgr._chunk_queue[room] = [
-            ("33#0", 11, 0, remote[0:16], endpoint),
-            ("33#1", 12, 16, remote[16:32], endpoint),
+            ("33#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
+            ("33#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
 
         self.assertTrue(mgr.maybe_start_pull(room))
@@ -909,7 +946,9 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         mgr = self._decode(room, local, capacity=4)
         mgr._full_engine_max_blocks = 8
-        mgr._chunk_queue[room] = [("43#0", 11, 0, remote[0:16], "127.0.0.1:31020")]
+        mgr._chunk_queue[room] = [
+            ("43#0", 11, list(range(0, 0 + 16)), remote[0:16], "127.0.0.1:31020")
+        ]
 
         self.assertFalse(mgr.maybe_start_pull(room))
         mgr._engine.start_read.assert_not_called()
@@ -927,7 +966,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._local_swa_blocks = {room: [7, 8, 9]}
         mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
         mgr._chunk_queue[room] = [
-            (str(room), room, 48, remote[48:64], "127.0.0.1:31020")
+            (
+                str(room),
+                room,
+                list(range(48, 48 + 16)),
+                remote[48:64],
+                "127.0.0.1:31020",
+            )
         ]
 
         self.assertFalse(mgr.maybe_start_pull(room))
@@ -960,7 +1005,61 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # The second chunk overtakes the first on the wire.
         mgr._on_chunk(chunk("45#1", 16, remote[16:32]))
         mgr._on_chunk(chunk("45#0", 0, remote[0:16]))
-        self.assertEqual(mgr._announced_pages[room], 32)
+        self.assertEqual(sorted(mgr._announced_spans[room]), [(0, 16), (16, 32)])
+
+    def test_closing_read_covers_a_chunk_lost_mid_range(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_blocks
+
+        # Chunk 0:16 lost its announcement race while 16:32 got through; the
+        # closing read must pull 0:16 and 32:64, not just the tail.
+        room = 46
+        remote = list(range(100, 164))
+        mgr = self._decode(room, list(range(200, 264)), capacity=4)
+        mgr._remote_blocks = {}
+        mgr._remote_endpoint = {}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_swa_endpoint = {}
+        mgr._decode_aux_index = {}
+        mgr._on_chunk(
+            [
+                MessageTag.CHUNK,
+                str(room).encode("ascii"),
+                b"46#1",
+                b"11",
+                b"16",
+                b"64",
+                pack_blocks(remote[16:32]),
+                b"127.0.0.1:31020",
+            ]
+        )
+        mgr._on_blocks(
+            [
+                MessageTag.BLOCKS,
+                str(room).encode("ascii"),
+                pack_blocks(remote),
+                b"127.0.0.1:31020",
+                pack_blocks([]),
+                b"",
+                b"",
+            ]
+        )
+        req_id, uuid, pages, blocks, _ = mgr._chunk_queue[room][-1]
+        self.assertEqual(req_id, str(room))
+        self.assertEqual(pages, list(range(0, 16)) + list(range(32, 64)))
+        self.assertEqual(blocks, remote[0:16] + remote[32:64])
+
+    def test_room_failure_does_not_settle_its_closing_read(self):
+        # An abort shares its id with the closing read; only the engine's own
+        # report may release the pages the read still writes.
+        room = 47
+        mgr = self._decode(room, list(range(200, 264)), capacity=4)
+        mgr._pulling.admit(str(room))
+        with mgr._state_lock:
+            mgr._fail_room_locked(room, "aborted mid-read")
+        self.assertTrue(mgr.room_has_active_io(room))
+        with mgr._state_lock:
+            mgr._native_failed.add(str(room))
+        self.assertFalse(mgr.room_has_active_io(room))
 
     def test_failed_chunk_read_fails_the_request(self):
         room = 42
@@ -969,14 +1068,15 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
         mgr._chunk_queue[room] = [
-            ("42#0", 11, 0, remote[0:16], endpoint),
-            ("42#1", 12, 16, remote[16:32], endpoint),
+            ("42#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
+            ("42#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
         self.assertTrue(mgr.maybe_start_pull(room))
         self.assertFalse(mgr.is_failed(room))
 
         with mgr._state_lock:
             mgr._failed.add("42#0")
+            mgr._native_failed.add("42#0")
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.is_failed(room))
         self.assertFalse(mgr.is_failed(420))
@@ -993,8 +1093,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr = self._decode(first, local, capacity=1)
         mgr._local_blocks[second] = local
         mgr._remote_total[second] = 64
-        mgr._chunk_queue[first] = [("36#0", 11, 0, remote[0:16], endpoint)]
-        mgr._chunk_queue[second] = [("37#0", 21, 0, remote[0:16], endpoint)]
+        mgr._chunk_queue[first] = [
+            ("36#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint)
+        ]
+        mgr._chunk_queue[second] = [
+            ("37#0", 21, list(range(0, 0 + 16)), remote[0:16], endpoint)
+        ]
 
         self.assertTrue(mgr.maybe_start_pull(first))
         mgr._completed_send.add("36#0")
@@ -1019,8 +1123,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
         mgr._chunk_queue[room] = [
-            ("38#0", 11, 0, remote[0:16], endpoint),
-            ("38#1", 12, 16, remote[16:32], endpoint),
+            ("38#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
+            ("38#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
         self.assertTrue(mgr.maybe_start_pull(room))
         with mgr._state_lock:
@@ -1048,14 +1152,19 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._remote_swa_endpoint = {first: "127.0.0.1:31022", second: "127.0.0.1:31022"}
         mgr._local_blocks[second] = local
         mgr._remote_total[second] = 64
-        mgr._chunk_queue[first] = [(str(first), first, 48, remote[48:64], endpoint)]
-        mgr._chunk_queue[second] = [(str(second), second, 48, remote[48:64], endpoint)]
+        mgr._chunk_queue[first] = [
+            (str(first), first, list(range(48, 48 + 16)), remote[48:64], endpoint)
+        ]
+        mgr._chunk_queue[second] = [
+            (str(second), second, list(range(48, 48 + 16)), remote[48:64], endpoint)
+        ]
 
         self.assertTrue(mgr.maybe_start_pull(first))
         # The full-attention read fails while the sliding-window read is
         # still in flight on the other engine.
         with mgr._state_lock:
             mgr._failed.add(str(first))
+            mgr._native_failed.add(str(first))
             mgr._release_pull_slots_locked()
         self.assertFalse(mgr.maybe_start_pull(second))
         self.assertEqual(mgr._engine.start_read.call_count, 1)
@@ -1077,7 +1186,9 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._remote_swa_blocks = {room: [4, 5]}
         mgr._local_swa_blocks = {room: [7]}
         mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
-        mgr._chunk_queue[room] = [(str(room), room, 48, remote[48:64], endpoint)]
+        mgr._chunk_queue[room] = [
+            (str(room), room, list(range(48, 48 + 16)), remote[48:64], endpoint)
+        ]
 
         self.assertTrue(mgr.maybe_start_pull(room))
         with mgr._state_lock:
@@ -1181,11 +1292,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._reshard_push_lock = threading.Lock()
         mgr._engine = Mock()
@@ -1200,6 +1313,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
         mgr._send_blocks = {}
+        mgr._read_leases = {}
         mgr._send_swa_blocks = {}
         mgr._send_aux = {}
         mgr._send_total = {}
@@ -1215,7 +1329,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_pushed = set()
         mgr._reshard_replied_at = {}
         mgr._reshard_chunks = {}
-        mgr._reshard_announced = {}
+        mgr._reshard_covered = {}
+        mgr._reshard_ready_pages = {}
         mgr._reshard_chunk_acked = {}
         mgr._pending_offer = {}
         mgr._announce_pages = 16
@@ -1224,8 +1339,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr._pulling = None
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr._pulling_cleared = set()
         mgr._cleared_plans = {}
         mgr._socket = Mock()
@@ -1274,9 +1391,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_chunks[room] = {0: (0, list(range(16))), 1: (16, list(range(16)))}
         mgr._push_executor = Mock()  # hold the push; only the accounting matters
         mgr._on_reshard_chunk_ready([MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"7"])
-        self.assertEqual(mgr._reshard_announced[room], 16)
+        self.assertEqual(mgr._reshard_chunk_acked[room], {0})
         mgr._on_reshard_chunk_ready([MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"7"])
-        self.assertEqual(mgr._reshard_announced[room], 16)
+        self.assertEqual(mgr._reshard_chunk_acked[room], {0})
         self.assertEqual(mgr._reshard_pushes_pending[room], 1)
         self.assertEqual(mgr._push_executor.submit.call_count, 1)
 
@@ -1289,7 +1406,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_replied.add(room)
         mgr._announce_reshard_chunk(room, 0, list(range(16)), 64)
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK), [])
-        self.assertNotIn(room, mgr._reshard_announced)
+        self.assertNotIn(room, mgr._reshard_chunk_acked)
 
     def test_chunk_racing_the_closing_reply_is_skipped(self):
         # A chunk announced after the reply would arrive after it and outlive
@@ -1345,7 +1462,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
             mgr.append_send_blocks(room, blocks[32:64])
             mgr.finalize_send(room, None)
             self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_BLOCKS)), 1)
-            mgr._on_reshard_ready([MessageTag.RESHARD_READY, b"41"])
+            mgr._on_reshard_ready(
+                [
+                    MessageTag.RESHARD_READY,
+                    b"41",
+                    pack_ints(list(range(32, 64))),
+                ]
+            )
             self.assertEqual(mgr._failed, set())
             uuid, req = mgr._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))
@@ -1357,11 +1480,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
     def _decode(self):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock(transfer_address="10.0.0.2:31000")
         mgr._swa_engine = None
@@ -1383,20 +1508,24 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_sources = {self.ROOM: {}}
         mgr._reshard_registered = set()
         mgr._reshard_chunk_sources = {}
+        mgr._reshard_covered = {}
+        mgr._reshard_ready_pages = {}
         mgr._reshard_chunk_registering = {}
         mgr._reshard_plans = {}
         mgr._cleared_plans = {}
         mgr._pulling = None
         mgr._aborted = {}
+        mgr._send_reads = {}
         mgr._pulling_cleared = set()
         mgr._chunk_reads = {}
         mgr._chunk_queue = {}
         mgr._final_seen = set()
-        mgr._announced_pages = {}
+        mgr._announced_spans = {}
         mgr._remote_total = {}
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
+        mgr._native_failed = set()
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()
@@ -1770,6 +1899,54 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertEqual(_plan_blocks(req, 1), (src[1][24:64], self.DECODE_BLOCKS))
         self.assertNotIn(room, mgr._reshard_chunk_sources)
         self.assertEqual(mgr._chunk_reads[room], ["41"])
+
+    def test_closing_plan_covers_a_reshard_chunk_lost_mid_range(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_ints, unpack_ints
+
+        # Chunk 0 (pages 24:32) lost its race; chunk 1 (pages 32:40) was
+        # registered by both sources. The closing plan and the READY must
+        # cover 24:32 and 40:64, not just the tail past the furthest chunk.
+        room = self.ROOM
+        src = {0: list(range(100, 164)), 1: list(range(300, 364))}
+        mgr = self._decode()
+
+        with patch.dict(sys.modules, _pb2_modules()):
+            for rank in (0, 1):
+                mgr._on_reshard_chunk(
+                    [
+                        MessageTag.RESHARD_CHUNK,
+                        b"41",
+                        b"1",
+                        b"32",
+                        b"64",
+                        pack_ints(src[rank][32:40]),
+                        str(rank).encode("ascii"),
+                    ]
+                )
+            for rank in (0, 1):
+                mgr._on_reshard_blocks(
+                    [
+                        MessageTag.RESHARD_BLOCKS,
+                        b"41",
+                        pack_ints(src[rank]),
+                        str(rank).encode("ascii"),
+                        b"",
+                    ]
+                )
+
+        missing = list(range(24, 32)) + list(range(40, 64))
+        uuid, req = mgr._engine.register_active_plan.call_args.args
+        self.assertEqual((uuid, req.req_id), (room, "41"))
+        self.assertEqual(
+            _plan_blocks(req, 0),
+            (
+                [src[0][pg] for pg in missing],
+                self.DECODE_BLOCKS[0:8] + self.DECODE_BLOCKS[16:40],
+            ),
+        )
+        readies = self._sent(mgr, MessageTag.RESHARD_READY)
+        self.assertTrue(readies)
+        self.assertEqual(unpack_ints(readies[-1][2]), missing)
 
     def test_closing_plan_waits_for_chunk_registration_to_publish(self):
         from sglang.srt.disaggregation.raiden.serde import pack_ints

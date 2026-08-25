@@ -15,9 +15,12 @@ Per request (keyed by `bootstrap_room`): prefill `register_read`s its page
 block-ids; decode pushes a pull request with its rank endpoint; prefill replies
 with its block-ids + raiden endpoint + aux blob; decode issues `start_read`.
 Both sides drain `poll_stats()` in `poll()` — prefill frees on `done_sending`,
-decode runs on `done_recving`. Cross-rank gating is the framework's existing
-`poll_and_all_reduce` (min over ranks); no worker-side barrier. Page ids come
-from `kv_to_page_indices` in token order and are raiden block ids directly.
+decode runs on `done_recving`. Cross-rank status first reduces to the minimum
+over the complete attention-TP/CP group. If any rank fails, every Raiden poller
+tombstones the room before a second reduction confirms that accepted native
+I/O has drained on every rank; only then can the framework release KV pages.
+Page ids come from `kv_to_page_indices` in token order and are raiden block ids
+directly.
 
 KV moves chunk by chunk: as each chunked-prefill step commits its pages the
 prefill announces them, and the decode pulls each piece as soon as a staging
