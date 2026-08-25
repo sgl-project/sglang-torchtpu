@@ -4,7 +4,6 @@ Unsupported sampling features retain the full-vocabulary PyTorch path."""
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
@@ -22,7 +21,7 @@ _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
     1, envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE.get()
 )
 # Kill switch for the sort-free top-k/top-p/min-p filtering path.
-_BSEARCH_SAMPLING_ENABLED = os.getenv("SGLANG_TPU_BSEARCH_SAMPLING", "1") == "1"
+_BSEARCH_SAMPLING_ENABLED = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
 
 
 def distributed_top_k_min_batch_size() -> int:
@@ -59,6 +58,31 @@ def _use_bsearch_filtering(probs: torch.Tensor) -> bool:
     """The sort-free mask is a TPU custom op; CPU tensors (unit tests, other
     devices) keep the generic torch fallback."""
     return _BSEARCH_SAMPLING_ENABLED and probs.device.type == "tpu"
+
+
+def _filter_gathered_top_k_probs(
+    top_k_probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+) -> torch.Tensor:
+    """Apply top-p/min-p inside a gathered descending [bs, k] block.
+
+    Exact versus full-width filtering: a nucleus narrower than k finds the
+    same cutoff in the block, a wider one keeps the whole block (which is
+    what ANDing with top-k yields), and min-p's reference max is the block's
+    first column. Nothing renormalizes on this path, so gathered
+    probabilities stay directly comparable to full-row ones."""
+
+    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+
+    return tpu_filter_probs(
+        top_k_probs,
+        sampling_info.top_ks,
+        sampling_info.top_ps,
+        sampling_info.min_ps,
+        need_top_k=False,  # gathering k columns already applied top-k
+        need_top_p=sampling_info.need_top_p_sampling,
+        need_min_p=sampling_info.need_min_p_sampling,
+    )
 
 
 def distributed_top_k_for_batch(
@@ -205,17 +229,25 @@ class TpuSampler(Sampler):
                 positions=positions,
             )
         top_k = sampling_info.uniform_top_k
+        needs_top_p_or_min_p = (
+            sampling_info.need_top_p_sampling or sampling_info.need_min_p_sampling
+        )
         if (
             top_k is not None
             and 1 < top_k <= MAX_DISTRIBUTED_TOP_K
             and sampling_info.sampling_seed is None
             and sampling_info.need_top_k_sampling
-            and not sampling_info.need_top_p_sampling
-            and not sampling_info.need_min_p_sampling
+            and (not needs_top_p_or_min_p or _use_bsearch_filtering(probs))
         ):
             from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
 
             global_top_k_probs, global_top_k_token_ids = tpu_top_k(probs, top_k)
+            if needs_top_p_or_min_p:
+                # Filtering the gathered block replaces ~30 full-vocabulary
+                # reductions with ~30 reductions over top_k columns.
+                global_top_k_probs = _filter_gathered_top_k_probs(
+                    global_top_k_probs, sampling_info
+                )
             sampled_top_k_position = sampling_from_probs_torch(global_top_k_probs)
             return torch.gather(
                 global_top_k_token_ids,
@@ -235,9 +267,9 @@ class TpuSampler(Sampler):
                 sampling_info.top_ks,
                 sampling_info.top_ps,
                 sampling_info.min_ps,
-                sampling_info.need_top_k_sampling,
-                sampling_info.need_top_p_sampling,
-                sampling_info.need_min_p_sampling,
+                need_top_k=sampling_info.need_top_k_sampling,
+                need_top_p=sampling_info.need_top_p_sampling,
+                need_min_p=sampling_info.need_min_p_sampling,
             )
             return sampling_from_probs_torch(filtered_probs)
 

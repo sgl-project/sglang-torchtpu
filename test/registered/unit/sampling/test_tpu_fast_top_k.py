@@ -405,11 +405,89 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             info.top_ks,
             info.top_ps,
             info.min_ps,
-            info.need_top_k_sampling,
-            info.need_top_p_sampling,
-            info.need_min_p_sampling,
+            need_top_k=info.need_top_k_sampling,
+            need_top_p=info.need_top_p_sampling,
+            need_min_p=info.need_min_p_sampling,
         )
         sample.assert_called_once_with(filtered)
+
+    def test_uniform_top_k_with_top_p_filters_the_gathered_block(self):
+        """With the sort-free mask available, uniform top-k plus top-p/min-p
+        keeps the native-TopK fast path: the block of k gathered columns is
+        filtered in place (need_top_k=False — gathering already applied it)
+        instead of paying ~30 full-vocabulary reductions."""
+        sampler = SimpleNamespace()
+        probs = torch.rand(1, 128)
+        positions = torch.tensor([7])
+        info = _forward_batch(need_top_p_sampling=True).sampling_info
+        global_top_k_probs = torch.tensor([[0.7, 0.3]])
+        filtered_block = torch.tensor([[0.7, 0.0]])
+        global_top_k_token_ids = torch.tensor([[91, 17]], dtype=torch.int32)
+
+        with (
+            patch.object(
+                tpu_sampler_module, "_use_bsearch_filtering", return_value=True
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.top_k.tpu_top_k",
+                return_value=(global_top_k_probs, global_top_k_token_ids),
+            ) as top_k,
+            patch(
+                "sglang.srt.hardware_backend.tpu.sampling_mask.tpu_filter_probs",
+                return_value=filtered_block,
+            ) as filter_probs,
+            patch.object(
+                tpu_sampler_module,
+                "sampling_from_probs_torch",
+                return_value=torch.tensor([0], dtype=torch.int32),
+            ) as sample,
+        ):
+            actual = TpuSampler._sample_from_probs(
+                sampler, probs, info, positions, simple_sampling_case=False
+            )
+
+        torch.testing.assert_close(actual, torch.tensor([91], dtype=torch.int32))
+        top_k.assert_called_once_with(probs, 50)
+        filter_probs.assert_called_once_with(
+            global_top_k_probs,
+            info.top_ks,
+            info.top_ps,
+            info.min_ps,
+            need_top_k=False,
+            need_top_p=True,
+            need_min_p=False,
+        )
+        sample.assert_called_once_with(filtered_block)
+
+    def test_kill_switch_restores_the_torch_reference_path(self):
+        """With bsearch filtering disabled, uniform top-k plus top-p must NOT
+        take the native-TopK fast path (its block filter would be
+        unavailable) and must fall through to the torch sort reference —
+        the kill switch restores pre-PR behavior exactly."""
+        sampler = SimpleNamespace()
+        probs = torch.rand(1, 128)
+        positions = torch.tensor([7])
+        info = _forward_batch(need_top_p_sampling=True).sampling_info
+        expected = torch.tensor([17], dtype=torch.int32)
+
+        with (
+            patch.object(
+                tpu_sampler_module, "_use_bsearch_filtering", return_value=False
+            ),
+            patch("sglang.srt.hardware_backend.tpu.top_k.tpu_top_k") as top_k,
+            patch.object(
+                tpu_sampler_module,
+                "top_k_top_p_min_p_sampling_from_probs_torch",
+                return_value=expected,
+            ) as generic_sampler,
+        ):
+            actual = TpuSampler._sample_from_probs(
+                sampler, probs, info, positions, simple_sampling_case=False
+            )
+
+        self.assertIs(actual, expected)
+        top_k.assert_not_called()
+        generic_sampler.assert_called_once()
 
     def test_uniform_top_k_uses_post_gather_native_top_k(self):
         sampler = SimpleNamespace()
