@@ -80,7 +80,7 @@ dependencies = [
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
-  "tpu-raiden-torch==0.0.1.dev20260819190323",
+  "tpu-raiden-torch==0.0.1.dev20260825123352",
   "libtpu==0.0.44.1",
   "torch==2.11.0",
   "torchvision==0.26.0",
