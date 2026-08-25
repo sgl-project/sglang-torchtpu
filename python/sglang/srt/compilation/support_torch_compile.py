@@ -107,6 +107,7 @@ class DecoderCompilePolicy(CompilePolicy):
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> bool:
+        """Materialize an idle DP rank for a shared extend shape, if supported."""
         return False
 
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:

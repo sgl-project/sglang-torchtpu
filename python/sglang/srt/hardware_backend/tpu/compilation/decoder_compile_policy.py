@@ -731,6 +731,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> bool:
+        """Materialize an empty DP rank as one TPU extend request.
+
+        This belongs to the decoder policy rather than the speculative policy:
+        normal and speculative extend/prefill forwards both need every DP rank
+        to execute the same compiled shape. Keeping the construction here also
+        avoids embedding TPU-specific compile inputs in ``ForwardBatch``.
+        """
         if forward_batch.seq_lens.shape[0] != 0:
             return False
 
