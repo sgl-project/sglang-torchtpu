@@ -75,7 +75,7 @@ jobs:
           if [ "$safe_trigger" != "$safe_origin" ]; then
             who="${safe_trigger:0:20}-rr-${safe_origin:0:20}"
           fi
-          tag="$(date -u +%Y%m%d)-${who}-${safe_ref:0:12}-${{ github.run_id }}"
+          tag="$(date -u +%Y%m%d)-${who}-${safe_ref:0:12}-${{ github.run_id }}.${{ github.run_attempt }}"
           bucket="${GCP_PROJECT}_cloudbuild"
           object="source/${tag}.tgz"
           # `gcloud builds submit` runs a client-side staging/service-usage pre-flight
