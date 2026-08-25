@@ -1,7 +1,7 @@
-"""Qwen3-Coder-480B EAGLE3 single-host GSM8K quality gate.
+"""Qwen3-Coder-480B EAGLE3 single-host GSM8K quality gates.
 
-The quality lane launches the same speculative-decoding configuration as the
-functional integration test, then scores 200 GSM8K examples through run_eval.
+The quality lanes cover the standard and hybrid-DP speculative-decoding
+configurations, then score 200 GSM8K examples through run_eval.
 """
 
 import os
@@ -9,11 +9,7 @@ import os
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 
-register_tpu_ci(
-    est_time=3600,
-    suite="stage-b-test-tpu-4-v7",
-    disabled="Removed from CI",
-)
+register_tpu_ci(est_time=7200, suite="nightly-tpu-4-v7", nightly=True)
 
 SERVED_MODEL_NAME = "qwen3-coder-480b"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
@@ -29,12 +25,11 @@ LAUNCH_ENV = {
     "ISL": "4096",
     "OSL": "512",
     "CONCUR": "16",
-    "DP_SIZE": "2",
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": "8192",
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 8",
+    "TPU_COMPILE_BS": "1 2 4 16",
     "DISABLE_RADIX_CACHE": "0",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "EXTRA_ARGS": (
@@ -50,15 +45,22 @@ LAUNCH_ENV = {
     ),
 }
 
+HYBRID_DP_LAUNCH_ENV = {
+    **LAUNCH_ENV,
+    "DP_SIZE": "2",
+    # These are DP-local buckets; launcher reconciliation adds global bs=16.
+    "TPU_COMPILE_BS": "1 2 4 8",
+}
+
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
-    "test_name": "qwen3-coder-480b-spec-decoding-hybrid-dp-gsm8k",
-    "variant": "TP8+EP8+DP2+EAGLE3",
+    "test_name": "qwen3-coder-480b-spec-decoding-gsm8k",
+    "variant": "TP8+EP8+EAGLE3",
     "launch": {
         "recipe": "recipe/qwen3_coder_480b/server.sh",
         "env": LAUNCH_ENV,
         "health_timeout": HEALTH_TIMEOUT,
-        "tag": "qwen3-coder-480b-spec-dp-gsm8k-e2e",
+        "tag": "qwen3-coder-480b-spec-gsm8k-e2e",
     },
     "gates": [
         {
@@ -73,6 +75,17 @@ MODEL_CONFIG = {
     ],
 }
 
+HYBRID_DP_MODEL_CONFIG = {
+    **MODEL_CONFIG,
+    "test_name": "qwen3-coder-480b-spec-decoding-hybrid-dp-gsm8k",
+    "variant": "TP8+EP8+DP2+EAGLE3",
+    "launch": {
+        **MODEL_CONFIG["launch"],
+        "env": HYBRID_DP_LAUNCH_ENV,
+        "tag": "qwen3-coder-480b-spec-dp-gsm8k-e2e",
+    },
+}
+
 
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    model_config_main([MODEL_CONFIG, HYBRID_DP_MODEL_CONFIG], base_url=BASE_URL)

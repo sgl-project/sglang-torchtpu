@@ -23,7 +23,7 @@ from sglang.test.tpu.server_test_suite import (
 )
 
 register_tpu_ci(
-    est_time=10800,
+    est_time=21600,
     suite="nightly-tpu-integration",
     nightly=True,
 )
@@ -75,6 +75,26 @@ def load_speed_bench_prompts(*, category=None):
             f"{len(prompts)} rows contain prompts"
         )
     return prompts
+
+
+class HybridDPPrefixCacheMixin:
+    @classmethod
+    def verify_prefix_cache_reuse(cls) -> None:
+        """Keep the cold and warm probes on the same DP-local radix tree."""
+        prompt = (
+            "Continue this integer sequence, comma separated:\n"
+            + ", ".join(str(i) for i in range(1, 401))
+            + ","
+        )
+        params = {"temperature": 0.0, "max_new_tokens": 1}
+        try:
+            cls.engine.flush_cache()
+            cls.engine.generate(prompt, params, routed_dp_rank=0)
+            warm = cls.engine.generate(prompt, params, routed_dp_rank=0)
+            if warm["meta_info"].get("cached_tokens", 0) < 1:
+                raise AssertionError("DP rank 0 did not reuse the fixture prefix")
+        finally:
+            cls.engine.flush_cache()
 
 
 @unittest.skipUnless(is_tpu(), "TPU required")
@@ -175,6 +195,19 @@ class TestGPTOss120BSpecDecoding(SGLangTPUServerTestSuite):
 
 
 @unittest.skipUnless(is_tpu(), "TPU required")
+class TestGPTOss120BHybridDPSpecDecoding(
+    HybridDPPrefixCacheMixin, TestGPTOss120BSpecDecoding
+):
+    server_args: ClassVar[dict[str, object]] = {
+        **TestGPTOss120BSpecDecoding.server_args,
+        "dp_size": 2,
+        "enable_dp_attention": True,
+        "enable_dp_lm_head": True,
+        "tpu_compile_bs": [1, 2, 4, 8],
+    }
+
+
+@unittest.skipUnless(is_tpu(), "TPU required")
 class TestQwen3Coder480BSpecDecoding(SGLangTPUServerTestSuite):
     expected_accept_length = 1.0
     # v7x coding reference: 2.2075 over 64 prompts at bs=16; gate at 90%.
@@ -187,9 +220,6 @@ class TestQwen3Coder480BSpecDecoding(SGLangTPUServerTestSuite):
         "dtype": "bfloat16",
         "tp_size": 8,
         "ep_size": 8,
-        "dp_size": 2,
-        "enable_dp_attention": True,
-        "enable_dp_lm_head": True,
         "page_size": 256,
         "quantization": "fp8",
         "kv_cache_dtype": "fp8_e4m3",
@@ -198,7 +228,7 @@ class TestQwen3Coder480BSpecDecoding(SGLangTPUServerTestSuite):
         "mem_fraction_static": 0.8,
         "max_prefill_tokens": 4096,
         "max_running_requests": 16,
-        "tpu_compile_bs": [1, 2, 4, 8],
+        "tpu_compile_bs": [1, 2, 4],
         "tpu_compile_tokens": [512, 2048, 4096],
         "enable_torch_compile": True,
         "speculative_algorithm": "EAGLE3",
@@ -209,24 +239,6 @@ class TestQwen3Coder480BSpecDecoding(SGLangTPUServerTestSuite):
         "speculative_eagle_topk": 1,
         "speculative_num_draft_tokens": 4,
     }
-
-    @classmethod
-    def verify_prefix_cache_reuse(cls) -> None:
-        """Keep the cold and warm probes on the same DP-local radix tree."""
-        prompt = (
-            "Continue this integer sequence, comma separated:\n"
-            + ", ".join(str(i) for i in range(1, 401))
-            + ","
-        )
-        params = {"temperature": 0.0, "max_new_tokens": 1}
-        try:
-            cls.engine.flush_cache()
-            cls.engine.generate(prompt, params, routed_dp_rank=0)
-            warm = cls.engine.generate(prompt, params, routed_dp_rank=0)
-            if warm["meta_info"].get("cached_tokens", 0) < 1:
-                raise AssertionError("DP rank 0 did not reuse the fixture prefix")
-        finally:
-            cls.engine.flush_cache()
 
     def test_accept_length_single_prompt(self):
         output, accept_length = self.verify_spec_decoding(
@@ -283,6 +295,19 @@ class TestQwen3Coder480BSpecDecoding(SGLangTPUServerTestSuite):
             f"over {verified_responses}/{len(prompts)} verified prompts "
             f"at batch_size={SPEED_BENCH_BATCH_SIZE}"
         )
+
+
+@unittest.skipUnless(is_tpu(), "TPU required")
+class TestQwen3Coder480BHybridDPSpecDecoding(
+    HybridDPPrefixCacheMixin, TestQwen3Coder480BSpecDecoding
+):
+    server_args: ClassVar[dict[str, object]] = {
+        **TestQwen3Coder480BSpecDecoding.server_args,
+        "dp_size": 2,
+        "enable_dp_attention": True,
+        "enable_dp_lm_head": True,
+        "tpu_compile_bs": [1, 2, 4, 8],
+    }
 
 
 if __name__ == "__main__":
