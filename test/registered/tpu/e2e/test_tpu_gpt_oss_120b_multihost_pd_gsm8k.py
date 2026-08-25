@@ -395,6 +395,8 @@ def _serve_worker(topology: PodTopology, role: Role) -> int:
 
 def _serve_prefill_leader(topology: PodTopology) -> int:
     """Serve prefill engine, start mini-LB, and run GSM8K accuracy evaluation."""
+    # Router runs on prefill rank 0: ClusterQueue quota covers only the two TPU slices,
+    # so a separate CPU pod would exceed quota and block Kueue admission.
     procs = []
     self_host = topology.group_hostnames[0]
     decode_host = peer_group_hostname(
