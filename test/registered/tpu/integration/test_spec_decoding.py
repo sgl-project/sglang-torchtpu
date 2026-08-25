@@ -210,6 +210,24 @@ class TestQwen3Coder480BSpecDecoding(SGLangTPUServerTestSuite):
         "speculative_num_draft_tokens": 4,
     }
 
+    @classmethod
+    def verify_prefix_cache_reuse(cls) -> None:
+        """Keep the cold and warm probes on the same DP-local radix tree."""
+        prompt = (
+            "Continue this integer sequence, comma separated:\n"
+            + ", ".join(str(i) for i in range(1, 401))
+            + ","
+        )
+        params = {"temperature": 0.0, "max_new_tokens": 1}
+        try:
+            cls.engine.flush_cache()
+            cls.engine.generate(prompt, params, routed_dp_rank=0)
+            warm = cls.engine.generate(prompt, params, routed_dp_rank=0)
+            if warm["meta_info"].get("cached_tokens", 0) < 1:
+                raise AssertionError("DP rank 0 did not reuse the fixture prefix")
+        finally:
+            cls.engine.flush_cache()
+
     def test_accept_length_single_prompt(self):
         output, accept_length = self.verify_spec_decoding(
             SPEC_TEST_PROMPT,
