@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.speculative.spec_info import SpecInput
 
 __all__ = [
     "CompilePolicy",
@@ -80,12 +81,6 @@ class DecoderCompilePolicy(CompilePolicy):
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         """Finalize outputs and batch state after a normal or target forward."""
 
-    def normalize_dp_sync_token_width(
-        self, forward_batch: ForwardBatch, num_tokens: int
-    ) -> int:
-        """Map a DP-agreed token count to a physical execution width."""
-        return num_tokens
-
     def get_dp_padded_token_counts(
         self,
         forward_batch: ForwardBatch,
@@ -121,7 +116,7 @@ class DecoderCompilePolicy(CompilePolicy):
         """Normalize a speculative phase before phase-specific bookkeeping."""
 
     def prepare_spec_draft_input(
-        self, forward_batch: ForwardBatch, draft_input: Any
+        self, forward_batch: ForwardBatch, draft_input: SpecInput
     ) -> None:
         """Prepare draft inputs consumed before the first model forward."""
 

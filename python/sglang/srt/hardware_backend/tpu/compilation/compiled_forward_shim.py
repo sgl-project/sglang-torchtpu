@@ -108,7 +108,7 @@ def _dp_attn_select_bucket_shape(
 
     is_decode = forward_batch.forward_mode.is_decode()
     is_idle = forward_batch.forward_mode.is_idle()
-    is_fixed_width_spec = (
+    has_fixed_tokens_per_request = (
         forward_batch.forward_mode.is_target_verify()
         or forward_batch.forward_mode.is_draft_extend_v2()
     )
@@ -123,9 +123,10 @@ def _dp_attn_select_bucket_shape(
         # so the decode BATCH bucket is identical across ranks.
         pad_t = b_bucketer.next_bucket(max(real_q, max_tokens_per_rank))
         pad_b = b_bucketer.next_bucket(max(real_b, max_tokens_per_rank))
-    elif is_fixed_width_spec:
+    elif has_fixed_tokens_per_request:
         # Fixed-width spec modes bucket whole requests, not independent tokens.
-        tokens_per_req = getattr(forward_batch.spec_info, "num_tokens_per_req", 0)
+        spec_info = forward_batch.spec_info
+        tokens_per_req = spec_info.num_tokens_per_req
         if tokens_per_req <= 0:
             raise ValueError(
                 "Fixed-width speculative forwards require "

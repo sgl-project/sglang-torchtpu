@@ -1345,7 +1345,7 @@ class TestDpSyncNumTokens(CustomTestCase):
             spec_info=SimpleNamespace(num_tokens_per_req=4),
             input_ids=torch.zeros(28),
         )
-        self.assertEqual(policy.normalize_dp_sync_token_width(forward_batch, 28), 32)
+        self.assertEqual(policy._bucket_dp_sync_token_width(forward_batch, 28), 32)
 
     def test_keeps_an_already_materialized_wider_bucket(self):
         policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4, 8, 16))
@@ -1354,7 +1354,7 @@ class TestDpSyncNumTokens(CustomTestCase):
             input_ids=torch.zeros(16),
         )
 
-        self.assertEqual(policy.normalize_dp_sync_token_width(forward_batch, 8), 16)
+        self.assertEqual(policy._bucket_dp_sync_token_width(forward_batch, 8), 16)
 
     def test_keeps_materialized_request_rows_for_draft_extend(self):
         policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4, 8, 16))
@@ -1364,7 +1364,7 @@ class TestDpSyncNumTokens(CustomTestCase):
             req_pool_indices=torch.zeros(4, dtype=torch.int32),
         )
 
-        self.assertEqual(policy.normalize_dp_sync_token_width(forward_batch, 4), 16)
+        self.assertEqual(policy._bucket_dp_sync_token_width(forward_batch, 4), 16)
 
 
 class TestSpecDraftExtendPadding(CustomTestCase):

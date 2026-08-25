@@ -292,9 +292,9 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         if mode.is_target_verify():
             tokens_per_req = int(getattr(spec_info, "draft_token_num", 0))
         elif mode.is_draft_extend_v2():
-            tokens_per_req = int(getattr(spec_info, "num_tokens_per_req", 0))
-        elif mode.is_decode() and getattr(spec_info, "is_draft_input", lambda: False)():
-            tokens_per_req = int(getattr(spec_info, "num_tokens_per_req", 0))
+            tokens_per_req = spec_info.num_tokens_per_req
+        elif mode.is_decode() and spec_info.is_draft_input():
+            tokens_per_req = spec_info.num_tokens_per_req
         else:
             tokens_per_req = 0
 
@@ -575,7 +575,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 cp_align_size=cp_align_size,
             )
         if bucket_width:
-            shared_width = self.normalize_dp_sync_token_width(
+            shared_width = self._bucket_dp_sync_token_width(
                 forward_batch, max(global_num_tokens)
             )
             global_num_tokens = [shared_width] * len(global_num_tokens)
@@ -602,14 +602,14 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             physical_num_tokens=request_rows * self.speculative_eagle_topk,
         )
 
-    def normalize_dp_sync_token_width(
+    def _bucket_dp_sync_token_width(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> int:
         """Round a speculative DP width up to a runnable TPU graph shape."""
         if self.b_bucketer is None:
             return num_tokens
         spec_info = forward_batch.spec_info
-        tokens_per_req = int(getattr(spec_info, "num_tokens_per_req", 0))
+        tokens_per_req = spec_info.num_tokens_per_req
         if tokens_per_req <= 0 or num_tokens <= 0:
             return num_tokens
         physical_tokens = int(forward_batch.input_ids.shape[0])
