@@ -564,8 +564,20 @@ def reconcile_tpu_batch_limits(
     torch_compile_max_bs: int | None,
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
+    attn_dp_size: int = 1,
 ) -> tuple[int, Optional[List[int]], int]:
-    """Make the TPU compile grid cover scheduler concurrency without dead shapes."""
+    """Make the TPU compile grid cover scheduler concurrency without dead shapes.
+
+    The grid serves one attention-DP worker, and each worker's scheduler runs
+    at most ``max_running_requests // attn_dp_size`` requests (the same
+    division kv_cache_configurator applies), so all coupling here uses that
+    per-worker concurrency, not the global cap.
+    """
+    per_worker_mrr = (
+        max(max_running_requests // attn_dp_size, 1)
+        if max_running_requests is not None
+        else None
+    )
     explicit_compile_limits = [
         limit
         for limit in (
@@ -576,21 +588,22 @@ def reconcile_tpu_batch_limits(
     ]
     if explicit_compile_limits:
         tcmb = max(explicit_compile_limits)
-    elif max_running_requests is not None:
-        # The scheduler never batches more than max_running_requests, so
+    elif per_worker_mrr is not None:
+        # A worker's scheduler never batches more than its concurrency cap, so
         # buckets above it are dead shapes: they cost compile time and, for
         # long contexts, SMEM for the attention page table.
-        tcmb = max_running_requests
+        tcmb = per_worker_mrr
     else:
         tcmb = DEFAULT_TPU_COMPILE_MAX_BS
 
-    if max_running_requests is not None:
-        tcmb = max(tcmb, max_running_requests)
+    if per_worker_mrr is not None:
+        tcmb = max(tcmb, per_worker_mrr)
     else:
-        max_running_requests = tcmb
+        per_worker_mrr = tcmb
+        max_running_requests = tcmb * attn_dp_size
 
-    if tpu_compile_bs and max(tpu_compile_bs) < max_running_requests:
-        tpu_compile_bs = sorted(set(tpu_compile_bs) | {max_running_requests})
+    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_mrr:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_mrr})
 
     return tcmb, tpu_compile_bs, max_running_requests
 

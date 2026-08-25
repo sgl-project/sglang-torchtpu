@@ -661,10 +661,14 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
     explicit limits when no larger serving batch is reachable (Task #40)."""
 
     def _r(
-        self, torch_compile_max_bs=None, tpu_compile_bs=None, max_running_requests=None
+        self,
+        torch_compile_max_bs=None,
+        tpu_compile_bs=None,
+        max_running_requests=None,
+        attn_dp_size=1,
     ):
         return reconcile_tpu_batch_limits(
-            torch_compile_max_bs, tpu_compile_bs, max_running_requests
+            torch_compile_max_bs, tpu_compile_bs, max_running_requests, attn_dp_size
         )
 
     def test_default_neither_set(self):
@@ -690,6 +694,36 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
         # --max-running-requests 4 with no explicit compile limit -> the grid
         # stops at 4 instead of compiling dead shapes up to 64.
         self.assertEqual(self._r(max_running_requests=4), (4, None, 4))
+
+    def test_dp_attention_derives_per_worker_cap(self):
+        # --max-running-requests 32 across 4 attention-DP workers -> each
+        # worker batches at most 8, so the grid stops at 8.
+        self.assertEqual(
+            self._r(max_running_requests=32, attn_dp_size=4), (8, None, 32)
+        )
+
+    def test_dp_attention_grows_ceiling_per_worker_only(self):
+        # Explicit ceiling 16 with per-worker concurrency 32 (128/4) -> grown
+        # to 32, not to the global 128.
+        tcmb, _, mrr = self._r(
+            torch_compile_max_bs=16, max_running_requests=128, attn_dp_size=4
+        )
+        self.assertEqual((tcmb, mrr), (32, 128))
+
+    def test_dp_attention_bucket_list_grows_to_per_worker_cap(self):
+        tcmb, bs, mrr = self._r(
+            tpu_compile_bs=[1, 8], max_running_requests=64, attn_dp_size=4
+        )
+        self.assertEqual((tcmb, mrr), (16, 64))
+        self.assertEqual(bs, [1, 8, 16])
+
+    def test_dp_attention_default_concurrency_scales_with_workers(self):
+        # Nothing requested with 4 workers -> each worker compiles the default
+        # grid, so the global concurrency is 4x the per-worker ceiling.
+        self.assertEqual(
+            self._r(attn_dp_size=4),
+            (DEFAULT_TPU_COMPILE_MAX_BS, None, DEFAULT_TPU_COMPILE_MAX_BS * 4),
+        )
 
     def test_tpu_compile_bs_sets_ceiling_and_concurrency(self):
         tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8])

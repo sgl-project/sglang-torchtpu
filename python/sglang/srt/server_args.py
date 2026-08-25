@@ -5031,6 +5031,9 @@ class ServerArgs:
                 self.torch_compile_max_bs,
                 self.tpu_compile_bs,
                 self.max_running_requests,
+                attn_dp_size=(
+                    self.dp_size if self._resolved().enable_dp_attention else 1
+                ),
             )
             logger.info(
                 "TPU batch limits after reconciliation: "
