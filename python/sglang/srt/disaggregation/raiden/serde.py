@@ -38,6 +38,10 @@ class MessageTag(bytes, enum.Enum):
         b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
     )
 
+    # Backend-agnostic abort sent by ``CommonKVReceiver`` to the prefill rank
+    # that owns the room: decode gave up on the request.
+    ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
+
 
 def pack_ints(values: List[int]) -> bytes:
     return np.asarray(values, dtype=np.int64).tobytes()

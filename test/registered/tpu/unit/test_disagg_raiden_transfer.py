@@ -166,9 +166,14 @@ class RaidenRendezvousTestCase(CustomTestCase):
             m._socket_lock = threading.Lock()
             m._socket_send_locks = {}
             m.request_status = {}
-            m._connect = lambda ep, is_ipv6=False: m._socket_cache.setdefault(
-                ep, _LoopbackSender(ep, inboxes)
-            )
+
+            def _connect(ep, is_ipv6=False):
+                # The real _connect guarantees a cached socket always has its
+                # endpoint send lock, and the send path indexes the lock.
+                m._socket_send_locks.setdefault(ep, threading.Lock())
+                return m._socket_cache.setdefault(ep, _LoopbackSender(ep, inboxes))
+
+            m._connect = _connect
 
         kv_args = SimpleNamespace(
             aux_data_ptrs=aux.ptrs,
@@ -181,9 +186,13 @@ class RaidenRendezvousTestCase(CustomTestCase):
         server_args = SimpleNamespace(context_length=1024)
 
         # _listen is stubbed to a no-op: its daemon thread would otherwise race
-        # the tests for the inbox. Handlers are driven directly instead.
+        # the tests for the inbox. Handlers are driven directly instead. The
+        # decode heartbeat checker is stubbed the same way -- the stubbed
+        # common init carries none of the fields its thread reads.
         with patch.object(CommonKVManager, "__init__", _fake_common_init), patch.object(
             RaidenKVManager, "_listen", lambda self: None
+        ), patch.object(
+            CommonKVManager, "_start_heartbeat_checker_thread", lambda self: None
         ):
             m = RaidenKVManager(kv_args, mode, server_args)
 

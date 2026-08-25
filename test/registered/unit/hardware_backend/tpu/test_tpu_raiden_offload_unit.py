@@ -13,12 +13,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import collections
 import inspect
 import os
 import sys
 import threading
 import types
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -224,6 +226,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.kv_args = SimpleNamespace(page_size=128, sliding_window_size=4096)
 
         with patch.dict(
@@ -234,6 +240,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.kv_args = SimpleNamespace(page_size=128, sliding_window_size=4096)
 
         with patch.dict(
@@ -255,10 +265,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
+                mgr._aborted = {}
+                mgr.failure_records = {}
+                mgr.failure_lock = threading.Lock()
+                mgr.request_status = {}
                 mgr._state_lock = threading.Lock()
-                mgr._push_lock = threading.Lock()
                 mgr._announce_lock = threading.Lock()
                 mgr._send_blocks = {}
+                mgr._aborted = {}
                 mgr._send_aux = {}
                 mgr._decode_addr = {}
                 mgr._replied = set()
@@ -272,7 +286,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr.swa_raiden_endpoint = None
                 mgr.raiden_endpoint = "127.0.0.1:31020"
                 socket = Mock()
-                mgr._connect = Mock(return_value=socket)
+                mgr._socket_send_locks = defaultdict(threading.Lock)
+                mgr._socket_lock = threading.Lock()
+                mgr._socket_cache = {}
+                mgr._connect = Mock(
+                    side_effect=lambda ep, is_ipv6=False: mgr._socket_cache.setdefault(
+                        ep, socket
+                    )
+                )
 
                 mgr.append_send_blocks(room, blocks)
                 if finalize_first:
@@ -295,11 +316,15 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.kv_args = Mock(state_types=[StateType.SWA])
         mgr._state_lock = threading.Lock()
-        mgr._push_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._send_blocks = {}
+        mgr._aborted = {}
         mgr._send_swa_blocks = {}
         mgr._send_aux = {}
         mgr._decode_addr = {}
@@ -313,7 +338,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.swa_raiden_endpoint = "127.0.0.1:31022"
         mgr._completed_send = set()
         socket = Mock()
-        mgr._connect = Mock(return_value=socket)
+        mgr._socket_send_locks = defaultdict(threading.Lock)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._connect = Mock(
+            side_effect=lambda ep, is_ipv6=False: mgr._socket_cache.setdefault(
+                ep, socket
+            )
+        )
 
         swa_from_state = mgr._swa_blocks_from_state_indices([swa_blocks])
         mgr.append_send_blocks(room, full_blocks, swa_from_state)
@@ -335,6 +367,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
@@ -443,6 +479,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_a_staging_slot_frees(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
@@ -473,6 +513,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _decode_mgr(capacity, full_limit, swa_limit=None):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
@@ -580,6 +624,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_rejects_asymmetric_tp_before_reshard(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr._swa_engine = Mock()
         mgr._reshard_enabled = True
         mgr._register_reshard_request = Mock()
@@ -673,8 +721,11 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr._state_lock = threading.Lock()
-        mgr._push_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.register_read = Mock(return_value=True)
@@ -694,7 +745,14 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._reshard_finalized = set()
         mgr.raiden_endpoint = "127.0.0.1:31020"
         mgr._socket = Mock()
-        mgr._connect = Mock(return_value=mgr._socket)
+        mgr._socket_send_locks = collections.defaultdict(threading.Lock)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._connect = Mock(
+            side_effect=lambda ep, is_ipv6=False: mgr._socket_cache.setdefault(
+                ep, mgr._socket
+            )
+        )
         return mgr
 
     @staticmethod
@@ -761,6 +819,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _decode(room, local, capacity):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.start_read = Mock(return_value=0)
@@ -1033,6 +1095,20 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertFalse(mgr._completed_recv)
 
 
+class TestNoPushLock(CustomTestCase):
+    def test_every_send_goes_through_the_endpoint_send_lock(self):
+        # The per-endpoint send helper replaced the old global push lock; a
+        # send site reintroducing it would crash in production while unit
+        # fixtures could mask the missing constructor field.
+        import sglang.srt.disaggregation.raiden.conn as conn_module
+
+        self.assertNotIn("_push_lock\n", inspect.getsource(conn_module))
+        self.assertNotIn(
+            "self._push_lock",
+            inspect.getsource(conn_module).replace("self._reshard_push_lock", ""),
+        )
+
+
 class _InlineExecutor:
     """Runs submitted pushes on the calling thread."""
 
@@ -1104,9 +1180,12 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
-        mgr._push_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._reshard_push_lock = threading.Lock()
         mgr._engine = Mock()
@@ -1134,6 +1213,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_replied = set()
         mgr._reshard_ready = set()
         mgr._reshard_pushed = set()
+        mgr._reshard_replied_at = {}
         mgr._reshard_chunks = {}
         mgr._reshard_announced = {}
         mgr._reshard_chunk_acked = {}
@@ -1145,10 +1225,18 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._pulling = None
+        mgr._aborted = {}
         mgr._pulling_cleared = set()
         mgr._cleared_plans = {}
         mgr._socket = Mock()
-        mgr._connect = Mock(return_value=mgr._socket)
+        mgr._socket_send_locks = collections.defaultdict(threading.Lock)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._connect = Mock(
+            side_effect=lambda ep, is_ipv6=False: mgr._socket_cache.setdefault(
+                ep, mgr._socket
+            )
+        )
         # clear_room sweeps the reshard bookkeeping too.
         mgr._reshard_slot_of = {}
         mgr._reshard_slot_rooms = [None]
@@ -1268,9 +1356,12 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _decode(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._aborted = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
         mgr.chunked_transfer = True
         mgr._state_lock = threading.Lock()
-        mgr._push_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._engine = Mock(transfer_address="10.0.0.2:31000")
         mgr._swa_engine = None
@@ -1296,6 +1387,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_plans = {}
         mgr._cleared_plans = {}
         mgr._pulling = None
+        mgr._aborted = {}
         mgr._pulling_cleared = set()
         mgr._chunk_reads = {}
         mgr._chunk_queue = {}
@@ -1306,7 +1398,14 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._socket = Mock()
-        mgr._connect = Mock(return_value=mgr._socket)
+        mgr._socket_send_locks = collections.defaultdict(threading.Lock)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._connect = Mock(
+            side_effect=lambda ep, is_ipv6=False: mgr._socket_cache.setdefault(
+                ep, mgr._socket
+            )
+        )
         # clear_room sweeps the reshard bookkeeping too.
         mgr._reshard_slot_of = {}
         mgr._reshard_slot_rooms = [None]
