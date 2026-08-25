@@ -45,7 +45,8 @@ LAUNCH_ENV = {
         "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI "
         "--speculative-num-steps 3 "
         "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4"
+        "--speculative-num-draft-tokens 4 "
+        "--tpu-compile-tracer dynamo"
     ),
 }
 
