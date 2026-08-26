@@ -863,5 +863,38 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
         self.assertEqual(fb.global_dp_buffer_len, 8 * 4)
 
 
+class TestHiCacheReloadGate(CustomTestCase):
+    """The shim must wait on the device pool's transfer counter per forward.
+
+    Regression: the gate looked the pool up on the ForwardBatch, which
+    carries no pool references, so the defensive lookup returned None and a
+    forward consumed hicache-reloaded pages while their host->device DMAs
+    were still in flight (garbage output on every reload-hit request; run
+    32933877240).
+    """
+
+    def _shim(self, counter):
+        policy = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            ),
+            finalize_forward_batch=lambda out, fb: out,
+        )
+        return CompiledForwardShim(lambda *a, **k: "out", policy=policy)
+
+    def test_forward_waits_on_reload_counter(self):
+        counter = MagicMock()
+        shim = self._shim(counter)
+        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        self.assertEqual(shim(None, None, fb), "out")
+        counter.wait.assert_called_once_with()
+
+    def test_forward_runs_without_counter(self):
+        # hicache off: the pool's counter slot stays None.
+        shim = self._shim(None)
+        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        self.assertEqual(shim(None, None, fb), "out")
+
+
 if __name__ == "__main__":
     unittest.main()

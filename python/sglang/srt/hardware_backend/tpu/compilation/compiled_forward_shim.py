@@ -513,12 +513,16 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
-        # TODO: rename layer_transfer_counter to transfer_counter or similar after integrating to upstream as it represents different things on tpu and other hardware backends.
-        pool = getattr(forward_batch, "token_to_kv_pool", None)
-        counter = getattr(pool, "layer_transfer_counter", None)
-        if counter is not None:
-            counter.wait()
+        # HiCache reload no-stale gate: the reload's host->device scatters are
+        # not in the traced graph, so block until they have landed before
+        # launching. The counter lives on the device pool wrapper, registered
+        # by the cache controller; it is None when hicache is off, and a
+        # detached policy (no model runner) has no pool to gate on.
+        model_runner = self.policy.model_runner
+        if model_runner is not None:
+            counter = model_runner.token_to_kv_pool.layer_transfer_counter
+            if counter is not None:
+                counter.wait()
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as different
