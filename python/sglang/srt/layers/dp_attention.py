@@ -528,9 +528,19 @@ def _dp_gather_tpu_all_reduce(
             f"but the global buffer slot holds {expected_rows}."
         )
 
-    idx = _dp_rank_slot_rows(num_rows=expected_rows, device=local_tokens.device)
-    contrib = torch.zeros_like(global_tokens)
-    contrib[idx] = local_tokens
+    # Place this rank's rows in its slot with a broadcast multiply rather than
+    # a runtime-index scatter: tile the local rows across all dp_size slots and
+    # zero every slot but this one. Value-identical to
+    # zeros_like() + contrib[slot_rows] = local_tokens, but every shape is
+    # static. The scatter form core-halts tpu7x (e0200
+    # RuntimeUnexpectedCoreHalt) once the global buffer reaches
+    # [dp_size * 512, hidden].
+    sel = _dp_rank_slot_mask(dp_size, local_tokens.device)
+    contrib = torch.where(
+        sel.view(dp_size, 1, 1),
+        local_tokens.unsqueeze(0),
+        torch.zeros((), dtype=local_tokens.dtype, device=local_tokens.device),
+    ).reshape(global_tokens.shape)
     contrib = get_tp_group().all_reduce(contrib)
     global_tokens.copy_(contrib)
 
@@ -876,8 +886,25 @@ def dp_scatter(
         )
         n = local_tokens.shape[0]
         if n > 0:
-            idx = _dp_rank_slot_rows(num_rows=n, device=global_tokens.device)
-            local_tokens.copy_(global_tokens.index_select(0, idx))
+            if get_attn_tensor_model_parallel_world_size() > 1:
+                # Index-free for the same reason as the gather above. Only the
+                # attention-TP > 1 path needs it, and it reads dp_size x more
+                # of the global buffer, so attn_tp_size == 1 keeps index_select.
+                dp_size = global_tokens.shape[0] // n
+                sel = _dp_rank_slot_mask(dp_size, global_tokens.device)
+                slots = global_tokens.view(dp_size, n, *global_tokens.shape[1:])
+                local_tokens.copy_(
+                    torch.where(
+                        sel.view(dp_size, 1, 1),
+                        slots,
+                        torch.zeros(
+                            (), dtype=global_tokens.dtype, device=global_tokens.device
+                        ),
+                    ).sum(0)
+                )
+            else:
+                idx = _dp_rank_slot_rows(num_rows=n, device=global_tokens.device)
+                local_tokens.copy_(global_tokens.index_select(0, idx))
         return
 
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
@@ -1156,6 +1183,29 @@ def _dp_rank_slot_rows(num_rows: int, device: torch.device) -> torch.Tensor:
     return _rank_tensor("attn_dp", device) * num_rows + torch.arange(
         num_rows, device=device
     )
+
+
+def _dp_rank_slot_mask(dp_size: int, device: torch.device) -> torch.Tensor:
+    """0/1 selector over the dp_size slots of a MAX_LEN global DP buffer.
+
+    Args:
+        dp_size: Number of per-rank slots in the global buffer.
+        device: Device of the returned tensor.
+
+    Returns:
+        1-D bool tensor of length dp_size, True at this rank's slot and False
+        elsewhere, computed in-graph so the rank stays a runtime operand.
+
+    This is the index-free counterpart of _dp_rank_slot_rows. Selecting a slot
+    by arithmetic rather than by a runtime index tensor keeps every shape
+    static, which the TPU attention-TP path requires (see its callers).
+
+    Callers select with ``torch.where`` rather than multiplying by a 0/1 scale:
+    ``0 * inf`` is NaN, so a scale would turn one rank's overflow into NaN in
+    every *other* rank's slot and the all-reduce would spread it everywhere.
+    The index form it replaces writes exact zeros, and ``where`` matches that.
+    """
+    return torch.arange(dp_size, device=device) == _rank_tensor("attn_dp", device)
 
 
 def attn_rank0_scale(ref: torch.Tensor) -> torch.Tensor:
