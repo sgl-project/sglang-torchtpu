@@ -4,7 +4,7 @@ import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from jax import tree_util
@@ -83,6 +83,24 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_fail_on_recompile_stance(self):
+        compiled = direct_compile.direct_compile(
+            lambda value: value,
+            specialization_key=lambda value: value,
+        )
+        artifact = MagicMock(return_value="output")
+
+        with (
+            patch.object(compiled, "_compile", return_value=artifact) as compile_fn,
+            torch.compiler.set_stance("fail_on_recompile"),
+        ):
+            self.assertEqual(compiled("warmup"), "output")
+            self.assertEqual(compiled("warmup"), "output")
+            with self.assertRaisesRegex(RuntimeError, "Detected recompile"):
+                compiled("new specialization")
+
+        compile_fn.assert_called_once()
+
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
         def fn(value):

@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 import torch
 from jax import tree_util
+from torch._dynamo import eval_frame
 from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode
@@ -201,6 +202,13 @@ class CompiledFunction:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
         if artifact is None:
+            # set_stance has no public getter and replaces eval_frame._stance.
+            if self.cache and eval_frame._stance.stance == "fail_on_recompile":
+                raise RuntimeError(
+                    "Detected recompile when torch.compile stance is "
+                    "'fail_on_recompile'. direct_compile specialization key: "
+                    f"{key!r}"
+                )
             artifact = self._compile(args, kwargs)
             self.cache[key] = artifact
         return artifact((args, kwargs))
