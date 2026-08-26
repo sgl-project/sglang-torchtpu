@@ -176,6 +176,10 @@ MODEL_PROFILES = {
         device_pool_tokens_hint=32768,
         gsm8k_threshold=0.80,
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
+        # The SparseCore MoE path halts this model's 2-host tp16 bring-up
+        # (E0200, SC sequencers halted before warmup); the resharding test's
+        # qwen profile carries the same setting.
+        extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
         chat_template_kwargs={"enable_thinking": False},
     ),
 }
