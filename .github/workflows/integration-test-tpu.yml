@@ -1,5 +1,5 @@
 # TPU P/D-disaggregation integration tests:
-# 1. pd-prefix-caching-kv-offload (issue #376): multihost prefill + multihost
+# 1. 2p2d-prefix-caching-kv-offload (issue #376): multihost prefill + multihost
 #    decode, prefix caching + raiden KV offload on prefill.
 # 2. pd-tp-resharding (issue #378): multihost prefill (TP16EP16) + multihost
 #    decode (DP2TP8EP16) with heterogeneous attention TP resharding.
@@ -47,7 +47,7 @@ jobs:
       contents: read
       id-token: write
 
-  pd-prefix-caching-kv-offload:
+  2p2d-prefix-caching-kv-offload:
     needs: build
     if: inputs.suite == 'all' || inputs.suite == 'pd_prefix_caching_kv_offload'
     strategy:
@@ -56,7 +56,7 @@ jobs:
       matrix:
         # matrix context is unavailable in job-level `if`; selection shapes the matrix.
         model: ${{ (inputs.model == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]')) || fromJSON('["gpt_oss_120b"]') }}
-    name: pd-prefix-caching-kv-offload-${{ matrix.model }}
+    name: 2p2d-prefix-caching-kv-offload-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -67,12 +67,12 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
       weights_pvc: model-weights-rox
-      run_name: pd-kvoff-${{ matrix.model }}
+      run_name: 2p2d-kvoff-${{ matrix.model }}
     permissions:
       contents: read
       id-token: write
 
-  pd-tp-resharding:
+  2p2d-tp-resharding:
     needs: build
     if: inputs.suite == 'all' || inputs.suite == 'pd_tp_resharding' || inputs.suite == null
     strategy:
@@ -81,7 +81,7 @@ jobs:
       matrix:
         # matrix context is unavailable in job-level `if`; selection shapes the matrix.
         model: ${{ (inputs.model == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]')) || fromJSON('["qwen3_coder_480b"]') }}
-    name: pd-tp-resharding-${{ matrix.model }}
+    name: 2p2d-tp-resharding-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -96,7 +96,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
-      run_name: pd-tpreshard-${{ matrix.model }}
+      run_name: 2p2d-tpreshard-${{ matrix.model }}
     permissions:
       contents: read
       id-token: write

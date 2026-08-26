@@ -1117,15 +1117,15 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
     def test_peer_hostname_maps_only_the_role_segment(self) -> None:
         self.assertEqual(
             peer_group_hostname(
-                "tpu-ci-pd-kvoff-x7f2-prefill-0-1",
+                "tpu-ci-2p2d-kvoff-x7f2-prefill-0-1",
                 from_role=ROLE_PREFILL,
                 to_role=ROLE_DECODE,
             ),
-            "tpu-ci-pd-kvoff-x7f2-decode-0-1",
+            "tpu-ci-2p2d-kvoff-x7f2-decode-0-1",
         )
         with self.assertRaisesRegex(ValueError, "no '-prefill-' segment"):
             peer_group_hostname(
-                "tpu-ci-pd-kvoff-x7f2-decode-0-0",
+                "tpu-ci-2p2d-kvoff-x7f2-decode-0-0",
                 from_role=ROLE_PREFILL,
                 to_role=ROLE_DECODE,
             )
