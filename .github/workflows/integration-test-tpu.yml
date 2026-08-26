@@ -47,7 +47,7 @@ jobs:
       contents: read
       id-token: write
 
-  2p2d-prefix-caching-kv-offload:
+  test-2p2d-prefix-caching-kv-offload:
     needs: build
     if: inputs.suite == 'all' || inputs.suite == 'pd_prefix_caching_kv_offload'
     strategy:
@@ -55,8 +55,8 @@ jobs:
       max-parallel: 1   # both rows contend for the same two slices
       matrix:
         # matrix context is unavailable in job-level `if`; selection shapes the matrix.
-        model: ${{ (inputs.model == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]')) || fromJSON('["gpt_oss_120b"]') }}
-    name: 2p2d-prefix-caching-kv-offload-${{ matrix.model }}
+        model: ${{ (inputs.model == 'all' && fromJSON('["gpt_oss_120b","qwen3_coder_480b"]')) || fromJSON(format('["{0}"]', inputs.model)) }}
+    name: test-2p2d-prefix-caching-kv-offload-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -73,7 +73,7 @@ jobs:
       contents: read
       id-token: write
 
-  2p2d-tp-resharding:
+  test-2p2d-tp-resharding:
     needs: build
     if: inputs.suite == 'all' || inputs.suite == 'pd_tp_resharding' || inputs.suite == null
     strategy:
@@ -82,7 +82,7 @@ jobs:
       matrix:
         # matrix context is unavailable in job-level `if`; selection shapes the matrix.
         model: ${{ (inputs.model == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]')) || fromJSON('["qwen3_coder_480b"]') }}
-    name: 2p2d-tp-resharding-${{ matrix.model }}
+    name: test-2p2d-tp-resharding-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
