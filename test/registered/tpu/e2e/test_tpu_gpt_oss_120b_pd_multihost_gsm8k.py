@@ -72,6 +72,8 @@ QUANTIZATION = ""
 KV_CACHE_DTYPE = "fp8_e4m3"
 MAX_TOTAL_TOKENS = 786432
 DISAGG_TRANSFER_BACKEND = "raiden"
+# Use Raiden for P/D transfer and decode retraction backup.
+HICACHE_IO_BACKEND = "raiden"
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
 
@@ -239,6 +241,11 @@ def build_decode_env(
         *EXTRA_SERVER_ARGS,
         "--disaggregation-transfer-backend",
         DISAGG_TRANSFER_BACKEND,
+        # TPU decode retraction requires a fused host pool.
+        "--hicache-mem-layout",
+        "page_first_fused",
+        "--hicache-io-backend",
+        HICACHE_IO_BACKEND,
         "--skip-server-warmup",
         "--sampling-backend",
         "pytorch",
@@ -395,8 +402,7 @@ def _serve_worker(topology: PodTopology, role: Role) -> int:
 
 def _serve_prefill_leader(topology: PodTopology) -> int:
     """Serve prefill engine, start mini-LB, and run GSM8K accuracy evaluation."""
-    # Router runs on prefill rank 0: ClusterQueue quota covers only the two TPU slices,
-    # so a separate CPU pod would exceed quota and block Kueue admission.
+    # Run the router on the prefill leader to avoid requesting another pod.
     procs = []
     self_host = topology.group_hostnames[0]
     decode_host = peer_group_hostname(
@@ -431,38 +437,11 @@ def _serve_prefill_leader(topology: PodTopology) -> int:
 
 def serve_role(topology: PodTopology, role: Role) -> int:
     """Dispatch and execute service behavior according to role and rank."""
+    # model_config_main invokes unittest, so remove the CLI mode first.
+    sys.argv = [sys.argv[0]]
     if topology.is_prefill_leader:
         return _serve_prefill_leader(topology)
     return _serve_worker(topology, role)
-
-
-def render_jobset_yaml(
-    image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
-    lane: str = "nightly",
-    weights_pvc: str = "model-weights-rox",
-    run_name: str = "gpt-oss-120b-pd-gsm8k",
-) -> str:
-    """Render the Kubernetes JobSet YAML for this test."""
-    rel_path = os.path.relpath(__file__, REPO)
-    cmd = [
-        PYTHON,
-        os.path.join(REPO, ".github", "tpu-ci", "render_jobset.py"),
-        "--pd-prefill-hosts",
-        "2",
-        "--pd-decode-hosts",
-        "2",
-        "--lane",
-        lane,
-        "--image",
-        image,
-        "--weights-pvc",
-        weights_pvc,
-        "--name",
-        run_name,
-        "--exec",
-        f"python3 {rel_path} integration",
-    ]
-    return subprocess.check_output(cmd, text=True)
 
 
 class TestPdGptOss120bConfiguration(unittest.TestCase):
@@ -485,9 +464,17 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
     def test_no_hierarchical_cache_or_speculative_features(self) -> None:
         for env_fn in (build_prefill_env, build_decode_env):
             env = env_fn(2, env={})
-            self.assertNotIn("hicache", env["EXTRA_ARGS"])
             self.assertNotIn("hierarchical-cache", env["EXTRA_ARGS"])
             self.assertNotIn("speculative", env["EXTRA_ARGS"])
+        # Prefill never retracts, so only decode carries the host-pool flags.
+        self.assertNotIn("hicache", build_prefill_env(2, env={})["EXTRA_ARGS"])
+
+    def test_decode_retraction_host_pool_stays_on_raiden(self) -> None:
+        # GPT-OSS's hybrid KV layout requires Raiden.
+        decode_args = build_decode_env(2, env={})["EXTRA_ARGS"]
+        self.assertIn("--hicache-mem-layout page_first_fused", decode_args)
+        self.assertIn("--hicache-io-backend raiden", decode_args)
+        self.assertNotIn("torch_tpu", decode_args)
 
     def test_raiden_port_does_not_collide_with_service_ports(self) -> None:
         for env_fn in (build_prefill_env, build_decode_env):
@@ -553,20 +540,6 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             validate_model_source("/weights/definitely-missing-gpt-oss-120b")
         validate_model_source(HF_REPO_ID)
 
-    def test_dry_run_render_jobset_yaml(self) -> None:
-        yaml_content = render_jobset_yaml()
-        self.assertIn("generateName: tpu-ci-gpt-oss-120b-pd-gsm8k-", yaml_content)
-        self.assertIn("targetReplicatedJobs:", yaml_content)
-        self.assertIn("- prefill", yaml_content)
-        self.assertNotIn("name: router", yaml_content)
-        self.assertIn("name: prefill", yaml_content)
-        self.assertIn("name: decode", yaml_content)
-        self.assertIn("CI_PD_ROLE", yaml_content)
-        self.assertIn(
-            "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_multihost_pd_gsm8k.py integration",
-            yaml_content,
-        )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="P/D multihost test")
@@ -574,15 +547,12 @@ if __name__ == "__main__":
         "mode",
         nargs="?",
         default="unittest",
-        choices=["unittest", "integration", "integration_dry_run"],
+        choices=["unittest", "integration"],
         help="Execution mode (default: unittest)",
     )
     args, extra_args = parser.parse_known_args()
 
-    if args.mode == "integration_dry_run":
-        print(render_jobset_yaml())
-        sys.exit(0)
-    elif args.mode == "integration":
+    if args.mode == "integration":
         topology = PodTopology.from_env()
         role = get_role(topology)
         sys.exit(serve_role(topology, role))

@@ -40,6 +40,7 @@ Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
 (see the *Config structs below).
 """
 
+import atexit
 import json
 import os
 import re
@@ -753,27 +754,24 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
 
 
 def _start_host_watch() -> None:
-    """[probe] Stream kernel kill evidence and host-memory headroom to stdout.
-
-    A rank that dies without a Python traceback leaves nothing in the pod log;
-    the kernel ring buffer (OOM kills, segfaults) and the memory slope are the
-    only way to tell an OOM kill from a native abort. Privileged CI pods can
-    read the host ring buffer.
-    """
+    """Stream host diagnostics until the parent test process exits."""
+    watched_pid = os.getpid()
     script = (
         "(dmesg -w 2>/dev/null || echo '[hostwatch] dmesg unavailable') | "
         "grep --line-buffered -iE "
         "'out of memory|oom|killed process|segfault|hostwatch' | "
         "sed -u 's/^/[hostwatch:dmesg] /' & "
-        "while :; do "
+        f"while [ -e /proc/{watched_pid} ]; do "
         "echo \"[hostwatch:mem] $(grep -E 'MemTotal|MemAvailable' /proc/meminfo"
         " | tr -s ' \\n' ' ')\"; "
         "for d in /proc/[0-9]*; do r=$(awk '{print $2}' $d/statm 2>/dev/null); "
         '[ -n "$r" ] && echo "$((r*4/1024))MB ${d##*/} $(cat $d/comm 2>/dev/null)"; '
         "done | sort -rn | head -3 | sed 's/^/[hostwatch:rss] /'; "
-        "sleep 20; done"
+        "sleep 20; done; "
+        "kill 0 2>/dev/null"
     )
-    subprocess.Popen(["bash", "-c", script], start_new_session=True)
+    watcher = subprocess.Popen(["bash", "-c", script], start_new_session=True)
+    atexit.register(_kill, watcher)
 
 
 def _http_ok(url: str, timeout: int = 5) -> bool:
@@ -959,13 +957,7 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
 
 
 def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
-    """Non-leader pods: serve this pod's engine role until the leader is done.
-
-    No cross-slice shutdown channel exists, so workers watch the leader's
-    prefill server: healthy once and then gone means the verdict is in. A pod's
-    own engine dying early still gates -- the leader fails independently when a
-    peer it needs is broken, and unambiguous local deaths return nonzero.
-    """
+    """Serve a worker until the prefill leader finishes."""
     if topo.role == ROLE_DECODE:
         script, env, log = (
             "launch_decode.sh",
@@ -989,9 +981,18 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
     while True:
         rc = proc.poll()
         if rc is not None:
-            if leader_seen and not _http_ok(leader_url):
-                print(f"[{topo.role}:{topo.group_rank}] exited during teardown")
-                return 0
+            if not leader_seen:
+                return rc
+            # Wait for leader health to settle before classifying the exit.
+            for _ in range(6):
+                if _http_ok(leader_url):
+                    misses = 0
+                else:
+                    misses += 1
+                    if misses >= 6:
+                        print(f"[{topo.role}:{topo.group_rank}] exited during teardown")
+                        return 0
+                time.sleep(10)
             return rc
         if _http_ok(leader_url):
             leader_seen, misses = True, 0
