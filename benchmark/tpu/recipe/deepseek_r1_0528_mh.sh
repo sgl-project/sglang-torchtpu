@@ -24,7 +24,8 @@ export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
-export EXTRA_ARGS="--reasoning-parser deepseek-r1${EXTRA_ARGS:+ $EXTRA_ARGS}"
+# drop mapped checkpoint pages as they load; keeps the CI pod off node-memory eviction
+export EXTRA_ARGS="--reasoning-parser deepseek-r1 --weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 export ENABLE_PROFILER_ENDPOINT=${ENABLE_PROFILER_ENDPOINT:-0}
 
 cd "$(dirname "$0")/.."

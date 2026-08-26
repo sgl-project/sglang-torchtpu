@@ -67,7 +67,7 @@ ${POOL_AFFINITY}
                 - name: dshm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 16Gi
+                    sizeLimit: 64Gi  # tier-2 compile cache lives here; R1's reaches ~57GB
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
