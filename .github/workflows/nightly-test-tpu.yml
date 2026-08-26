@@ -23,7 +23,19 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, pd-integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e]
+        options:
+          - all
+          - accuracy
+          - combo
+          - integration
+          - multihost
+          - multihost-combo
+          - pd-e2e
+          - pd-integration
+          - pd-singlehost
+          - perf
+          - single-host
+          - singlehost-combo
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -158,6 +170,29 @@ jobs:
             || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
       weights_pvc: model-weights-rox
       run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # One host per P/D engine isolates this gate from intra-engine multihost issues.
+  # The shared P/D lock serializes it with pd-e2e.
+  pd-singlehost:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-singlehost"]'), inputs.only || 'all') }}
+    name: pd-singlehost-gpt-oss-120b-gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py integration
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-120b-pd-singlehost-gsm8k
     permissions:
       contents: read
       id-token: write

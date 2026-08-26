@@ -1,13 +1,7 @@
-"""Prefix-caching + KV-offload gate: probe mechanics and its verdict.
+"""Feature gate for prefix caching, KV offload, and optional speculation.
 
-Plugs into ``AccuracyTestParams.runner`` like the eval harnesses in
-``eval_support``, but it is a feature gate rather than a score: it drives its own
-workload and asserts which cache tier served each read, so it self-gates via
-``_passed``.
-
-Split three ways on purpose. ``plan_eviction`` and ``validate_probe`` are pure and
-carry every judgement the gate makes, so the reasoning is readable and reviewable
-apart from the transport. ``run_probe`` owns the HTTP and nothing else.
+The runner checks a cold read, a device-cache hit, and a host reload. Optional
+speculation checks use counters returned by the same three requests.
 """
 
 import math
@@ -62,11 +56,13 @@ _REQUEST_TIMEOUT = 900
 
 
 class CacheObservation(msgspec.Struct, frozen=True):
-    """One /generate round trip, with the tier that served its prefix."""
+    """Response text, cache-tier counts, and speculative decoding counters."""
 
     text: str
     device_tokens: int
     host_tokens: int
+    completion_tokens: int
+    spec_verify_ct: int
 
 
 class KvOffloadProbe(msgspec.Struct, frozen=True):
@@ -115,6 +111,15 @@ def plan_eviction(
         num_fillers=num_fillers,
         host_pool_tokens=host_pool_tokens,
         backed_up_tokens=backed_up_tokens,
+    )
+
+
+def _labelled_reads(probe: KvOffloadProbe):
+    """The three reads, in the order the gate reports them."""
+    return (
+        ("cold", probe.cold),
+        ("device-hit", probe.warm),
+        ("host-reload", probe.reload),
     )
 
 
@@ -202,15 +207,40 @@ def validate_probe(
     # Every tier, not just the reload: the same check on the cold prefill and the
     # device hit is what makes a host-reload failure mean the host, since a bug that
     # breaks all three is not about offloading.
-    for label, observation in (
-        ("cold", probe.cold),
-        ("device-hit", probe.warm),
-        ("host-reload", probe.reload),
-    ):
+    for label, observation in _labelled_reads(probe):
         counting_failure = _counting_failure(label=label, text=observation.text)
         if counting_failure is not None:
             failures.append(counting_failure)
 
+    return failures
+
+
+def mean_accept_length(*, probe: KvOffloadProbe) -> float:
+    """Return completion tokens per verify forward, or 0 when none ran."""
+    verifies = sum(read.spec_verify_ct for _, read in _labelled_reads(probe))
+    if not verifies:
+        return 0.0
+    return sum(read.completion_tokens for _, read in _labelled_reads(probe)) / verifies
+
+
+def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[str]:
+    """Require verify forwards on every read and sufficient mean accept length."""
+    failures = [
+        f"speculative decoding did not run on the {label} read: spec_verify_ct=0 "
+        f"over {read.completion_tokens} completion tokens"
+        for label, read in _labelled_reads(probe)
+        if read.spec_verify_ct <= 0
+    ]
+    if failures:
+        return failures
+
+    accept_length = mean_accept_length(probe=probe)
+    if accept_length <= min_accept_length:
+        failures.append(
+            f"mean accept length {accept_length:.2f} over the three probe reads is "
+            f"not above {min_accept_length:.2f}, so the draft model ran but its "
+            "tokens were never accepted"
+        )
     return failures
 
 
@@ -287,6 +317,9 @@ def generate_with_cache_report(
         text=output["text"],
         device_tokens=details.get("device", 0),
         host_tokens=details.get("host", 0),
+        completion_tokens=meta_info.get("completion_tokens", 0),
+        # Missing and zero both mean speculative verification did not run.
+        spec_verify_ct=meta_info.get("spec_verify_ct") or 0,
     )
 
 
@@ -335,30 +368,12 @@ def kv_offload_runner(
     page_size: int,
     probe_tokens: int,
     hicache_ratio: float,
+    min_accept_length: Optional[float] = None,
 ):
-    """Build an ``AccuracyTestParams.runner`` gating prefix caching + KV offload.
+    """Build a runner that validates device hits and complete host reloads.
 
-    Sequence on one server whose device pool is small enough to overflow:
-
-    1. flush -- cold radix tree and cold host pool (HiRadixCache.reset clears both)
-    2. probe -- cold prefill, written through to host
-    3. probe -- DEVICE hit, the prefix is still resident
-    4. fillers -- overflow the device pool so the probe is evicted to host only
-    5. probe -- HOST reload
-
-    That covers the three things the feature owes: a cache hit (3), offloading
-    observed (5), and KV that survived the host round-trip. The last is why the
-    probe prompt ends on a forced count -- every read has to continue it, and KV
-    that came back wrong cannot.
-
-    It is deliberately not an equality check between reads. These servers do not
-    decode reproducibly, and they diverge on the device hit as readily as on the
-    host reload, so equality fails on runs where nothing was offloaded wrong at
-    all. See ``_FORCED_TAIL`` and ``_counting_failure``.
-
-    ``hicache_ratio`` is the server's, and is checked rather than used, so a config
-    whose host pool cannot hold the probe plus every filler is refused here instead
-    of passing vacuously on the hardware.
+    ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
+    ``min_accept_length`` additionally enables speculative-decoding checks.
     """
     plan = plan_eviction(
         device_pool_tokens=device_pool_tokens,
@@ -375,9 +390,7 @@ def kv_offload_runner(
         )
         failures = validate_probe(probe=probe, page_size=page_size, plan=plan)
 
-        # Built-in backends dump their own metrics, so a runner must do its own. Left
-        # unplotted (no `workload`, no kind=accuracy): the pass/fail is the gate, and
-        # these counts are the detail a reader needs when it goes red.
+        # Record cache-tier counts for diagnosing gate failures.
         labels = {"model": test_name, "kind": "kv_offload"}
         dump_metric(
             f"{test_name}.device_cached_tokens", probe.warm.device_tokens, labels=labels
@@ -385,6 +398,20 @@ def kv_offload_runner(
         dump_metric(
             f"{test_name}.host_cached_tokens", probe.reload.host_tokens, labels=labels
         )
+
+        if min_accept_length is not None:
+            accept_length = mean_accept_length(probe=probe)
+            verifies = ", ".join(
+                f"{label}={read.spec_verify_ct}"
+                for label, read in _labelled_reads(probe)
+            )
+            print(
+                f"[kv-offload] {test_name}: spec verify forwards {verifies}, mean "
+                f"accept length {accept_length:.2f} against floor {min_accept_length}",
+                flush=True,
+            )
+            dump_metric(f"{test_name}.spec_accept_length", accept_length, labels=labels)
+            failures += spec_failures(probe=probe, min_accept_length=min_accept_length)
 
         return {
             "score": probe.reload.host_tokens,
