@@ -103,13 +103,25 @@ def _padded_token_count(m: int, topk: int, sublane: int) -> int:
     return m_pad
 
 
-def _valid_rows_mask(group_sizes, expert_group_offset, local_num_experts, unsort_idx):
-    """Return a mask of which rows are owned by this rank."""
+def _shard_row_window(topk_ids_flat, expert_group_offset, local_num_experts):
+    """Row range ``[start, end)`` of the expert-major sorted array this rank owns.
+
+    Rows are sorted by expert id, so the count of rows before expert ``e`` is
+    exactly ``count(topk_ids_flat < e)`` -- the same value as
+    ``cumulative_sum(group_sizes, include_initial=True)[e]``, and the same bound
+    ``gmm_v2`` derives internally.
+    """
     import jax.numpy as jnp
 
-    gsum = jnp.cumulative_sum(group_sizes, include_initial=True)
-    row_start = gsum[expert_group_offset]
-    row_end = gsum[expert_group_offset + local_num_experts]
+    row_start = jnp.sum(topk_ids_flat < expert_group_offset).astype(jnp.int32)
+    row_end = jnp.sum(topk_ids_flat < expert_group_offset + local_num_experts).astype(
+        jnp.int32
+    )
+    return row_start, row_end
+
+
+def _valid_rows_mask(row_start, row_end, unsort_idx):
+    """Return a mask of which rows are owned by this rank."""
     return (row_start <= unsort_idx) & (unsort_idx < row_end)
 
 
@@ -373,6 +385,17 @@ def _fused_moe_jax(
     token_indices = jnp.repeat(jnp.arange(m, dtype=jnp.int32), topk)
     sorted_token_ids = token_indices[argsort_idx]
 
+    # gmm_v2 only reads and writes the rows of expert groups at or after
+    # ``group_offset``, so this rank's routed-row window is all the permute has
+    # to produce. Computed here (not at the ``group_sizes`` site below) so the
+    # gather can start as soon as the sort is done.
+    use_group_offset = global_num_experts > num_experts
+    row_start = row_end = None
+    if use_group_offset:
+        row_start, row_end = _shard_row_window(
+            topk_ids_flat, expert_group_offset, num_experts
+        )
+
     # Decide whether to use the dense permute/un-permute paths based on the
     # number of rows (m) and the number of routed rows (m*topk).
     use_dense_permute = m < permute_dense_threshold
@@ -392,11 +415,23 @@ def _fused_moe_jax(
         )
 
         n_sorted = sorted_token_ids.shape[0]
+        if use_group_offset:
+            # ``start``/``end`` bound only the Pallas grid; rows outside stay
+            # uninitialized and the GMM never reads them (it skips groups before
+            # ``group_offset``, and gmm_v2 masks its store with a select, so an
+            # unwritten row cannot poison a sum). At EP8 this is ~8x less HBM
+            # traffic in the permute. Matches tpu-inference, which passes the
+            # same shard window to this same kernel.
+            gather_start = row_start.reshape(1)
+            gather_end = row_end.reshape(1)
+        else:
+            gather_start = jnp.array([0], dtype=jnp.int32)
+            gather_end = jnp.array([n_sorted], dtype=jnp.int32)
         x_sorted = ragged_gather_v2(
             hidden_states,
             sorted_token_ids,
-            jnp.array([0], dtype=jnp.int32),
-            jnp.array([n_sorted], dtype=jnp.int32),
+            gather_start,
+            gather_end,
         )
     else:
         x_sorted = hidden_states[sorted_token_ids]  # [m*topk, k]
@@ -439,7 +474,6 @@ def _fused_moe_jax(
             "is unsupported: pad weights AND scales jointly at load time."
         )
 
-    use_group_offset = global_num_experts > num_experts
     route_num_experts = global_num_experts if use_group_offset else num_experts
     # one_hot+sum is cheaper on TPU than bincount.
     group_sizes = jax.nn.one_hot(topk_ids_flat, route_num_experts, dtype=jnp.int32).sum(
@@ -547,12 +581,7 @@ def _fused_moe_jax(
                     gmm2_out,
                     unsort_idx.astype(jnp.int32),
                     topk_weights.reshape(-1),
-                    _valid_rows_mask(
-                        group_sizes,
-                        expert_group_offset,
-                        num_experts,
-                        unsort_idx,
-                    ),
+                    _valid_rows_mask(row_start, row_end, unsort_idx),
                     topk,
                 )
             else:
@@ -587,9 +616,9 @@ def _fused_moe_jax(
         # Zero the rows this rank did not compute, so later post-norm + combine
         # cannot consume expert-0 placeholder outputs with original router weights.
         if use_group_offset:
-            valid_rows_mask = _valid_rows_mask(
-                group_sizes, expert_group_offset, num_experts, unsort_idx
-            )[: m_orig * topk].reshape(m_orig, topk, 1)
+            valid_rows_mask = _valid_rows_mask(row_start, row_end, unsort_idx)[
+                : m_orig * topk
+            ].reshape(m_orig, topk, 1)
         else:
             valid_rows_mask = topk_weights[:m_orig].reshape(m_orig, topk, 1) != 0
         return jnp.where(valid_rows_mask, unsorted, jnp.zeros_like(unsorted))
