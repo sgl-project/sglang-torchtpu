@@ -33,7 +33,11 @@ Usage:
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=600, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(
+    est_time=600,
+    suite="stage-b-test-tpu-4-v7",
+    disabled="Deprecated: superseded by test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload_gsm8k.py",
+)
 
 import os
 import unittest

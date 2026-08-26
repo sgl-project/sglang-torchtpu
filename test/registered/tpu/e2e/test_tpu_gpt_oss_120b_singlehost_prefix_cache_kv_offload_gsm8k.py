@@ -22,6 +22,7 @@ from sglang.test.tpu.kv_offload_probe import kv_offload_runner
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
+register_tpu_ci(est_time=4200, suite="stage-b-test-tpu-4-v7")
 register_tpu_ci(est_time=4200, suite="nightly-tpu-4-v7", nightly=True)
 
 SERVED_MODEL_NAME = "gpt-oss-120b"
@@ -46,12 +47,12 @@ LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",
     "ISL": "4096",
     "OSL": "512",
-    "CONCUR": "8",
+    "CONCUR": "64",
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
     "PAGE_SIZE": str(PAGE_SIZE),
     "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 8",
+    "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
     # raiden requires the RPA v3 backend (the only TPU backend with the HiCache
     # reload-commit hook) and the fused page-first layout, and server_args rejects any
     # other combination. Both are already the recipe's default -- pinned here so a
@@ -110,7 +111,7 @@ MODEL_CONFIG = {
             "num_examples": 200,
             # Matches CONCUR above: the small device pool cannot hold more requests
             # in flight without retracting them.
-            "num_threads": 8,
+            "num_threads": 64,
             "max_tokens": 512,
             "temperature": 0.0,
         },
