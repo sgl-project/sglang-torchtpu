@@ -974,6 +974,16 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        if logits.shape[0] == 0:
+            # A DP rank holding no selected tokens -- an idle rank under DP
+            # attention -- contributes zero rows, and XLA rejects a collective
+            # whose operand has a zero-length dimension ("dimension size of
+            # operand at 'all_gather_dim' cannot be zero"). There is nothing to
+            # gather, and skipping keeps the collective matched: the row count
+            # is a property of the DP rank, not of the attention-TP rank, so
+            # every member of this attention-TP group shards the same tokens
+            # over the vocabulary, sees 0 here, and skips together.
+            return logits.new_empty((0, self.vocab_size))
         if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
