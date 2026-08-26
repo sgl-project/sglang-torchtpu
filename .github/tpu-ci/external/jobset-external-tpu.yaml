@@ -1,0 +1,167 @@
+# External multi-host TPU test workload -- ONE JobSet per launch group. Rendered by
+# .github/tpu-ci/external/render_external_jobset.py from external-topology.yaml. Render vars (do NOT
+# write them as dollar-brace tokens in these comments -- the renderer would substitute them
+# here too):
+#   IMAGE          digest-pinned image (Artifact Registry in Project A; external nodes pull it)
+#   RUN_NAME       DNS-safe label for the JobSet
+#   NAMESPACE      target namespace (default; no Kueue on this cluster)
+#   HOSTS          completions/parallelism (== the slice's host count)
+#   TOPOLOGY       cloud.google.com/gke-tpu-topology label
+#   NODEPOOL       cloud.google.com/gke-nodepool -- pins the whole gang to ONE slice
+#   ACCELERATOR    cloud.google.com/gke-tpu-accelerator label (tpu7x)
+#   ACTIVE_DEADLINE JobSet activeDeadlineSeconds
+#   LAUNCH_SCRIPT  the launch group's recipe (relative to benchmark/tpu/)
+#   TEST_FILES     space-separated test files rank-0 runs against the server
+#   MODEL_PATH     serve model dir (gcsfuse mount path + weights prefix + model subdir)
+#   TP_SIZE/EP_SIZE  parallelism (== HOSTS x devices_per_host)
+#   EXTRA_ARGS     loader/serve flags appended by the recipe (gcsfuse-tuned; see README)
+#   TIMEOUT_PER_FILE per-file timeout for rank-0's live-server run
+#   WEIGHTS_BUCKET / WEIGHTS_MOUNT_OPTIONS / WEIGHTS_MOUNT_PATH   gcsfuse CSI attributes
+#   EPHEMERAL_LIMIT  gke-gcsfuse ephemeral-storage-limit (must exceed the file cache size)
+#
+# Launch model mirrors the in-project multi-host template: every host runs the launch
+# group's recipe (it owns model + config); rank 0 runs each TEST_FILES entry in LIVE-SERVER
+# mode against the one server; workers serve until the leader tears down, then exit 0.
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: ${RUN_NAME}-
+  namespace: ${NAMESPACE}
+spec:
+  ttlSecondsAfterFinished: 7200
+  failurePolicy:
+    maxRestarts: 0
+  network:
+    enableDNSHostnames: true         # stable pod DNS for multi-host rendezvous
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${HOSTS}
+          parallelism: ${HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: external-tpu-ci
+              annotations:
+                gke-gcsfuse/volumes: "true"
+                gke-gcsfuse/ephemeral-storage-limit: "${EPHEMERAL_LIMIT}"
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: ${ACCELERATOR}
+                cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
+                cloud.google.com/gke-nodepool: ${NODEPOOL}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+                - name: weights
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: ${WEIGHTS_BUCKET}
+                      mountOptions: "${WEIGHTS_MOUNT_OPTIONS}"
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: MODEL
+                      value: "${MODEL_PATH}"
+                    - name: TP_SIZE
+                      value: "${TP_SIZE}"
+                    - name: EP_SIZE
+                      value: "${EP_SIZE}"
+                    # Single-quoted so JSON flags survive, e.g.
+                    # --model-loader-extra-config {"num_threads":8}
+                    - name: EXTRA_ARGS
+                      value: '${EXTRA_ARGS}'
+                    # HF token for gated datasets; optional -- pods start without it.
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
+                      RANK="${TPU_WORKER_ID:-0}"
+                      echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK model=${MODEL} tp=${TP_SIZE}"
+
+                      # Every host runs the launch group's recipe (owns model+config). Announce
+                      # the files BEFORE anything can fail so a bring-up death is still attributed
+                      # to the test, not the job.
+                      echo "== test files: ${TEST_FILES} =="
+                      ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
+                          bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
+                      spid=$!
+                      if [ "$RANK" = "0" ]; then
+                        ok=0
+                        for i in $(seq 1 300); do
+                          curl -sf --max-time 5 http://127.0.0.1:30000/health_generate >/dev/null 2>&1 && { ok=1; break; }
+                          kill -0 "$spid" 2>/dev/null || { echo "server exited early"; break; }
+                          sleep 10
+                        done
+                        echo "== server.log tail =="; tail -n 60 /tmp/server.log
+                        [ "$ok" = 1 ] || { echo "FAIL: server never healthy"; exit 1; }
+                        # rank 0 runs every file in this launch group against the one server.
+                        rc=0
+                        timings=""
+                        for f in ${TEST_FILES}; do
+                          echo "== live-server test: $f =="
+                          t0=$SECONDS
+                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout ${TIMEOUT_PER_FILE} python3 "$f"
+                          frc=$?
+                          passed=true
+                          if [ "$frc" -ne 0 ]; then passed=false; rc=1; fi
+                          timings="$timings{\"file\": \"$f\", \"passed\": $passed, \"elapsed\": $((SECONDS - t0))}"$'\n'
+                        done
+                        echo "========== TIMINGS BEGIN =========="
+                        printf '%s' "$timings"
+                        echo "========== TIMINGS END =========="
+                        kill "$spid" 2>/dev/null || true
+                        exit $rc
+                      else
+                        # A worker is a shard of the same server as rank-0; rank-0's exit code
+                        # gates every real failure. Teardown (leader gone -> peer disconnect /
+                        # SIGTERM 143 / SIGKILL 137 on "Connection reset by peer") passes; a
+                        # genuine local crash (OOM 137 without that signature, SIGSEGV 139) fails.
+                        wait "$spid"; src=$?
+                        if [ "$src" = 137 ] && grep -q "Connection reset by peer" /tmp/server.log; then
+                          echo "worker rank=$RANK: leader closed (teardown); success"; exit 0
+                        fi
+                        case "$src" in
+                          137|139) echo "worker rank=$RANK server crashed rc=$src"; exit 1 ;;
+                          *)       echo "worker rank=$RANK done (server rc=$src)"; exit 0 ;;
+                        esac
+                      fi
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: weights
+                      mountPath: ${WEIGHTS_MOUNT_PATH}
+                      readOnly: true
+                  securityContext:
+                    privileged: true

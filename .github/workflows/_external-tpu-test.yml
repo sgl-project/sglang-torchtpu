@@ -1,0 +1,232 @@
+# Reusable: run ONE SLICE's launch groups on the external TPU cluster. The external cluster has
+# NO Kueue, so discovery buckets groups per slice (render_external_jobset.py --list-groups) and
+# this workflow pins them all to that slice's nodepool and runs them BACK-TO-BACK -- parallel
+# across slices (one matrix job each), serial within a slice (cross-group concurrency = 1). For
+# each group it renders a JobSet, applies it over the GKE DNS endpoint, streams logs, gates on
+# the JobSet Completed/Failed condition, and tears it down before the next group. A trimmed
+# cousin of _tpu-test.yml (no admission budget / Workload check). See external/README.md.
+name: _external-tpu-test
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string            # repo@sha256:... from _tpu-build
+      suite:
+        required: true
+        type: string            # an external-nightly-* suite (all groups in this slice share it)
+      slice_name:
+        required: true
+        type: string            # e.g. external-nightly-2x2x2-s0 (labels + artifact name)
+      nodepool_var:
+        required: true
+        type: string            # NAME of the repo secret holding this slice's nodepool
+      groups_json:
+        required: true
+        type: string            # JSON array of this slice's groups (from --list-groups)
+      extra_args:
+        required: false
+        type: string
+        default: ""             # empty -> weights.default_extra_args from external-topology.yaml
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Serialize per SLICE across ALL runs (keyed on the nodepool, NOT the run id): without Kueue
+  # gang-admission, two runs must never apply to the same nodepool at once. Different slices run
+  # in parallel. Depth-1 (GitHub keeps one pending) is enough until Kueue lands.
+  group: external-slice-${{ inputs.nodepool_var }}
+  cancel-in-progress: false
+
+env:
+  # The runner authenticates as the in-project CI SA; the external cluster grants that SA access
+  # to their cluster (RBAC + roles/container.developer) and its DNS endpoint. See README "Access".
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+  # Partner-internal identifiers come from repo secrets (masked in logs, out of source).
+  EXTERNAL_CLUSTER: ${{ secrets.EXTERNAL_CLUSTER }}
+  EXTERNAL_PROJECT: ${{ secrets.EXTERNAL_PROJECT }}
+  EXTERNAL_LOCATION: us-central1        # public GCP region; not a partner identifier
+  EXTERNAL_NAMESPACE: default
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.EXTERNAL_CLUSTER }}
+          location: ${{ env.EXTERNAL_LOCATION }}
+          project_id: ${{ env.EXTERNAL_PROJECT }}
+          use_dns_based_endpoint: true
+
+      - name: Render + run this slice's groups
+        env:
+          # Every slice's nodepool secret; the run reads the one named by inputs.nodepool_var
+          # (assigned by discovery's round-robin) via indirect expansion. Add a line here when
+          # adding a slice to external-topology.yaml's nodepool_vars.
+          EXTERNAL_NODEPOOL_2X2X2_0: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_0 }}
+          EXTERNAL_NODEPOOL_2X2X2_1: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_1 }}
+          EXTERNAL_NODEPOOL_2X2X2_2: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_2 }}
+          EXTERNAL_NODEPOOL_2X2X2_3: ${{ secrets.EXTERNAL_NODEPOOL_2X2X2_3 }}
+          EXTERNAL_NODEPOOL_2X2X4_0: ${{ secrets.EXTERNAL_NODEPOOL_2X2X4_0 }}
+          EXTERNAL_NODEPOOL_2X2X4_1: ${{ secrets.EXTERNAL_NODEPOOL_2X2X4_1 }}
+          NODEPOOL_VAR: ${{ inputs.nodepool_var }}
+          GROUPS_JSON: ${{ inputs.groups_json }}
+        run: |
+          set -uo pipefail
+          slice='${{ inputs.slice_name }}'
+          ns='${{ env.EXTERNAL_NAMESPACE }}'
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
+          : > "$RUNNER_TEMP/external-pod-logs.txt"
+
+          # Resolve this slice's nodepool from the secret named by nodepool_var (GitHub masks
+          # the value in logs). Fail closed if the secret is unset.
+          NODEPOOL="${!NODEPOOL_VAR:-}"
+          [ -n "$NODEPOOL" ] || { echo "❌ repo secret ${NODEPOOL_VAR} is not set -- see external/README.md 'Configuration'"; exit 1; }
+
+          # Re-mint the CI SA token from a fresh GitHub OIDC token (same exchange the auth action
+          # does) and swap it into the kubeconfig; a full slice of groups can outlast one hour.
+          refresh_cluster_token() {
+            local oidc sts sa_token user
+            oidc="$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://iam.googleapis.com/${WIF_PROVIDER}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')" || return 1
+            sts="$(curl -sSf -X POST https://sts.googleapis.com/v1/token \
+              -H 'Content-Type: application/json' \
+              -d "{\"audience\":\"//iam.googleapis.com/${WIF_PROVIDER}\",
+                   \"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",
+                   \"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",
+                   \"scope\":\"https://www.googleapis.com/auth/cloud-platform\",
+                   \"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",
+                   \"subjectToken\":\"${oidc}\"}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')" || return 1
+            sa_token="$(curl -sSf -X POST \
+              "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${CI_SA}:generateAccessToken" \
+              -H "Authorization: Bearer ${sts}" -H 'Content-Type: application/json' \
+              -d '{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')" || return 1
+            user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
+            kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
+            echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
+          }
+
+          # Delete whatever JobSet is live if the job is canceled mid-slice.
+          CUR=""
+          cleanup() { [ -n "$CUR" ] && kubectl -n "$ns" delete "$CUR" --ignore-not-found --wait=false 2>/dev/null; true; }
+          trap cleanup EXIT
+
+          # Render, apply, gate, and tear down ONE group's JobSet. Returns 0 pass / 1 fail.
+          run_group() {
+            local job="$1" label="$2" name short sel rc=1
+            name="$(kubectl -n "$ns" create -f "$job" -o name)" || { echo "❌ ${label}: create failed"; return 1; }
+            CUR="$name"; short="${name##*/}"; sel="jobset.sigs.k8s.io/jobset-name=${short}"
+            echo "Created ${name} for ${label}"
+
+            local running_deadline; running_deadline=$(( $(date +%s) + 1200 ))
+            until kubectl -n "$ns" get pods -l "$sel" -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+              if [ "$(date +%s)" -ge "$running_deadline" ]; then
+                echo "⚠️  ${label}: no pod Running 1200s after apply; continuing anyway"
+                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+                break
+              fi
+              sleep 10
+            done
+            kubectl -n "$ns" get pods -l "$sel" -o wide || true
+
+            refresh_cluster_token || echo "credential refresh failed; continuing"
+            # Stream logs (best effort; the pod log is the only egress). Append per group.
+            kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
+              --max-log-requests=10 --pod-running-timeout=20m --tail=-1 \
+              2>&1 | tee -a "$RUNNER_TEMP/external-pod-logs.txt" || true
+
+            local deadline next_refresh auth_fails=0 iter=0 ok bad
+            deadline=$(( $(date +%s) + 9600 ))      # outlast the JobSet's activeDeadlineSeconds
+            next_refresh=$(( $(date +%s) + 2400 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              if [ "$(date +%s)" -ge "$next_refresh" ]; then
+                refresh_cluster_token && next_refresh=$(( $(date +%s) + 2400 )) \
+                  || { echo "refresh failed; retry in 45s"; next_refresh=$(( $(date +%s) + 45 )); }
+              fi
+              if [ $(( iter % 12 )) -eq 0 ]; then
+                echo "--- [$(date +%T)] ${label} pods ---"
+                kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
+              fi
+              iter=$(( iter + 1 ))
+              if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
+                auth_fails=$((auth_fails + 1))
+                [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
+                if [ "$auth_fails" -ge 12 ]; then echo "❌ ${label}: lost cluster access; outcome unknown"; break; fi
+                sleep 5; continue
+              fi
+              auth_fails=0
+              ok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+              bad="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+              if [ "$ok" = "True" ]; then echo "✅ ${label} PASSED"; rc=0; break; fi
+              if [ "$bad" = "True" ]; then
+                echo "❌ ${label} FAILED"
+                kubectl -n "$ns" get pods -l "$sel" -o wide || true
+                kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 2>/dev/null || true
+                kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+                kubectl -n "$ns" describe "$name" | tail -n 120 || true
+                rc=1; break
+              fi
+              sleep 5
+            done
+            [ "$rc" = 0 ] || { [ "$iter" -gt 0 ] && echo "❌ ${label}: did not complete before deadline" || true; }
+            kubectl -n "$ns" delete "$name" --ignore-not-found --wait=false 2>/dev/null || true
+            CUR=""
+            return "$rc"
+          }
+
+          n="$(jq length <<<"$GROUPS_JSON")"
+          echo "slice ${slice}: ${n} group(s), run serially on one nodepool (cross-group concurrency = 1)"
+          overall=0
+          for i in $(seq 0 $(( n - 1 ))); do
+            g="$(jq -c ".[$i]" <<<"$GROUPS_JSON")"
+            ls="$(jq -r '.launch_script' <<<"$g")"
+            files="$(jq -r '.files' <<<"$g")"
+            weights="$(jq -r '.weights' <<<"$g")"
+            gname="$(jq -r '.name' <<<"$g")"
+            grun="$(jq -r '.run_name' <<<"$g")"
+            echo "::group::group $(( i + 1 ))/${n}: ${gname}"
+            python3 .github/tpu-ci/external/render_external_jobset.py \
+              --image '${{ inputs.image }}' \
+              --suite '${{ inputs.suite }}' \
+              --launch-script "$ls" \
+              --files "$files" \
+              --weights "$weights" \
+              --nodepool "$NODEPOOL" \
+              --extra-args '${{ inputs.extra_args }}' \
+              --name "$grun" > /tmp/external-job.yaml || { echo "render failed for ${gname}"; overall=1; echo '::endgroup::'; continue; }
+            grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|TP_SIZE|bash "benchmark' /tmp/external-job.yaml | head
+            run_group /tmp/external-job.yaml "$gname" || overall=1
+            echo '::endgroup::'
+          done
+          echo "slice ${slice} done, overall rc=${overall}"
+          exit "$overall"
+
+      - name: Upload pod logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-tpu-logs-${{ inputs.slice_name }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/external-pod-logs.txt
+          if-no-files-found: ignore
+          retention-days: 30
