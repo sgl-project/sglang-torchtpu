@@ -132,6 +132,10 @@ One ClusterQueue per `(lane, hosts)`. The shapes must not share a queue: a 2-hos
 A PodSet is assigned exactly one ResourceFlavor, which is what keeps a multi-host JobSet's
 two pods inside a single slice.
 
+Multihost P/D (2p+2d) is one JobSet with two PodSets, one 2x2x2 slice each — the whole
+`tpu-nightly-2h` quota. Kueue admits a Workload's PodSets atomically, so a P/D run takes
+both slices or waits; there is no GitHub-side P/D lock.
+
 Before creating the JobSet, `_tpu-test.yml` runs `reconcile_quota.py --pool=<pool>`, which
 sets every ClusterQueue's `nominalQuota` from live allocatable chips and refuses to submit
 if the target pool holds more than one slice. After creating it, the workflow asserts Kueue

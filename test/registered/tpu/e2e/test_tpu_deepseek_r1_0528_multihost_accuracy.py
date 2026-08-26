@@ -24,7 +24,10 @@ from sglang.test.tpu import model_config_main
 
 # est_time is the expected wall clock (bookkeeping); the enforced per-file
 # cap is MULTIHOST_LAUNCH.timeout_per_file below.
-register_tpu_ci(est_time=7200, suite="nightly-tpu-multihost", nightly=True)
+# Temporarily out of the nightly lane: on-demand suite, discovered by
+# accuracy-test-tpu.yml (-f model=deepseek-r1-0528). Move the suite back to
+# "nightly-tpu-multihost" to restore the nightly trend.
+register_tpu_ci(est_time=7200, suite="nightly-tpu-multihost-ondemand", nightly=True)
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,

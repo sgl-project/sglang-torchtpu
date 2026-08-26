@@ -8,7 +8,12 @@ import requests
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase
 
-register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
+register_tpu_ci(
+    est_time=1800,
+    suite="nightly-tpu-multihost",
+    nightly=True,
+    disabled="Qwen3-30B-A3B-FP8 multihost coverage is no longer needed (retired, not broken)",
+)
 
 # Own launch group: 30B-A3B-FP8 MoE recipe + the ROX weights volume.
 MULTIHOST_LAUNCH = {

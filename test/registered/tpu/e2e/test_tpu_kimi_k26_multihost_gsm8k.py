@@ -22,12 +22,11 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
-register_tpu_ci(
-    est_time=7200,
-    suite="nightly-tpu-multihost",
-    nightly=True,
-    disabled="Kimi-K2.6 W4A16 int4 MoE and MoonViT torch.compile support are not merged yet",
-)
+# Out of the nightly lane while W4A16 int4 MoE and MoonViT torch.compile support
+# land: on-demand suite, discovered by accuracy-test-tpu.yml
+# (-f model=kimi-k26). `disabled=` did not park it -- discover_multihost.py does
+# not read that field -- so the suite name is what keeps it out of the nightly.
+register_tpu_ci(est_time=7200, suite="nightly-tpu-multihost-ondemand", nightly=True)
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,

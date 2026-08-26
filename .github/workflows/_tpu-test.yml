@@ -66,9 +66,8 @@ on:
         required: false
         type: string
         default: ""
-      # --- P/D mode: prefill + decode groups, each on its own slice; needs exec_cmd.
-      # Callers should also pass `hosts` = the per-role slice size so the
-      # concurrency group serializes with other runs contending for the slices.
+      # --- P/D mode: prefill + decode groups, each on its own slice; needs
+      # exec_cmd. `hosts` = the per-role slice size.
       pd_prefill_hosts:
         required: false
         type: number
@@ -83,9 +82,9 @@ permissions:
   id-token: write
 
 concurrency:
-  # P/D jobs need both 2x2x2 slices in the cluster and must serialize globally to prevent deadlocks.
-  # Non-P/D jobs are isolated per-run and dispatched directly to Kueue.
-  group: ${{ (inputs.pd_prefill_hosts != 0 || inputs.pd_decode_hosts != 0) && 'tpu-pd-lock' || format('tpu-test-{0}-{1}', github.run_id, inputs.run_name || inputs.suite) }}
+  # Per-run group: supersession only. Slice contention is Kueue's job -- a shared
+  # GitHub group keeps one job pending and cancels the rest.
+  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
   cancel-in-progress: false
 
 env:

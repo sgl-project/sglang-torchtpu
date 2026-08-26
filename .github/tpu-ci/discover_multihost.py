@@ -44,7 +44,14 @@ def _scan(root, suite, nightly_only):
                 kw = {k.arg: k.value for k in node.keywords}
                 s = _literal(kw["suite"]) if "suite" in kw else None
                 n = _literal(kw["nightly"]) if "nightly" in kw else False
+                # `disabled` is a skip reason, same as run_suite.py honors for
+                # single-host. Without this a disabled multihost test still got
+                # a JobSet and a slice every night.
+                d = _literal(kw["disabled"]) if "disabled" in kw else None
                 if s == suite and (n or not nightly_only):
+                    if d is not None:
+                        print(f"skip {path}: disabled ({d})", file=sys.stderr)
+                        continue
                     registered = True
             elif isinstance(node, ast.Assign):
                 for t in node.targets:
