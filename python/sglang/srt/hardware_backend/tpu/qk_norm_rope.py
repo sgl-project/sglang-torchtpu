@@ -15,9 +15,10 @@ if TYPE_CHECKING:
     import jax
 
 # Max token rows per Pallas program.
-# 512 is a reasonable default but NOT tuned. It would be worthwhile to tune
+# 256 bounds per-program VMEM for large compiled token buckets. This is still
+# not tuned. It would be worthwhile to tune
 # if this kernel ever accounts for a large enough share of step time to matter.
-_MAX_BLOCK_TOKENS = 512
+_MAX_BLOCK_TOKENS = 256
 
 
 def _rms(x: "jax.Array", weight: "jax.Array", eps: float) -> "jax.Array":
