@@ -24,7 +24,7 @@ LAUNCH_ENV = {
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": "8192",
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
+    "TPU_COMPILE_TOKENS": "512 1024 2048 4096",
     # DP-local buckets: DP4 turns the global concurrency of 16 into four per rank.
     "TPU_COMPILE_BS": "1 2 4",
     "DISABLE_RADIX_CACHE": "0",
