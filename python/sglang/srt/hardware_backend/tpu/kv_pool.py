@@ -248,12 +248,31 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # CPU offload / restore
     # ------------------------------------------------------------------ #
 
+    def _raiden_backup(self):
+        """The pool's retraction backup, built once when budgeted."""
+        if not hasattr(self, "_raiden_backup_obj"):
+            from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+                maybe_build_backup,
+            )
+
+            self._raiden_backup_obj = maybe_build_backup(self)
+        return self._raiden_backup_obj
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         """Copy the KV rows at ``indices`` out to host.
 
         Overrides the base version, which stores K and V in two separate
-        tensors, while this pool uses one fused KV tensor per layer.
+        tensors, while this pool uses one fused KV tensor per layer. With a
+        raiden retraction budget, whole pages go to pinned host staging by
+        DMA instead and come back the same way; rows that do not fill their
+        pages sequentially use the row path.
         """
+        backup = self._raiden_backup()
+        if backup is not None:
+            self.device_module.synchronize()
+            handle = backup.try_save(indices)
+            if handle is not None:
+                return handle
         # Indices might be on host and need to be copied to device.
         indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
         self.device_module.synchronize()
@@ -274,21 +293,87 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         """Copy the KV rows at ``indices`` from host to device.
 
-        Inverse of `get_cpu_copy`.
+        Inverse of `get_cpu_copy`. A raiden-staged payload DMAs straight
+        back into the pages holding ``indices``. Row payloads are written a
+        whole page at a time through `write_pages_torch`, which updates the
+        layer buffer in place; a page that ``indices`` only partly covers is
+        read back first and merged on device.
         """
-        # Indices might be on host and need to be copied to device.
-        indices = indices.to(device=self.kv_buffer[0].device, dtype=torch.long)
+        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
+        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            RaidenKVBackupHandle,
+        )
+
+        if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
+            self.device_module.synchronize()
+            self._raiden_backup().restore(kv_cache_cpu, indices)
+            self.device_module.synchronize()
+            return
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        page = self.page_size
+        blocks = indices // page
+        offsets = indices % page
+        uniq_blocks, block_pos = torch.unique(blocks, return_inverse=True)
+        full = torch.bincount(block_pos, minlength=uniq_blocks.numel()) == page
+        full_rows = full[block_pos]
+        # Position of each row's page within the full / partial page batches.
+        full_pos = torch.cumsum(full.long(), 0) - 1
+        part_pos = torch.cumsum((~full).long(), 0) - 1
+        device = self.kv_buffer[0].device
+        full_blocks = uniq_blocks[full].to(device)
+        part_blocks = uniq_blocks[~full].to(device)
+        full_page_pos = full_pos[block_pos][full_rows]
+        full_offsets = offsets[full_rows]
+        part_page_pos = part_pos[block_pos][~full_rows].to(device)
+        part_offsets = offsets[~full_rows].to(device)
+
         self.device_module.synchronize()
-        chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
-            layer_kv = self.kv_buffer[layer_id].flatten(0, 1)
-            for i in range(0, len(indices), chunk_size):
-                chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
-                assert kv_cpu.shape[0] == len(chunk_indices)
-                kv_chunk = kv_cpu.to(layer_kv.device, non_blocking=True)
-                layer_kv.index_copy_(0, chunk_indices, kv_chunk)
+            rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
+            assert rows.shape[0] == indices.numel()
+            dst = self.kv_buffer[layer_id]
+            if full_blocks.numel():
+                pages = torch.empty(
+                    (full_blocks.numel(), page, *rows.shape[1:]), dtype=rows.dtype
+                )
+                pages[full_page_pos, full_offsets] = rows[full_rows]
+                write_pages_torch(full_blocks, pages.to(device, non_blocking=True), dst)
+            if part_blocks.numel():
+                pages = dst[part_blocks]
+                pages[part_page_pos, part_offsets] = rows[~full_rows].to(
+                    device, non_blocking=True
+                )
+                write_pages_torch(part_blocks, pages, dst)
         self.device_module.synchronize()
+
+    def filter_cpu_copy(self, kv_cache_cpu, row_mask: torch.Tensor):
+        """Keep only the rows of a `get_cpu_copy` payload selected by ``row_mask``.
+
+        Raiden-staged payloads are whole pages and are never filtered: only
+        the sliding-window pool's payload goes through here, and that pool
+        stays on the row path.
+
+        Each layer's chunks are single fused KV tensors with the token axis
+        first; the rows are masked along that axis and re-split into
+        ``cpu_offloading_chunk_size`` chunks, the format `load_cpu_copy` reads.
+        """
+        chunk_size = self.cpu_offloading_chunk_size
+        filtered = []
+        for layer_chunks in kv_cache_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+            layer_kv = torch.cat(layer_chunks, dim=0)[row_mask]
+            filtered.append(
+                [
+                    layer_kv[i : i + chunk_size]
+                    for i in range(0, len(layer_kv), chunk_size)
+                ]
+            )
+        return filtered
 
     # ``get_fused_kv_buffer`` is the canonical accessor on TPU; the Pallas
     # backend uses it directly.

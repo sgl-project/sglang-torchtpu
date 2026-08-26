@@ -512,6 +512,8 @@ class TestDraftPrecompileOrdering(CustomTestCase):
 
         events = []
         worker = object.__new__(EagleDraftWorker)
+        worker.speculative_num_steps = 3
+        worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
         worker.draft_tp_context = lambda _group: contextlib.nullcontext()
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
@@ -544,6 +546,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         ), patch(
             "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
             return_value=False,
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2._is_tpu",
+            True,
         ):
             worker.init_cuda_graphs()
 
@@ -552,8 +557,34 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             capture_decode_cuda_graph=False
         )
         worker.draft_runner.compile_policy.precompile_draft.assert_called_once_with(
-            worker.draft_attn_backend, worker.draft_extend_attn_backend
+            worker.draft_attn_backend,
+            worker.draft_extend_attn_backend,
+            worker._fused_draft_forward,
         )
+
+    def test_fused_draft_refreshes_dp_metadata_after_spec_padding(self):
+        """The direct fused call must publish its final padded DP shape."""
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        events = []
+        worker = object.__new__(EagleDraftWorker)
+        worker.draft_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(
+                prepare_spec_forward_batch=lambda _batch: events.append("spec"),
+                refresh_fused_draft_dp_metadata=lambda _batch: events.append("dp"),
+            ),
+        )
+        worker.draft_attn_backend = SimpleNamespace(
+            init_forward_metadata=lambda _batch: events.append("metadata")
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            mark_forward_metadata_ready=lambda: events.append("ready"),
+        )
+
+        worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
+
+        self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
 
 
 if __name__ == "__main__":

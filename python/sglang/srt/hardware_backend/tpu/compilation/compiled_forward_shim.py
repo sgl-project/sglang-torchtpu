@@ -108,6 +108,10 @@ def _dp_attn_select_bucket_shape(
 
     is_decode = forward_batch.forward_mode.is_decode()
     is_idle = forward_batch.forward_mode.is_idle()
+    has_fixed_tokens_per_request = (
+        forward_batch.forward_mode.is_target_verify()
+        or forward_batch.forward_mode.is_draft_extend_v2()
+    )
 
     group_is_decode = is_decode or (
         is_idle and not getattr(forward_batch, "is_extend_in_batch", False)
@@ -119,6 +123,19 @@ def _dp_attn_select_bucket_shape(
         # so the decode BATCH bucket is identical across ranks.
         pad_t = b_bucketer.next_bucket(max(real_q, max_tokens_per_rank))
         pad_b = b_bucketer.next_bucket(max(real_b, max_tokens_per_rank))
+    elif has_fixed_tokens_per_request:
+        # Fixed-width spec modes bucket whole requests, not independent tokens.
+        spec_info = forward_batch.spec_info
+        tokens_per_req = spec_info.num_tokens_per_req
+        if tokens_per_req <= 0:
+            raise ValueError(
+                "Fixed-width speculative forwards require "
+                "spec_info.num_tokens_per_req > 0, "
+                f"got {tokens_per_req}."
+            )
+        max_bs_per_rank = (max_tokens_per_rank + tokens_per_req - 1) // tokens_per_req
+        pad_b = b_bucketer.next_bucket(max(real_b, max_bs_per_rank))
+        pad_t = pad_b * tokens_per_req
     else:
         # Extend pads to one fixed batch shape. It cannot contain more requests
         # than tokens, so cap the shape by the token ceiling when decode
@@ -137,16 +154,27 @@ def _dp_attn_apply_bucket_metadata(forward_batch, pad_t: int, pad_b: int) -> Non
     )
 
     dp_size = len(forward_batch.global_num_tokens_cpu)
-    device = forward_batch.input_ids.device
+    input_ids = getattr(forward_batch, "input_ids", None)
+    device = (
+        input_ids.device
+        if isinstance(input_ids, torch.Tensor)
+        else forward_batch.seq_lens.device
+    )
 
     forward_batch.global_num_tokens_cpu = [pad_t] * dp_size
     forward_batch.global_num_tokens_gpu = torch.full(
         (dp_size,), pad_t, dtype=torch.int64, device=device
     )
     if forward_batch.global_num_tokens_for_logprob_cpu is not None:
-        forward_batch.global_num_tokens_for_logprob_cpu = [pad_b] * dp_size
+        # Verify gathers one logit row per token; other modes gather per request.
+        padded_logprob_rows = (
+            pad_t if forward_batch.forward_mode.is_target_verify() else pad_b
+        )
+        forward_batch.global_num_tokens_for_logprob_cpu = [
+            padded_logprob_rows
+        ] * dp_size
         forward_batch.global_num_tokens_for_logprob_gpu = torch.full(
-            (dp_size,), pad_b, dtype=torch.int64, device=device
+            (dp_size,), padded_logprob_rows, dtype=torch.int64, device=device
         )
     # Clear cached local offsets so they recompute from the padded counts.
     forward_batch.dp_local_start_pos = None
@@ -170,7 +198,7 @@ def _dp_attn_compute_padding(
     b_bucketer: Bucketer,
     real_q: int,
     real_b: int,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, int, int, int]:
     """Compute the DP-attention padding (no side effects).
 
     Every rank must run the same shape, so the bucket is chosen by taking the
@@ -227,7 +255,7 @@ def _dp_attn_prepare_padding(
 ) -> tuple[int, int, int, int]:
     """Compute the DP-attention padding and apply the DP-specific batch state.
 
-    Returns (pad_t, pad_b, real_q_out, real_b_out). the caller pads tensors to
+    Returns (pad_t, pad_b, real_q_out, real_b_out). The caller pads tensors to
     the bucket sizes.
     """
     pad_t, pad_b, real_q_out, real_b_out = _dp_attn_compute_padding(
@@ -363,8 +391,11 @@ def _pad_forward_batch_inputs(
 
     # mm_inputs is per request. Keep it aligned with padded extend_* CPU lists
     # so eager multimodal embedding code can index by batch position.
-    mm_inputs = getattr(forward_batch, "mm_inputs", None)
-    if isinstance(mm_inputs, list) and len(mm_inputs) < pad_b:
+    # Normalize None to avoid a separate idle-rank Dynamo guard.
+    mm_inputs = forward_batch.mm_inputs
+    if mm_inputs is None:
+        mm_inputs = []
+    if len(mm_inputs) < pad_b:
         forward_batch.mm_inputs = mm_inputs + [None] * (pad_b - len(mm_inputs))
 
     # Pad spec_info tensors whose token dim must match input_ids after padding
@@ -513,12 +544,16 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        # HiCache reload no-stale gate: the producer's reload scatters aren't in the traced graph, so wait until they've landed before launching.
-        # TODO: rename layer_transfer_counter to transfer_counter or similar after integrating to upstream as it represents different things on tpu and other hardware backends.
-        pool = getattr(forward_batch, "token_to_kv_pool", None)
-        counter = getattr(pool, "layer_transfer_counter", None)
-        if counter is not None:
-            counter.wait()
+        # HiCache reload no-stale gate: the reload's host->device scatters are
+        # not in the traced graph, so block until they have landed before
+        # launching. The counter lives on the device pool wrapper, registered
+        # by the cache controller; it is None when hicache is off, and a
+        # detached policy (no model runner) has no pool to gate on.
+        model_runner = self.policy.model_runner
+        if model_runner is not None:
+            counter = model_runner.token_to_kv_pool.layer_transfer_counter
+            if counter is not None:
+                counter.wait()
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as different
@@ -564,8 +599,20 @@ def reconcile_tpu_batch_limits(
     torch_compile_max_bs: int | None,
     tpu_compile_bs: Optional[List[int]],
     max_running_requests: int | None,
+    attn_dp_size: int = 1,
 ) -> tuple[int, Optional[List[int]], int]:
-    """Make the TPU compile grid cover scheduler concurrency without dead shapes."""
+    """Make the TPU compile grid cover scheduler concurrency without dead shapes.
+
+    The grid serves one attention-DP worker, and each worker's scheduler runs
+    at most ``max_running_requests // attn_dp_size`` requests (the same
+    division kv_cache_configurator applies), so all coupling here uses that
+    per-worker concurrency, not the global cap.
+    """
+    per_worker_mrr = (
+        max(max_running_requests // attn_dp_size, 1)
+        if max_running_requests is not None
+        else None
+    )
     explicit_compile_limits = [
         limit
         for limit in (
@@ -574,19 +621,24 @@ def reconcile_tpu_batch_limits(
         )
         if limit is not None
     ]
-    tcmb = (
-        max(explicit_compile_limits)
-        if explicit_compile_limits
-        else DEFAULT_TPU_COMPILE_MAX_BS
-    )
-
-    if max_running_requests is not None:
-        tcmb = max(tcmb, max_running_requests)
+    if explicit_compile_limits:
+        tcmb = max(explicit_compile_limits)
+    elif per_worker_mrr is not None:
+        # A worker's scheduler never batches more than its concurrency cap, so
+        # buckets above it are dead shapes: they cost compile time and, for
+        # long contexts, SMEM for the attention page table.
+        tcmb = per_worker_mrr
     else:
-        max_running_requests = tcmb
+        tcmb = DEFAULT_TPU_COMPILE_MAX_BS
 
-    if tpu_compile_bs and max(tpu_compile_bs) < max_running_requests:
-        tpu_compile_bs = sorted(set(tpu_compile_bs) | {max_running_requests})
+    if per_worker_mrr is not None:
+        tcmb = max(tcmb, per_worker_mrr)
+    else:
+        per_worker_mrr = tcmb
+        max_running_requests = tcmb * attn_dp_size
+
+    if tpu_compile_bs and max(tpu_compile_bs) < per_worker_mrr:
+        tpu_compile_bs = sorted(set(tpu_compile_bs) | {per_worker_mrr})
 
     return tcmb, tpu_compile_bs, max_running_requests
 

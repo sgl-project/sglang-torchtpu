@@ -12,6 +12,7 @@ Plugs into the two extension points on the shared accuracy runner:
 
 import atexit
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -329,5 +330,256 @@ def gpqa_openai_runner(
             labels={"model": model, "eval": "gpt_oss.evals"},
         )
         return {"score": result.score}
+
+    return run
+
+
+# --- perf ---------------------------------------------------------------------
+# A throughput sweep is an AccuracyTestParams.runner like the two above, not a
+# parallel harness: it wants the same recipe launch, the same one-boot-many-gates
+# sharing, and the same reporting. run_combined_tests' own performance_params
+# cannot serve here -- it launches with popen_launch_server, and a TPU server only
+# comes up through launch_server.sh (chiplet visibility, compile cache, topology).
+
+_TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
+
+
+# bench_serving.sh's own per-point file stem. Its tag and this must agree, or the
+# sweep would measure fine and the reader would report a point that never ran.
+def bench_point_tag(concurrency: int, isl: int, osl: int) -> str:
+    return f"c{concurrency}-isl{isl}-osl{osl}"
+
+
+def bench_sweep_arg(points: List[Dict[str, Any]]) -> str:
+    """The SWEEP string for bench_serving.sh: "c:isl:osl:workload" per point.
+
+    ``workload`` is the name the perf dashboard's Workload dropdown shows, so the
+    test that defines a shape is what names it.
+    """
+    required = {"workload", "isl", "osl", "concurrency"}
+    tokens = []
+    for point in points:
+        unknown = set(point) - required
+        if unknown:
+            raise ValueError(f"unknown sweep point key(s): {sorted(unknown)}")
+        missing = sorted(required - set(point))
+        if missing:
+            raise ValueError(f"sweep point is missing {missing}: {point}")
+        workload = str(point["workload"])
+        if not workload or ":" in workload:
+            raise ValueError(
+                f"workload name must be non-empty and ':'-free: {workload!r}"
+            )
+        tokens.append(
+            f"{point['concurrency']}:{point['isl']}:{point['osl']}:{workload}"
+        )
+    return " ".join(tokens)
+
+
+def bench_output_dir(test_name: str) -> str:
+    """Where a sweep writes: under the root the CI collector reads, when set.
+
+    Empty means "leave OUTPUT_DIR unset", so bench_serving.sh's own
+    ./results/<slug>-tpu/<ts> default applies -- a path the collector also globs.
+    """
+    root = os.environ.get("TPU_CI_BENCH_OUTPUT_ROOT")
+    return os.path.join(root, test_name) if root else ""
+
+
+def read_bench_point(out_dir: str, point: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The last JSONL record a sweep point wrote, or None if it never landed.
+
+    Searched recursively: with OUTPUT_DIR unset the file is under a generated
+    ./results/<slug>-tpu/<timestamp>/ path. Last line, because serving.py appends.
+    """
+    stem = bench_point_tag(point["concurrency"], point["isl"], point["osl"]) + ".jsonl"
+    matches = sorted(Path(out_dir).rglob(stem))
+    if not matches:
+        return None
+    record = None
+    with open(matches[-1], encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                record = json.loads(line)
+    return record
+
+
+# Every numeric field bench_serving writes per sweep point, and how to read it.
+# Dumped in full because the JSONL never leaves the pod and the job log expires at
+# ~90 days: a field not recorded tonight cannot be back-filled later without
+# re-running the sweep. The cost is a few hundred bytes a night.
+#
+# Config echoes in the same record (backend, dataset_name, tag, server_info, the
+# random_* shape, request_rate) are deliberately NOT dumped -- they are settings,
+# not measurements, and the dashboard already captures them from the config block
+# bench_serving.sh prints.
+_HIGHER_IS_BETTER = (
+    "request_throughput",
+    "input_throughput",
+    "output_throughput",
+    "total_throughput",
+    "max_output_tokens_per_s",
+    "accept_length",  # speculative decoding; absent otherwise
+)
+_LOWER_IS_BETTER = tuple(
+    f"{stat}_{family}"
+    for family in ("ttft_ms", "tpot_ms", "itl_ms", "e2e_latency_ms")
+    for stat in ("mean", "median", "std", "p90", "p95", "p99")
+) + ("duration",)
+# Counters worth keeping but not worth judging. `completed` should equal the
+# expected request count exactly -- more is not better, which is why it is not
+# higher_is_better; the gate checks it instead. Cache counters are only
+# meaningful against a run's own cache setting: this sweep disables prefix
+# caching on purpose, so a rise would mean the cache leaked in, not that things
+# improved.
+_INFORMATIONAL = (
+    "completed",
+    "total_input_tokens",
+    "total_input_text_tokens",
+    "total_input_vision_tokens",
+    "total_output_tokens",
+    "total_output_tokens_retokenized",
+    "total_prompt_tokens",
+    "total_cached_tokens",
+    "device_cached_tokens",
+    "host_cached_tokens",
+    "storage_cached_tokens",
+    "cache_hit_rate_pct",
+    "max_concurrent_requests",
+)
+
+_BENCH_METRICS = {
+    **{f: "higher_is_better" for f in _HIGHER_IS_BETTER},
+    **{f: "lower_is_better" for f in _LOWER_IS_BETTER},
+    **{f: "informational" for f in _INFORMATIONAL},
+}
+
+# The one series per model a reader should look at first.
+_HEADLINE_METRIC = "total_throughput"
+
+
+def bench_serving_runner(
+    sweep: List[Dict[str, Any]],
+    test_name: str,
+    model: str = "",
+    bench_env: Optional[Dict[str, str]] = None,
+    prompts_per_concurrency: int = 10,
+):
+    """Build an ``AccuracyTestParams.runner`` that measures throughput.
+
+    The measurement is benchmark/tpu/bench_serving.sh -- the same script a human
+    runs by hand -- so CI and a manual repro produce the same JSONL, and the numbers
+    reach the dashboard through the collector that already reads that directory.
+    Nothing is re-derived here.
+
+    WHAT IT GATES. Not a throughput threshold: the dashboard's trend is the
+    regression detector, and a floor invented before any nightly has run would
+    either never fire or fire on noise. It gates that the measurement is COMPLETE --
+    every point wrote its JSONL, no request errored, throughput positive -- which is
+    what separates "slower" from "the server served nothing".
+    """
+
+    def run(base_url: str) -> Dict[str, Any]:
+        out_dir = bench_output_dir(test_name)
+        env = os.environ.copy()
+        # bench_serving.sh exits 2 without MODEL, and it is the tokenizer source, so
+        # default it to the config's model. A test whose weights are a local path
+        # overrides MODEL in bench_env and names the model with SERVED_MODEL_NAME.
+        if model:
+            env["MODEL"] = model
+        env.update({k: str(v) for k, v in (bench_env or {}).items()})
+        env["BASE_URL"] = base_url
+        env["SWEEP"] = bench_sweep_arg(sweep)
+        env["PROMPTS_PER_CONCURRENCY"] = str(prompts_per_concurrency)
+        if out_dir:
+            env["OUTPUT_DIR"] = out_dir
+            os.makedirs(out_dir, exist_ok=True)
+
+        print(f"[perf] {test_name}: SWEEP={env['SWEEP']}", flush=True)
+        # No capture_output: bench_serving.sh's own per-point block is the log a
+        # human reads when a number looks wrong, and swallowing it hides the run.
+        proc = subprocess.run(
+            ["bash", str(_TPU_BENCH_DIR / "bench_serving.sh")],
+            cwd=str(_TPU_BENCH_DIR),
+            env=env,
+        )
+        search_dir = out_dir or str(_TPU_BENCH_DIR / "results")
+
+        failures = []
+        if proc.returncode != 0:
+            failures.append(f"bench_serving.sh exited {proc.returncode}")
+
+        headline = None
+        for point in sweep:
+            label = f"{test_name} {point['workload']} c{point['concurrency']}"
+            record = read_bench_point(search_dir, point)
+            if record is None:
+                failures.append(f"{label}: no JSONL -- the point never ran")
+                continue
+            expected = point["concurrency"] * prompts_per_concurrency
+            if record.get("completed") != expected:
+                failures.append(
+                    f"{label}: {record.get('completed')} of {expected} requests "
+                    "completed; the rest errored, so its throughput is not comparable"
+                )
+                # And for the same reason it must not be published: a partial
+                # point charted next to complete ones poisons the trend (the
+                # 2026-08-24 gsm8k 0.0 was exactly this shape of bug).
+                continue
+            total = record.get("total_throughput")
+            if not total or total <= 0:
+                failures.append(f"{label}: total_throughput is {total}")
+                continue
+            headline = headline or total
+            print(
+                f"[perf] {label}: {total:.0f} tok/s total, "
+                f"ttft {record.get('median_ttft_ms', float('nan')):.0f} ms",
+                flush=True,
+            )
+            # Built-in backends dump their own metrics; a runner must do its own.
+            # Everything bench_serving measured is dumped, not just the headline:
+            # the [METRIC] line is the ONLY thing that survives -- the JSONL dies
+            # with the pod and the log expires at ~90 days, so a field not dumped
+            # tonight cannot be charted later without re-running the sweep. The
+            # cost of carrying all of them is a few hundred bytes a night.
+            stem = f"{test_name}.{point['workload']}"
+            for field, direction in _BENCH_METRICS.items():
+                value = record.get(field)
+                if not isinstance(value, (int, float)):
+                    continue
+                # model keys the dashboard's series and ties the point back to the
+                # server/bench config captured for the same model. `direction` says
+                # which way is an improvement, because a regression check that
+                # assumes higher-is-better reads a TTFT drop as a win.
+                labels = {
+                    "model": model or test_name,
+                    "c": point["concurrency"],
+                    "direction": direction,
+                }
+                if field == _HEADLINE_METRIC:
+                    # `workload` is what routes a metric to the Performance tab, so
+                    # only the headline carries it. The other 40-odd land as
+                    # "unclassified": stored in the dashboard's archive forever, but
+                    # charted nowhere -- which is the point. Recording them costs a
+                    # few hundred bytes a night and cannot be done retroactively once
+                    # the job log expires; charting them all would bury the one
+                    # number anyone opens the page for under forty series.
+                    #
+                    # To chart one later: give it `workload` here, or teach the
+                    # dashboard to treat kind="bench_detail" as performance -- the
+                    # latter lights up every night already recorded, retroactively.
+                    labels["workload"] = point["workload"]
+                    labels["headline"] = "1"
+                else:
+                    labels["kind"] = "bench_detail"
+                    labels["workload_name"] = point["workload"]
+                dump_metric(f"{stem}.{field}", value, labels=labels)
+
+        return {
+            "score": headline or 0.0,
+            "_passed": not failures,
+            "_failures": failures,
+        }
 
     return run

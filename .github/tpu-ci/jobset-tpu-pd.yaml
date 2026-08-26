@@ -33,6 +33,10 @@ spec:
   ttlSecondsAfterFinished: 7200
   failurePolicy:
     maxRestarts: 0
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - prefill
   network:
     enableDNSHostnames: true       # stable pod DNS for cross-slice rendezvous
   replicatedJobs:
@@ -50,6 +54,7 @@ spec:
                 app: tpu-ci
             spec:
               restartPolicy: Never
+${SERVICE_ACCOUNT}
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
                 cloud.google.com/gke-tpu-topology: ${PREFILL_TOPOLOGY}
@@ -126,6 +131,7 @@ ${WEIGHTS_MOUNT}
                 app: tpu-ci
             spec:
               restartPolicy: Never
+${SERVICE_ACCOUNT}
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
                 cloud.google.com/gke-tpu-topology: ${DECODE_TOPOLOGY}

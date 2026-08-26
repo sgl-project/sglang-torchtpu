@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -59,7 +59,7 @@ from sglang.srt.utils import (
     is_tpu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
@@ -233,11 +233,12 @@ def register_attn_tp_sequence_sharded_predicate(
     _attn_tp_sequence_sharded_predicate = predicate
 
 
-def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
-    mode = getattr(server_args, "return_hidden_states_mode", None)
+def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
+    features = get_exec().features
+    mode = features.return_hidden_states_mode
     if mode == "last":
         return CaptureHiddenMode.LAST
-    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+    if mode == "full" or features.enable_return_hidden_states:
         return CaptureHiddenMode.FULL
     return CaptureHiddenMode.NULL
 
@@ -303,59 +304,23 @@ def compute_local_num_token_non_padded_cpu(
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
 
-    Bundles slot indices for full/SWA pools, the two compressed-KV pools
-    (c4/c128), and the two compressed-state pools (c4_state/c128_state).
+    Bundles slot indices for full/SWA pools and the two compressed-KV pools
+    (C4/C128). Compressor state uses fixed ring storage and explicit
+    ``state_loc`` metadata, so it is not part of the token-allocation bundle.
     Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
     the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
-    otherwise. CUDA's DSV4 path doesn't construct this bundle (state is
-    derived via translate_kv_loc_to_compress_state_loc there).
+    otherwise.
 
     All fields are token-level slot ids in their respective pools (NOT page
     ids). Attention backends convert to page ids via ``// page_size`` when
     constructing PA_ND block tables.
 
-    State fields default to ``None`` so the bundle is constructible from
-    paths that allocate KV but not state (or vice versa); the NPU allocator
-    fills all six on real alloc, CUDA paths leave state ones None and use
-    the ring-hash translation instead.
     """
 
     out_full_loc: torch.Tensor
     out_swa_loc: torch.Tensor
     out_c4_loc: torch.Tensor
     out_c128_loc: torch.Tensor
-    out_c4_state_loc: Optional[torch.Tensor] = None
-    out_c128_state_loc: Optional[torch.Tensor] = None
-
-
-@dataclass
-class DSV4StateLens:
-    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
-
-    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
-    threaded through ``mem_cache/common.py`` to
-    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
-
-      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
-        state-slot count (the paged allocator's ``prefix`` contract).
-      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
-      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
-
-    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
-    take: scheduler only produces this object, common only forwards it, the
-    allocator only consumes it.
-    """
-
-    c4_prefix_lens: torch.Tensor
-    c4_prefix_lens_cpu: torch.Tensor
-    c4_seq_lens: torch.Tensor
-    c4_seq_lens_cpu: torch.Tensor
-    c4_extend_num_tokens: int
-    c128_prefix_lens: torch.Tensor
-    c128_prefix_lens_cpu: torch.Tensor
-    c128_seq_lens: torch.Tensor
-    c128_seq_lens_cpu: torch.Tensor
-    c128_extend_num_tokens: int
 
 
 @dataclass
@@ -761,7 +726,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if model_runner.is_draft_worker
                 else max(
                     batch.return_hidden_states_mode,
-                    get_server_return_hidden_states_mode(model_runner.server_args),
+                    get_server_return_hidden_states_mode(),
                 )
             )
             capture_hidden_mode = get_required_capture_hidden_mode(
@@ -1168,57 +1133,129 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return mrope_positions
 
     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
-        # batch_size * [3 * seq_len]
-        batch_size = self.seq_lens_cpu.shape[0]
-        mrope_positions_list = [[]] * batch_size
+        # mrope_positions shape: [3, total_seq_len]
+        # The first dimension corresponds to temporal, height and width positions.
+        forward_mode = self.forward_mode
+
+        if forward_mode.is_decode():
+            self._compute_mrope_positions_decode(model_runner, batch)
+            return
+
+        if not forward_mode.is_extend(include_draft_extend_v2=True):
+            # Should not reach here: spec/draft_extend_v2 modes go through
+            # compute_spec_mrope_positions in init_new.
+            raise RuntimeError(
+                f"_compute_mrope_positions called with unsupported forward_mode: {forward_mode}"
+            )
+
+        self._compute_mrope_positions_extend(model_runner, batch)
+
+    def _compute_mrope_positions_decode(
+        self, model_runner: ModelRunner, batch: ScheduleBatch
+    ):
+        seq_lens_cpu = self.seq_lens_cpu
+        batch_size = seq_lens_cpu.shape[0]
+        mm_inputs = batch.multimodal_inputs
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        seq_lens_int64 = self.seq_lens.to(torch.int64)
+
+        # Some multimodal models (e.g. image generation models) provide
+        # precomputed MRoPE positions. In this case, positions cannot be
+        # reconstructed only from mrope_position_delta and need the original
+        # per-request computation path.
+        has_precomputed_mrope = any(
+            mm is not None
+            and mm.mrope_positions is not None
+            and mm.mrope_positions.shape[1] >= seq_lens_cpu[i]
+            for i, mm in enumerate(mm_inputs)
+        )
+        has_multimodal_input = any(mm is not None for mm in mm_inputs)
+
+        if rl_on_policy_target is not None or not has_multimodal_input:
+            # Text-only
+            positions_1d = seq_lens_int64 - 1
+            self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
+            return
+
+        if not has_precomputed_mrope:
+            # Compute all requests together to avoid per-request Python loops.
+            deltas_list = [0] * batch_size
+            for i, mm in enumerate(mm_inputs):
+                deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
+            deltas = torch.tensor(
+                deltas_list, dtype=torch.int64, device=model_runner.device
+            )
+            positions_1d = (deltas - 1) + seq_lens_int64
+            self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
+            return
+
+        # Fallback path for models with precomputed spatial MRoPE positions.
+        # These positions cannot be derived from mrope_position_delta.
+        mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
-            mm_input = batch.multimodal_inputs[batch_idx]
-            if self.forward_mode.is_decode():
-                # 3 * N
-                if mm_input is None or rl_on_policy_target is not None:
-                    mrope_positions_list[batch_idx] = torch.full(
-                        (3, 1),
-                        self.seq_lens_cpu[batch_idx] - 1,
-                        dtype=torch.int64,
-                    )
-                else:
-                    mrope_positions = self._expand_mrope_from_input(
-                        mm_input, self.seq_lens_cpu[batch_idx]
-                    )
-                    mrope_positions_list[batch_idx] = mrope_positions
-            elif self.forward_mode.is_extend(include_draft_extend_v2=True):
-                extend_seq_len, extend_prefix_len = (
-                    batch.extend_lens[batch_idx],
-                    batch.prefix_lens[batch_idx],
+            mm_input = mm_inputs[batch_idx]
+            if mm_input is None:
+                # text only
+                mrope_positions = torch.full(
+                    (3, 1),
+                    seq_lens_cpu[batch_idx] - 1,
+                    dtype=torch.int64,
                 )
-                if mm_input is None or rl_on_policy_target is not None:
-                    # text only
-                    mrope_positions = torch.tensor(
-                        [
-                            [
-                                pos
-                                for pos in range(
-                                    extend_prefix_len,
-                                    extend_prefix_len + extend_seq_len,
-                                )
-                            ]
-                        ]
-                        * 3
-                    )
-                else:
-                    mrope_positions = mm_input.mrope_positions[
-                        :,
-                        extend_prefix_len : extend_prefix_len + extend_seq_len,
-                    ]
-                    if mrope_positions.numel() == 0:
-                        mrope_positions = self._expand_mrope_from_input(
-                            mm_input, self.seq_lens_cpu[batch_idx]
-                        )
-                mrope_positions_list[batch_idx] = mrope_positions
+            else:
+                mrope_positions = self._expand_mrope_from_input(
+                    mm_input, seq_lens_cpu[batch_idx]
+                )
+            mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
-            [pos for pos in mrope_positions_list],
+            mrope_positions_list,
+            dim=1,
+        ).to(
+            dtype=torch.int64,
+            device=model_runner.device,
+            non_blocking=True,
+        )
+
+    def _compute_mrope_positions_extend(
+        self, model_runner: ModelRunner, batch: ScheduleBatch
+    ):
+        seq_lens_cpu = self.seq_lens_cpu
+        batch_size = seq_lens_cpu.shape[0]
+        mm_inputs = batch.multimodal_inputs
+        rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        extend_lens = batch.extend_lens
+        prefix_lens = batch.prefix_lens
+
+        # Optimize text-only branch with torch.arange
+        mrope_positions_list = [None] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = mm_inputs[batch_idx]
+            extend_seq_len = extend_lens[batch_idx]
+            extend_prefix_len = prefix_lens[batch_idx]
+            if mm_input is None or rl_on_policy_target is not None:
+                # text only
+                mrope_positions = (
+                    torch.arange(
+                        extend_prefix_len,
+                        extend_prefix_len + extend_seq_len,
+                        dtype=torch.int64,
+                    )
+                    .unsqueeze(0)
+                    .repeat(3, 1)
+                )
+            else:
+                mrope_positions = mm_input.mrope_positions[
+                    :,
+                    extend_prefix_len : extend_prefix_len + extend_seq_len,
+                ]
+                if mrope_positions.numel() == 0:
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, seq_lens_cpu[batch_idx]
+                    )
+            mrope_positions_list[batch_idx] = mrope_positions
+
+        self.mrope_positions = torch.cat(
+            mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
@@ -1251,30 +1288,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
-
-        for i in range(sync_group_size):
-            # Make sure that the padded length is divisible by attn_tp_size
-            # because we may need reduce-scatter across attn_tp dim.
-            # There is no reduce-scatter in LM logprob, so we do not need
-            # to adjust the padded length for logprob.
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
-            if _is_tpu:
-                # TPU DPA gather expects local_tokens.shape[0] == expected_rows;
-                # match global_num_tokens_cpu padding. expected_rows comes from
-                # formula global_tokens.shape[0] // get_attention_dp_size().
-                self.global_num_tokens_for_logprob_cpu[i] = ceil_align(
-                    self.global_num_tokens_for_logprob_cpu[i], attn_tp_size
-                )
-
-        # make sure that each rank has the same number of tokens to do collective communication.
-        # Zigzag (in-seq-split) CP pads to 2 * attn_cp_size for load balance; other CP modes
-        # pad to attn_cp_size; CP off pads nothing (extra padding breaks EAGLE/MTP draft
-        # prefill with NaN draft logits, see #23269).
-        # FIXME(kpham-sgl): revisit so draft prefill-extend tolerates padded dummy tokens.
-        if not enable_cp_v2():
-            cp_align_size = get_cp_padding_align_size()
-            for i in range(sync_group_size):
-                global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+        # Zigzag CP performs its own padding. Other CP modes expose the
+        # alignment required by the platform-neutral compile policy.
+        cp_align_size = 1 if enable_cp_v2() else get_cp_padding_align_size()
+        (
+            global_num_tokens,
+            self.global_num_tokens_for_logprob_cpu,
+        ) = model_runner.compile_policy.get_dp_padded_token_counts(
+            self,
+            model_runner,
+            global_num_tokens,
+            self.global_num_tokens_for_logprob_cpu,
+            attn_tp_size=attn_tp_size,
+            cp_align_size=cp_align_size,
+        )
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1373,7 +1400,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 # prefill breakable CUDA graph (idle + prefill), which needs
                 # every DP rank to run the same captured shape. The `else`
                 # branch handles decode rows padded to a 1-token extend.
-                if hybrid_ssm or self.seq_lens.shape[0] == 0:
+                if model_runner.compile_policy.materialize_dp_idle_extend(
+                    self, num_tokens
+                ):
+                    bs = self.batch_size
+                    self.orig_seq_lens = torch.tensor(
+                        [num_tokens],
+                        dtype=self.orig_seq_lens.dtype,
+                        device=self.seq_lens.device,
+                    )
+                    if self.num_token_non_padded is not None:
+                        self.num_token_non_padded.fill_(num_tokens)
+                    self.num_token_non_padded_cpu = num_tokens
+                elif hybrid_ssm or self.seq_lens.shape[0] == 0:
                     dev = self.seq_lens.device
                     assert (
                         self.seq_lens.shape[0] == 0
@@ -1466,6 +1505,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._original_num_tokens = self.positions.shape[0]
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
+        if self.input_embeds is not None:
+            # Keep token-aligned inputs consistent after padding.
+            self.input_embeds = self._pad_tensor_to_size(self.input_embeds, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         if self.req_pool_indices_cpu is not None:
             self.req_pool_indices_cpu = self._pad_tensor_to_size(
@@ -1590,6 +1632,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.req_pool_indices = self.req_pool_indices[:bs]
             if self.seq_lens_cpu is not None:
                 self.seq_lens_cpu = self.seq_lens_cpu[:bs]
+
+        if self.spec_info is not None and getattr(
+            self.spec_info, "keep_outputs_padded", False
+        ):
+            if hasattr(self, "hidden_states_backup"):
+                self.spec_info.hidden_states = self.hidden_states_backup
+            if hasattr(self, "output_cache_loc_backup"):
+                self.out_cache_loc = self.output_cache_loc_backup
+            return
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft

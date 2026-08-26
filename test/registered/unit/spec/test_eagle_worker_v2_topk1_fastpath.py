@@ -1,11 +1,6 @@
-"""Equivalence tests for the EagleDraftWorker topk=1 chain fast path.
+"""Tests for EagleDraftWorker topk=1 and fused draft paths."""
 
-For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
-cat/topk/sort/gather of the slow path and returns pre-allocated constants. These
-tests check that the pre-allocated `parent_list` / `top_scores_index` match the
-slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
-"""
-
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -136,6 +131,151 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             worker._rebuild_topk1_chain_buffers()
 
 
+class TestEagleWorkerV2FusedDraft(CustomTestCase):
+    def test_fused_steps_bypass_direct_tracer(self):
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+
+        with patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True):
+            worker.server_args.tpu_compile_tracer = "dynamo"
+            self.assertTrue(worker._should_fuse_draft_steps())
+
+            worker.server_args.tpu_compile_tracer = "direct"
+            self.assertFalse(worker._should_fuse_draft_steps())
+
+    def test_fused_steps_thread_per_step_inputs(self):
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker.hot_token_id = None
+
+        calls = []
+
+        def model_forward(input_ids, positions, forward_batch):
+            calls.append(
+                (
+                    input_ids.clone(),
+                    forward_batch.input_ids.clone(),
+                    forward_batch.spec_info.rpa_draft_kv_lens.clone(),
+                    forward_batch.spec_info.hidden_states.clone(),
+                    forward_batch.out_cache_loc.clone(),
+                    positions.clone(),
+                )
+            )
+            return SimpleNamespace(
+                next_token_logits=torch.tensor([[0.0, 1.0]], device=DEVICE),
+                hidden_states=forward_batch.spec_info.hidden_states + 10,
+            )
+
+        worker.draft_runner = SimpleNamespace(
+            model=SimpleNamespace(forward=model_forward)
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=None,
+            positions=torch.tensor([5], device=DEVICE),
+            out_cache_loc=None,
+            spec_info=SimpleNamespace(
+                hidden_states=torch.zeros((1, 2), device=DEVICE),
+                rpa_draft_kv_lens=None,
+            ),
+        )
+        kv_lens = torch.tensor([[10], [11]], device=DEVICE)
+        out_cache_loc = torch.tensor([[20], [21]], device=DEVICE)
+
+        def select_step(i, topk_p, topk_index, hidden_states, scores, topk):
+            del topk_p, topk_index, scores, topk
+            token = torch.tensor([[100 + i]], device=DEVICE)
+            return token, hidden_states + 1, None, (None, token, None)
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
+            side_effect=select_step,
+        ):
+            tokens = worker._fused_draft_steps(
+                forward_batch,
+                torch.ones((1, 1), device=DEVICE),
+                torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
+                torch.zeros((1, 2), device=DEVICE),
+                kv_lens,
+                out_cache_loc,
+            )
+
+        self.assertEqual([token.item() for token in tokens], [100, 101, 102])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
+        self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
+        self.assertEqual(calls[0][2].item(), 10)
+        self.assertEqual(calls[1][2].item(), 11)
+        self.assertEqual(calls[0][3].tolist(), [[1.0, 1.0]])
+        self.assertEqual(calls[1][3].tolist(), [[12.0, 12.0]])
+        self.assertEqual(calls[0][4].item(), 20)
+        self.assertEqual(calls[1][4].item(), 21)
+        self.assertEqual(calls[0][5].item(), 5)
+        self.assertEqual(calls[1][5].item(), 6)
+
+    def test_fused_forward_builds_topk1_chain(self):
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker._topk1_parents_prealloc = torch.tensor(
+            [-1, 0, 1], dtype=torch.long, device=DEVICE
+        ).repeat(2, 1)
+        worker._topk1_score_indices_prealloc = torch.arange(
+            3, dtype=torch.long, device=DEVICE
+        ).repeat(2, 1)
+        worker.hot_token_id = None
+        tokens = tuple(
+            torch.full((2, 1), i, dtype=torch.long, device=DEVICE) for i in range(3)
+        )
+        observed_prefill_only = []
+
+        def compiled_fused_steps(*args):
+            observed_prefill_only.append(args[0].is_prefill_only)
+            return tokens
+
+        worker._compiled_fused_steps = MagicMock(side_effect=compiled_fused_steps)
+        worker.draft_attn_backend = SimpleNamespace(
+            attn_backends=[
+                SimpleNamespace(
+                    forward_metadata=SimpleNamespace(
+                        kv_lens=torch.tensor([10 + i], device=DEVICE)
+                    )
+                )
+                for i in range(2)
+            ]
+        )
+        spec_info = SimpleNamespace(
+            topk_p=torch.ones((2, 1), device=DEVICE),
+            topk_index=torch.zeros((2, 1), dtype=torch.long, device=DEVICE),
+            hidden_states=torch.zeros((2, 2), device=DEVICE),
+            rpa_draft_kv_lens=torch.tensor([-1], device=DEVICE),
+        )
+        forward_batch = SimpleNamespace(
+            spec_info=spec_info,
+            out_cache_loc=torch.arange(6, device=DEVICE),
+            batch_size=2,
+            is_prefill_only=True,
+        )
+        per_step_cache = torch.arange(4, device=DEVICE).reshape(2, 2)
+
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.per_step_draft_out_cache_loc",
+                return_value=per_step_cache,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.forward_context",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            parents, indices, draft_tokens, draft_probs = worker._fused_draft_forward(
+                forward_batch
+            )
+
+        self.assertEqual(parents.tolist(), [[-1, 0, 1], [-1, 0, 1]])
+        self.assertEqual(indices.tolist(), [[0, 1, 2], [0, 1, 2]])
+        self.assertEqual(draft_tokens.tolist(), [[0, 1, 2], [0, 1, 2]])
+        self.assertIsNone(draft_probs)
+        self.assertIsNone(spec_info.rpa_draft_kv_lens)
+        self.assertEqual(observed_prefill_only, [False])
+        self.assertTrue(forward_batch.is_prefill_only)
+
+
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
     def setUp(self):
         # The adaptive state-machine paths write live spec switches through
@@ -198,6 +338,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
                 draft_input = SimpleNamespace(
                     bonus_tokens=torch.zeros((1,), dtype=torch.long, device=DEVICE),
+                    padding_state=None,
                     dsa_topk_indices=(
                         torch.ones((1, 1), dtype=torch.int32, device=DEVICE)
                         if seed_present

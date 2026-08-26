@@ -128,7 +128,9 @@ class MiniLoadBalancer:
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
-                total=self.timeout
+                total=self.timeout,
+                sock_read=self.timeout,
+                sock_connect=300,
             )  # Add timeout for request reliability
         ) as session:
 
@@ -179,26 +181,26 @@ class MiniLoadBalancer:
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
+        session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(
+                total=self.timeout,
+                sock_read=self.timeout,
+                sock_connect=300,
+            )  # Add timeout for request reliability
+        )
+        responses = []
+
+        async def close_upstreams():
+            for response in responses:
+                response.close()
+            await session.close()
+
         async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(
-                    total=self.timeout
-                )  # Add timeout for request reliability
-            ) as session:
-                # Create the tasks for both prefill and decode requests
-                tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
-                ]
-
-                # Wait for both responses to complete. Since this is streaming, they return immediately.
-                prefill_response, decode_response = await asyncio.gather(*tasks)
-
+            try:
                 if modified_request.get("return_logprob", False):
                     prefill_chunks = []
                     async for chunk in prefill_response.content:
                         prefill_chunks.append(chunk)
-
                     first_prefill_chunk = (
                         prefill_chunks[0].decode("utf-8")[5:].strip("\n")
                     )
@@ -220,7 +222,6 @@ class MiniLoadBalancer:
                                 ]
                                 + ret_json["meta_info"]["input_token_logprobs"]
                             )
-
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
                         else:
                             yield chunk
@@ -229,11 +230,38 @@ class MiniLoadBalancer:
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
+            finally:
+                await close_upstreams()
 
-        return StreamingResponse(
-            stream_results(),
-            media_type="text/event-stream",
-        )
+        # The session and both upstream responses stay open only for an
+        # accepted request, whose stream_results() closes them when the
+        # stream ends; every other exit closes them here.
+        streaming = False
+        try:
+            # Both servers answer the headers before any token is produced, so
+            # a request either server rejects is known here, before the
+            # streaming response (and its 200 status) is committed.
+            prefill_response, decode_response = await asyncio.gather(
+                session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                session.post(f"{decode_server}/{endpoint}", json=modified_request),
+            )
+            responses.extend((prefill_response, decode_response))
+            for response in responses:
+                if response.status != 200:
+                    body = await response.read()
+                    return Response(
+                        content=body,
+                        status_code=response.status,
+                        media_type=response.content_type,
+                    )
+            streaming = True
+            return StreamingResponse(
+                stream_results(),
+                media_type="text/event-stream",
+            )
+        finally:
+            if not streaming:
+                await close_upstreams()
 
 
 app = FastAPI()

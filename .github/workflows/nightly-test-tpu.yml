@@ -23,11 +23,11 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo]
+        options: [all, single-host, integration, multihost, combo, singlehost-combo, multihost-combo, perf, accuracy, pd-e2e]
 
 concurrency:
-  group: tpu-slice-nightly
-  cancel-in-progress: false   # let a running nightly finish; don't stack them
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -48,8 +48,8 @@ jobs:
       lane: nightly
       suite: nightly-tpu-4-v7
       nightly: true
-      # gpt-oss-120b lm-eval loads from the ROX weights disk at /weights
-      # (test_tpu_gpt_oss_120b.py); harmless for tests that don't use it.
+      # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
+      # the ROX weights disk at /weights; harmless for tests that don't use it.
       weights_pvc: model-weights-rox
     permissions:
       contents: read
@@ -113,6 +113,80 @@ jobs:
             || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
       weights_pvc: model-weights-rox
       run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # P/D Disaggregation multihost accuracy E2E tests on Nightly lane.
+  pd-e2e:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-e2e"]'), inputs.only || 'all') }}
+    name: pd-e2e-gpt-oss-120b-gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_multihost_pd_gsm8k.py integration
+      weights_pvc: model-weights-rox
+      run_name: pd-gpt-oss-120b-gsm8k
+    permissions:
+      contents: read
+      id-token: write
+
+  # Throughput sweeps, one job per model so they take separate slices and run in
+  # parallel -- same exec-mode shape as the combo layers above. Also dispatchable
+  # on its own (perf-test-tpu.yml) to collect a datapoint without a full nightly.
+  perf:
+    needs: build
+    if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # qwen3-30b was retired: its 480B sibling's perf source is the agentic
+        # sweep in the multi-host job, which dumps its own workload metrics.
+        suite: [nightly-tpu-perf-gpt-oss-120b]
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      nightly: true
+      weights_pvc: model-weights-rox
+      timeout_per_file: 1800
+    permissions:
+      contents: read
+      id-token: write
+
+  # Accuracy gates, one job per model -- the same fan-out as perf, so a broken
+  # model costs the others nothing. Also dispatchable on its own
+  # (accuracy-test-tpu.yml) to collect a datapoint without a full nightly.
+  accuracy:
+    needs: build
+    if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [nightly-tpu-accuracy-gpt-oss-120b]
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      nightly: true
+      # gpt-oss-120b serves from the shared ROX disk at /weights.
+      weights_pvc: model-weights-rox
+      # est_time 2400 (GPQA at 8 repeats + MMLU at 2000 examples) plus bring-up.
+      timeout_per_file: 3600
     permissions:
       contents: read
       id-token: write

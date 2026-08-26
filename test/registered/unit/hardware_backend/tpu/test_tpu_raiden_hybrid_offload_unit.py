@@ -230,6 +230,7 @@ class TestAssemblerPlatformHook(CustomTestCase):
         # so TPU hybrid models got a CUDA host pool that died on the
         # page_first_fused layout. It must go through the platform hook.
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+        from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
         built = {}
@@ -244,14 +245,19 @@ class TestAssemblerPlatformHook(CustomTestCase):
 
         args = ServerArgs(model_path="dummy")
         kv_pool = object()
-        with patch("sglang.srt.platforms.current_platform", fake_platform):
-            pool = hybrid_pool_assembler.build_kv_host_pool(
-                kv_pool=kv_pool,
-                page_size=64,
-                server_args=args,
-                use_mla=False,
-                pool_label="swa",
-            )
+        reset_context()
+        publish(args, role="scheduler")
+        try:
+            with patch("sglang.srt.platforms.current_platform", fake_platform):
+                pool = hybrid_pool_assembler.build_kv_host_pool(
+                    kv_pool=kv_pool,
+                    page_size=64,
+                    server_args=args,
+                    use_mla=False,
+                    pool_label="swa",
+                )
+        finally:
+            reset_context()
 
         fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(kv_pool)
         self.assertIsInstance(pool, _RecordingPool)

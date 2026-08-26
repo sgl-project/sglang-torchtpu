@@ -158,14 +158,25 @@ class PrefillTransferInfo:
 
     def __post_init__(self) -> None:
         self._reshard_error: str | None = None
+        # Neutral geometry for an unsupported reshard: the transfer is failed
+        # by check_status, but the sender thread may read these properties
+        # before that, so every derived attribute must exist.
+        self.src_attn_tp_rank = self.src_tp_rank % self.src_attn_tp_size
+        self.dst_attn_tp_rank = self.dst_tp_rank % self.dst_attn_tp_size
+        self.src_heads = self.dst_heads = 0
+        self.src_replication = self.dst_replication = 1
+        self.resharding_direction = ReshardDirection.UNSPECIFIED
+        self.is_src_replica = self.is_dst_replica = False
+        self.src_head_start = self.dst_head_start = 0
+        self.n_head_to_send = 0
+        self.src_lane_idx = self.dst_lane_idx = 0
+        self.n_lane_to_send = 0
         if self.total_num_head <= 0:
             self._reshard_error = (
                 f"total_num_head must be > 0, got {self.total_num_head}"
             )
             return
 
-        self.src_attn_tp_rank = self.src_tp_rank % self.src_attn_tp_size
-        self.dst_attn_tp_rank = self.dst_tp_rank % self.dst_attn_tp_size
         self.src_heads = max(1, self.total_num_head // self.src_attn_tp_size)
         self.dst_heads = max(1, self.total_num_head // self.dst_attn_tp_size)
         self.src_replication = max(1, self.src_attn_tp_size // self.total_num_head)

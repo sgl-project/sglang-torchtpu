@@ -20,8 +20,9 @@ Two filters can narrow the discovered set:
 - SGLANG_BUILD_RUST_EXTS env var, applied at build time on top of the above:
   unset or "all" builds everything, "none" builds nothing, and a
   comma-separated list matches substrings, e.g. "grpc" matches
-  "sglang.srt.grpc._core". It is read directly from os.environ instead of
-  sglang.srt.environ, which is not importable until the package is built.
+  "sglang.srt.rust_extensions._grpc". It is read directly from os.environ
+  instead of sglang.srt.environ, which is not importable until the package is
+  built.
 """
 
 import json
@@ -178,6 +179,8 @@ def _declared_rust_extensions():
     # "none" short-circuits discovery so builds without a ../rust checkout
     # (e.g. from an sdist) still work.
     if (os.environ.get(_BUILD_RUST_EXTS_ENV) or "").strip().lower() == "none":
+        return []
+    if not (_RUST_WORKSPACE_DIR / "Cargo.toml").is_file():
         return []
     return _pyproject_rust_extensions(_discovered_rust_extensions())
 

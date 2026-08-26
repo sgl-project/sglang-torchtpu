@@ -27,6 +27,31 @@ export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=${SGLANG_ALLOW_OVERWRITE_LONGER
 export SGLANG_TPU_OVERLAP_PROFILE=${SGLANG_TPU_OVERLAP_PROFILE:-1}
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=${TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:-false}
 
+# Disable periodic diagnostic/telemetry harvesting in libtpu to prevent
+# multihost core map std::out_of_range crashes during long serving runs.
+export TPU_ENABLE_DIAGNOSTIC_COORDINATOR=${TPU_ENABLE_DIAGNOSTIC_COORDINATOR:-0}
+export TPU_DISABLE_DIAGNOSTIC_COORDINATOR=${TPU_DISABLE_DIAGNOSTIC_COORDINATOR:-1}
+export TPU_ENABLE_TELEMETRY_HARVESTING=${TPU_ENABLE_TELEMETRY_HARVESTING:-0}
+export TPU_ENABLE_TELEMETRY=${TPU_ENABLE_TELEMETRY:-0}
+export ENABLE_TPU_TELEMETRY=${ENABLE_TPU_TELEMETRY:-0}
+export TPU_TELEMETRY_INTERVAL_SECONDS=${TPU_TELEMETRY_INTERVAL_SECONDS:-86400}
+export TPU_TELEMETRY_INTERVAL_SEC=${TPU_TELEMETRY_INTERVAL_SEC:-86400}
+export TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC=${TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC:-86400}
+
+# Preload libtpu telemetry stub to prevent multihost std::out_of_range crashes in GetAllCoreStates()
+_COMMON_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_STUB_SO="/tmp/libtpu_telemetry_stub.so"
+if [[ ! -f "$_STUB_SO" && -f "$_COMMON_ENV_DIR/libtpu_telemetry_stub.c" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+        gcc -O2 -fPIC -shared "$_COMMON_ENV_DIR/libtpu_telemetry_stub.c" -o "$_STUB_SO" 2>/dev/null || true
+    elif command -v clang >/dev/null 2>&1; then
+        clang -O2 -fPIC -shared "$_COMMON_ENV_DIR/libtpu_telemetry_stub.c" -o "$_STUB_SO" 2>/dev/null || true
+    fi
+fi
+if [[ -f "$_STUB_SO" ]]; then
+    export LD_PRELOAD="${_STUB_SO}${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
+
 # torch.compile logging: +recompiles surfaces recompilation churn cheaply. Avoid
 # +dynamo / +output_code / +guards — they stream per-bytecode tracing logs and
 # turn a ~minute compile into 10+ minutes plus a multi-GB log file.

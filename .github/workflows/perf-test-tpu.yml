@@ -1,0 +1,69 @@
+# TPU throughput sweeps -- test/registered/tpu/nightly-perf/ via run_suite, ONE
+# JOB PER MODEL so they take separate slices and run in parallel.
+# A model that fails costs the others nothing, and each gets its own
+# --timeout-per-file rather than sharing one with every other model.
+# The same jobs run nightly (nightly-test-tpu.yml); this action is the isolated
+# trigger, for collecting a datapoint on demand without waiting for a nightly:
+#   gh workflow run perf-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
+name: Perf Test (TPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      model:
+        description: "Which model to measure"
+        required: false
+        default: all
+        type: choice
+        options: [all, gpt-oss-120b]
+
+concurrency:
+  # Keyed on ref so runs for different branches proceed in parallel; the nightly
+  # lane has 3 single-host slices to absorb them. Same ref still serializes, so a
+  # re-dispatch cannot race the previous run's numbers into the same window.
+  group: tpu-perf-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  perf:
+    needs: build
+    strategy:
+      # A slow or broken model must not cancel the other's measurement.
+      fail-fast: false
+      matrix:
+        # matrix context is unavailable in job-level `if`, so selection shapes the
+        # matrix instead -- same trick as combo-test-tpu.yml. One model today; the
+        # next one adds a choice above and a branch here.
+        suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-perf-gpt-oss-120b"]'))
+                || fromJSON('["nightly-tpu-perf-gpt-oss-120b"]') }}
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      nightly: true
+      # gpt-oss-120b serves from the shared ROX disk at /weights; harmless for the
+      # model that pulls from HF instead.
+      weights_pvc: model-weights-rox
+      # One bring-up (weight load + per-shape compile) plus one sweep leg. The
+      # two-model file needed 3000s; a single model needs about half that, and the
+      # slack is what absorbs a cold compile cache.
+      timeout_per_file: 1800
+    permissions:
+      contents: read
+      id-token: write

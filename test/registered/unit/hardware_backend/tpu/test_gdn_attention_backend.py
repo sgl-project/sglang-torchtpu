@@ -12,8 +12,8 @@ so it is worth pinning directly: ``[bs, bs, bs]`` for a pure-decode batch,
 ``[0, bs, bs]`` for extend/prefill (matching the RPA v3 backend's convention),
 int32, and cached per ``(is_decode, bs, device)``.
 
-Kernel/op numerics (including mixed prefill+decode batches) are gated on TPU by
-``test/registered/tpu/test_gdn_attention_v3.py`` (kernel vs. eager reference)
+Kernel/numerics (including mixed prefill+decode batches) are gated on TPU by
+``test/registered/tpu/unit/test_gdn_attention_v3.py`` (kernel vs. eager reference)
 and ``test_gdn_attention_op.py`` (bridge op + state write-back). This file only
 pins the CPU-side metadata contract.
 

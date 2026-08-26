@@ -28,12 +28,15 @@ class OpenAIServingBase(ABC):
 
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        server_args = (
+            getattr(self.tokenizer_manager, "server_args", None)
+            if self.tokenizer_manager is not None
+            else None
+        )
         self.allowed_custom_labels = (
-            set(
-                self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
-            )
-            if isinstance(self.tokenizer_manager.server_args, ServerArgs)
-            and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
+            set(server_args.tokenizer_metrics_allowed_custom_labels)
+            if isinstance(server_args, ServerArgs)
+            and server_args.tokenizer_metrics_allowed_custom_labels
             else None
         )
 
@@ -147,19 +150,6 @@ class OpenAIServingBase(ABC):
             return rid
 
         return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-
-    def _compute_extra_key(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Compute the final extra_key by concatenating cache_salt and extra_key if both are provided."""
-        parts = []
-        for key in ["cache_salt", "extra_key"]:
-            value = getattr(request, key, None)
-            if value:
-                if not isinstance(value, str):
-                    raise TypeError(
-                        f"Value of {key} must be a string, but got {type(value).__name__}"
-                    )
-                parts.append(value)
-        return "".join(parts) if parts else None
 
     @abstractmethod
     def _convert_to_internal_request(

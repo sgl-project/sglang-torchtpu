@@ -23,6 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0.dev0 \
+    SGLANG_BUILD_RUST_EXTS=none \
     SGLANG_PLATFORM=tpu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,6 +34,7 @@ WORKDIR /sgl-workspace/sglang
 
 # Fork source: python/ builds the sglang package; test/ runs the suite;
 # benchmark/ provides the canonical TPU launcher (benchmark/tpu/launch_server.sh).
+COPY README.md LICENSE ./
 COPY python    ./python
 COPY test      ./test
 COPY scripts   ./scripts

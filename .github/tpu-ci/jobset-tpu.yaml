@@ -10,6 +10,7 @@
 #   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
 #   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
 #   TIMEOUT_PER_FILE single-host timeout passed to run_suite.py
+#   SERVICE_ACCOUNT  indented serviceAccountName line (empty -> namespace default KSA)
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
 #
@@ -53,6 +54,7 @@ spec:
                 app: tpu-ci
             spec:
               restartPolicy: Never
+${SERVICE_ACCOUNT}
               nodeSelector:
                 cloud.google.com/gke-tpu-accelerator: tpu7x
                 cloud.google.com/gke-tpu-topology: ${TOPOLOGY}
@@ -93,6 +95,14 @@ ${WEIGHTS_VOLUME}
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
 
+                      # Where a perf test must point bench_serving.sh's OUTPUT_DIR. Fixed
+                      # and exported so the gate can find each sweep point's JSONL without
+                      # guessing the model slug and timestamp the script defaults to.
+                      # The numbers themselves leave via dump_metric's [METRIC] stdout
+                      # lines, which the dashboard scrapes from this job's log.
+                      export TPU_CI_BENCH_OUTPUT_ROOT=/tmp/tpu-perf-bench
+                      mkdir -p "$TPU_CI_BENCH_OUTPUT_ROOT"
+
                       # Exec mode (render_jobset.py --exec): every host runs the same
                       # command; pod exit codes gate the JobSet. Empty unless --exec.
                       if [ -n "${EXEC_CMD}" ]; then
@@ -111,6 +121,12 @@ ${WEIGHTS_VOLUME}
                       fi
 
                       # Multi-host: every host runs the launch group's recipe (owns model+config).
+                      # Announce the group's files BEFORE anything can fail. A job that dies in
+                      # bring-up (server never healthy, OOM) otherwise reaches the dashboard with
+                      # no test name at all and gets filed under the job, which reads as a test
+                      # that does not exist. Printed once, unconditionally, so attribution never
+                      # depends on how far the run got.
+                      echo "== test files: ${TEST_FILES} =="
                       ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
                           bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
@@ -124,11 +140,24 @@ ${WEIGHTS_VOLUME}
                         echo "== server.log tail =="; tail -n 60 /tmp/server.log
                         [ "$ok" = 1 ] || { echo "FAIL: server never healthy"; exit 1; }
                         # rank 0 runs every file in this launch group against the one server.
+                        # Per-file verdicts are emitted in run_suite's TIMINGS format, so a
+                        # dashboard reads multi-host and single-host through one parser. The
+                        # loop's own rc is a single bit for the whole group, which cannot say
+                        # WHICH file failed.
                         rc=0
+                        timings=""
                         for f in ${TEST_FILES}; do
                           echo "== live-server test: $f =="
-                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 3600 python3 "$f" || rc=1
+                          t0=$SECONDS
+                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 3600 python3 "$f"
+                          frc=$?
+                          passed=true
+                          if [ "$frc" -ne 0 ]; then passed=false; rc=1; fi
+                          timings="$timings{\"file\": \"$f\", \"passed\": $passed, \"elapsed\": $((SECONDS - t0))}"$'\n'
                         done
+                        echo "========== TIMINGS BEGIN =========="
+                        printf '%s' "$timings"
+                        echo "========== TIMINGS END =========="
                         kill "$spid" 2>/dev/null || true
                         exit $rc
                       else

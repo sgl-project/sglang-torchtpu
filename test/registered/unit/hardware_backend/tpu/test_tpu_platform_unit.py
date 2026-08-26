@@ -169,6 +169,7 @@ class TestTpuPlatformMemory(CustomTestCase):
 
     def setUp(self):
         self.platform = TpuSRTPlatform()
+        self.platform._backend_initialized = True
 
     def _patch_mem(self, free, limit):
         # get_device() builds torch.device("tpu", ...) which is invalid off-TPU;
@@ -177,6 +178,13 @@ class TestTpuPlatformMemory(CustomTestCase):
             patch.object(self.platform, "get_device", return_value=None),
             patch("torch.accelerator.get_memory_info", return_value=(free, limit)),
         )
+
+    def test_uninitialized_returns_zero_without_calling_runtime(self):
+        uninit_platform = TpuSRTPlatform()
+        with patch("torch.accelerator.get_memory_info") as mock_mem:
+            self.assertEqual(uninit_platform.get_device_total_memory(), 0)
+            self.assertEqual(uninit_platform.get_current_memory_usage(), 0.0)
+            mock_mem.assert_not_called()
 
     def test_total_memory_returns_reported_limit(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)

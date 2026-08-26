@@ -19,6 +19,14 @@ decode runs on `done_recving`. Cross-rank gating is the framework's existing
 `poll_and_all_reduce` (min over ranks); no worker-side barrier. Page ids come
 from `kv_to_page_indices` in token order and are raiden block ids directly.
 
+KV moves chunk by chunk: as each chunked-prefill step commits its pages the
+prefill announces them, and the decode pulls each piece as soon as a staging
+slot is free, so only the last chunk's transfer is left after the prefill. The
+closing message carries the aux blob and the remaining pages. A request keeps
+one chunk in flight at a time, and pages the decode already holds from its own
+prefix cache are never announced. A hybrid model's sliding-window pages ride on
+the closing read, since the window is only settled when the prefill ends.
+
 ## Asymmetric attention TP (strided push-resharding)
 
 When decode TP < prefill TP (e.g. 8TP (P) -> 4TP2DP (D)), a decode rank
@@ -71,9 +79,12 @@ reuse, `dst_tp > src_tp`.
 | `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*(dp_rank*tp_size + tp_rank)` (data = `+1`, SWA engine control/data = `+2`/`+3`) |
 | `SGLANG_RAIDEN_RESHARD` | `1` | on by default; activates only for asymmetric attn TP (`dst_tp < src_tp`) — symmetric traffic is unaffected. Set `0` to disable (asymmetric TP then raises) and keep the multi-slot host pool instead of the reshard device-shadow sizing. |
 | `SGLANG_RAIDEN_NUM_SLOTS` | `16` | raiden host-pool transfer slots |
-| `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | max pages/request; auto = `ceil(context_len/page_size)` |
+| `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
+| `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
+
+A decode rank issues at most one pull per host staging slot; requests past that stay in the transfer queue and are retried as slots free, so the batch size does not have to fit the slot count.
 
 ## Launch (one host each, equal TP)
 

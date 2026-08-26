@@ -56,6 +56,20 @@ def _get_pages_per_seq(max_context_len: int, page_size: int) -> int:
     return (max_context_len + page_size - 1) // page_size
 
 
+# Scoped SMEM available to one Pallas kernel invocation on TPU.
+_SCOPED_SMEM_BYTES = 1 << 20
+
+
+def _page_table_smem_bytes(max_num_seqs: int, pages_per_seq: int) -> int:
+    """Bytes of SMEM the kernel's page table occupies for ``max_num_seqs``.
+
+    The page table is a scalar-prefetch operand: ``max_num_seqs * pages_per_seq``
+    int32 entries, padded to a multiple of 128 entries.
+    """
+    entries = max_num_seqs * pages_per_seq
+    return ((entries + 127) // 128) * 128 * 4
+
+
 def _validate_kv_len_capacity(max_kv_len: int, capacity: int) -> None:
     if max_kv_len > capacity:
         raise ValueError(
@@ -78,8 +92,21 @@ class PallasForwardMetadata:
     page_indices: torch.Tensor
     # i32[3]  (decode_end, prefill_end, mixed_end) sequence-index ranges
     distribution: torch.Tensor
+    # Scalar i32 query-row count covered by ``distribution``.
+    active_num_tokens: torch.Tensor
     # i32[max_num_seqs * pages_per_seq]  page indices
     swa_page_indices: torch.Tensor | None = None
+
+
+def _zero_inactive_rpa_rows(
+    output: torch.Tensor, active_num_tokens: torch.Tensor
+) -> torch.Tensor:
+    """Zero output rows that the RPA distribution does not execute."""
+    row_ids = torch.arange(output.shape[0], device=output.device)
+    active = row_ids < active_num_tokens
+    active = active.reshape((output.shape[0],) + (1,) * (output.ndim - 1))
+    zero = torch.zeros((), dtype=output.dtype, device=output.device)
+    return torch.where(active, output, zero)
 
 
 class InvokeKernelFn(Protocol):
@@ -329,8 +356,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
         self.page_size = model_runner.page_size
         self.max_context_len = (
-            model_runner.model_config.context_len
-            + get_req_to_token_extra_context_len(model_runner.server_args)
+            model_runner.model_config.context_len + get_req_to_token_extra_context_len()
         )
         self.req_to_token_pool = model_runner.req_to_token_pool
         req_to_token_width = self.req_to_token_pool.req_to_token.shape[1]
@@ -339,6 +365,22 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 "RPA context capacity exceeds the request-to-token table width: "
                 f"required={self.max_context_len}, available={req_to_token_width}."
             )
+        max_bs = getattr(model_runner.server_args, "torch_compile_max_bs", None)
+        if max_bs:
+            pages_per_seq = _get_pages_per_seq(self.max_context_len, self.page_size)
+            table_bytes = _page_table_smem_bytes(max_bs, pages_per_seq)
+            if table_bytes > _SCOPED_SMEM_BYTES:
+                logger.warning(
+                    "RPA page table for %d sequences x %d pages needs %.2f MiB of "
+                    "SMEM, above the %.0f MiB scoped budget; the kernel compile "
+                    "will fail. Lower --torch-compile-max-bs (<= %d at this "
+                    "context length) or raise --page-size.",
+                    max_bs,
+                    pages_per_seq,
+                    table_bytes / 2**20,
+                    _SCOPED_SMEM_BYTES / 2**20,
+                    max(1, (_SCOPED_SMEM_BYTES // 4 - 128) // pages_per_seq),
+                )
 
         # Hybrid-SWA models keep two KV sub-pools and need a
         # second page_indices tensor with indices translated into the SWA
@@ -404,16 +446,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # ForwardBatch onto the attn backend (see self.token_to_kv_pool above).
         self.token_to_kv_pool.tpu_commit_pending_loads()
 
-        # Look up the cached RPA ``distribution`` on TPU, so we don't build it,
-        # don't H2D it per step, and don't need the barrier that ensured the RPA
-        # kernel launched only after that H2D finished.
-        device = forward_batch.seq_lens.device
+        # Build metadata and its cached distribution from the same active width.
         non_empty_bs = self._non_empty_batch_size(forward_batch)
-        is_decode = forward_batch.forward_mode.is_decode()
-        distribution = self._get_cached_rpa_distribution(
-            is_decode, non_empty_bs, device
-        )
-        self.forward_metadata = self._build_metadata(forward_batch, distribution)
+        self.forward_metadata = self._build_metadata(forward_batch, non_empty_bs)
 
     @staticmethod
     def _pre_bucket_padded_batch_size(forward_batch: ForwardBatch) -> int:
@@ -478,7 +513,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         )
 
     def _build_metadata(
-        self, forward_batch: ForwardBatch, distribution: torch.Tensor
+        self,
+        forward_batch: ForwardBatch,
+        non_empty_bs: int,
     ) -> PallasForwardMetadata:
         """Build per-forward-pass metadata for the Pallas kernel.
 
@@ -498,6 +535,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         """
         page_size = self.page_size
         device = forward_batch.seq_lens.device
+        distribution = self._get_cached_rpa_distribution(
+            forward_batch.forward_mode.is_decode(), non_empty_bs, device
+        )
         bs = int(forward_batch.seq_lens.shape[0])
         req_to_token = self.req_to_token_pool.req_to_token
         pages_per_seq = _get_pages_per_seq(self.max_context_len, page_size)
@@ -514,6 +554,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 req_to_token,
                 pages_per_seq,
                 distribution,
+                non_empty_bs,
             )
 
         # -------------------------------------------------------------- #
@@ -616,6 +657,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             cu_kv_lens=cu_kv_lens,
             page_indices=page_indices,
             distribution=distribution,
+            active_num_tokens=cu_q_lens[non_empty_bs],
             swa_page_indices=swa_page_indices,
         )
 
@@ -628,6 +670,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         req_to_token,
         pages_per_seq,
         distribution: torch.Tensor,
+        non_empty_bs: int,
     ) -> PallasForwardMetadata:
         """Host-resident metadata build (gated in ``_build_metadata``).
 
@@ -727,12 +770,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         # H2D for host-built cu-lens / page_indices; kv_lens already on device,
         # distribution is the caller's cached buffer.
+        cu_q_lens = cu_q_lens.to(device, non_blocking=True)
         return PallasForwardMetadata(
             kv_lens=kv_lens,
-            cu_q_lens=cu_q_lens.to(device, non_blocking=True),
+            cu_q_lens=cu_q_lens,
             cu_kv_lens=cu_kv_lens.to(device, non_blocking=True),
             page_indices=page_indices.to(device, non_blocking=True),
             distribution=distribution,
+            active_num_tokens=cu_q_lens[non_empty_bs],
             swa_page_indices=swa_page_indices,
         )
 
@@ -834,12 +879,18 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale = None
             v_scale = None
 
+        draft_kv_lens = getattr(forward_batch.spec_info, "rpa_draft_kv_lens", None)
+        kv_lens = (
+            draft_kv_lens
+            if draft_kv_lens is not None
+            else self.forward_metadata.kv_lens
+        )
         out = op(
             q,
             k,
             v,
             kv_cache,
-            self.forward_metadata.kv_lens,
+            kv_lens,
             page_indices,
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
@@ -851,6 +902,11 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             k_scale,
             v_scale,
         )
+
+        capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
+        # FULL capture retains padded rows for later EAGLE steps.
+        if capture_mode is not None and capture_mode.is_full():
+            out = _zero_inactive_rpa_rows(out, self.forward_metadata.active_num_tokens)
 
         # The kernel emits output at the (padded) qk head_dim. For asymmetric
         # K/V the trailing (qk - v) columns come from the zero-padded V slots and

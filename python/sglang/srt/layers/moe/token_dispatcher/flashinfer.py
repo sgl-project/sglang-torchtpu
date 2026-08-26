@@ -5,7 +5,7 @@ from typing import NamedTuple, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
@@ -29,18 +29,21 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import is_cuda, is_flashinfer_available
 
-try:
-    from flashinfer import nvfp4_block_scale_interleave
-    from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
-    from flashinfer.comm.mapping import Mapping
-    from flashinfer.comm.mnnvl import MnnvlConfig
+use_flashinfer = False
+if is_cuda() and is_flashinfer_available():
+    try:
+        from flashinfer import nvfp4_block_scale_interleave
+        from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
+        from flashinfer.comm.mapping import Mapping
+        from flashinfer.comm.mnnvl import MnnvlConfig
 
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+        from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-    use_flashinfer = True
-except ImportError:
-    use_flashinfer = False
+        use_flashinfer = True
+    except (ImportError, AttributeError):
+        use_flashinfer = False
 
 logger = logging.getLogger(__name__)
 

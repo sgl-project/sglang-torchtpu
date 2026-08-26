@@ -552,10 +552,16 @@ class TpuSRTPlatform(SRTPlatform):
         # Per-process HBM limit. Each worker is pinned to one core
         # (TPU_VISIBLE_CHIPS=local_rank), so this already reflects v7 megacore
         # sharing (2 cores split a chip's HBM) — no cores-per-chip math needed.
+        # Guard against premature PjRt initialization in the parent/tokenizer
+        # process before init_backend() runs in worker subprocesses.
+        if not getattr(self, "_backend_initialized", False):
+            return 0
         _, limit = torch.accelerator.get_memory_info(self.get_device(device_id))
         return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
+        if not getattr(self, "_backend_initialized", False):
+            return 0.0
         if device is None:
             device = self.get_device(0)
         free, total = torch.accelerator.get_memory_info(device)

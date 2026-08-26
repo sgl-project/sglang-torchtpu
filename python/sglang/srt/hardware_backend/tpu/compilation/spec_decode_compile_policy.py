@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
+    _dp_attn_apply_bucket_metadata,
     _restore_forward_batch_inputs,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
@@ -21,7 +22,9 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _get_hbm_usage_mb,
     _hbm_delta_str,
+    _materialize_out,
 )
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -33,7 +36,8 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpecPaddingState
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType, SpecPaddingState
+from sglang.srt.utils.common import ceil_align
 
 logger = get_logger(__name__)
 
@@ -54,6 +58,7 @@ class _SpecVerifyPadding:
     state: SpecPaddingState
     batch: Any
     verify_input: SpecInput
+    forward_mode: ForwardMode
     seq_lens: torch.Tensor
     draft_token: torch.Tensor
     retrieve_index: torch.Tensor
@@ -68,12 +73,18 @@ def _pad_rows(tensor: torch.Tensor, pad_rows: int, fill: float) -> torch.Tensor:
     return F.pad(tensor, pad_spec, value=fill)
 
 
-def _deferred_padding_state(spec_info: SpecInput, logits_rows: int):
+def _deferred_padding_state(
+    spec_info: SpecInput, logits_rows: int
+) -> SpecPaddingState | None:
     """Report the padding still present in the target logits, if any."""
     state = spec_info.padding_state
     if state is None or not spec_info.keep_outputs_padded:
         return None
     if state.physical_num_tokens == state.logical_num_tokens:
+        return None
+    if logits_rows == state.logical_num_tokens:
+        # Outputs were already restored before the deferred sampling hook.
+        spec_info.keep_outputs_padded = False
         return None
     if logits_rows != state.physical_num_tokens:
         raise ValueError(
@@ -81,6 +92,19 @@ def _deferred_padding_state(spec_info: SpecInput, logits_rows: int):
             f"state={state}, logits rows={logits_rows}."
         )
     return state
+
+
+def _draft_extend_precompile_bs_buckets(
+    bs_buckets: list[int], local_req_capacity: int
+) -> list[int]:
+    """Limit draft-extend warmup to locally reachable batch buckets."""
+    valid = [bs for bs in bs_buckets if bs <= local_req_capacity]
+    if not valid:
+        raise ValueError(
+            "DRAFT_EXTEND_V2 has no precompile batch bucket within the local "
+            f"request-pool capacity {local_req_capacity}: buckets={bs_buckets}."
+        )
+    return valid
 
 
 def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | None:
@@ -92,6 +116,42 @@ def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | N
         return t
     pad = t.new_zeros((target_rows - t.shape[0], *t.shape[1:]))
     return torch.cat([t, pad], dim=0)
+
+
+def _get_dp_peer_request_rows(
+    global_num_tokens: list[int] | tuple[int, ...] | None,
+    *,
+    tokens_per_request: int,
+    attention_tp_size: int,
+) -> int:
+    peer_tokens = max(global_num_tokens or (), default=0)
+    if peer_tokens <= 0:
+        return 0
+    if tokens_per_request <= 0:
+        raise ValueError(
+            "DP speculative width requires a positive token count per request, "
+            f"got {tokens_per_request}."
+        )
+    aligned_tokens = ceil_align(peer_tokens, max(attention_tp_size, 1))
+    if aligned_tokens % tokens_per_request != 0:
+        raise ValueError(
+            "DP speculative width must contain whole requests: "
+            f"aligned_tokens={aligned_tokens}, "
+            f"tokens_per_request={tokens_per_request}."
+        )
+    return aligned_tokens // tokens_per_request
+
+
+def _pad_eagle_draft_input(draft_input: EagleDraftInput, request_rows: int) -> int:
+    current_rows = 0 if draft_input.topk_p is None else int(draft_input.topk_p.shape[0])
+    if current_rows >= request_rows:
+        return current_rows
+    draft_input.topk_p = _pad_first_dim(draft_input.topk_p, request_rows)
+    draft_input.topk_index = _pad_first_dim(draft_input.topk_index, request_rows)
+    draft_input.hidden_states = _pad_first_dim(draft_input.hidden_states, request_rows)
+    draft_input.bonus_tokens = _pad_first_dim(draft_input.bonus_tokens, request_rows)
+    draft_input.draft_probs = _pad_first_dim(draft_input.draft_probs, request_rows)
+    return current_rows
 
 
 class SpecDecodeCompilePolicyMixin:
@@ -128,6 +188,14 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a draft forward before constructing attention metadata."""
         mode = forward_batch.forward_mode
+        if (
+            is_dp_attention_enabled()
+            and forward_batch.spec_info is not None
+            and (mode.is_idle() or forward_batch.seq_lens.numel() == 0)
+        ):
+            self._prepare_empty_dp_draft_batch(forward_batch, mode)
+            return
+
         if mode.is_idle():
             return
         if mode.is_decode():
@@ -135,6 +203,435 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             self._pad_draft_decode(forward_batch)
         elif mode.is_draft_extend_v2():
             self._pad_draft_extend(forward_batch)
+
+    def refresh_fused_draft_dp_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Publish the final padded draft shape before a fused direct call."""
+        if not is_dp_attention_enabled() or forward_batch.forward_mode.is_idle():
+            return
+        padded_batch_size = int(forward_batch.batch_size)
+        _dp_attn_apply_bucket_metadata(
+            forward_batch, padded_batch_size, padded_batch_size
+        )
+
+    def _prepare_empty_dp_draft_batch(
+        self, forward_batch: ForwardBatch, original_mode: ForwardMode
+    ) -> None:
+        """Give an empty DP draft phase the same physical shape as its peers."""
+        if (
+            original_mode.is_idle()
+            and getattr(forward_batch, "_original_forward_mode", None) is None
+        ):
+            forward_batch._original_forward_mode = original_mode
+        # Idle peers must execute the full draft-decode program.
+        forward_batch.forward_mode = ForwardMode.DECODE
+        rows = self._get_dp_peer_request_rows(forward_batch) or 1
+        self._materialize_dp_idle_spec_batch(
+            forward_batch, ForwardMode.DECODE, rows=rows
+        )
+
+        if isinstance(forward_batch.spec_info, EagleDraftInput):
+            self.prepare_spec_draft_input(forward_batch, forward_batch.spec_info)
+        forward_batch.spec_info.keep_outputs_padded = True
+        self._pad_draft_decode(forward_batch)
+        if original_mode.is_decode() or original_mode.is_idle():
+            steps = max(self.speculative_num_steps, 1)
+            cache_rows = rows * self.speculative_eagle_topk * steps
+            if (
+                isinstance(forward_batch.out_cache_loc, torch.Tensor)
+                and forward_batch.out_cache_loc.shape[0] != cache_rows
+            ):
+                forward_batch.out_cache_loc = torch.zeros(
+                    cache_rows,
+                    dtype=forward_batch.out_cache_loc.dtype,
+                    device=forward_batch.out_cache_loc.device,
+                )
+
+    def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Bucket once, then record the phase's logical and physical shapes."""
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            return super().prepare_forward_batch(forward_batch)
+
+        logical_bs, logical_tokens = self._logical_spec_shape(
+            forward_batch,
+            fallback_batch_size=int(forward_batch.seq_lens.shape[0]),
+            fallback_num_tokens=int(forward_batch.input_ids.shape[0]),
+        )
+        self._materialize_dp_idle_spec_batch(forward_batch, forward_batch.forward_mode)
+        super().prepare_forward_batch(forward_batch)
+        spec_info.record_padding(
+            logical_batch_size=logical_bs,
+            physical_batch_size=int(forward_batch.seq_lens.shape[0]),
+            logical_num_tokens=logical_tokens,
+            physical_num_tokens=int(forward_batch.input_ids.shape[0]),
+        )
+
+    def _logical_spec_shape(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        fallback_batch_size: int,
+        fallback_num_tokens: int,
+    ) -> tuple[int, int]:
+        """Return the scheduler-logical shape for a padded spec phase."""
+        spec_info = forward_batch.spec_info
+        prior = getattr(spec_info, "padding_state", None)
+        if prior is not None:
+            return prior.logical_batch_size, prior.logical_num_tokens
+
+        original_mode = getattr(forward_batch, "_original_forward_mode", None)
+        if original_mode is not None and original_mode.is_idle():
+            return 0, 0
+
+        logical_bs = getattr(forward_batch, "_original_batch_size", None)
+        if logical_bs is None:
+            logical_bs = fallback_batch_size
+        logical_bs = int(logical_bs)
+
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify():
+            tokens_per_req = int(getattr(spec_info, "draft_token_num", 0))
+        elif mode.is_draft_extend_v2():
+            tokens_per_req = spec_info.num_tokens_per_req
+        elif mode.is_decode() and spec_info.is_draft_input():
+            tokens_per_req = spec_info.num_tokens_per_req
+        else:
+            tokens_per_req = 0
+
+        if tokens_per_req > 0:
+            logical_tokens = logical_bs * tokens_per_req
+        elif mode.is_extend():
+            unpadded_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+            logical_tokens = (
+                int(unpadded_tokens)
+                if unpadded_tokens is not None
+                else fallback_num_tokens
+            )
+        else:
+            logical_tokens = fallback_num_tokens
+        return logical_bs, logical_tokens
+
+    def _record_spec_execution_padding(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        fallback_logical_batch_size: int,
+        physical_batch_size: int,
+        fallback_logical_num_tokens: int,
+        physical_num_tokens: int,
+    ) -> None:
+        """Record scheduler-logical to final-physical speculative padding."""
+        spec_info = forward_batch.spec_info
+        logical_bs, logical_tokens = self._logical_spec_shape(
+            forward_batch,
+            fallback_batch_size=fallback_logical_batch_size,
+            fallback_num_tokens=fallback_logical_num_tokens,
+        )
+        spec_info.record_padding(
+            logical_batch_size=logical_bs,
+            physical_batch_size=physical_batch_size,
+            logical_num_tokens=logical_tokens,
+            physical_num_tokens=physical_num_tokens,
+        )
+
+    def _materialize_dp_idle_spec_batch(
+        self,
+        forward_batch: ForwardBatch,
+        mode: ForwardMode,
+        *,
+        rows: int = 1,
+        pre_write_seq_lens: bool = False,
+    ) -> None:
+        """Give an empty DP rank the physical rows required by its spec phase."""
+        if (
+            not is_dp_attention_enabled()
+            or forward_batch.spec_info is None
+            or forward_batch.seq_lens.numel() > 0
+        ):
+            return
+
+        if mode.is_draft_extend_v2():
+            self._materialize_dp_idle_draft_extend(
+                forward_batch, pre_write_seq_lens=pre_write_seq_lens
+            )
+        elif mode.is_extend():
+            max_tokens = max(forward_batch.global_num_tokens_cpu or (), default=0)
+            if max_tokens > 0:
+                self.materialize_dp_idle_extend(forward_batch, max_tokens)
+        else:
+            self._materialize_dp_idle_decode(forward_batch, rows=rows)
+
+    @staticmethod
+    def _materialize_dp_idle_decode(
+        forward_batch: ForwardBatch, *, rows: int = 1
+    ) -> None:
+        """Represent an idle draft-decode rank with physical dummy sequences."""
+        if forward_batch.seq_lens.numel() > 0:
+            return
+
+        rows = max(int(rows), 1)
+        device = forward_batch.input_ids.device
+        seq_dtype = forward_batch.seq_lens.dtype
+        forward_batch.batch_size = rows
+        forward_batch.seq_lens = torch.ones(rows, dtype=seq_dtype, device=device)
+        forward_batch.seq_lens_cpu = torch.ones(rows, dtype=seq_dtype)
+        forward_batch.seq_lens_sum = rows
+        forward_batch.input_ids = torch.zeros(
+            rows, dtype=forward_batch.input_ids.dtype, device=device
+        )
+        forward_batch.positions = torch.zeros(rows, dtype=torch.int64, device=device)
+        if isinstance(forward_batch.out_cache_loc, torch.Tensor):
+            forward_batch.out_cache_loc = torch.zeros(
+                rows, dtype=forward_batch.out_cache_loc.dtype, device=device
+            )
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            pool_dtype = forward_batch.req_pool_indices.dtype
+            forward_batch.req_pool_indices = torch.zeros(
+                rows, dtype=pool_dtype, device=device
+            )
+            forward_batch.req_pool_indices_cpu = torch.zeros(rows, dtype=pool_dtype)
+
+    @staticmethod
+    def _materialize_dp_idle_draft_extend(
+        forward_batch: ForwardBatch, *, pre_write_seq_lens: bool = False
+    ) -> None:
+        """Build fixed-width extend metadata for a logically idle draft rank."""
+        tokens_per_req = int(getattr(forward_batch.spec_info, "num_tokens_per_req", 0))
+        max_tokens = max(forward_batch.global_num_tokens_cpu or (), default=0)
+        if tokens_per_req <= 0 or max_tokens <= 0:
+            return
+        if max_tokens % tokens_per_req != 0:
+            raise ValueError(
+                "DP idle DRAFT_EXTEND_V2 requires whole requests: "
+                f"max_tokens={max_tokens}, tokens_per_req={tokens_per_req}."
+            )
+
+        batch_size = max_tokens // tokens_per_req
+        device = forward_batch.input_ids.device
+        seq_dtype = forward_batch.seq_lens.dtype
+        seq_len = 0 if pre_write_seq_lens else tokens_per_req
+        forward_batch.batch_size = batch_size
+        forward_batch.extend_num_tokens = max_tokens
+        forward_batch.seq_lens = torch.full(
+            (batch_size,), seq_len, dtype=seq_dtype, device=device
+        )
+        forward_batch.seq_lens_cpu = torch.full((batch_size,), seq_len, dtype=seq_dtype)
+        forward_batch.seq_lens_sum = seq_len * batch_size
+        forward_batch.extend_seq_lens = torch.full(
+            (batch_size,), tokens_per_req, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_prefix_lens = torch.zeros(
+            batch_size, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_start_loc = torch.arange(
+            0, max_tokens, tokens_per_req, dtype=torch.int32, device=device
+        )
+        forward_batch.extend_seq_lens_cpu = [tokens_per_req] * batch_size
+        forward_batch.extend_prefix_lens_cpu = [0] * batch_size
+        forward_batch.extend_logprob_start_lens_cpu = [0] * batch_size
+        forward_batch.input_ids = torch.zeros(
+            max_tokens, dtype=forward_batch.input_ids.dtype, device=device
+        )
+        forward_batch.positions = torch.arange(
+            max_tokens, dtype=torch.int64, device=device
+        )
+        if isinstance(getattr(forward_batch, "out_cache_loc", None), torch.Tensor):
+            forward_batch.out_cache_loc = torch.zeros(
+                max_tokens,
+                dtype=forward_batch.out_cache_loc.dtype,
+                device=device,
+            )
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            pool_dtype = forward_batch.req_pool_indices.dtype
+            forward_batch.req_pool_indices = torch.zeros(
+                batch_size, dtype=pool_dtype, device=device
+            )
+            forward_batch.req_pool_indices_cpu = torch.zeros(
+                batch_size, dtype=pool_dtype
+            )
+
+        spec_info = forward_batch.spec_info
+        if isinstance(spec_info, EagleDraftExtendInput):
+            spec_info.input_ids = forward_batch.input_ids
+            spec_info.seq_lens = forward_batch.seq_lens
+            spec_info.seq_lens_cpu = forward_batch.seq_lens_cpu
+            spec_info.req_pool_indices = forward_batch.req_pool_indices
+            spec_info.positions = forward_batch.positions
+            if spec_info.hidden_states is not None:
+                spec_info.hidden_states = spec_info.hidden_states.new_zeros(
+                    (max_tokens, *spec_info.hidden_states.shape[1:])
+                )
+            if spec_info.num_correct_drafts is not None:
+                spec_info.num_correct_drafts = spec_info.num_correct_drafts.new_zeros(
+                    batch_size
+                )
+            if spec_info.num_accept_tokens is not None:
+                spec_info.num_accept_tokens = spec_info.num_accept_tokens.new_full(
+                    (batch_size,), tokens_per_req
+                )
+            spec_info.num_accept_tokens_cpu = [tokens_per_req] * batch_size
+            if spec_info.bonus_tokens is not None:
+                spec_info.bonus_tokens = spec_info.bonus_tokens.new_zeros(batch_size)
+
+    def normalize_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Materialize an idle post-verify draft before sequence bookkeeping."""
+        if (
+            not forward_batch.forward_mode.is_idle()
+            or not is_dp_attention_enabled()
+            or not isinstance(forward_batch.spec_info, EagleDraftExtendInput)
+            or int(forward_batch.spec_info.num_tokens_per_req) <= 1
+            or max(forward_batch.global_num_tokens_cpu or (), default=0) <= 0
+        ):
+            return
+
+        forward_batch._original_forward_mode = forward_batch.forward_mode
+        forward_batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        forward_batch.spec_info.keep_outputs_padded = True
+        # The caller applies the shared sequence-length update afterward.
+        self._materialize_dp_idle_spec_batch(
+            forward_batch,
+            ForwardMode.DRAFT_EXTEND_V2,
+            pre_write_seq_lens=True,
+        )
+
+    def _normalize_dp_idle_forward(self, forward_batch: ForwardBatch) -> None:
+        """Match an idle speculative rank to the active rank's phase."""
+        spec_info = forward_batch.spec_info
+        if spec_info is None:
+            return super()._normalize_dp_idle_forward(forward_batch)
+
+        if forward_batch._original_forward_mode is None:
+            forward_batch._original_forward_mode = forward_batch.forward_mode
+        # Preserve physical rows until speculative bookkeeping completes.
+        spec_info.keep_outputs_padded = True
+
+        if getattr(spec_info, "is_verify_input", lambda: False)():
+            forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+            return
+
+        is_draft_extend = (
+            getattr(spec_info, "spec_input_type", None)
+            == SpecInputType.EAGLE_DRAFT_EXTEND
+        )
+        if is_draft_extend and int(spec_info.num_tokens_per_req) == 1:
+            # Draft prefill is an ordinary EXTEND.
+            forward_batch.forward_mode = ForwardMode.EXTEND
+        elif is_draft_extend:
+            forward_batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        else:
+            forward_batch.forward_mode = ForwardMode.DECODE
+
+        self._materialize_dp_idle_spec_batch(forward_batch, forward_batch.forward_mode)
+
+    def _get_dp_peer_request_rows(self, forward_batch: ForwardBatch) -> int:
+        """Return the compile-bucket request width shared by all DP ranks."""
+        if not is_dp_attention_enabled() or self.b_bucketer is None:
+            return 0
+        request_rows = _get_dp_peer_request_rows(
+            forward_batch.global_num_tokens_cpu,
+            tokens_per_request=self.speculative_eagle_topk,
+            attention_tp_size=get_parallel().attn_tp_size,
+        )
+        return self.b_bucketer.next_bucket(request_rows) if request_rows else 0
+
+    def get_dp_padded_token_counts(
+        self,
+        forward_batch: ForwardBatch,
+        model_runner: Any,
+        global_num_tokens: list[int],
+        global_num_tokens_for_logprob: list[int],
+        *,
+        attn_tp_size: int,
+        cp_align_size: int,
+    ) -> tuple[list[int], list[int]]:
+        if not is_dp_attention_enabled() or forward_batch.spec_info is None:
+            return super().get_dp_padded_token_counts(
+                forward_batch,
+                model_runner,
+                global_num_tokens,
+                global_num_tokens_for_logprob,
+                attn_tp_size=attn_tp_size,
+                cp_align_size=cp_align_size,
+            )
+        fixed_width = (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        bucket_width = fixed_width or (
+            model_runner.is_draft_worker
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info.is_draft_input()
+        )
+        if not fixed_width:
+            (
+                global_num_tokens,
+                global_num_tokens_for_logprob,
+            ) = super().get_dp_padded_token_counts(
+                forward_batch,
+                model_runner,
+                global_num_tokens,
+                global_num_tokens_for_logprob,
+                attn_tp_size=attn_tp_size,
+                cp_align_size=cp_align_size,
+            )
+        if bucket_width:
+            shared_width = self._bucket_dp_sync_token_width(
+                forward_batch, max(global_num_tokens)
+            )
+            global_num_tokens = [shared_width] * len(global_num_tokens)
+        return global_num_tokens, global_num_tokens_for_logprob
+
+    def prepare_spec_draft_input(
+        self, forward_batch: ForwardBatch, draft_input: EagleDraftInput
+    ) -> None:
+        request_rows = self._get_dp_peer_request_rows(forward_batch)
+        if request_rows <= 0:
+            return
+        seed_rows = _pad_eagle_draft_input(draft_input, request_rows)
+        if seed_rows >= request_rows:
+            return
+        original_mode = getattr(forward_batch, "_original_forward_mode", None)
+        logical_rows = (
+            0 if original_mode is not None and original_mode.is_idle() else seed_rows
+        )
+        draft_input.keep_outputs_padded = True
+        draft_input.record_padding(
+            logical_batch_size=logical_rows,
+            physical_batch_size=request_rows,
+            logical_num_tokens=logical_rows * self.speculative_eagle_topk,
+            physical_num_tokens=request_rows * self.speculative_eagle_topk,
+        )
+
+    def _bucket_dp_sync_token_width(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> int:
+        """Round a speculative DP width up to a runnable TPU graph shape."""
+        if self.b_bucketer is None:
+            return num_tokens
+        spec_info = forward_batch.spec_info
+        tokens_per_req = spec_info.num_tokens_per_req
+        if tokens_per_req <= 0 or num_tokens <= 0:
+            return num_tokens
+        physical_tokens = int(forward_batch.input_ids.shape[0])
+        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+        if isinstance(req_pool_indices, torch.Tensor):
+            physical_tokens = max(
+                physical_tokens,
+                int(req_pool_indices.shape[0]) * tokens_per_req,
+            )
+        required_tokens = max(num_tokens, physical_tokens)
+        rows = (required_tokens + tokens_per_req - 1) // tokens_per_req
+        return self.b_bucketer.next_bucket(rows) * tokens_per_req
+
+    def _dp_peer_draft_extend_rows(self, forward_batch: ForwardBatch) -> int:
+        """Return the shared post-verify draft-extend request width."""
+        if not is_dp_attention_enabled():
+            return 0
+        max_tokens = max(forward_batch.global_num_tokens_cpu or (), default=0)
+        tokens_per_req = self.draft_token_num
+        if max_tokens <= 0 or tokens_per_req <= 0:
+            return 0
+        return -(-max_tokens // tokens_per_req)
 
     def _infer_eagle_hidden_size(self) -> int:
         """Derive the hidden-state width the EAGLE3 draft model's forward expects.
@@ -215,11 +712,21 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 )
 
     def _precompile_extend_full(self) -> None:
-        """Compile EXTEND with CaptureHiddenMode.FULL at the fixed batch cap."""
+        """Compile target prefill with and without speculative input state.
+
+        A new request reaches the target with ``spec_info=None``. A continued
+        speculative request may carry an ``EagleDraftInput``. Dynamo guards on
+        both object states, so precompile both before recompiles are disabled.
+        """
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        valid_shapes = [
+            (t, bs, has_spec_info)
+            for t in self.t_bucketer.buckets
+            if t >= bs
+            for has_spec_info in (False, True)
+        ]
         logger.info(
             "[spec compile policy] EXTEND(FULL): %d shapes "
             "(bs=%d, token_buckets=%s)",
@@ -236,7 +743,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             if get_parallel().tp_rank == 0
             else valid_shapes
         )
-        for num_tokens, bs in compile_range:
+        for num_tokens, bs, has_spec_info in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
@@ -244,14 +751,15 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 bs=bs,
                 mode=ForwardMode.EXTEND,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self._make_null_spec_info(),
+                spec_info=self._make_null_spec_info() if has_spec_info else None,
             )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs})"
+                    f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
+                    f"spec_info={'set' if has_spec_info else 'none'})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
 
@@ -259,6 +767,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         self,
         draft_attn_backend: Any,
         draft_extend_attn_backend: Any,
+        fused_draft_forward: Callable[[ForwardBatch], Any] | None = None,
     ) -> None:
         """Compile every DRAFT-model forward family at server warmup.
 
@@ -279,6 +788,8 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         overall = time.perf_counter()
         self._precompile_draft_prefill_extend()
         self._precompile_draft_decode(draft_attn_backend)
+        if fused_draft_forward is not None:
+            self._precompile_fused_draft_decode(draft_attn_backend, fused_draft_forward)
         self._precompile_draft_extend(draft_extend_attn_backend)
         logger.info(
             "[spec compile policy] DRAFT precompile done in %.1fs.",
@@ -373,17 +884,79 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
 
         self._precompile_shapes("DRAFT DECODE", shapes, run)
 
+    def _precompile_fused_draft_decode(
+        self,
+        draft_attn_backend: Any,
+        fused_draft_forward: Callable[[ForwardBatch], Any],
+    ) -> None:
+        """Compile the fused draft loop for every decode batch bucket."""
+        assert self.b_bucketer is not None
+        bs_buckets = list(self.b_bucketer.buckets)
+        logger.info(
+            "[spec compile policy] FUSED DRAFT: %d shapes (bs=%s)",
+            len(bs_buckets),
+            bs_buckets,
+        )
+
+        def run(bs: int) -> str:
+            args, kwargs = self._make_warmup_inputs(
+                num_tokens=bs * self.speculative_eagle_topk,
+                bs=bs,
+                mode=ForwardMode.DECODE,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                spec_info=self._make_fused_draft_decode_spec_info(bs),
+            )
+            forward_batch = kwargs.get("forward_batch", args[2])
+            # A live fused draft reserves one KV output slot per request and
+            # draft step. Generic DECODE warmup only allocates one per request.
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.repeat_interleave(
+                self.speculative_num_steps
+            )
+            self._seed_dummy_req_to_token(forward_batch)
+            if is_dp_attention_enabled():
+                self._set_dp_attention_metadata(
+                    forward_batch,
+                    bs * self.speculative_eagle_topk,
+                    bs,
+                    ForwardMode.DECODE,
+                )
+            # Serving buckets and marks the draft input before attention
+            # metadata is built. Keep padded outputs at their physical width
+            # for every model call in the fused loop.
+            self.prepare_spec_forward_batch(forward_batch)
+            self.model_runner.model.prepare_forward_batch(forward_batch)
+            draft_attn_backend.init_forward_metadata(forward_batch)
+            forward_batch.mark_forward_metadata_ready()
+            # The live draft path has consumed this seed before entering the
+            # fused loop. Match its state so Dynamo reuses the warmup graph.
+            forward_batch.input_ids = None
+            with torch.no_grad():
+                out = fused_draft_forward(forward_batch)
+                _materialize_out(
+                    out,
+                    draft_attn_backend.attn_backends[0],
+                    self.model_runner.token_to_kv_pool,
+                )
+            return f"bs={bs}"
+
+        self._precompile_shapes("FUSED DRAFT", bs_buckets, run)
+
     def _precompile_draft_extend(self, attn_backend: Any) -> None:
         """Compile DRAFT_EXTEND_V2(FULL) across the bs buckets."""
         assert self.b_bucketer is not None
-        bs_buckets = list(self.b_bucketer.buckets)
+        all_bs_buckets = list(self.b_bucketer.buckets)
+        local_req_capacity = int(self.model_runner.req_to_token_pool.size)
+        bs_buckets = _draft_extend_precompile_bs_buckets(
+            all_bs_buckets, local_req_capacity
+        )
         tokens_per_req = self.draft_token_num
         logger.info(
             "[spec compile policy] DRAFT_EXTEND_V2(FULL): %d shapes "
-            "(bs=%s, tokens_per_req=%d)",
+            "(bs=%s, tokens_per_req=%d, local_req_capacity=%d)",
             len(bs_buckets),
             bs_buckets,
             tokens_per_req,
+            local_req_capacity,
         )
 
         def run(bs: int) -> str:
@@ -424,6 +997,23 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         )
         spec_info.num_tokens_per_req = self.speculative_eagle_topk
         spec_info.num_tokens_for_logprob_per_req = self.speculative_eagle_topk
+        return spec_info
+
+    def _make_fused_draft_decode_spec_info(self, bs: int) -> EagleDraftInput:
+        """Build the batch-shaped EAGLE seeds consumed by the fused loop."""
+        spec_info = self._make_draft_decode_spec_info()
+        device = self.model_runner.device
+        spec_info.topk_p = torch.ones(
+            (bs, self.speculative_eagle_topk), device=device, dtype=torch.float32
+        )
+        spec_info.topk_index = torch.zeros(
+            (bs, self.speculative_eagle_topk), device=device, dtype=torch.int64
+        )
+        spec_info.hidden_states = torch.zeros(
+            (bs, spec_info.hidden_states.shape[1]),
+            device=device,
+            dtype=self.model_runner.dtype,
+        )
         return spec_info
 
     def _make_draft_extend_spec_info(self) -> EagleDraftExtendInput:
@@ -556,18 +1146,36 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             # cooperatively so a model-specific policy later in the MRO (for
             # example Qwen3-VL) can slice those outputs and restore metadata.
             return super().finalize_forward_batch(outputs, forward_batch)
-        if next_token_logits is not None and real_b < next_token_logits.shape[0]:
+        original_mode = getattr(forward_batch, "_original_forward_mode", None)
+        preserve_idle_outputs = original_mode is not None and original_mode.is_idle()
+        spec_info = forward_batch.spec_info
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        preserve_deferred_verify_outputs = (
+            forward_mode is not None
+            and forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.keep_outputs_padded
+        )
+        preserve_padded_outputs = (
+            preserve_idle_outputs or preserve_deferred_verify_outputs
+        )
+        if (
+            not preserve_padded_outputs
+            and next_token_logits is not None
+            and real_b < next_token_logits.shape[0]
+        ):
             # TARGET_VERIFY outputs bs * draft_token_num logits (one per draft
             # token across all requests); slicing to real_b would drop verify
             # tokens, so use real_q instead.
-            fm = getattr(forward_batch, "forward_mode", None)
             logit_rows = (
-                real_q if (fm is not None and fm.is_target_verify()) else real_b
+                real_q
+                if (forward_mode is not None and forward_mode.is_target_verify())
+                else real_b
             )
             if logit_rows < next_token_logits.shape[0]:
                 outputs.next_token_logits = next_token_logits[:logit_rows]
 
-        if hidden_states is not None:
+        if hidden_states is not None and not preserve_padded_outputs:
             # Capture-LAST (draft extend) emits one hidden row per
             # sequence (batch-dim), so slice to real_b. Every other capture mode
             # emits one row per token (real_q).
@@ -577,8 +1185,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 outputs.hidden_states = hidden_states[:n_real]
 
         _restore_forward_batch_inputs(forward_batch, real_q, real_b)
-        spec_info = forward_batch.spec_info
-        if spec_info is not None:
+        if spec_info is not None and not preserve_padded_outputs:
             spec_info.keep_outputs_padded = False
         return outputs
 
@@ -588,7 +1195,11 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         if b_bucketer is None:
             return
         real_bs = int(forward_batch.seq_lens.shape[0])
-        pad_b = b_bucketer.next_bucket(real_bs)
+        # Draft seeds and later model outputs must use the same DP width.
+        pad_b = max(
+            b_bucketer.next_bucket(real_bs),
+            self._get_dp_peer_request_rows(forward_batch),
+        )
         if pad_b == real_bs:
             return
 
@@ -632,15 +1243,17 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
 
         # EagleDraftInput seeds consumed by select_top_k_tokens.
         spec_info = forward_batch.spec_info
-        if spec_info is not None:
-            spec_info.topk_p = _pad_first_dim(spec_info.topk_p, pad_b)
-            spec_info.topk_index = _pad_first_dim(spec_info.topk_index, pad_b)
-            spec_info.hidden_states = _pad_first_dim(spec_info.hidden_states, pad_b)
-
+        if isinstance(spec_info, EagleDraftInput):
+            _pad_eagle_draft_input(spec_info, pad_b)
+            logical_bs, logical_tokens = self._logical_spec_shape(
+                forward_batch,
+                fallback_batch_size=real_bs,
+                fallback_num_tokens=real_bs * self.speculative_eagle_topk,
+            )
             spec_info.record_padding(
-                logical_batch_size=real_bs,
+                logical_batch_size=logical_bs,
                 physical_batch_size=pad_b,
-                logical_num_tokens=real_bs * self.speculative_eagle_topk,
+                logical_num_tokens=logical_tokens,
                 physical_num_tokens=pad_b * self.speculative_eagle_topk,
             )
 
@@ -653,6 +1266,9 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         """Trim draft outputs and restore the logical batch state."""
         real_bs = getattr(forward_batch, _REAL_B_KEY, None)
         spec_info = forward_batch.spec_info
+        if spec_info is not None and spec_info.keep_outputs_padded:
+            # Keep the shared physical width through the complete draft loop.
+            return outputs
         if real_bs is None:
             if spec_info is not None:
                 spec_info.keep_outputs_padded = False
@@ -670,7 +1286,9 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         draft_extend_input = forward_batch.spec_info
         real_bs = int(forward_batch.seq_lens.shape[0])
         real_tokens = int(forward_batch.input_ids.shape[0])
-        pad_b = self.b_bucketer.next_bucket(real_bs)
+        pad_b = self.b_bucketer.next_bucket(
+            max(real_bs, self._dp_peer_draft_extend_rows(forward_batch))
+        )
         pad_tokens = pad_b * self.draft_token_num
         if pad_b != real_bs:
             # Draft extend has a fixed width, so it needs no token bucket.
@@ -707,18 +1325,26 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             forward_batch.mm_inputs = (mm_inputs + [None] * pad_b)[:pad_b]
 
         if isinstance(draft_extend_input, EagleDraftExtendInput):
-            draft_extend_input.record_padding(
-                logical_batch_size=real_bs,
+            self._record_spec_execution_padding(
+                forward_batch,
+                fallback_logical_batch_size=real_bs,
                 physical_batch_size=pad_b,
-                logical_num_tokens=real_tokens,
+                fallback_logical_num_tokens=real_tokens,
                 physical_num_tokens=pad_tokens,
             )
 
     def should_defer_verify_output_unpadding(
         self, batch: Any, verify_input: SpecInput
     ) -> bool:
-        """Keep compiled verify outputs bucketed through sampling helpers."""
-        verify_input.keep_outputs_padded = not batch.forward_mode.is_idle()
+        """Decide whether TPU can defer target-output unpadding until sampling."""
+        idle_with_active_dp_peer = (
+            batch.forward_mode.is_idle()
+            and is_dp_attention_enabled()
+            and max(getattr(batch, "global_num_tokens_cpu", None) or (), default=0) > 0
+        )
+        verify_input.keep_outputs_padded = (
+            not batch.forward_mode.is_idle() or idle_with_active_dp_peer
+        )
         return verify_input.keep_outputs_padded
 
     def prepare_spec_verify(
@@ -728,8 +1354,6 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         next_token_logits: torch.Tensor,
     ) -> _SpecVerifyPadding | None:
         """Temporarily pad scheduler inputs to match deferred target logits."""
-        if batch.forward_mode.is_idle():
-            return None
         state = _deferred_padding_state(verify_input, int(next_token_logits.shape[0]))
         if state is None:
             return None
@@ -742,6 +1366,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
             state=state,
             batch=batch,
             verify_input=verify_input,
+            forward_mode=batch.forward_mode,
             seq_lens=batch.seq_lens,
             draft_token=verify_input.draft_token,
             retrieve_index=verify_input.retrieve_index,
@@ -776,6 +1401,11 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         )
 
         # Publish padded tensors only while eagle_sample runs.
+        # A logically idle DP peer must take the same sampling/bookkeeping
+        # path as its active peer after its tensors have been materialized.
+        # Restore IDLE before scheduler bookkeeping observes the batch again.
+        if batch.forward_mode.is_idle():
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.seq_lens = seq_lens
         verify_input.draft_token = draft_token
         verify_input.retrieve_index = retrieve_index
@@ -802,9 +1432,11 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         predict, accept_lens, accept_index = verify_result
         new_seq_lens, bonus_tokens = bookkeeping_result
         sampling_info = padding.batch.sampling_info
+        padding.batch.forward_mode = padding.forward_mode
         padding.batch.seq_lens = padding.seq_lens
         padding.verify_input.draft_token = padding.draft_token
         padding.verify_input.retrieve_index = padding.retrieve_index
+        padding.verify_input.keep_outputs_padded = False
         sampling_info.temperatures = padding.temperatures
         sampling_info.top_ks = padding.top_ks
         sampling_info.top_ps = padding.top_ps

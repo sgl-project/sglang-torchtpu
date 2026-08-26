@@ -162,6 +162,7 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s = Scheduler.__new__(Scheduler)
         s.use_overlap_streams = use_overlap_streams
         s.forward_stream_ctx = nullcontext()
+        s.copy_stream_ctx = nullcontext()
         # The relay itself (FutureMap stash vs ngram skip) is covered elsewhere;
         # here we only assert it is invoked with this iter's payload.
         s._relay_forward_payload = MagicMock()
@@ -191,11 +192,13 @@ class TestLaunchBatchSampleStreamGating(CustomTestCase):
         s = self._make_self(use_overlap_streams=True)
         s.forward_stream = MagicMock()
         s.schedule_stream = MagicMock()
+        s.copy_stream = MagicMock()
         br = self._make_batch_result()
 
         Scheduler.launch_batch_sample_if_needed(s, br, self._make_cur_batch())
 
         s.forward_stream.wait_stream.assert_called_once_with(s.schedule_stream)
+        s.copy_stream.wait_stream.assert_called_once_with(s.forward_stream)
         br.copy_to_cpu.assert_called_once()
 
     def test_delayed_sample_releases_global_top_k_tensors(self):

@@ -50,17 +50,23 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
-try:
-    from flashinfer import (
-        nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
-    )
+from sglang.srt.utils.common import is_cuda, is_flashinfer_available
 
-    from sglang.srt.layers.quantization.modelopt_quant import (
-        fp4_quantize as fp4_quantize_flashinfer,
-    )
-except ImportError:
-    fp4_quantize_flashinfer = None
-    nvfp4_block_scale_interleave_flashinfer = None
+fp4_quantize_flashinfer = None
+nvfp4_block_scale_interleave_flashinfer = None
+
+if is_cuda() and is_flashinfer_available():
+    try:
+        from flashinfer import (
+            nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
+        )
+
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            fp4_quantize as fp4_quantize_flashinfer,
+        )
+    except (ImportError, AttributeError):
+        fp4_quantize_flashinfer = None
+        nvfp4_block_scale_interleave_flashinfer = None
 
 
 class StandardDispatchOutput(NamedTuple):

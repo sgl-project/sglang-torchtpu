@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -18,6 +19,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import is_mps, is_npu, is_tpu
@@ -78,6 +80,7 @@ class SchedulerProfilerManager:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.merge_profiles = False
+        self.detailed_annotations: bool = False
 
         # For ROCM
         self.rpd_profiler = None
@@ -97,9 +100,11 @@ class SchedulerProfilerManager:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
+        detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
+            self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
                 output_dir=output_dir,
                 start_step=start_step,
@@ -112,6 +117,7 @@ class SchedulerProfilerManager:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
+                detailed_annotations=detailed_annotations,
             )
 
         if self.profile_in_progress:
@@ -142,6 +148,7 @@ class SchedulerProfilerManager:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
+        self.detailed_annotations = detailed_annotations
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.get_forward_ct() + 1)
@@ -164,10 +171,17 @@ class SchedulerProfilerManager:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
+    def _apply_detailed_annotations(self, enabled: bool) -> None:
+        # Toggle the process-wide flag read by build_step_span_name; folds the
+        # per-phase sq/sqsq/sqsk/sk aggregates (context c_ / generation g_)
+        # into the step span while a detailed-annotation profile is active.
+        set_detailed_annotations_enabled(enabled)
+
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
+            self._apply_detailed_annotations(self.detailed_annotations)
             return self._profile_manager.manual_start()
 
         stage_str = f" for {stage.name}" if stage else ""
@@ -290,6 +304,7 @@ class SchedulerProfilerManager:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        self._apply_detailed_annotations(self.detailed_annotations)
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _is_global_primary_rank(self) -> bool:
@@ -339,6 +354,7 @@ class SchedulerProfilerManager:
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
+            self._apply_detailed_annotations(False)
             return self._profile_manager.manual_stop()
 
         if not self.profile_in_progress:
@@ -424,10 +440,15 @@ class SchedulerProfilerManager:
             self.torch_profiler_output_dir,
             merge_message,
         )
-        self.torch_profiler = None
+
+        if self.torch_profiler is not None:
+            self.torch_profiler = None
+            gc.collect()
+
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        self._apply_detailed_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
@@ -484,6 +505,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.detailed_annotations,
                     recv_req.profile_stages,
                 )
             else:
@@ -498,6 +520,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.detailed_annotations,
                 )
                 # Don't start if init failed.
                 if result is not None and not result.success:

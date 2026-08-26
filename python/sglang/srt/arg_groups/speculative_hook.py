@@ -21,6 +21,23 @@ def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
     )
 
 
+def _validate_tpu_speculative_args(server_args: ServerArgs, model_config) -> None:
+    if server_args.device != "tpu":
+        return
+    if server_args.speculative_eagle_topk != 1:
+        raise ValueError(
+            "TPU speculative decoding requires --speculative-eagle-topk=1."
+        )
+    if server_args.speculative_use_rejection_sampling:
+        raise ValueError(
+            "TPU speculative decoding does not support rejection sampling."
+        )
+    if server_args.kv_canary != "none":
+        raise ValueError("TPU speculative decoding does not support KV canary.")
+    if getattr(model_config.hf_config, "index_share_for_mtp_iteration", False):
+        raise ValueError("TPU speculative decoding does not support DSA index sharing.")
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -276,24 +293,42 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 
 def _handle_dspark(server_args: ServerArgs) -> None:
-    if not server_args.device.startswith("cuda"):
-        raise ValueError("DSpark speculative decoding only supports CUDA device.")
+    _is_npu = server_args.device.startswith("npu")
+    if not server_args.device.startswith(("cuda", "npu")):
+        raise ValueError(
+            "DSpark speculative decoding only supports CUDA or NPU device."
+        )
 
-    if server_args.enable_dp_attention:
+    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
+    if server_args.enable_dp_attention and server_args.dp_size > 1:
         if not server_args.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if server_args.moe_a2a_backend != "none":
+        if not _is_npu and server_args.moe_a2a_backend not in ("none", "megamoe"):
             raise ValueError(
-                "DSpark with dp attention only supports the built-in TP MoE "
-                f"(moe_a2a_backend='none'), got {server_args.moe_a2a_backend!r}."
+                "DSpark with dp attention supports moe_a2a_backend 'none' "
+                "(built-in TP MoE) or 'megamoe', got "
+                f"{server_args.moe_a2a_backend!r}."
             )
+        if not _is_npu and server_args.moe_a2a_backend != "none":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "DSpark with dp attention + "
+                    f"moe_a2a_backend={server_args.moe_a2a_backend!r} requires "
+                    "SGLANG_RAGGED_VERIFY_MODE=static."
+                )
         if server_args.attn_cp_size > 1:
             raise ValueError(
                 "DSpark with dp attention does not support context parallel "
                 f"(attn_cp_size={server_args.attn_cp_size})."
             )
         if (
-            server_args.speculative_moe_a2a_backend is not None
+            not _is_npu
+            and server_args.speculative_moe_a2a_backend is not None
             and server_args.speculative_moe_a2a_backend != server_args.moe_a2a_backend
         ):
             raise ValueError(
@@ -558,7 +593,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "eagle speculative decoding."
         )
 
-    model_arch = server_args.get_model_config().hf_config.architectures[0]
+    model_config = server_args.get_model_config()
+    model_arch = model_config.hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",
@@ -605,6 +641,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             raise ValueError(
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
+
+    _validate_tpu_speculative_args(server_args, model_config)
 
     if server_args.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.

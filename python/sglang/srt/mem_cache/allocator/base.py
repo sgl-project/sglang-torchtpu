@@ -88,6 +88,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 device=device if device is not None else self.device,
             )
 
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Token ids as the PD-disaggregation transfer engine addresses them.
+
+        Identity here: a static pool's token ids index its registered buffers
+        directly. Virtual-id pools must override.
+        """
+        return kv_indices
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()

@@ -240,10 +240,14 @@ def accept_sampling_triton(
     return correct_len, bonus, cap_trim_lens
 
 
-try:
-    from flashinfer.sampling import softmax as _flashinfer_softmax
-except ImportError:
-    _flashinfer_softmax = None
+from sglang.srt.utils.common import is_cuda, is_flashinfer_available
+
+_flashinfer_softmax = None
+if is_cuda() and is_flashinfer_available():
+    try:
+        from flashinfer.sampling import softmax as _flashinfer_softmax
+    except (ImportError, AttributeError):
+        _flashinfer_softmax = None
 
 
 class SoftmaxTemp:
