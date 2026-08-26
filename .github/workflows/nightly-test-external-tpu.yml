@@ -1,0 +1,77 @@
+# Nightly TPU e2e on Meta's external (Project B) cluster. Builds the image ONCE (same
+# _tpu-build as the in-project nightly; Meta's nodes pull it from the Project A Artifact
+# Registry), then discovers the `meta-nightly-*` launch groups from the test tree and runs
+# one JobSet per group on Meta's TPU slice. Weights are served from the Project A GCS bucket
+# over gcsfuse. See .github/tpu-ci/meta/README.md.
+#
+# SCAFFOLD: with no meta-nightly-* test registered yet, `discover` outputs [] and `run`
+# is skipped -- the workflow is green and does nothing until a dev registers the first test.
+name: Nightly Test (Meta TPU)
+
+on:
+  schedule:
+    - cron: "30 10 * * *"   # 10:30 UTC daily; staggered after the in-project nightly (09:00)
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Discover meta-nightly launch groups from the test files (test-owned launch specs).
+  discover:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.d.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: d
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
+          groups="$(python3 .github/tpu-ci/meta/render_meta_jobset.py --list-groups)"
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
+          echo "discovered meta-nightly groups: $groups"
+          [ "$groups" = "[]" ] && echo "No meta-nightly-* tests registered yet; run will be skipped."
+
+  # One JobSet per launch group on Meta's cluster. matrix.group is a discovered object.
+  run:
+    needs: [build, discover]
+    if: needs.discover.outputs.groups != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.discover.outputs.groups) }}
+    name: ${{ matrix.group.name }}
+    uses: ./.github/workflows/_meta-tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: ${{ matrix.group.suite }}
+      launch_script: ${{ matrix.group.launch_script }}
+      files: ${{ matrix.group.files }}
+      weights: ${{ matrix.group.weights }}
+      nodepool_var: ${{ matrix.group.nodepool_var }}
+      run_name: ${{ matrix.group.name }}
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write

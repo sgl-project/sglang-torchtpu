@@ -1,0 +1,38 @@
+# Meta (Project B) TPU test config for the `meta-nightly-*` suites. See README.md.
+#
+# Partner-internal identifiers (cluster name, project id, nodepool names) are NOT stored in
+# source -- they come from repo secrets at workflow time:
+#   secrets.META_CLUSTER, secrets.META_PROJECT, secrets.META_NODEPOOL_<shape>
+# This file holds only non-sensitive structure. Each suite names the SECRET that holds its
+# nodepool (`nodepool_var`), resolved by the workflow; the value never lands in git.
+
+cluster:
+  namespace: default            # no Kueue; JobSets land here directly
+  accelerator: tpu7x
+  # tpu7x-standard-4t = 4 chips/host x 2 TensorCores/chip = 8 devices/host. tp = hosts x 8.
+  devices_per_host: 8
+
+weights:
+  # The CI artifacts bucket doubles as the weight store under weights/<model>/. Stage with:
+  #   gcloud storage rsync -r ./<model> gs://sglang-torchtpu-ci-artifacts/weights/<model>
+  bucket: sglang-torchtpu-ci-artifacts
+  prefix: weights
+  mount_path: /gcs-weights
+  # gcsfuse mount tuned for safetensors weight loading. cache-file-for-range-read turns the
+  # loader's many small seeky reads into one whole-file sequential download into a bounded,
+  # node-local file cache; every subsequent read hits local disk. See README.
+  mount_options: "implicit-dirs,file-cache:max-size-mb:102400,file-cache:cache-file-for-range-read:true"
+  ephemeral_storage_limit: 120Gi
+  default_extra_args: "--weight-loader-disable-mmap"
+
+# Suite name -> slice. The suite fixes the slice shape; `nodepool_var` names the repo secret
+# holding that slice's nodepool (a GKE multi-host nodepool IS one physical slice).
+suites:
+  meta-nightly-2x2x2:
+    hosts: 2
+    topology: 2x2x2
+    nodepool_var: META_NODEPOOL_2X2X2      # tp=16 (8 chips, 2 hosts)
+  meta-nightly-2x2x4:
+    hosts: 4
+    topology: 2x2x4
+    nodepool_var: META_NODEPOOL_2X2X4      # tp=32 (16 chips, 4 hosts)

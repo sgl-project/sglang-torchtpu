@@ -1,0 +1,217 @@
+# Reusable: render one Meta (Project B) launch group's JobSet onto the already-built `image`,
+# apply it to Meta's external TPU cluster over the GKE DNS endpoint, stream its logs, and gate
+# on the JobSet Completed/Failed condition. Meta's cluster has NO Kueue -- the JobSet pins
+# itself to one multi-host nodepool -- so this is a trimmed cousin of _tpu-test.yml: no
+# admission budget, no Workload check, just apply + poll. See .github/tpu-ci/meta/README.md.
+name: _meta-tpu-test
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string            # repo@sha256:... from _tpu-build
+      suite:
+        required: true
+        type: string            # a meta-nightly-* suite (fixes the slice)
+      launch_script:
+        required: true
+        type: string
+      files:
+        required: true
+        type: string            # space-separated test files rank-0 runs
+      weights:
+        required: true
+        type: string            # model subdir under gs://<bucket>/weights/
+      nodepool_var:
+        required: true
+        type: string            # NAME of the repo secret holding this slice's nodepool
+      run_name:
+        required: false
+        type: string
+        default: ""
+      extra_args:
+        required: false
+        type: string
+        default: ""             # empty -> weights.default_extra_args from meta-topology.yaml
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Meta runs one slice at a time; serialize per (workflow, run) so two groups never contend
+  # for the same physical nodepool.
+  group: meta-tpu-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
+  cancel-in-progress: false
+
+env:
+  # The runner authenticates as the in-project CI SA; Meta grants that SA access to their
+  # cluster (RBAC + roles/container.developer) and its DNS endpoint. See README "Access".
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
+  CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
+  # Partner-internal identifiers come from repo secrets (masked in logs, out of source).
+  META_CLUSTER: ${{ secrets.META_CLUSTER }}
+  META_PROJECT: ${{ secrets.META_PROJECT }}
+  META_LOCATION: us-central1        # public GCP region; not a partner identifier
+  META_NAMESPACE: default
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_SA }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ env.META_CLUSTER }}
+          location: ${{ env.META_LOCATION }}
+          project_id: ${{ env.META_PROJECT }}
+          use_dns_based_endpoint: true
+
+      - name: Render + run on Meta TPU
+        env:
+          # Every slice's nodepool secret; the run reads the one named by inputs.nodepool_var
+          # via indirect expansion. Add a line here when adding a new slice shape.
+          META_NODEPOOL_2X2X2: ${{ secrets.META_NODEPOOL_2X2X2 }}
+          META_NODEPOOL_2X2X4: ${{ secrets.META_NODEPOOL_2X2X4 }}
+          NODEPOOL_VAR: ${{ inputs.nodepool_var }}
+        run: |
+          set -euo pipefail
+          label='${{ inputs.run_name || inputs.suite }}'
+          ns='${{ env.META_NAMESPACE }}'
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
+
+          # Resolve this slice's nodepool from the secret named by nodepool_var (GitHub masks
+          # the value in logs). Fail closed if the secret is unset.
+          NODEPOOL="${!NODEPOOL_VAR:-}"
+          [ -n "$NODEPOOL" ] || { echo "❌ repo secret ${NODEPOOL_VAR} is not set -- see meta/README.md 'Configuration'"; exit 1; }
+
+          python3 .github/tpu-ci/meta/render_meta_jobset.py \
+            --image '${{ inputs.image }}' \
+            --suite '${{ inputs.suite }}' \
+            --launch-script '${{ inputs.launch_script }}' \
+            --files '${{ inputs.files }}' \
+            --weights '${{ inputs.weights }}' \
+            --nodepool "$NODEPOOL" \
+            --extra-args '${{ inputs.extra_args }}' \
+            --name '${{ inputs.run_name }}' > /tmp/meta-job.yaml
+          echo "== rendered (key fields) =="
+          grep -nE 'generateName:|completions:|gke-nodepool:|gke-tpu-topology:|bucketName:|MODEL$|value: \"/gcs-weights|TP_SIZE|LAUNCH_SCRIPT|bash "benchmark' /tmp/meta-job.yaml | head
+
+          # The kubeconfig token lives one hour; a weight-load + compile + eval run can outlast
+          # it. Re-mint the CI SA token from a fresh GitHub OIDC token (same exchange the auth
+          # action does) and swap it into the kubeconfig before it can expire.
+          refresh_cluster_token() {
+            local oidc sts sa_token user
+            oidc="$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://iam.googleapis.com/${WIF_PROVIDER}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')" || return 1
+            sts="$(curl -sSf -X POST https://sts.googleapis.com/v1/token \
+              -H 'Content-Type: application/json' \
+              -d "{\"audience\":\"//iam.googleapis.com/${WIF_PROVIDER}\",
+                   \"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",
+                   \"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",
+                   \"scope\":\"https://www.googleapis.com/auth/cloud-platform\",
+                   \"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",
+                   \"subjectToken\":\"${oidc}\"}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')" || return 1
+            sa_token="$(curl -sSf -X POST \
+              "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${CI_SA}:generateAccessToken" \
+              -H "Authorization: Bearer ${sts}" -H 'Content-Type: application/json' \
+              -d '{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')" || return 1
+            user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
+            kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
+            echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
+          }
+
+          name="$(kubectl -n "$ns" create -f /tmp/meta-job.yaml -o name)"
+          echo "Created ${name}"
+          trap 'kubectl -n '"$ns"' delete '"${name}"' --ignore-not-found --wait=false' EXIT
+          short="${name##*/}"
+          sel="jobset.sigs.k8s.io/jobset-name=${short}"
+
+          # Wait for a pod to bind + pull on the reserved slice (warm nodes; minutes, not the
+          # long Kueue queue the in-project lanes see).
+          running_deadline=$(( $(date +%s) + 1200 ))
+          until kubectl -n "$ns" get pods -l "$sel" \
+                  -o jsonpath='{.items[*].status.phase}' 2>/dev/null | grep -q Running; do
+            if [ "$(date +%s)" -ge "$running_deadline" ]; then
+              echo "⚠️  ${label}: no pod Running 1200s after apply; continuing anyway"
+              kubectl -n "$ns" get pods -l "$sel" -o wide || true
+              kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 30 || true
+              break
+            fi
+            sleep 10
+          done
+          kubectl -n "$ns" get pods -l "$sel" -o wide || true
+
+          refresh_cluster_token || echo "credential refresh failed; continuing with current token"
+          # Stream logs from every host (best effort; the pod log is the only egress).
+          kubectl -n "$ns" logs -f -l "$sel" --all-containers=true --prefix=true \
+            --max-log-requests=10 --pod-running-timeout=20m --tail=-1 \
+            2>&1 | tee "$RUNNER_TEMP/meta-pod-logs.txt" || true
+
+          # Gate on the JobSet condition. Deadline outlasts the JobSet's activeDeadlineSeconds
+          # (9000s) so the JobSet -- not this loop -- decides the outcome.
+          deadline=$(( $(date +%s) + 9600 ))
+          next_refresh=$(( $(date +%s) + 2400 ))
+          auth_fails=0
+          iter=0
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ "$(date +%s)" -ge "$next_refresh" ]; then
+              refresh_cluster_token && next_refresh=$(( $(date +%s) + 2400 )) \
+                || { echo "refresh failed; retry in 45s"; next_refresh=$(( $(date +%s) + 45 )); }
+            fi
+            if [ $(( iter % 12 )) -eq 0 ]; then
+              echo "--- [$(date +%T)] Pod status for ${label} ---"
+              kubectl -n "$ns" get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName 2>/dev/null || true
+            fi
+            iter=$(( iter + 1 ))
+            if ! kubectl -n "$ns" get "$name" >/dev/null 2>&1; then
+              auth_fails=$((auth_fails + 1))
+              [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
+              if [ "$auth_fails" -ge 12 ]; then
+                echo "❌ ${label}: lost cluster access while polling; outcome unknown"; exit 1
+              fi
+              sleep 5; continue
+            fi
+            auth_fails=0
+            ok="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
+            bad="$(kubectl -n "$ns" get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            [ "$ok" = "True" ]  && { echo "✅ ${label} PASSED"; exit 0; }
+            [ "$bad" = "True" ] && {
+              echo "❌ ${label} FAILED"
+              kubectl -n "$ns" get pods -l "$sel" -o wide || true
+              kubectl -n "$ns" logs -l "$sel" --all-containers --prefix --tail=200 2>/dev/null || true
+              kubectl -n "$ns" get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+              kubectl -n "$ns" describe "$name" | tail -n 120
+              exit 1
+            }
+            sleep 5
+          done
+          echo "❌ ${label} TIMED OUT"
+          kubectl -n "$ns" get pods -l "$sel" -o wide || true
+          kubectl -n "$ns" describe "$name" | tail -n 120 || true
+          exit 1
+
+      - name: Upload pod logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-tpu-logs-${{ inputs.run_name || inputs.suite }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/meta-pod-logs.txt
+          if-no-files-found: ignore
+          retention-days: 30

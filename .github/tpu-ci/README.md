@@ -4,6 +4,10 @@ PR-gate and nightly SGLang tests on Google Cloud TPU, dispatched from GitHub
 Actions into a reserved GKE cluster. Auth is keyless (Workload Identity
 Federation); no long-lived keys.
 
+> **Meta (Project B) external cluster:** the `meta-nightly-*` suites run the same tests on
+> Meta's external tpu7x cluster, serving weights from the CI bucket over gcsfuse. That path
+> has its own renderer/workflow/config — see [`meta/README.md`](meta/README.md).
+
 ## Architecture
 
 ```
