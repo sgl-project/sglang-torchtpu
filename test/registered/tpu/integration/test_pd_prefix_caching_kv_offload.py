@@ -7,15 +7,21 @@ prefill engine through the raiden HiCache io backend. The CI JobSet
 roles are dispatched from the CI_PD_ROLE env plus the slice-local TPU worker env.
 
 What each verification proves:
-  * quality:    gsm8k through the LB must clear the model's accuracy floor.
+  * quality:    gsm8k through the LB must clear the model's accuracy floor,
+                and the cached fraction of its prefill tokens must dominate
+                (>= 0.5), so the score gates the cached prefill path rather
+                than cold traffic.
   * cache hit:  an immediate resend of a long prompt must hit the device radix
                 cache (cached_tokens_details.device).
   * offload:    after churn evicts the device pool, a resend must reload the
                 prefix from the host tier (cached_tokens_details.host > 0), and
                 the prefill log must show the raiden transfer engine came up.
-  * KV transfer: every probe goes prefill -> decode across slices; greedy output
-                must stay bit-equal to the cold baseline, certifying the KV
-                crossed both the P/D wire and the host tier intact.
+  * KV transfer: every probe goes prefill -> decode across slices; the three
+                cached passes (device hit, host reload, post-reload hit) run
+                the same extend shape and must produce identical greedy text
+                on a forced verbatim copy task -- a difference means stale or
+                corrupt KV in the host offload round trip. The cold pass runs
+                a different extend shape and is held to liveness only.
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
@@ -36,6 +42,7 @@ Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -142,7 +149,11 @@ MODEL_PROFILES = {
         # validated clean on both counts.
         max_total_tokens=786_432,
         device_pool_tokens_hint=786_432,
-        gsm8k_threshold=0.72,
+        # Measured 0.98 (1p1d, 2026-08-15) and 0.97 (2p2d, run 32908499644),
+        # both over 100 examples; binomial sigma there is ~1.5 points, so 0.90
+        # sits several sigma below measurement while still failing on a real
+        # quality regression rather than only on catastrophic KV corruption.
+        gsm8k_threshold=0.90,
         extra_server_args=("--reasoning-parser", "gpt-oss"),
         # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
         # (dynamic token dim in the extend graph).
@@ -175,7 +186,9 @@ class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
     device_pool_tokens: int
     target_words: int
     filler_words: int
-    num_fillers: int
+    # None sizes the churn at runtime from the first filler's measured token
+    # count (churn_fillers_needed); an explicit value overrides that.
+    num_fillers: Optional[int]
     max_new_tokens: int
 
     @classmethod
@@ -188,22 +201,35 @@ class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
                 "CACHE_PROBE_DEVICE_TOKENS", str(profile.device_pool_tokens_hint)
             )
         )
-        filler_words = int(values.get("CACHE_PROBE_FILLER_WORDS", "2048"))
-        # ~1.3 tokens/word; sized to push ~1.2x the pool through it so the
-        # churn evicts the warm target. Both are hints, not guarantees -- the
-        # host-reload assertion is what actually proves eviction happened.
-        filler_tokens_est = filler_words * 13 // 10
-        default_fillers = (12 * device_tokens) // (10 * filler_tokens_est) + 2
+        fillers_raw = values.get("CACHE_PROBE_NUM_FILLERS")
         return cls(
             page_size=profile.page_size,
             device_pool_tokens=device_tokens,
             target_words=int(values.get("CACHE_PROBE_TARGET_WORDS", "2048")),
-            filler_words=filler_words,
-            num_fillers=int(
-                values.get("CACHE_PROBE_NUM_FILLERS", str(default_fillers))
-            ),
-            max_new_tokens=int(values.get("CACHE_PROBE_MAX_NEW_TOKENS", "16")),
+            filler_words=int(values.get("CACHE_PROBE_FILLER_WORDS", "2048")),
+            num_fillers=None if fillers_raw is None else int(fillers_raw),
+            # Room for all four copied item lines plus any preamble.
+            max_new_tokens=int(values.get("CACHE_PROBE_MAX_NEW_TOKENS", "64")),
         )
+
+
+def churn_fillers_needed(
+    *, measured_filler_tokens: int, device_pool_tokens: int
+) -> int:
+    """Fillers that push ~2x the device pool through the cache.
+
+    Sized from a measured filler's token count, not a tokens-per-word guess: a
+    guess that runs short leaves the churn below pool capacity, no eviction
+    ever fires, and the host-reload leg silently tests nothing (the 0.8x
+    undershoot observed in run 32927137148). The 2x margin also absorbs slack
+    between the configured pool bound and the allocator's effective capacity.
+    """
+    if measured_filler_tokens <= 0:
+        raise AssertionError(
+            f"measured filler prompt_tokens={measured_filler_tokens}; cannot "
+            "size the churn"
+        )
+    return (2 * device_pool_tokens) // measured_filler_tokens + 1
 
 
 class Gsm8kConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -226,7 +252,7 @@ class Gsm8kConfig(msgspec.Struct, frozen=True, kw_only=True):
         if not 0.0 <= threshold <= 1.0:
             raise ValueError(f"GSM8K threshold must be in [0, 1], got {threshold}")
         return cls(
-            num_examples=int(values.get("GSM8K_NUM_EXAMPLES", "100")),
+            num_examples=int(values.get("GSM8K_NUM_EXAMPLES", "200")),
             num_threads=int(values.get("GSM8K_NUM_THREADS", "8")),
             max_tokens=int(values.get("GSM8K_MAX_TOKENS", "2048")),
             threshold=threshold,
@@ -441,6 +467,46 @@ def make_prompt(index: int, nwords: int) -> str:
     return f"Document {index} header alpha{index} beta{index * 7}. " + " ".join(words)
 
 
+_ITEM_NOUNS = (
+    "lantern kettle walnut anchor violet magnet saddle donkey harbor pencil "
+    "quartz turnip magpie helmet donkey copper barrel falcon garnet hammer "
+    "island jasper kitten locket mirror needle onward parrot quiver ribbon "
+    "sombra tundra"
+).split()
+
+
+def make_target_prompt(nwords: int) -> Tuple[str, Tuple[int, ...]]:
+    """A numbered item list ending in a verbatim copy instruction.
+
+    Returns (prompt, queried item numbers). The greedy continuation is forced:
+    the model must repeat four distinctive lines drawn from across the list,
+    read through full attention from the queried positions' KV. Kernel-level
+    epsilon differences between cache paths cannot flip a forced copy, so any
+    output difference between passes means the KV values themselves changed.
+    (The repetitive filler prompts have near-tie logits at every step, where
+    any epsilon flips the text -- useless as a correctness oracle.)
+    """
+    num_items = max(40, nwords // 6)
+    lines = []
+    for i in range(1, num_items + 1):
+        noun = _ITEM_NOUNS[(i * 2654435761 & 0xFFFFFFFF) % len(_ITEM_NOUNS)]
+        lines.append(f"item {i}: {noun}-{i * 7 % 97}")
+    queried = (
+        num_items // 8,
+        num_items // 3,
+        (2 * num_items) // 3,
+        num_items - 5,
+    )
+    ask = ", ".join(str(q) for q in queried)
+    prompt = (
+        "Below is a list of items.\n"
+        + "\n".join(lines)
+        + f"\nOutput items {ask} from the list above exactly as written, "
+        "one per line, and nothing else.\nAnswer:\nitem "
+    )
+    return prompt, queried
+
+
 class GenerationRecord(msgspec.Struct, frozen=True, kw_only=True):
     text: str
     prompt_tokens: int
@@ -488,12 +554,22 @@ def validate_cache_probe(
     cold: GenerationRecord,
     device_hit: GenerationRecord,
     host_reload: GenerationRecord,
+    post_reload_hit: GenerationRecord,
     page_size: int,
 ) -> int:
     """The device-hit -> churn -> host-reload oracle; returns expected tokens.
 
-    Bit-equal greedy text across the three passes certifies the KV integrity of
-    both the P/D transfer and the host offload round trip.
+    The three cached passes run the same extend shape over the same stored
+    prefix KV, so their greedy text must be identical: device-hit vs
+    host-reload catches a stale or corrupt host round trip, and host-reload
+    vs post-reload-hit separates the two (a reload that raced its own
+    host->device DMA reads clean once the pages settle; corrupt values stay
+    wrong). Every pass crosses the P/D transfer.
+
+    The cold pass is held to cache-state and liveness checks only: its
+    prefill runs a different extend shape and consumes the prefix at compute
+    dtype rather than KV-cache dtype, so its logits differ at epsilon scale
+    and even the forced-copy prompt's preamble can break ties differently.
     """
     if cold.prompt_tokens < 2 * page_size:
         raise AssertionError(f"target prompt too short: {cold.prompt_tokens} tokens")
@@ -517,8 +593,8 @@ def validate_cache_probe(
         raise AssertionError(
             f"immediate resend loaded from host: {device_hit.host_cached_tokens}"
         )
-    if device_hit.text != cold.text:
-        raise AssertionError("device-hit greedy output diverged from cold baseline")
+    if not device_hit.text.strip() or device_hit.completion_tokens <= 0:
+        raise AssertionError("device-hit request produced no decode output")
 
     if host_reload.host_cached_tokens <= 0:
         raise AssertionError(
@@ -531,8 +607,22 @@ def validate_cache_probe(
             f"device={host_reload.device_cached_tokens} "
             f"host={host_reload.host_cached_tokens} expected>={expected}"
         )
-    if host_reload.text != cold.text:
-        raise AssertionError("host-reloaded greedy output diverged from cold baseline")
+    if host_reload.text != device_hit.text:
+        if post_reload_hit.text == device_hit.text:
+            raise AssertionError(
+                "host-reloaded copy output diverged from the device-hit pass "
+                "but the post-reload resend matches -- the reload raced its "
+                "own host->device transfer (no-stale gate not honored)"
+            )
+        raise AssertionError(
+            "host-reloaded copy output diverged from the device-hit pass -- "
+            "the offloaded KV pages did not survive the host round trip"
+        )
+    if post_reload_hit.text != device_hit.text:
+        raise AssertionError(
+            "post-reload resend diverged from the device-hit pass -- the "
+            "reloaded device-resident pages hold different KV values"
+        )
     return expected
 
 
@@ -540,17 +630,51 @@ def run_cache_probe(
     base_url: str, flush_url: str, profile: ModelProfile, config: CacheProbeConfig
 ) -> None:
     _flush_cache(flush_url)
-    target = make_prompt(0, config.target_words)
+    target, queried = make_target_prompt(config.target_words)
+    print(f"cache probe target queries items {queried}", flush=True)
     cold = _generate(base_url, target, config.max_new_tokens)
     device_hit = _generate(base_url, target, config.max_new_tokens)
-    for index in range(config.num_fillers):
+
+    first_filler = _generate(base_url, make_prompt(1000, config.filler_words), 1)
+    num_fillers = config.num_fillers
+    if num_fillers is None:
+        num_fillers = churn_fillers_needed(
+            measured_filler_tokens=first_filler.prompt_tokens,
+            device_pool_tokens=config.device_pool_tokens,
+        )
+    print(
+        f"churn: {num_fillers} fillers x {first_filler.prompt_tokens} tokens "
+        f"against a {config.device_pool_tokens}-token device pool",
+        flush=True,
+    )
+    for index in range(1, num_fillers):
         _generate(base_url, make_prompt(1000 + index, config.filler_words), 1)
     host_reload = _generate(base_url, target, config.max_new_tokens)
+    # The reload leaves the prefix device-resident again; this pass rereads
+    # the reloaded pages after any in-flight host->device transfers have
+    # settled, separating a racing reload from corrupt reloaded values.
+    post_reload_hit = _generate(base_url, target, config.max_new_tokens)
 
+    # Emitted before validation so a failed oracle still carries every
+    # generation for diagnosis.
+    print(
+        json.dumps(
+            {
+                "cache_probe": profile.key,
+                "cold": msgspec.to_builtins(cold),
+                "device_hit": msgspec.to_builtins(device_hit),
+                "host_reload": msgspec.to_builtins(host_reload),
+                "post_reload_hit": msgspec.to_builtins(post_reload_hit),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     expected = validate_cache_probe(
         cold=cold,
         device_hit=device_hit,
         host_reload=host_reload,
+        post_reload_hit=post_reload_hit,
         page_size=config.page_size,
     )
     labels = {"model": profile.served_name, "test": "pd_prefix_caching_kv_offload"}
@@ -560,19 +684,7 @@ def run_cache_probe(
     dump_metric(
         "kv_offload_host_reload_tokens", host_reload.host_cached_tokens, labels=labels
     )
-    print(
-        json.dumps(
-            {
-                "cache_probe": profile.key,
-                "expected_cached_tokens": expected,
-                "cold": msgspec.to_builtins(cold),
-                "device_hit": msgspec.to_builtins(device_hit),
-                "host_reload": msgspec.to_builtins(host_reload),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    print(f"cache probe passed: expected_cached_tokens={expected}", flush=True)
 
 
 def run_gsm8k(base_url: str, profile: ModelProfile, config: Gsm8kConfig) -> float:
@@ -636,6 +748,30 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
         pass
 
 
+def _start_host_watch() -> None:
+    """[probe] Stream kernel kill evidence and host-memory headroom to stdout.
+
+    A rank that dies without a Python traceback leaves nothing in the pod log;
+    the kernel ring buffer (OOM kills, segfaults) and the memory slope are the
+    only way to tell an OOM kill from a native abort. Privileged CI pods can
+    read the host ring buffer.
+    """
+    script = (
+        "(dmesg -w 2>/dev/null || echo '[hostwatch] dmesg unavailable') | "
+        "grep --line-buffered -iE "
+        "'out of memory|oom|killed process|segfault|hostwatch' | "
+        "sed -u 's/^/[hostwatch:dmesg] /' & "
+        "while :; do "
+        "echo \"[hostwatch:mem] $(grep -E 'MemTotal|MemAvailable' /proc/meminfo"
+        " | tr -s ' \\n' ' ')\"; "
+        "for d in /proc/[0-9]*; do r=$(awk '{print $2}' $d/statm 2>/dev/null); "
+        '[ -n "$r" ] && echo "$((r*4/1024))MB ${d##*/} $(cat $d/comm 2>/dev/null)"; '
+        "done | sort -rn | head -3 | sed 's/^/[hostwatch:rss] /'; "
+        "sleep 20; done"
+    )
+    subprocess.Popen(["bash", "-c", script], start_new_session=True)
+
+
 def _http_ok(url: str, timeout: int = 5) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -654,6 +790,26 @@ def _wait_http_200(url: str, secs: int, procs: Tuple = ()) -> None:
             return
         time.sleep(10)
     raise TimeoutError(f"{url} not ready after {secs}s")
+
+
+PREFILL_BATCH_RE = re.compile(
+    r"Prefill batch.*?#new-token: (\d+), #cached-token: (\d+)"
+)
+
+
+def prefill_cache_coverage(log_text: str) -> Tuple[int, int, int]:
+    """Sum (batches, new tokens, cached tokens) over scheduler prefill lines.
+
+    The scheduler's per-batch accounting is the only per-request cache-hit
+    signal that reaches the pod, so a traffic window's cache coverage is read
+    from the engine log rather than from HTTP responses.
+    """
+    batches, new_tokens, cached_tokens = 0, 0, 0
+    for match in PREFILL_BATCH_RE.finditer(log_text):
+        batches += 1
+        new_tokens += int(match.group(1))
+        cached_tokens += int(match.group(2))
+    return batches, new_tokens, cached_tokens
 
 
 def _assert_raiden_engaged(log_path: str) -> None:
@@ -749,20 +905,49 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
         )
 
     def test_02_gsm8k_quality(self) -> None:
+        eval_log_offset = os.path.getsize(PREFILL_LOG)
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
             config=self.gsm8k_config,
         )
-        dump_metric(
-            "gsm8k_score",
-            score,
-            labels={
-                "model": self.profile.served_name,
-                "test": "pd_prefix_caching_kv_offload",
-            },
-        )
+        labels = {
+            "model": self.profile.served_name,
+            "test": "pd_prefix_caching_kv_offload",
+        }
+        dump_metric("gsm8k_score", score, labels=labels)
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
+
+        # The quality gate certifies the CACHED prefill path only if the eval
+        # traffic actually hits the prefix cache: every request past the first
+        # shares the few-shot prefix, so the cached fraction of its prefill
+        # tokens must dominate. A regression that silently disables caching
+        # would otherwise leave the score gating cold traffic only.
+        with open(PREFILL_LOG, "rb") as f:
+            f.seek(eval_log_offset)
+            eval_log = f.read().decode(errors="replace")
+        batches, new_tokens, cached_tokens = prefill_cache_coverage(eval_log)
+        total = new_tokens + cached_tokens
+        if total < 100 * self.gsm8k_config.num_examples:
+            raise AssertionError(
+                "gsm8k prefill accounting looks wrong: "
+                f"{batches} batches / {total} prompt tokens for "
+                f"{self.gsm8k_config.num_examples} examples -- the eval did "
+                "not route through this prefill engine, or the scheduler's "
+                "batch log format changed"
+            )
+        coverage = cached_tokens / total
+        dump_metric("gsm8k_prefill_cached_token_fraction", coverage, labels=labels)
+        print(
+            f"gsm8k prefill cache coverage={coverage:.3f} "
+            f"({cached_tokens}/{total} tokens over {batches} batches)"
+        )
+        self.assertGreaterEqual(
+            coverage,
+            0.5,
+            "gsm8k traffic barely hit the prefix cache; its score does not "
+            "gate the cached prefill path",
+        )
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
 
@@ -887,15 +1072,47 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
         self.assertEqual(env["QUANTIZATION"], "")
 
     def test_churn_overflows_the_device_pool(self) -> None:
+        # The churn is sized from a measured filler length; whatever that
+        # measurement comes back as, the computed filler count must clear the
+        # pool with margin. The 1766-token case replays the observed filler
+        # length whose word-count estimate undershot the pool (run 32927137148).
         for profile in MODEL_PROFILES.values():
             config = CacheProbeConfig.from_env(profile, env={})
-            churn_tokens_est = config.num_fillers * config.filler_words * 13 // 10
-            self.assertGreater(
-                churn_tokens_est,
-                config.device_pool_tokens,
-                f"{profile.key}: churn (~{churn_tokens_est} tokens) cannot evict "
-                f"a {config.device_pool_tokens}-token device pool",
-            )
+            self.assertIsNone(config.num_fillers)
+            for measured in (1766, 2048, 2662):
+                fillers = churn_fillers_needed(
+                    measured_filler_tokens=measured,
+                    device_pool_tokens=config.device_pool_tokens,
+                )
+                self.assertGreaterEqual(
+                    fillers * measured,
+                    2 * config.device_pool_tokens,
+                    f"{profile.key}: churn of {fillers} x {measured}-token "
+                    f"fillers cannot evict a {config.device_pool_tokens}-token "
+                    "device pool",
+                )
+
+    def test_target_prompt_queries_resolve_to_unique_lines(self) -> None:
+        # The copy oracle only forces the continuation if every queried item
+        # exists exactly once, and only spans the prefix if the queries spread
+        # across it.
+        prompt, queried = make_target_prompt(2048)
+        lines = prompt.split("\n")
+        positions = []
+        for number in queried:
+            matches = [
+                i for i, l in enumerate(lines) if l.startswith(f"item {number}: ")
+            ]
+            self.assertEqual(len(matches), 1, f"item {number}")
+            positions.append(matches[0])
+        self.assertLess(positions[0], len(lines) // 4)
+        self.assertGreater(positions[-1], (3 * len(lines)) // 4)
+
+    def test_explicit_filler_count_overrides_calibration(self) -> None:
+        config = CacheProbeConfig.from_env(
+            MODEL_PROFILES["gpt_oss_120b"], env={"CACHE_PROBE_NUM_FILLERS": "7"}
+        )
+        self.assertEqual(config.num_fillers, 7)
 
     def test_peer_hostname_maps_only_the_role_segment(self) -> None:
         self.assertEqual(
@@ -942,6 +1159,20 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
             ).is_leader
         )
 
+    def test_prefill_cache_coverage_reads_scheduler_batch_lines(self) -> None:
+        # The regex mirrors the scheduler's batch-accounting line; decode
+        # batches carry no cache counters and must not match.
+        log = "\n".join(
+            (
+                "[2026-08-25 23:21:41 TP0 EP0] Prefill batch, #new-seq: 1, "
+                "#new-token: 2112, #cached-token: 0, full token usage: 0.00,",
+                "[2026-08-25 23:21:42 TP0 EP0] Prefill batch, #new-seq: 1, "
+                "#new-token: 64, #cached-token: 2048, full token usage: 0.00,",
+                "[2026-08-25 23:21:43 TP0 EP0] Decode batch, #running-req: 1,",
+            )
+        )
+        self.assertEqual(prefill_cache_coverage(log), (2, 2176, 2048))
+
     def test_model_specific_gsm8k_threshold_wins(self) -> None:
         config = Gsm8kConfig.from_env(
             MODEL_PROFILES["qwen3_coder_480b"],
@@ -961,6 +1192,7 @@ if __name__ == "__main__":
         sys.argv = [sys.argv[0], "TestPdIntegrationConfiguration"]
         unittest.main(verbosity=2)
     topology = PodTopology.from_env()
+    _start_host_watch()
     if not topology.is_leader:
         sys.exit(_serve_role(topology, select_profile(E("MODEL_PROFILE", ""))))
     sys.argv = [sys.argv[0], "TestPdPrefixCachingKvOffload"]
