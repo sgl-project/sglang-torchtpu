@@ -210,6 +210,7 @@ jobs:
       files: ${{ matrix.group.files }}
       hosts: ${{ matrix.group.hosts }}
       weights_pvc: ${{ matrix.group.weights_pvc }}
+      timeout_per_file: ${{ matrix.group.timeout_per_file }}
       run_name: ${{ matrix.group.name }}
     permissions:
       contents: read

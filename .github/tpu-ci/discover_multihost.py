@@ -71,10 +71,17 @@ def main():
             continue
         wp = spec.get("weights_pvc", "") or ""
         key = (ls, wp, hosts)
-        groups.setdefault(key, []).append(path)
+        entry = groups.setdefault(key, {"files": [], "timeout_per_file": 3600})
+        entry["files"].append(path)
+        # A group runs one `timeout` per file (jobset-tpu.yaml); the slowest
+        # file's declared budget bounds them all.
+        entry["timeout_per_file"] = max(
+            entry["timeout_per_file"], int(spec.get("timeout_per_file", 3600))
+        )
 
     out = []
-    for (ls, wp, hosts), files in groups.items():
+    for (ls, wp, hosts), entry in groups.items():
+        files = entry["files"]
         slug = re.sub(
             r"[^a-z0-9]+", "-", os.path.basename(ls).lower().removesuffix(".sh")
         ).strip("-")
@@ -85,6 +92,7 @@ def main():
                 "weights_pvc": wp,
                 "hosts": hosts,
                 "files": " ".join(sorted(files)),
+                "timeout_per_file": entry["timeout_per_file"],
             }
         )
     print(json.dumps(out))

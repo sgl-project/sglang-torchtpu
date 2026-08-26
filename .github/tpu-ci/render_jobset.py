@@ -303,9 +303,10 @@ def main():
     elif a.exec_cmd:
         active_deadline = 7200
     else:
-        # Launch mode: ~30m server bring-up (R1 weight load + compile warmup)
-        # + up to 2 files x `timeout 3600` (jobset-tpu.yaml) + margin.
-        active_deadline = 9000
+        # Launch mode: up to ~50m server bring-up (R1 weight load + cold compile;
+        # the health poll in jobset-tpu.yaml allows 300x10s) + each file's
+        # `timeout` budget. _tpu-test's mh wait_s mirrors this formula.
+        active_deadline = 3600 + len(a.files.split()) * a.timeout_per_file
 
     pvc = a.weights_pvc
     vals = {

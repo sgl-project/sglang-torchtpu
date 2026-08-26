@@ -9,7 +9,7 @@
 #   LAUNCH_SCRIPT multi-host: the launch group's recipe (relative to benchmark/tpu/)
 #   TEST_FILES    multi-host: space-separated test files rank-0 runs against the server
 #   WEIGHTS_VOLUME / WEIGHTS_MOUNT   indented YAML blocks (empty when no weights PVC)
-#   TIMEOUT_PER_FILE single-host timeout passed to run_suite.py
+#   TIMEOUT_PER_FILE per-file timeout (run_suite.py single-host; `timeout` per live-server file)
 #   SERVICE_ACCOUNT  indented serviceAccountName line (empty -> namespace default KSA)
 # The renderer substitutes only those; the container's own $spid / TPU_WORKER_ID stay
 # literal. Gating is handled by the kind-aware _tpu-test.
@@ -149,7 +149,7 @@ ${WEIGHTS_VOLUME}
                         for f in ${TEST_FILES}; do
                           echo "== live-server test: $f =="
                           t0=$SECONDS
-                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout 3600 python3 "$f"
+                          SGLANG_TPU_USE_LIVE_SERVER=1 BASE_URL=http://127.0.0.1:30000 timeout ${TIMEOUT_PER_FILE} python3 "$f"
                           frc=$?
                           passed=true
                           if [ "$frc" -ne 0 ]; then passed=false; rc=1; fi
