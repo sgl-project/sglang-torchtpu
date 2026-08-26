@@ -55,6 +55,14 @@ RUN --mount=type=secret,id=gcp_token \
       --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       -e ".[dev_tpu]"
 
+# sgl-eval is git-only (see the note in pyproject.toml), so it cannot be an
+# extra. The Aug-2026 migration that routed mmlu and MMMU-Pro through it added
+# the install to the CUDA/AMD/NPU dependency scripts but not to this image, so
+# every sgl-eval-backed gate failed here with
+# "[Errno 2] No such file or directory: 'sgl-eval'". Same pinned ref as the
+# other backends -- bumping it moves scoring for all of them at once.
+RUN . scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"
+
 # Fail fast if the core runtime imports are broken. torch + libtpu import without
 # hardware; torch_tpu registers the PrivateUse1 backend and may need a TPU, so its
 # check is soft (the real gate is the on-TPU integration test).
