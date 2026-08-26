@@ -31,25 +31,30 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
 """
 
 import argparse
-import ast
+import glob
+import importlib.util
 import os
 import re
 import sys
 
 import yaml
 
-# Poll budget = max(sum(est_time) * MARGIN, FLOOR). The margin gives headroom over the
-# (approximate) est_time estimates; the floor covers tiny/near-empty suites.
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+_CI_REGISTER_PATH = os.path.join(
+    _REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
+)
+_spec = importlib.util.spec_from_file_location("tpu_ci_register", _CI_REGISTER_PATH)
+_ci_register = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_ci_register)
+
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
 
 # P/D mode: two engines to bring up (weight load + compile warmup on both
 # slices) before the probe + accuracy eval even start.
 _PD_ACTIVE_DEADLINE = 10800
-
-# Positional order of register_*_ci(...) args (mirrors ci_register._PARAM_ORDER) so the
-# scan handles both register_tpu_ci(120, "suite") and register_tpu_ci(est_time=120, ...).
-_REGISTER_PARAMS = ("est_time", "suite", "nightly", "disabled")
 
 # Indentation matches jobset-tpu.yaml: volume items under `volumes:` at 16 spaces,
 # volumeMount items under `volumeMounts:` at 20 spaces.
@@ -90,51 +95,30 @@ def dns_safe(name):
     return (s[:40].strip("-")) or "run"
 
 
-def suite_wait_seconds(suite, tests_dir="test/registered"):
-    """CI poll budget (seconds) for `suite`: max(sum(est_time) * MARGIN, FLOOR).
-
-    Sums est_time over the enabled tests registered to `suite` by statically parsing
-    the registered tree (no sglang import). A test counts if it has a register_*_ci(...)
-    call with suite=<suite> and no truthy `disabled=` reason.
-    """
-    total = 0.0
-    for root, _dirs, files in os.walk(tests_dir):
-        for fn in files:
-            if not fn.endswith(".py"):
-                continue
-            path = os.path.join(root, fn)
-            try:
-                tree = ast.parse(open(path, encoding="utf-8", errors="replace").read())
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                fname = getattr(node.func, "id", "") or getattr(node.func, "attr", "")
-                if not (fname.startswith("register_") and fname.endswith("_ci")):
-                    continue
-                # Merge positional + keyword args by name so both call styles work.
-                argv = {
-                    _REGISTER_PARAMS[i]: a
-                    for i, a in enumerate(node.args)
-                    if i < len(_REGISTER_PARAMS)
-                }
-                argv.update({k.arg: k.value for k in node.keywords if k.arg})
-                suite_val = argv.get("suite")
-                if not (
-                    isinstance(suite_val, ast.Constant) and suite_val.value == suite
-                ):
-                    continue
-                disabled = argv.get("disabled")
-                if disabled is not None and not (
-                    isinstance(disabled, ast.Constant) and not disabled.value
-                ):
-                    continue  # disabled registration -- not run, so excluded
-                est = argv.get("est_time")
-                if isinstance(est, ast.Constant) and isinstance(
-                    est.value, (int, float)
-                ):
-                    total += float(est.value)
+def suite_wait_seconds(
+    suite,
+    tests_dir="test/registered",
+    *,
+    nightly=False,
+    partition_id=None,
+    partition_size=None,
+):
+    files = [
+        path
+        for path in glob.glob(os.path.join(tests_dir, "**", "*.py"), recursive=True)
+        if os.path.basename(path) not in ("conftest.py", "__init__.py")
+    ]
+    tests = [
+        test
+        for test in _ci_register.collect_tests(files, sanity_check=False)
+        if test.backend == _ci_register.HWBackend.TPU
+        and test.effective_suite == suite
+        and test.nightly == nightly
+        and test.disabled is None
+    ]
+    if partition_size is not None:
+        tests = _ci_register.auto_partition(tests, partition_id, partition_size)
+    total = sum(test.est_time for test in tests)
     return max(int(total * _WAIT_MARGIN), _WAIT_FLOOR_SECONDS)
 
 
@@ -169,6 +153,8 @@ def main():
     ap.add_argument("--name", default="")  # multi-host run label
     ap.add_argument("--dir", default=".github/tpu-ci")
     ap.add_argument("--tests-dir", default="test/registered")
+    ap.add_argument("--partition-id", type=int, default=-1)
+    ap.add_argument("--partition-size", type=int, default=0)
     ap.add_argument(
         "--print-wait-seconds",
         action="store_true",
@@ -176,8 +162,25 @@ def main():
     )
     a = ap.parse_args()
 
+    partitioned = a.partition_id != -1 or a.partition_size != 0
+    if partitioned and not (
+        a.partition_size > 0 and 0 <= a.partition_id < a.partition_size
+    ):
+        ap.error("--partition-id must be in [0, --partition-size)")
+
+    partition_args = {
+        "partition_id": a.partition_id if partitioned else None,
+        "partition_size": a.partition_size if partitioned else None,
+    }
     if a.print_wait_seconds:
-        print(suite_wait_seconds(a.suite, a.tests_dir))
+        print(
+            suite_wait_seconds(
+                a.suite,
+                a.tests_dir,
+                nightly=a.nightly,
+                **partition_args,
+            )
+        )
         return
 
     if not a.image:
@@ -198,6 +201,8 @@ def main():
         return sl
 
     if a.pd_prefill_hosts or a.pd_decode_hosts:
+        if partitioned:
+            ap.error("partitioning is only supported in single-host suite mode")
         if not (a.pd_prefill_hosts >= 1 and a.pd_decode_hosts >= 1):
             ap.error("P/D mode needs both --pd-prefill-hosts and --pd-decode-hosts")
         if not a.exec_cmd:
@@ -278,6 +283,8 @@ def main():
         return
 
     if a.launch_script:
+        if partitioned:
+            ap.error("partitioning is only supported in single-host suite mode")
         if a.hosts < 1:
             ap.error("--hosts must be a positive integer for multi-host mode")
         hosts = a.hosts
@@ -286,6 +293,8 @@ def main():
         if not a.files:
             sys.exit("multi-host mode needs --files")
     elif a.exec_cmd:
+        if partitioned:
+            ap.error("partitioning is only supported in single-host suite mode")
         if a.hosts < 1:
             ap.error("--hosts must be a positive integer for exec mode")
         hosts = a.hosts
@@ -297,7 +306,12 @@ def main():
                 "need --suite (single-host), --launch-script (multi-host) or --exec"
             )
         hosts = 1
-        run_name = dns_safe(a.suite)
+        default_name = (
+            f"{a.suite}-{a.partition_id + 1}-of-{a.partition_size}"
+            if partitioned
+            else a.suite
+        )
+        run_name = dns_safe(a.name or default_name)
         suite = a.suite
         if a.timeout_per_file <= 0:
             ap.error("--timeout-per-file must be a positive integer")
@@ -312,7 +326,12 @@ def main():
     # two in agreement). Exec gets 7200: the combo rows budget WAIT_SECS=2400 for
     # engine bring-up alone.
     if suite:
-        active_deadline = suite_wait_seconds(suite, a.tests_dir)
+        active_deadline = suite_wait_seconds(
+            suite,
+            a.tests_dir,
+            nightly=a.nightly,
+            **partition_args,
+        )
     elif a.exec_cmd:
         active_deadline = 7200
     else:
@@ -338,6 +357,12 @@ def main():
         # fast-fails to give the slice back. Without it the suite stops at the first
         # failure and the files behind it never report at all.
         "NIGHTLY_FLAG": "--nightly --continue-on-error" if a.nightly else "",
+        "PARTITION_FLAGS": (
+            f"--auto-partition-id {a.partition_id} "
+            f"--auto-partition-size {a.partition_size}"
+            if partitioned
+            else ""
+        ),
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",

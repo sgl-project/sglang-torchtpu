@@ -1,5 +1,5 @@
 # Nightly TPU e2e. Builds the image ONCE, then:
-#   * single-host  -> run_suite over the single-host suite (each test self-launches).
+#   * single-host  -> run three LPT-balanced shards sequentially.
 #   * multi-host    -> discover_multihost.py finds multi-host test files (MULTIHOST_LAUNCH)
 #                      registered to nightly-tpu-multihost and GROUPS them by launch spec;
 #                      one JobSet per group (launch once, rank-0 runs the group's files).
@@ -53,6 +53,12 @@ jobs:
   single-host:
     needs: build
     if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'single-host' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        partition: [0, 1, 2]
+    name: single-host-${{ matrix.partition }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -60,6 +66,9 @@ jobs:
       lane: nightly
       suite: nightly-tpu-4-v7
       nightly: true
+      partition_id: ${{ matrix.partition }}
+      partition_size: 3
+      run_name: nightly-tpu-4-v7-${{ matrix.partition }}
       # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
       # the ROX weights disk at /weights; harmless for tests that don't use it.
       weights_pvc: model-weights-rox

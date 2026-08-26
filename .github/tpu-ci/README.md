@@ -104,7 +104,8 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 ```
 build ─────────────────────────────────┐
-  ├─▶ single-host           (hosts=1)  │  suite: nightly-tpu-4-v7
+  ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
+  │    suite: nightly-tpu-4-v7
   ├─▶ singlehost-combo      (hosts=1)  │  exec: feature_combo singlehost
   ├─▶ multihost-combo       (hosts=2)  │  exec: feature_combo pd | spec
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
@@ -147,9 +148,9 @@ quota entry — no workflow change.
 
 | phase | budget | covers |
 |-------|--------|--------|
-| admission | the runner's remaining lifetime (~2h55m launch, 3h25m exec) | suspended in Kueue; no pods exist yet |
+| admission | the runner's remaining lifetime | suspended in Kueue; no pods exist yet |
 | running | 900s | placed, but binding + image pull |
-| runtime | 9600 (launch) / 7800 (exec) / `est_time`×1.5+600 (suite) | the test itself |
+| runtime | 9600 (launch) / 7800 (exec) / `est_time`×1.5+600 (single-host shard) | the test itself |
 
 One slice runs one multi-host job at a time, so a job's wait is however long everything
 queued ahead of it takes — there is no useful number smaller than "as much of the runner as
@@ -157,6 +158,9 @@ is left". `admit_s` is therefore derived: `timeout-minutes` (360, GitHub's hard 
 hosted runners) minus this job's own runtime, the bind/pull window and setup. The runtime
 figure must OUTLAST the JobSet's `activeDeadlineSeconds` so the JobSet — not the poll loop —
 reports the outcome.
+
+The nightly single-host suite uses three deterministic LPT partitions with
+`max-parallel: 1`, so the shards reuse one image build and one TPU slice.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
@@ -199,7 +203,7 @@ _TODO._
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
-| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → single-host + discover → multi-host **matrix** over groups |
+| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → fixed single-host LPT matrix + discover → multi-host **matrix** over groups |
 
 ## Cluster infra
 
