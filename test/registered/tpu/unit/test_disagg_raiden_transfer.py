@@ -159,6 +159,11 @@ class RaidenRendezvousTestCase(CustomTestCase):
             m.attn_tp_size = attn_tp_size
             m.attn_tp_rank = attn_tp_rank
             m.attn_dp_rank = 0
+            m.attn_dp_size = 1
+            m.attn_cp_rank = 0
+            m.attn_cp_size = 1
+            m.system_dp_rank = 0
+            m.system_dp_size = 1
             m.local_ip = "127.0.0.1"
             m.rank_port = port
             m.server_socket = inbox

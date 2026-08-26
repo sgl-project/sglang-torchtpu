@@ -43,7 +43,13 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
-from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+from sglang.srt.disaggregation.raiden.host_pool import (
+    SlotAdmission,
+    node_worker_rank,
+    ranks_per_node,
+    slot_host_bytes,
+    slots_within_budget,
+)
 from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
     pack_blocks,
@@ -136,18 +142,30 @@ class RaidenKVManager(CommonKVManager):
         self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
         self.swa_raiden_endpoint: Optional[str] = None
-        # Each rank reserves control+data ports for full KV and SWA KV.
+        # Each rank reserves control+data ports for full KV and SWA KV. The
+        # rank counts every worker on the node -- attention-TP ranks of every
+        # context-parallel, attention-DP, and system-DP replica -- so
+        # replicas never share a port, an engine id, or a uuid namespace.
         base_port = int(os.environ.get("SGLANG_RAIDEN_KV_PORT", "30000"))
-        self._local_rank = self.attn_dp_rank * self.attn_tp_size + self.attn_tp_rank
+        self._local_rank = node_worker_rank(
+            self.attn_tp_rank,
+            self.attn_tp_size,
+            self.attn_dp_rank,
+            self.attn_dp_size,
+            self.system_dp_rank,
+            self.attn_cp_rank,
+            self.attn_cp_size,
+        )
         self._control_port = base_port + 4 * self._local_rank
         self._timeout_s = float(os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120"))
-        # Strided push-resharding for asymmetric TP (decode TP < prefill TP),
-        # on by default and auto-engaged per request only when a
-        # decode rank is fed by several prefill ranks; symmetric traffic never
-        # enters this path. Set SGLANG_RAIDEN_RESHARD=0 to disable it (an
-        # asymmetric topology then raises) and keep the multi-slot host staging
-        # pool instead of the device-shadow sizing the reshard receiver needs.
-        self._reshard_enabled = bool(int(os.environ.get("SGLANG_RAIDEN_RESHARD", "1")))
+        # Raiden's own switch, read when the engine is built in this process:
+        # host staging is allocated per transfer (and per reshard plan) from
+        # the pool instead of in fixed slots. On unless the operator sets it
+        # to 0; asymmetric attention TP (push-resharding) requires it.
+        os.environ.setdefault("TPU_RAIDEN_DYNAMIC_HOST_STAGING", "1")
+        self._dynamic_host_staging = (
+            os.environ["TPU_RAIDEN_DYNAMIC_HOST_STAGING"] == "1"
+        )
         # Whether KV moves chunk by chunk as the prefill commits it, or in one
         # transfer after the whole prefill; decided from the KV layout when the
         # pool tensors are handed over.
@@ -184,6 +202,11 @@ class RaidenKVManager(CommonKVManager):
         # keeps delivering into the plan, so the plan stays registered until
         # the engine reports the push settled.
         self._cleared_plans: Dict[str, int] = {}
+        # Sender plans whose D2H stage timed out while the copy was still
+        # running, as (uuid, room, future). Unregistering would free the
+        # staging under the copy -- and the room's pages are what the copy
+        # reads -- so both are kept until the future settles.
+        self._stale_plans: List[Tuple[int, int, Any]] = []
         self._full_engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
@@ -302,13 +325,6 @@ class RaidenKVManager(CommonKVManager):
             self._reshard_sources: Dict[int, Dict[int, List[int]]] = {}
             self._reshard_meta: Dict[int, dict] = {}
             self._reshard_registered: Set[int] = set()
-        # Round-robin host staging slots for the push path (device->host stage on
-        # prefill; host staging on decode is written by raiden's receiver).
-        self._reshard_slot_rooms: List[Optional[int]] = [None] * max(
-            1, int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "16"))
-        )
-        self._reshard_slot_of: Dict[int, int] = {}
-
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
 
@@ -330,28 +346,6 @@ class RaidenKVManager(CommonKVManager):
         # set on both the prefill and decode KVArgs.
         total_kv_heads = int(self.kv_args.total_kv_head_num)
         return ReshardGeometry(src_attn_tp, dst_attn_tp, hp, total_kv_heads)
-
-    def _host_slot_blocks(self, room: int, n: int) -> List[int]:
-        """Host staging block-ids for ``room`` (n blocks) in a round-robin slot.
-
-        Slot ``s`` owns host blocks ``[s*max_blocks, s*max_blocks + n)``; reused
-        once the room is cleared. Raises if all slots are in flight.
-        """
-        slot = self._reshard_slot_of.get(room)
-        if slot is None:
-            try:
-                slot = self._reshard_slot_rooms.index(None)
-            except ValueError:
-                raise RuntimeError("raiden reshard: no free host staging slot")
-            self._reshard_slot_rooms[slot] = room
-            self._reshard_slot_of[room] = slot
-        base = slot * self._max_request_blocks()
-        return [base + i for i in range(n)]
-
-    def _release_host_slot(self, room: int) -> None:
-        slot = self._reshard_slot_of.pop(room, None)
-        if slot is not None:
-            self._reshard_slot_rooms[slot] = None
 
     # ----- engine lifecycle -------------------------------------------------
 
@@ -384,14 +378,9 @@ class RaidenKVManager(CommonKVManager):
         # dim as a page, matching the TPU fused KV pool ([num_blocks, page, ...]).
         from tpu_sync.api.torch.kv_cache_manager import KVCacheManager
 
+        engines = 2 if self._swa_kv_caches else 1
         max_blocks = self._max_request_blocks()
-        num_slots = self._num_slots()
-        # Reshard staging is indexed 1-to-1 by device block id. Size it to
-        # the fused tensor's block count with a single slot.
-        if self._reshard_enabled:
-            num_blocks = int(self._kv_caches[0].shape[0])
-            max_blocks = num_blocks
-            num_slots = 1
+        num_slots = self._num_slots(self._kv_caches, max_blocks, engines)
         self.raiden_endpoint = f"{self.local_ip}:{self._control_port}"
         self._engine = KVCacheManager(
             kv_caches=self._kv_caches,
@@ -415,7 +404,7 @@ class RaidenKVManager(CommonKVManager):
         if self._swa_kv_caches:
             self.swa_raiden_endpoint = f"{self.local_ip}:{self._control_port + 2}"
             swa_max_blocks = self._swa_max_request_blocks()
-            swa_num_slots = self._num_slots()
+            swa_num_slots = self._num_slots(self._swa_kv_caches, swa_max_blocks, 2)
             self._swa_engine = KVCacheManager(
                 kv_caches=self._swa_kv_caches,
                 node_id=self._local_rank,
@@ -458,8 +447,54 @@ class RaidenKVManager(CommonKVManager):
         max_tokens = window_size + self.kv_args.page_size - 1
         return max(1, math.ceil(max_tokens / self.kv_args.page_size))
 
-    def _num_slots(self) -> int:
-        return max(1, int(os.environ.get("SGLANG_RAIDEN_NUM_SLOTS", "16")))
+    def _slot_ceiling(self) -> int:
+        """Slots that can ever be claimed at once.
+
+        A transfer holds one slot from the moment it is issued until its H2D
+        lands. The decode admits a request into the transfer queue before it
+        joins the running batch, so the reach is the batch plus the extra
+        in-transfer slots reserved alongside it; past that, slots are
+        unclaimable.
+        """
+        batch = int(self.server_args.max_running_requests or 64)
+        in_transfer = int(
+            getattr(self.server_args, "disaggregation_decode_extra_slots", 0) or 0
+        )
+        return max(1, batch + in_transfer)
+
+    def _num_slots(
+        self, kv_caches: List[Any], max_blocks: int, engines: int = 1
+    ) -> int:
+        """Slots this engine can afford within the host staging budget.
+
+        The per-node budget is split across the ranks resident on this host
+        and across the engines this rank builds, then divided by what one slot
+        costs. Deriving the count keeps a large context length from turning
+        into a host allocation that fails at startup -- it lowers the transfer
+        concurrency instead, and refuses to start when not even one slot fits
+        the budget.
+        """
+        budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
+        local_ranks = ranks_per_node(
+            self.attn_tp_size,
+            self.attn_dp_size,
+            self.system_dp_size,
+            self.server_args.nnodes,
+            self.attn_cp_size,
+        )
+        budget /= local_ranks * max(1, engines)
+        slot_bytes = slot_host_bytes(kv_caches, max_blocks)
+        slots = slots_within_budget(budget, slot_bytes, self._slot_ceiling())
+        logger.info(
+            "RaidenKVManager rank%d slot budget | max_blocks=%d slot=%.1fMB "
+            "rank_budget=%.1fGB slots=%d",
+            self.attn_tp_rank,
+            max_blocks,
+            slot_bytes / (1024**2),
+            budget / (1024**3),
+            slots,
+        )
+        return slots
 
     def _ensure_engine(self) -> Any:
         if self._engine is None:
@@ -521,6 +556,12 @@ class RaidenKVManager(CommonKVManager):
                     logger.error(
                         "RaidenKVManager rank%d failed=%s", self.attn_tp_rank, failed
                     )
+        with self._state_lock:
+            settled_stale = [e for e in self._stale_plans if e[2].is_ready()]
+            for entry in settled_stale:
+                self._stale_plans.remove(entry)
+        for uuid, _room, _fut in settled_stale:
+            self._unregister_plan(uuid)
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         with self._status_lock:
@@ -1169,25 +1210,27 @@ class RaidenKVManager(CommonKVManager):
                 )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
-            # head-slice strided into the wider decode block.
-            if self._reshard_enabled:
-                if not local_blocks:
-                    # Full prefix-cache hit: decode already holds every page,
-                    # nothing to receive.
-                    with self._state_lock:
-                        self._completed_recv.add(str(room))
-                    return
-                self._register_reshard_request(
-                    room, local_blocks, aux_index, bootstrap_infos
+            # head-slice strided into the wider decode block. The plan stages
+            # in host blocks raiden allocates for it, which only per-transfer
+            # staging provides.
+            if not self._dynamic_host_staging:
+                raise NotImplementedError(
+                    "Raiden asymmetric attention TP (got "
+                    f"{len(bootstrap_infos)} prefill sources for one decode "
+                    "rank) needs per-transfer host staging; do not set "
+                    "TPU_RAIDEN_DYNAMIC_HOST_STAGING=0."
                 )
-                self.update_status(room, KVPoll.WaitingForInput)
+            if not local_blocks:
+                # Full prefix-cache hit: decode already holds every page,
+                # nothing to receive.
+                with self._state_lock:
+                    self._completed_recv.add(str(room))
                 return
-            raise NotImplementedError(
-                "Raiden asymmetric attention TP (got "
-                f"{len(bootstrap_infos)} prefill sources for one decode rank) "
-                "needs strided push-resharding, but it is disabled "
-                "(SGLANG_RAIDEN_RESHARD=0); unset it to enable."
+            self._register_reshard_request(
+                room, local_blocks, aux_index, bootstrap_infos
             )
+            self.update_status(room, KVPoll.WaitingForInput)
+            return
         with self._state_lock:
             self._local_blocks[room] = local_blocks
             self._local_swa_blocks[room] = local_swa_blocks
@@ -1270,6 +1313,22 @@ class RaidenKVManager(CommonKVManager):
         except RuntimeError as e:
             if "not registered" not in str(e):
                 raise
+
+    def _reap_stale_plan(self, uuid: int, room: int, fut) -> None:
+        """Waits out a parked plan's copy, then drops the plan.
+
+        The request that parked it is already failed and may be the last one
+        served, so reclaiming cannot ride on another request's poll.
+        """
+        while True:
+            with self._state_lock:
+                if (uuid, room, fut) not in self._stale_plans:
+                    return  # a completion sweep already reclaimed it
+                if fut.is_ready():
+                    self._stale_plans.remove((uuid, room, fut))
+                    break
+            time.sleep(0.05)
+        self._unregister_plan(uuid)
 
     def _release_pull_slots_locked(self) -> None:
         """Hand back the slots of reads that have settled."""
@@ -2109,27 +2168,6 @@ class RaidenKVManager(CommonKVManager):
         live = [self.kv_args.page_size] * n
 
         engine = self._ensure_engine()
-        # push_registered_plan streams from the host staging pool; the pool is
-        # sized as a full device shadow (see _build_engine) and indexed 1-to-1 by
-        # device block id, so stage each device block into the host block at the
-        # SAME id. The receiver matches on this same src_block_id (the prefill
-        # device blocks it learned via RESHARD_BLOCKS).
-        fut = engine.d2h(prefill_blocks, prefill_blocks, [1] * n)
-        deadline = self._monotonic() + self._timeout_s
-        while fut is not None and not fut.is_ready():
-            if self._monotonic() > deadline:
-                raise TimeoutError(
-                    f"raiden reshard D2H stage for room {room} timed out"
-                )
-            time.sleep(0.0005)
-        # is_ready() is true even for a ready-with-error future, so check ok()
-        # before pushing -- otherwise a failed d2h would push stale staging.
-        if fut is not None and not fut.ok():
-            raise RuntimeError(
-                f"raiden reshard D2H stage for room {room} failed: "
-                f"{fut.error_message()}"
-            )
-
         req = build_sender_request(
             pb2,
             uuid=uuid,
@@ -2153,20 +2191,56 @@ class RaidenKVManager(CommonKVManager):
             prefill_blocks[:4],
             decode_blocks[:4],
         )
-        # raiden runs SyncPush unlocked, so serialize register+push across workers
-        # (concurrent pushes to a decode peer corrupt its shared transport); d2h
-        # above is internally locked and can overlap.
-        with self._reshard_push_lock:
-            engine.register_active_plan(uuid, req, is_sender=True)
-            # The receiver's completion barrier is total_blocks * num_layers, and
-            # each push counts its blocks once regardless of how many layers it
-            # carries, so push one layer per request to deliver every layer.
-            for layer_idx in range(len(self._kv_caches)):
-                engine.push_registered_plan(
-                    uuid, push_endpoint, prefill_blocks, decode_blocks, layer_idx
+        # Registering the plan first lets raiden choose the host blocks this
+        # transfer stages into: the blocks' own ids in the device-shadow
+        # layout, or blocks allocated for the plan under demand staging. The
+        # receiver matches on src_block_id (the prefill device blocks it
+        # learned via RESHARD_BLOCKS), which is unaffected by where the bytes
+        # are staged.
+        engine.register_active_plan(uuid, req, is_sender=True)
+        fut = None
+        try:
+            host_blocks = engine.plan_host_blocks(uuid, prefill_blocks)
+            fut = engine.d2h(prefill_blocks, host_blocks, [1] * n)
+            deadline = self._monotonic() + self._timeout_s
+            while fut is not None and not fut.is_ready():
+                if self._monotonic() > deadline:
+                    raise TimeoutError(
+                        f"raiden reshard D2H stage for room {room} timed out"
+                    )
+                time.sleep(0.0005)
+            # is_ready() is true even for a ready-with-error future, so check
+            # ok() before pushing -- otherwise a failed d2h would push stale
+            # staging.
+            if fut is not None and not fut.ok():
+                raise RuntimeError(
+                    f"raiden reshard D2H stage for room {room} failed: "
+                    f"{fut.error_message()}"
                 )
-            # The push is synchronous; the plan has done its work.
-            engine.unregister_active_plan(uuid)
+            # raiden runs SyncPush unlocked, so serialize pushes across workers
+            # (concurrent pushes to a decode peer corrupt its shared transport).
+            with self._reshard_push_lock:
+                # The receiver's completion barrier is total_blocks * num_layers,
+                # and each push counts its blocks once regardless of how many
+                # layers it carries, so push one layer per request to deliver
+                # every layer.
+                for layer_idx in range(len(self._kv_caches)):
+                    engine.push_registered_plan(
+                        uuid, push_endpoint, prefill_blocks, decode_blocks, layer_idx
+                    )
+        finally:
+            # Frees the plan's staging on the sender; the receiver's is freed
+            # when its upload completes. A copy that timed out but is still
+            # running keeps the plan until it settles -- unregistering would
+            # free the staging while the copy writes it.
+            if fut is not None and not fut.is_ready():
+                with self._state_lock:
+                    self._stale_plans.append((uuid, room, fut))
+                threading.Thread(
+                    target=self._reap_stale_plan, args=(uuid, room, fut), daemon=True
+                ).start()
+            else:
+                engine.unregister_active_plan(uuid)
         if not self.chunked_transfer:
             with self._state_lock:
                 self._completed_send.add(str(room))
@@ -2334,7 +2408,6 @@ class RaidenKVManager(CommonKVManager):
                     self.failure_records.pop(room, None)
         for uuid in settled_plans:
             self._unregister_plan(uuid)
-        self._release_host_slot(room)
 
 
 class RaidenKVSender(CommonKVSender):

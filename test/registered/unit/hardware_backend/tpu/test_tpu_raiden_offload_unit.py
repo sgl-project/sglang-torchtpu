@@ -18,6 +18,7 @@ import inspect
 import os
 import sys
 import threading
+import time
 import types
 import unittest
 from collections import defaultdict
@@ -257,7 +258,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         ):
             self.assertEqual(mgr._swa_max_request_blocks(), 11)
 
-    def test_symmetric_pull_rendezvous_works_with_reshard_enabled(self):
+    def test_symmetric_pull_rendezvous(self):
         class _Engine:
             def __init__(self):
                 self.register_read = Mock()
@@ -284,7 +285,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr._replied = set()
                 mgr._reshard_req = {}
                 mgr._reshard_finalized = set()
-                mgr._reshard_enabled = True
                 mgr._engine = _Engine()
                 mgr._swa_engine = None
                 mgr._swa_kv_caches = []
@@ -658,7 +658,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.failure_lock = threading.Lock()
         mgr.request_status = {}
         mgr._swa_engine = Mock()
-        mgr._reshard_enabled = True
         mgr._register_reshard_request = Mock()
 
         with self.assertRaisesRegex(
@@ -878,6 +877,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._failed = set()
         mgr._native_failed = set()
         mgr._pulling_cleared = set()
+        mgr._cleared_plans = {}
+        mgr._stale_plans = []
         # clear_room sweeps the reshard bookkeeping too.
         mgr._reshard_slot_of = {}
         mgr._reshard_slot_rooms = [None]
@@ -1303,6 +1304,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_push_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._engine.d2h = Mock(return_value=_ReadyFuture())
+        # Device-shadow staging: a plan stages each device block into the
+        # host block of the same id.
+        mgr._engine.plan_host_blocks = Mock(side_effect=lambda uuid, blocks: blocks)
         mgr._swa_engine = None
         mgr._kv_caches = [object(), object()]
         mgr.kv_args = Mock(page_size=128)
@@ -1345,6 +1349,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._send_reads = {}
         mgr._pulling_cleared = set()
         mgr._cleared_plans = {}
+        mgr._stale_plans = []
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()
@@ -1513,6 +1518,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_chunk_registering = {}
         mgr._reshard_plans = {}
         mgr._cleared_plans = {}
+        mgr._stale_plans = []
         mgr._pulling = None
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -1669,6 +1675,79 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._completed_recv)
+
+    def test_timed_out_stage_keeps_its_plan_until_the_copy_settles(self):
+
+        room = self.ROOM
+        blocks = self.PREFILL_BLOCKS
+        mgr = self._prefill()
+        mgr._timeout_s = 0.01
+
+        class _PendingFuture:
+            ready = False
+
+            def is_ready(self):
+                return self.ready
+
+        fut = _PendingFuture()
+        mgr._engine.plan_host_blocks = Mock(side_effect=lambda uuid, b: list(b))
+        mgr._engine.d2h = Mock(return_value=fut)
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_req(self._reshard_req())
+            mgr._send_blocks[room] = list(blocks[:32])
+            for start in (0, 16):
+                mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
+            chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
+            # The push's D2H stage never becomes ready and times out.
+            mgr._on_reshard_chunk_ready(
+                [MessageTag.RESHARD_CHUNK_READY, b"41", chunk_msg[2], b"7"]
+            )
+        self.assertTrue(mgr.is_failed(room))
+        # The copy still runs: the plan (and its staging) must survive it.
+        mgr._engine.unregister_active_plan.assert_not_called()
+        self.assertEqual([(u, r) for u, r, _ in mgr._stale_plans], [(7, self.ROOM)])
+
+        mgr._engine.poll_stats = Mock(return_value=([], [], []))
+        mgr._drain_engine()
+        mgr._engine.unregister_active_plan.assert_not_called()
+
+        fut.ready = True
+        mgr._drain_engine()
+        mgr._engine.unregister_active_plan.assert_called_once_with(7)
+        self.assertEqual(mgr._stale_plans, [])
+
+    def test_timed_out_stage_is_reclaimed_without_another_poll(self):
+
+        room = self.ROOM
+        blocks = self.PREFILL_BLOCKS
+        mgr = self._prefill()
+        mgr._timeout_s = 0.01
+
+        class _PendingFuture:
+            ready = False
+
+            def is_ready(self):
+                return self.ready
+
+        fut = _PendingFuture()
+        mgr._engine.plan_host_blocks = Mock(side_effect=lambda uuid, b: list(b))
+        mgr._engine.d2h = Mock(return_value=fut)
+        with patch.dict(sys.modules, _pb2_modules()):
+            mgr._on_reshard_req(self._reshard_req())
+            mgr._send_blocks[room] = list(blocks[:32])
+            for start in (0, 16):
+                mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
+            chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
+            mgr._on_reshard_chunk_ready(
+                [MessageTag.RESHARD_CHUNK_READY, b"41", chunk_msg[2], b"7"]
+            )
+        # The copy settles later with nobody polling; the plan still goes.
+        fut.ready = True
+        deadline = time.time() + 3
+        while mgr._stale_plans and time.time() < deadline:
+            time.sleep(0.02)
+        mgr._engine.unregister_active_plan.assert_called_once_with(7)
+        self.assertEqual(mgr._stale_plans, [])
 
     def test_push_asked_for_before_the_room_was_cleared_is_a_noop(self):
 
