@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+import sglang.srt.hardware_backend.tpu.tpu_spec_helper as tpu_spec_helper
 import sglang.srt.speculative.eagle_utils as eagle_utils
 import sglang.srt.speculative.spec_utils as kernels
 
@@ -416,6 +417,123 @@ def test_eagle_prepare_for_decode_uses_torch_native_allocator():
     assert kwargs["batch_size"] == 2
     assert torch.equal(kwargs["cur_kv_lens_cpu"], torch.tensor([2, 5]))
     assert torch.equal(kwargs["nxt_kv_lens_cpu"], torch.tensor([7, 5]))
+
+
+def _build_tree_inputs(bs, num_verify_tokens, seed=0):
+    torch.manual_seed(seed)
+    bonus_tokens = torch.randint(0, 10000, (bs,), dtype=torch.int64)
+    draft_tokens = torch.randint(
+        0, 10000, (bs, num_verify_tokens - 1), dtype=torch.int64
+    )
+    seq_lens = torch.randint(1, 500, (bs,), dtype=torch.int64)
+    return bonus_tokens, draft_tokens, seq_lens
+
+
+def _reference_tree(bonus_tokens, draft_tokens, seq_lens, num_verify_tokens):
+    """Build the same tree through the general TPU path."""
+    bs = seq_lens.numel()
+    retrieve_buf = torch.full((3, bs, num_verify_tokens), -1, dtype=torch.long)
+    retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
+    positions = torch.empty((bs * num_verify_tokens,), dtype=torch.long)
+    eagle_utils._build_tree_kernel_efficient_torch(
+        1,
+        eagle_utils.TreeMaskMode.FULL_MASK,
+        num_verify_tokens,
+        bs,
+        torch.device("cpu"),
+        seq_lens,
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+    )
+    tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
+    return (
+        positions,
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        tokens,
+    )
+
+
+def test_topk1_tree_matches_general_tree_builder():
+    for bs, num_verify_tokens in ((1, 4), (1, 1), (8, 2), (4, 5), (16, 8)):
+        bonus_tokens, draft_tokens, seq_lens = _build_tree_inputs(bs, num_verify_tokens)
+        with patch.object(eagle_utils, "_use_torch_native", True):
+            tree_mask, *actual = eagle_utils.build_tree_kernel_efficient(
+                bonus_tokens,
+                None,
+                None,
+                draft_tokens,
+                seq_lens,
+                int(seq_lens.sum()),
+                1,
+                num_verify_tokens - 1,
+                num_verify_tokens,
+                eagle_utils.TreeMaskMode.FULL_MASK,
+            )
+
+        expected = _reference_tree(
+            bonus_tokens, draft_tokens, seq_lens, num_verify_tokens
+        )
+        for got, want in zip(actual, expected):
+            assert got.dtype == want.dtype
+            assert torch.equal(got, want)
+        # TPU attention never reads the mask, so it is not materialized.
+        assert tree_mask.numel() == 0
+
+
+def test_topk1_tree_preserves_staged_buffers():
+    bs, num_verify_tokens = 2, 4
+    bonus_tokens, draft_tokens, seq_lens = _build_tree_inputs(bs, num_verify_tokens)
+    seq_lens_sum = int(seq_lens.sum())
+    mask_len = (
+        seq_lens_sum * num_verify_tokens + num_verify_tokens * num_verify_tokens * bs
+    )
+    tree_mask_buf = torch.empty(mask_len, dtype=torch.bool)
+    position_buf = torch.empty(bs * num_verify_tokens, dtype=torch.long)
+    with patch.object(eagle_utils, "_use_torch_native", True):
+        tree_mask, positions, *_ = eagle_utils.build_tree_kernel_efficient(
+            bonus_tokens,
+            None,
+            None,
+            draft_tokens,
+            seq_lens,
+            seq_lens_sum,
+            1,
+            num_verify_tokens - 1,
+            num_verify_tokens,
+            eagle_utils.TreeMaskMode.FULL_MASK,
+            tree_mask_buf,
+            position_buf,
+        )
+
+    assert tree_mask is tree_mask_buf
+    assert positions is position_buf
+
+
+def test_topk1_tree_reuses_shape_constants_across_steps():
+    tpu_spec_helper._get_topk1_tree_constants.cache_clear()
+    bs, num_verify_tokens = 3, 4
+    bonus_tokens, draft_tokens, seq_lens = _build_tree_inputs(bs, num_verify_tokens)
+
+    first = tpu_spec_helper.build_topk1_tree(
+        bonus_tokens, draft_tokens, seq_lens, num_verify_tokens
+    )
+    second = tpu_spec_helper.build_topk1_tree(
+        bonus_tokens, draft_tokens, seq_lens + 7, num_verify_tokens
+    )
+
+    # Shape-only tensors are handed out again; tokens and positions are not.
+    for index in (0, 2, 3, 4):
+        assert first[index] is second[index]
+    assert torch.equal(second[1], first[1] + 7)
+
+    other_shape = tpu_spec_helper.build_topk1_tree(
+        bonus_tokens[:1], draft_tokens[:1], seq_lens[:1], num_verify_tokens
+    )
+    assert other_shape[2] is not first[2]
+    assert tpu_spec_helper._get_topk1_tree_constants.cache_info().currsize == 2
 
 
 if __name__ == "__main__":
