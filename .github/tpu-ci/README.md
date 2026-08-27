@@ -186,8 +186,10 @@ _TODO._
 
 | Path | Purpose |
 |------|---------|
-| `docker/tpu.Dockerfile` | TPU image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
-| `docker/cloudbuild.tpu.yaml` | Cloud Build config; runs **as `tpu-ci`**, token from the metadata server, pushes to AR |
+| `docker/tpu-base.Dockerfile` | TPU base image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
+| `docker/cloudbuild.tpu-base.yaml` | Cloud Build config for base image; runs **as `tpu-ci`**, pushes `sglang-tpu-base` to AR |
+| `docker/tpu.Dockerfile` | Final TPU image: builds on `sglang-tpu-base` and installs editable SGLang without reinstalling deps |
+| `docker/cloudbuild.tpu.yaml` | Cloud Build config for final image; builds on base and pushes `sglang-tpu` to AR |
 | `.github/tpu-ci/topology.yaml` | `(lane, host count)` → slice `{topology, pool, queue}` (detection source of truth) |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Strategic-merge patch dropping the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |

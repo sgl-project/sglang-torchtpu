@@ -50,6 +50,12 @@ def main() -> None:
     ap.add_argument("--bucket", required=True, help="GCS bucket of the staged source")
     ap.add_argument("--object", required=True, help="GCS object of the staged source")
     ap.add_argument("--tag", required=True, help="value for the _TAG substitution")
+    ap.add_argument(
+        "--substitutions",
+        nargs="*",
+        default=[],
+        help="additional substitutions in KEY=VALUE format",
+    )
     ap.add_argument("--token-file", required=True, help="file holding a bearer token")
     ap.add_argument("--timeout", default="3600s", help="build timeout")
     args = ap.parse_args()
@@ -78,12 +84,18 @@ def main() -> None:
                 return e.code, {"error": e.read().decode()[:500]}
 
     cfg = _load_config(args.config)
+    subs = dict(cfg.get("substitutions", {}))
+    subs["_TAG"] = args.tag
+    for item in args.substitutions:
+        if "=" in item:
+            k, v = item.split("=", 1)
+            subs[k] = v
     build = {
         "source": {"storageSource": {"bucket": args.bucket, "object": args.object}},
         "steps": cfg["steps"],
         "images": cfg.get("images", []),
         "options": cfg.get("options", {}),
-        "substitutions": {**cfg.get("substitutions", {}), "_TAG": args.tag},
+        "substitutions": subs,
         "timeout": args.timeout,
     }
     if "serviceAccount" in cfg:  # run the build as the configured SA (tpu-ci)
