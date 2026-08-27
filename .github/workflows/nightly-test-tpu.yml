@@ -103,7 +103,7 @@ jobs:
         include:
           - name: pd-kvoff
             model: gpt_oss_120b
-            file: test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
+            file: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
           - name: pd-tpreshard
             model: qwen3_coder_480b
             file: test/registered/tpu/integration/test_pd_tp_resharding.py

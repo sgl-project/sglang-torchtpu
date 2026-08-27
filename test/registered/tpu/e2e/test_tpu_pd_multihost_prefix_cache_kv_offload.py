@@ -1,4 +1,4 @@
-"""P/D disaggregation x prefix caching x KV offload integration test (issue #376).
+"""P/D disaggregation x prefix caching x KV offload end-to-end test (issue #376).
 
 Topology: a multihost PREFILL engine and a multihost DECODE engine, each spanning
 its own TPU slice, connected by the PD mini load balancer. KV offload runs on the
@@ -33,7 +33,7 @@ Roles (rank = slice-local TPU_WORKER_ID):
 Run one model profile per invocation on hardware:
 
   MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
-      test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
+      test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
 Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
@@ -62,7 +62,7 @@ try:
     from sglang.test.test_utils import dump_metric
 except ModuleNotFoundError as exc:
     # Keep the configuration tests runnable in a source-only checkout; the
-    # integration cases need the full SGLang TPU environment anyway.
+    # end-to-end cases need the full SGLang TPU environment anyway.
     SGLANG_IMPORT_ERROR = exc
 
     def register_tpu_ci(*_args, **_kwargs):
@@ -1012,7 +1012,7 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
 # --------------------------- configuration tests -----------------------------
 
 
-class TestPdIntegrationConfiguration(unittest.TestCase):
+class TestPdE2eConfiguration(unittest.TestCase):
     """Host-side contract tests; runnable without TPU hardware."""
 
     def test_profile_selection_requires_exactly_one(self) -> None:
@@ -1193,7 +1193,7 @@ class TestPdIntegrationConfiguration(unittest.TestCase):
 
 if __name__ == "__main__":
     if not E("CI_PD_ROLE"):
-        sys.argv = [sys.argv[0], "TestPdIntegrationConfiguration"]
+        sys.argv = [sys.argv[0], "TestPdE2eConfiguration"]
         unittest.main(verbosity=2)
     topology = PodTopology.from_env()
     _start_host_watch()

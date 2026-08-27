@@ -65,8 +65,8 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
-      files: test/registered/tpu/integration/test_pd_prefix_caching_kv_offload.py
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
+      files: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
       weights_pvc: model-weights-rox
       run_name: 2p2d-kvoff-${{ matrix.model }}
     permissions:
