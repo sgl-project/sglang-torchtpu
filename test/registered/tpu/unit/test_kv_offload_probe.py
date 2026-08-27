@@ -8,6 +8,7 @@ from sglang.test.tpu.kv_offload_probe import (
     KvOffloadProbe,
     mean_accept_length,
     spec_failures,
+    validate_probe,
 )
 
 register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
@@ -69,6 +70,43 @@ class TestSpeculativeKvOffloadProbe(unittest.TestCase):
 
     def test_productive_drafts_pass(self) -> None:
         self.assertEqual(spec_failures(probe=_probe(), min_accept_length=1.0), [])
+
+
+class TestKvOffloadOutputOracle(unittest.TestCase):
+    def _tiered_probe(self, *, warm_text: str, reload_text: str) -> KvOffloadProbe:
+        return KvOffloadProbe(
+            cold=_read(),
+            warm=CacheObservation(warm_text, 960, 0, 8, 0),
+            reload=CacheObservation(reload_text, 0, 960, 8, 0),
+        )
+
+    def test_equivalent_cache_reads_pass_without_counting(self) -> None:
+        failures = validate_probe(
+            probe=self._tiered_probe(
+                warm_text="not a count", reload_text="not a count"
+            ),
+            page_size=64,
+            require_counting=False,
+        )
+        self.assertEqual(failures, [])
+
+    def test_changed_host_reload_fails_without_counting(self) -> None:
+        failures = validate_probe(
+            probe=self._tiered_probe(warm_text="device", reload_text="host"),
+            page_size=64,
+            require_counting=False,
+        )
+        self.assertEqual(len(failures), 1)
+        self.assertIn("host reload changed", failures[0])
+
+    def test_counting_remains_the_default(self) -> None:
+        failures = validate_probe(
+            probe=self._tiered_probe(
+                warm_text="not a count", reload_text="not a count"
+            ),
+            page_size=64,
+        )
+        self.assertEqual(len(failures), 2)
 
 
 if __name__ == "__main__":

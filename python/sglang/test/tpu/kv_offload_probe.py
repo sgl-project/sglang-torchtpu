@@ -146,7 +146,11 @@ def _counting_failure(*, label: str, text: str) -> Optional[str]:
 
 
 def validate_probe(
-    *, probe: KvOffloadProbe, page_size: int, plan: Optional[EvictionPlan] = None
+    *,
+    probe: KvOffloadProbe,
+    page_size: int,
+    plan: Optional[EvictionPlan] = None,
+    require_counting: bool = True,
 ) -> List[str]:
     """Every judgement the gate makes. Empty list means the feature is working.
 
@@ -204,13 +208,20 @@ def validate_probe(
             f"the offloaded copy did not survive intact.{hint}"
         )
 
-    # Every tier, not just the reload: the same check on the cold prefill and the
-    # device hit is what makes a host-reload failure mean the host, since a bug that
-    # breaks all three is not about offloading.
-    for label, observation in _labelled_reads(probe):
-        counting_failure = _counting_failure(label=label, text=observation.text)
-        if counting_failure is not None:
-            failures.append(counting_failure)
+    if require_counting:
+        # Check every tier so a host-reload failure can be attributed to the host.
+        for label, observation in _labelled_reads(probe):
+            counting_failure = _counting_failure(label=label, text=observation.text)
+            if counting_failure is not None:
+                failures.append(counting_failure)
+    else:
+        if not probe.warm.text or not probe.reload.text:
+            failures.append("the device-hit and host-reload reads must be non-empty")
+        elif probe.warm.text != probe.reload.text:
+            failures.append(
+                "the host reload changed the device-cached output: "
+                f"device={probe.warm.text!r}, host={probe.reload.text!r}"
+            )
 
     return failures
 
@@ -369,11 +380,14 @@ def kv_offload_runner(
     probe_tokens: int,
     hicache_ratio: float,
     min_accept_length: Optional[float] = None,
+    require_counting: bool = True,
 ):
     """Build a runner that validates device hits and complete host reloads.
 
     ``hicache_ratio`` must leave enough host capacity for the probe and fillers.
     ``min_accept_length`` additionally enables speculative-decoding checks.
+    ``require_counting=False`` compares the device-hit and host-reload outputs for
+    models that do not reliably follow the probe's forced counting instruction.
     """
     plan = plan_eviction(
         device_pool_tokens=device_pool_tokens,
@@ -388,7 +402,12 @@ def kv_offload_runner(
             probe_tokens=probe_tokens,
             plan=plan,
         )
-        failures = validate_probe(probe=probe, page_size=page_size, plan=plan)
+        failures = validate_probe(
+            probe=probe,
+            page_size=page_size,
+            plan=plan,
+            require_counting=require_counting,
+        )
 
         # Record cache-tier counts for diagnosing gate failures.
         labels = {"model": test_name, "kind": "kv_offload"}
