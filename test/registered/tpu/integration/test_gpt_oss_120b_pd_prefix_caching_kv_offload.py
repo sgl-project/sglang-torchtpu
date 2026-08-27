@@ -33,7 +33,11 @@ Roles (rank = slice-local TPU_WORKER_ID):
 Run one model profile per invocation on hardware:
 
   MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
+<<<<<<<< HEAD:test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
       test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
+========
+      test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
+>>>>>>>> 4d8f753e2 ([TPU/CI] Refactor P/D integration tests to use GPT-OSS-120B and chain nightly gates):test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
 Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
@@ -161,6 +165,7 @@ MODEL_PROFILES = {
         extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
         reasoning_effort="low",
     ),
+<<<<<<<< HEAD:test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
     "qwen3_coder_480b": ModelProfile(
         key="qwen3_coder_480b",
         display_name="Qwen3-Coder-480B",
@@ -183,6 +188,8 @@ MODEL_PROFILES = {
         extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
         chat_template_kwargs={"enable_thinking": False},
     ),
+========
+>>>>>>>> 4d8f753e2 ([TPU/CI] Refactor P/D integration tests to use GPT-OSS-120B and chain nightly gates):test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
 }
 
 
@@ -1180,16 +1187,16 @@ class TestPdE2eConfiguration(unittest.TestCase):
 
     def test_model_specific_gsm8k_threshold_wins(self) -> None:
         config = Gsm8kConfig.from_env(
-            MODEL_PROFILES["qwen3_coder_480b"],
-            env={"GSM8K_THRESHOLD": "0.50", "GSM8K_THRESHOLD_QWEN3_CODER_480B": "0.91"},
+            MODEL_PROFILES["gpt_oss_120b"],
+            env={"GSM8K_THRESHOLD": "0.50", "GSM8K_THRESHOLD_GPT_OSS_120B": "0.91"},
         )
         self.assertEqual(config.threshold, 0.91)
 
     def test_local_model_path_is_validated(self) -> None:
-        profile = MODEL_PROFILES["qwen3_coder_480b"]
+        profile = MODEL_PROFILES["gpt_oss_120b"]
         with self.assertRaisesRegex(FileNotFoundError, profile.model_env):
-            validate_model_source(profile, "/weights/definitely-missing-480b")
-        validate_model_source(profile, "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8")
+            validate_model_source(profile, "/weights/definitely-missing-gpt-oss-120b")
+        validate_model_source(profile, "openai/gpt-oss-120b")
 
 
 if __name__ == "__main__":

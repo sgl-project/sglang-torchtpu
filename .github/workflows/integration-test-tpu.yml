@@ -11,7 +11,7 @@
 # Trigger:
 #   gh workflow run integration-test-tpu.yml [-f ref=<branch>] \
 #     [-f suite=all|pd_prefix_caching_kv_offload|pd_tp_resharding] \
-#     [-f model=all|gpt_oss_120b|qwen3_coder_480b]
+#     [-f model=all|gpt_oss_120b]
 name: Integration Test (TPU)
 
 on:
@@ -32,7 +32,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, qwen3_coder_480b, gpt_oss_120b]
+        options: [all, gpt_oss_120b]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -65,8 +65,8 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
-      files: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
+      files: test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
       weights_pvc: model-weights-rox
       run_name: 2p2d-kvoff-${{ matrix.model }}
     permissions:
@@ -81,7 +81,7 @@ jobs:
       max-parallel: 1   # both rows contend for the same two slices
       matrix:
         # matrix context is unavailable in job-level `if`; selection shapes the matrix.
-        model: ${{ (inputs.model == 'qwen3_coder_480b' && fromJSON('["qwen3_coder_480b"]')) || fromJSON('["qwen3_coder_480b"]') }}
+        model: ${{ (inputs.model == 'gpt_oss_120b' && fromJSON('["gpt_oss_120b"]')) || fromJSON('["gpt_oss_120b"]') }}
     name: test-2p2d-tp-resharding-${{ matrix.model }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -95,8 +95,8 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
-      files: test/registered/tpu/integration/test_pd_tp_resharding.py
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_gpt_oss_120b_pd_tp_resharding.py
+      files: test/registered/tpu/integration/test_gpt_oss_120b_pd_tp_resharding.py
       weights_pvc: model-weights-rox
       run_name: 2p2d-tpreshard-${{ matrix.model }}
     permissions:

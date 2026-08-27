@@ -468,18 +468,6 @@ that boots a server by hand gets a chart with no reproduce commands.
 no test to blame otherwise, and it would land on the dashboard as a row named after
 the job. Keep that line ahead of anything that can fail.
 
-**P/D tests get the same two markers from `jobset-tpu-pd.yaml`,** driven by
-`_tpu-test.yml`'s `files` input (`render_jobset.py --files`, which P/D mode
-*requires* — an empty one would emit a record with no `file`). Every pod of both
-slices announces the files; only the prefill leader emits the TIMINGS record,
-because the other three run the same command but do not carry the verdict, and
-four records would be four duplicate rows for one test.
-
-**A dispatch-only workflow earns no history row.** Only scheduled runs are
-ingested, so a test that lives solely in `integration-test-tpu.yml`
-(`workflow_dispatch` only) never trends no matter how well-formed its log is. It
-needs a leg in `nightly-test-tpu.yml` too — that is what `pd-integration` is.
-
 Sanity-check a new test's log against the parser before waiting a night for it:
 
 ```bash

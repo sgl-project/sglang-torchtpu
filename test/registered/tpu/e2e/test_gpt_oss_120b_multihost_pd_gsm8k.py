@@ -444,6 +444,40 @@ def serve_role(topology: PodTopology, role: Role) -> int:
     return _serve_worker(topology, role)
 
 
+<<<<<<<< HEAD:test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
+========
+def render_jobset_yaml(
+    image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
+    lane: str = "nightly",
+    weights_pvc: str = "model-weights-rox",
+    run_name: str = "gpt-oss-120b-pd-gsm8k",
+) -> str:
+    """Render the Kubernetes JobSet YAML for this test."""
+    rel_path = os.path.relpath(__file__, REPO)
+    cmd = [
+        PYTHON,
+        os.path.join(REPO, ".github", "tpu-ci", "render_jobset.py"),
+        "--pd-prefill-hosts",
+        "2",
+        "--pd-decode-hosts",
+        "2",
+        "--lane",
+        lane,
+        "--image",
+        image,
+        "--weights-pvc",
+        weights_pvc,
+        "--name",
+        run_name,
+        "--files",
+        rel_path,
+        "--exec",
+        f"python3 {rel_path} integration",
+    ]
+    return subprocess.check_output(cmd, text=True)
+
+
+>>>>>>>> 4d8f753e2 ([TPU/CI] Refactor P/D integration tests to use GPT-OSS-120B and chain nightly gates):test/registered/tpu/e2e/test_gpt_oss_120b_multihost_pd_gsm8k.py
 class TestPdGptOss120bConfiguration(unittest.TestCase):
     """Host-side configuration tests runnable without TPU hardware."""
 
@@ -540,6 +574,23 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             validate_model_source("/weights/definitely-missing-gpt-oss-120b")
         validate_model_source(HF_REPO_ID)
 
+<<<<<<<< HEAD:test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
+========
+    def test_dry_run_render_jobset_yaml(self) -> None:
+        yaml_content = render_jobset_yaml()
+        self.assertIn("generateName: tpu-ci-gpt-oss-120b-pd-gsm8k-", yaml_content)
+        self.assertIn("targetReplicatedJobs:", yaml_content)
+        self.assertIn("- prefill", yaml_content)
+        self.assertNotIn("name: router", yaml_content)
+        self.assertIn("name: prefill", yaml_content)
+        self.assertIn("name: decode", yaml_content)
+        self.assertIn("CI_PD_ROLE", yaml_content)
+        self.assertIn(
+            "python3 test/registered/tpu/e2e/test_gpt_oss_120b_multihost_pd_gsm8k.py integration",
+            yaml_content,
+        )
+
+>>>>>>>> 4d8f753e2 ([TPU/CI] Refactor P/D integration tests to use GPT-OSS-120B and chain nightly gates):test/registered/tpu/e2e/test_gpt_oss_120b_multihost_pd_gsm8k.py
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="P/D multihost test")

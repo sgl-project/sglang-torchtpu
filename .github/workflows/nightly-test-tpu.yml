@@ -17,25 +17,14 @@ on:
         description: "Git ref to test"
         required: false
         default: main
-      # Scheduled runs (inputs empty) run everything.
+      # Scheduled runs (inputs empty) run everything. `pd` runs the chained
+      # gpt-oss-120b P/D gates (gsm8k -> offloading -> resharding).
       only:
-        description: "Run only one part (combo = both combo layers)"
+        description: "Run only one part"
         required: false
         default: all
         type: choice
-        options:
-          - all
-          - accuracy
-          - combo
-          - integration
-          - multihost
-          - multihost-combo
-          - pd-multihost
-          - pd-integration
-          - pd-singlehost
-          - perf
-          - single-host
-          - singlehost-combo
+        options: [all, single-host, multihost, combo, singlehost-combo, perf, accuracy, pd]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -76,70 +65,8 @@ jobs:
       contents: read
       id-token: write
 
-  # Registered single-server integration tests. JobSet provisioning and mounted
-  # weights stay in this runner layer; test fixtures only own sgl.Engine lifetime.
-  integration:
-    needs: build
-    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'integration' }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      suite: nightly-tpu-integration
-      nightly: true
-      weights_pvc: model-weights-rox
-      timeout_per_file: 16200
-    permissions:
-      contents: read
-      id-token: write
-
-  # P/D disaggregation integration tests: same JobSets as the standalone
-  # integration-test-tpu.yml action, which is workflow_dispatch-only. Only
-  # SCHEDULED runs are ingested by the CI dashboard, so a dispatch-only test
-  # never earns a history row -- this job is what gives these two a nightly
-  # cadence and therefore a green/red trend.
-  pd-integration:
-    needs: build
-    if: ${{ contains(fromJSON('["all","pd-integration"]'), inputs.only || 'all') }}
-    strategy:
-      fail-fast: false
-      # Each row holds BOTH 2x2x2 nightly slices at once (one per engine role),
-      # i.e. the whole tpu-nightly-2h quota, so the rows cannot overlap -- and
-      # they serialize behind multihost/multihost-combo, which draw on the same
-      # queue. See the runner-cap gap in .github/tpu-ci/README.md.
-      max-parallel: 1
-      matrix:
-        include:
-          - name: pd-kvoff
-            model: gpt_oss_120b
-            file: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
-          - name: pd-tpreshard
-            model: qwen3_coder_480b
-            file: test/registered/tpu/integration/test_pd_tp_resharding.py
-    name: ${{ matrix.name }}-${{ matrix.model }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      # hosts feeds only the slice concurrency group; the P/D topology below
-      # sizes the JobSet (2-host prefill slice + 2-host decode slice).
-      hosts: 2
-      # The nightly lane is the only one owning two 2x2x2 slices, which is what
-      # a prefill engine and a decode engine need at the same time.
-      lane: nightly
-      pd_prefill_hosts: 2
-      pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 ${{ matrix.file }}
-      # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: ${{ matrix.file }}
-      weights_pvc: model-weights-rox
-      run_name: ${{ matrix.name }}-${{ matrix.model }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Feature-combination layers: same exec-mode runs as the standalone
-  # combo-test-tpu.yml action; these jobs add nightly cadence.
+  # Single-host feature-combination layer: same exec-mode run as the standalone
+  # combo-test-tpu.yml action; this job adds nightly cadence.
   singlehost-combo:
     needs: build
     if: ${{ contains(fromJSON('["all","combo","singlehost-combo"]'), inputs.only || 'all') }}
@@ -156,8 +83,9 @@ jobs:
       contents: read
       id-token: write
 
+  # Multihost feature-combination layer: same exec-mode run as the standalone
+  # combo-test-tpu.yml action; this job adds nightly cadence.
   multihost-combo:
-    # Unchained: Kueue queues the hosts=2 jobs, so this need not wait out multi-host.
     needs: build
     if: ${{ contains(fromJSON('["all","combo","multihost-combo"]'), inputs.only || 'all') }}
     strategy:
@@ -183,34 +111,16 @@ jobs:
       contents: read
       id-token: write
 
-  # One host per P/D engine isolates this gate from intra-engine multihost issues.
-  # The shared P/D lock serializes it with pd-multihost.
-  pd-singlehost:
+  # P/D disaggregation multihost gsm8k gates on the Nightly lane, all on
+  # gpt-oss-120b. Chained gsm8k -> offloading -> resharding: each holds BOTH
+  # 2x2x2 nightly slices (one per engine role), so they must not overlap;
+  # `needs` serializes them and short-circuits the chain when an upstream gate
+  # fails. `files` names the dashboard row / TIMINGS record (required in P/D
+  # mode) and carries the model name via the test file path.
+  pd-gsm8k:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-singlehost"]'), inputs.only || 'all') }}
-    name: pd-singlehost-gpt-oss-120b-gsm8k
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      pd_prefill_hosts: 1
-      pd_decode_hosts: 1
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py integration
-      # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py
-      weights_pvc: model-weights-rox
-      run_name: gpt-oss-120b-pd-singlehost-gsm8k
-    permissions:
-      contents: read
-      id-token: write
-
-  # Multihost P/D GSM8K accuracy test with 2 prefill and 2 decode hosts.
-  pd-multihost:
-    needs: build
-    if: ${{ contains(fromJSON('["all","pd-multihost"]'), inputs.only || 'all') }}
-    name: pd-multihost-gpt-oss-120b-gsm8k
+    if: ${{ contains(fromJSON('["all","pd"]'), inputs.only || 'all') }}
+    name: gpt_oss_120b_multihost_pd_gsm8k
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -219,11 +129,50 @@ jobs:
       hosts: 2
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py integration
-      # Used for dashboard and timing records.
-      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
+      exec_cmd: python3 test/registered/tpu/e2e/test_gpt_oss_120b_multihost_pd_gsm8k.py integration
+      files: test/registered/tpu/e2e/test_gpt_oss_120b_multihost_pd_gsm8k.py
       weights_pvc: model-weights-rox
-      run_name: pd-gpt-oss-120b-gsm8k
+      run_name: gpt-oss-120b-pd-gsm8k
+    permissions:
+      contents: read
+      id-token: write
+
+  pd-offloading:
+    needs: [build, pd-gsm8k]
+    if: ${{ contains(fromJSON('["all","pd"]'), inputs.only || 'all') }}
+    name: gpt_oss_120b_multihost_pd_offloading_gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
+      files: test/registered/tpu/integration/test_gpt_oss_120b_pd_prefix_caching_kv_offload.py
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-120b-pd-offloading-gsm8k
+    permissions:
+      contents: read
+      id-token: write
+
+  pd-resharding:
+    needs: [build, pd-offloading]
+    if: ${{ contains(fromJSON('["all","pd"]'), inputs.only || 'all') }}
+    name: gpt_oss_120b_multihost_pd_resharding_gsm8k
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/integration/test_gpt_oss_120b_pd_tp_resharding.py
+      files: test/registered/tpu/integration/test_gpt_oss_120b_pd_tp_resharding.py
+      weights_pvc: model-weights-rox
+      run_name: gpt-oss-120b-pd-resharding-gsm8k
     permissions:
       contents: read
       id-token: write
