@@ -30,10 +30,10 @@ on:
           - combo-multihost
           - combo-singlehost
           - multihost
-          - pd-multihost-gpt-oss-120b-gsm8k
-          - pd-multihost-gpt-oss-120b-pc-offload-gsm8k
-          - pd-multihost-gpt-oss-120b-tp-reshard-gsm8k
-          - pd-singlehost-gpt-oss-120b-gsm8k
+          - pd-multihost
+          - pd-multihost-pc-offload
+          - pd-multihost-tp-reshard
+          - pd-singlehost
           - perf
           - singlehost
 
@@ -84,10 +84,15 @@ jobs:
   # slice, so every P/D job holds BOTH nightly-2h slices at once; the shared
   # tpu-pd-lock in _tpu-test.yml serializes them (and against pd-singlehost /
   # pd-multihost below). See the runner-cap gap in .github/tpu-ci/README.md.
-  pd-multihost-gpt-oss-120b-pc-offload-gsm8k:
+  # P/D pods are named tpu-ci-<run_name>-<rand>-{prefill,decode}-<idx>, so these
+  # names must stay short or they blow k8s's 63-char pod-name cap. model
+  # (gpt-oss-120b) and the gsm8k gate are constant across the P/D jobs, so they
+  # are omitted; both remain visible via the test file / dashboard row (keyed by
+  # `files`). The trailing token is the distinguishing feature (none = plain P/D).
+  pd-multihost-pc-offload:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-multihost-gpt-oss-120b-pc-offload-gsm8k"]'), inputs.only || 'all') }}
-    name: pd-multihost-gpt-oss-120b-pc-offload-gsm8k
+    if: ${{ contains(fromJSON('["all","pd-multihost-pc-offload"]'), inputs.only || 'all') }}
+    name: pd-multihost-pc-offload
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -104,15 +109,15 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
       weights_pvc: model-weights-rox
-      run_name: pd-multihost-gpt-oss-120b-pc-offload-gsm8k
+      run_name: pd-multihost-pc-offload
     permissions:
       contents: read
       id-token: write
 
-  pd-multihost-gpt-oss-120b-tp-reshard-gsm8k:
+  pd-multihost-tp-reshard:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-multihost-gpt-oss-120b-tp-reshard-gsm8k"]'), inputs.only || 'all') }}
-    name: pd-multihost-gpt-oss-120b-tp-reshard-gsm8k
+    if: ${{ contains(fromJSON('["all","pd-multihost-tp-reshard"]'), inputs.only || 'all') }}
+    name: pd-multihost-tp-reshard
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -125,7 +130,7 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
-      run_name: pd-multihost-gpt-oss-120b-tp-reshard-gsm8k
+      run_name: pd-multihost-tp-reshard
     permissions:
       contents: read
       id-token: write
@@ -151,7 +156,7 @@ jobs:
   multihost-combo:
     # Unchained: Kueue queues the hosts=2 jobs, so this need not wait out multi-host.
     # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access). The pd
-    # row was dropped -- it duplicated pd-multihost-gpt-oss-120b-pc-offload-gsm8k.
+    # row was dropped -- it duplicated pd-multihost-pc-offload.
     needs: build
     if: ${{ contains(fromJSON('["all","combo","combo-multihost"]'), inputs.only || 'all') }}
     name: combo-multihost-spec
@@ -170,10 +175,10 @@ jobs:
 
   # One host per P/D engine isolates this gate from intra-engine multihost issues.
   # The shared tpu-pd-lock serializes it with the other P/D jobs above.
-  pd-singlehost-gpt-oss-120b-gsm8k:
+  pd-singlehost:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-singlehost-gpt-oss-120b-gsm8k"]'), inputs.only || 'all') }}
-    name: pd-singlehost-gpt-oss-120b-gsm8k
+    if: ${{ contains(fromJSON('["all","pd-singlehost"]'), inputs.only || 'all') }}
+    name: pd-singlehost
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -186,16 +191,16 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py
       weights_pvc: model-weights-rox
-      run_name: pd-singlehost-gpt-oss-120b-gsm8k
+      run_name: pd-singlehost
     permissions:
       contents: read
       id-token: write
 
   # Multihost P/D GSM8K accuracy test with 2 prefill and 2 decode hosts.
-  pd-multihost-gpt-oss-120b-gsm8k:
+  pd-multihost:
     needs: build
-    if: ${{ contains(fromJSON('["all","pd-multihost-gpt-oss-120b-gsm8k"]'), inputs.only || 'all') }}
-    name: pd-multihost-gpt-oss-120b-gsm8k
+    if: ${{ contains(fromJSON('["all","pd-multihost"]'), inputs.only || 'all') }}
+    name: pd-multihost
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -208,7 +213,7 @@ jobs:
       # Used for dashboard and timing records.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
       weights_pvc: model-weights-rox
-      run_name: pd-multihost-gpt-oss-120b-gsm8k
+      run_name: pd-multihost
     permissions:
       contents: read
       id-token: write

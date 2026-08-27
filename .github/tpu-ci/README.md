@@ -483,8 +483,7 @@ four records would be four duplicate rows for one test.
 ingested, so a test that lives solely in `integration-test-tpu.yml`
 (`workflow_dispatch` only) never trends no matter how well-formed its log is. It
 needs a leg in `nightly-test-tpu.yml` too — that is what the
-`pd-multihost-gpt-oss-120b-pc-offload-gsm8k` and
-`pd-multihost-gpt-oss-120b-tp-reshard-gsm8k` jobs are.
+`pd-multihost-pc-offload` and `pd-multihost-tp-reshard` jobs are.
 
 Sanity-check a new test's log against the parser before waiting a night for it:
 
