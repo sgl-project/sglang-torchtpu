@@ -107,7 +107,7 @@ build ────────────────────────�
   ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
   │    suite: nightly-tpu-4-v7
   ├─▶ singlehost-combo      (hosts=1)  │  exec: feature_combo singlehost
-  ├─▶ multihost-combo       (hosts=2)  │  exec: feature_combo spec
+  ├─▶ combo-multihost-spec  (hosts=2)  │  exec: feature_combo spec
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
 ```
 

@@ -153,7 +153,7 @@ jobs:
       contents: read
       id-token: write
 
-  multihost-combo:
+  combo-multihost-spec:
     # Unchained: Kueue queues the hosts=2 jobs, so this need not wait out multi-host.
     # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access). The pd
     # row was dropped -- it duplicated pd-multihost-pc-offload.
