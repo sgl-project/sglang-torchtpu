@@ -7,8 +7,14 @@ substitutions:
 
 serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
+# GCS copy of the build log, streamed into the GitHub Actions job log by
+# run_cloudbuild.py. External collaborators cannot open this project's Cloud
+# Console / Cloud Logging, so the Actions log is the only surface they can read.
+# LEGACY keeps the Cloud Logging / console log view working for maintainers.
+logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
+
 options:
-  logging: CLOUD_LOGGING_ONLY
+  logging: LEGACY
   machineType: E2_HIGHCPU_8
 
 steps:

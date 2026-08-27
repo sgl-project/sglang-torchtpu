@@ -6,8 +6,12 @@ substitutions:
 
 serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
+# GCS copy of the build log, streamed into the GitHub Actions job log by
+# run_cloudbuild.py; see docker/cloudbuild.tpu.yaml for why.
+logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
+
 options:
-  logging: CLOUD_LOGGING_ONLY
+  logging: LEGACY
   machineType: E2_HIGHCPU_8
 
 steps:

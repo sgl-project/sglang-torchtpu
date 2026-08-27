@@ -81,9 +81,13 @@ jobs:
             base_object="source/base-${base_tag}-${{ github.run_id }}.tgz"
             gcloud storage cp "$src" "gs://${bucket}/${base_object}" --project "$GCP_PROJECT" \
               --access-token-file="$tokfile"
+            # run_cloudbuild.py streams the Cloud Build log into this step's
+            # output (the only build log external collaborators can read) and
+            # retries once on intermittent build failures.
             python3 .github/tpu-ci/run_cloudbuild.py \
               --project "$GCP_PROJECT" --config docker/cloudbuild.tpu-base.yaml \
-              --bucket "$bucket" --object "$base_object" --tag "$base_tag" --token-file "$tokfile"
+              --bucket "$bucket" --object "$base_object" --tag "$base_tag" --token-file "$tokfile" \
+              --max-attempts 2
           fi
 
           # 3. Build the final SGLang image on top of the base image
@@ -102,6 +106,7 @@ jobs:
           digest="$(python3 .github/tpu-ci/run_cloudbuild.py \
             --project "$GCP_PROJECT" --config docker/cloudbuild.tpu.yaml \
             --bucket "$bucket" --object "$object" --tag "$tag" --token-file "$tokfile" \
-            --substitutions "_BASE_IMAGE=${AR_BASE_IMAGE}:${base_tag}")"
+            --substitutions "_BASE_IMAGE=${AR_BASE_IMAGE}:${base_tag}" \
+            --max-attempts 2)"
           echo "digest=${AR_IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
           echo "built ${AR_IMAGE}@${digest}"
