@@ -381,6 +381,9 @@ class CompiledFunction:
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
+            tensor_inputs_traced_shapes=tuple(
+                tuple(path_leaves[index][1].shape) for index in tensor_leaf_indices
+            ),
             output_treespec=output_treespec,
             output_count=len(output_leaves),
         )
@@ -394,6 +397,7 @@ class _CompiledArtifact:
     model_inputs: tuple[torch.Tensor, ...]
     kv_pool: KVPool | None
     tensor_inputs_key_paths: tuple[tree_util.KeyPath, ...]
+    tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...]
     output_treespec: Any
     output_count: int
 
@@ -401,13 +405,24 @@ class _CompiledArtifact:
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.
-        for path in self.tensor_inputs_key_paths:
+        for path, traced_shape in zip(
+            self.tensor_inputs_key_paths, self.tensor_inputs_traced_shapes
+        ):
             value = _get_path(call, path)
             if not _is_tpu_tensor(value):
                 raise TypeError(
                     "A direct_compile tensor input changed type at runtime: "
                     f"{tree_util.keystr(path)} was traced as a TPU tensor but is "
                     f"now {type(value).__name__}"
+                )
+            if tuple(value.shape) != traced_shape:
+                # A mismatched buffer corrupts the launch (XLA e0102): the
+                # specialization key failed to distinguish this call.
+                raise ValueError(
+                    "A direct_compile tensor input changed shape at runtime: "
+                    f"{tree_util.keystr(path)} was traced as {traced_shape} but "
+                    f"is now {tuple(value.shape)} ({value.dtype}). The "
+                    "specialization key does not cover whatever varies here."
                 )
             inputs.append(value)
 

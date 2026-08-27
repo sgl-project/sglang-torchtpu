@@ -43,6 +43,7 @@ _BS_FIELDS = (
     "req_pool_indices_cpu",
     "extend_seq_lens",
     "extend_prefix_lens",
+    "extend_start_loc",
     "encoder_lens",
 )
 

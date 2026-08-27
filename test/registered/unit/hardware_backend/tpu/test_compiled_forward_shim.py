@@ -12,6 +12,8 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     PowerBucketer,
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    _BS_FIELDS,
+    _TOKEN_FIELDS,
     DEFAULT_TPU_COMPILE_MAX_BS,
     CompiledForwardShim,
     _dp_attn_apply_bucket_metadata,
@@ -26,6 +28,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
+    _DummyForwardBatchFields,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     Eagle3CompilePolicyMixin,
@@ -105,6 +108,31 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         spec_info=None,
         mm_inputs=None,
     )
+
+
+class TestDummyFieldPadCoverage(CustomTestCase):
+    """Bookkeeping: every device tensor the precompile dummies place on a
+    ForwardBatch must be in the shim's pad lists, or live batches reach the
+    compiled graphs with shapes the trace never saw (XLA e0102 — happened
+    with `extend_start_loc`). Host mirrors (`*_cpu`) are not graph inputs."""
+
+    def test_extend_dummy_device_tensors_are_padded(self):
+        dummy = _DummyForwardBatchFields.default(
+            num_tokens=8,
+            bs=4,
+            is_extend=True,
+            tokens_per_req=2,
+            device="cpu",
+            slot=0,
+            out_cache_loc_dtype=torch.int32,
+        )
+        device_tensor_fields = {
+            name
+            for name in dummy.__struct_fields__
+            if isinstance(getattr(dummy, name), torch.Tensor)
+            and not name.endswith("_cpu")
+        }
+        self.assertLessEqual(device_tensor_fields, set(_TOKEN_FIELDS) | set(_BS_FIELDS))
 
 
 class TestZeroPad1d(CustomTestCase):

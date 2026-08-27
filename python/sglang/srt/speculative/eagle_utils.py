@@ -83,10 +83,14 @@ def per_step_draft_out_cache_loc(
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # contiguous() is load-bearing on TPU: without it the per-step rows stay
+    # lazy strided views, and a compiled graph binds a row's strided span over
+    # the base buffer instead of a dense [bs*topk] input (XLA e0102).
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
-        .reshape(num_steps, -1)
+        .contiguous()
+        .view(num_steps, -1)
     )
 
 

@@ -1495,6 +1495,34 @@ class TestDpSyncNumTokens(CustomTestCase):
 
 
 class TestSpecDraftExtendPadding(CustomTestCase):
+    def test_pads_extend_metadata_tensors_off_bucket(self):
+        """Bug regression: at an off-bucket bs, `_pad_inputs_to_size` grows the
+        core request-axis tensors but left `extend_seq_lens` /
+        `extend_prefix_lens` / `extend_start_loc` at real_bs, so the compiled
+        DRAFT_EXTEND_V2 graph (traced with them at the bucket length) was
+        invoked with shapes the trace never saw."""
+        policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
+        forward_batch = SimpleNamespace(
+            input_ids=torch.ones(12, dtype=torch.int32),
+            seq_lens=torch.ones(3, dtype=torch.int32),
+            spec_info=None,
+            _pad_inputs_to_size=MagicMock(),
+            extend_seq_lens=torch.tensor([4, 4, 4], dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([8, 7, 6], dtype=torch.int32),
+            extend_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            extend_seq_lens_cpu=[4, 4, 4],
+            extend_prefix_lens_cpu=[8, 7, 6],
+            extend_logprob_start_lens_cpu=[0, 0, 0],
+            mm_inputs=None,
+        )
+
+        policy._pad_draft_extend(forward_batch)
+
+        self.assertEqual(forward_batch.batch_size, 4)
+        self.assertEqual(forward_batch.extend_seq_lens.tolist(), [4, 4, 4, 0])
+        self.assertEqual(forward_batch.extend_prefix_lens.tolist(), [8, 7, 6, 0])
+        self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
+
     def test_normalizes_stale_cpu_lists_at_exact_bucket(self):
         policy = _make_spec_policy(num_steps=3, bs_buckets=(1, 4))
         forward_batch = SimpleNamespace(

@@ -1298,6 +1298,15 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
                 num_tokens=pad_tokens,
                 bs=pad_b,
             )
+            # _pad_inputs_to_size skips the extend metadata tensors, but the
+            # compiled graph was traced with them at the bucket length. Zero
+            # rows are safe: padded requests' outputs are discarded.
+            for field in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+                value = getattr(forward_batch, field, None)
+                if isinstance(value, torch.Tensor) and value.shape[0] < pad_b:
+                    setattr(
+                        forward_batch, field, F.pad(value, (0, pad_b - value.shape[0]))
+                    )
             forward_batch.batch_size = pad_b
             # Intentionally leave _REAL_Q_KEY unset. draft extend consumes the
             # output later using its own select-index gather instead of generic
