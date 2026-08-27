@@ -34,6 +34,7 @@ on:
           - pd-mh-gpt-120b-pc-offload
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
+          - pd-sh-gpt-120b-spec
           - perf
           - sh
 
@@ -172,7 +173,7 @@ jobs:
       id-token: write
 
   # One host per P/D engine isolates this gate from intra-engine multihost issues.
-  # The shared tpu-pd-lock serializes it with the other P/D jobs above.
+  # Kueue queues it against other P/D jobs contending for the nightly lane.
   pd-singlehost:
     needs: build
     if: ${{ contains(fromJSON('["all","pd-sh-gpt-120b"]'), inputs.only || 'all') }}
@@ -190,6 +191,28 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py
       weights_pvc: model-weights-rox
       run_name: pd-sh-gpt-120b
+    permissions:
+      contents: read
+      id-token: write
+
+  # Keep the CI identifier compact: <category>-<topology>-<model>-<feature>.
+  # The full model and testcase remain visible in the dashboard file key.
+  pd-sh-gpt-120b-spec:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-sh-gpt-120b-spec"]'), inputs.only || 'all') }}
+    name: pd-sh-gpt-120b-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: pd-sh-gpt-120b-spec
     permissions:
       contents: read
       id-token: write
