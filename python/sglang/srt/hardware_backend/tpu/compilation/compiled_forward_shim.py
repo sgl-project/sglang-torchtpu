@@ -537,6 +537,14 @@ class CompiledForwardShim:
         self._recompilation_checker = checker
         self._model_label = model_label
 
+    def wait_for_hicache_reload(self) -> None:
+        """Wait for the current HiCache reload outside compiled regions."""
+        model_runner = self.policy.model_runner
+        if model_runner is not None:
+            counter = model_runner.token_to_kv_pool.layer_transfer_counter
+            if counter is not None:
+                counter.wait()
+
     def __call__(
         self,
         input_ids: torch.Tensor | None,
@@ -545,16 +553,12 @@ class CompiledForwardShim:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        # HiCache reload no-stale gate: the reload's host->device scatters are
-        # not in the traced graph, so block until they have landed before
-        # launching. The counter lives on the device pool wrapper, registered
-        # by the cache controller; it is None when hicache is off, and a
-        # detached policy (no model runner) has no pool to gate on.
-        model_runner = self.policy.model_runner
-        if model_runner is not None:
-            counter = model_runner.token_to_kv_pool.layer_transfer_counter
-            if counter is not None:
-                counter.wait()
+        # HiCache reload no-stale gate: block until the reload's host->device
+        # scatters have landed. A compiled caller must invoke the eager gate
+        # before entering its graph; tracing the mutable counter would guard on
+        # its lifecycle state and recompile on the first real reload.
+        if not torch.compiler.is_compiling():
+            self.wait_for_hicache_reload()
 
         if self._default_kwargs and kwargs:
             # Dynamo treats omitted kwargs and explicit defaults as different

@@ -653,6 +653,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             self._compiled_fused_steps = steps_fn
 
+        # The fused loop inlines CompiledForwardShim into an outer Dynamo
+        # graph. Gate the batch's HiCache reload eagerly so the shim can omit
+        # the mutable transfer counter while that graph is being traced.
+        compiled_forward_shim = getattr(
+            self.draft_runner.compile_policy, "compiled_forward_shim", None
+        )
+        if compiled_forward_shim is not None:
+            compiled_forward_shim.wait_for_hicache_reload()
+
         # Draft decode is never a prefill-only operation. A request completing
         # chunked prefill may retain that scheduler marker. Pin the whole fused
         # loop to decode while preserving the scheduler-owned value afterward.

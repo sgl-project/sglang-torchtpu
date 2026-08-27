@@ -958,6 +958,16 @@ class TestHiCacheReloadGate(CustomTestCase):
         fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
         self.assertEqual(shim(None, None, fb), "out")
 
+    def test_compiled_caller_does_not_trace_reload_counter(self):
+        counter = MagicMock()
+        shim = self._shim(counter)
+        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+
+        with unittest.mock.patch("torch.compiler.is_compiling", return_value=True):
+            self.assertEqual(shim(None, None, fb), "out")
+
+        counter.wait.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

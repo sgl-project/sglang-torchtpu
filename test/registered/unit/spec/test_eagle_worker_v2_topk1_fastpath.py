@@ -229,6 +229,10 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             return tokens
 
         worker._compiled_fused_steps = MagicMock(side_effect=compiled_fused_steps)
+        reload_gate = MagicMock()
+        worker.draft_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(compiled_forward_shim=reload_gate)
+        )
         worker.draft_attn_backend = SimpleNamespace(
             attn_backends=[
                 SimpleNamespace(
@@ -274,6 +278,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         self.assertIsNone(spec_info.rpa_draft_kv_lens)
         self.assertEqual(observed_prefill_only, [False])
         self.assertTrue(forward_batch.is_prefill_only)
+        reload_gate.wait_for_hicache_reload.assert_called_once_with()
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
