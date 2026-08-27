@@ -1,7 +1,8 @@
-"""Feature gate for prefix caching, KV offload, and optional speculation.
+"""Feature gates for prefix caching, KV offload, and optional speculation.
 
-The runner checks a cold read, a device-cache hit, and a host reload. Optional
-speculation checks use counters returned by the same three requests.
+The device-cache runner checks a cold read and an immediate device-cache hit. The
+KV-offload runner additionally checks a host reload after eviction. Optional
+speculation checks use counters returned by the same requests.
 """
 
 import math
@@ -65,6 +66,13 @@ class CacheObservation(msgspec.Struct, frozen=True):
     spec_verify_ct: int
 
 
+class DeviceCacheProbe(msgspec.Struct, frozen=True):
+    """A cold read followed by an immediate device-cache read."""
+
+    cold: CacheObservation
+    warm: CacheObservation
+
+
 class KvOffloadProbe(msgspec.Struct, frozen=True):
     """The three reads of the same prompt the gate reasons over.
 
@@ -121,6 +129,11 @@ def _labelled_reads(probe: KvOffloadProbe):
         ("device-hit", probe.warm),
         ("host-reload", probe.reload),
     )
+
+
+def _labelled_device_reads(probe: DeviceCacheProbe):
+    """The two device-cache reads, in the order the gate reports them."""
+    return (("cold", probe.cold), ("device-hit", probe.warm))
 
 
 def _counting_failure(*, label: str, text: str) -> Optional[str]:
@@ -208,6 +221,39 @@ def validate_probe(
     # device hit is what makes a host-reload failure mean the host, since a bug that
     # breaks all three is not about offloading.
     for label, observation in _labelled_reads(probe):
+        counting_failure = _counting_failure(label=label, text=observation.text)
+        if counting_failure is not None:
+            failures.append(counting_failure)
+
+    return failures
+
+
+def validate_device_cache_probe(
+    *, probe: DeviceCacheProbe, page_size: int
+) -> List[str]:
+    """Validate a cold prefill and an immediate device-cache read."""
+    failures: List[str] = []
+
+    if probe.cold.device_tokens or probe.cold.host_tokens:
+        failures.append(
+            f"cold probe hit the cache ({probe.cold.device_tokens} device, "
+            f"{probe.cold.host_tokens} host tokens) -- /flush_cache did not empty "
+            "the tree"
+        )
+
+    if probe.warm.device_tokens < page_size:
+        failures.append(
+            f"no device cache hit on the immediate re-send: "
+            f"{probe.warm.device_tokens} cached tokens, expected at least one page "
+            f"({page_size})"
+        )
+    if probe.warm.host_tokens:
+        failures.append(
+            f"the resident re-send reloaded {probe.warm.host_tokens} tokens from "
+            "host, and HiCache is disabled"
+        )
+
+    for label, observation in _labelled_device_reads(probe):
         counting_failure = _counting_failure(label=label, text=observation.text)
         if counting_failure is not None:
             failures.append(counting_failure)
@@ -359,6 +405,54 @@ def run_probe(
         flush=True,
     )
     return KvOffloadProbe(cold=cold, warm=warm, reload=reload)
+
+
+def run_device_cache_probe(
+    *, base_url: str, test_name: str, probe_tokens: int
+) -> DeviceCacheProbe:
+    """Flush, read a prompt cold, then immediately read it from device cache."""
+    prompt = probe_prompt(index=0, approx_tokens=probe_tokens)
+
+    flush = requests.post(base_url.rstrip("/") + "/flush_cache", timeout=60)
+    flush.raise_for_status()
+
+    cold = generate_with_cache_report(
+        base_url=base_url, prompt=prompt, max_new_tokens=_MAX_NEW_TOKENS
+    )
+    warm = generate_with_cache_report(
+        base_url=base_url, prompt=prompt, max_new_tokens=_MAX_NEW_TOKENS
+    )
+    print(
+        f"[device-cache] {test_name}: cold=({cold.device_tokens},{cold.host_tokens}) "
+        f"warm=({warm.device_tokens},{warm.host_tokens}) device/host cached tokens",
+        flush=True,
+    )
+    return DeviceCacheProbe(cold=cold, warm=warm)
+
+
+def device_cache_runner(*, test_name: str, page_size: int, probe_tokens: int):
+    """Build a runner that validates an immediate device-cache read."""
+
+    def run(base_url: str) -> Dict[str, Any]:
+        probe = run_device_cache_probe(
+            base_url=base_url,
+            test_name=test_name,
+            probe_tokens=probe_tokens,
+        )
+        failures = validate_device_cache_probe(probe=probe, page_size=page_size)
+
+        labels = {"model": test_name, "kind": "device_prefix_cache"}
+        dump_metric(
+            f"{test_name}.device_cached_tokens", probe.warm.device_tokens, labels=labels
+        )
+
+        return {
+            "score": probe.warm.device_tokens,
+            "_passed": not failures,
+            "_failures": failures,
+        }
+
+    return run
 
 
 def kv_offload_runner(
