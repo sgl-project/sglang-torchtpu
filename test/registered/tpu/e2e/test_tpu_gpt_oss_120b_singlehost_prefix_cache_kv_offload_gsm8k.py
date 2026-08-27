@@ -91,8 +91,8 @@ MODEL_CONFIG = {
     # config the accuracy lane does not serve, so plotting it next to that lane's
     # would compare two different servers.
     "gates": [
-        # First, on a cache it flushes and fully owns -- GSM8K would otherwise leave
-        # the pool full and the eviction arithmetic would no longer hold.
+        # Run before GSM8K so this gate owns a freshly flushed cache and its filler
+        # traffic cannot interact with the later accuracy requests.
         {
             "dataset": "prefix_cache_kv_offload",
             "label": "prefix-cache-kv-offload",
