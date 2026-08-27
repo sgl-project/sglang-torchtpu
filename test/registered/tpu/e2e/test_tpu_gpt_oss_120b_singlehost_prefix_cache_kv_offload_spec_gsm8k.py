@@ -24,8 +24,10 @@ HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 PAGE_SIZE = 64
 
-# Values above 1.0 prove that draft tokens were accepted.
-MIN_ACCEPT_LENGTH = 1.0  # measured 2.67 on the probe reads, 2.77 over GSM8K
+# Calibrated floor at ~90% of the measured probe accept length: a spec
+# acceptance-rate regression fails here. This is the gpt-oss-120b accept_length
+# guard formerly in test_spec_decoding.py (integration job, since removed).
+MIN_ACCEPT_LENGTH = 2.4  # measured 2.67 on the probe reads, 2.77 over GSM8K
 
 LAUNCH_ENV = {
     "MODEL": "/weights/gpt-oss-120b",

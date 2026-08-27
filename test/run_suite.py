@@ -190,9 +190,6 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.TPU: [
         "nightly-tpu-4-v7",
-        # Dropped by the #433 upstream-sync merge while test_spec_decoding.py and
-        # the nightly's integration job still use it; restored.
-        "nightly-tpu-integration",
         "nightly-tpu-multihost",
         # One suite per perf model, so the nightly can fan them out as separate
         # jobs on separate slices instead of one sequential single-host job.

@@ -107,7 +107,7 @@ build ────────────────────────�
   ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
   │    suite: nightly-tpu-4-v7
   ├─▶ singlehost-combo      (hosts=1)  │  exec: feature_combo singlehost
-  ├─▶ multihost-combo       (hosts=2)  │  exec: feature_combo pd | spec
+  ├─▶ multihost-combo       (hosts=2)  │  exec: feature_combo spec
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
 ```
 
@@ -482,7 +482,9 @@ four records would be four duplicate rows for one test.
 **A dispatch-only workflow earns no history row.** Only scheduled runs are
 ingested, so a test that lives solely in `integration-test-tpu.yml`
 (`workflow_dispatch` only) never trends no matter how well-formed its log is. It
-needs a leg in `nightly-test-tpu.yml` too — that is what `pd-integration` is.
+needs a leg in `nightly-test-tpu.yml` too — that is what the
+`pd-multihost-gpt-oss-120b-pc-offload-gsm8k` and
+`pd-multihost-gpt-oss-120b-tp-reshard-gsm8k` jobs are.
 
 Sanity-check a new test's log against the parser before waiting a night for it:
 
