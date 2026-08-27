@@ -25,6 +25,7 @@ WORKDIR /sgl-workspace/sglang
 COPY README.md LICENSE ./
 COPY python/pyproject_tpu.toml ./python/pyproject.toml
 COPY scripts/ci/utils/sgl_eval_ref.sh ./scripts/ci/utils/sgl_eval_ref.sh
+COPY scripts/ci/tpu/warm_mmlu_cache.py ./scripts/ci/tpu/warm_mmlu_cache.py
 
 # Install the pinned TPU stack (dev_tpu extra = all_tpu + test + ray) without sglang itself.
 RUN --mount=type=secret,id=gcp_token \
@@ -39,6 +40,9 @@ RUN --mount=type=secret,id=gcp_token \
     pip uninstall -y sglang && \
     rm -rf sglang && \
     . ../scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"
+
+# Fill sgl-eval's mmlu cache so the accuracy suite runs the eval offline.
+RUN python scripts/ci/tpu/warm_mmlu_cache.py
 
 # Verify base stack imports
 RUN python -c "import torch, libtpu; print('torch', torch.__version__, '| libtpu', libtpu.__version__)" \

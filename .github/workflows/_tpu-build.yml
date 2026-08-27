@@ -62,7 +62,7 @@ jobs:
           trap 'rm -f "$tokfile"' EXIT
 
           # 1. Compute deterministic hash for base image dependencies
-          base_hash=$(sha256sum python/pyproject_tpu.toml docker/tpu-base.Dockerfile scripts/ci/utils/sgl_eval_ref.sh | sha256sum | head -c 16)
+          base_hash=$(sha256sum python/pyproject_tpu.toml docker/tpu-base.Dockerfile scripts/ci/utils/sgl_eval_ref.sh scripts/ci/tpu/warm_mmlu_cache.py | sha256sum | head -c 16)
           base_tag="base-${base_hash}"
           echo "Base image tag: ${base_tag}"
 
