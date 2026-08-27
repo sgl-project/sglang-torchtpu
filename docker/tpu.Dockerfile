@@ -19,6 +19,7 @@ COPY benchmark ./benchmark
 RUN cd python && rm -f pyproject.toml && cp pyproject_tpu.toml pyproject.toml
 
 # Install SGLang in editable mode without reinstalling dependencies
+# Fast build on top of base
 RUN pip install --no-deps -e ./python
 
 CMD ["/bin/bash"]
