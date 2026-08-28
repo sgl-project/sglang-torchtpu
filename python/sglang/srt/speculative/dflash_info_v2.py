@@ -11,7 +11,11 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.speculative.spec_utils import allocate_and_assign_decode_cache
+from sglang.srt.utils import is_tpu
 from sglang.srt.utils.common import is_pin_memory_available
+
+_is_tpu = is_tpu()
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -175,39 +179,57 @@ class DFlashDraftInputV2(SpecInput):
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
 
-        caller_stream = None
-        if plan_stream is not None:
-            caller_stream = torch.get_device_module(batch.device).current_stream()
-
-        with plan_stream_ctx:
-            if plan_stream is not None and caller_stream is not None:
-                # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
-                # have just been rebuilt on the scheduler stream by filter/merge ops.
-                # The plan stream must wait for those writes before reading them.
-                plan_stream.wait_stream(caller_stream)
-
-            cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
-            nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
-
-            alloc_for_spec_decode(
-                batch.tree_cache,
-                batch.req_to_token_pool,
-                reqs=batch.reqs,
+        if _is_tpu and batch.req_to_token_pool.host_resident:
+            allocate_and_assign_decode_cache(
+                tree_cache=batch.tree_cache,
+                req_to_token_pool=batch.req_to_token_pool,
                 req_pool_indices=batch.req_pool_indices,
-                cur_kv_lens=cur_kv_lens,
                 cur_kv_lens_cpu=cur_kv_lens_cpu_t,
-                nxt_kv_lens=nxt_kv_lens,
                 nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
                 num_needed_tokens=num_needed_tokens,
-                batch=batch,
+                batch_size=bs,
+                device=batch.device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
             )
-        if caller_stream is not None:
-            # Enqueue the dependency on the caller's stream, not inside the
-            # plan-stream context, so forward work cannot observe partially
-            # prepared req_to_token / KV allocation state.
-            caller_stream.wait_stream(plan_stream)
+            for i, req in enumerate(batch.reqs):
+                req.kv.kv_allocated_len = max(
+                    req.kv.kv_allocated_len, int(nxt_kv_lens_cpu_t[i])
+                )
+        else:
+            caller_stream = None
+            if plan_stream is not None:
+                caller_stream = torch.get_device_module(batch.device).current_stream()
+
+            with plan_stream_ctx:
+                if plan_stream is not None and caller_stream is not None:
+                    # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
+                    # have just been rebuilt on the scheduler stream by filter/merge ops.
+                    # The plan stream must wait for those writes before reading them.
+                    plan_stream.wait_stream(caller_stream)
+
+                cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
+                nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
+                cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+                nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+
+                alloc_for_spec_decode(
+                    batch.tree_cache,
+                    batch.req_to_token_pool,
+                    reqs=batch.reqs,
+                    req_pool_indices=batch.req_pool_indices,
+                    cur_kv_lens=cur_kv_lens,
+                    cur_kv_lens_cpu=cur_kv_lens_cpu_t,
+                    nxt_kv_lens=nxt_kv_lens,
+                    nxt_kv_lens_cpu=nxt_kv_lens_cpu_t,
+                    num_needed_tokens=num_needed_tokens,
+                    batch=batch,
+                )
+            if caller_stream is not None:
+                # Enqueue the dependency on the caller's stream, not inside the
+                # plan-stream context, so forward work cannot observe partially
+                # prepared req_to_token / KV allocation state.
+                caller_stream.wait_stream(plan_stream)
+
         for req in batch.reqs:
             req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.

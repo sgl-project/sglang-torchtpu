@@ -13,13 +13,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @dataclass
@@ -117,7 +118,10 @@ class DFlashVerifyInput(SpecInput):
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
-        elif not batch.forward_mode.is_idle():
+        elif not _is_tpu and not batch.forward_mode.is_idle():
+            # On GPU eager, pre-initialize attention metadata here so forward can skip it.
+            # On TPU, defer metadata init to eager_runner so prepare_forward_batch can pad
+            # inputs to static buckets first.
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch
             )

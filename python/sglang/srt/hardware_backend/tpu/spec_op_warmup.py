@@ -78,3 +78,25 @@ def make_draft_extend_select_args(
         ),
         select_index,
     )
+
+
+def make_dflash_verify_bookkeeping_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs,),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+    )

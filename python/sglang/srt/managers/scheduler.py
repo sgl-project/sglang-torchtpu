@@ -619,11 +619,7 @@ class Scheduler(
 
         # Init overlap schedule
         self.init_overlap()
-        if (
-            current_platform.is_tpu()
-            and self.draft_worker is not None
-            and self.spec_algorithm.is_eagle3()
-        ):
+        if current_platform.is_tpu() and self.draft_worker is not None:
             self.precompile_tpu_spec_ops()
 
         # Init Ngram Embedding
@@ -1556,14 +1552,14 @@ class Scheduler(
 
     def precompile_tpu_spec_ops(self) -> None:
         from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-            SpecDecodeCompilePolicyMixin,
+            BaseSpecDecodeCompilePolicyMixin,
         )
         from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
 
         compile_policy = self.tp_worker.model_runner.compile_policy
-        if not isinstance(compile_policy, SpecDecodeCompilePolicyMixin):
+        if not isinstance(compile_policy, BaseSpecDecodeCompilePolicyMixin):
             return
         assert compile_policy.b_bucketer is not None
 

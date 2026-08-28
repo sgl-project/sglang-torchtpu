@@ -21,8 +21,9 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _extend_batch_cap,
     _matches_default,
     _pad_forward_batch_inputs,
+    _restore_forward_batch_inputs,
     _static_default_kwargs,
-    _zero_pad_1d,
+    _zero_pad_dim0,
     build_bucketers,
     reconcile_tpu_batch_limits,
 )
@@ -30,9 +31,10 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     _DummyForwardBatchFields,
 )
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    Eagle3CompilePolicyMixin,
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -135,15 +137,22 @@ class TestDummyFieldPadCoverage(CustomTestCase):
         self.assertLessEqual(device_tensor_fields, set(_TOKEN_FIELDS) | set(_BS_FIELDS))
 
 
-class TestZeroPad1d(CustomTestCase):
+class TestZeroPadDim0(CustomTestCase):
     def test_pads_zeros_at_tail(self):
-        out = _zero_pad_1d(_t(1, 2, 3), target_size=5)
+        out = _zero_pad_dim0(_t(1, 2, 3), target_size=5)
         self.assertEqual(out.tolist(), [1, 2, 3, 0, 0])
 
     def test_no_op_when_already_at_size(self):
         x = _t(1, 2, 3)
-        self.assertIs(_zero_pad_1d(x, target_size=3), x)
-        self.assertIs(_zero_pad_1d(x, target_size=2), x)
+        self.assertIs(_zero_pad_dim0(x, target_size=3), x)
+        self.assertIs(_zero_pad_dim0(x, target_size=2), x)
+
+    def test_pads_2d_tensor_along_dim0(self):
+        x = torch.ones((3, 4), dtype=torch.float32)
+        out = _zero_pad_dim0(x, target_size=5)
+        self.assertEqual(out.shape, (5, 4))
+        self.assertTrue(torch.equal(out[:3], x))
+        self.assertTrue(torch.equal(out[3:], torch.zeros((2, 4), dtype=torch.float32)))
 
 
 class TestPadForwardBatchInputs(CustomTestCase):
@@ -432,10 +441,30 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual((real_q, real_b), (6, 3))
         self.assertEqual(fb.input_ids.shape[0], 8)  # pad_b(4) * width(2)
 
+    def test_pads_and_restores_input_embeds(self):
+        fb = _forward_batch(real_t=4, real_b=1, mode="extend")
+        fb.input_embeds = torch.ones((4, 16), dtype=torch.bfloat16)
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (4, 1))
+        self.assertEqual(fb.input_embeds.shape, (8, 16))
+        self.assertTrue(
+            torch.equal(fb.input_embeds[:4], torch.ones((4, 16), dtype=torch.bfloat16))
+        )
+        self.assertTrue(
+            torch.equal(fb.input_embeds[4:], torch.zeros((4, 16), dtype=torch.bfloat16))
+        )
 
-class TestSpecDecodeCompilePolicyPadding(CustomTestCase):
+        _restore_forward_batch_inputs(fb, real_q, real_b)
+        self.assertEqual(fb.input_embeds.shape, (4, 16))
+
+
+class TestEagle3SpecDecodeCompilePolicyPadding(CustomTestCase):
     def test_draft_decode_pads_req_pool_indices_cpu_to_bucket(self):
-        policy = object.__new__(Eagle3CompilePolicyMixin)
+        policy = object.__new__(Eagle3SpecDecodeCompilePolicyMixin)
         policy.b_bucketer = _bucketer("Bs", [1, 2, 4])
         fb = _forward_batch(real_t=3, real_b=3, mode="decode")
 
@@ -486,7 +515,7 @@ class TestCompiledForwardShim(CustomTestCase):
         padded_logits = torch.arange(4 * 10, dtype=torch.float32).reshape(4, 10)
         padded_hidden = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
         compiled = MagicMock(
-            return_value=SimpleNamespace(
+            return_value=LogitsProcessorOutput(
                 next_token_logits=padded_logits,
                 hidden_states=padded_hidden,
             )
@@ -500,7 +529,7 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
 
     def test_defers_output_unpadding_for_chained_forwards(self):
-        padded = SimpleNamespace(
+        padded = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 10),
             hidden_states=torch.zeros(8, 5),
         )
@@ -522,7 +551,9 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertEqual(fb.batch_size, 4)
 
     def test_passes_args_through(self):
-        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled = MagicMock(
+            return_value=LogitsProcessorOutput(next_token_logits=torch.empty(0))
+        )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, "extra1", kw="extra2")
@@ -558,6 +589,21 @@ class TestCompiledForwardShim(CustomTestCase):
         fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
+
+    def test_syncs_input_embeds_kwarg_with_padded_forward_batch(self):
+        def forward(input_ids, positions, forward_batch, input_embeds=None):
+            pass
+
+        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled.__signature__ = inspect.signature(forward)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
+        padded_embeds = torch.zeros((8, 16), dtype=torch.bfloat16)
+        fb.input_embeds = padded_embeds
+        stale_unpadded_embeds = torch.zeros((4, 16), dtype=torch.bfloat16)
+
+        shim("ids", "pos", fb, input_embeds=stale_unpadded_embeds)
+        compiled.assert_called_once_with("ids", "pos", fb, input_embeds=padded_embeds)
 
     def test_no_op_when_real_size_keys_missing(self):
         # Padding hook didn't run (e.g. forward_idle): output passes through.

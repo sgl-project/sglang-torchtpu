@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
 
 """Inference-only GptOss model compatible with HuggingFace weights."""
 
@@ -20,7 +21,7 @@ import math
 import re
 from collections.abc import Iterable
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -613,16 +614,23 @@ class GptOssDecoderLayer(nn.Module):
                 self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
         )
+        self._is_layer_to_capture = False
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
+        residual: torch.Tensor | None,
+        captured_last_layer_outputs: list[torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if hidden_states.shape[0] != 0:
@@ -703,16 +711,26 @@ class GptOssModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
-        self.layers_to_capture = []
+        self.layers_to_capture: list[int] = []
+
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            self.layers[layer_id]._is_layer_to_capture = True
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            self.layers[layer_id]._is_layer_to_capture = True
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[torch.Tensor, PPProxyTensors]:
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+    ) -> torch.Tensor | PPProxyTensors:
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -724,25 +742,21 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        # Capture hidden-state boundaries: boundary 0 is the embedding output,
-        # and boundary i + 1 is the output after transformer block i.
         aux_hidden_states = []
-        if self.start_layer in self.layers_to_capture:
-            aux_hidden_states.append(
-                hidden_states + residual if residual is not None else hidden_states
-            )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None
+                    ),
                 )
-                if i + 1 in self.layers_to_capture:
-                    aux_hidden_states.append(
-                        hidden_states + residual
-                        if residual is not None
-                        else hidden_states
-                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -1331,24 +1345,24 @@ class GptOssForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         if not self.pp_group.is_last_rank:
             return
 
         num_layers = self.config.num_hidden_layers
         if layer_ids is None:
             self.capture_aux_hidden_states = True
-            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+            self.model.set_eagle3_layers_to_capture(
+                [2, num_layers // 2, num_layers - 3]
+            )
         else:
             self.capture_aux_hidden_states = True
-            # Preserve IDs that already include the final hidden-state
-            # boundary; otherwise retain the legacy output-layer conversion.
             if layer_ids and max(layer_ids) == num_layers:
-                self.model.layers_to_capture = list(layer_ids)
+                self.model.set_eagle3_layers_to_capture(list(layer_ids))
             else:
-                self.model.layers_to_capture = [val + 1 for val in layer_ids]
+                self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
-    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         if not self.pp_group.is_last_rank:
             return
 
@@ -1358,7 +1372,7 @@ class GptOssForCausalLM(nn.Module):
             )
 
         self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

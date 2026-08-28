@@ -418,6 +418,131 @@ def test_eagle_prepare_for_decode_uses_torch_native_allocator():
     assert torch.equal(kwargs["nxt_kv_lens_cpu"], torch.tensor([7, 5]))
 
 
+def test_dflash_worker_write_layer_kv_tpu_interleaving():
+    # 2 blocks, page_size=4, 2 kv_heads (interleaved 4), head_dim=4
+    # Shape: [2, 4, 2, 2, 4] -> [8, 4, 4]
+    buf = torch.zeros((2, 4, 2, 2, 4), dtype=torch.float32)
+    pool = SimpleNamespace(
+        get_fused_kv_buffer=Mock(return_value=buf),
+        head_num=2,
+        head_dim=4,
+        v_head_dim=4,
+        padded_head_dim=4,
+        num_kv_heads_x2=4,
+        store_dtype=torch.float32,
+    )
+    worker = SimpleNamespace(draft_model_runner=SimpleNamespace(token_to_kv_pool=pool))
+
+    loc = torch.tensor([3, 5], dtype=torch.int64)
+    k = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+            [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0]],
+        ],
+        dtype=torch.float32,
+    )
+    v = torch.tensor(
+        [
+            [[101.0, 102.0, 103.0, 104.0], [105.0, 106.0, 107.0, 108.0]],
+            [[201.0, 202.0, 203.0, 204.0], [205.0, 206.0, 207.0, 208.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+    DFlashWorkerV2._write_layer_kv_tpu(worker, layer_idx=0, loc=loc, k=k, v=v)
+
+    # Flatten buffer to [num_tokens, num_kv_heads_x2, head_dim] for logical verification.
+    flat_buf = buf.flatten(0, 1).flatten(1, 2)
+
+    assert torch.equal(flat_buf[3, 0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.equal(flat_buf[3, 1], torch.tensor([101.0, 102.0, 103.0, 104.0]))
+    assert torch.equal(flat_buf[3, 2], torch.tensor([5.0, 6.0, 7.0, 8.0]))
+    assert torch.equal(flat_buf[3, 3], torch.tensor([105.0, 106.0, 107.0, 108.0]))
+
+    assert torch.equal(flat_buf[5, 0], torch.tensor([10.0, 20.0, 30.0, 40.0]))
+    assert torch.equal(flat_buf[5, 1], torch.tensor([201.0, 202.0, 203.0, 204.0]))
+    assert torch.equal(flat_buf[5, 2], torch.tensor([50.0, 60.0, 70.0, 80.0]))
+    assert torch.equal(flat_buf[5, 3], torch.tensor([205.0, 206.0, 207.0, 208.0]))
+
+    assert torch.all(flat_buf[0] == 0)
+    assert torch.all(flat_buf[1] == 0)
+    assert torch.all(flat_buf[2] == 0)
+    assert torch.all(flat_buf[4] == 0)
+
+    # Test 2D k and v auto-unflattening
+    k_2d = k.flatten(1, 2)
+    v_2d = v.flatten(1, 2)
+    buf.zero_()
+    DFlashWorkerV2._write_layer_kv_tpu(worker, layer_idx=0, loc=loc, k=k_2d, v=v_2d)
+    assert torch.equal(flat_buf[3, 0], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.equal(flat_buf[3, 1], torch.tensor([101.0, 102.0, 103.0, 104.0]))
+
+
+def test_dflash_prepare_for_decode_uses_torch_native_allocator():
+    import sglang.srt.speculative.dflash_info_v2 as dflash_info_v2
+    from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+    reqs = [
+        SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=2),
+            kv_committed_len=3,
+            sampling_params=SimpleNamespace(top_k=1),
+            decode_batch_idx=0,
+        ),
+        SimpleNamespace(
+            kv=SimpleNamespace(kv_allocated_len=5),
+            kv_committed_len=1,
+            sampling_params=SimpleNamespace(top_k=1),
+            decode_batch_idx=0,
+        ),
+    ]
+    req_pool_indices = torch.tensor([2, 3], dtype=torch.int64)
+    req_pool_indices_cpu = torch.tensor([2, 3], dtype=torch.int64)
+    batch = SimpleNamespace(
+        batch_size=Mock(return_value=2),
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=1),
+        reqs=reqs,
+        tree_cache=object(),
+        req_to_token_pool=SimpleNamespace(host_resident=True),
+        req_pool_indices=req_pool_indices,
+        req_pool_indices_cpu=req_pool_indices_cpu,
+        device=torch.device("cpu"),
+        maybe_evict_swa=Mock(),
+    )
+    out = torch.arange(5)
+    spec_mock = SimpleNamespace(speculative_num_draft_tokens=4)
+
+    info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
+
+    with (
+        patch.object(dflash_info_v2, "_is_tpu", True),
+        patch.object(dflash_info_v2, "get_spec", return_value=spec_mock),
+        patch.object(
+            dflash_info_v2, "allocate_and_assign_decode_cache", return_value=out
+        ) as allocate,
+    ):
+        info.prepare_for_decode(batch)
+
+    allocate.assert_called_once()
+    kwargs = allocate.call_args.kwargs
+    assert kwargs["tree_cache"] is batch.tree_cache
+    assert kwargs["req_to_token_pool"] is batch.req_to_token_pool
+    assert kwargs["req_pool_indices"] is req_pool_indices
+    assert kwargs["host_req_pool_indices"] is req_pool_indices_cpu
+    assert kwargs["num_needed_tokens"] == 13
+    assert kwargs["batch_size"] == 2
+    assert torch.equal(
+        kwargs["cur_kv_lens_cpu"], torch.tensor([2, 5], dtype=torch.int32)
+    )
+    assert torch.equal(
+        kwargs["nxt_kv_lens_cpu"], torch.tensor([11, 9], dtype=torch.int32)
+    )
+    assert reqs[0].kv.kv_allocated_len == 11
+    assert reqs[1].kv.kv_allocated_len == 9
+
+
 if __name__ == "__main__":
     import sys
 

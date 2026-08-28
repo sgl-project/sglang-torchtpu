@@ -106,7 +106,7 @@ class LogitsProcessorOutput:
     next_token_logits: Optional[torch.Tensor]
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
-    hidden_states: Optional[torch.Tensor] = None
+    hidden_states: torch.Tensor | None = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -154,6 +154,9 @@ class LogitsProcessorOutput:
     # vocabulary. Both tensors have shape [#seq, k].
     next_token_global_top_k_logits: Optional[torch.Tensor] = None
     next_token_global_top_k_token_ids: Optional[torch.Tensor] = None
+
+    # Sampled draft token IDs when draft sampling is fused into draft model forward
+    next_draft_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         has_global_top_k_logits = self.next_token_global_top_k_logits is not None

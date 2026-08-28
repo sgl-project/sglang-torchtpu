@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 
 import sglang.srt.model_executor.forward_batch_info as fbi
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -108,7 +109,7 @@ class TestForwardBatchPadding(CustomTestCase):
         fb.spec_info = SimpleNamespace()
         fb.hidden_states_backup = torch.zeros(2, 4)
         fb._original_batch_size = 2
-        logits_output = SimpleNamespace(
+        logits_output = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 8),
             hidden_states=torch.zeros(4, 4),
         )
@@ -123,7 +124,7 @@ class TestForwardBatchPadding(CustomTestCase):
         fb.forward_mode = ForwardMode.IDLE
         fb.spec_info = SimpleNamespace(keep_outputs_padded=True)
         fb._original_batch_size = 0
-        logits_output = SimpleNamespace(
+        logits_output = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 8),
             hidden_states=None,
         )

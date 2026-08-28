@@ -24,8 +24,8 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _materialize_out,
     _unpad_decoder_outputs,
 )
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    Eagle3CompilePolicyMixin,
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
     SpecDecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.sampler import select_logits_output_mode
@@ -342,6 +342,7 @@ class TestInstallExtendCap(CustomTestCase):
         model_runner = SimpleNamespace(
             model=model,
             forward=MagicMock(),
+            is_draft_worker=False,
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 chunked_prefill_size=None,
@@ -492,6 +493,54 @@ class TestInstallExtendCap(CustomTestCase):
         self.assertIs(logits_processor.forward, compiled_logits)
         self.assertIs(policy.compiled_forward_shim.fn, original_outer)
 
+    def test_draft_compiles_direct_draft_model_without_submodule_or_logits_processor(
+        self,
+    ):
+        original_forward = MagicMock(name="direct_draft_forward")
+        model = SimpleNamespace(
+            forward=original_forward,
+            prepare_forward_batch=MagicMock(),
+        )
+        model_runner = SimpleNamespace(
+            model=model,
+            forward=MagicMock(),
+            is_draft_worker=True,
+            model_config=SimpleNamespace(context_len=4096),
+            server_args=SimpleNamespace(
+                chunked_prefill_size=None,
+                max_prefill_tokens=2048,
+                torch_compile_max_bs=64,
+                prefill_max_requests=16,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
+        policy.backend = "eager"
+        compiled_model = MagicMock(name="compiled_model")
+
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "build_bucketers",
+            return_value=(
+                Bucketer(name="Token", buckets=[64, 2048]),
+                Bucketer(name="Bs", buckets=[16, 32, 64]),
+            ),
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "is_dp_attention_enabled",
+            return_value=False,
+        ), patch(
+            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+            "torch.compile",
+            return_value=compiled_model,
+        ) as compile_mock:
+            self.assertTrue(policy.install())
+
+        self.assertEqual(compile_mock.call_count, 1)
+        self.assertIs(model.forward, policy.compiled_forward_shim)
+        self.assertIs(policy.compiled_forward_shim.fn, compiled_model)
+
 
 class TestQwen3VLDecoderPolicy(CustomTestCase):
     def _forward_batch(self):
@@ -611,7 +660,9 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
         self.assertEqual(result["residual"].shape, (5, 4))
 
     def test_spec_policy_delegates_raw_vl_output_unpadding(self):
-        class _SpecQwenPolicy(Eagle3CompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy):
+        class _SpecQwenPolicy(
+            Eagle3SpecDecodeCompilePolicyMixin, Qwen3VLDecoderTpuCompilePolicy
+        ):
             pass
 
         policy = object.__new__(_SpecQwenPolicy)
@@ -1018,7 +1069,9 @@ def _make_spec_policy(
     )
 
 
-_SPEC_POLICY = "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
+_SPEC_POLICY = (
+    "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3."
+)
 _DECODER_POLICY = "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
 
 
@@ -1211,7 +1264,7 @@ class TestSpecDummyForwardBatch(CustomTestCase):
 
     def test_target_verify_batch_shapes_and_capture_mode(self):
         policy = _make_spec_policy(num_steps=3)  # draft_token_num = 4
-        spec_info = policy._make_verify_spec_info()
+        spec_info = policy.make_verify_spec_info()
         fb = policy._make_dummy_forward_batch(
             num_tokens=16,
             bs=4,
@@ -1241,7 +1294,7 @@ class TestSpecDummyForwardBatch(CustomTestCase):
             num_tokens=64,
             bs=4,
             mode=ForwardMode.EXTEND,
-            spec_info=policy._make_null_spec_info(),
+            spec_info=policy.make_null_spec_info(),
         )
         self.assertIsNotNone(fb.spec_info)
         self.assertEqual(fb.out_cache_loc.dtype, torch.int32)
@@ -1597,8 +1650,7 @@ class TestSpecDraftExtendPadding(CustomTestCase):
         )
 
         with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy."
-            "is_dp_attention_enabled",
+            _SPEC_POLICY + "is_dp_attention_enabled",
             return_value=True,
         ):
             policy._pad_draft_extend(forward_batch)
@@ -1784,6 +1836,7 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             spec_info=spec_info,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
         )
 
         policy.prepare_spec_forward_batch(forward_batch)
@@ -1793,7 +1846,11 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
 
     def test_draft_extend_dispatches(self):
         policy = self._policy()
-        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DRAFT_EXTEND_V2)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            spec_info=None,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+        )
 
         policy.prepare_spec_forward_batch(forward_batch)
 
@@ -1801,7 +1858,11 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
 
     def test_idle_is_noop(self):
         policy = self._policy()
-        forward_batch = SimpleNamespace(forward_mode=ForwardMode.IDLE)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            spec_info=None,
+            seq_lens=torch.tensor([], dtype=torch.int32),
+        )
 
         policy.prepare_spec_forward_batch(forward_batch)
 
@@ -1810,7 +1871,11 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
 
     def test_target_verify_is_noop(self):
         policy = self._policy()
-        forward_batch = SimpleNamespace(forward_mode=ForwardMode.TARGET_VERIFY)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=None,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+        )
 
         policy.prepare_spec_forward_batch(forward_batch)
 
@@ -2060,6 +2125,9 @@ def _serving_stubs():
     ), patch(
         "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
         return_value=False,
+    ), patch(
+        "torch._dynamo.config.disable",
+        True,
     ), get_context().override_server_args(
         speculative_use_rejection_sampling=False,
         speculative_accept_threshold_single=1.0,

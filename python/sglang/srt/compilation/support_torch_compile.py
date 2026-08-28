@@ -66,6 +66,8 @@ class CompilePolicy(ABC):
 class DecoderCompilePolicy(CompilePolicy):
     """Compile policy for decoder boundaries driven by a ForwardBatch."""
 
+    b_bucketer: Any | None = None
+
     def precompile_draft(
         self, draft_attn_backend: Any, draft_extend_attn_backend: Any
     ) -> None:

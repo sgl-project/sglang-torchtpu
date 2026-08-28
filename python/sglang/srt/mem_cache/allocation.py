@@ -246,11 +246,11 @@ def get_last_loc_torch(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    # Host-resident pool: index with host tensors (torch.where evaluates the
-    # gather branch even when prefix_lens==0, so a device index would error).
-    if req_to_token.device.type == "cpu":
-        req_pool_indices_tensor = req_pool_indices_tensor.cpu()
-        prefix_lens_tensor = prefix_lens_tensor.cpu()
+    target_device = req_to_token.device
+    if req_pool_indices_tensor.device != target_device:
+        req_pool_indices_tensor = req_pool_indices_tensor.to(target_device)
+    if prefix_lens_tensor.device != target_device:
+        prefix_lens_tensor = prefix_lens_tensor.to(target_device)
     return torch.where(
         prefix_lens_tensor > 0,
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],

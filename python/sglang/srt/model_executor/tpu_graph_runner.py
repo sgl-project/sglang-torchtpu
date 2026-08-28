@@ -37,36 +37,51 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    Eagle3CompilePolicyMixin,
-    SpecDecodeCompilePolicyMixin,
+    BaseSpecDecodeCompilePolicyMixin,
+)
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+)
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def _eagle3_enabled(model_runner: ModelRunner) -> bool:
-    """Whether this runner uses the in-tree EAGLE3 implementation."""
-    return model_runner.spec_algorithm.is_eagle3()
+def _spec_enabled(model_runner: ModelRunner) -> bool:
+    """Whether this runner uses speculative decoding on TPU."""
+    return (
+        model_runner.spec_algorithm.is_eagle3()
+        or model_runner.spec_algorithm.is_dflash()
+    )
+
+
+def _resolve_spec_compile_policy_mixin(
+    spec_algorithm: SpeculativeAlgorithm,
+) -> type[BaseSpecDecodeCompilePolicyMixin]:
+    """Resolve speculative compile policy mixin class based on algorithm."""
+    if spec_algorithm.is_dflash():
+        return DFlashSpecDecodeCompilePolicyMixin
+    return Eagle3SpecDecodeCompilePolicyMixin
 
 
 def _augment_spec_policy(policy_cls: type, model_runner: ModelRunner) -> type:
-    """Compose EAGLE3 compile behavior over a decoder policy."""
-    if not _eagle3_enabled(model_runner) or not issubclass(
+    """Compose speculative decoding compile behavior over a decoder policy."""
+    if not _spec_enabled(model_runner) or not issubclass(
         policy_cls, DecoderCompilePolicy
     ):
         return policy_cls
-    if issubclass(policy_cls, SpecDecodeCompilePolicyMixin):
+    if issubclass(policy_cls, BaseSpecDecodeCompilePolicyMixin):
         return policy_cls
     if not issubclass(policy_cls, DecoderTpuCompilePolicy):
         return policy_cls
-    return type(
-        f"{Eagle3CompilePolicyMixin.__name__}{policy_cls.__name__}",
-        (Eagle3CompilePolicyMixin, policy_cls),
-        {},
-    )
+    spec_mixin_cls = _resolve_spec_compile_policy_mixin(model_runner.spec_algorithm)
+    return type(f"Spec{policy_cls.__name__}", (spec_mixin_cls, policy_cls), {})
 
 
 # This module lives outside the tpu/ tree, so __name__ does not start with
@@ -209,18 +224,18 @@ class TpuGraphRunner:
                     f"method {method_name!r}, but the module has no such method."
                 )
 
-            # Compose EAGLE3 behavior over the model's own decoder policy.
+            # Compose speculative decoding behavior over the model's own decoder policy.
             if (
-                _eagle3_enabled(model_runner)
+                _spec_enabled(model_runner)
                 and issubclass(policy_cls, DecoderCompilePolicy)
-                and not issubclass(policy_cls, SpecDecodeCompilePolicyMixin)
+                and not issubclass(policy_cls, BaseSpecDecodeCompilePolicyMixin)
             ):
                 logger.warning(
                     "Speculative decoding is active and %s ships its own compile "
-                    "policy %s; composing %s over it.",
+                    "policy %s; composing the default speculative compile policy over "
+                    "it.",
                     type(module).__name__,
                     policy_cls.__name__,
-                    Eagle3CompilePolicyMixin.__name__,
                 )
             policy_cls = _augment_spec_policy(policy_cls, model_runner)
 

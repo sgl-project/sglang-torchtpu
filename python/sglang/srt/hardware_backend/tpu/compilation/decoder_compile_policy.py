@@ -25,6 +25,7 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     build_bucketers,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -68,6 +69,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         "next_token_logits",
         "next_token_global_top_k_logits",
         "next_token_global_top_k_token_ids",
+        "next_draft_tokens",
     ):
         value = getattr(out, field, None)
         if isinstance(value, torch.Tensor):
@@ -108,23 +110,23 @@ def _hbm_delta_str(
     return f" HBM: +{delta:.0f} MB ({after[0]:.0f}/{after[1]:.0f} MB)"
 
 
-def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
+def _unpad_decoder_outputs(
+    out: LogitsProcessorOutput | Any,
+    forward_batch: ForwardBatch,
+) -> Any:
     real_q = getattr(forward_batch, _REAL_Q_KEY, None)
     real_b = getattr(forward_batch, _REAL_B_KEY, None)
     if real_q is None or real_b is None:
         return out
 
-    trim_next_token_outputs = getattr(out, "trim_next_token_outputs", None)
-    if trim_next_token_outputs is not None:
-        trim_next_token_outputs(real_b)
-    else:
-        next_token_logits = getattr(out, "next_token_logits", None)
-        if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            out.next_token_logits = next_token_logits[:real_b]
-
-    hidden_states = getattr(out, "hidden_states", None)
-    if hidden_states is not None and real_q < hidden_states.shape[0]:
-        out.hidden_states = hidden_states[:real_q]
+    if isinstance(out, LogitsProcessorOutput):
+        out.trim_next_token_outputs(real_b)
+        if (
+            out.hidden_states is not None
+            and isinstance(out.hidden_states, torch.Tensor)
+            and real_q < out.hidden_states.shape[0]
+        ):
+            out.hidden_states = out.hidden_states[:real_q]
 
     # Restore real token/batch metadata so eager outer-model processing and
     # downstream consumers never observe static-shape ghost slots.
@@ -390,8 +392,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return False
 
         server_args = self.model_runner.server_args
-        is_draft_worker = bool(getattr(self.model_runner, "is_draft_worker", False))
-        compile_owner = self.owner.model if is_draft_worker else self.owner
+        is_draft_worker = self.model_runner.is_draft_worker
+        compile_owner = (
+            getattr(self.owner, "model", self.owner) if is_draft_worker else self.owner
+        )
         compile_fn = compile_owner.forward if is_draft_worker else fn
 
         if self._compiles_logits_processor():
@@ -409,7 +413,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "forward" if is_draft_worker else self.method_name,
             compiled,
         )
-        if is_draft_worker:
+        if is_draft_worker and hasattr(self.owner, "logits_processor"):
             logits_fn = self.owner.logits_processor.forward
             compiled_logits = torch.compile(
                 torch.no_grad()(logits_fn),
@@ -460,13 +464,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.prepare_forward_batch(forward_batch)
 
         outer_model.prepare_forward_batch = _prepare
-
-        # Keep draft logits out of the compiled model-forward graph. The outer
-        # forward calls the backbone and logits processor as independent
-        # compiled regions.
-        shim_target = fn if is_draft_worker else compiled
-        self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
-        setattr(self.owner, self.method_name, self.compiled_forward_shim)
+        self._install_forward_shim(fn=fn, compiled=compiled)
         self.model_runner.compile_policy = self
 
         if is_dp_attention_enabled():
@@ -482,6 +480,33 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def _install_forward_shim(
+        self, fn: Callable[..., Any], compiled: Callable[..., Any]
+    ) -> None:
+        """Wrap and install the compiled forward shim on owner.
+
+        EAGLE3 splits backbone and logits_processor into separate compiled regions,
+        leaving outer forward eager as a coordinator. DFlash samples via target lm_head
+        without logits_processor, so its entire forward is compiled.
+
+        Args:
+          fn: Original uncompiled forward function.
+          compiled: Compiled forward function.
+        """
+        is_eagle3_draft = self.model_runner.is_draft_worker and hasattr(
+            self.owner, "logits_processor"
+        )
+        shim_target = fn if is_eagle3_draft else compiled
+        logger.info(
+            "[decoder compile policy] _install_forward_shim for %s (is_draft=%s, is_eagle3_draft=%s, shim_target=%s)",
+            type(self.owner).__name__,
+            self.model_runner.is_draft_worker,
+            is_eagle3_draft,
+            getattr(shim_target, "__name__", type(shim_target).__name__),
+        )
+        self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
+        setattr(self.owner, self.method_name, self.compiled_forward_shim)
 
     def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         if self.tracer == "direct":

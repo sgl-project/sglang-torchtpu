@@ -24,6 +24,8 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -505,3 +507,5 @@ def _register_hidden_states_pytree(cls: type) -> None:
 
 _register_hidden_states_pytree(EagleDraftInput)
 _register_hidden_states_pytree(EagleDraftExtendInput)
+_register_hidden_states_pytree(DFlashDraftInputV2)
+tree_util.register_dataclass(DFlashVerifyInput)

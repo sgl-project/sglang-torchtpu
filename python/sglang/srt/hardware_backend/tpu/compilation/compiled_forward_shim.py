@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 DEFAULT_TPU_COMPILE_MAX_BS = 64
 
 # Fields whose token dim gets padded to the token bucket.
-_TOKEN_FIELDS = ("input_ids", "positions", "out_cache_loc")
+_TOKEN_FIELDS = ("input_ids", "positions", "out_cache_loc", "input_embeds")
 
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
@@ -90,11 +90,12 @@ def _matches_default(value: Any, default: Any) -> bool:
     return type(value) is type(default) and value == default
 
 
-def _zero_pad_1d(t: torch.Tensor, target_size: int) -> torch.Tensor:
-    """Zero-pad a 1-D tensor to target_size."""
+def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
+    """Zero-pad a tensor along dim 0 to target_size."""
     if t.shape[0] >= target_size:
         return t
-    return F.pad(t, (0, target_size - t.shape[0]))
+    pad_rows = target_size - t.shape[0]
+    return F.pad(t, (0,) * (2 * (t.ndim - 1)) + (0, pad_rows))
 
 
 def _dp_attn_select_bucket_shape(
@@ -355,7 +356,7 @@ def _pad_forward_batch_inputs(
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_t:
-            setattr(forward_batch, field, _zero_pad_1d(val, pad_t))
+            setattr(forward_batch, field, _zero_pad_dim0(val, pad_t))
 
     # MROPE positions are (3, num_tokens); pad along the token dim.
     mrope_pos = getattr(forward_batch, "mrope_positions", None)
@@ -367,12 +368,12 @@ def _pad_forward_batch_inputs(
     if is_draft_extend_v2:
         out_cache_loc = forward_batch.out_cache_loc
         if out_cache_loc.shape[0] < pad_t:
-            forward_batch.out_cache_loc = _zero_pad_1d(out_cache_loc, pad_t)
+            forward_batch.out_cache_loc = _zero_pad_dim0(out_cache_loc, pad_t)
 
     for field in _BS_FIELDS:
         val = getattr(forward_batch, field, None)
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
-            setattr(forward_batch, field, _zero_pad_1d(val, pad_b))
+            setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
 
     # Normalize tensor/None values to padded lists so every extend batch
     # presents the same type to the compiled graph (the precompile dummy uses
@@ -567,6 +568,9 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        input_embeds = getattr(forward_batch, "input_embeds", None)
+        if input_embeds is not None:
+            kwargs["input_embeds"] = input_embeds
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across

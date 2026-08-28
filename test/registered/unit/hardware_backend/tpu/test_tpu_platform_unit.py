@@ -420,14 +420,19 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
 
     def test_mha_kv_pool_cls(self):
         # get_mha_kv_pool_cls picks the pool by the resolved attention backend
-        # read off the global server args; a non-RPA backend yields the flat
-        # MHATokenToKVPool.
         with patch(
             "sglang.srt.server_args.get_global_server_args",
             return_value=SimpleNamespace(attention_backend="torch_native"),
         ):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "MHATokenToKVPool")
+
+        with patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=SimpleNamespace(attention_backend="pallas_tpu_rpa_v3"),
+        ):
+            cls = self.platform.get_mha_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
     def test_nsa_raises(self):
         with self.assertRaises(NotImplementedError):
