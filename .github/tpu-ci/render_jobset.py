@@ -95,6 +95,14 @@ def dns_safe(name):
     return (s[:40].strip("-")) or "run"
 
 
+def single_test_name(files):
+    """Return a test filename stem when files contains exactly one path."""
+    paths = files.split()
+    if len(paths) != 1:
+        return ""
+    return os.path.basename(paths[0]).removesuffix(".py")
+
+
 def suite_wait_seconds(
     suite,
     tests_dir="test/registered",
@@ -224,7 +232,7 @@ def main():
         # rather than emitting a record with an empty `file`.
         if not a.files:
             ap.error("P/D mode needs --files (the test file(s) --exec runs)")
-        run_name = dns_safe(a.name or "pd")
+        run_name = dns_safe(a.name or single_test_name(a.files) or "pd")
         # Pods locate their peer slice by swapping the replicated-job segment
         # ("-prefill-"/"-decode-") of their own hostname; a run name containing
         # either word would make that swap ambiguous.

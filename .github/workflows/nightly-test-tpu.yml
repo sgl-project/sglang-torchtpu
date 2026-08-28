@@ -108,7 +108,6 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
       weights_pvc: model-weights-rox
-      run_name: pd-mh-gpt-120b-pc-offload
     permissions:
       contents: read
       id-token: write
@@ -129,7 +128,6 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
-      run_name: pd-mh-gpt-120b-tp-reshard
     permissions:
       contents: read
       id-token: write
@@ -190,7 +188,6 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py
       weights_pvc: model-weights-rox
-      run_name: pd-sh-gpt-120b
     permissions:
       contents: read
       id-token: write
@@ -234,7 +231,6 @@ jobs:
       # Used for dashboard and timing records.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
       weights_pvc: model-weights-rox
-      run_name: pd-mh-gpt-120b
     permissions:
       contents: read
       id-token: write
