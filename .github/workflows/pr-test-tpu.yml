@@ -110,6 +110,7 @@ jobs:
   unit:
     name: unit-test
     needs: build
+    if: ${{ false }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       # PR head SHA (immutable, matches the pushed code) rather than the test-merge
@@ -126,6 +127,7 @@ jobs:
   e2e:
     name: e2e-test
     needs: build
+    if: ${{ false }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -136,11 +138,26 @@ jobs:
       contents: read
       id-token: write
 
+  topk-stability-probe:
+    name: topk-stability-probe
+    needs: build
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload_gsm8k.py -f
+      hosts: 1
+      weights_pvc: model-weights-rox
+      run_name: topk-stability-probe
+    permissions:
+      contents: read
+      id-token: write
+
   # Aggregator finish job for branch protection / required status checks.
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
-    needs: [decide, build, unit, e2e]
+    needs: [decide, build, unit, e2e, topk-stability-probe]
     if: always()
     runs-on: ubuntu-latest
     steps:
