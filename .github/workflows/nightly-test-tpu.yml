@@ -78,7 +78,7 @@ jobs:
           echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
           echo "perf=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-perf-gpt-oss-120b --nightly)" >> "$GITHUB_OUTPUT"
           echo "accuracy=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-accuracy-gpt-oss-120b --nightly)" >> "$GITHUB_OUTPUT"
-          echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_gsm8k.py)" >> "$GITHUB_OUTPUT"
           echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/integration/test_pd_tp_resharding.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py)" >> "$GITHUB_OUTPUT"
@@ -137,9 +137,9 @@ jobs:
       lane: nightly
       pd_prefill_hosts: 2
       pd_decode_hosts: 2
-      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_gsm8k.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
-      files: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_gsm8k.py
       weights_pvc: model-weights-rox
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].run_name }}
     permissions:

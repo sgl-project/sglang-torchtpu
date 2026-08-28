@@ -30,14 +30,15 @@ Roles (rank = slice-local TPU_WORKER_ID):
   decode any rank  launches/joins the decode engine, serves until the leader
                    tears down.
 
-Run one model profile per invocation on hardware:
+Run on hardware with CI_PD_ROLE set by the P/D JobSet:
 
-  MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
-      test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
+  CI_PD_ROLE=prefill python3 \
+      test/registered/tpu/e2e/\
+      test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_gsm8k.py
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
-Model paths, pool sizes, churn workload, and gsm8k floors are env-overridable
-(see the *Config structs below).
+Model paths, pool sizes, churn workload, and the GSM8K floor are
+environment-overridable (see the configuration structs below).
 """
 
 import atexit
@@ -73,8 +74,8 @@ except ModuleNotFoundError as exc:
         return None
 
 
-# One invocation runs ONE model profile: two engines (weight load + compile),
-# the cache probe with device-pool churn, and gsm8k.
+# One invocation runs two GPT-OSS-120B engines (weight load + compile), the
+# cache probe with device-pool churn, and GSM8K.
 register_tpu_ci(est_time=10800, suite="tpu-integration")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,60 +131,36 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
-MODEL_PROFILES = {
-    "gpt_oss_120b": ModelProfile(
-        key="gpt_oss_120b",
-        display_name="GPT-OSS-120B",
-        served_name="gpt-oss-120b",
-        default_model_path="/weights/gpt-oss-120b",
-        model_env="GPT_OSS_MODEL",
-        page_size=64,
-        mem_fraction_prefill="0.35",
-        mem_fraction_decode="0.35",
-        # GPT-OSS ships MXFP4 quantization_config; forcing fp8 would re-quantize.
-        quantization="",
-        kv_cache_dtype="fp8_e4m3",
-        # The pool size is pinched from both sides on this model: below ~605k
-        # tokens the extend-graph precompile hangs (issue #363), and with no
-        # explicit bound the mem_fraction-sized pool is materialized unaliased
-        # in the compiled graph and its HLO temporaries exceed HBM. 786k is
-        # validated clean on both counts.
-        max_total_tokens=786_432,
-        device_pool_tokens_hint=786_432,
-        # Measured 0.98 (1p1d, 2026-08-15) and 0.97 (2p2d, run 32908499644),
-        # both over 100 examples; binomial sigma there is ~1.5 points, so 0.90
-        # sits several sigma below measurement while still failing on a real
-        # quality regression rather than only on catastrophic KV corruption.
-        gsm8k_threshold=0.90,
-        extra_server_args=("--reasoning-parser", "gpt-oss"),
-        # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
-        # (dynamic token dim in the extend graph).
-        extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
-        reasoning_effort="low",
-    ),
-    "qwen3_coder_480b": ModelProfile(
-        key="qwen3_coder_480b",
-        display_name="Qwen3-Coder-480B",
-        served_name="qwen3-coder-480b",
-        default_model_path="/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
-        model_env="QWEN3_CODER_MODEL",
-        page_size=64,
-        mem_fraction_prefill="0.6",
-        mem_fraction_decode="0.6",
-        quantization="fp8",
-        kv_cache_dtype="fp8_e4m3",
-        # Small device pool so a short churn pass forces host offload.
-        max_total_tokens=32768,
-        device_pool_tokens_hint=32768,
-        gsm8k_threshold=0.80,
-        extra_server_args=("--tpu-fp8-runtime", "channelwise"),
-        # The SparseCore MoE path halts this model's 2-host tp16 bring-up
-        # (E0200, SC sequencers halted before warmup); the resharding test's
-        # qwen profile carries the same setting.
-        extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
-        chat_template_kwargs={"enable_thinking": False},
-    ),
-}
+GPT_OSS_120B = ModelProfile(
+    key="gpt_oss_120b",
+    display_name="GPT-OSS-120B",
+    served_name="gpt-oss-120b",
+    default_model_path="/weights/gpt-oss-120b",
+    model_env="GPT_OSS_MODEL",
+    page_size=64,
+    mem_fraction_prefill="0.35",
+    mem_fraction_decode="0.35",
+    # GPT-OSS ships MXFP4 quantization_config; forcing fp8 would re-quantize.
+    quantization="",
+    kv_cache_dtype="fp8_e4m3",
+    # The pool size is pinched from both sides on this model: below ~605k
+    # tokens the extend-graph precompile hangs (issue #363), and with no
+    # explicit bound the mem_fraction-sized pool is materialized unaliased
+    # in the compiled graph and its HLO temporaries exceed HBM. 786k is
+    # validated clean on both counts.
+    max_total_tokens=786_432,
+    device_pool_tokens_hint=786_432,
+    # Measured 0.98 (1p1d, 2026-08-15) and 0.97 (2p2d, run 32908499644),
+    # both over 100 examples; binomial sigma there is ~1.5 points, so 0.90
+    # sits several sigma below measurement while still failing on a real
+    # quality regression rather than only on catastrophic KV corruption.
+    gsm8k_threshold=0.90,
+    extra_server_args=("--reasoning-parser", "gpt-oss"),
+    # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
+    # (dynamic token dim in the extend graph).
+    extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
+    reasoning_effort="low",
+)
 
 
 class CacheProbeConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -439,17 +416,6 @@ def build_decode_env(
             )
         ).strip(),
     }
-
-
-def select_profile(raw: str) -> ModelProfile:
-    key = raw.strip()
-    if key not in MODEL_PROFILES:
-        allowed = ", ".join(MODEL_PROFILES)
-        raise ValueError(
-            f"MODEL_PROFILE must name exactly one of: {allowed} (got {key!r}); "
-            "P/D runs launch one engine pair per invocation"
-        )
-    return MODEL_PROFILES[key]
 
 
 # ------------------------------ probe workload -------------------------------
@@ -837,7 +803,7 @@ class TestPdPrefixCachingKvOffload(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.topo = PodTopology.from_env()
-        cls.profile = select_profile(E("MODEL_PROFILE", ""))
+        cls.profile = GPT_OSS_120B
         model_path = resolve_model_path(cls.profile)
         validate_model_source(cls.profile, model_path)
         cls.cache_config = CacheProbeConfig.from_env(cls.profile)
@@ -1016,54 +982,43 @@ def _serve_role(topo: PodTopology, profile: ModelProfile) -> int:
 class TestPdE2eConfiguration(unittest.TestCase):
     """Host-side contract tests; runnable without TPU hardware."""
 
-    def test_profile_selection_requires_exactly_one(self) -> None:
-        self.assertIs(select_profile("gpt_oss_120b"), MODEL_PROFILES["gpt_oss_120b"])
-        for bad in ("", "all", "gpt_oss_120b,qwen3_coder_480b", "unknown"):
-            with self.assertRaisesRegex(ValueError, "MODEL_PROFILE"):
-                select_profile(bad)
-
     def test_prefill_enables_prefix_cache_and_raiden_offload(self) -> None:
-        for profile in MODEL_PROFILES.values():
-            env = build_prefill_env(profile, 2, env={})
-            self.assertEqual(env["DISABLE_RADIX_CACHE"], "0")
-            self.assertEqual(env["TP_SIZE"], "16")
-            self.assertIn("--enable-hierarchical-cache", env["EXTRA_ARGS"])
-            self.assertIn("--hicache-io-backend raiden", env["EXTRA_ARGS"])
-            self.assertIn("--hicache-mem-layout page_first_fused", env["EXTRA_ARGS"])
-            self.assertIn("--enable-cache-report", env["EXTRA_ARGS"])
+        env = build_prefill_env(GPT_OSS_120B, 2, env={})
+        self.assertEqual(env["DISABLE_RADIX_CACHE"], "0")
+        self.assertEqual(env["TP_SIZE"], "16")
+        self.assertIn("--enable-hierarchical-cache", env["EXTRA_ARGS"])
+        self.assertIn("--hicache-io-backend raiden", env["EXTRA_ARGS"])
+        self.assertIn("--hicache-mem-layout page_first_fused", env["EXTRA_ARGS"])
+        self.assertIn("--enable-cache-report", env["EXTRA_ARGS"])
 
     def test_both_engines_use_the_raiden_transfer_backend(self) -> None:
         # The launchers hardcode the native "tpu" transfer backend, which
         # rejects GPT-OSS's hybrid SWA pool at init; the profiles must append
         # the raiden override on BOTH engines (a one-sided override would
         # desync the transfer handshake).
-        for profile in MODEL_PROFILES.values():
-            for env in (
-                build_prefill_env(profile, 2, env={}),
-                build_decode_env(profile, 2, env={}),
-            ):
-                self.assertIn(
-                    "--disaggregation-transfer-backend raiden", env["EXTRA_ARGS"]
-                )
-                # Warmup deadlocks a lone disagg engine (no peer yet), and the
-                # raiden control-port base must stay clear of the HTTP ports.
-                self.assertIn("--skip-server-warmup", env["EXTRA_ARGS"])
-                self.assertIn("--sampling-backend pytorch", env["EXTRA_ARGS"])
-                raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
-                for port in (PREFILL_PORT, DECODE_PORT, LB_PORT, BOOTSTRAP_PORT):
-                    self.assertNotIn(port, range(raiden_base, raiden_base + 4 * 16))
+        for env in (
+            build_prefill_env(GPT_OSS_120B, 2, env={}),
+            build_decode_env(GPT_OSS_120B, 2, env={}),
+        ):
+            self.assertIn("--disaggregation-transfer-backend raiden", env["EXTRA_ARGS"])
+            # Warmup deadlocks a lone disagg engine (no peer yet), and the
+            # raiden control-port base must stay clear of the HTTP ports.
+            self.assertIn("--skip-server-warmup", env["EXTRA_ARGS"])
+            self.assertIn("--sampling-backend pytorch", env["EXTRA_ARGS"])
+            raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
+            for port in (PREFILL_PORT, DECODE_PORT, LB_PORT, BOOTSTRAP_PORT):
+                self.assertNotIn(port, range(raiden_base, raiden_base + 4 * 16))
 
     def test_decode_has_no_hicache(self) -> None:
-        for profile in MODEL_PROFILES.values():
-            env = build_decode_env(profile, 2, env={})
-            self.assertNotIn("hicache", env["EXTRA_ARGS"])
+        env = build_decode_env(GPT_OSS_120B, 2, env={})
+        self.assertNotIn("hicache", env["EXTRA_ARGS"])
 
     def test_gpt_oss_pool_is_bounded_and_above_precompile_floor(self) -> None:
         # Regression guard, both directions observed on hardware: a pool below
         # ~605k tokens hangs the GPT-OSS extend-graph precompile (issue #363),
         # and an UNbounded pool at tp=16 blows HBM with compile temporaries
         # (150G > 94.75G). Both engines must carry the same explicit bound.
-        profile = MODEL_PROFILES["gpt_oss_120b"]
+        profile = GPT_OSS_120B
         self.assertIsNotNone(profile.max_total_tokens)
         self.assertGreaterEqual(profile.max_total_tokens, 605_000)
         bound = f"--max-total-tokens {profile.max_total_tokens}"
@@ -1073,7 +1028,7 @@ class TestPdE2eConfiguration(unittest.TestCase):
     def test_gpt_oss_does_not_force_quantization(self) -> None:
         # MXFP4 ships its own quantization_config; QUANTIZATION must be
         # explicitly empty or launch_server.sh applies its fp8 default.
-        env = build_prefill_env(MODEL_PROFILES["gpt_oss_120b"], 2, env={})
+        env = build_prefill_env(GPT_OSS_120B, 2, env={})
         self.assertEqual(env["QUANTIZATION"], "")
 
     def test_churn_overflows_the_device_pool(self) -> None:
@@ -1081,21 +1036,19 @@ class TestPdE2eConfiguration(unittest.TestCase):
         # measurement comes back as, the computed filler count must clear the
         # pool with margin. The 1766-token case replays the observed filler
         # length whose word-count estimate undershot the pool (run 32927137148).
-        for profile in MODEL_PROFILES.values():
-            config = CacheProbeConfig.from_env(profile, env={})
-            self.assertIsNone(config.num_fillers)
-            for measured in (1766, 2048, 2662):
-                fillers = churn_fillers_needed(
-                    measured_filler_tokens=measured,
-                    device_pool_tokens=config.device_pool_tokens,
-                )
-                self.assertGreaterEqual(
-                    fillers * measured,
-                    2 * config.device_pool_tokens,
-                    f"{profile.key}: churn of {fillers} x {measured}-token "
-                    f"fillers cannot evict a {config.device_pool_tokens}-token "
-                    "device pool",
-                )
+        config = CacheProbeConfig.from_env(GPT_OSS_120B, env={})
+        self.assertIsNone(config.num_fillers)
+        for measured in (1766, 2048, 2662):
+            fillers = churn_fillers_needed(
+                measured_filler_tokens=measured,
+                device_pool_tokens=config.device_pool_tokens,
+            )
+            self.assertGreaterEqual(
+                fillers * measured,
+                2 * config.device_pool_tokens,
+                f"churn of {fillers} x {measured}-token fillers cannot evict "
+                f"a {config.device_pool_tokens}-token device pool",
+            )
 
     def test_target_prompt_queries_resolve_to_unique_lines(self) -> None:
         # The copy oracle only forces the continuation if every queried item
@@ -1115,7 +1068,7 @@ class TestPdE2eConfiguration(unittest.TestCase):
 
     def test_explicit_filler_count_overrides_calibration(self) -> None:
         config = CacheProbeConfig.from_env(
-            MODEL_PROFILES["gpt_oss_120b"], env={"CACHE_PROBE_NUM_FILLERS": "7"}
+            GPT_OSS_120B, env={"CACHE_PROBE_NUM_FILLERS": "7"}
         )
         self.assertEqual(config.num_fillers, 7)
 
@@ -1178,19 +1131,6 @@ class TestPdE2eConfiguration(unittest.TestCase):
         )
         self.assertEqual(prefill_cache_coverage(log), (2, 2176, 2048))
 
-    def test_model_specific_gsm8k_threshold_wins(self) -> None:
-        config = Gsm8kConfig.from_env(
-            MODEL_PROFILES["qwen3_coder_480b"],
-            env={"GSM8K_THRESHOLD": "0.50", "GSM8K_THRESHOLD_QWEN3_CODER_480B": "0.91"},
-        )
-        self.assertEqual(config.threshold, 0.91)
-
-    def test_local_model_path_is_validated(self) -> None:
-        profile = MODEL_PROFILES["qwen3_coder_480b"]
-        with self.assertRaisesRegex(FileNotFoundError, profile.model_env):
-            validate_model_source(profile, "/weights/definitely-missing-480b")
-        validate_model_source(profile, "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8")
-
 
 if __name__ == "__main__":
     if not E("CI_PD_ROLE"):
@@ -1199,6 +1139,6 @@ if __name__ == "__main__":
     topology = PodTopology.from_env()
     _start_host_watch()
     if not topology.is_leader:
-        sys.exit(_serve_role(topology, select_profile(E("MODEL_PROFILE", ""))))
+        sys.exit(_serve_role(topology, GPT_OSS_120B))
     sys.argv = [sys.argv[0], "TestPdPrefixCachingKvOffload"]
     unittest.main(verbosity=2)
