@@ -1,7 +1,10 @@
 import contextlib
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -43,6 +46,9 @@ class AccuracyTestParams:
     # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
     # of letting _run_sgl_eval infer it from the model name.
     sgl_eval_thinking: Optional[bool] = None
+    # Optional secondary gate read from /server_info after the evaluation. The
+    # primary score remains dataset accuracy. Every scheduler state must meet it.
+    spec_accept_length_threshold: Optional[float] = None
     # When set, run_accuracy_test dumps the measured score as `[METRIC] {name}=score`
     # with these labels, whatever backend scored it. This is the one channel that
     # feeds dashboards, so only declared gates are ever plotted; the backends' own
@@ -50,6 +56,16 @@ class AccuracyTestParams:
     metric_labels: Optional[dict] = None
     # Report a completed score without comparing it to a quality floor.
     report_only: bool = False
+
+    def __post_init__(self) -> None:
+        if self.spec_accept_length_threshold is not None and (
+            not math.isfinite(self.spec_accept_length_threshold)
+            or self.spec_accept_length_threshold < 0.0
+        ):
+            raise ValueError(
+                "spec_accept_length_threshold must be finite and non-negative, got "
+                f"{self.spec_accept_length_threshold}"
+            )
 
     @property
     def name(self) -> str:
@@ -131,6 +147,43 @@ def served(model: ModelLaunchSettings, base_url: str):
         yield
     finally:
         kill_process_tree(process.pid)
+
+
+def _get_avg_spec_accept_lengths(base_url: str) -> List[float]:
+    """Read each scheduler's cumulative speculative accept length."""
+    base_url = base_url.rstrip("/")
+    endpoint = "/server_info"
+    response = requests.get(f"{base_url}{endpoint}", timeout=30)
+    if response.status_code == 404:
+        # Older MiniLB releases expose only the deprecated alias. Keep the
+        # fallback local to endpoint discovery so other HTTP errors stay fatal.
+        endpoint = "/get_server_info"
+        response = requests.get(f"{base_url}{endpoint}", timeout=30)
+    response.raise_for_status()
+    server_info = response.json()
+    if not isinstance(server_info, dict):
+        raise ValueError(f"{endpoint} did not return an object")
+
+    states = server_info.get("internal_states")
+    if not isinstance(states, list) or not states:
+        raise ValueError(f"{endpoint} returned no internal_states")
+
+    accept_lengths = []
+    for state_index, state in enumerate(states):
+        value = state.get("avg_spec_accept_length") if isinstance(state, dict) else None
+        if value is None:
+            raise ValueError(
+                f"{endpoint} scheduler {state_index} has no avg_spec_accept_length"
+            )
+        accept_length = float(value)
+        if not math.isfinite(accept_length):
+            raise ValueError(
+                f"{endpoint} scheduler {state_index} returned non-finite "
+                f"avg_spec_accept_length={value!r}"
+            )
+        accept_lengths.append(accept_length)
+
+    return accept_lengths
 
 
 def _run_simple_eval(
@@ -569,10 +622,21 @@ def run_accuracy_test(
     print(f"  Eval: {params.name}")
     if params.floor is not None:
         print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
+    if params.spec_accept_length_threshold is not None:
+        print(
+            "  Spec accept-length threshold: " f"{params.spec_accept_length_threshold}"
+        )
     print(f"{'='*60}\n")
 
+    spec_accept_lengths = None
+    spec_accept_length_error = None
     with served(model, base_url):
         success, error, metrics = _dispatch_eval(model, params, base_url)
+        if success and params.spec_accept_length_threshold is not None:
+            try:
+                spec_accept_lengths = _get_avg_spec_accept_lengths(base_url)
+            except (TypeError, ValueError, requests.RequestException) as exc:
+                spec_accept_length_error = str(exc)
 
     if not success:
         print(f"✗ Accuracy test failed for {model.model_path}: {error}")
@@ -643,6 +707,38 @@ def run_accuracy_test(
                 f"(baseline {params.baseline_accuracy} - atol {params.atol})"
             )
             print(f"✗ {error}")
+
+    if params.spec_accept_length_threshold is not None:
+        spec_threshold = params.spec_accept_length_threshold
+        if spec_accept_length_error is not None:
+            spec_error = (
+                f"{params.name}: could not read avg_spec_accept_length: "
+                f"{spec_accept_length_error}"
+            )
+            passed = False
+            error = "; ".join(filter(None, [error, spec_error]))
+            print(f"✗ {spec_error}")
+        elif spec_accept_lengths is None:
+            spec_error = f"{params.name}: avg_spec_accept_length was not collected"
+            passed = False
+            error = "; ".join(filter(None, [error, spec_error]))
+            print(f"✗ {spec_error}")
+        elif min(spec_accept_lengths) < spec_threshold:
+            spec_error = (
+                f"{params.name}: minimum avg_spec_accept_length "
+                f"{min(spec_accept_lengths):.4f} below threshold "
+                f"{spec_threshold:.4f}"
+            )
+            passed = False
+            error = "; ".join(filter(None, [error, spec_error]))
+            print(f"✗ {spec_error}")
+        else:
+            print(
+                f"✓ {params.name}: avg_spec_accept_length="
+                f"{[round(value, 4) for value in spec_accept_lengths]}; "
+                f"minimum {min(spec_accept_lengths):.4f} >= threshold "
+                f"{spec_threshold:.4f}"
+            )
 
     return AccuracyTestResult(
         model=model.model_path,

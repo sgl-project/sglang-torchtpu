@@ -17,6 +17,9 @@ DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 
 # Accuracy should stay near the measured 0.83-0.84 score.
 GSM8K_ACCURACY = 0.80  # measured 0.83-0.84 over 200 examples, accept length 2.77
+SPEC_ACCEPT_LENGTH_THRESHOLD = float(
+    os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90")
+)
 
 # Permits probe eviction while supporting eight concurrent requests.
 DEVICE_POOL_TOKENS = 16384
@@ -96,6 +99,7 @@ MODEL_CONFIG = {
             "dataset": "gsm8k",
             "label": "gsm8k",
             "baseline": GSM8K_ACCURACY,
+            "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
             "num_examples": 200,
             "num_threads": 8,
             "max_tokens": 512,

@@ -95,9 +95,7 @@ RETRACTION_BACKUP = "cpu_tensor"
 SPEC_NUM_STEPS = 3
 SPEC_EAGLE_TOPK = 1
 SPEC_NUM_DRAFT_TOKENS = 4
-SPEC_PROBE_REQUESTS = 8
-SPEC_PROBE_OUTPUT_TOKENS = 32
-MIN_ACCEPT_LENGTH = float(E("SPEC_MIN_ACCEPT_LENGTH", "1.0"))
+SPEC_ACCEPT_LENGTH_THRESHOLD = float(E("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90"))
 
 # The non-P/D GPT-OSS EAGLE3 gate measured 0.785 over 200 examples. Keep the
 # same floor and concurrency so this test isolates the P/D handoff.
@@ -365,16 +363,6 @@ def _get_json(url: str, timeout: int = 30) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _post_json(url: str, payload: Dict[str, Any], timeout: int = 900) -> Any:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
 def _wait_http_200(
     *, url: str, secs: int, procs: Sequence[Tuple[str, subprocess.Popen]] = ()
 ) -> None:
@@ -438,108 +426,7 @@ def engine_configuration_failures(
     return failures
 
 
-def speculative_generation_failures(results: Any) -> Tuple[List[str], Dict[str, Any]]:
-    failures = []
-    if not isinstance(results, list):
-        results = [results]
-    if len(results) != SPEC_PROBE_REQUESTS:
-        failures.append(
-            f"spec probe returned {len(results)} responses, expected "
-            f"{SPEC_PROBE_REQUESTS}"
-        )
-
-    completion_tokens = 0
-    verify_count = 0
-    proposed_drafts = 0
-    correct_drafts = 0
-    nonempty = 0
-    for index, result in enumerate(results):
-        if not isinstance(result, dict):
-            failures.append(f"spec response {index} is not an object")
-            continue
-        if str(result.get("text", "")).strip():
-            nonempty += 1
-        meta = result.get("meta_info") or {}
-        completion_tokens += int(meta.get("completion_tokens") or 0)
-        verify_count += int(meta.get("spec_verify_ct") or 0)
-        proposed_drafts += int(meta.get("spec_num_proposed_drafts") or 0)
-        correct_drafts += int(meta.get("spec_num_correct_drafts") or 0)
-
-    accept_length = completion_tokens / verify_count if verify_count else 0.0
-    if nonempty != len(results):
-        failures.append(f"only {nonempty}/{len(results)} spec responses were non-empty")
-    if verify_count <= 0:
-        failures.append("router responses reported no speculative verification")
-    if proposed_drafts <= 0:
-        failures.append("router responses reported no proposed draft tokens")
-    if correct_drafts <= 0:
-        failures.append("router responses reported no accepted draft tokens")
-    if accept_length <= MIN_ACCEPT_LENGTH:
-        failures.append(
-            f"mean speculative accept length {accept_length:.4f} did not exceed "
-            f"{MIN_ACCEPT_LENGTH:.4f}"
-        )
-    return failures, {
-        "requests": len(results),
-        "completion_tokens": completion_tokens,
-        "spec_verify_ct": verify_count,
-        "proposed_drafts": proposed_drafts,
-        "correct_drafts": correct_drafts,
-        "accept_length": round(accept_length, 4),
-    }
-
-
-def pd_spec_runner(*, prefill_url: str, decode_url: str):
-    """Validate the two engine roles and real speculative work through the LB."""
-
-    def run(base_url: str) -> Dict[str, Any]:
-        prefill_info = _get_json(f"{prefill_url}/server_info")
-        decode_info = _get_json(f"{decode_url}/server_info")
-        failures = engine_configuration_failures(
-            prefill_info=prefill_info, decode_info=decode_info
-        )
-
-        prompt = (
-            "Continue this integer sequence, comma separated: "
-            + ", ".join(str(i) for i in range(1, 33))
-            + ","
-        )
-        results = _post_json(
-            f"{base_url.rstrip('/')}/generate",
-            {
-                "text": [prompt] * SPEC_PROBE_REQUESTS,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "ignore_eos": True,
-                    "max_new_tokens": SPEC_PROBE_OUTPUT_TOKENS,
-                },
-            },
-        )
-        spec_failures, metrics = speculative_generation_failures(results)
-        failures.extend(spec_failures)
-        print(
-            "[pd-spec] "
-            + json.dumps(
-                {
-                    "prefill": f"TP{prefill_info.get('tp_size')}/EAGLE3",
-                    "decode": f"TP{decode_info.get('tp_size')}/EAGLE3",
-                    **metrics,
-                },
-                sort_keys=True,
-            ),
-            flush=True,
-        )
-        return {
-            "score": 0.0 if failures else 1.0,
-            "_passed": not failures,
-            "_failures": failures,
-            **metrics,
-        }
-
-    return run
-
-
-def build_model_config(*, decode_host: str) -> Dict[str, Any]:
+def build_model_config() -> Dict[str, Any]:
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": "gpt-oss-120b-pd-singlehost-spec-gsm8k",
@@ -549,29 +436,19 @@ def build_model_config(*, decode_host: str) -> Dict[str, Any]:
             "health_timeout": HEALTH_TIMEOUT,
             "tag": "gpt-oss-120b-pd-spec-gsm8k-e2e",
         },
-        # The feature probe runs before GSM8K and prevents a silent fallback to
-        # ordinary decoding from passing on accuracy alone.
         "gates": [
-            {
-                "dataset": "pd_spec",
-                "label": "pd-spec",
-                "runner": pd_spec_runner(
-                    prefill_url=f"http://{LOCAL_HOST}:{PREFILL_PORT}",
-                    decode_url=f"http://{decode_host}:{DECODE_PORT}",
-                ),
-            },
             {
                 "dataset": "gsm8k",
                 "label": "gsm8k",
                 "baseline": GSM8K_BASELINE,
+                "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
                 "num_examples": NUM_EXAMPLES,
                 "num_threads": NUM_THREADS,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0.0,
-                # Match GSM8KMixin and the established GPT-OSS quality gates:
-                # raw 5-shot completion with last-number scoring. Chat mode
-                # separates GPT-OSS reasoning and can return empty content.
-                "api": "completion",
+                # Match the other speculative GSM8K gates so their acceptance
+                # measurements use the same request contract.
+                "api": "chat",
             },
         ],
     }
@@ -593,6 +470,12 @@ def run_prefill_leader() -> int:
             procs=procs,
         )
         _wait_http_200(url=f"http://{decode_host}:{DECODE_PORT}/health", secs=WAIT_SECS)
+        config_failures = engine_configuration_failures(
+            prefill_info=_get_json(f"http://{LOCAL_HOST}:{PREFILL_PORT}/server_info"),
+            decode_info=_get_json(f"http://{decode_host}:{DECODE_PORT}/server_info"),
+        )
+        if config_failures:
+            raise RuntimeError("; ".join(config_failures))
         procs.append(
             (
                 "router",
@@ -603,7 +486,7 @@ def run_prefill_leader() -> int:
             url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=procs
         )
         model_config_main(
-            build_model_config(decode_host=decode_host),
+            build_model_config(),
             base_url=f"http://{LOCAL_HOST}:{LB_PORT}",
         )
         return 0
@@ -719,37 +602,14 @@ class TestPdSingleHostSpecGptOss120bConfiguration(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, ROLE_ENV):
             resolve_role({})
 
-    def test_spec_probe_rejects_fallback_and_accepts_active_spec(self) -> None:
-        fallback = [
-            {
-                "text": "33, 34",
-                "meta_info": {"completion_tokens": SPEC_PROBE_OUTPUT_TOKENS},
-            }
-            for _ in range(SPEC_PROBE_REQUESTS)
-        ]
-        failures, _ = speculative_generation_failures(fallback)
-        self.assertTrue(failures)
-
-        active = [
-            {
-                "text": "33, 34",
-                "meta_info": {
-                    "completion_tokens": SPEC_PROBE_OUTPUT_TOKENS,
-                    "spec_verify_ct": 12,
-                    "spec_num_proposed_drafts": 48,
-                    "spec_num_correct_drafts": 20,
-                },
-            }
-            for _ in range(SPEC_PROBE_REQUESTS)
-        ]
-        failures, metrics = speculative_generation_failures(active)
-        self.assertEqual(failures, [])
-        self.assertGreater(metrics["accept_length"], MIN_ACCEPT_LENGTH)
-
-    def test_gsm8k_uses_completion_api_and_token_default(self) -> None:
-        gsm8k_gate = build_model_config(decode_host="decode.example")["gates"][1]
-        self.assertEqual(gsm8k_gate["api"], "completion")
+    def test_gsm8k_uses_chat_api_and_spec_acceptance_threshold(self) -> None:
+        gsm8k_gate = build_model_config()["gates"][0]
+        self.assertEqual(gsm8k_gate["api"], "chat")
         self.assertEqual(gsm8k_gate["max_tokens"], 512)
+        self.assertEqual(
+            gsm8k_gate["spec_accept_length_threshold"],
+            SPEC_ACCEPT_LENGTH_THRESHOLD,
+        )
 
     def test_local_model_path_validation(self) -> None:
         with self.assertRaisesRegex(FileNotFoundError, MODEL_ENV):

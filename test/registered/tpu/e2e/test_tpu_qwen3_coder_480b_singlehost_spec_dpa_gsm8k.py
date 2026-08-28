@@ -12,6 +12,9 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 
 GSM8K_ACCURACY = 0.65
+SPEC_ACCEPT_LENGTH_THRESHOLD = float(
+    os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90")
+)
 
 LAUNCH_ENV = {
     "MODEL": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
@@ -58,6 +61,7 @@ MODEL_CONFIG = {
             "dataset": "gsm8k",
             "label": "gsm8k",
             "baseline": GSM8K_ACCURACY,
+            "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
             "num_examples": 200,
             "num_threads": 16,
             "max_tokens": 512,

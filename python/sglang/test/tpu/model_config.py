@@ -87,6 +87,9 @@ gates -- one entry per evaluation
                   (DATASET_NAME, TOKENIZE_PROMPT, ...). Geometry comes from `sweep`.
     num_examples, num_threads, max_tokens, temperature, top_p, top_k, api
                   Passed straight through to run_eval.
+    spec_accept_length_threshold
+                  Optional secondary threshold for every scheduler's cumulative
+                  avg_spec_accept_length, read from /server_info after the eval.
 
 Two things stay in the test file. ``register_tpu_ci(...)`` is read by parsing source
 with ``ast``, so it must appear literally; it is also what lets est_time, suite and
@@ -140,6 +143,7 @@ _GATE_PASSTHROUGH = {
     "top_p",
     "top_k",
     "api",
+    "spec_accept_length_threshold",
     "runner",
     "report_only",
 }

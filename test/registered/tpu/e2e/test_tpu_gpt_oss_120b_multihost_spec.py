@@ -19,6 +19,9 @@ BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3000"))
 GSM8K_ACCURACY = 0.70
 GSM8K_CONCURRENCY = 64
+SPEC_ACCEPT_LENGTH_THRESHOLD = float(
+    os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "1.90")
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
@@ -38,6 +41,7 @@ MODEL_CONFIG = {
             "dataset": "gsm8k",
             "label": "gsm8k",
             "baseline": GSM8K_ACCURACY,
+            "spec_accept_length_threshold": SPEC_ACCEPT_LENGTH_THRESHOLD,
             "num_examples": 200,
             "num_threads": GSM8K_CONCURRENCY,
             "max_tokens": 512,
