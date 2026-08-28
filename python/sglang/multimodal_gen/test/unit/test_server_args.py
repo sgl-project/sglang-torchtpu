@@ -103,6 +103,10 @@ def _mock_cuda_platform(
             return_value=False,
         ),
         patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
+            return_value=False,
+        ),
+        patch(
             "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
             return_value=True,
         ),
@@ -228,6 +232,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
                 return_value=False,
             ),
             patch(
@@ -456,6 +464,10 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                     patch(
                         "sglang.multimodal_gen.registry.get_model_info",
                         return_value=None,
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
+                        return_value=False,
                     ),
                     patch(
                         "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
@@ -797,6 +809,10 @@ class TestOffloadDefaults(unittest.TestCase):
             ),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
                 return_value=False,
             ),
             patch(
@@ -2402,6 +2418,10 @@ class TestOffloadDefaults(unittest.TestCase):
                 return_value=False,
             ),
             patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
+                return_value=False,
+            ),
+            patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
                 return_value=True,
             ),
@@ -2989,6 +3009,40 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 fsdp_args._validate_direct_gpu_weight_loading()
             with self.assertRaisesRegex(ValueError, "tp-size 1"):
                 tp_args._validate_direct_gpu_weight_loading()
+
+
+class TestTpuSingleWorkerValidation(unittest.TestCase):
+
+    def _args(self, num_gpus):
+        with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
+            args = ServerArgs.from_dict({"model_path": "/fake"})
+        args.num_gpus = num_gpus
+        return args
+
+    @contextmanager
+    def _on_tpu(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
+            return_value=True,
+        ):
+            yield
+
+    def test_single_gpu_is_accepted(self):
+        with self._on_tpu():
+            self._args(1)._adjust_platform_specific()
+
+    def test_multi_gpu_is_rejected(self):
+        args = self._args(2)
+        with self._on_tpu():
+            with self.assertRaisesRegex(ValueError, "--num-gpus 1"):
+                args._adjust_platform_specific()
+
+    def test_other_platforms_are_unaffected(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.platforms.current_platform.is_tpu",
+            return_value=False,
+        ):
+            self._args(8)._adjust_platform_specific()
 
 
 if __name__ == "__main__":

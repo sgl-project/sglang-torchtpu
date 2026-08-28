@@ -1336,6 +1336,12 @@ class ServerArgs(DisaggServerArgsMixin):
             self.vae_cpu_offload = False
             self.cpu_offload_components = None
 
+        if current_platform.is_tpu() and self.num_gpus != 1:
+            raise ValueError(
+                "TPU diffusion supports --num-gpus 1; distributed TPU support "
+                f"is a later milestone (got {self.num_gpus})."
+            )
+
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
 
