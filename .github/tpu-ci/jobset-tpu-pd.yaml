@@ -108,10 +108,20 @@ ${WEIGHTS_VOLUME}
                       t0=$SECONDS
                       ${EXEC_CMD}
                       rc=$?
-                      # Only the prefill leader's verdict gates; a teardown
-                      # SIGTERM on any other pod is success.
-                      if [ "${TPU_WORKER_ID:-0}" != "0" ] && [ "$rc" = 143 ]; then
-                        echo "worker teardown SIGTERM; success"; rc=0
+                      # Only the prefill leader's verdict gates. On a non-leader
+                      # host teardown is expected in two shapes: SIGTERM (143), or
+                      # -- when the leader finishes the eval and exits first -- the
+                      # worker scheduler dying on the severed request-broadcast
+                      # socket (gloo Connection closed/reset by peer), which
+                      # sglang's crash handler then SIGKILLs to 137. Treat both as
+                      # success; the disconnect grep keeps a real 137 (e.g.
+                      # OOM-kill) red, and the leader gates every real failure.
+                      if [ "${TPU_WORKER_ID:-0}" != "0" ]; then
+                        if [ "$rc" = 143 ]; then
+                          echo "worker teardown SIGTERM; success"; rc=0
+                        elif [ "$rc" = 137 ] && grep -qsE "Connection (closed|reset) by peer" /tmp/pd*prefill*.log; then
+                          echo "worker teardown (leader closed request-broadcast socket); success"; rc=0
+                        fi
                       fi
                       # Per-file verdict in run_suite's TIMINGS format, so the
                       # dashboard reads P/D, multi-host and single-host through
@@ -201,9 +211,14 @@ ${WEIGHTS_VOLUME}
                       echo "== test files: ${TEST_FILES} =="
                       ${EXEC_CMD}
                       rc=$?
-                      # Decode pods never gate on teardown SIGTERM.
+                      # Decode pods never gate the verdict, so a teardown exit is
+                      # success: SIGTERM (143), or a 137 whose log shows the peer
+                      # disconnect (leader closed the socket, sglang SIGKILLs its
+                      # tree). The disconnect grep keeps a real 137 (OOM-kill) red.
                       if [ "$rc" = 143 ]; then
                         echo "worker teardown SIGTERM; success"; rc=0
+                      elif [ "$rc" = 137 ] && grep -qsE "Connection (closed|reset) by peer" /tmp/pd*decode*.log; then
+                        echo "worker teardown (peer disconnect); success"; rc=0
                       fi
                       exit $rc
                   resources:
