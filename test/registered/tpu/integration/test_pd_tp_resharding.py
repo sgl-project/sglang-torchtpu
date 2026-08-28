@@ -13,12 +13,24 @@ both slices; roles are dispatched from the CI_PD_ROLE env plus the slice-local
 TPU worker env.
 
 What each verification proves:
-  * quality:          gsm8k through the LB must clear the model's accuracy floor
-                      under TP resharding.
   * KV resharding:    generation requests dispatched to prefill -> decode across
                       both DP replicas produce valid, deterministic, and bit-equal
                       greedy text, certifying that KV cache was resharded and
                       transferred intact.
+  * context sweep:    raw /generate at growing prompt lengths must all read as
+                      prose. The greedy probe above sends ~15-token prompts and
+                      stays green even when longer ones come back as token spew;
+                      sweeping localizes the first bad length, which separates a
+                      per-page reshard fault (breaks past one 64-token page) from
+                      a bad compiled bucket (breaks at 64/256/1024).
+  * chat termination: the same long prompt through /v1/chat/completions stops on
+                      its own and says something. Together with the probe above
+                      this separates prompt length from the chat path, which the
+                      failing runs moved at once.
+  * quality:          gsm8k through the LB must clear the model's accuracy floor
+                      under TP resharding. Below the floor the sampled responses
+                      are dumped from run_eval's report, which otherwise dies with
+                      the pod and leaves only a bare score.
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
@@ -38,6 +50,7 @@ Without CI_PD_ROLE the file runs only its host-side configuration tests.
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -45,6 +58,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
@@ -150,8 +164,11 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     max_total_tokens: Optional[int]
     device_pool_tokens_hint: int
     gsm8k_threshold: float
-    # Appended after the launcher's default so it wins (argparse keeps the
-    # last occurrence).
+    # Appended after the launcher's default so it wins (argparse keeps the last
+    # occurrence). The ZMQ "tpu" connector is being sunset -- raiden is the
+    # go-forward transfer backend, and it is the only one that carries strided
+    # push-reshard schedules (raiden/reshard_schedule.py) for the asymmetric
+    # attention TP this test exercises.
     disagg_transfer_backend: str = "raiden"
     extra_server_args: Tuple[str, ...] = ()
     extra_launch_env: Dict[str, str] = {}
@@ -160,6 +177,14 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
 
 
 MODEL_PROFILES = {
+    # BLOCKED on hardware: GPT-OSS is hybrid-SWA, and raiden's Scope (v1)
+    # excludes "hybrid-SWA under push-resharding" -- a hybrid model keeps two
+    # pools with distinct page-id spaces while a reshard plan carries a single
+    # block-id space, so a decode rank fed by >1 prefill rank raises
+    # NotImplementedError in raiden/conn.py::register_decode_request (run
+    # 33091543516). The profile stays so it is ready when raiden grows SWA
+    # reshard schedules; until then this model needs either symmetric attention
+    # TP (see test_pd_prefix_caching_kv_offload.py) or --disable-hybrid-swa-memory.
     "gpt_oss_120b": ModelProfile(
         key="gpt_oss_120b",
         display_name="GPT-OSS-120B",
@@ -374,6 +399,9 @@ def _common_launch_env(
         "TPU_TELEMETRY_INTERVAL_SEC": "86400",
         "TPU_DIAGNOSTIC_HARVESTER_INTERVAL_SEC": "86400",
         "PYTHON": PYTHON,
+        # The raiden connector's per-rank control ports start at this base;
+        # its default (30000) collides with rank 0's HTTP server port.
+        "SGLANG_RAIDEN_KV_PORT": values.get("SGLANG_RAIDEN_KV_PORT", "31000"),
         **profile.extra_launch_env,
     }
 
@@ -534,6 +562,282 @@ def _generate(base_url: str, prompt: str, max_new_tokens: int = 32) -> Generatio
     )
 
 
+class ChatRecord(msgspec.Struct, frozen=True, kw_only=True):
+    text: str
+    finish_reason: str
+    completion_tokens: int
+    prompt_tokens: int
+
+
+def chat_body(prompt: str, profile: ModelProfile, max_tokens: int) -> Dict[str, Any]:
+    """The /v1/chat/completions payload, carrying the profile's template controls.
+
+    gsm8k reaches the model through this path rather than /generate, and run_eval
+    forwards these same two profile fields to its sampler. The probe only sees
+    what gsm8k sees while this keeps mirroring them.
+    """
+    body: Dict[str, Any] = {
+        "model": profile.served_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": max_tokens,
+    }
+    if profile.chat_template_kwargs is not None:
+        body["chat_template_kwargs"] = profile.chat_template_kwargs
+    if profile.reasoning_effort is not None:
+        body["reasoning_effort"] = profile.reasoning_effort
+    return body
+
+
+def _chat(
+    base_url: str, prompt: str, profile: ModelProfile, max_tokens: int
+) -> ChatRecord:
+    body = chat_body(prompt, profile, max_tokens)
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=900) as resp:
+        payload = json.loads(resp.read())
+    choice = (payload.get("choices") or [{}])[0]
+    usage = payload.get("usage") or {}
+    return ChatRecord(
+        text=(choice.get("message") or {}).get("content") or "",
+        finish_reason=choice.get("finish_reason") or "",
+        completion_tokens=int(usage.get("completion_tokens") or 0),
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+    )
+
+
+# gsm8k's 5-shot prompt runs ~900 tokens; the failure below only appears once the
+# prompt is that long, so pad to the same order rather than sending one line.
+_LONG_CONTEXT_FILLER = (
+    "Background note {i}: a delivery van carries {i} crates, each crate holds "
+    "{i} boxes, and every box contains a packing slip that lists the crate id, "
+    "the depot of origin, and the arrival time recorded by the dispatcher. "
+)
+_CHAT_PROBE_CAP = 256
+
+
+def _long_context_question(paragraphs: int = 18) -> str:
+    """~700 words, i.e. ~900 tokens -- the size of gsm8k's 5-shot prompt."""
+    filler = "".join(_LONG_CONTEXT_FILLER.format(i=i) for i in range(paragraphs))
+    return (
+        f"{filler}\n\n"
+        "Ignore the notes above. Question: what is 17 plus 25? "
+        "Reply with only the number and nothing else."
+    )
+
+
+# 17 + 25. Trivial, greedy-decoded, and the probe prompt asks for just this, so
+# its presence is a sharper check than any guess at what healthy prose looks
+# like: the corrupted state cannot produce it, and a correct engine always does.
+_PROBE_ANSWER = "42"
+# The corrupted state emits one character over and over ('\\' in runs of
+# thousands). 20 is far above anything real text repeats and far below the runs
+# observed, so it does not depend on a tuned ratio.
+_SPEW_RUN = 20
+
+
+def looks_degenerate(text: str) -> bool:
+    """Whether a sample is the token spew the corrupted-context state emits.
+
+    Run 33171526086 answered every ~900-token request with ~8k characters of
+    backslashes ('________\\\\\\...', extracted answer -9999999) while short
+    prompts on the same engine pair stayed coherent.
+
+    Keyed on a long single-character run, NOT on the fraction of letters: run
+    33200976580 showed a correct ' 42' is 0% alphabetic, so a ratio test fails
+    healthy engines on exactly the answer this probe asks for.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    return re.search(r"(.)\1{%d,}" % (_SPEW_RUN - 1), stripped) is not None
+
+
+# Paragraph counts chosen so the resulting prompts straddle both candidate
+# boundaries: the KV page size (64 tokens) and the compiled token buckets
+# (TPU_COMPILE_TOKENS "64 256 1024"). Where output first degenerates says which.
+# 0 is the known-good baseline (~28 tokens: one page, bucket 64). The page and
+# bucket boundaries coincide at 64, so those two only separate higher up: 2 pages
+# still inside bucket 256 clean, with 5+ pages in bucket 1024 dirty, would clear
+# page count and indict the bucket.
+_SWEEP_PARAGRAPHS = (0, 1, 2, 6, 18)
+
+
+def run_context_length_sweep_probe(base_url: str, profile: ModelProfile) -> None:
+    """Raw /generate at growing prompt lengths; every length must read as prose.
+
+    Run 33187228615 answered a 897-token /generate with backslash spew while
+    ~15-token prompts on the same engine pair stayed coherent, so prompt length
+    alone drives the corruption (no chat template is involved). Two mechanisms
+    fit that, and they predict different break points:
+
+      * KV pages: a 2:1 fan-in that misplaces pages beyond the first breaks as
+        soon as the prompt exceeds one page (>64 tokens).
+      * compiled buckets: a bad graph for one of TPU_COMPILE_TOKENS
+        (64/256/1024) breaks only once the prompt reaches that bucket.
+
+    Sweeping localizes the first bad length instead of leaving both live, and
+    keeps doing so for whatever regresses next.
+    """
+    results = []
+    for paragraphs in _SWEEP_PARAGRAPHS:
+        rec = _generate(base_url, _long_context_question(paragraphs), 64)
+        results.append(
+            {
+                "paragraphs": paragraphs,
+                "prompt_tokens": rec.prompt_tokens,
+                "pages": -(-rec.prompt_tokens // profile.page_size),
+                "answered": _PROBE_ANSWER in rec.text,
+                "spew": looks_degenerate(rec.text),
+                "sample_output": rec.text[:120],
+            }
+        )
+    print(
+        json.dumps(
+            {"context_length_sweep": profile.key, "results": results}, sort_keys=True
+        ),
+        flush=True,
+    )
+    bad = [r for r in results if not r["answered"]]
+    if bad:
+        first = bad[0]
+        raise AssertionError(
+            f"Raw /generate stopped answering {_PROBE_ANSWER!r} from "
+            f"{first['prompt_tokens']} prompt tokens ({first['pages']} KV pages, "
+            f"spew={first['spew']}) upward; correct below that. No chat template "
+            "is involved, so the context the model reads is corrupt. "
+            f"Sample: {first['sample_output']!r}"
+        )
+
+
+def run_chat_termination_probe(base_url: str, profile: ModelProfile) -> None:
+    """A long chat-formatted request must stop on its own and say something.
+
+    The greedy /generate probe below passes even when the engine pair is in the
+    state where every chat completion runs to its cap and gsm8k scores exactly
+    0.0 (runs 33098546292 on the tpu backend, 33123385123 and 33135561031 on
+    raiden -- all three at prompt+cap tokens with the eval taking ~62min instead
+    of ~5). That state is invisible to short raw-text generation, so without this
+    check the first signal is an hour-long gsm8k returning nothing parseable.
+
+    A one-number answer under a 256-token cap is far below what any healthy
+    response needs, so `finish_reason == "length"` here means non-termination,
+    not a prompt that legitimately needed more room.
+    """
+    rec = _chat(base_url, _long_context_question(), profile, _CHAT_PROBE_CAP)
+    print(
+        json.dumps(
+            {
+                "chat_termination_probe": profile.key,
+                "finish_reason": rec.finish_reason,
+                "prompt_tokens": rec.prompt_tokens,
+                "completion_tokens": rec.completion_tokens,
+                "sample_output": rec.text[:200],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    if rec.finish_reason == "length":
+        raise AssertionError(
+            "Chat completion never terminated: hit the "
+            f"{_CHAT_PROBE_CAP}-token cap on a prompt asking for one number "
+            f"({rec.prompt_tokens} prompt tokens). This is the state that scores "
+            f"gsm8k 0.0. First 200 chars: {rec.text[:200]!r}"
+        )
+    if _PROBE_ANSWER not in rec.text:
+        raise AssertionError(
+            f"Chat completion did not answer {_PROBE_ANSWER!r} (finish_reason="
+            f"{rec.finish_reason!r}, {rec.prompt_tokens} prompt tokens, "
+            f"spew={looks_degenerate(rec.text)}) -- gsm8k would score 0.0 on this "
+            f"engine pair. First 200 chars: {rec.text[:200]!r}"
+        )
+
+
+# Every request the test has ever sent went out one at a time, so nothing here
+# has exercised concurrent transfers even though the engines run with
+# --max-running-requests 8. A race in the reshard handshake, the receiver plan
+# or staging-slot reuse cannot fire serially, which would explain why the
+# corruption survives every deterministic theory. Match the server's limit.
+_REPEAT_COUNT = 40
+_REPEAT_CONCURRENCY = 8
+
+
+def run_repeat_consistency_probe(base_url: str, profile: ModelProfile) -> None:
+    """The same long prompt many times: measures the corruption's rate and shape.
+
+    Run 33202570607 answered a 897-token /generate correctly and then spewed on a
+    905-token chat request seconds later, so neither prompt length nor the chat
+    path decides it -- the corruption is per-request. What it looks like across
+    repeats says where to look next:
+
+      * strict alternation -- one of the two DP decode replicas holds bad KV, so
+        the fan-in placed one decode rank's heads wrongly;
+      * a run of good then all bad -- state that degrades, e.g. staging slots or
+        page reuse;
+      * scattered -- a race in the transfer itself.
+
+    Identical prompts also make the greedy outputs comparable: any difference
+    between them is itself corruption, since temperature is 0.
+    """
+    question = _long_context_question()
+
+    def _one(i: int) -> Dict[str, Any]:
+        # Alternate the two paths at identical settings. Chat has failed in 3 of
+        # 5 runs while long /generate failed once in ~25 attempts, but those
+        # differed in token cap (256 vs 64) as well as in the template, so the
+        # comparison was never clean. Same cap here isolates the template.
+        via_chat = i % 2 == 1
+        if via_chat:
+            crec = _chat(base_url, question, profile, _CHAT_PROBE_CAP)
+            text, ptoks = crec.text, crec.prompt_tokens
+        else:
+            grec = _generate(base_url, question, _CHAT_PROBE_CAP)
+            text, ptoks = grec.text, grec.prompt_tokens
+        return {
+            "i": i,
+            "path": "chat" if via_chat else "generate",
+            "prompt_tokens": ptoks,
+            "answered": _PROBE_ANSWER in text,
+            "spew": looks_degenerate(text),
+            "sample_output": text[:60],
+        }
+
+    with ThreadPoolExecutor(max_workers=_REPEAT_CONCURRENCY) as pool:
+        outcomes = sorted(
+            pool.map(_one, range(_REPEAT_COUNT)), key=lambda o: int(o["i"])
+        )
+    pattern = "".join("." if o["answered"] else "X" for o in outcomes)
+    distinct = sorted({o["sample_output"] for o in outcomes})
+    print(
+        json.dumps(
+            {
+                "repeat_probe": profile.key,
+                "pattern": pattern,
+                "distinct_outputs": len(distinct),
+                "outcomes": outcomes,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    bad = [o for o in outcomes if not o["answered"]]
+    if bad:
+        by_path = {
+            p: sum(1 for o in bad if o["path"] == p) for p in ("generate", "chat")
+        }
+        raise AssertionError(
+            f"{len(bad)}/{_REPEAT_COUNT} identical long-context requests came back "
+            f"wrong (pattern {pattern!r}, '.'=ok 'X'=bad, odd slots are chat; "
+            f"bad by path {by_path}; {len(distinct)} distinct outputs at "
+            f"temperature 0). First bad: {bad[0]['sample_output']!r}"
+        )
+
+
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
     records = []
     for i, prompt in enumerate(_PROMPTS):
@@ -541,6 +845,14 @@ def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
         if not rec.text.strip() or rec.completion_tokens <= 0:
             raise AssertionError(
                 f"Request {i} produced empty decode output -- TP resharding P/D transfer failed"
+            )
+        # Emptiness and the resend check below both pass on the corrupted state:
+        # its spew is non-empty and, being greedy, identical on resend. Only a
+        # content check separates it (runs 33187228615, 33202570607).
+        if looks_degenerate(rec.text):
+            raise AssertionError(
+                f"Request {i} produced degenerate output -- the KV that crossed "
+                f"the reshard is corrupt. First 200 chars: {rec.text[:200]!r}"
             )
         records.append(rec)
 
@@ -562,6 +874,60 @@ def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
         ),
         flush=True,
     )
+
+
+def gsm8k_report_path(profile: ModelProfile) -> str:
+    """Where run_eval dumps its per-example report (make_report over the convos)."""
+    stem = f"gsm8k_{profile.served_name.replace('/', '_')}"
+    return os.path.join("/tmp", f"{stem}.html")
+
+
+def _strip_tags(html: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
+def parse_gsm8k_samples(report: str) -> Tuple[Tuple[str, str], ...]:
+    """(response, results) per example, from simple_eval_common's HTML_JINJA.
+
+    That template lays each example out as ``Prompt conversation`` ->
+    ``Sampled message`` -> ``Results``.
+    """
+    blocks = re.findall(
+        r"<h3>Sampled message</h3>(.*?)<h3>Results</h3>(.*?)"
+        r"(?=<h3>Prompt conversation</h3>|\Z)",
+        report,
+        flags=re.S,
+    )
+    return tuple(
+        (_strip_tags(sampled), _strip_tags(results)) for sampled, results in blocks
+    )
+
+
+def dump_gsm8k_samples(profile: ModelProfile, limit: int = 3, chars: int = 900) -> None:
+    """Print a few sampled responses from run_eval's report.
+
+    A bare ``score=0.0`` cannot tell apart a model that answers wrongly from one
+    that never stops generating -- runs 33098546292, 33123385123 and 33135561031
+    all failed with every response pinned at the token cap, and the responses
+    themselves were the one thing the log did not carry. run_eval already writes
+    them to /tmp, but the pod is torn down with the file, so lift an excerpt into
+    stdout where CI keeps it.
+    """
+    path = gsm8k_report_path(profile)
+    if not os.path.isfile(path):
+        print(f"[gsm8k] no report at {path}; cannot show sampled responses")
+        return
+    with open(path, "r", errors="replace") as f:
+        blocks = parse_gsm8k_samples(f.read())
+    if not blocks:
+        print(f"[gsm8k] report at {path} has no sampled messages to show")
+        return
+    print(f"=== first {min(limit, len(blocks))} of {len(blocks)} gsm8k samples ===")
+    for i, (text, results) in enumerate(blocks[:limit]):
+        print(f"--- sample {i}: {len(text)} chars ---")
+        print(text[:chars])
+        print(f"    {results}")
+    print("=== end gsm8k samples ===", flush=True)
 
 
 def run_gsm8k(base_url: str, profile: ModelProfile, config: Gsm8kConfig) -> float:
@@ -692,6 +1058,9 @@ class TestPdTpResharding(unittest.TestCase):
     procs: list[subprocess.Popen] = []
     topo: PodTopology
     profile: ModelProfile
+    # A probe's verdict that the engine pair emits garbage, carried forward so
+    # gsm8k can skip instead of spending an hour confirming it.
+    degenerate_verdict: Optional[str] = None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -794,7 +1163,43 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
-    def test_02_gsm8k_quality(self) -> None:
+    def test_02_context_length_sweep(self) -> None:
+        self._probe(
+            run_context_length_sweep_probe,
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
+    def test_03_repeat_consistency(self) -> None:
+        self._probe(
+            run_repeat_consistency_probe,
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
+    def test_04_chat_completion_terminates(self) -> None:
+        self._probe(
+            run_chat_termination_probe,
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
+    def _probe(self, fn, **kwargs) -> None:
+        """Run a probe, remembering a corrupt verdict for gsm8k to act on."""
+        try:
+            fn(**kwargs)
+        except AssertionError as exc:
+            type(self).degenerate_verdict = str(exc)
+            raise
+
+    def test_05_gsm8k_quality(self) -> None:
+        if self.degenerate_verdict is not None:
+            # The probes already proved the pair emits garbage; gsm8k then spends
+            # ~62min generating maximum-length spew to reach a foregone 0.0 (run
+            # 33171526086), delaying a verdict that is already in.
+            raise unittest.SkipTest(
+                f"probe already found degenerate output: {self.degenerate_verdict}"
+            )
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
             profile=self.profile,
@@ -809,6 +1214,8 @@ class TestPdTpResharding(unittest.TestCase):
             },
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
+        if score < self.gsm8k_config.threshold:
+            dump_gsm8k_samples(self.profile)
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
 
@@ -938,6 +1345,93 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         bound = f"--max-total-tokens {profile.max_total_tokens}"
         self.assertIn(bound, build_prefill_env(profile, 2, env={})["EXTRA_ARGS"])
         self.assertIn(bound, build_decode_env(profile, 2, env={})["EXTRA_ARGS"])
+
+    def test_both_engines_transfer_over_raiden(self) -> None:
+        # The ZMQ "tpu" connector is being sunset; every profile here must ride
+        # raiden, and both engines must agree -- a one-sided backend desyncs the
+        # transfer handshake, and the mismatch only shows after a full hardware
+        # bring-up.
+        for profile in MODEL_PROFILES.values():
+            self.assertEqual(profile.disagg_transfer_backend, "raiden")
+            for env in (
+                build_prefill_env(profile, 2, env={}),
+                build_decode_env(profile, 2, env={}),
+            ):
+                self.assertIn(
+                    "--disaggregation-transfer-backend raiden", env["EXTRA_ARGS"]
+                )
+                # raiden claims 4 ports per rank at
+                # base + 4*(attn_dp_rank*attn_tp_size + attn_tp_rank); its 30000
+                # default would land on rank 0's HTTP server port.
+                raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
+                claimed = range(raiden_base, raiden_base + 4 * 32)
+                for port in (
+                    PREFILL_PORT,
+                    DECODE_PORT,
+                    LB_PORT,
+                    BOOTSTRAP_PORT,
+                    DIST_PORT,
+                ):
+                    self.assertNotIn(port, claimed)
+
+    def test_chat_probe_mirrors_the_gsm8k_request_shape(self) -> None:
+        # The probe's only value is reproducing what gsm8k sends: run_eval hands
+        # these two fields to its sampler, so a probe that drops them can pass
+        # while gsm8k fails on the very thing it was added to catch.
+        for profile in MODEL_PROFILES.values():
+            body = chat_body("q", profile, 256)
+            self.assertEqual(body["model"], profile.served_name)
+            self.assertEqual(body["temperature"], 0.0)
+            self.assertEqual(
+                body.get("chat_template_kwargs"), profile.chat_template_kwargs
+            )
+            self.assertEqual(body.get("reasoning_effort"), profile.reasoning_effort)
+
+    def test_degeneracy_check_separates_spew_from_real_answers(self) -> None:
+        # Spew as observed in run 33171526086.
+        self.assertTrue(looks_degenerate("________" + "\\" * 200))
+        self.assertTrue(looks_degenerate(""))
+        self.assertTrue(looks_degenerate("   "))
+        # Regression, run 33200976580: the first version thresholded on the
+        # fraction of alphabetic characters, so a correct bare " 42" -- exactly
+        # what the probe prompt asks for -- read as 0% letters and failed a
+        # healthy engine pair at every sweep length, voiding the run.
+        self.assertFalse(looks_degenerate(" 42"))
+        self.assertFalse(looks_degenerate("42"))
+        self.assertFalse(looks_degenerate(" Answer: 42."))
+        self.assertFalse(
+            looks_degenerate(
+                "General relativity is a theory developed by Albert Einstein "
+                "that describes how gravity works."
+            )
+        )
+
+    def test_chat_probe_prompt_is_long_enough_to_expose_the_failure(self) -> None:
+        # The non-termination state only shows on a gsm8k-sized prompt (~900
+        # tokens); a one-line question is served correctly even while gsm8k
+        # scores 0.0, so a shrunken prompt would silently defeat the probe.
+        question = _long_context_question()
+        self.assertGreater(len(question.split()), 600)
+        self.assertIn("Reply with only the number", question)
+
+    def test_gsm8k_sample_dump_parses_the_report_layout(self) -> None:
+        # Guards the extraction against simple_eval_common's HTML_JINJA layout
+        # drifting: a silently non-matching regex would leave a failing run with
+        # no responses again, which is the gap this dump exists to close.
+        report = (
+            "<h3>Prompt conversation</h3><p>ignored</p>"
+            "<h3>Sampled message</h3><p>first answer</p>"
+            "<h3>Results</h3><p>Score: 0.0</p>"
+            "<h3>Prompt conversation</h3><p>ignored</p>"
+            "<h3>Sampled message</h3><p>second answer</p>"
+            "<h3>Results</h3><p>Score: 1.0</p>"
+        )
+        blocks = parse_gsm8k_samples(report)
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0][0], "first answer")
+        self.assertEqual(blocks[1][0], "second answer")
+        self.assertIn("Score: 1.0", blocks[1][1])
+        self.assertEqual(parse_gsm8k_samples("<h3>nothing here</h3>"), ())
 
     def test_gpt_oss_does_not_force_quantization(self) -> None:
         env = build_prefill_env(MODEL_PROFILES["gpt_oss_120b"], 2, env={})

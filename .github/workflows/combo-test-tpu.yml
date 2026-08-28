@@ -2,12 +2,15 @@
 # via _tpu-test's exec mode:
 #   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, nightly host)
 #   multihost-combo-test-{pd,spec}: P/D and spec rows across the 2x2x2 slice
+#   pd-tp-resharding:             2p2d heterogeneous attention-TP resharding
+#                                 (issue #378) on production-size models
 # Both run in the `nightly` lane (topology.yaml), same pools as nightly-test-tpu.yml.
 # The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
 # trigger:
-#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] \
+#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec|pd-tpreshard] \
 #     [-f singlehost_model=qwen3-1.7b|qwen3-coder-480b] \
-#     [-f singlehost_combo=1|2|3|all] [-f ref=<branch>]
+#     [-f singlehost_combo=1|2|3|all] [-f pd_model=qwen3_coder_480b|gpt_oss_120b|all] \
+#     [-f ref=<branch>]
 name: Combo Test (TPU)
 
 on:
@@ -22,7 +25,10 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, singlehost, multihost, pd, spec]
+        # pd-tpreshard is deliberately NOT part of `all`: it holds BOTH nightly
+        # 2x2x2 slices for the whole run, so folding it into the default target
+        # would starve every other row behind it.
+        options: [all, singlehost, multihost, pd, spec, pd-tpreshard]
       singlehost_model:
         description: "Model profile for the single-host combos"
         required: false
@@ -35,6 +41,14 @@ on:
         default: all
         type: choice
         options: [all, "1", "2", "3"]
+      pd_model:
+        description: "Model profile(s) for the pd-tpreshard row"
+        required: false
+        # gpt_oss_120b is hybrid-SWA, which raiden's v1 scope excludes under
+        # push-resharding, so `all` would spend a slice pair on a known failure.
+        default: qwen3_coder_480b
+        type: choice
+        options: [qwen3_coder_480b, gpt_oss_120b, all]
 
 concurrency:
   # Keyed on ref so combo runs for different PRs proceed in parallel; the nightly lane has
@@ -94,6 +108,41 @@ jobs:
             || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
       weights_pvc: model-weights-rox
       run_name: multihost-combo-test-${{ matrix.row }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # 2p2d heterogeneous attention TP (issue #378): multihost prefill (TP16EP16)
+  # and multihost decode (DP2TP8EP16) on their own slices, KV resharded 2:1 on
+  # the way across. Needs the nightly pool to hold TWO 2x2x2 slices at once (one
+  # per role) or the JobSet stays Pending until its deadline.
+  pd-tp-resharding:
+    needs: build
+    if: ${{ inputs.target == 'pd-tpreshard' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1   # rows contend for the same two slices
+      matrix:
+        # matrix context is unavailable in job-level `if`; selection shapes the matrix.
+        model: ${{ (inputs.pd_model == 'all' && fromJSON('["gpt_oss_120b","qwen3_coder_480b"]')) || fromJSON(format('["{0}"]', inputs.pd_model || 'qwen3_coder_480b')) }}
+    name: pd-tp-resharding-${{ matrix.model }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      # hosts feeds only the slice concurrency group; the P/D topology below
+      # sizes the JobSet (2-host prefill slice + 2-host decode slice).
+      hosts: 2
+      # The nightly lane is the only one owning two 2x2x2 slices, which is what a
+      # prefill engine and a decode engine need at the same time.
+      lane: nightly
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=${{ matrix.model }} python3 test/registered/tpu/integration/test_pd_tp_resharding.py
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/integration/test_pd_tp_resharding.py
+      weights_pvc: model-weights-rox
+      run_name: pd-tpreshard-${{ matrix.model }}
     permissions:
       contents: read
       id-token: write
