@@ -74,7 +74,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
         self.strategy = strategy
         self.symmetric = symmetric
         self.group_size = -1 if group_size is None else group_size
-        self.has_g_idx = actorder == ActivationOrdering.GROUP
+        self.has_g_idx = actorder in (getattr(ActivationOrdering, "WEIGHT", None), "weight")
 
         if self.group_size == -1 and self.strategy != "channel":
             raise ValueError("Marlin kernels require group quantization or "
