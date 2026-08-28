@@ -51,25 +51,58 @@ jobs:
       contents: read
       id-token: write
 
-  single-host:
+  discover-tests:
     needs: build
-    if: ${{ (inputs.only || 'all') == 'all' || inputs.only == 'sh' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      single_host: ${{ steps.tests.outputs.single_host }}
+      perf: ${{ steps.tests.outputs.perf }}
+      accuracy: ${{ steps.tests.outputs.accuracy }}
+      pd_pc_offload: ${{ steps.tests.outputs.pd_pc_offload }}
+      pd_tp_reshard: ${{ steps.tests.outputs.pd_tp_reshard }}
+      pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
+      pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
+      pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
+      combo_sh: ${{ steps.tests.outputs.combo_sh }}
+      combo_mh: ${{ steps.tests.outputs.combo_mh }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: tests
+        run: |
+          set -euo pipefail
+          discover_files='python3 .github/tpu-ci/discover_files.py'
+          echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
+          echo "perf=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-perf-gpt-oss-120b --nightly)" >> "$GITHUB_OUTPUT"
+          echo "accuracy=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-accuracy-gpt-oss-120b --nightly)" >> "$GITHUB_OUTPUT"
+          echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/integration/test_pd_tp_resharding.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py)" >> "$GITHUB_OUTPUT"
+          echo "combo_sh=$($discover_files --entry test/manual/tpu/feature_combo/test_feature_combos_singlehost.py)" >> "$GITHUB_OUTPUT"
+          echo "combo_mh=$($discover_files --entry test/manual/tpu/feature_combo/multihost/test_feature_combos.py)" >> "$GITHUB_OUTPUT"
+
+  single-host:
+    needs: [build, discover-tests]
+    if: ${{ ((inputs.only || 'all') == 'all' || inputs.only == 'sh') && needs.discover-tests.outputs.single_host != '[]' }}
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
-        partition: [0, 1, 2]
-    name: sh-${{ matrix.partition }}
+        test: ${{ fromJSON(needs.discover-tests.outputs.single_host) }}
+    name: ${{ matrix.test.name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       lane: nightly
-      suite: nightly-tpu-4-v7
+      suite: ${{ matrix.test.suite }}
+      test_file: ${{ matrix.test.file }}
       nightly: true
-      partition_id: ${{ matrix.partition }}
-      partition_size: 3
-      run_name: nightly-tpu-4-v7-${{ matrix.partition }}
+      run_name: ${{ matrix.test.run_name }}
       # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
       # the ROX weights disk at /weights; harmless for tests that don't use it.
       weights_pvc: model-weights-rox
@@ -89,9 +122,9 @@ jobs:
   # use compact abbreviations (pd-{sh,mh}-gpt-120b[-<feature>]) to stay well
   # under k8s's 63-char pod-name cap.
   pd-mh-gpt-120b-pc-offload:
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload"]'), inputs.only || 'all') }}
-    name: pd-mh-gpt-120b-pc-offload
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -108,14 +141,15 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_pd_multihost_prefix_cache_kv_offload.py
       weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].run_name }}
     permissions:
       contents: read
       id-token: write
 
   pd-mh-gpt-120b-tp-reshard:
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b-tp-reshard"]'), inputs.only || 'all') }}
-    name: pd-mh-gpt-120b-tp-reshard
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -128,6 +162,7 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -135,9 +170,9 @@ jobs:
   # Feature-combination layers: same exec-mode runs as the standalone
   # combo-test-tpu.yml action; these jobs add nightly cadence.
   singlehost-combo:
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","combo","combo-sh"]'), inputs.only || 'all') }}
-    name: combo-sh
+    name: ${{ fromJSON(needs.discover-tests.outputs.combo_sh)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -145,7 +180,7 @@ jobs:
       lane: nightly
       hosts: 1
       exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-      run_name: combo-sh
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.combo_sh)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -154,9 +189,9 @@ jobs:
     # Unchained: Kueue queues the hosts=2 jobs, so this need not wait out multi-host.
     # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access). The pd
     # row was dropped -- it duplicated pd-mh-gpt-120b-pc-offload.
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","combo","combo-mh"]'), inputs.only || 'all') }}
-    name: combo-mh-spec
+    name: ${{ fromJSON(needs.discover-tests.outputs.combo_mh)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -165,7 +200,7 @@ jobs:
       hosts: 2
       exec_cmd: python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec
       weights_pvc: model-weights-rox
-      run_name: combo-mh-spec
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.combo_mh)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -173,9 +208,9 @@ jobs:
   # One host per P/D engine isolates this gate from intra-engine multihost issues.
   # Kueue queues it against other P/D jobs contending for the nightly lane.
   pd-singlehost:
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-sh-gpt-120b"]'), inputs.only || 'all') }}
-    name: pd-sh-gpt-120b
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -188,6 +223,7 @@ jobs:
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py
       weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -195,9 +231,9 @@ jobs:
   # Keep the CI identifier compact: <category>-<topology>-<model>-<feature>.
   # The full model and testcase remain visible in the dashboard file key.
   pd-sh-gpt-120b-spec:
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-sh-gpt-120b-spec"]'), inputs.only || 'all') }}
-    name: pd-sh-gpt-120b-spec
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -209,16 +245,16 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py
       weights_pvc: model-weights-rox
-      run_name: pd-sh-gpt-120b-spec
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
     permissions:
       contents: read
       id-token: write
 
   # Multihost P/D GSM8K accuracy test with 2 prefill and 2 decode hosts.
   pd-multihost:
-    needs: build
+    needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b"]'), inputs.only || 'all') }}
-    name: pd-mh-gpt-120b
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -231,6 +267,7 @@ jobs:
       # Used for dashboard and timing records.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
       weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].run_name }}
     permissions:
       contents: read
       id-token: write
@@ -239,24 +276,22 @@ jobs:
   # parallel -- same exec-mode shape as the combo layers above. Also dispatchable
   # on its own (perf-test-tpu.yml) to collect a datapoint without a full nightly.
   perf:
-    needs: build
-    if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') }}
+    needs: [build, discover-tests]
+    if: ${{ contains(fromJSON('["all","perf"]'), inputs.only || 'all') && needs.discover-tests.outputs.perf != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        # qwen3-30b was retired: its 480B sibling's perf source is the agentic
-        # sweep in the multi-host job, which dumps its own workload metrics.
-        include:
-          - suite: nightly-tpu-perf-gpt-oss-120b
-            name: perf-sh-gpt-120b
-    name: ${{ matrix.name }}
+        test: ${{ fromJSON(needs.discover-tests.outputs.perf) }}
+    name: ${{ matrix.test.name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       lane: nightly
       hosts: 1
-      suite: ${{ matrix.suite }}
+      suite: ${{ matrix.test.suite }}
+      test_file: ${{ matrix.test.file }}
+      run_name: ${{ matrix.test.run_name }}
       nightly: true
       weights_pvc: model-weights-rox
       timeout_per_file: 1800
@@ -268,22 +303,22 @@ jobs:
   # model costs the others nothing. Also dispatchable on its own
   # (accuracy-test-tpu.yml) to collect a datapoint without a full nightly.
   accuracy:
-    needs: build
-    if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') }}
+    needs: [build, discover-tests]
+    if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') && needs.discover-tests.outputs.accuracy != '[]' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - suite: nightly-tpu-accuracy-gpt-oss-120b
-            name: accuracy-sh-gpt-120b
-    name: ${{ matrix.name }}
+        test: ${{ fromJSON(needs.discover-tests.outputs.accuracy) }}
+    name: ${{ matrix.test.name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       lane: nightly
       hosts: 1
-      suite: ${{ matrix.suite }}
+      suite: ${{ matrix.test.suite }}
+      test_file: ${{ matrix.test.file }}
+      run_name: ${{ matrix.test.run_name }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights.
       weights_pvc: model-weights-rox
@@ -333,7 +368,7 @@ jobs:
       hosts: ${{ matrix.group.hosts }}
       weights_pvc: ${{ matrix.group.weights_pvc }}
       timeout_per_file: ${{ matrix.group.timeout_per_file }}
-      run_name: ${{ matrix.group.name }}
+      run_name: ${{ matrix.group.run_name }}
     permissions:
       contents: read
       id-token: write

@@ -306,7 +306,7 @@ def main():
         if a.hosts < 1:
             ap.error("--hosts must be a positive integer for multi-host mode")
         hosts = a.hosts
-        run_name = dns_safe(a.name or a.launch_script)
+        run_name = dns_safe(a.name or single_test_name(a.files) or a.launch_script)
         suite = ""
         if not a.files:
             sys.exit("multi-host mode needs --files")
@@ -329,7 +329,7 @@ def main():
             if partitioned
             else a.suite
         )
-        run_name = dns_safe(a.name or default_name)
+        run_name = dns_safe(a.name or single_test_name(a.test_file) or default_name)
         suite = a.suite
         if a.timeout_per_file <= 0:
             ap.error("--timeout-per-file must be a positive integer")

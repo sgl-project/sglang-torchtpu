@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 
+from test_names import names_from_path
+
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 _CI_REGISTER_PATH = os.path.join(
     REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
@@ -32,13 +34,7 @@ def discover(suite: str, nightly: bool, root: str) -> list[dict]:
         ):
             continue
         path = os.path.relpath(test.filename, REPO_ROOT)
-        rows.append(
-            {
-                "name": os.path.splitext(os.path.basename(path))[0],
-                "suite": suite,
-                "file": path,
-            }
-        )
+        rows.append({"suite": suite, "file": path, **names_from_path(path)})
     return sorted(rows, key=lambda row: row["name"])
 
 

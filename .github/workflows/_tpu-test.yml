@@ -88,7 +88,7 @@ permissions:
 concurrency:
   # Per-run group: supersession only. Slice contention is Kueue's job -- a shared
   # GitHub group keeps one job pending and cancels the rest.
-  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
+  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}
   cancel-in-progress: false
 
 env:
@@ -119,7 +119,7 @@ jobs:
       - name: Render + run on TPU
         run: |
           set -euo pipefail
-          label='${{ inputs.run_name || inputs.suite }}'
+          label='${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}'
           JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
@@ -430,7 +430,7 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: tpu-bench-result-${{ inputs.run_name || inputs.suite }}-${{ github.run_id }}
+          name: tpu-bench-result-${{ inputs.run_name || inputs.suite || 'test' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/bench-result.json
           if-no-files-found: ignore
           retention-days: 30
