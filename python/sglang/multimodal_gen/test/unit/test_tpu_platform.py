@@ -2,6 +2,8 @@
 """Unit tests for the TPU platform. Cases needing torch_tpu self-skip."""
 
 import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -109,6 +111,19 @@ class TestTorchTpuIntegration(unittest.TestCase):
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         self.assertTrue(callable(_prepare_tpu_env))
+
+    def test_importing_the_platform_package_does_not_initialize_pjrt(self):
+        # The parent resolves current_platform before spawning the worker;
+        # PJRT is one client per process and the worker must be the one to own it.
+        code = (
+            "import torch, sglang.multimodal_gen.runtime.platforms as p; "
+            "p.current_platform; import sglang.multimodal_gen.runtime.platforms.tpu; "
+            "raise SystemExit(1 if torch.tpu.is_initialized() else 0)"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
 
     def test_device_module_shims_installed_once(self):
         from sglang.multimodal_gen.runtime.platforms.tpu import (
