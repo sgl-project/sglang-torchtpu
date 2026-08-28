@@ -983,7 +983,13 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
         token_to_kv_pool_allocator=SimpleNamespace(
             free_pages=torch.arange(4, dtype=torch.int32)
         ),
-        model_config=SimpleNamespace(hidden_size=16),
+        model_config=SimpleNamespace(
+            hidden_size=16,
+            spec_hidden_size=16,
+            hf_config=SimpleNamespace(
+                eagle_config={"use_aux_hidden_state": False},
+            ),
+        ),
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
@@ -1055,6 +1061,23 @@ def _dp_idle_batch(spec_info, *, peer_tokens, **overrides):
 
 class TestSpecPrecompileLoops(CustomTestCase):
     """Target spec precompile covers its serving forward families."""
+
+    def test_infers_eagle_aux_hidden_width_from_config(self):
+        mr = _spec_model_runner(is_draft_worker=True)
+        mr.model_config = SimpleNamespace(
+            hidden_size=8_192,
+            spec_hidden_size=8_192,
+            hf_config=SimpleNamespace(
+                target_hidden_size=8_192,
+                eagle_config={
+                    "use_aux_hidden_state": True,
+                    "eagle_aux_hidden_state_layer_ids": [7, 15, 23],
+                },
+            ),
+        )
+        policy = _make_spec_policy(mr)
+
+        self.assertEqual(policy.eagle_hidden_size, 24_576)
 
     def test_extend_full_uses_configured_prefill_cap(self):
         mr = _spec_model_runner(num_steps=3)

@@ -36,6 +36,9 @@ from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
 )
+from sglang.srt.speculative.eagle_utils import (
+    get_draft_input_from_target_hidden_dim,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType, SpecPaddingState
 from sglang.srt.utils.common import ceil_align
 
@@ -183,7 +186,11 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         )
         # Width of ``spec_info.hidden_states`` the EAGLE3 draft model expects.
         # 0 for non-draft workers (the target never reads it).
-        self.eagle_hidden_size = self._infer_eagle_hidden_size()
+        self.eagle_hidden_size = (
+            get_draft_input_from_target_hidden_dim(self.model_runner)
+            if self.is_draft_worker
+            else 0
+        )
 
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a draft forward before constructing attention metadata."""
@@ -632,21 +639,6 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         if max_tokens <= 0 or tokens_per_req <= 0:
             return 0
         return -(-max_tokens // tokens_per_req)
-
-    def _infer_eagle_hidden_size(self) -> int:
-        """Derive the hidden-state width the EAGLE3 draft model's forward expects.
-
-        EAGLE3 draft models expose an ``fc`` layer whose ``in_features`` is
-        ``target_hidden_size * num_aux_hidden_states``. Fall back to
-        ``model_config.hidden_size``. Returns 0 for non-draft workers.
-        """
-        if not self.is_draft_worker:
-            return 0
-        model = self.model_runner.model
-        fc = getattr(getattr(model, "model", None), "fc", None)
-        if fc is not None and hasattr(fc, "in_features"):
-            return fc.in_features
-        return getattr(self.model_runner.model_config, "hidden_size", 0) or 0
 
     def precompile(self) -> None:
         """Warm target graphs during graph-runner initialization.
