@@ -150,7 +150,9 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     max_total_tokens: Optional[int]
     device_pool_tokens_hint: int
     gsm8k_threshold: float
-    disagg_transfer_backend: str = "tpu"
+    # Appended after the launcher's default so it wins (argparse keeps the
+    # last occurrence).
+    disagg_transfer_backend: str = "raiden"
     extra_server_args: Tuple[str, ...] = ()
     extra_launch_env: Dict[str, str] = {}
     reasoning_effort: Optional[str] = None
