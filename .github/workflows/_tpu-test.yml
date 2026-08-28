@@ -22,6 +22,10 @@ on:
         required: false
         type: string
         default: ""
+      test_file:
+        required: false
+        type: string
+        default: ""
       # --- multi-host launch-group mode ---
       launch_script:
         required: false
@@ -129,6 +133,7 @@ jobs:
           python3 .github/tpu-ci/render_jobset.py \
             --image '${{ inputs.image }}' \
             --suite '${{ inputs.suite }}' \
+            --test-file '${{ inputs.test_file }}' \
             --launch-script '${{ inputs.launch_script }}' \
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
@@ -202,6 +207,7 @@ jobs:
             # the outcome rather than this loop racing it to a generic timeout.
             wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py \
               --suite "$suite" \
+              --test-file '${{ inputs.test_file }}' \
               --partition-id '${{ inputs.partition_id }}' \
               --partition-size '${{ inputs.partition_size }}' \
               ${{ inputs.nightly && '--nightly' || '' }} \

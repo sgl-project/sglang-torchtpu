@@ -100,6 +100,7 @@ def suite_wait_seconds(
     tests_dir="test/registered",
     *,
     nightly=False,
+    test_file="",
     partition_id=None,
     partition_size=None,
 ):
@@ -116,6 +117,13 @@ def suite_wait_seconds(
         and test.nightly == nightly
         and test.disabled is None
     ]
+    if test_file:
+        requested = os.path.normpath(os.path.abspath(test_file))
+        tests = [
+            test
+            for test in tests
+            if os.path.normpath(os.path.abspath(test.filename)) == requested
+        ]
     if partition_size is not None:
         tests = _ci_register.auto_partition(tests, partition_id, partition_size)
     total = sum(test.est_time for test in tests)
@@ -127,6 +135,7 @@ def main():
     ap.add_argument("--image")
     ap.add_argument("--nightly", action="store_true")
     ap.add_argument("--suite", default="")  # single-host mode
+    ap.add_argument("--test-file", default="")  # one file from a single-host suite
     ap.add_argument("--launch-script", default="")  # multi-host mode
     ap.add_argument("--files", default="")  # multi-host: space-separated
     # Exec mode: every host runs this command; pod exit codes gate the JobSet.
@@ -178,6 +187,7 @@ def main():
                 a.suite,
                 a.tests_dir,
                 nightly=a.nightly,
+                test_file=a.test_file,
                 **partition_args,
             )
         )
@@ -330,6 +340,7 @@ def main():
             suite,
             a.tests_dir,
             nightly=a.nightly,
+            test_file=a.test_file,
             **partition_args,
         )
     elif a.exec_cmd:
@@ -363,6 +374,7 @@ def main():
             if partitioned
             else ""
         ),
+        "TEST_FILE_FLAG": f"--test-file {a.test_file}" if a.test_file else "",
         "LAUNCH_SCRIPT": a.launch_script,
         "TEST_FILES": a.files,
         "WEIGHTS_VOLUME": WEIGHTS_VOLUME_TMPL.format(pvc=pvc) if pvc else "",

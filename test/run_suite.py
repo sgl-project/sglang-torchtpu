@@ -366,6 +366,16 @@ def run_a_suite(args):
     validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
+    if args.test_file:
+        requested = os.path.normpath(os.path.join(repo_root, args.test_file))
+        ci_tests = [
+            test for test in ci_tests if os.path.normpath(test.filename) == requested
+        ]
+        if not ci_tests:
+            raise ValueError(
+                f"Enabled test {args.test_file!r} was not found in suite {suite!r}"
+            )
+
     if auto_partition_size:
         live_est = load_live_est(args.partition_model_file, suite, repo_root)
         if live_est is not None:
@@ -413,6 +423,11 @@ def main():
         help="Hardware backend to run tests on.",
     )
     parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument(
+        "--test-file",
+        type=str,
+        help="Run only this registered file from the selected suite.",
+    )
     parser.add_argument(
         "--nightly",
         action="store_true",
