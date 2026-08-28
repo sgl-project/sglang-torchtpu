@@ -125,6 +125,24 @@ class TestTorchTpuIntegration(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
 
+    def test_worker_init_selects_cpu_only_jax_before_calling_srt(self):
+        # A worker started without srt's entry-point activation in the parent
+        # has no JAX_PLATFORMS; _prepare_tpu_env then raises once JAX is imported.
+        from sglang.srt.hardware_backend.tpu import patches
+
+        seen = {}
+
+        def record(**kwargs):
+            seen["JAX_PLATFORMS"] = os.environ.get("JAX_PLATFORMS")
+
+        with (
+            patch.dict(os.environ),
+            patch.object(patches, "_prepare_tpu_env", side_effect=record),
+        ):
+            os.environ.pop("JAX_PLATFORMS", None)
+            TpuPlatform._init_worker_process()
+        self.assertEqual(seen.get("JAX_PLATFORMS"), "cpu")
+
     def test_device_module_shims_installed_once(self):
         from sglang.multimodal_gen.runtime.platforms.tpu import (
             _install_device_module_shims,

@@ -146,6 +146,11 @@ class TpuPlatform(Platform):
                 "TPU diffusion runs one worker, but WORLD_SIZE="
                 f"{os.environ['WORLD_SIZE']} was inherited."
             )
+        # srt's activate() selects CPU-only JAX for TorchTPU processes; the
+        # worker cannot rely on that having run in the parent (entry-point
+        # discovery), and _prepare_tpu_env refuses an unset value once JAX is
+        # imported.
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
         _prepare_tpu_env(resolve_single_host_topology=True)
         import torch_tpu  # noqa: F401
 
