@@ -98,7 +98,7 @@ jobs:
           if [ "$safe_trigger" != "$safe_origin" ]; then
             who="${safe_trigger:0:20}-rr-${safe_origin:0:20}"
           fi
-          tag="$(date -u +%Y%m%d)-${who}-${safe_ref:0:12}-${{ github.run_id }}"
+          tag="$(date -u +%Y%m%d)-${who}-${safe_ref:0:12}-${{ github.run_id }}.${{ github.run_attempt }}"
           object="source/${tag}.tgz"
 
           gcloud storage cp "$src" "gs://${bucket}/${object}" --project "$GCP_PROJECT" \
