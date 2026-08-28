@@ -823,7 +823,7 @@ class Eagle3CompilePolicyMixin(SpecDecodeCompilePolicyMixin):
         """
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
-        bs = self.b_bucketer.max_val
+        bs = self._extend_compile_cap()
         valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
         logger.info(
             "[spec compile policy] DRAFT EXTEND(LAST): %d shapes "

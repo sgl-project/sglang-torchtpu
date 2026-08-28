@@ -1062,6 +1062,20 @@ def _dp_idle_batch(spec_info, *, peer_tokens, **overrides):
 class TestSpecPrecompileLoops(CustomTestCase):
     """Target spec precompile covers its serving forward families."""
 
+    def test_draft_prefill_uses_configured_prefill_cap(self):
+        mr = _spec_model_runner(is_draft_worker=True)
+        policy = _make_spec_policy(
+            mr,
+            token_buckets=(1024, 4096),
+            bs_buckets=(16, 32, 64),
+        )
+        policy.extend_bs = 16
+
+        with get_parallel().override(tp_rank=1):
+            policy._precompile_draft_prefill_extend()
+
+        self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
+
     def test_infers_eagle_aux_hidden_width_from_config(self):
         mr = _spec_model_runner(is_draft_worker=True)
         mr.model_config = SimpleNamespace(
