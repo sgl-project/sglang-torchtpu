@@ -32,6 +32,7 @@ on:
           - mh
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
+          - pd-mh-gpt-120b-spec
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
@@ -268,6 +269,27 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_gsm8k.py
       weights_pvc: model-weights-rox
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Multihost P/D with 2 prefill + 2 decode hosts, EAGLE3 spec + prefix caching.
+  pd-multihost-spec:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b-spec"]'), inputs.only || 'all') }}
+    name: pd-mh-gpt-120b-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: pd-mh-gpt-120b-spec
     permissions:
       contents: read
       id-token: write
