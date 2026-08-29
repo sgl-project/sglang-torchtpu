@@ -602,7 +602,7 @@ class TestPdSingleHostGptOss120bConfiguration(unittest.TestCase):
         self.assertNotIn("name: router", yaml_content)
         self.assertIn("CI_PD_ROLE", yaml_content)
         self.assertIn(
-            "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_gsm8k.py integration",
+            "python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration",
             yaml_content,
         )
 

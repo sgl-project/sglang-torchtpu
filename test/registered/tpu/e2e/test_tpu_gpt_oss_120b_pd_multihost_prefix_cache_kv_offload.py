@@ -34,7 +34,7 @@ Run on hardware with CI_PD_ROLE set by the P/D JobSet:
 
   CI_PD_ROLE=prefill python3 \
       test/registered/tpu/e2e/\
-      test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_gsm8k.py
+      test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
 
 Without CI_PD_ROLE the file runs only its host-side configuration tests.
 Model paths, pool sizes, churn workload, and the GSM8K floor are

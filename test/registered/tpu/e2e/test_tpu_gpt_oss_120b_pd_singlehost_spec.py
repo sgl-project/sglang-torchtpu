@@ -769,7 +769,7 @@ class TestPdSingleHostSpecGptOss120bConfiguration(unittest.TestCase):
         self.assertIn("CI_PD_ROLE", yaml_content)
         self.assertIn(
             "python3 test/registered/tpu/e2e/"
-            "test_tpu_gpt_oss_120b_pd_singlehost_spec_gsm8k.py integration",
+            "test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration",
             yaml_content,
         )
 
