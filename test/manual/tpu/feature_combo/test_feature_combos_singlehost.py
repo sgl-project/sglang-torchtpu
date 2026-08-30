@@ -398,7 +398,7 @@ class TestFeatureCombo(unittest.TestCase):
             prompts.append(COUNT_LONG)
         outs = self.engine.generate(
             prompts,
-            [{"temperature": 0.0, "max_new_tokens": MAX_NEW}] * len(prompts),
+            [{"temperature": 0.6, "max_new_tokens": MAX_NEW}] * len(prompts),
         )
         self.assertEqual(len(outs), len(prompts))
         # Only the correctness oracle: routing/timing decide whether a given
