@@ -1,11 +1,13 @@
 """Hardware-free tests for the KV-offload probe's speculative gate."""
 
 import unittest
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu.kv_offload_probe import (
     CacheObservation,
     KvOffloadProbe,
+    generate_with_cache_report,
     mean_accept_length,
     spec_failures,
     validate_probe,
@@ -107,6 +109,50 @@ class TestKvOffloadOutputOracle(unittest.TestCase):
             page_size=64,
         )
         self.assertEqual(len(failures), 2)
+
+
+class TestDpRouting(unittest.TestCase):
+    @patch("sglang.test.tpu.kv_offload_probe.requests.post")
+    def test_generate_routes_to_requested_dp_rank(self, post: Mock) -> None:
+        response = post.return_value
+        response.json.return_value = {
+            "text": "ok",
+            "meta_info": {
+                "dp_rank": 3,
+                "cached_tokens": 64,
+                "cached_tokens_details": {"device": 64, "host": 0},
+                "completion_tokens": 1,
+            },
+        }
+
+        observation = generate_with_cache_report(
+            base_url="http://localhost:30000",
+            prompt="prompt",
+            max_new_tokens=1,
+            routed_dp_rank=3,
+        )
+
+        self.assertEqual(observation.device_tokens, 64)
+        self.assertEqual(post.call_args.kwargs["json"]["routed_dp_rank"], 3)
+
+    @patch("sglang.test.tpu.kv_offload_probe.requests.post")
+    def test_generate_rejects_wrong_dp_rank(self, post: Mock) -> None:
+        post.return_value.json.return_value = {
+            "text": "ok",
+            "meta_info": {
+                "dp_rank": 2,
+                "cached_tokens": 0,
+                "completion_tokens": 1,
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "response reports dp_rank=2"):
+            generate_with_cache_report(
+                base_url="http://localhost:30000",
+                prompt="prompt",
+                max_new_tokens=1,
+                routed_dp_rank=3,
+            )
 
 
 if __name__ == "__main__":

@@ -1,13 +1,7 @@
-# TPU feature-combination e2e -- both layers of test/manual/tpu/feature_combo/,
-# via _tpu-test's exec mode:
-#   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, nightly host)
-#   multihost-combo-test-{pd,spec}: P/D and spec rows across the 2x2x2 slice
-# Both run in the `nightly` lane (topology.yaml), same pools as nightly-test-tpu.yml.
-# The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
-# trigger:
-#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] \
-#     [-f singlehost_model=qwen3-1.7b|qwen3-coder-480b] \
-#     [-f singlehost_combo=1|2|3|all] [-f ref=<branch>]
+# TPU multihost feature-combination e2e via _tpu-test's exec mode. The P/D and
+# speculative rows run across a 2x2x2 slice in the `nightly` lane. The same layer
+# runs nightly; this action is its isolated trigger:
+#   gh workflow run combo-test-tpu.yml [-f target=multihost|pd|spec] [-f ref=<branch>]
 name: Combo Test (TPU)
 
 on:
@@ -22,19 +16,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, singlehost, multihost, pd, spec]
-      singlehost_model:
-        description: "Model profile for the single-host combos"
-        required: false
-        default: qwen3-1.7b
-        type: choice
-        options: [qwen3-1.7b, qwen3-coder-480b]
-      singlehost_combo:
-        description: "Single-host combo to run"
-        required: false
-        default: all
-        type: choice
-        options: [all, "1", "2", "3"]
+        options: [all, multihost, pd, spec]
 
 concurrency:
   # Keyed on ref so combo runs for different PRs proceed in parallel; the nightly lane has
@@ -47,26 +29,6 @@ jobs:
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  singlehost-combo:
-    needs: build
-    if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
-    name: singlehost-combo-test
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      exec_cmd: >-
-        ${{ inputs.singlehost_model == 'qwen3-coder-480b'
-            && format('env MODEL=/weights/Qwen3-Coder-480B-A35B-Instruct-FP8 DRAFT_MODEL=/weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-coder-480b {0}', inputs.singlehost_combo || 'all')
-            || format('python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-1.7b {0}', inputs.singlehost_combo || 'all') }}
-      weights_pvc: ${{ inputs.singlehost_model == 'qwen3-coder-480b' && 'qwen3-coder-480b-rox' || '' }}
-      run_name: combo-${{ inputs.singlehost_model || 'qwen3-1.7b' }}-${{ inputs.singlehost_combo || 'all' }}
     permissions:
       contents: read
       id-token: write

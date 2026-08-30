@@ -249,8 +249,8 @@ def spec_failures(*, probe: KvOffloadProbe, min_accept_length: float) -> List[st
     if accept_length <= min_accept_length:
         failures.append(
             f"mean accept length {accept_length:.2f} over the three probe reads is "
-            f"not above {min_accept_length:.2f}, so the draft model ran but its "
-            "tokens were never accepted"
+            f"not above {min_accept_length:.2f}, so accepted draft tokens were not "
+            "demonstrated"
         )
     return failures
 
@@ -280,7 +280,11 @@ def probe_prompt(*, index: int, approx_tokens: int) -> str:
 
 
 def generate_with_cache_report(
-    *, base_url: str, prompt: str, max_new_tokens: int
+    *,
+    base_url: str,
+    prompt: str,
+    max_new_tokens: int,
+    routed_dp_rank: Optional[int] = None,
 ) -> CacheObservation:
     """Generate greedily and read back which tier served the prefix.
 
@@ -294,15 +298,18 @@ def generate_with_cache_report(
     Note --enable-cache-report does not gate any of this. It gates the OpenAI usage
     block, which is the path GSM8K takes, not /generate.
     """
+    payload = {
+        "text": prompt,
+        "sampling_params": {
+            "max_new_tokens": max_new_tokens,
+            "temperature": 0.0,
+        },
+    }
+    if routed_dp_rank is not None:
+        payload["routed_dp_rank"] = routed_dp_rank
     response = requests.post(
         base_url.rstrip("/") + "/generate",
-        json={
-            "text": prompt,
-            "sampling_params": {
-                "max_new_tokens": max_new_tokens,
-                "temperature": 0.0,
-            },
-        },
+        json=payload,
         timeout=_REQUEST_TIMEOUT,
     )
     response.raise_for_status()
@@ -310,6 +317,11 @@ def generate_with_cache_report(
     if isinstance(output, list):
         output = output[0]
     meta_info = output["meta_info"]
+    if routed_dp_rank is not None and meta_info.get("dp_rank") != routed_dp_rank:
+        raise RuntimeError(
+            f"request routed to DP rank {routed_dp_rank}, but the response reports "
+            f"dp_rank={meta_info.get('dp_rank')!r}"
+        )
     if "cached_tokens" not in meta_info:
         raise RuntimeError(
             "the /generate response carried no cached_tokens, so no cache accounting "
@@ -335,18 +347,28 @@ def generate_with_cache_report(
 
 
 def run_probe(
-    *, base_url: str, test_name: str, probe_tokens: int, plan: EvictionPlan
+    *,
+    base_url: str,
+    test_name: str,
+    probe_tokens: int,
+    plan: EvictionPlan,
+    routed_dp_rank: Optional[int] = None,
+    flush_cache: bool = True,
 ) -> KvOffloadProbe:
     """Flush, read the probe cold, warm, and again once the fillers evicted it."""
     prompt = probe_prompt(index=0, approx_tokens=probe_tokens)
 
     def generate(text: str, max_new_tokens: int = _MAX_NEW_TOKENS) -> CacheObservation:
         return generate_with_cache_report(
-            base_url=base_url, prompt=text, max_new_tokens=max_new_tokens
+            base_url=base_url,
+            prompt=text,
+            max_new_tokens=max_new_tokens,
+            routed_dp_rank=routed_dp_rank,
         )
 
-    flush = requests.post(base_url.rstrip("/") + "/flush_cache", timeout=60)
-    flush.raise_for_status()
+    if flush_cache:
+        flush = requests.post(base_url.rstrip("/") + "/flush_cache", timeout=60)
+        flush.raise_for_status()
 
     cold = generate(prompt)
     warm = generate(prompt)
@@ -381,6 +403,7 @@ def kv_offload_runner(
     hicache_ratio: float,
     min_accept_length: Optional[float] = None,
     require_counting: bool = True,
+    dp_size: int = 1,
 ):
     """Build a runner that validates device hits and complete host reloads.
 
@@ -395,45 +418,75 @@ def kv_offload_runner(
         hicache_ratio=hicache_ratio,
     )
 
+    if dp_size < 1:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+
     def run(base_url: str) -> Dict[str, Any]:
-        probe = run_probe(
-            base_url=base_url,
-            test_name=test_name,
-            probe_tokens=probe_tokens,
-            plan=plan,
-        )
-        failures = validate_probe(
-            probe=probe,
-            page_size=page_size,
-            plan=plan,
-            require_counting=require_counting,
-        )
-
-        # Record cache-tier counts for diagnosing gate failures.
-        labels = {"model": test_name, "kind": "kv_offload"}
-        dump_metric(
-            f"{test_name}.device_cached_tokens", probe.warm.device_tokens, labels=labels
-        )
-        dump_metric(
-            f"{test_name}.host_cached_tokens", probe.reload.host_tokens, labels=labels
-        )
-
-        if min_accept_length is not None:
-            accept_length = mean_accept_length(probe=probe)
-            verifies = ", ".join(
-                f"{label}={read.spec_verify_ct}"
-                for label, read in _labelled_reads(probe)
+        flush = requests.post(base_url.rstrip("/") + "/flush_cache", timeout=60)
+        flush.raise_for_status()
+        failures = []
+        probes = []
+        for dp_rank in range(dp_size):
+            routed_dp_rank = dp_rank if dp_size > 1 else None
+            probe = run_probe(
+                base_url=base_url,
+                test_name=f"{test_name}/dp{dp_rank}",
+                probe_tokens=probe_tokens,
+                plan=plan,
+                routed_dp_rank=routed_dp_rank,
+                flush_cache=False,
             )
-            print(
-                f"[kv-offload] {test_name}: spec verify forwards {verifies}, mean "
-                f"accept length {accept_length:.2f} against floor {min_accept_length}",
-                flush=True,
+            probes.append(probe)
+            failures += [
+                f"dp_rank={dp_rank}: {failure}"
+                for failure in validate_probe(
+                    probe=probe,
+                    page_size=page_size,
+                    plan=plan,
+                    require_counting=require_counting,
+                )
+            ]
+
+            labels = {
+                "model": test_name,
+                "kind": "kv_offload",
+                "dp_rank": str(dp_rank),
+            }
+            dump_metric(
+                f"{test_name}.device_cached_tokens",
+                probe.warm.device_tokens,
+                labels=labels,
             )
-            dump_metric(f"{test_name}.spec_accept_length", accept_length, labels=labels)
-            failures += spec_failures(probe=probe, min_accept_length=min_accept_length)
+            dump_metric(
+                f"{test_name}.host_cached_tokens",
+                probe.reload.host_tokens,
+                labels=labels,
+            )
+
+            if min_accept_length is not None:
+                accept_length = mean_accept_length(probe=probe)
+                verifies = ", ".join(
+                    f"{label}={read.spec_verify_ct}"
+                    for label, read in _labelled_reads(probe)
+                )
+                print(
+                    f"[kv-offload] {test_name}/dp{dp_rank}: spec verify forwards "
+                    f"{verifies}, mean accept length {accept_length:.2f} against "
+                    f"floor {min_accept_length}",
+                    flush=True,
+                )
+                dump_metric(
+                    f"{test_name}.spec_accept_length", accept_length, labels=labels
+                )
+                failures += [
+                    f"dp_rank={dp_rank}: {failure}"
+                    for failure in spec_failures(
+                        probe=probe, min_accept_length=min_accept_length
+                    )
+                ]
 
         return {
-            "score": probe.reload.host_tokens,
+            "score": sum(probe.reload.host_tokens for probe in probes),
             "_passed": not failures,
             "_failures": failures,
         }

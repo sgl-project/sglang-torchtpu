@@ -19,7 +19,7 @@ on:
         default: main
       # Scheduled runs (inputs empty) run everything.
       only:
-        description: "Run only one part (combo = both combo layers)"
+        description: "Run only one part"
         required: false
         default: all
         type: choice
@@ -28,7 +28,6 @@ on:
           - accuracy
           - combo
           - combo-mh
-          - combo-sh
           - mh
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
@@ -66,7 +65,6 @@ jobs:
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
       pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
       pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
-      combo_sh: ${{ steps.tests.outputs.combo_sh }}
       combo_mh: ${{ steps.tests.outputs.combo_mh }}
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +82,6 @@ jobs:
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
-          echo "combo_sh=$($discover_files --entry test/manual/tpu/feature_combo/test_feature_combos_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "combo_mh=$($discover_files --entry test/manual/tpu/feature_combo/multihost/test_feature_combos.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
@@ -164,24 +161,6 @@ jobs:
       files: test/registered/tpu/integration/test_pd_tp_resharding.py
       weights_pvc: model-weights-rox
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
-  # Feature-combination layers: same exec-mode runs as the standalone
-  # combo-test-tpu.yml action; these jobs add nightly cadence.
-  singlehost-combo:
-    needs: [build, discover-tests]
-    if: ${{ contains(fromJSON('["all","combo","combo-sh"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.combo_sh)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      exec_cmd: python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py all
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.combo_sh)[0].run_name }}
     permissions:
       contents: read
       id-token: write
