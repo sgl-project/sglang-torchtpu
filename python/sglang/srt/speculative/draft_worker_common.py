@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+from sglang.srt.utils import is_tpu
+
 logger = logging.getLogger(__name__)
 
 # trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
@@ -30,6 +32,11 @@ _SUPPORTED_DRAFT_BACKENDS = (
     "triton",
     "ascend",
     "trtllm_mha",
+    "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_batched",
+    "pallas_tpu_flash",
+    "pallas_tpu_mla",
+    "torch_native",
 )
 
 
@@ -47,9 +54,17 @@ def _resolve_draft_attention_backend_fallback(
     if draft_backend is None:
         draft_backend, _ = server_args.get_attention_backends()
     if draft_backend is None:
-        return "triton" if torch.version.hip else "flashinfer"
+        return (
+            "pallas_tpu_rpa_v3"
+            if is_tpu()
+            else ("triton" if torch.version.hip else "flashinfer")
+        )
     if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
-        fallback = "triton" if torch.version.hip else "flashinfer"
+        fallback = (
+            "pallas_tpu_rpa_v3"
+            if is_tpu()
+            else ("triton" if torch.version.hip else "flashinfer")
+        )
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
@@ -101,6 +116,10 @@ def build_draft_tp_worker(
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
+
+    # DFlash drafts have no vocab; borrow the target's.
+    if draft_model_runner.model_config.vocab_size is None:
+        draft_model_runner.model_config.vocab_size = target_model_config.vocab_size
     return DraftWorkerBundle(
         draft_worker=draft_worker,
         draft_model_runner=draft_model_runner,

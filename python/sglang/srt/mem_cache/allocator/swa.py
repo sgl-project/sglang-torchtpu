@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -194,7 +196,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
-        out_indices_cpu: torch.Tensor = None,
+        out_indices_cpu: Optional[torch.Tensor] = None,
     ):
         assert self.page_size > 1
 

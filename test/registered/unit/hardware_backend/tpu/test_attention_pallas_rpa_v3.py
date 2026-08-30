@@ -6,13 +6,38 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    _zero_inactive_rpa_rows,
+)
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    _SCOPED_SMEM_BYTES,
+    _get_pages_per_seq,
+    _page_table_smem_bytes,
+)
+
+
+class TestPageTableSmemBudget(unittest.TestCase):
+    def test_1m_context_default_batch_cap_exceeds_smem(self):
+        # 1,052,672 tokens at page 64 -> 16,448 pages/seq; the default compile
+        # cap of 64 sequences needs 4.2 MB, far above the 1 MiB scoped SMEM.
+        pages = _get_pages_per_seq(1052672, 64)
+        self.assertEqual(pages, 16448)
+        self.assertGreater(_page_table_smem_bytes(64, pages), _SCOPED_SMEM_BYTES)
+        self.assertLessEqual(_page_table_smem_bytes(8, pages), _SCOPED_SMEM_BYTES)
+
+    def test_entries_padded_to_128(self):
+        self.assertEqual(_page_table_smem_bytes(1, 1), 128 * 4)
+        self.assertEqual(_page_table_smem_bytes(2, 100), 256 * 4)
 
 
 class TestAttentionPallasRpaV3(unittest.TestCase):
@@ -28,8 +53,17 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
         req_to_token_device="cpu",
     ):
         pool_width = self.POOL_WIDTH if pool_width is None else pool_width
+        override = get_context().override_server_args(
+            speculative_num_draft_tokens=self.DRAFT_TOKENS,
+            speculative_algorithm="EAGLE3",
+            speculative_num_steps=None,
+            speculative_eagle_topk=1,
+            page_size=self.PAGE_SIZE,
+        )
+        override.install()
+        self.addCleanup(override.restore)
         server_args = SimpleNamespace(
-            max_speculative_num_draft_tokens=self.DRAFT_TOKENS,
+            speculative_num_draft_tokens=self.DRAFT_TOKENS,
             speculative_algorithm="EAGLE3",
             speculative_num_steps=None,
             speculative_eagle_topk=1,
@@ -73,8 +107,22 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=spec_info,
         )
-        distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
-        return backend._build_metadata(forward_batch, distribution)
+        return backend._build_metadata(forward_batch, non_empty_bs=1)
+
+    def _build_padded_decode_metadata(self, backend, active_bs):
+        physical_bs = 128
+        seq_lens = torch.full((physical_bs,), 100, dtype=torch.int32)
+        req_pool_indices = torch.zeros(physical_bs, dtype=torch.int64)
+        forward_batch = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices.clone(),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            spec_info=None,
+        )
+        return backend._build_metadata(forward_batch, non_empty_bs=active_bs)
 
     def test_pages_per_seq_uses_context_plus_spec_headroom(self):
         backend = self._make_backend()
@@ -148,7 +196,6 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
 
     def test_seq_lens_cpu_list_and_empty_inputs(self):
         backend = self._make_backend()
-        distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
 
         # 1. seq_lens_cpu as a Python list
         fb_list = SimpleNamespace(
@@ -160,7 +207,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=None,
         )
-        meta_list = backend._build_metadata(fb_list, distribution)
+        meta_list = backend._build_metadata(fb_list, non_empty_bs=1)
         self.assertIsNotNone(meta_list)
 
         # 2. seq_lens_cpu as empty Tensor (e.g. idle rank forced into decode for DP collectives)
@@ -173,7 +220,7 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=None,
         )
-        meta_empty_tensor = backend._build_metadata(fb_empty_tensor, distribution)
+        meta_empty_tensor = backend._build_metadata(fb_empty_tensor, non_empty_bs=0)
         self.assertIsNotNone(meta_empty_tensor)
 
         # 3. seq_lens_cpu as an empty list
@@ -186,8 +233,51 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=None,
         )
-        meta_empty_list = backend._build_metadata(fb_empty_list, distribution)
+        meta_empty_list = backend._build_metadata(fb_empty_list, non_empty_bs=0)
         self.assertIsNotNone(meta_empty_list)
+
+    def test_active_num_tokens_owns_scalar_storage_for_padded_decode(self):
+        for req_to_token_device in ("cpu", "meta"):
+            with self.subTest(req_to_token_device=req_to_token_device):
+                backend = self._make_backend(req_to_token_device=req_to_token_device)
+                for active_bs in (128, 125):
+                    with self.subTest(active_bs=active_bs):
+                        metadata = self._build_padded_decode_metadata(
+                            backend, active_bs
+                        )
+
+                        self.assertEqual(metadata.cu_q_lens.shape, (129,))
+                        self.assertEqual(metadata.active_num_tokens.shape, ())
+                        self.assertEqual(metadata.active_num_tokens.item(), active_bs)
+                        self.assertNotEqual(
+                            metadata.active_num_tokens.untyped_storage().data_ptr(),
+                            metadata.cu_q_lens.untyped_storage().data_ptr(),
+                        )
+
+                        metadata.cu_q_lens[active_bs] = -1
+                        self.assertEqual(metadata.active_num_tokens.item(), active_bs)
+
+
+class TestInactiveRpaRows(unittest.TestCase):
+    def test_zeros_only_inactive_nan_rows(self):
+        output = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        live_rows = output[:2].clone()
+        output[2:] = float("nan")
+
+        output = _zero_inactive_rpa_rows(output, torch.tensor(2))
+
+        self.assertTrue(torch.equal(output[:2], live_rows))
+        self.assertTrue(torch.equal(output[2:], torch.zeros(2, 8)))
+
+    def test_preserves_non_finite_live_values(self):
+        output = torch.ones(3, 4)
+        output[0, 0] = float("nan")
+        output[2] = float("nan")
+
+        output = _zero_inactive_rpa_rows(output, torch.tensor(2))
+
+        self.assertTrue(torch.isnan(output[0, 0]))
+        self.assertTrue(torch.equal(output[2], torch.zeros(4)))
 
 
 if __name__ == "__main__":

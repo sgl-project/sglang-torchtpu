@@ -25,11 +25,22 @@ class MessageTag(bytes, enum.Enum):
     # Symmetric-TP pull path (decode TP == prefill TP).
     PULL_REQ = b"RAIDEN_PULL_REQ"  # decode -> prefill: "send me room R's blocks"
     BLOCKS = b"RAIDEN_BLOCKS"  # prefill -> decode: block-ids + endpoint + aux
+    CHUNK = b"RAIDEN_CHUNK"  # prefill -> decode: one chunk's pages, mid-prefill
 
     # Asymmetric-TP push-resharding path (decode TP < prefill TP).
     RESHARD_REQ = b"RAIDEN_RESHARD_REQ"  # decode -> prefill: endpoint + blocks + tp
     RESHARD_BLOCKS = b"RAIDEN_RESHARD_BLOCKS"  # prefill -> decode: blocks + rank + aux
     RESHARD_READY = b"RAIDEN_RESHARD_READY"  # decode -> prefill: registered, push now
+    RESHARD_CHUNK = (
+        b"RAIDEN_RESHARD_CHUNK"  # prefill -> decode: one chunk's pages, mid-prefill
+    )
+    RESHARD_CHUNK_READY = (
+        b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
+    )
+
+    # Backend-agnostic abort sent by ``CommonKVReceiver`` to the prefill rank
+    # that owns the room: decode gave up on the request.
+    ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
 
 def pack_ints(values: List[int]) -> bytes:

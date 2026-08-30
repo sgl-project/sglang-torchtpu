@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
@@ -51,6 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
@@ -74,26 +76,26 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "PackWeightMethod",
 }
 
-# When set, LogitsProcessor.forward returns an empty output and skips the
-# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
-# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
-# and its [batch * dp_size, vocab] output OOMs under DP attention with a
-# tight mem_fraction_static.
-_in_autotune_dummy_run = False
+# None outside a FlashInfer autotune pass; inside one, whether that pass runs the
+# LM head. Not-None means the forward's output is discarded -- attention backends
+# read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
+# Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
+# under DP attention with a tight mem_fraction_static.
+_autotune_run_lm_head: Optional[bool] = None
 
 
 def get_in_autotune_dummy_run() -> bool:
-    return _in_autotune_dummy_run
+    return _autotune_run_lm_head is not None
 
 
 @contextmanager
-def autotune_dummy_run_mode():
-    global _in_autotune_dummy_run
-    _in_autotune_dummy_run = True
+def autotune_dummy_run_mode(*, run_lm_head: bool):
+    global _autotune_run_lm_head
+    _autotune_run_lm_head = run_lm_head
     try:
         yield
     finally:
-        _in_autotune_dummy_run = False
+        _autotune_run_lm_head = None
 
 
 @dataclasses.dataclass
@@ -104,7 +106,7 @@ class LogitsProcessorOutput:
     next_token_logits: Optional[torch.Tensor]
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
-    hidden_states: Optional[torch.Tensor] = None
+    hidden_states: torch.Tensor | None = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -152,6 +154,9 @@ class LogitsProcessorOutput:
     # vocabulary. Both tensors have shape [#seq, k].
     next_token_global_top_k_logits: Optional[torch.Tensor] = None
     next_token_global_top_k_token_ids: Optional[torch.Tensor] = None
+
+    # Sampled draft token IDs when draft sampling is fused into draft model forward
+    next_draft_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         has_global_top_k_logits = self.next_token_global_top_k_logits is not None
@@ -238,9 +243,14 @@ class LogitsMetadata:
     draft_extend_select_index: Optional[torch.Tensor] = None
 
     @classmethod
-    def from_forward_batch(cls, forward_batch: ForwardBatch):
+    def from_forward_batch(
+        cls, forward_batch: ForwardBatch, *, compute_input_logprobs: bool = True
+    ):
+        """Build metadata, optionally excluding request-specific prompt logprobs."""
+
         if (
-            forward_batch.forward_mode.is_extend()
+            compute_input_logprobs
+            and forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
         ):
@@ -264,6 +274,17 @@ class LogitsMetadata:
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
+        if compute_input_logprobs:
+            top_logprobs_nums = forward_batch.top_logprobs_nums
+            token_ids_logprobs = forward_batch.token_ids_logprobs
+            extend_input_logprob_token_ids_gpu = (
+                forward_batch.extend_input_logprob_token_ids_gpu
+            )
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
+            extend_input_logprob_token_ids_gpu = None
+
         if forward_batch.forward_mode.is_draft_extend_v2():
             draft_extend_select_index = forward_batch.spec_info.select_index
         else:
@@ -280,9 +301,9 @@ class LogitsMetadata:
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=forward_batch.extend_logprob_start_lens_cpu,
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
-            top_logprobs_nums=forward_batch.top_logprobs_nums,
-            token_ids_logprobs=forward_batch.token_ids_logprobs,
-            extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
+            extend_input_logprob_token_ids_gpu=extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
@@ -351,6 +372,7 @@ class LogitsProcessor(nn.Module):
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
@@ -405,34 +427,8 @@ class LogitsProcessor(nn.Module):
         )
 
         self.input_logprob_processor = InputLogprobProcessor()
-
-    def get_tpu_distributed_top_k_for_batch(
-        self,
-        forward_batch: ForwardBatch,
-        lm_head: VocabParallelEmbedding,
-    ) -> Optional[int]:
-        """Return the static k only when this model can skip the TPU vocab gather.
-        Full-logit models, disabled/DP gathers, and non-sharded heads return ``None``.
-        """
-
-        if (
-            not self.use_tpu_distributed_top_k
-            or not self.do_tensor_parallel_all_gather
-            or self.do_tensor_parallel_all_gather_dp_attn
-        ):
-            return None
-
-        from sglang.srt.hardware_backend.tpu.sampler import (
-            distributed_top_k_for_batch,
-        )
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            supports_distributed_tpu_top_k,
-        )
-
-        top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
-        if top_k is None or not supports_distributed_tpu_top_k(lm_head, top_k):
-            return None
-        return top_k
+        # TPU compilation disables prompt logprobs before tracing the model.
+        self.compute_input_logprobs = True
 
     def forward(
         self,
@@ -448,15 +444,24 @@ class LogitsProcessor(nn.Module):
         distributed_top_k = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
-            distributed_top_k = self.get_tpu_distributed_top_k_for_batch(
-                logits_metadata, lm_head
-            )
-            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+            logits_output_mode = logits_metadata.logits_output_mode
+            if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
+                from sglang.srt.hardware_backend.tpu.sampler import (
+                    distributed_top_k_candidate_width,
+                )
 
-        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
-        # Placed before the MIS / DLLM / common dispatch so all three LM-head
-        # paths are skipped.
-        if _in_autotune_dummy_run:
+                distributed_top_k = distributed_top_k_candidate_width(self, lm_head)
+                if distributed_top_k is None:
+                    raise RuntimeError("DISTRIBUTED_TOP_K is unsupported by this model")
+            logits_metadata = LogitsMetadata.from_forward_batch(
+                logits_metadata,
+                compute_input_logprobs=self.compute_input_logprobs,
+            )
+
+        # Autotune dummy run discards this output. `is False` not `not`: None
+        # means no autotune pass, which must not skip. Placed before the MIS /
+        # DLLM / common dispatch so all three LM-head paths are skipped.
+        if _autotune_run_lm_head is False:
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
@@ -865,15 +870,22 @@ class LogitsProcessor(nn.Module):
         ):
             logits = logits.contiguous().float()
 
+        used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            ):
+                logits = self._tp_lm_head_all_to_all(logits)
+                used_tp_lm_head_all_to_all = True
             else:
                 logits = self._logits_gatherer(logits)
 
-        logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
-        )
+        if not used_tp_lm_head_all_to_all:
+            logits = self._scatter_dp_attn_logits(
+                logits, local_hidden_states, logits_metadata
+            )
 
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
@@ -904,9 +916,25 @@ class LogitsProcessor(nn.Module):
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:
-                logits = torch.matmul(
-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
+                # inputs. Retain explicit FP32 casts for unsupported devices or
+                # dtype combinations.
+                use_mm_out_dtype = (
+                    hidden_states.is_cuda
+                    and hidden_states.dtype == lm_head.weight.dtype
+                    and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 )
+                if use_mm_out_dtype:
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                    )
+                else:
+                    logits = torch.matmul(
+                        hidden_states.to(torch.float32),
+                        lm_head.weight.to(torch.float32).T,
+                    )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
@@ -975,6 +1003,54 @@ class LogitsProcessor(nn.Module):
                 logits,
             )
         return global_logits
+
+    def _can_use_tp_lm_head_all_to_all(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        if not self.use_tp_lm_head_all_to_all:
+            return False
+
+        tp_size = get_parallel().tp_size
+        base_lm_head = getattr(lm_head, "base_layer", lm_head)
+        if getattr(base_lm_head, "tp_size", None) != tp_size:
+            # Tied embeddings may be replicated across DP ranks (tp_size=1),
+            # even though the logits processor runs in a larger global TP
+            # group. Such logits are full-vocabulary rather than TP shards and
+            # therefore do not satisfy the all-to-all layout contract.
+            return False
+
+        # Every participant must make the same collective choice. Decode CUDA
+        # graphs omit CPU counts and fill every GPU count with the same padded
+        # bucket size. Eager batches carry the same global CPU count list on
+        # every rank, so they are also safe when all entries are equal.
+        global_counts_cpu = logits_metadata.global_num_tokens_for_logprob_cpu
+        is_equal_padded_graph_layout = global_counts_cpu is None and (
+            logits_metadata.global_num_tokens_for_logprob_gpu is not None
+        )
+        is_equal_eager_layout = (
+            global_counts_cpu is not None
+            and len(global_counts_cpu) == tp_size
+            and len(global_counts_cpu) > 0
+            and all(count == global_counts_cpu[0] for count in global_counts_cpu)
+        )
+        if not (is_equal_padded_graph_layout or is_equal_eager_layout):
+            return False
+
+        local_rows = local_hidden_states.shape[0]
+        return local_rows > 0 and logits.shape[0] == local_rows * tp_size
+
+    def _tp_lm_head_all_to_all(self, logits: torch.Tensor) -> torch.Tensor:
+        """Exchange only the row block owned by each destination DP rank."""
+        logits = logits.contiguous()
+        all_to_all_output = torch.empty_like(logits)
+        get_tp_group().all_to_all_single(all_to_all_output.view(-1), logits.view(-1))
+        return _reassemble_tp_lm_head_all_to_all_output(
+            all_to_all_output, get_parallel().tp_size
+        )
 
     def _scatter_dp_attn_logits(
         self,
@@ -1131,6 +1207,26 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+
+
+def _reassemble_tp_lm_head_all_to_all_output(
+    all_to_all_output: torch.Tensor, tp_size: int
+) -> torch.Tensor:
+    """Convert source-major all-to-all output to row-major full-vocab logits.
+
+    Each source TP rank contributes ``[local_rows, vocab_shard]`` for this
+    destination DP rank. ``all_to_all_single`` concatenates those contributions
+    along dim 0, while the sampler expects the vocab shards concatenated along
+    dim 1.
+    """
+    assert all_to_all_output.shape[0] % tp_size == 0
+    local_rows = all_to_all_output.shape[0] // tp_size
+    vocab_shard = all_to_all_output.shape[1]
+    return (
+        all_to_all_output.view(tp_size, local_rows, vocab_shard)
+        .permute(1, 0, 2)
+        .reshape(local_rows, tp_size * vocab_shard)
+    )
 
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:

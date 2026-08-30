@@ -51,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -111,6 +112,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_tpu,
     is_xpu,
     log_info_on_rank0,
 )
@@ -121,6 +123,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 
@@ -159,7 +162,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rebuild_topk1_chain_buffers()
 
         # Load draft model weights only.
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+        if (
+            get_parallel().enable_dp_attention
+            and self.speculative_algorithm.is_eagle3()
+        ):
             ctx = draft_tp_context(get_parallel().attn_tp_group)
         else:
             ctx = empty_context()
@@ -183,9 +189,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
+        self._compiled_fused_steps = None
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
@@ -239,7 +246,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             self.draft_runner.compile_policy.precompile_draft(
-                self.draft_attn_backend, self.draft_extend_attn_backend
+                self.draft_attn_backend,
+                self.draft_extend_attn_backend,
+                (
+                    self._fused_draft_forward
+                    if self._should_fuse_draft_steps()
+                    else None
+                ),
             )
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
                 self.draft_runner.init_prefill_cuda_graph(force_for_draft_worker=True)
@@ -325,7 +338,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend = None
 
         draft_backend_factory = DraftBackendFactory(
-            self.server_args,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -407,16 +419,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        supports_hip_aiter_draft_extend_graph = False
+        supports_hip_draft_extend_graph = False
         if _is_hip:
-            # Keep import local so non-HIP environments do not require aiter.
+            # Keep imports local so non-HIP environments do not require these.
+            # aiter packs draft-extend support into the decode (multi-step)
+            # backend; DSV4 exposes it on the draft-extend backend itself.
             from sglang.srt.layers.attention.aiter_backend import (
                 AiterMultiStepDraftBackend,
             )
-
-            supports_hip_aiter_draft_extend_graph = isinstance(
-                self.draft_attn_backend, AiterMultiStepDraftBackend
+            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+                DeepseekV4HipRadixBackend,
             )
+
+            supports_hip_draft_extend_graph = isinstance(
+                self.draft_attn_backend, AiterMultiStepDraftBackend
+            ) or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
 
         graph_supported_backend_types = [
             TritonAttnBackend,
@@ -461,7 +478,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 _is_npu
                 or _is_xpu
                 or supports_cuda_draft_extend_graph
-                or supports_hip_aiter_draft_extend_graph
+                or supports_hip_draft_extend_graph
             )
         ):
             tic = time.perf_counter()
@@ -507,6 +524,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk,
             self.speculative_num_steps,
         )
+        self.draft_runner.compile_policy.prepare_spec_draft_input(
+            forward_batch, draft_input
+        )
         if (
             can_run_decode_cuda_graph
             and not forward_batch.forward_mode.is_idle()
@@ -532,24 +552,43 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.cuda_graph_runner.execute(forward_batch)
                 )
             else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
-                    self.draft_runner.compile_policy.prepare_spec_forward_batch(
-                        forward_batch
+                use_fused_draft = (
+                    self._should_fuse_draft_steps()
+                    and not forward_batch.forward_mode.is_idle()
+                )
+                if self.speculative_num_steps > 1:
+                    self._prepare_draft_forward_batch(
+                        forward_batch, refresh_dp_metadata=use_fused_draft
                     )
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
-                draft_outputs = self.draft_forward(forward_batch)
+                if use_fused_draft:
+                    draft_outputs = self._fused_draft_forward(forward_batch)
+                else:
+                    draft_outputs = self.draft_forward(forward_batch)
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_runner.compile_policy.finalize_spec_forward_batch(
                         outputs=draft_outputs,
                         forward_batch=forward_batch,
                     )
                 )
+
+        # Tree construction consumes scheduler-logical rows.
+        padding = draft_input.padding_state
+        if (
+            padding is not None
+            and padding.physical_batch_size > padding.logical_batch_size
+        ):
+            real_bs = padding.logical_batch_size
+
+            def _unpad_rows(tensor):
+                if isinstance(tensor, torch.Tensor) and tensor.shape[0] > real_bs:
+                    return tensor[:real_bs]
+                return tensor
+
+            parent_list = _unpad_rows(parent_list)
+            top_scores_index = _unpad_rows(top_scores_index)
+            draft_tokens = _unpad_rows(draft_tokens)
+            draft_probs = _unpad_rows(draft_probs)
+            draft_input.bonus_tokens = _unpad_rows(draft_input.bonus_tokens)
 
         return build_eagle_verify_input(
             batch,
@@ -565,6 +604,134 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+
+    def _prepare_draft_forward_batch(
+        self, forward_batch: ForwardBatch, *, refresh_dp_metadata: bool
+    ) -> None:
+        self.draft_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
+        if forward_batch.forward_mode.is_idle():
+            return
+        if refresh_dp_metadata:
+            # The fused loop calls the model directly, bypassing ModelRunner's
+            # normal prepare hook. Publish the final DP bucket metadata after
+            # speculative padding without rebuilding already-consumed inputs.
+            self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
+                forward_batch
+            )
+        self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.mark_forward_metadata_ready()
+
+    def _fused_draft_forward(self, forward_batch: ForwardBatch):
+        """Run all draft steps in one compiled call."""
+        spec_info: EagleDraftInput = forward_batch.spec_info
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p")
+        if self.hot_token_id is not None:
+            topk_index = self.hot_token_id[topk_index]
+
+        attn_backends = self.draft_attn_backend.attn_backends
+        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
+        out_cache_loc = per_step_draft_out_cache_loc(
+            forward_batch.out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
+
+        steps_fn = self._compiled_fused_steps
+        if steps_fn is None:
+            # Model forwards are already compiled; compile only the loop.
+            steps_fn = torch.compile(
+                self._fused_draft_steps,
+                backend="tpu",
+                fullgraph=False,
+                dynamic=False,
+            )
+            self._compiled_fused_steps = steps_fn
+
+        # The fused loop inlines CompiledForwardShim into an outer Dynamo
+        # graph. Gate the batch's HiCache reload eagerly so the shim can omit
+        # the mutable transfer counter while that graph is being traced.
+        compiled_forward_shim = getattr(
+            self.draft_runner.compile_policy, "compiled_forward_shim", None
+        )
+        if compiled_forward_shim is not None:
+            compiled_forward_shim.wait_for_hicache_reload()
+
+        # Draft decode is never a prefill-only operation. A request completing
+        # chunked prefill may retain that scheduler marker. Pin the whole fused
+        # loop to decode while preserving the scheduler-owned value afterward.
+        orig_prefill_only = forward_batch.is_prefill_only
+        forward_batch.is_prefill_only = False
+        try:
+            with forward_context(ForwardContext(attn_backend=attn_backends[0])):
+                token_list = steps_fn(
+                    forward_batch,
+                    topk_p,
+                    topk_index,
+                    hidden_states,
+                    kv_lens_stack,
+                    out_cache_loc,
+                )
+        finally:
+            forward_batch.is_prefill_only = orig_prefill_only
+        spec_info.rpa_draft_kv_lens = None
+
+        bs = token_list[0].shape[0]
+        return (
+            self._topk1_parents_prealloc[:bs],
+            self._topk1_score_indices_prealloc[:bs],
+            torch.cat(token_list, dim=1),
+            None,
+        )
+
+    def _should_fuse_draft_steps(self) -> bool:
+        # The fused outer loop is a Dynamo graph around the compiled model
+        # forwards. The direct tracer deliberately bypasses Dynamo.
+        return (
+            _is_tpu
+            and self.speculative_num_steps > 1
+            and getattr(self.server_args, "tpu_compile_tracer", "dynamo") != "direct"
+        )
+
+    def _fused_draft_steps(
+        self,
+        forward_batch: ForwardBatch,
+        topk_p: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_lens_stack: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ):
+        """Run the compiled draft loop."""
+        num_steps = self.speculative_num_steps
+        model = self.draft_runner.model
+        base_positions = forward_batch.positions
+        tokens: tuple = ()
+        scores = None
+        for i in range(num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            tokens += (tree_info[1],)
+            if i == num_steps - 1:
+                break
+
+            forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
+            forward_batch.spec_info.hidden_states.copy_(hidden_states)
+            forward_batch.input_ids = input_ids
+            forward_batch.out_cache_loc = out_cache_loc[i]
+            logits_output = model.forward(input_ids, base_positions + i, forward_batch)
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.hot_token_id is not None:
+                topk_index = self.hot_token_id[topk_index]
+            hidden_states = logits_output.hidden_states
+        return tokens
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -1055,7 +1222,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -1085,7 +1252,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
-    def war_fastpath_runner(self):
+    def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
         # draft_extend, which runs on the draft runner.
         return self._draft_worker.draft_runner
@@ -1533,7 +1700,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
             topk=self.topk,
-            num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             metadata_ready_pre_pad=False,

@@ -17,6 +17,21 @@ from sglang.benchmark.datasets.common import (
 from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
 
 
+def _sends_token_ids(args: Namespace) -> bool:
+    """Whether prompts go out as token ids rather than text.
+
+    Text prompts are re-tokenized by the server and come back a few percent
+    longer than requested, so the random-ids dataset sends ids wherever the
+    backend accepts them (the sglang /generate API, under either backend
+    alias); --tokenize-prompt forces ids for every dataset on that backend.
+    """
+    if getattr(args, "tokenize_prompt", False):
+        return True
+    return getattr(args, "dataset_name", "") == "random-ids" and getattr(
+        args, "backend", ""
+    ) in ("sglang", "sglang-native")
+
+
 @dataclass
 class RandomDataset(BaseDataset):
     input_len: int
@@ -35,7 +50,7 @@ class RandomDataset(BaseDataset):
             num_requests=args.num_prompts,
             range_ratio=args.random_range_ratio,
             dataset_path=args.dataset_path,
-            return_text=not getattr(args, "tokenize_prompt", False),
+            return_text=not _sends_token_ids(args),
             random_sample=(args.dataset_name == "random"),
         )
 

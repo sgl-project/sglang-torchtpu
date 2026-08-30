@@ -4,23 +4,33 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
+from sglang.srt.compilation.compiled_op import compiled_op
+from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+    make_dflash_verify_bookkeeping_args,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_p_normalize_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_tpu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
+_is_tpu = is_tpu()
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
-_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[int | None, int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -65,6 +75,72 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
+def _dflash_npu_top_k_top_p_renorm_prob(
+    probs: torch.Tensor,
+    *,
+    top_ks: Optional[torch.Tensor] = None,
+    top_ps: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if not is_npu() or probs.device.type != "npu":
+        return None
+    try:
+        import torch_npu
+    except ImportError:
+        return None
+    if not hasattr(torch_npu, "npu_top_k_top_p"):
+        return None
+
+    logits = probs.log()
+    npu_top_ps = (
+        top_ps.reshape(-1).to(device=probs.device, dtype=probs.dtype)
+        if top_ps is not None
+        else None
+    )
+    npu_top_ks = (
+        top_ks.reshape(-1).to(device=probs.device, dtype=torch.int32)
+        if top_ks is not None
+        else None
+    )
+    if npu_top_ks is not None and not bool(
+        torch.all((npu_top_ks >= 1) & (npu_top_ks <= 1024)).item()
+    ):
+        return None
+    filtered_logits = torch_npu.npu_top_k_top_p(logits, npu_top_ps, npu_top_ks)
+    return filtered_logits.softmax(dim=-1)
+
+
+def _dflash_top_k_renorm_prob(
+    probs: torch.Tensor, top_ks: torch.Tensor
+) -> torch.Tensor:
+    if top_k_renorm_prob is not None:
+        return top_k_renorm_prob(probs, top_ks)
+
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
+    if npu_probs is not None:
+        return npu_probs
+
+    vocab_size = probs.shape[-1]
+    top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
+    top_ks = top_ks.clamp(min=1, max=vocab_size)
+    max_top_k = int(top_ks.max().item())
+    topk_probs, topk_indices = torch.topk(probs, k=max_top_k, dim=-1)
+    ranks = torch.arange(max_top_k, device=probs.device)[None, :]
+    topk_probs.masked_fill_(ranks >= top_ks[:, None], 0.0)
+    topk_probs.div_(topk_probs.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
+
+
+def _dflash_top_p_renorm_prob(
+    probs: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    if top_p_renorm_prob is not None:
+        return top_p_renorm_prob(probs, top_ps)
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
+    if npu_probs is not None:
+        return npu_probs
+    return top_p_normalize_probs_torch(probs, top_ps)
+
+
 def dflash_draft_cell_size_per_token(
     *,
     draft_model_config: Any,
@@ -86,7 +162,7 @@ def scale_kv_cell_size_per_token_for_dflash(
     target_cell_size_per_token: int,
     target_num_layers: int,
     draft_num_layers: int,
-    draft_cell_size_per_token: Optional[int] = None,
+    draft_cell_size_per_token: int | None = None,
 ) -> int:
     """Compute bytes/token budget for combined target+draft KV pools (DFLASH).
 
@@ -149,8 +225,7 @@ def apply_dflash_verify_logits_adjustments(
         return
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
     if draft_token_num <= 0:
         raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
@@ -174,7 +249,7 @@ def apply_dflash_verify_logits_adjustments(
     grammar_mask = getattr(sampling_info, "grammar_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
 
-    logits_3d: Optional[torch.Tensor] = None
+    logits_3d: torch.Tensor | None = None
 
     def get_logits_3d() -> torch.Tensor:
         nonlocal logits_3d
@@ -281,7 +356,7 @@ def _get_or_create_chain_verify_buffers(
     )
 
 
-def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
+def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> list[int]:
     """Select target layer indices used to build DFlash context features.
 
     Args:
@@ -321,7 +396,7 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
-def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
     if layer_types is None:
@@ -333,7 +408,7 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     return layer_types
 
 
-def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
@@ -396,8 +471,8 @@ def _parse_optional_int(
     value: Any,
     *,
     field_name: str,
-    min_value: Optional[int] = None,
-) -> Optional[int]:
+    min_value: int | None = None,
+) -> int | None:
     if value is None:
         return None
     try:
@@ -412,12 +487,12 @@ def _parse_optional_int(
 
 @dataclass(frozen=True)
 class DFlashDraftConfig:
-    num_hidden_layers: Optional[int]
-    num_target_layers: Optional[int]
-    block_size: Optional[int]
-    target_layer_ids: Optional[List[int]]
+    num_hidden_layers: int | None
+    num_target_layers: int | None
+    block_size: int | None
+    target_layer_ids: list[int] | None
     mask_token: str
-    mask_token_id: Optional[int]
+    mask_token_id: int | None
 
     def require_num_layers(self) -> int:
         if self.num_hidden_layers is None:
@@ -427,15 +502,15 @@ class DFlashDraftConfig:
             )
         return int(self.num_hidden_layers)
 
-    def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
+    def resolve_block_size(self, *, default: int | None = None) -> int | None:
         return self.block_size if self.block_size is not None else default
 
     def resolve_target_layer_ids(
         self,
         *,
         target_num_layers: int,
-        draft_num_layers: Optional[int] = None,
-    ) -> List[int]:
+        draft_num_layers: int | None = None,
+    ) -> list[int]:
         target_num_layers = int(target_num_layers)
         if target_num_layers <= 0:
             raise ValueError(
@@ -497,7 +572,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         "target_layer_ids",
         _cfg_get(draft_hf_config, "target_layer_ids", None),
     )
-    parsed_target_layer_ids: Optional[List[int]]
+    parsed_target_layer_ids: list[int] | None
     if layer_ids is None:
         parsed_target_layer_ids = None
     else:
@@ -513,7 +588,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"Got len(target_layer_ids)={len(parsed_target_layer_ids)}."
             )
 
-    mask_token = dflash_cfg.get("mask_token", None)
+    mask_token = dflash_cfg.get(
+        "mask_token", _cfg_get(draft_hf_config, "mask_token", None)
+    )
     if mask_token is None:
         mask_token = DEFAULT_DFLASH_MASK_TOKEN
     if not isinstance(mask_token, str) or not mask_token:
@@ -522,7 +599,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"got {mask_token!r}."
         )
 
-    mask_token_id = dflash_cfg.get("mask_token_id", None)
+    mask_token_id = dflash_cfg.get(
+        "mask_token_id", _cfg_get(draft_hf_config, "mask_token_id", None)
+    )
     if mask_token_id is not None:
         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
             raise ValueError(
@@ -546,7 +625,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     )
 
 
-def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
+def can_dflash_slice_qkv_weight(qkv_proj: Any) -> tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
     if not isinstance(quant_method, UnquantizedLinearMethod):
@@ -560,7 +639,7 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
-def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
+def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> tuple[bool, str]:
     """Validate whether a QKV layer is eligible for DFlash fused KV materialization."""
     eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
     if not eligible:
@@ -570,11 +649,34 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+@triton.jit
+def _fused_correct_drafts_and_bonus_kernel(
+    candidates_ptr,
+    target_predict_ptr,
+    num_correct_drafts_ptr,
+    bonus_tokens_ptr,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    in_row = offs < block_size - 1
+    drafts = tl.load(candidates_ptr + b * block_size + 1 + offs, mask=in_row, other=-1)
+    targets = tl.load(target_predict_ptr + b * block_size + offs, mask=in_row, other=-2)
+    eq = (drafts == targets) & in_row
+    # Leading-match count = index of the first mismatch lane; lanes past the
+    # row and all-match rows both resolve to block_size - 1 via the min.
+    num_correct = tl.min(tl.where(eq, BLOCK, offs), 0)
+    bonus_token = tl.load(target_predict_ptr + b * block_size + num_correct)
+    tl.store(num_correct_drafts_ptr + b, num_correct.to(tl.int32))
+    tl.store(bonus_tokens_ptr + b, bonus_token.to(tl.int64))
+
+
 def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
 
     Args:
@@ -605,16 +707,107 @@ def compute_dflash_correct_drafts_and_bonus(
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
-    return correct_len, bonus.to(torch.int64)
+    if candidates.is_cuda:
+        num_correct_drafts = torch.empty(
+            bs, dtype=torch.int32, device=candidates.device
+        )
+        bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
+        _fused_correct_drafts_and_bonus_kernel[(bs,)](
+            candidates.contiguous(),
+            target_predict.contiguous(),
+            num_correct_drafts,
+            bonus_tokens,
+            block_size,
+            BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
+        )
+        return num_correct_drafts, bonus_tokens
+
+    if _is_tpu:
+        if block_size > 1:
+            matches = candidates[:, 1:] == target_predict[:, :-1]
+            all_match = matches.all(dim=1)
+            first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
+            correct_len = torch.where(all_match, block_size - 1, first_mismatch)
+        else:
+            correct_len = torch.zeros(
+                (bs,), dtype=torch.int32, device=candidates.device
+            )
+
+        col_idx = torch.arange(block_size, device=candidates.device).unsqueeze(0)
+        bonus_mask = col_idx == correct_len.to(torch.int64).unsqueeze(1)
+        bonus = torch.where(
+            bonus_mask,
+            target_predict,
+            torch.zeros_like(target_predict),
+        ).sum(dim=1)
+    else:
+        matches = candidates[:, 1:] == target_predict[:, :-1]
+        correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+        bonus = target_predict[
+            torch.arange(bs, device=target_predict.device), correct_len
+        ]
+    return correct_len.to(torch.int32), bonus.to(torch.int64)
+
+
+@compiled_op(warmup=make_dflash_verify_bookkeeping_args)
+def dflash_verify_bookkeeping_torch(
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    prefix_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused DFlash accept/bonus/out_tokens bookkeeping on TPU.
+
+    Args:
+      candidates: Proposed token IDs of shape [bs, block_size].
+      target_predict: Target model predicted token IDs of shape [bs, block_size].
+      prefix_lens: Prefix sequence lengths of shape [bs].
+
+    Returns:
+      Tuple of accept_len, commit_lens, bonus, out_tokens, new_seq_lens.
+    """
+    bs, block_size = candidates.shape
+    device = candidates.device
+
+    if block_size > 1:
+        matches = candidates[:, 1:] == target_predict[:, :-1]
+        all_match = matches.all(dim=1)
+        first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
+        accept_len = torch.where(all_match, block_size - 1, first_mismatch)
+    else:
+        accept_len = torch.zeros((bs,), dtype=torch.int32, device=device)
+
+    commit_lens = accept_len + 1
+    new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
+    col_idx = torch.arange(block_size, device=device).unsqueeze(0)
+    accept_len_2d = accept_len.to(torch.int64).unsqueeze(1)
+    bonus_mask = col_idx == accept_len_2d
+    bonus = torch.where(
+        bonus_mask,
+        target_predict,
+        torch.zeros_like(target_predict),
+    ).sum(dim=1)
+
+    draft_tokens = torch.zeros_like(candidates)
+    if block_size > 1:
+        draft_tokens[:, :-1] = candidates[:, 1:]
+    out_tokens = torch.where(
+        col_idx < accept_len_2d,
+        draft_tokens,
+        torch.where(
+            col_idx == accept_len_2d,
+            target_predict,
+            torch.zeros_like(candidates),
+        ),
+    ).to(torch.int64)
+
+    return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
 
 def apply_dflash_simulated_acceptance(
     *,
     candidates: torch.Tensor,
-    target_predict: Optional[torch.Tensor],
+    target_predict: torch.Tensor | None,
     accept_len: torch.Tensor,
     commit_lens: torch.Tensor,
     bonus: torch.Tensor,
@@ -653,14 +846,14 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
-    max_top_k: Optional[int] = None,
-    uniform_top_k_value: Optional[int] = None,
-    threshold_single: Optional[float] = None,
-    threshold_acc: Optional[float] = None,
-    uniform_samples: Optional[torch.Tensor] = None,
-    uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
+    max_top_k: int | None = None,
+    uniform_top_k_value: int | None = None,
+    threshold_single: float | None = None,
+    threshold_acc: float | None = None,
+    uniform_samples: torch.Tensor | None = None,
+    uniform_samples_for_final_sampling: torch.Tensor | None = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -676,8 +869,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
     if next_token_logits.ndim != 2:
         raise ValueError(
-            "next_token_logits must be 2D, "
-            f"got shape={tuple(next_token_logits.shape)}."
+            f"next_token_logits must be 2D, got shape={tuple(next_token_logits.shape)}."
         )
 
     bs, draft_token_num = candidates.shape
@@ -792,8 +984,8 @@ def build_dflash_verify_target_probs(
     sampling_info: Any,
     draft_token_num: int,
     bs: int,
-    max_top_k: Optional[int] = None,
-    uniform_top_k_value: Optional[int] = None,
+    max_top_k: int | None = None,
+    uniform_top_k_value: int | None = None,
     use_sparse_topk: bool = True,
 ) -> torch.Tensor:
     device = next_token_logits.device
@@ -835,7 +1027,7 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -844,20 +1036,100 @@ def build_dflash_verify_target_probs(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
-            target_probs = top_k_renorm_prob(
+            target_probs = _dflash_top_k_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _dflash_top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(req: Req, enable_overlap: bool) -> str | None:
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     return None
+
+
+@triton.jit
+def _table_qk_norm_rope_kernel(
+    qkv_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_ptr,
+    pos_ptr,
+    row_stride,
+    q_size,
+    NHQ: tl.constexpr,
+    D: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+
+    HALF: tl.constexpr = D // 2
+    half_ar = tl.arange(0, HALF)
+    d_ar = tl.arange(0, D)
+    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
+
+    is_q = h < NHQ
+    col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
+    w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
+        tl.pointer_type(tl.bfloat16)
+    )
+
+    row = qkv_ptr + t * row_stride + col0
+    x = tl.load(row + d_ar).to(tl.float32)
+    ms = tl.sum(x * x, 0) / D
+    inv = 1.0 / tl.sqrt(ms + EPS)
+    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
+    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
+    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
+    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+    x1 = x1.to(tl.bfloat16).to(tl.float32)
+    x2 = x2.to(tl.bfloat16).to(tl.float32)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    tl.store(row + half_ar, o1.to(tl.bfloat16))
+    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
+
+
+def table_qk_norm_rope_(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_dim: int,
+    eps: float,
+) -> None:
+    """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
+
+    Reads cos/sin from the SAME rotary table as the unfused path, so there is
+    no large-position angle drift (unlike theta-recompute kernels). V columns
+    are untouched.
+    """
+    T = qkv.shape[0]
+    if T == 0:
+        return
+    grid = (T, num_q_heads + num_k_heads)
+    _table_qk_norm_rope_kernel[grid](
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        qkv.stride(0),
+        num_q_heads * head_dim,
+        NHQ=num_q_heads,
+        D=head_dim,
+        EPS=eps,
+    )

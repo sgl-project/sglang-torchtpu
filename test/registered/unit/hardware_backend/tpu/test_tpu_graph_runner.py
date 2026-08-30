@@ -22,8 +22,13 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    Eagle3CompilePolicyMixin,
-    SpecDecodeCompilePolicyMixin,
+    BaseSpecDecodeCompilePolicyMixin,
+)
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecodeCompilePolicyMixin,
+)
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang.srt.model_executor.tpu_graph_runner import (
     TpuGraphRunner,
@@ -174,6 +179,7 @@ class TestTpuGraphRunner(CustomTestCase):
             model=model,
             model_config=SimpleNamespace(context_len=2048),
             max_running_requests=1,
+            is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             server_args=server_args,
         )
@@ -279,8 +285,7 @@ class TestTpuGraphRunner(CustomTestCase):
         self.mock_register.assert_called_once()
 
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
-        # EAGLE3 spec composes the spec mixin over the resolved policy (both the
-        # fallback and a model's own annotated policy go through this).
+        # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
         mr = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
             server_args=SimpleNamespace(
@@ -288,16 +293,31 @@ class TestTpuGraphRunner(CustomTestCase):
             ),
         )
         cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
-        self.assertTrue(issubclass(cls, Eagle3CompilePolicyMixin))
-        self.assertTrue(issubclass(cls, SpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, Eagle3SpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
         self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
         # Idempotent: a policy that already implements spec is left untouched.
+        self.assertIs(_augment_spec_policy(cls, mr), cls)
+
+    def test_augment_spec_policy_mixes_spec_over_base_for_dflash(self):
+        # DFLASH spec composes the DFlash spec mixin over the resolved policy.
+        mr = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            server_args=SimpleNamespace(
+                speculative_num_steps=3, speculative_algorithm="DFLASH"
+            ),
+        )
+        cls = _augment_spec_policy(DecoderTpuCompilePolicy, mr)
+        self.assertTrue(issubclass(cls, DFlashSpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, BaseSpecDecodeCompilePolicyMixin))
+        self.assertTrue(issubclass(cls, DecoderTpuCompilePolicy))
         self.assertIs(_augment_spec_policy(cls, mr), cls)
 
     def test_augment_spec_policy_noop_without_spec(self):
         # No speculative decoding -> plain (unmixed) policy.
         no_spec = SimpleNamespace(
-            spec_algorithm=SpeculativeAlgorithm.NONE, server_args=SimpleNamespace()
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            server_args=SimpleNamespace(),
         )
         self.assertIs(
             _augment_spec_policy(DecoderTpuCompilePolicy, no_spec),
@@ -306,7 +326,7 @@ class TestTpuGraphRunner(CustomTestCase):
 
     def test_augment_spec_policy_preserves_explicit_spec_policy(self):
         class _ExplicitSpecPolicy(
-            SpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy
+            BaseSpecDecodeCompilePolicyMixin, DecoderTpuCompilePolicy
         ):
             pass
 
@@ -320,22 +340,16 @@ class TestTpuGraphRunner(CustomTestCase):
             _augment_spec_policy(_ExplicitSpecPolicy, mr), _ExplicitSpecPolicy
         )
 
-    def test_augment_spec_policy_is_algorithm_agnostic(self):
-        # Any spec run gets the spec mixin regardless of algorithm; the mixin
-        # enforces the supported algorithm at construction (non-EAGLE3 raises,
-        # covered in test_decoder_tpu_compile_policy), rather than silently
-        # falling back to a non-spec policy here.
+    def test_augment_spec_policy_noop_for_other_algorithm(self):
         ngram = SimpleNamespace(
             spec_algorithm=SpeculativeAlgorithm.NGRAM,
             server_args=SimpleNamespace(
                 speculative_num_steps=3, speculative_algorithm="NGRAM"
             ),
         )
-        self.assertTrue(
-            issubclass(
-                _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
-                Eagle3CompilePolicyMixin,
-            )
+        self.assertIs(
+            _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
+            DecoderTpuCompilePolicy,
         )
 
     def test_precompile_called_for_installed_policy(self):
@@ -517,6 +531,8 @@ class TestDraftPrecompileOrdering(CustomTestCase):
 
         events = []
         worker = object.__new__(EagleDraftWorker)
+        worker.speculative_num_steps = 3
+        worker.server_args = SimpleNamespace(tpu_compile_tracer="dynamo")
         worker.draft_tp_context = lambda _group: contextlib.nullcontext()
         worker.draft_runner = SimpleNamespace(
             tp_group=object(),
@@ -549,6 +565,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         ), patch(
             "sglang.srt.speculative.eagle_worker_v2.check_cuda_graph_backend",
             return_value=False,
+        ), patch(
+            "sglang.srt.speculative.eagle_worker_v2._is_tpu",
+            True,
         ):
             worker.init_cuda_graphs()
 
@@ -557,8 +576,34 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             capture_decode_cuda_graph=False
         )
         worker.draft_runner.compile_policy.precompile_draft.assert_called_once_with(
-            worker.draft_attn_backend, worker.draft_extend_attn_backend
+            worker.draft_attn_backend,
+            worker.draft_extend_attn_backend,
+            worker._fused_draft_forward,
         )
+
+    def test_fused_draft_refreshes_dp_metadata_after_spec_padding(self):
+        """The direct fused call must publish its final padded DP shape."""
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        events = []
+        worker = object.__new__(EagleDraftWorker)
+        worker.draft_runner = SimpleNamespace(
+            compile_policy=SimpleNamespace(
+                prepare_spec_forward_batch=lambda _batch: events.append("spec"),
+                refresh_fused_draft_dp_metadata=lambda _batch: events.append("dp"),
+            ),
+        )
+        worker.draft_attn_backend = SimpleNamespace(
+            init_forward_metadata=lambda _batch: events.append("metadata")
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            mark_forward_metadata_ready=lambda: events.append("ready"),
+        )
+
+        worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
+
+        self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
 
 
 if __name__ == "__main__":

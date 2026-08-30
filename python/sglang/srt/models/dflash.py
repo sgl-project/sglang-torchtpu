@@ -13,6 +13,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed import (
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -34,13 +38,23 @@ from sglang.srt.speculative.dflash_utils import (
     get_dflash_layer_types,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+
+def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+    """Honor explicit causality while preserving legacy layer defaults."""
+    text_config = config.get_text_config()
+    is_causal = getattr(text_config, "is_causal", None)
+    if is_causal is None:
+        return default
+    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
 
 
 def _get_dflash_layer_attention_params(
@@ -57,17 +71,15 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        text_config = getattr(config, "text_config", None) or config
-        attention_type = (
-            AttentionType.DECODER
-            if getattr(text_config, "is_causal", False)
-            else AttentionType.ENCODER_ONLY
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
         )
-        return -1, attention_type
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, AttentionType.DECODER
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
@@ -149,6 +161,13 @@ class DFlashAttention(nn.Module):
         )
 
         self.scaling = head_dim**-0.5
+        rotary = self.rotary_emb
+        self.use_table_qk_norm_rope = (
+            not (_is_npu or _is_tpu)
+            and hasattr(rotary, "cos_sin_cache")
+            and getattr(rotary, "rotary_dim", None) == head_dim
+            and getattr(rotary, "is_neox_style", False)
+        )
         self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
@@ -191,6 +210,21 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
+        elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            from sglang.srt.speculative.dflash_utils import table_qk_norm_rope_
+
+            table_qk_norm_rope_(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
@@ -359,11 +393,12 @@ class DFlashDraftModel(nn.Module):
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
         draft_config = parse_dflash_draft_config(draft_hf_config=config)
-        target_num_layers = (
-            int(draft_config.num_target_layers)
-            if draft_config.num_target_layers is not None
-            else num_layers
-        )
+        if draft_config.num_target_layers is not None:
+            target_num_layers = int(draft_config.num_target_layers)
+        elif draft_config.target_layer_ids is not None:
+            target_num_layers = max(draft_config.target_layer_ids) + 1
+        else:
+            target_num_layers = num_layers
         target_layer_ids = draft_config.resolve_target_layer_ids(
             target_num_layers=target_num_layers, draft_num_layers=num_layers
         )
@@ -376,6 +411,7 @@ class DFlashDraftModel(nn.Module):
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
         self.block_size = draft_config.resolve_block_size(default=16)
+        self.lm_head: nn.Module | None = None
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -399,6 +435,53 @@ class DFlashDraftModel(nn.Module):
             )
         return self.hidden_norm(self.fc(target_hidden))
 
+    def _sample_draft_tokens_tpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Sample draft tokens on TPU using target lm_head."""
+        if self.lm_head is None:
+            raise ValueError("DFlash draft on TPU requires lm_head.")
+        hs_3d = hidden_states.view(-1, self.block_size, hidden_states.shape[-1])
+        bs = hs_3d.shape[0]
+        hs_1d = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
+        hs = (
+            hs_1d
+            if hs_1d.dtype == self.lm_head.weight.dtype
+            else hs_1d.to(self.lm_head.weight.dtype)
+        )
+
+        tp_size = (
+            int(get_tp_group().world_size) if model_parallel_is_initialized() else 1
+        )
+
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            TpuVocabShard,
+            distributed_tpu_top_k,
+            supports_distributed_tpu_top_k,
+        )
+
+        if tp_size > 1 and supports_distributed_tpu_top_k(self.lm_head, top_k=1):
+            local_logits = torch.matmul(hs, self.lm_head.weight.T)
+            _, global_token_ids = distributed_tpu_top_k(
+                local_logits,
+                TpuVocabShard.from_lm_head(self.lm_head),
+                k=1,
+                group=get_tp_group(),
+            )
+            tokens = global_token_ids.squeeze(-1).to(torch.long)
+            return tokens.view(bs, self.block_size - 1)
+
+        shard = getattr(self.lm_head, "shard_indices", None)
+        num_org = int(shard.num_org_elements) if shard is not None else 0
+        org_vocab_start = int(shard.org_vocab_start_index) if shard is not None else 0
+        if num_org > 0:
+            local_logits = torch.matmul(hs, self.lm_head.weight[:num_org].T)
+        else:
+            local_logits = torch.matmul(hs, self.lm_head.weight.T)
+
+        tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
+        if org_vocab_start > 0:
+            tokens.add_(org_vocab_start)
+        return tokens.view(bs, self.block_size - 1)
+
     @torch.no_grad()
     def forward(
         self,
@@ -409,9 +492,24 @@ class DFlashDraftModel(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
+        """Forward pass for the DFlash draft model.
+
+        Args:
+          input_ids: [num_tokens] token IDs.
+          positions: [num_tokens] position indices.
+          forward_batch: Forward batch metadata.
+          input_embeds: Optional [num_tokens, hidden_size] input embeddings.
+          get_embedding: Whether to return embeddings.
+          pp_proxy_tensors: Optional pipeline parallel proxy tensors.
+
+        Returns:
+          LogitsProcessorOutput with hidden states.
+        """
         if input_embeds is None:
             if hasattr(self, "forward_embed"):
                 input_embeds = self.forward_embed(input_ids)
+            elif forward_batch and forward_batch.input_embeds is not None:
+                input_embeds = forward_batch.input_embeds
             else:
                 raise ValueError(
                     "DFlashDraftModel requires `input_embeds` (use the target "
@@ -431,8 +529,14 @@ class DFlashDraftModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
+        if _is_tpu and hidden_states.numel() != 0:
+            next_draft_tokens = self._sample_draft_tokens_tpu(hidden_states)
+        else:
+            next_draft_tokens = None
+
         return LogitsProcessorOutput(
             next_token_logits=None,
+            next_draft_tokens=next_draft_tokens,
             hidden_states=hidden_states,
         )
 
@@ -448,6 +552,12 @@ class DFlashDraftModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
+        # Alias the native export's "encoder." names.
+        _VENDOR_ENCODER_ALIASES = {
+            "encoder.fc.weight": "fc.weight",
+            "encoder.output_norm_enc.weight": "hidden_norm.weight",
+        }
+
         def resolve_param_name(name: str) -> Optional[str]:
             if name in params_dict:
                 return name
@@ -459,6 +569,9 @@ class DFlashDraftModel(nn.Module):
                 prefixed_name = f"model.{name}"
                 if prefixed_name in params_dict:
                     return prefixed_name
+            aliased_name = _VENDOR_ENCODER_ALIASES.get(name)
+            if aliased_name is not None and aliased_name in params_dict:
+                return aliased_name
             return None
 
         for name, loaded_weight in weights:
@@ -586,4 +699,8 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(self.fc(fused))
 
 
-EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM]
+class MuseGlimmerAssistantModel(DFlashDraftModel):
+    """Alias for checkpoints declaring architectures=["MuseGlimmerAssistantModel"]."""
+
+
+EntryClass = [DFlashDraftModel, DFlashLagunaForCausalLM, MuseGlimmerAssistantModel]

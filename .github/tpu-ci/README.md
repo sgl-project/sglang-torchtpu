@@ -4,6 +4,10 @@ PR-gate and nightly SGLang tests on Google Cloud TPU, dispatched from GitHub
 Actions into a reserved GKE cluster. Auth is keyless (Workload Identity
 Federation); no long-lived keys.
 
+> **External cluster:** the `external-nightly-*` suites run the same tests on
+> the external tpu7x cluster, serving weights from the CI bucket over gcsfuse. That path
+> has its own renderer/workflow/config — see [`external/README.md`](external/README.md).
+
 ## Architecture
 
 ```
@@ -104,9 +108,9 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 ```
 build ─────────────────────────────────┐
-  ├─▶ single-host           (hosts=1)  │  suite: nightly-tpu-4-v7
-  ├─▶ singlehost-combo      (hosts=1)  │  exec: feature_combo singlehost
-  ├─▶ multihost-combo       (hosts=2)  │  exec: feature_combo pd | spec
+  ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
+  │    suite: nightly-tpu-4-v7
+  ├─▶ P/D feature gates     (hosts=2)  │  dedicated registered tests
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
 ```
 
@@ -131,6 +135,10 @@ One ClusterQueue per `(lane, hosts)`. The shapes must not share a queue: a 2-hos
 A PodSet is assigned exactly one ResourceFlavor, which is what keeps a multi-host JobSet's
 two pods inside a single slice.
 
+Multihost P/D (2p+2d) is one JobSet with two PodSets, one 2x2x2 slice each — the whole
+`tpu-nightly-2h` quota. Kueue admits a Workload's PodSets atomically, so a P/D run takes
+both slices or waits; there is no GitHub-side P/D lock.
+
 Before creating the JobSet, `_tpu-test.yml` runs `reconcile_quota.py --pool=<pool>`, which
 sets every ClusterQueue's `nominalQuota` from live allocatable chips and refuses to submit
 if the target pool holds more than one slice. After creating it, the workflow asserts Kueue
@@ -147,9 +155,9 @@ quota entry — no workflow change.
 
 | phase | budget | covers |
 |-------|--------|--------|
-| admission | the runner's remaining lifetime (~2h55m launch, 3h25m exec) | suspended in Kueue; no pods exist yet |
+| admission | the runner's remaining lifetime | suspended in Kueue; no pods exist yet |
 | running | 900s | placed, but binding + image pull |
-| runtime | 9600 (launch) / 7800 (exec) / `est_time`×1.5+600 (suite) | the test itself |
+| runtime | 9600 (launch) / 7800 (exec) / `est_time`×1.5+600 (single-host shard) | the test itself |
 
 One slice runs one multi-host job at a time, so a job's wait is however long everything
 queued ahead of it takes — there is no useful number smaller than "as much of the runner as
@@ -157,6 +165,9 @@ is left". `admit_s` is therefore derived: `timeout-minutes` (360, GitHub's hard 
 hosted runners) minus this job's own runtime, the bind/pull window and setup. The runtime
 figure must OUTLAST the JobSet's `activeDeadlineSeconds` so the JobSet — not the poll loop —
 reports the outcome.
+
+The nightly single-host suite uses three deterministic LPT partitions with
+`max-parallel: 1`, so the shards reuse one image build and one TPU slice.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
@@ -186,8 +197,10 @@ _TODO._
 
 | Path | Purpose |
 |------|---------|
-| `docker/tpu.Dockerfile` | TPU image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
-| `docker/cloudbuild.tpu.yaml` | Cloud Build config; runs **as `tpu-ci`**, token from the metadata server, pushes to AR |
+| `docker/tpu-base.Dockerfile` | TPU base image: installs `python/pyproject_tpu.toml` from the private torch-tpu registry (token via BuildKit secret) |
+| `docker/cloudbuild.tpu-base.yaml` | Cloud Build config for base image; runs **as `tpu-ci`**, pushes `sglang-tpu-base` to AR |
+| `docker/tpu.Dockerfile` | Final TPU image: builds on `sglang-tpu-base` and installs editable SGLang without reinstalling deps |
+| `docker/cloudbuild.tpu.yaml` | Cloud Build config for final image; builds on base and pushes `sglang-tpu` to AR |
 | `.github/tpu-ci/topology.yaml` | `(lane, host count)` → slice `{topology, pool, queue}` (detection source of truth) |
 | `.github/tpu-ci/kueue-controller-resources.yaml` | Strategic-merge patch dropping the Kueue controller's CPU request to fit `system-pool`; re-apply after every Kueue upgrade |
 | `.github/tpu-ci/kueue-tpu.yaml` | Kueue ResourceFlavors (one per slice), one ClusterQueue + LocalQueue per `(lane, hosts)` |
@@ -199,30 +212,45 @@ _TODO._
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
-| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → single-host + discover → multi-host **matrix** over groups |
+| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → fixed single-host LPT matrix + discover → multi-host **matrix** over groups |
 
 ## Cluster infra
 
 CI node pools, all on the `ghostfish-u2zcmybntv70q` reservation. Create a new one with
-`--machine-type=tpu7x-standard-4t --reservation-affinity=specific --node-labels=ci-tpu-pool=…
---workload-metadata=GKE_METADATA`; multi-host also needs `--tpu-topology` plus a
-`workload-policy` resource policy (`--type=HIGH_THROUGHPUT --accelerator-topology=<topo>`).
+`--machine-type=tpu7x-standard-4t --reservation-affinity=specific
+--node-labels=ci-tpu-pool=<unique>,ci-tpu-lane=<lane> --workload-metadata=GKE_METADATA`;
+multi-host also needs `--tpu-topology` plus a `workload-policy` resource policy
+(`--type=HIGH_THROUGHPUT --accelerator-topology=<topo>`).
 Single-host pools take **no** `--tpu-topology` — GKE derives `2x2x1` from the machine type,
 and passing it takes the multi-host path, which is rejected for this machine type.
 
-| pool | `ci-tpu-pool` | topology | nodes | chips |
-|------|---------------|----------|-------|-------|
-| `ci-tpu7x-2x2x1` | `pr-gate` | 2x2x1 | 2 | 8 |
-| `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | 2x2x2 | 2 | 8 |
-| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | 2x2x1 | 3 | 12 |
-| `ci-tpu7x-2x2x2` | `nightly` | 2x2x2 | 2 | 8 |
-| `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | 2x2x4 | 4 | 16 |
+**Both labels matter.** `ci-tpu-pool` must be unique per slice (it is the only selector
+that can pin a gang to one slice — tpu7x exposes no per-slice label). `ci-tpu-lane` is what
+`discover_pools.py` reads to place the pool in a lane without a code change: it unions the
+discovered pools into `topology.yaml`'s list, mints the Kueue `ResourceFlavor`, and attaches
+it to that `(lane, hosts)`'s ClusterQueue. Omit `ci-tpu-lane` and the pool is simply never
+used — no error, so check the `pools for lane=… hosts=…` line in the job log.
+
+| pool | `ci-tpu-pool` | `ci-tpu-lane` | topology | nodes | chips |
+|------|---------------|---------------|----------|-------|-------|
+| `ci-tpu7x-2x2x1` | `pr-gate` | `pr-gate` | 2x2x1 | 2 | 8 |
+| `ci-tpu7x-2x2x2-prgate` | `pr-gate-2h` | `pr-gate` | 2x2x2 | 2 | 8 |
+| `ci-tpu7x-2x2x1-nightly` | `nightly-1h` | `nightly` | 2x2x1 | 3 | 12 |
+| `ci-tpu7x-2x2x2` | `nightly` | `nightly` | 2x2x2 | 2 | 8 |
+| `ci-tpu7x-2x2x2-b` | `nightly-b` | `nightly` | 2x2x2 | 2 | 8 |
+| `ci-tpu7x-2x2x4-nightly` | `nightly-4h` | `nightly` | 2x2x4 | 4 | 16 |
+
+The pools above predate `ci-tpu-lane` and are still carried by `topology.yaml`'s static
+list, so they work whether or not the label is applied; the column records what to set when
+backfilling. Discovery unions rather than replaces precisely so a partial backfill cannot
+shrink the pool set.
 
 Only the `2x2x1` pools are safe to resize — each of their nodes is already a whole slice,
 so quota follows automatically via `reconcile_quota.py` and no manifest edit is needed.
 Resizing a multi-host pool puts two slices behind one `ci-tpu-pool` label and a JobSet's
 pods can straddle them: no error, just an ICI rendezvous hang. `reconcile_quota.py` refuses
-to submit when it sees that, but the fix is to add capacity as a **new pool**.
+to submit when it sees that, but the fix is to add capacity as a **new pool** — which, with
+both labels set, needs no edit to `topology.yaml` or `kueue-tpu.yaml`.
 
 - `tpu7x-2x2x2-haolin-dev` and `tpu7x-2x2x2-mimo` also exist — not CI, do not repurpose.
 - `system-pool` (e2-standard-2 ×2) hosts the **JobSet operator v0.12.0** and the **Kueue
@@ -389,6 +417,88 @@ Topology-Aware Scheduling instead.
 
 Qwen3-0.6B **OOMs at tp>1** on tpu7x (a bug: ~151G HLO temporaries > 94G HBM) — do not
 use it as a multi-host launch model. Multi-host tests use Qwen3-30B-A3B-FP8.
+
+## Dashboard — making a new test show up
+
+The nightly dashboard is generated **outside this repo** (`ci-monitor/src/tpu_ci.py`
+and `tpu_dashboard.py` in `radixark/keel`, reusing the same parsers as the upstream
+sglang CI dashboard). Nothing here renders it, and nothing here needs to change to add
+a test to it — its **only** input is the job log this repo already prints. What follows
+is the contract that log has to satisfy.
+
+**Correctness (overview + history tabs) is free.** Register the file the usual way and
+the parser picks it up from `run_suite.py`'s `Test Summary` / `TIMINGS` block, or from
+the multi-host loop's per-file records:
+
+```python
+register_tpu_ci(est_time=3000, suite="nightly-tpu-4-v7", nightly=True)
+```
+
+Only **scheduled** nightlies are ingested; a `workflow_dispatch` run is not a data point.
+
+**Accuracy and performance tabs are driven by `dump_metric` labels.** A metric lands in
+a tab because the test said so, never because the dashboard pattern-matched its name:
+
+```python
+from sglang.test.test_utils import dump_metric
+
+# -> accuracy tab
+dump_metric("mmlu_score", 0.82, labels={"model": MODEL, "eval": "simple-evals"})
+
+# -> performance tab
+dump_metric(f"{test_name}.{workload}.total_throughput", tok_s,
+            labels={"model": MODEL, "workload": workload, "c": concurrency})
+```
+
+Resolution order, highest first:
+
+| what the test passes | tab |
+|---|---|
+| `labels={"kind": "accuracy"}` or `{"kind": "performance"}` | that one, unconditionally |
+| `labels={"workload": ...}` | performance |
+| `labels={"eval": ...}` | accuracy |
+| none of the above | **neither** — the build prints a `warning: N metric(s) carry no kind` naming them |
+
+Use the explicit `kind` for anything that is not a throughput sweep or an eval score;
+the other two rows are just the shapes the existing emitters already happen to pass.
+`labels["model"]` is what keys a chart's series, so keep it stable — a model that is
+sometimes an HF id and sometimes a mount path becomes two unrelated trends.
+
+**Server / bench config panels come free** for a perf test that launches through
+`RecipeLauncher` and measures with `benchmark/tpu/bench_serving.sh`. The launcher
+prints its exact boot env, the script echoes the settings it resolved, and the
+dashboard reassembles both into the two collapsed commands under each chart. A test
+that boots a server by hand gets a chart with no reproduce commands.
+
+**Multi-host tests must let the job name its files.** `jobset-tpu.yaml` prints
+`== test files: ... ==` before the server boots. A job that dies during bring-up has
+no test to blame otherwise, and it would land on the dashboard as a row named after
+the job. Keep that line ahead of anything that can fail.
+
+**P/D tests get the same two markers from `jobset-tpu-pd.yaml`,** driven by
+`_tpu-test.yml`'s `files` input (`render_jobset.py --files`, which P/D mode
+*requires* — an empty one would emit a record with no `file`). Every pod of both
+slices announces the files; only the prefill leader emits the TIMINGS record,
+because the other three run the same command but do not carry the verdict, and
+four records would be four duplicate rows for one test.
+
+**A dispatch-only workflow earns no history row.** Only scheduled runs are
+ingested, so a test that lives solely in `integration-test-tpu.yml`
+(`workflow_dispatch` only) never trends no matter how well-formed its log is. It
+needs a leg in `nightly-test-tpu.yml` too — that is what the
+`pd-mh-gpt-120b-pc-offload` and `pd-mh-gpt-120b-tp-reshard` jobs are.
+
+Sanity-check a new test's log against the parser before waiting a night for it:
+
+```bash
+# from a keel checkout, against nightlies that already ran (needs repo read scope)
+export GITHUB_TOKEN=$(gh auth token)
+python3 ci-monitor/src/tpu_ci.py sync --limit 3 --db-dir /tmp/tpu-ci
+python3 ci-monitor/src/tpu_dashboard.py --db-dir /tmp/tpu-ci --out /tmp/tpu-ci.html
+```
+
+`sync` is idempotent — records are keyed by run, so re-running over the same window
+converges instead of duplicating.
 
 ## Local validation helpers
 

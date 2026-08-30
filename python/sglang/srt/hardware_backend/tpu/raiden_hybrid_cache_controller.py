@@ -10,9 +10,10 @@ one all-layer raiden DMA per pool.
 torch_tpu has no real device streams or events, so the CUDA
 ``HybridCacheController`` data path (side streams, per-layer load loop,
 recorded events) is replaced the same way ``TpuRaidenHiCacheController``
-replaces the single-pool path: poll-only future-events for acks, a
+replaces the single-pool path: raiden issues every copy on its own background
+thread and returns poll-only future-events, which serve as the acks and feed a
 ``BatchDoneCounter`` gating the whole forward instead of a per-layer
-``LayerDoneCounter``, and index tensors kept host-resident throughout
+``LayerDoneCounter``; index tensors stay host-resident throughout
 (``SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1``).
 """
 
@@ -23,7 +24,6 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
@@ -52,18 +52,6 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         # whole-batch ``wait()`` resolves against the reload event.
         self.layer_done_counter = BatchDoneCounter()
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
-
-        # Same worker-thread H2D overlap as the single-pool raiden controller:
-        # raiden's H2d releases the GIL while it blocks, and the
-        # BatchDoneCounter gates the consuming forward on the worker event.
-        # SGLANG_TPU_RAIDEN_ASYNC_H2D=0 selects the inline poll-to-complete
-        # path.
-        self._async_h2d = envs.SGLANG_TPU_RAIDEN_ASYNC_H2D.get()
-        self._load_worker = None
-        if self._async_h2d:
-            from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
-
-            self._load_worker = TpuKvCopyWorker("raiden-hybrid-h2d")
 
     # ----- draft registration guards -----------------------------------------
 
@@ -96,13 +84,11 @@ class TpuRaidenHybridCacheController(HybridCacheController):
     # ----- lifecycle ---------------------------------------------------------
 
     def reset(self):
-        # Drain outstanding D2H write-backs before the base clears the ack
-        # queues and the cache frees host pages: a page raiden is still writing
-        # must not return to the free list mid-DMA.
-        for ack in list(self.ack_write_queue):
+        # Drain outstanding DMAs before the base clears the ack queues and the
+        # cache frees pages: a page raiden is still copying must not return to
+        # a free list mid-DMA.
+        for ack in list(self.ack_write_queue) + list(self.ack_load_queue):
             ack.finish_event.synchronize()
-        if self._load_worker is not None:
-            self._load_worker.submit(lambda: None).synchronize()
         self.layer_done_counter.reset()
         super().reset()
 
@@ -218,40 +204,11 @@ class TpuRaidenHybridCacheController(HybridCacheController):
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
 
-        if self._async_h2d:
-            # Issue every pool's H2d on the worker thread and return; the
-            # forward's CompiledForwardShim wait() blocks on the worker event,
-            # so the (GIL-releasing) DMAs overlap whatever the scheduler runs
-            # before the consuming forward.
-            def _load():
-                for ev in self._issue_pool_dmas(op, load=True):
-                    ev.synchronize()
-
-            worker_done = self._load_worker.submit(_load)
-            # BatchDoneCounter has 2 slots, so round N reuses round N-2's slot
-            # and update_producer() synchronizes on it. Safe only because the
-            # single FIFO worker cannot dequeue round N's _load until round
-            # N-2's has returned. Parallelizing the worker or growing
-            # num_counters would break this invariant.
-            self.layer_done_counter.set_event(producer_id, worker_done)
-            self.ack_load_queue.append(
-                HiCacheAck(
-                    start_event=worker_done,
-                    finish_event=worker_done,
-                    node_ids=op.node_ids,
-                    num_tokens=len(op.device_indices),
-                    num_tokens_by_pool=self._num_tokens_by_pool(op),
-                    num_bytes=self._transfer_num_bytes(op),
-                )
-            )
-            return producer_id
-
-        # Inline path: all pools' H2d, then block until every DMA has landed
-        # (poll-only; never Await). TPU's wait_event is a no-op and the
-        # consuming forward runs this same step, so the load must complete
-        # here.
+        # All pools' H2d; each future-event comes back before its DMA lands.
+        # The consuming forward's CompiledForwardShim wait() polls the combined
+        # event through the whole-batch gate (poll-only; never Await), so the
+        # DMAs overlap whatever the scheduler runs before that forward.
         finish_event = CombinedFutureEvent(self._issue_pool_dmas(op, load=True))
-        finish_event.synchronize()
         self.layer_done_counter.set_event(producer_id, finish_event)
         self.ack_load_queue.append(
             HiCacheAck(

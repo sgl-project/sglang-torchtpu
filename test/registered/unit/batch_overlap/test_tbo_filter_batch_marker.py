@@ -10,7 +10,11 @@ import unittest
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    LogitsOutputMode,
+)
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -86,6 +90,17 @@ class TestTboFilterBatchMarker(CustomTestCase):
 
         self.assertEqual(child.req_pool_indices.tolist(), [2, 3, 4, 5])
         self.assertEqual(child.req_pool_indices_cpu.tolist(), [2, 3, 4, 5])
+
+    def test_filter_preserves_logits_output_mode(self):
+        parent = _make_target_verify_batch(8)
+        parent.logits_output_mode = LogitsOutputMode.DISTRIBUTED_TOP_K
+
+        child = _filter(parent, lo=0, hi=4)
+
+        self.assertIs(
+            child.logits_output_mode,
+            LogitsOutputMode.DISTRIBUTED_TOP_K,
+        )
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:

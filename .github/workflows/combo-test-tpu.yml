@@ -1,12 +1,6 @@
-# TPU feature-combination e2e -- both layers of test/manual/tpu/feature_combo/,
-# via _tpu-test's exec mode:
-#   singlehost-combo-test:        engine-level combos 1/2/3 (Qwen3-1.7B, pr-gate host)
-#   multihost-combo-test-{pd,spec}: P/D and spec rows across the 2x2x2 slice
-# The same layers run nightly (nightly-test-tpu.yml); this action is the isolated
-# trigger:
-#   gh workflow run combo-test-tpu.yml [-f target=singlehost|multihost|pd|spec] \
-#     [-f singlehost_model=qwen3-1.7b|qwen3-coder-480b] \
-#     [-f singlehost_combo=1|2|3|all] [-f ref=<branch>]
+# Isolated trigger for the registered GPT-OSS-120B 2P+2D feature test.
+# The same test also runs from nightly-test-tpu.yml.
+#   gh workflow run combo-test-tpu.yml [-f ref=<branch>]
 name: Combo Test (TPU)
 
 on:
@@ -16,28 +10,11 @@ on:
         description: "Git ref to test"
         required: false
         default: main
-      target:
-        description: "Which combo layer/row to run"
-        required: false
-        default: all
-        type: choice
-        options: [all, singlehost, multihost, pd, spec]
-      singlehost_model:
-        description: "Model profile for the single-host combos"
-        required: false
-        default: qwen3-1.7b
-        type: choice
-        options: [qwen3-1.7b, qwen3-coder-480b]
-      singlehost_combo:
-        description: "Single-host combo to run"
-        required: false
-        default: all
-        type: choice
-        options: [all, "1", "2", "3"]
 
 concurrency:
-  group: tpu-combo
-  cancel-in-progress: false   # let a running combo finish; don't stack them
+  # Different refs can use separate nightly slices. Runs for one ref serialize.
+  group: tpu-combo-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false # Let a running test finish. Do not stack runs.
 
 jobs:
   build:
@@ -48,47 +25,21 @@ jobs:
       contents: read
       id-token: write
 
-  singlehost-combo:
+  pd-mh-gpt-120b-pc-offload-spec:
     needs: build
-    if: ${{ contains(fromJSON('["all","singlehost"]'), inputs.target || 'all') }}
-    name: singlehost-combo-test
+    name: pd-mh-gpt-120b-pc-offload-spec
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
-      hosts: 1
-      exec_cmd: >-
-        ${{ inputs.singlehost_model == 'qwen3-coder-480b'
-            && format('env MODEL=/weights/Qwen3-Coder-480B-A35B-Instruct-FP8 DRAFT_MODEL=/weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-coder-480b {0}', inputs.singlehost_combo || 'all')
-            || format('python3 test/manual/tpu/feature_combo/test_feature_combos_singlehost.py --model-profile qwen3-1.7b {0}', inputs.singlehost_combo || 'all') }}
-      weights_pvc: ${{ inputs.singlehost_model == 'qwen3-coder-480b' && 'qwen3-coder-480b-rox' || '' }}
-      run_name: combo-${{ inputs.singlehost_model || 'qwen3-1.7b' }}-${{ inputs.singlehost_combo || 'all' }}
-    permissions:
-      contents: read
-      id-token: write
-
-  multihost-combo:
-    needs: build
-    if: ${{ contains(fromJSON('["all","multihost","pd","spec"]'), inputs.target || 'all') }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # matrix context is unavailable in job-level `if`; selection shapes the matrix.
-        row: ${{ (inputs.target == 'pd' && fromJSON('["pd"]')) || (inputs.target == 'spec' && fromJSON('["spec"]')) || fromJSON('["pd","spec"]') }}
-    name: multihost-combo-test-${{ matrix.row }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
       hosts: 2
-      # pd: FP8 30B from the shared disk (functional oracle -- quant-safe).
-      # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access).
-      exec_cmd: >-
-        ${{ matrix.row == 'pd'
-            && 'env MODEL=/weights/Qwen3-30B-A3B-FP8 python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd'
-            || 'python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec' }}
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
       weights_pvc: model-weights-rox
-      run_name: multihost-combo-test-${{ matrix.row }}
+      run_name: pd-mh-gpt-120b-pc-offload-spec
     permissions:
       contents: read
       id-token: write

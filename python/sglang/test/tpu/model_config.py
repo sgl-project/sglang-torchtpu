@@ -20,6 +20,10 @@ call, so a test file is a register call, a dict, and two lines to run it:
     if __name__ == "__main__":
         model_config_main(MODEL_CONFIG)
 
+``model_config_main`` also takes a LIST of configs, which is how one file covers
+several models -- see test_tpu_perf.py, where two models want the same sweep but
+different servers. One TestCase per config, run in sequence.
+
 Top level
     model         Model path or HF id. Reported, and sent as the model id by the eval
                   clients; the recipe is what actually sets MODEL on the server.
@@ -29,6 +33,12 @@ Top level
                   Defaults to `model`.
     variant       Distinguishes launch configs of the same model in reports, e.g.
                   "TP8+EP8". Cosmetic while a model has one config.
+    dashboard     "accuracy" -> each non-sweep gate's score is dumped as
+                  `[METRIC] {label}={score}` with kind=accuracy, which is what puts
+                  it on the CI dashboard's accuracy tab. Absent -> the gates still
+                  gate, but nothing is plotted: a feature-validation test cannot
+                  land on the tab by accident. (The performance tab works the same
+                  way off the sweep gate's own workload labels.)
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
@@ -61,6 +71,16 @@ gates -- one entry per evaluation
     lm_eval_config     YAML under test/lm_eval_configs/. It owns the ground truths and
                   tolerances and is also what run_lm_eval.sh reads, so `baseline`
                   and `atol` must not be set alongside it.
+    sweep         Makes this a THROUGHPUT gate instead of an accuracy one: a list of
+                  {workload, isl, osl, concurrency} points handed to
+                  bench_serving.sh, measured against the same server boot as the
+                  model's accuracy gates. Each point's numbers reach the perf
+                  dashboard, where `workload` is the name its dropdown shows. There
+                  is no floor -- the gate checks the measurement is complete, and
+                  the dashboard's trend is what detects a regression -- so
+                  `baseline`/`atol` must not be set alongside it.
+    bench_env     Extra environment for a `sweep` gate's bench_serving.sh
+                  (DATASET_NAME, TOKENIZE_PROMPT, ...). Geometry comes from `sweep`.
     num_examples, num_threads, max_tokens, temperature, top_p, top_k, api
                   Passed straight through to run_eval.
 
@@ -77,7 +97,7 @@ threshold is the failure mode this shape would otherwise invite.
 import re
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.run_combined_tests import run_combined_tests
@@ -86,12 +106,21 @@ from sglang.test.tpu.eval_support import (
     ExternalServerLauncher,
     RecipeLauncher,
     TpuModelLaunchSettings,
+    bench_serving_runner,
     lm_eval_runner,
 )
 
 _TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
 
-_CONFIG_KEYS = {"model", "test_name", "variant", "launch", "gates", "skip_unless"}
+_CONFIG_KEYS = {
+    "model",
+    "test_name",
+    "variant",
+    "launch",
+    "gates",
+    "dashboard",
+    "skip_unless",
+}
 _LAUNCH_KEYS = {"recipe", "env", "tag", "health_timeout", "external"}
 # Gate keys that map straight onto AccuracyTestParams.
 _GATE_PASSTHROUGH = {
@@ -109,7 +138,13 @@ _GATE_PASSTHROUGH = {
     "runner",
 }
 # Gate keys needing translation.
-_GATE_TRANSLATED = {"baseline", "reasoning_effort", "lm_eval_config"}
+_GATE_TRANSLATED = {
+    "baseline",
+    "reasoning_effort",
+    "lm_eval_config",
+    "sweep",
+    "bench_env",
+}
 
 
 def _reject_unknown(got, allowed, where: str) -> None:
@@ -145,9 +180,20 @@ def _build_launcher(launch: Dict[str, Any]):
     )
 
 
-def _build_gate(gate: Dict[str, Any]) -> AccuracyTestParams:
+def _build_gate(
+    gate: Dict[str, Any],
+    test_name: str = "",
+    model: str = "",
+    dashboard: Optional[str] = None,
+) -> AccuracyTestParams:
     _reject_unknown(gate, _GATE_PASSTHROUGH | _GATE_TRANSLATED, "gate")
     kwargs = {k: v for k, v in gate.items() if k in _GATE_PASSTHROUGH}
+
+    if dashboard == "accuracy" and "sweep" not in gate:
+        # The dashboard plots only metrics that declare kind=accuracy; the stamp
+        # is per-config so a copied gate cannot reach the tab undeclared. A sweep
+        # gate is excluded: its points carry their own performance labels.
+        kwargs["metric_labels"] = {"model": test_name, "kind": "accuracy"}
 
     if "baseline" in gate:
         kwargs["baseline_accuracy"] = gate["baseline"]
@@ -165,12 +211,41 @@ def _build_gate(gate: Dict[str, Any]) -> AccuracyTestParams:
             )
         kwargs["runner"] = lm_eval_runner(gate["lm_eval_config"])
 
+    if "sweep" in gate:
+        # A throughput gate. It shares the boot with this model's accuracy gates
+        # rather than paying for a second one, and it self-gates (no floor) --
+        # see bench_serving_runner for what it does check.
+        conflicting = sorted(
+            {"baseline", "atol", "runner", "lm_eval_config"} & set(gate)
+        )
+        if conflicting:
+            raise ValueError(
+                f"a sweep gate must not set {conflicting}: it measures rather than "
+                "grades, and gates itself on the measurement being complete"
+            )
+        kwargs["runner"] = bench_serving_runner(
+            sweep=gate["sweep"],
+            test_name=test_name or gate.get("label") or gate["dataset"],
+            model=model,
+            bench_env=gate.get("bench_env"),
+        )
+    elif "bench_env" in gate:
+        raise ValueError('bench_env is only meaningful alongside "sweep"')
+
     return AccuracyTestParams(**kwargs)
 
 
 def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
     """Expand the ``gates`` list. Split out so tests can assert on it directly."""
-    return [_build_gate(g) for g in config["gates"]]
+    model = str(config.get("model", ""))
+    test_name = str(config.get("test_name", model))
+    dashboard = config.get("dashboard")
+    if dashboard not in (None, "accuracy"):
+        raise ValueError(f'dashboard must be "accuracy" or absent, got {dashboard!r}')
+    return [
+        _build_gate(g, test_name=test_name, model=model, dashboard=dashboard)
+        for g in config["gates"]
+    ]
 
 
 def build_model(config: Dict[str, Any]) -> TpuModelLaunchSettings:
@@ -229,14 +304,27 @@ def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
     return ModelConfigTest
 
 
-def model_config_main(config: Dict[str, Any], base_url: Optional[str] = None) -> None:
+def model_config_main(
+    config: Union[Dict[str, Any], List[Dict[str, Any]]],
+    base_url: Optional[str] = None,
+) -> None:
     """Entry point for a test file's ``__main__`` block.
 
-    Registers the synthesised case in the caller's module so ``unittest.main()``
-    finds it -- the loader only looks at ``__main__``, not at this module.
+    Registers the synthesised case(s) in the caller's module so ``unittest.main()``
+    finds them -- the loader only looks at ``__main__``, not at this module.
+
+    A LIST of configs puts several models in one file, one TestCase each, run in
+    sequence. They share ``base_url``, and RecipeLauncher evicts whoever holds it,
+    so each config still gets exactly the server its own launch env describes --
+    the point of a list is one file per concern, not one server for several
+    configs. Note the file, not the case, is the unit CI budgets and retries: the
+    whole list shares one --timeout-per-file, and failfast stops at the first
+    failing case. Split the file when either of those starts to bite.
     """
     import __main__
 
-    case = build_test_case(config, base_url=base_url)
-    setattr(__main__, case.__name__, case)
+    configs = config if isinstance(config, list) else [config]
+    for entry in configs:
+        case = build_test_case(entry, base_url=base_url)
+        setattr(__main__, case.__name__, case)
     unittest.main()

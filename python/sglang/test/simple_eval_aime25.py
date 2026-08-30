@@ -15,6 +15,7 @@ from typing import Optional
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
     ANSWER_PATTERN,
+    BOXED_PATTERN,
     HTML_JINJA,
     Eval,
     EvalResult,
@@ -94,9 +95,18 @@ class AIME25Eval(Eval):
             response_text = sampler(prompt_messages)
             response_text = response_text or ""
 
-            # Extract answer from response
+            # Extract answer from response. The prompt asks for a trailing
+            # "Answer: N" line, but reasoning models answer in \boxed{N}
+            # instead and score 0 on an otherwise correct solution -- on
+            # DeepSeek-R1-0528, 17 of 30 responses. Try the requested form
+            # first so responses that comply keep their existing extraction,
+            # then fall back to the last \boxed{}.
             match = re.search(ANSWER_PATTERN, response_text)
-            extracted_answer = match.group(1).strip() if match else None
+            if match:
+                extracted_answer = match.group(1).strip()
+            else:
+                boxed = re.findall(BOXED_PATTERN, response_text)
+                extracted_answer = boxed[-1].strip() if boxed else None
 
             # Normalize both answers for comparison
             normalized_extracted = normalize_aime_answer(extracted_answer)

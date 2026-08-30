@@ -16,15 +16,20 @@ export KV_CACHE_DTYPE=""                  # required; pallas_tpu_mla raises on f
 export QUANTIZATION=${QUANTIZATION:-fp8}
 
 # --- memory / shapes ---
-export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.70}
+export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.85}  # ~580k-token KV pool; evals run 96+ concurrent 32k-gen requests
 export MAX_RUNNING=${MAX_RUNNING:-128}
 export PAGE_SIZE=${PAGE_SIZE:-64}
 export CONTEXT_LEN=${CONTEXT_LEN:-40960}  # 32768 gen + 8192 prompt headroom
 export CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 export MAX_PREFILL_TOKENS=${MAX_PREFILL_TOKENS:-8192}
+# CI compiles cold every run (ENABLE_COMPILE_CACHE=0): trim the default
+# power-of-2 ladders (8 token x 8 bs graphs) to the shapes eval traffic hits.
+export TPU_COMPILE_TOKENS=${TPU_COMPILE_TOKENS:-"8192"}
+export TPU_COMPILE_BS=${TPU_COMPILE_BS:-"64 128"}
 export TORCH_COMPILE_MAX_BS=${TORCH_COMPILE_MAX_BS:-$MAX_RUNNING}
 
-export EXTRA_ARGS="--reasoning-parser deepseek-r1${EXTRA_ARGS:+ $EXTRA_ARGS}"
+# drop mapped checkpoint pages as they load; keeps the CI pod off node-memory eviction
+export EXTRA_ARGS="--reasoning-parser deepseek-r1 --weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
 export ENABLE_PROFILER_ENDPOINT=${ENABLE_PROFILER_ENDPOINT:-0}
 
 cd "$(dirname "$0")/.."

@@ -46,7 +46,7 @@ from sglang.benchmark.datasets.image import (
 from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
-from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.datasets.random import RandomDataset, sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.benchmark.serving import (
     _BACKEND_API_PATHS,
@@ -1488,6 +1488,40 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "Traceback",
         ]:
             self.assertNotIn(forbidden, stderr)
+
+
+class TestRandomIdsSendsIds(unittest.TestCase):
+    def _args(self, **kw):
+        base = dict(
+            random_input_len=8,
+            random_output_len=4,
+            num_prompts=2,
+            random_range_ratio=1.0,
+            dataset_path="",
+            dataset_name="random-ids",
+            backend="sglang",
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def test_random_ids_on_sglang_backend_sends_ids(self):
+        self.assertFalse(RandomDataset.from_args(self._args()).return_text)
+
+    def test_random_ids_on_sglang_native_backend_sends_ids(self):
+        args = self._args(backend="sglang-native")
+        self.assertFalse(RandomDataset.from_args(args).return_text)
+
+    def test_random_ids_on_other_backend_sends_text(self):
+        self.assertTrue(RandomDataset.from_args(self._args(backend="vllm")).return_text)
+
+    def test_random_text_dataset_keeps_text(self):
+        self.assertTrue(
+            RandomDataset.from_args(self._args(dataset_name="random")).return_text
+        )
+
+    def test_tokenize_prompt_forces_ids(self):
+        args = self._args(dataset_name="random", tokenize_prompt=True)
+        self.assertFalse(RandomDataset.from_args(args).return_text)
 
 
 if __name__ == "__main__":

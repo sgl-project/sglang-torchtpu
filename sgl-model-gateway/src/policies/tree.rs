@@ -567,11 +567,13 @@ impl Tree {
 
         // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
         // The cache is valid if the tenant still exists in tenant_last_access_time.
-        let tenant: TenantId = {
+        // `None` means no tenant owns this node -- it is reported as the `empty` sentinel
+        // below but never written back into the tree.
+        let owner: Option<TenantId> = {
             let cached = curr.last_tenant.read();
             if let Some(ref t) = *cached {
                 if curr.tenant_last_access_time.contains_key(t.as_ref()) {
-                    Arc::clone(t)
+                    Some(Arc::clone(t))
                 } else {
                     drop(cached);
                     // Cache stale, fall back to iteration and update cache
@@ -579,9 +581,10 @@ impl Tree {
                         .tenant_last_access_time
                         .iter()
                         .next()
-                        .map(|kv| Arc::clone(kv.key()))
-                        .unwrap_or_else(|| Arc::from("empty"));
-                    *curr.last_tenant.write() = Some(Arc::clone(&t));
+                        .map(|kv| Arc::clone(kv.key()));
+                    if let Some(ref t) = t {
+                        *curr.last_tenant.write() = Some(Arc::clone(t));
+                    }
                     t
                 }
             } else {
@@ -591,20 +594,29 @@ impl Tree {
                     .tenant_last_access_time
                     .iter()
                     .next()
-                    .map(|kv| Arc::clone(kv.key()))
-                    .unwrap_or_else(|| Arc::from("empty"));
-                *curr.last_tenant.write() = Some(Arc::clone(&t));
+                    .map(|kv| Arc::clone(kv.key()));
+                if let Some(ref t) = t {
+                    *curr.last_tenant.write() = Some(Arc::clone(t));
+                }
                 t
             }
         };
 
         // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
         // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
-        let epoch = get_epoch();
-        if epoch & 0x7 == 0 {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
+        // Skip untenanted nodes entirely: writing the `empty` sentinel here would attach a
+        // phantom tenant to the node (typically the root, on a cold match) that `insert`
+        // never accounts for in `tenant_char_count`, so `get_used_size_per_tenant` would
+        // report a tenant the maintained counts do not know about.
+        if let Some(ref tenant) = owner {
+            let epoch = get_epoch();
+            if epoch & 0x7 == 0 {
+                curr.tenant_last_access_time
+                    .insert(Arc::clone(tenant), epoch);
+            }
         }
+
+        let tenant: TenantId = owner.unwrap_or_else(|| Arc::from("empty"));
 
         // Compute input char count directly from input text.
         // This is equivalent to matched_chars + remaining.chars().count() but avoids
@@ -1094,6 +1106,45 @@ mod tests {
 
         assert_eq!(matched_text, "");
         assert_eq!(tenant, "empty");
+    }
+
+    #[test]
+    fn test_cold_match_does_not_register_empty_tenant() {
+        let tree = Tree::new();
+
+        // The LRU touch is gated on `get_epoch() & 0x7 == 0`, and `get_epoch` is a
+        // process-wide counter bumped once per touched match, so a regression that starts
+        // touching untenanted nodes again is guaranteed to fire within 16 iterations.
+        for _ in 0..16 {
+            let (_, tenant) = tree.prefix_match("hello");
+            assert_eq!(tenant, "empty");
+        }
+
+        // A miss is read-only: no phantom `empty` tenant may end up in the tree.
+        assert!(
+            tree.get_used_size_per_tenant().is_empty(),
+            "cold matches must not attach a tenant to any node"
+        );
+        assert_eq!(
+            get_maintained_counts(&tree),
+            tree.get_used_size_per_tenant()
+        );
+
+        // Same for a node that lost its last tenant. Matching "hello" while tenant1 still
+        // owns the root populates the root's `last_tenant` cache, and `remove_tenant` does
+        // not clear it, so the misses after it go through the stale-cache branch.
+        tree.insert("apple", "tenant1");
+        assert_eq!(tree.prefix_match("hello").1, "tenant1");
+        tree.remove_tenant("tenant1");
+        for _ in 0..16 {
+            let (_, tenant) = tree.prefix_match("hello");
+            assert_eq!(tenant, "empty");
+        }
+        assert!(!tree.get_used_size_per_tenant().contains_key("empty"));
+        assert_eq!(
+            get_maintained_counts(&tree),
+            tree.get_used_size_per_tenant()
+        );
     }
 
     #[test]

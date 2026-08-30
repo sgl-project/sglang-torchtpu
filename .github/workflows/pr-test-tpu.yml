@@ -57,11 +57,24 @@ jobs:
           filters: |
             tpu:
               - 'python/sglang/srt/hardware_backend/tpu/**'
+              - 'python/sglang/srt/layers/attention/pallas/**'
+              - 'python/sglang/srt/layers/moe/pallas/**'
+              - 'python/sglang/srt/disaggregation/tpu/**'
+              - 'python/sglang/test/tpu/**'
+              - 'python/sglang/multimodal_gen/runtime/platforms/tpu.py'
+              - 'python/sglang/multimodal_gen/runtime/platforms/__init__.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
+              - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
               - 'python/pyproject_tpu.toml'
               - 'benchmark/tpu/**'
               - 'docker/tpu.Dockerfile'
+              - 'docker/tpu-base.Dockerfile'
               - 'docker/cloudbuild.tpu.yaml'
+              - 'docker/cloudbuild.tpu-base.yaml'
               - 'test/registered/tpu/**'
+              - 'test/registered/unit/hardware_backend/tpu/**'
+              - 'test/registered/unit/layers/attention/pallas/**'
+              - 'test/registered/unit/layers/moe/pallas/**'
               - '.github/tpu-ci/**'
               - '.github/workflows/_tpu-build.yml'
               - '.github/workflows/_tpu-test.yml'
@@ -98,7 +111,8 @@ jobs:
       id-token: write
 
   # Per-commit TPU suite on a single-host 2x2x1 slice (sized from topology.yaml).
-  integration:
+  unit:
+    name: unit-test
     needs: build
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -113,14 +127,39 @@ jobs:
       contents: read
       id-token: write
 
-  # Runs only after stage-a passes
-  feature:
-    needs: [build, integration]
+  e2e:
+    name: e2e-test
+    needs: build
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
+      weights_pvc: model-weights-rox
     permissions:
       contents: read
       id-token: write
+
+  # Aggregator finish job for branch protection / required status checks.
+  # If tests are skipped (non-TPU PR), this finishes green immediately.
+  # If tests are run, it blocks until all TPU stages finish and fails if any fail.
+  pr-test-tpu-finish:
+    needs: [decide, build, unit, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all TPU job statuses
+        run: |
+          json_needs='${{ toJson(needs) }}'
+          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+
+          for job in $job_names; do
+            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+            echo "$job: $result"
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "TPU CI job '$job' failed or was cancelled."
+              exit 1
+            fi
+          done
+          echo "All TPU CI jobs completed successfully (or were intentionally skipped)."
+          exit 0

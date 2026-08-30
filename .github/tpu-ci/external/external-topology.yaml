@@ -1,0 +1,48 @@
+# External TPU test config for the `external-nightly-*` suites. See README.md.
+#
+# Partner-internal identifiers (cluster name, project id, nodepool names) are NOT stored in
+# source -- they come from repo secrets at workflow time:
+#   secrets.EXTERNAL_CLUSTER, secrets.EXTERNAL_PROJECT, secrets.EXTERNAL_NODEPOOL_<shape>
+# This file holds only non-sensitive structure. Each suite names the SECRET that holds its
+# nodepool (`nodepool_var`), resolved by the workflow; the value never lands in git.
+
+cluster:
+  namespace: default            # no Kueue; JobSets land here directly
+  accelerator: tpu7x
+  # tpu7x-standard-4t = 4 chips/host x 2 TensorCores/chip = 8 devices/host. tp = hosts x 8.
+  devices_per_host: 8
+
+weights:
+  # The CI artifacts bucket doubles as the weight store under weights/<model>/. Stage with:
+  #   gcloud storage rsync -r ./<model> gs://sglang-torchtpu-ci-artifacts/weights/<model>
+  bucket: sglang-torchtpu-ci-artifacts
+  prefix: weights
+  mount_path: /gcs-weights
+  # gcsfuse mount tuned for safetensors weight loading. cache-file-for-range-read turns the
+  # loader's many small seeky reads into one whole-file sequential download into a bounded,
+  # node-local file cache; every subsequent read hits local disk. See README.
+  mount_options: "implicit-dirs,file-cache:max-size-mb:102400,file-cache:cache-file-for-range-read:true"
+  ephemeral_storage_limit: 120Gi
+  default_extra_args: "--weight-loader-disable-mmap"
+
+# Suite name -> slice shape. The suite fixes hosts/topology; `nodepool_vars` lists the repo
+# secrets holding this shape's interchangeable slices (a GKE multi-host nodepool IS one
+# physical slice). There is no Kueue on this cluster, so discovery round-robins the launch
+# groups across these slices -- up to len(nodepool_vars) groups of a shape run in PARALLEL;
+# any beyond that share a slice and serialize (their pods stay Pending until it frees).
+# The nodepool NAMES stay out of source: each entry is the NAME of a repo secret.
+suites:
+  external-nightly-2x2x2:
+    hosts: 2                                   # tp=16 (8 chips, 2 hosts)
+    topology: 2x2x2
+    nodepool_vars:                             # 4 interchangeable 2x2x2 slices
+      - EXTERNAL_NODEPOOL_2X2X2_0
+      - EXTERNAL_NODEPOOL_2X2X2_1
+      - EXTERNAL_NODEPOOL_2X2X2_2
+      - EXTERNAL_NODEPOOL_2X2X2_3
+  external-nightly-2x2x4:
+    hosts: 4                                   # tp=32 (16 chips, 4 hosts)
+    topology: 2x2x4
+    nodepool_vars:                             # 2 interchangeable 2x2x4 slices
+      - EXTERNAL_NODEPOOL_2X2X4_0
+      - EXTERNAL_NODEPOOL_2X2X4_1

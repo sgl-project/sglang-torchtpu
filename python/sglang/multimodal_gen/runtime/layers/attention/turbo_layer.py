@@ -126,7 +126,7 @@ def async_a2a_communicate(
     a2a_inputs: Union[torch.Tensor, List[torch.Tensor]],
     cp_size: int,
     cp_group: ProcessGroup,
-    cp_stream: torch.get_device_module().Stream,
+    cp_stream: torch.Stream,
     local_seq_2_local_head: bool,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
     """
@@ -200,7 +200,7 @@ class _SeqAllToAllQKV(torch.autograd.Function):
         k: Tensor,
         v: Tensor,
         cp_size: int,
-        cp_stream: torch.get_device_module().Stream,
+        cp_stream: torch.Stream,
         local_seq_2_local_head: bool,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         ctx.group = group

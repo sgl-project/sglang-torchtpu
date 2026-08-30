@@ -25,17 +25,20 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     build_bucketers,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    LogitsOutputMode,
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -66,6 +69,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         "next_token_logits",
         "next_token_global_top_k_logits",
         "next_token_global_top_k_token_ids",
+        "next_draft_tokens",
     ):
         value = getattr(out, field, None)
         if isinstance(value, torch.Tensor):
@@ -106,23 +110,23 @@ def _hbm_delta_str(
     return f" HBM: +{delta:.0f} MB ({after[0]:.0f}/{after[1]:.0f} MB)"
 
 
-def _unpad_decoder_outputs(out: Any, forward_batch: Any) -> Any:
+def _unpad_decoder_outputs(
+    out: LogitsProcessorOutput | Any,
+    forward_batch: ForwardBatch,
+) -> Any:
     real_q = getattr(forward_batch, _REAL_Q_KEY, None)
     real_b = getattr(forward_batch, _REAL_B_KEY, None)
     if real_q is None or real_b is None:
         return out
 
-    trim_next_token_outputs = getattr(out, "trim_next_token_outputs", None)
-    if trim_next_token_outputs is not None:
-        trim_next_token_outputs(real_b)
-    else:
-        next_token_logits = getattr(out, "next_token_logits", None)
-        if next_token_logits is not None and real_b < next_token_logits.shape[0]:
-            out.next_token_logits = next_token_logits[:real_b]
-
-    hidden_states = getattr(out, "hidden_states", None)
-    if hidden_states is not None and real_q < hidden_states.shape[0]:
-        out.hidden_states = hidden_states[:real_q]
+    if isinstance(out, LogitsProcessorOutput):
+        out.trim_next_token_outputs(real_b)
+        if (
+            out.hidden_states is not None
+            and isinstance(out.hidden_states, torch.Tensor)
+            and real_q < out.hidden_states.shape[0]
+        ):
+            out.hidden_states = out.hidden_states[:real_q]
 
     # Restore real token/batch metadata so eager outer-model processing and
     # downstream consumers never observe static-shape ghost slots.
@@ -271,6 +275,37 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     dynamic = False
     model_extra_tensor_attrs: ClassVar[tuple[str, ...]] = ()
 
+    def get_dp_padded_token_counts(
+        self,
+        forward_batch: ForwardBatch,
+        model_runner: Any,
+        global_num_tokens: list[int],
+        global_num_tokens_for_logprob: list[int],
+        *,
+        attn_tp_size: int,
+        cp_align_size: int,
+    ) -> tuple[list[int], list[int]]:
+        (
+            global_num_tokens,
+            global_num_tokens_for_logprob,
+        ) = super().get_dp_padded_token_counts(
+            forward_batch,
+            model_runner,
+            global_num_tokens,
+            global_num_tokens_for_logprob,
+            attn_tp_size=attn_tp_size,
+            cp_align_size=cp_align_size,
+        )
+
+        # TPU DPA gather derives its expected local rows from the DP-global
+        # count, so logprob counts must use the same attention-TP alignment.
+        if attn_tp_size > 1:
+            global_num_tokens_for_logprob = [
+                (value + attn_tp_size - 1) // attn_tp_size * attn_tp_size
+                for value in global_num_tokens_for_logprob
+            ]
+        return global_num_tokens, global_num_tokens_for_logprob
+
     def __init__(
         self,
         *,
@@ -357,9 +392,19 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return False
 
         server_args = self.model_runner.server_args
-        is_draft_worker = bool(getattr(self.model_runner, "is_draft_worker", False))
-        compile_owner = self.owner.model if is_draft_worker else self.owner
+        is_draft_worker = self.model_runner.is_draft_worker
+        compile_owner = (
+            getattr(self.owner, "model", self.owner) if is_draft_worker else self.owner
+        )
         compile_fn = compile_owner.forward if is_draft_worker else fn
+
+        if self._compiles_logits_processor():
+            logits_processor = getattr(
+                self.model_runner.model, "logits_processor", None
+            )
+            if logits_processor is not None:
+                # TPUs don't support returning input logprobs -- this errors elsewhere.
+                logits_processor.compute_input_logprobs = False
 
         compiled = self._compile(compile_fn)
         compiled.__signature__ = inspect.signature(compile_fn)
@@ -368,7 +413,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             "forward" if is_draft_worker else self.method_name,
             compiled,
         )
-        if is_draft_worker:
+        if is_draft_worker and hasattr(self.owner, "logits_processor"):
             logits_fn = self.owner.logits_processor.forward
             compiled_logits = torch.compile(
                 torch.no_grad()(logits_fn),
@@ -419,13 +464,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.prepare_forward_batch(forward_batch)
 
         outer_model.prepare_forward_batch = _prepare
-
-        # Keep draft logits out of the compiled model-forward graph. The outer
-        # forward calls the backbone and logits processor as independent
-        # compiled regions.
-        shim_target = fn if is_draft_worker else compiled
-        self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
-        setattr(self.owner, self.method_name, self.compiled_forward_shim)
+        self._install_forward_shim(fn=fn, compiled=compiled)
         self.model_runner.compile_policy = self
 
         if is_dp_attention_enabled():
@@ -441,6 +480,33 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.b_bucketer.name,
         )
         return True
+
+    def _install_forward_shim(
+        self, fn: Callable[..., Any], compiled: Callable[..., Any]
+    ) -> None:
+        """Wrap and install the compiled forward shim on owner.
+
+        EAGLE3 splits backbone and logits_processor into separate compiled regions,
+        leaving outer forward eager as a coordinator. DFlash samples via target lm_head
+        without logits_processor, so its entire forward is compiled.
+
+        Args:
+          fn: Original uncompiled forward function.
+          compiled: Compiled forward function.
+        """
+        is_eagle3_draft = self.model_runner.is_draft_worker and hasattr(
+            self.owner, "logits_processor"
+        )
+        shim_target = fn if is_eagle3_draft else compiled
+        logger.info(
+            "[decoder compile policy] _install_forward_shim for %s (is_draft=%s, is_eagle3_draft=%s, shim_target=%s)",
+            type(self.owner).__name__,
+            self.model_runner.is_draft_worker,
+            is_eagle3_draft,
+            getattr(shim_target, "__name__", type(shim_target).__name__),
+        )
+        self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
+        setattr(self.owner, self.method_name, self.compiled_forward_shim)
 
     def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         if self.tracer == "direct":
@@ -467,9 +533,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
         fn = torch.no_grad()(fn)
         model = self.model_runner.model
-        ignored_spec_inputs = (
-            () if self.model_runner.is_draft_worker else ("forward_batch.spec_info",)
-        )
 
         def trace_forward(
             attention_metadata: Any,
@@ -497,10 +560,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             ignored_argnames=(
                 "forward_batch.sampling_info",
                 "forward_batch.orig_seq_lens",
+                # Prompt-logprob inputs are rejected on compiled TPU. Ignore
+                # this request-only tensor before direct compile flattens the
+                # ForwardBatch leaves, matching LogitsProcessor's static view.
+                "forward_batch.extend_input_logprob_token_ids_gpu",
                 # Pallas consumes these host mirrors before the compiled model.
                 "forward_batch.req_pool_indices_cpu",
                 "forward_batch.seq_lens_cpu",
-                *ignored_spec_inputs,
+                *self._extra_ignored_argnames(),
             ),
         )
 
@@ -514,6 +581,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def _extra_ignored_argnames(self) -> tuple[str, ...]:
+        if self.model_runner.is_draft_worker:
+            return ()
+        return ("forward_batch.spec_info",)
 
     def get_model_extra_tensor_attrs(self) -> tuple[str, ...]:
         """Returns paths to non-param non-buffer Tensor attrs on the model.
@@ -537,33 +609,54 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         *_args: Any,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
-        # Direct tracing omits sampling_info tensor inputs, although the logits
-        # processor branches on a host-only static k. Standard models expose
-        # their final model/layout capability so all full-logit cases share one
-        # executable. Unknown wrappers retain a conservative per-k key.
-        model = self.model_runner.model
-        logits_processor = getattr(model, "logits_processor", None)
-        lm_head = getattr(model, "lm_head", None)
-        selector = getattr(
-            logits_processor, "get_tpu_distributed_top_k_for_batch", None
+        logits_output_mode = (
+            forward_batch.logits_output_mode
+            if self._compiles_logits_processor()
+            else None
         )
-        if selector is not None and lm_head is not None:
-            distributed_top_k = selector(forward_batch, lm_head)
-        else:
-            from sglang.srt.hardware_backend.tpu.sampler import (
-                distributed_top_k_for_batch,
-            )
-
-            distributed_top_k = distributed_top_k_for_batch(
-                forward_batch,
-                sampling_backend=self.model_runner.server_args.sampling_backend,
-            )
         return (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
-            distributed_top_k,
+            logits_output_mode,
+        )
+
+    def _compiles_logits_processor(self) -> bool:
+        """Whether this compiled callable includes target-model logits processing."""
+
+        return self.owner is self.model_runner.model and not bool(
+            getattr(self.model_runner, "is_draft_worker", False)
+        )
+
+    def _distributed_top_k_width(self) -> int | None:
+        if not self._compiles_logits_processor():
+            return None
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_candidate_width_for_model,
+        )
+
+        return distributed_top_k_candidate_width_for_model(self.model_runner.model)
+
+    def _warmup_logits_output_modes(
+        self, batch_size: int
+    ) -> tuple[LogitsOutputMode, ...]:
+        """Return every logits mode reachable at this physical batch size."""
+
+        if self._distributed_top_k_width() is None:
+            return (LogitsOutputMode.FULL_VOCAB,)
+        spec_algorithm = getattr(self.model_runner, "spec_algorithm", None)
+        if spec_algorithm is not None and not spec_algorithm.is_none():
+            return (LogitsOutputMode.FULL_VOCAB,)
+        from sglang.srt.hardware_backend.tpu.sampler import (
+            distributed_top_k_min_batch_size,
+        )
+
+        if batch_size < distributed_top_k_min_batch_size():
+            return (LogitsOutputMode.FULL_VOCAB,)
+        return (
+            LogitsOutputMode.DISTRIBUTED_TOP_K,
+            LogitsOutputMode.FULL_VOCAB,
         )
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
@@ -588,18 +681,17 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
     def _install_dp_idle_as_decode(self) -> None:
-        """Run idle DP batches as DECODE.
+        """Normalize idle DP batches before model execution.
 
         An idle rank may take a different code path than decode, but with DP
-        attention all ranks must run the same code. Relabel idle as DECODE.
+        attention all ranks must run the same code. The base policy relabels an
+        idle batch as DECODE; specialized policies may override the phase.
 
         Upstream removed ``ModelRunner.forward_idle`` (idle now flows through
         ``ModelRunner.forward`` -> the eager runner), so hook ``forward`` and
         relabel idle batches at entry; the ``is_idle()`` guard keeps decode /
         extend batches untouched.
         """
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
         model_runner = self.model_runner
         # Idempotent: a re-install (tests, warmups) must not nest a second
         # wrapper around an already-wrapped forward.
@@ -620,11 +712,73 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 # the compiled forward can't match any variant's mode guard.
                 and forward_batch.global_num_tokens_cpu
             ):
-                forward_batch.forward_mode = ForwardMode.DECODE
+                self._normalize_dp_idle_forward(forward_batch)
             return orig_forward(forward_batch, *args, **kwargs)
 
         forward._tpu_idle_as_decode = True
         model_runner.forward = forward
+
+    def _normalize_dp_idle_forward(self, forward_batch) -> None:
+        """Relabel an ordinary idle DP batch for the existing decode pad path."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        forward_batch.forward_mode = ForwardMode.DECODE
+
+    def materialize_dp_idle_extend(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        """Materialize an empty DP rank as one TPU extend request.
+
+        This belongs to the decoder policy rather than the speculative policy:
+        normal and speculative extend/prefill forwards both need every DP rank
+        to execute the same compiled shape. Keeping the construction here also
+        avoids embedding TPU-specific compile inputs in ``ForwardBatch``.
+        """
+        if forward_batch.seq_lens.shape[0] != 0:
+            return False
+
+        device = forward_batch.seq_lens.device
+        seq_dtype = forward_batch.seq_lens.dtype
+        forward_batch.extend_num_tokens = num_tokens
+        forward_batch.extend_seq_lens = torch.tensor(
+            [num_tokens], dtype=torch.int32, device=device
+        )
+        forward_batch.extend_prefix_lens = torch.zeros(
+            1, dtype=seq_dtype, device=device
+        )
+        forward_batch.extend_start_loc = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        forward_batch.seq_lens = torch.tensor(
+            [num_tokens], dtype=seq_dtype, device=device
+        )
+        forward_batch.seq_lens_sum = int(num_tokens)
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu = torch.tensor([num_tokens], dtype=seq_dtype)
+        forward_batch.extend_prefix_lens_cpu = [0]
+        forward_batch.extend_seq_lens_cpu = [int(num_tokens)]
+        forward_batch.extend_logprob_start_lens_cpu = [0]
+        forward_batch.batch_size = 1
+        forward_batch.input_ids = torch.zeros(
+            num_tokens, dtype=forward_batch.input_ids.dtype, device=device
+        )
+        forward_batch.positions = torch.arange(
+            num_tokens, dtype=torch.int64, device=device
+        )
+        if isinstance(forward_batch.out_cache_loc, torch.Tensor):
+            forward_batch.out_cache_loc = torch.zeros(
+                num_tokens,
+                dtype=forward_batch.out_cache_loc.dtype,
+                device=device,
+            )
+        if isinstance(forward_batch.req_pool_indices, torch.Tensor):
+            pool_dtype = forward_batch.req_pool_indices.dtype
+            forward_batch.req_pool_indices = torch.zeros(
+                1, dtype=pool_dtype, device=device
+            )
+            if isinstance(forward_batch.req_pool_indices_cpu, torch.Tensor):
+                forward_batch.req_pool_indices_cpu = torch.zeros(1, dtype=pool_dtype)
+        return True
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Forward serving-time recompilation checks to the installed shim."""
@@ -635,8 +789,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
-        self._precompile_extend()
-        self._precompile_decode()
+        server_args = getattr(self.model_runner, "server_args", None)
+        disagg_mode = getattr(server_args, "disaggregation_mode", None)
+        if disagg_mode != "decode":
+            self._precompile_extend()
+        if disagg_mode != "prefill":
+            self._precompile_decode()
         logger.info(
             "[decoder compile policy] precompile done in %.1fs.",
             time.perf_counter() - overall,
@@ -655,33 +813,43 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
+        compile_items = [
+            (num_tokens, bs, mode, logits_output_mode)
+            for num_tokens, bs, mode in compile_cases
+            for logits_output_mode in self._warmup_logits_output_modes(bs)
+        ]
         logger.info(
-            "[decoder compile policy] EXTEND/MIXED: %d cases "
+            "[decoder compile policy] EXTEND/MIXED: %d graph variants "
             "(mode_caps=%s, token_buckets=%s)",
-            len(compile_cases),
+            len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
         )
         compile_range = (
             tqdm.tqdm(
-                compile_cases,
+                compile_items,
                 desc="Compiling EXTEND/MIXED",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else compile_cases
+            else compile_items
         )
-        for num_tokens, bs, mode in compile_range:
+        for num_tokens, bs, mode, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(num_tokens=num_tokens, bs=bs, mode=mode)
+            self._run_one(
+                num_tokens=num_tokens,
+                bs=bs,
+                mode=mode,
+                logits_output_mode=logits_output_mode,
+            )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled {mode.name} (tokens={num_tokens}, bs={bs}) "
-                    f"in {elapsed:.1f}s{hbm_str}"
+                    f"Compiled {mode.name} (tokens={num_tokens}, bs={bs}, "
+                    f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
 
     def _precompile_decode(self) -> None:
@@ -689,30 +857,41 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
 
         bs_buckets = list(self.b_bucketer.buckets)
+        compile_items = [
+            (bs, logits_output_mode)
+            for bs in bs_buckets
+            for logits_output_mode in self._warmup_logits_output_modes(bs)
+        ]
         logger.info(
-            "[decoder compile policy] DECODE: %d shapes (bs=%s)",
-            len(bs_buckets),
+            "[decoder compile policy] DECODE: %d graph variants (bs=%s)",
+            len(compile_items),
             bs_buckets,
         )
         compile_range = (
             tqdm.tqdm(
-                bs_buckets,
+                compile_items,
                 desc="Compiling DECODE",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else bs_buckets
+            else compile_items
         )
-        for bs in compile_range:
+        for bs, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
-            self._run_one(num_tokens=bs, bs=bs, mode=ForwardMode.DECODE)
+            self._run_one(
+                num_tokens=bs,
+                bs=bs,
+                mode=ForwardMode.DECODE,
+                logits_output_mode=logits_output_mode,
+            )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled DECODE (bs={bs}) in {elapsed:.1f}s{hbm_str}"
+                    f"Compiled DECODE (bs={bs}, logits={logits_output_mode.name}) "
+                    f"in {elapsed:.1f}s{hbm_str}"
                 )
 
     def _make_warmup_inputs(
@@ -742,6 +921,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         bs: int,
         mode: ForwardMode,
         variant: str = "plain",
+        logits_output_mode: LogitsOutputMode = LogitsOutputMode.FULL_VOCAB,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
@@ -758,6 +938,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch = (
             kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         )
+        if spec_info is None:
+            if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
+                forward_batch.sampling_info = self._make_top_k_warmup_sampling_info(bs)
+            elif logits_output_mode is LogitsOutputMode.FULL_VOCAB:
+                forward_batch.sampling_info = (
+                    self._make_full_vocab_warmup_sampling_info(bs)
+                )
+            else:
+                raise ValueError(f"Invalid warmup logits mode: {logits_output_mode}")
         self._seed_dummy_req_to_token(forward_batch)
 
         model = self.model_runner.model
@@ -767,6 +956,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if is_dp_attention_enabled():
             self._set_dp_attention_metadata(forward_batch, num_tokens, bs, mode)
         model.prepare_forward_batch(forward_batch)
+        forward_batch.logits_output_mode = logits_output_mode
 
         forward_attn_backend = attn_backend or self.model_runner.attn_backend
         forward_attn_backend.init_forward_metadata(forward_batch)
@@ -906,6 +1096,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             sampling_info=sampling_info,
             spec_info=spec_info,
+            # Serving copies this process-wide value from ModelRunner. Keep
+            # warmup on the same speculative/non-speculative selector branch.
+            spec_algorithm=getattr(self.model_runner, "spec_algorithm", None),
             mm_inputs=self._dummy_mm_inputs(bs),
         )
 
@@ -914,16 +1107,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         This warms candidate graphs instead of an unused no-sampling specialization."""
 
         device = self.model_runner.device
-        model_config = getattr(self.model_runner, "model_config", None)
-        vocab_size = int(
-            getattr(model_config, "vocab_size", _DISTRIBUTED_TOP_K_WARMUP_K)
+        top_k = min(
+            _DISTRIBUTED_TOP_K_WARMUP_K,
+            self._distributed_top_k_width() or _DISTRIBUTED_TOP_K_WARMUP_K,
         )
+        model_config = getattr(self.model_runner, "model_config", None)
+        vocab_size = int(getattr(model_config, "vocab_size", top_k))
         return SamplingBatchInfo(
             temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
             top_ps=torch.ones(bs, dtype=torch.float32, device=device),
             top_ks=torch.full(
                 (bs,),
-                _DISTRIBUTED_TOP_K_WARMUP_K,
+                top_k,
                 dtype=torch.int32,
                 device=device,
             ),
@@ -936,7 +1131,27 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             vocab_size=vocab_size,
             return_sampling_masks=[False] * bs,
             device=str(device),
-            uniform_top_k=_DISTRIBUTED_TOP_K_WARMUP_K,
+            uniform_top_k=top_k,
+        )
+
+    def _make_full_vocab_warmup_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        device = self.model_runner.device
+        model_config = getattr(self.model_runner, "model_config", None)
+        vocab_size = int(getattr(model_config, "vocab_size", 1))
+        return SamplingBatchInfo(
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+            top_ks=torch.full((bs,), TOP_K_ALL, dtype=torch.int32, device=device),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            is_all_greedy=False,
+            is_any_greedy=False,
+            need_top_p_sampling=False,
+            need_top_k_sampling=False,
+            need_min_p_sampling=False,
+            vocab_size=vocab_size,
+            return_sampling_masks=[False] * bs,
+            device=str(device),
+            uniform_top_k=TOP_K_ALL,
         )
 
     def _dummy_layout(
@@ -1005,12 +1220,18 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         input_deepstack_embeds: torch.Tensor | None = None,
         **_kwargs: Any,
     ) -> tuple[Any, ...]:
+        logits_output_mode = (
+            forward_batch.logits_output_mode
+            if self._compiles_logits_processor()
+            else None
+        )
         return (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_embeds.shape[0],
             input_deepstack_embeds is not None,
+            logits_output_mode,
         )
 
     def _decode_uses_input_ids(self) -> bool:
@@ -1066,19 +1287,19 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         if self._num_deepstack > 0:
             variants = ["deepstack", "text_only"]
 
+        compile_items = [
+            (num_tokens, bs, mode, variant, logits_output_mode)
+            for num_tokens, bs, mode in compile_cases
+            for variant in variants
+            for logits_output_mode in self._warmup_logits_output_modes(bs)
+        ]
         logger.info(
-            "[decoder compile policy] VL EXTEND: %d shapes x %d variants "
+            "[decoder compile policy] VL EXTEND: %d graph variants "
             "(batch_caps=%s, token_buckets=%s)",
-            len(compile_cases),
-            len(variants),
+            len(compile_items),
             sorted({(mode.name, batch_size) for _, batch_size, mode in compile_cases}),
             list(self.t_bucketer.buckets),
         )
-        compile_items = [
-            (num_tokens, bs, mode, variant)
-            for num_tokens, bs, mode in compile_cases
-            for variant in variants
-        ]
         compile_range = (
             tqdm.tqdm(
                 compile_items,
@@ -1088,7 +1309,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if get_parallel().tp_rank == 0
             else compile_items
         )
-        for num_tokens, bs, mode, variant in compile_range:
+        for num_tokens, bs, mode, variant, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
@@ -1096,6 +1317,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 bs=bs,
                 mode=mode,
                 variant=variant,
+                logits_output_mode=logits_output_mode,
             )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
@@ -1103,7 +1325,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
                     f"Compiled VL {mode.name} (tokens={num_tokens}, bs={bs}, "
-                    f"variant={variant}) in {elapsed:.1f}s{hbm_str}"
+                    f"variant={variant}, logits={logits_output_mode.name}) "
+                    f"in {elapsed:.1f}s{hbm_str}"
                 )
 
     def _precompile_decode(self) -> None:
@@ -1112,22 +1335,26 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         assert self.b_bucketer is not None
 
-        bs_buckets = list(self.b_bucketer.buckets)
+        compile_items = [
+            (bs, logits_output_mode)
+            for bs in self.b_bucketer.buckets
+            for logits_output_mode in self._warmup_logits_output_modes(bs)
+        ]
         logger.info(
-            "[decoder compile policy] VL DECODE: %d shapes (bs=%s)",
-            len(bs_buckets),
-            bs_buckets,
+            "[decoder compile policy] VL DECODE: %d graph variants (bs=%s)",
+            len(compile_items),
+            list(self.b_bucketer.buckets),
         )
         compile_range = (
             tqdm.tqdm(
-                bs_buckets,
+                compile_items,
                 desc="Compiling VL DECODE",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else bs_buckets
+            else compile_items
         )
-        for bs in compile_range:
+        for bs, logits_output_mode in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
@@ -1135,13 +1362,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 bs=bs,
                 mode=ForwardMode.DECODE,
                 variant="text_only",
+                logits_output_mode=logits_output_mode,
             )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled VL DECODE (bs={bs}) in {elapsed:.1f}s{hbm_str}"
+                    f"Compiled VL DECODE (bs={bs}, "
+                    f"logits={logits_output_mode.name}) in {elapsed:.1f}s{hbm_str}"
                 )
 
     def _make_warmup_inputs(

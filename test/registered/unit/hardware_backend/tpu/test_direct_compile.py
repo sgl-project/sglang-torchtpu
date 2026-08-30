@@ -4,7 +4,7 @@ import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from jax import tree_util
@@ -20,6 +20,19 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 
 _COMPILE_RESULT = SimpleNamespace(executable="executable")
+
+
+def _make_artifact(traced_shapes):
+    """A minimal single-input artifact reading its tensor from args[0][0]."""
+    return direct_compile._CompiledArtifact(
+        executable=object(),
+        model_inputs=(),
+        kv_pool=None,
+        tensor_inputs_key_paths=((tree_util.SequenceKey(0), tree_util.SequenceKey(0)),),
+        tensor_inputs_traced_shapes=traced_shapes,
+        output_treespec=tree_util.tree_structure(()),
+        output_count=0,
+    )
 
 
 @tree_util.register_dataclass
@@ -83,6 +96,24 @@ class _KVPool:
 
 
 class TestDirectCompile(CustomTestCase):
+    def test_fail_on_recompile_stance(self):
+        compiled = direct_compile.direct_compile(
+            lambda value: value,
+            specialization_key=lambda value: value,
+        )
+        artifact = MagicMock(return_value="output")
+
+        with (
+            patch.object(compiled, "_compile", return_value=artifact) as compile_fn,
+            torch.compiler.set_stance("fail_on_recompile"),
+        ):
+            self.assertEqual(compiled("warmup"), "output")
+            self.assertEqual(compiled("warmup"), "output")
+            with self.assertRaisesRegex(RuntimeError, "Detected recompile"):
+                compiled("new specialization")
+
+        compile_fn.assert_called_once()
+
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
         def fn(value):
@@ -389,22 +420,46 @@ class TestDirectCompile(CustomTestCase):
 
     def test_artifact_reports_runtime_tensor_structure_changes(self):
         value = torch.ones(2)
-        artifact = direct_compile._CompiledArtifact(
-            executable=object(),
-            model_inputs=(),
-            kv_pool=None,
-            tensor_inputs_key_paths=(
-                (tree_util.SequenceKey(0), tree_util.SequenceKey(0)),
-            ),
-            output_treespec=None,
-            output_count=0,
-        )
+        artifact = _make_artifact(traced_shapes=((2,),))
 
         with (
             patch.object(direct_compile, "_is_tpu_tensor", return_value=False),
             self.assertRaisesRegex(TypeError, r"\[0\]\[0\].*now Tensor"),
         ):
             artifact(((value,), {}))
+
+    def test_artifact_rejects_runtime_tensor_shape_changes(self):
+        """Bug regression: a pytree leaf not covered by the specialization key
+        (e.g. an unpadded batch-metadata tensor) used to be bound into the
+        executable at its runtime shape, corrupting the launch device-side
+        (XLA e0102). The artifact must instead fail loudly, naming the leaf."""
+        artifact = _make_artifact(traced_shapes=((64,),))
+
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
+            self.assertRaisesRegex(
+                ValueError, r"\[0\]\[0\].*traced as \(64,\).*now \(63,\)"
+            ),
+        ):
+            artifact(((torch.ones(63),), {}))
+
+    def test_artifact_accepts_traced_shapes(self):
+        """Negative branch of the shape guard: a traced-shape match must not
+        raise (a guard degraded to always-raise would pass the case above)."""
+        artifact = _make_artifact(traced_shapes=((2,),))
+        executed = []
+
+        with (
+            patch.object(direct_compile, "_is_tpu_tensor", return_value=True),
+            patch.object(
+                direct_compile.tpu_torch_compile,
+                "execute",
+                side_effect=lambda _executable, inputs: executed.append(inputs) or [],
+            ),
+        ):
+            artifact(((torch.ones(2),), {}))
+
+        self.assertEqual(len(executed), 1)
 
 
 if __name__ == "__main__":

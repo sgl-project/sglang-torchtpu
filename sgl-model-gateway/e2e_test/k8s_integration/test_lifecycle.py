@@ -41,6 +41,7 @@ from conftest import (  # pytest's rootdir adds the test dir to sys.path
     _port_forward_start,
     _wait_for_deployment_ready,
     _wait_for_pod_ready,
+    _wait_for_ready_pod,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,7 +280,16 @@ class TestGatewayRestart:
                 _cleanup_port_forward("restart_gateway_pre_kill", pf_holder[0])
                 pf_holder[0] = None
 
+            # Wait for the old pod's object to actually disappear before
+            # gating on readiness, so a still-Ready terminating pod can't
+            # satisfy `_wait_for_ready_pod` below. Then gate on the pods
+            # themselves: `kubectl rollout status` alone returns instantly here
+            # because the Deployment's status subresource still advertises the
+            # pod we just force-deleted as available, and the port-forward
+            # would hit the replacement pod while it is still Pending.
+            _wait_for_pod_gone(old_pod)
             _wait_for_deployment_ready("smg-gateway-restart")
+            _wait_for_ready_pod("app=smg-gateway-restart")
 
             # Open a fresh port-forward to the new gateway pod and stash it
             # in the holder so the fixture cleans it up even if the assertion

@@ -22,6 +22,10 @@ on:
         required: false
         type: string
         default: ""
+      test_file:
+        required: false
+        type: string
+        default: ""
       # --- multi-host launch-group mode ---
       launch_script:
         required: false
@@ -45,6 +49,18 @@ on:
         required: false
         type: string
         default: ""
+      timeout_per_file:
+        required: false
+        type: number
+        default: 3600
+      partition_id:
+        required: false
+        type: number
+        default: -1
+      partition_size:
+        required: false
+        type: number
+        default: 0
       run_name:
         required: false
         type: string
@@ -54,22 +70,32 @@ on:
         required: false
         type: string
         default: ""
+      # --- P/D mode: prefill + decode groups, each on its own slice; needs
+      # exec_cmd. `hosts` = the per-role slice size.
+      pd_prefill_hosts:
+        required: false
+        type: number
+        default: 0
+      pd_decode_hosts:
+        required: false
+        type: number
+        default: 0
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  # Keyed per job so it never gates: Kueue owns slice admission now (kueue-tpu.yaml), and
-  # the callers' workflow-level groups already stop a workflow stacking on itself.
-  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.suite }}
+  # Per-run group: supersession only. Slice contention is Kueue's job -- a shared
+  # GitHub group keeps one job pending and cancels the rest.
+  group: tpu-test-${{ github.run_id }}-${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}
   cancel-in-progress: false
 
 env:
   GCP_PROJECT: sglang-torchtpu
   GKE_ZONE: us-central1-c
   GKE_CLUSTER: tpu-cluster
-  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc
+  WIF_PROVIDER: projects/180183988733/locations/global/workloadIdentityPools/github/providers/github-oidc-v2
   CI_SA: tpu-ci@sglang-torchtpu.iam.gserviceaccount.com
 
 jobs:
@@ -93,20 +119,35 @@ jobs:
       - name: Render + run on TPU
         run: |
           set -euo pipefail
-          label='${{ inputs.run_name || inputs.suite }}'
+          label='${{ inputs.run_name || inputs.test_file || inputs.files || inputs.suite }}'
           JOB_CEILING_S=21600        # 360m, the GitHub cap
           suite='${{ inputs.suite }}'
           python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
+          # Resolve pools before rendering, because the pod's nodeAffinity is baked in at
+          # render time. Unions topology.yaml's list with any pool labelled
+          # ci-tpu-lane=<lane> of this slice shape, and registers a new pool's Kueue flavor,
+          # so adding a slice needs no code change. Fails open to topology.yaml.
+          pools="$(python3 .github/tpu-ci/discover_pools.py \
+                     --lane '${{ inputs.lane }}' --hosts '${{ inputs.hosts }}' --sync)"
+          echo "pools for lane=${{ inputs.lane }} hosts=${{ inputs.hosts }}: ${pools}"
           python3 .github/tpu-ci/render_jobset.py \
             --image '${{ inputs.image }}' \
             --suite '${{ inputs.suite }}' \
+            --test-file '${{ inputs.test_file }}' \
             --launch-script '${{ inputs.launch_script }}' \
             --files '${{ inputs.files }}' \
             --exec '${{ inputs.exec_cmd }}' \
             --hosts '${{ inputs.hosts }}' \
             --lane '${{ inputs.lane }}' \
+            --pools "${pools}" \
+            --pd-prefill-hosts '${{ inputs.pd_prefill_hosts }}' \
+            --pd-decode-hosts '${{ inputs.pd_decode_hosts }}' \
             --weights-pvc '${{ inputs.weights_pvc }}' \
+            --timeout-per-file '${{ inputs.timeout_per_file }}' \
+            --partition-id '${{ inputs.partition_id }}' \
+            --partition-size '${{ inputs.partition_size }}' \
             --name '${{ inputs.run_name }}' \
+            --service-account '${{ vars.TPU_CI_POD_KSA }}' \
             ${{ inputs.nightly && '--nightly' || '' }} > /tmp/job.yaml
           echo "== rendered (key fields) =="
           grep -nE 'completions:|gke-tpu-topology:|ci-tpu-pool:|claimName:|bash "benchmark|for f in|run_suite.py' /tmp/job.yaml | head
@@ -123,7 +164,6 @@ jobs:
           name="$(kubectl -n tpu-ci create -f /tmp/job.yaml -o name)"
           echo "Created ${name}"
           trap 'kubectl -n tpu-ci delete '"${name}"' --ignore-not-found --wait=false' EXIT
-
           short="${name##*/}"
           sel="jobset.sigs.k8s.io/jobset-name=${short}"
 
@@ -147,22 +187,31 @@ jobs:
 
           # Runtime budget, computed here because the admission budget is whatever is left
           # of the runner's lifetime after it.
-          #   * single-host: scales with the suite's registered est_time (static AST scan in
-          #     render_jobset.py -> max(sum(est_time)*1.5, 360s)). run_suite's
+          #   * single-host: scales with the shard's registered est_time
+          #     (max(sum(est_time)*1.5, 360s)). run_suite's
           #     --timeout-per-file still bounds each file.
-          #   * multi-host: the JobSet caps the run at activeDeadlineSeconds (9000s for
-          #     launch mode: ~30m bring-up + 2 files x `timeout 3600`, gsm8k on R1 needs
-          #     the full hour), and this must OUTLAST it so the JobSet -- not this loop --
+          #   * multi-host: the JobSet caps the run at activeDeadlineSeconds
+          #     (3600s bring-up + files x timeout_per_file, the render_jobset.py
+          #     formula), and this must OUTLAST it so the JobSet -- not this loop --
           #     decides the outcome.
-          if [ -n "${{ inputs.launch_script }}" ]; then
-            wait_s=9600          # activeDeadlineSeconds 9000 + streaming/scheduling margin
+          if [ '${{ inputs.pd_prefill_hosts }}' != '0' ]; then
+            wait_s=11400         # outlast P/D mode's activeDeadlineSeconds=10800 + margin
+          elif [ -n "${{ inputs.launch_script }}" ]; then
+            nf=$(wc -w <<< "${{ inputs.files }}")
+            wait_s=$(( 3600 + nf * ${{ inputs.timeout_per_file }} + 600 ))  # deadline + margin
           elif [ -n "${{ inputs.exec_cmd }}" ]; then
             wait_s=7800          # outlast exec mode's activeDeadlineSeconds=7200 + margin
           else
             # +600 for the same reason as the other two modes: the JobSet's deadline is
             # the same est_time figure, and the poll must outlast it so the JobSet reports
             # the outcome rather than this loop racing it to a generic timeout.
-            wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py --suite "$suite" --print-wait-seconds) + 600 ))
+            wait_s=$(( $(python3 .github/tpu-ci/render_jobset.py \
+              --suite "$suite" \
+              --test-file '${{ inputs.test_file }}' \
+              --partition-id '${{ inputs.partition_id }}' \
+              --partition-size '${{ inputs.partition_size }}' \
+              ${{ inputs.nightly && '--nightly' || '' }} \
+              --print-wait-seconds) + 600 ))
           fi
 
           # One slice runs one job at a time, so the wait is however long everything queued
@@ -170,12 +219,68 @@ jobs:
           # budget on it: ceiling minus this job's own runtime, the bind/pull window and
           # setup. A fixed 1h was the reason four of five multi-host jobs failed in run
           # 31834592348 while the slice was busy.
+          # The kubeconfig holds a one-hour access token minted at job start,
+          # and the org policy does not allow longer ones. A job that queues
+          # behind other PRs on the slice outlives it, so re-mint the token
+          # from a fresh GitHub OIDC token (the same exchange the auth action
+          # does) and swap it into the kubeconfig before it can expire.
+          refresh_cluster_token() {
+            local oidc sts sa_token user
+            oidc="$(curl -sSf -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://iam.googleapis.com/${WIF_PROVIDER}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')" || return 1
+            sts="$(curl -sSf -X POST https://sts.googleapis.com/v1/token \
+              -H 'Content-Type: application/json' \
+              -d "{\"audience\":\"//iam.googleapis.com/${WIF_PROVIDER}\",
+                   \"grantType\":\"urn:ietf:params:oauth:grant-type:token-exchange\",
+                   \"requestedTokenType\":\"urn:ietf:params:oauth:token-type:access_token\",
+                   \"scope\":\"https://www.googleapis.com/auth/cloud-platform\",
+                   \"subjectTokenType\":\"urn:ietf:params:oauth:token-type:jwt\",
+                   \"subjectToken\":\"${oidc}\"}" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')" || return 1
+            # userinfo.email is required: without it GKE sees a numeric id and RBAC denies.
+            sa_token="$(curl -sSf -X POST \
+              "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${CI_SA}:generateAccessToken" \
+              -H "Authorization: Bearer ${sts}" -H 'Content-Type: application/json' \
+              -d '{"scope":["https://www.googleapis.com/auth/cloud-platform","https://www.googleapis.com/auth/userinfo.email"],"lifetime":"3600s"}' \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["accessToken"])')" || return 1
+            user="$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
+            kubectl config set-credentials "$user" --token "$sa_token" >/dev/null
+            echo "refreshed cluster credentials at $(date -u +%FT%TZ)"
+          }
+
+
           admit_s=$(( JOB_CEILING_S - wait_s - 900 - 600 ))
           echo "budgets for ${label}: admission ${admit_s}s, runtime ${wait_s}s"
           echo "queued in this ClusterQueue right now:"
           kubectl -n tpu-ci get workloads 2>/dev/null | tail -n +2 | wc -l | xargs echo "  workloads:"
           admit_deadline=$(( $(date +%s) + admit_s ))
-          until [ -n "$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>/dev/null)" ]; do
+          next_refresh=$(( $(date +%s) + 2400 ))
+          auth_fails=0
+          while true; do
+            # A dead kubectl looks identical to "no pods yet" with errors
+            # suppressed, so track it explicitly and recover the credentials
+            # instead of reporting NOT ADMITTED with an expired kubeconfig.
+            if pods="$(kubectl -n tpu-ci get pods -l "$sel" -o name 2>&1)"; then
+              auth_fails=0
+              [ -n "$pods" ] && break
+            else
+              auth_fails=$((auth_fails + 1))
+              if [ "$auth_fails" -ge 3 ]; then
+                refresh_cluster_token || echo "credential refresh failed; will retry"
+                auth_fails=0
+              fi
+            fi
+            if [ "$(date +%s)" -ge "$next_refresh" ]; then
+              if refresh_cluster_token; then
+                next_refresh=$(( $(date +%s) + 2400 ))
+              else
+                # The current token dies at the hour mark; retry well before
+                # then rather than running blind for another 40 minutes.
+                echo "credential refresh failed; retrying in 45s"
+                next_refresh=$(( $(date +%s) + 45 ))
+              fi
+            fi
             if [ "$(date +%s)" -ge "$admit_deadline" ]; then
               echo "❌ ${label} NOT ADMITTED after ${admit_s}s -- slice quota never freed"
               kubectl -n tpu-ci get workloads 2>/dev/null | grep -- "${short}" || true
@@ -195,18 +300,137 @@ jobs:
             fi
             sleep 5
           done
+          kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+
+          # The stream below can outlive the token it starts with; start it fresh.
+          refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
 
           # Stream logs from every host (best effort; may restart while pods come up).
+          # Tee'd because the pod log is the ONLY egress from a JobSet: a benchmark
+          # test emits its results JSON into it, and the next step lifts that out.
           kubectl -n tpu-ci logs -f -l "$sel" --all-containers=true --prefix=true \
-            --max-log-requests=10 --pod-running-timeout=15m --tail=-1 || true
+            --max-log-requests=10 --pod-running-timeout=15m --tail=-1 \
+            2>&1 | tee "$RUNNER_TEMP/tpu-pod-logs.txt" || true
 
           # Runtime clock starts now: queue time is not charged to the test.
           deadline=$(( $(date +%s) + wait_s ))
+          auth_fails=0
+          # The stream may have run for a long time; poll with a fresh token.
+          refresh_cluster_token || echo "credential refresh failed; continuing with the current token"
+          next_refresh=$(( $(date +%s) + 2400 ))
+          iter=0
           while [ "$(date +%s)" -lt "$deadline" ]; do
+            if [ "$(date +%s)" -ge "$next_refresh" ]; then
+              if refresh_cluster_token; then
+                next_refresh=$(( $(date +%s) + 2400 ))
+              else
+                echo "credential refresh failed; retrying in 45s"
+                next_refresh=$(( $(date +%s) + 45 ))
+              fi
+            fi
+            # Multi-host pods can sit unschedulable for a long time with nothing
+            # else printed between the log stream and the verdict; surface where
+            # each pod landed once a minute (12 x the 5s poll below).
+            if [ $(( iter % 12 )) -eq 0 ]; then
+              echo "--- [$(date +%T)] Pod Status for ${label} ---"
+              kubectl -n tpu-ci get pods -l "$sel" -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,IP:.status.podIP 2>/dev/null || true
+            fi
+            iter=$(( iter + 1 ))
+            # A dead kubectl looks identical to "no condition yet" with errors
+            # suppressed, so track it explicitly instead of polling blind until
+            # the budget runs out; try one refresh before giving up.
+            if ! kubectl -n tpu-ci get "$name" >/dev/null 2>&1; then
+              auth_fails=$((auth_fails + 1))
+              [ "$auth_fails" -eq 3 ] && refresh_cluster_token || true
+              if [ "$auth_fails" -ge 12 ]; then
+                echo "❌ ${label}: lost cluster access while polling (credentials likely expired); JobSet outcome unknown"
+                exit 1
+              fi
+              sleep 5; continue
+            fi
+            auth_fails=0
             ok="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Completed")].status}' 2>/dev/null || true)"
             bad="$(kubectl -n tpu-ci get "$name" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
             [ "$ok" = "True" ]  && { echo "✅ ${label} PASSED"; exit 0; }
-            [ "$bad" = "True" ] && { echo "❌ ${label} FAILED"; kubectl -n tpu-ci describe "$name" | tail -n 80; exit 1; }
+            [ "$bad" = "True" ] && {
+              echo "❌ ${label} FAILED"
+              # Scheduling/admission evidence: pod placement, Kueue workload
+              # state, and recent namespace events tell apart "test failed"
+              # from "pods never got hardware".
+              kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+              # Late-arriving pods never join the initial `logs -f` stream, so
+              # re-collect every pod's tail before the JobSet is deleted.
+              kubectl -n tpu-ci logs -l "$sel" --all-containers --prefix --tail=150 2>/dev/null || true
+              kubectl -n tpu-ci get workloads -o wide 2>/dev/null || true
+              kubectl -n tpu-ci get events --sort-by=.lastTimestamp 2>/dev/null | tail -n 40 || true
+              kubectl -n tpu-ci describe "$name" | tail -n 200
+              exit 1
+            }
             sleep 5
           done
-          echo "❌ ${label} TIMED OUT after ${wait_s}s"; exit 1
+          echo "❌ ${label} TIMED OUT after ${wait_s}s"
+          kubectl -n tpu-ci get pods -l "$sel" -o wide || true
+          kubectl -n tpu-ci describe "$name" | tail -n 120 || true
+          exit 1
+
+      # A benchmark test prints its results JSON between markers, because the pod
+      # log is the only thing that leaves a JobSet. Lift it into a downloadable
+      # artifact + the run summary so a result is findable in the GitHub UI without
+      # scrolling a multi-host log. No-op (and non-fatal) for tests that emit
+      # nothing, which is every functional test.
+      - name: Publish benchmark results
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/tpu-pod-logs.txt"
+          out="$RUNNER_TEMP/bench-result.json"
+          [ -f "$log" ] || { echo "no pod log captured"; exit 0; }
+          # Take the LAST marker block, not a sed range over all of them: a launch
+          # group can run several test files against one server (the 30B group
+          # already runs two), and a sed range would splice every block into one
+          # invalid document -- dropping every result instead of one.
+          # The pod log is prefixed per container by --prefix=true; strip that too.
+          awk '/TPU_BENCH_RESULT_JSON BEGIN/ {buf=""; inblk=1; next}
+               /TPU_BENCH_RESULT_JSON END/   {last=buf; inblk=0; next}
+               inblk                          {buf = buf $0 "\n"}
+               END                            {printf "%s", last}' "$log" \
+            | sed -e 's/^\[[^]]*\] //' | tr -d '\r' > "$out" || true
+          if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$out" 2>/dev/null; then
+            echo "no benchmark results in this run's log"
+            rm -f "$out"
+            exit 0
+          fi
+          echo "extracted results -> $out ($(wc -c <"$out") bytes)"
+          python3 - "$out" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          run, totals = s.get("run", {}), s.get("totals", {})
+          print(f"## {run.get('benchmark', 'TPU benchmark')} — {run.get('mode', '?')}")
+          print()
+          print(f"- model `{run.get('model')}`  profile `{run.get('profile')}`  "
+                f"commit `{(run.get('git', {}).get('commit') or '')[:12]}`")
+          print(f"- {totals.get('legs_ok', 0)}/{totals.get('legs_total', 0)} legs ok, "
+                f"{totals.get('warnings', 0)} warning(s)")
+          print()
+          print("| leg | status | out tok/s | prompt tok/s | TTFT p50 ms | ITL p50 ms | prefix hit |")
+          print("|---|---|---:|---:|---:|---:|---:|")
+          for leg in s.get("legs", []):
+              m, d = leg.get("metrics") or {}, leg.get("derived") or {}
+              hit = (leg.get("feature_derived") or {}).get("prefix_cache_hit_rate")
+              f = lambda v, spec=".1f": format(v, spec) if isinstance(v, (int, float)) else "-"
+              print(f"| {leg.get('mode')}/{leg.get('tag')} | {leg.get('status')} "
+                    f"| {f(m.get('output_throughput'))} | {f(d.get('prompt_throughput'))} "
+                    f"| {f(m.get('median_ttft_ms'), '.0f')} | {f(m.get('median_itl_ms'))} "
+                    f"| {(format(hit, '.1%') if isinstance(hit, float) else '-')} |")
+          PY
+
+      - name: Upload benchmark results
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu-bench-result-${{ inputs.run_name || inputs.suite || 'test' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench-result.json
+          if-no-files-found: ignore
+          retention-days: 30

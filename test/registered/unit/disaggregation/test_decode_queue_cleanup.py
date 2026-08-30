@@ -8,10 +8,14 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    HiCacheRestoreGatedKVReceiver,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,8 +33,104 @@ class FakeReceiver:
         return None
 
 
+class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
+    def test_group_failure_lifecycle_is_forwarded_to_inner_receiver(self):
+        inner = SimpleNamespace(
+            group_failure_requires_drain=True,
+            quiesce_group_failure=MagicMock(),
+            drained=MagicMock(return_value=False),
+        )
+        wrapper = HiCacheRestoreGatedKVReceiver(SimpleNamespace(kv_receiver=inner))
+
+        self.assertTrue(wrapper.group_failure_requires_drain)
+        wrapper.quiesce_group_failure()
+        self.assertFalse(wrapper.drained())
+
+        inner.quiesce_group_failure.assert_called_once_with()
+        inner.drained.assert_called_once_with()
+
+    def test_non_drain_backend_keeps_capability_disabled(self):
+        wrapper = HiCacheRestoreGatedKVReceiver(
+            SimpleNamespace(kv_receiver=SimpleNamespace())
+        )
+
+        self.assertFalse(wrapper.group_failure_requires_drain)
+
+    def test_decode_poll_keeps_hicache_gate_and_reduces_tp_then_cp(self):
+        tp_group, cp_group = object(), object()
+        inner = SimpleNamespace(group_failure_requires_drain=True)
+        decode_req = SimpleNamespace(kv_receiver=inner)
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.queue = [decode_req]
+        queue.gloo_group = tp_group
+        queue.attn_cp_cpu_group = cp_group
+        queue.metadata_buffers = object()
+        queue.scheduler = SimpleNamespace(
+            enable_decode_hicache=True,
+            server_args=object(),
+        )
+
+        with patch(
+            "sglang.srt.disaggregation.decode.poll_and_all_reduce",
+            return_value=[KVPoll.Transferring],
+        ) as reduce:
+            queue._poll_with_metadata_gate()
+
+        pollers = reduce.call_args.args[0]
+        self.assertIsInstance(pollers[0], HiCacheRestoreGatedKVReceiver)
+        self.assertIs(pollers[0].decode_req, decode_req)
+        self.assertIs(reduce.call_args.args[1], tp_group)
+        self.assertEqual(reduce.call_args.kwargs["additional_groups"], [cp_group])
+
+
 class TestDecodeQueueCleanup(CustomTestCase):
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_prealloc_waiting_row_still_enters_tp_cp_vote(self, reduce):
+        tp_group, cp_group = object(), object()
+        receiver = SimpleNamespace(conclude_state=None)
+        decode_req = SimpleNamespace(
+            waiting_for_input=True,
+            kv_receiver=receiver,
+            req=SimpleNamespace(time_stats=MagicMock()),
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.pp_size = 1
+        queue.gloo_group = tp_group
+        queue.attn_cp_cpu_group = cp_group
+        reduce.return_value = [KVPoll.WaitingForInput]
+
+        queue._update_handshake_waiters()
+
+        reduce.assert_called_once_with(
+            [receiver], tp_group, additional_groups=[cp_group]
+        )
+
+    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
+    def test_prealloc_without_cp_keeps_all_waiting_shortcut(self, reduce):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [
+            SimpleNamespace(
+                waiting_for_input=True,
+                kv_receiver=SimpleNamespace(conclude_state=None),
+            )
+        ]
+        queue.pp_size = 1
+        queue.attn_cp_cpu_group = None
+
+        queue._update_handshake_waiters()
+
+        reduce.assert_not_called()
+
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
+        # resume_retracted_reqs reads the retraction backend off the disagg
+        # bag, so the case publishes a config instead of injecting one.
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         page_size = 128
         fill_len = 574
         physical_tokens_per_req = 5 * page_size
@@ -42,6 +142,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
+                retraction_backup=None,
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)
@@ -52,6 +153,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
@@ -200,6 +302,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_deferred_kv_release = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0

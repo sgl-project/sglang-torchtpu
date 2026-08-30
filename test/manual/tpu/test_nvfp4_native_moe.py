@@ -40,7 +40,7 @@ E2M1_ABS = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 E2M1_BOUNDS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
 
 
-# NVFP4 quantize/dequant helpers for row-major block-512 weights.
+# NVFP4 quantize/dequant helpers for the stock row-major block-512 path.
 
 
 def _quantize_rows_nvfp4(x, g, block_size=NVFP4_BLOCK):
@@ -91,7 +91,7 @@ def _dequant_rows_nvfp4(packed, fp8_scale, g, dtype=torch.bfloat16):
 def _make_nvfp4_moe_layer(E, hidden, intermediate, seed, block_size=NVFP4_BLOCK):
     """Build a synthetic NVFP4 MoE layer matching ModelOpt checkpoint params.
 
-    ``block_size`` is the supported block-512 scale granularity.
+    ``block_size`` is the stock Pallas path's block-512 scale granularity.
     """
     g = torch.Generator().manual_seed(seed)
     w1f = (torch.randn(E, intermediate, hidden, generator=g) * 0.1).float()
@@ -149,7 +149,7 @@ def _build_fake_layer(data, extra_params=True):
     return layer
 
 
-# The CPU-only block-512 layout check lives in per-commit CI:
+# The CPU-only layout checks live in per-commit CI:
 # test/registered/unit/layers/quantization/test_nvfp4_tpu_moe_fold.py
 
 

@@ -95,10 +95,16 @@ tpu:
   - changed-files:
     - any-glob-to-any-file:
       - 'python/sglang/srt/hardware_backend/tpu/**'
+      - 'python/sglang/multimodal_gen/runtime/platforms/tpu.py'
+      - 'python/sglang/multimodal_gen/runtime/platforms/__init__.py'
+      - 'python/sglang/multimodal_gen/test/unit/test_tpu_*.py'
+      - 'python/sglang/multimodal_gen/test/unit/test_platform_detection.py'
       - 'python/pyproject_tpu.toml'
       - 'benchmark/tpu/**'
       - 'docker/tpu.Dockerfile'
+      - 'docker/tpu-base.Dockerfile'
       - 'docker/cloudbuild.tpu.yaml'
+      - 'docker/cloudbuild.tpu-base.yaml'
       - 'test/registered/tpu/**'
       - '.github/tpu-ci/**'
       - '.github/workflows/_tpu-build.yml'

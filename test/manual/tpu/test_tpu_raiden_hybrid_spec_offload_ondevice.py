@@ -1,6 +1,6 @@
 """On-device test: hybrid raiden KV offload piggybacks the draft sidecar pool.
 
-Requires a TPU + a built tpu_raiden extension + torch_tpu. NOT a CI unit test
+Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_hybrid_offload_unit.py for the host-only logic). Run with:
 
     PYTHONPATH=/path/to/sglang-torchtpu/python \
@@ -124,8 +124,6 @@ def _make_controller(anchor, swa, draft):
     controller.mem_pool_device_draft = None
     controller.mem_pool_host_draft = None
     controller.layer_done_counter = BatchDoneCounter()
-    controller._async_h2d = False
-    controller._load_worker = None
     controller.write_queue = []
     controller.load_queue = []
     controller.ack_write_queue = []

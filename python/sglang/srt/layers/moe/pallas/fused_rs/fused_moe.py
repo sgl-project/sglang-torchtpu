@@ -154,6 +154,30 @@ def moe_gmm_local_rs_nodedup(
         else jax.lax.axis_index(ep_axis_name)
     )
 
+    # Compiler workaround for the non-SP fused remote-DMA graph: materialize
+    # IDs and weights from physical device 0 in one BF16 psum and feed both
+    # slices forward. Altering this dataflow can halt the compiled graph. This
+    # should not be interpreted as evidence that routing IDs differ across
+    # ranks; the ablations establish a lowering dependency, not its root cause.
+    # Backend selection limits this path to 256 experts, so IDs 0..255 are
+    # represented exactly in BF16.
+    # TODO: Remove this block once the mixed communicating-Pallas core halt is
+    # fixed at its root cause:
+    # https://github.com/sgl-project/sglang-torchtpu/issues/308
+    # https://github.com/google-pytorch/torch_tpu/issues/2794
+    if not sp_enabled:
+        route_source = my_id == 0
+        routing = jnp.stack(
+            (topk_indices.astype(jnp.bfloat16), topk_weights.astype(jnp.bfloat16)),
+            axis=-1,
+        )
+        routing = jax.lax.psum(
+            jnp.where(route_source, routing, jnp.zeros_like(routing)),
+            axis_name=ep_axis_name,
+        )
+        topk_indices = routing[..., 0].astype(jnp.int32)
+        topk_weights = routing[..., 1].astype(topk_weights.dtype)
+
     # Routing — inlined here so bincount lives in the SAME shard_map as the
     # kernel call. Mirrors v1 where bincount is co-located with the heavy
     # ``hidden_states[token_indices_sorted]`` gather, letting XLA fuse them.
@@ -206,8 +230,14 @@ def moe_gmm_local_rs_nodedup(
         fp8_direct_write=fp8_direct_write,
     )
     tile_m = block_sizes.tile_m
+    # Every device must execute the same padded GM loop. Use a static upper
+    # bound based on the number of experts owned by one device: in the worst
+    # case all routed rows land on that device. This is much tighter than the
+    # old global-expert bound while keeping the communication schedule wholly
+    # independent of runtime routing and physical rank order.
     max_num_gm = jnp.array(
-        num_experts + (size_m + tile_m - 1) // tile_m - 1, dtype=jnp.int32
+        num_local_experts + (size_m + tile_m - 1) // tile_m - 1,
+        dtype=jnp.int32,
     )
 
     out_buf = gmm_v2_fused_rs_nodedup(
@@ -231,6 +261,7 @@ def moe_gmm_local_rs_nodedup(
         ep_size=ep_size,
         ep_axis_name=ep_axis_name,
         max_num_gm=max_num_gm,
+        caller_tile_m=tile_m,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
     )

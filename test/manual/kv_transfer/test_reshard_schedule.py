@@ -1,7 +1,7 @@
 """Unit tests for the asymmetric-TP KV resharding schedule builder.
 
 Pure byte-math and protobuf construction (the proto is mocked), so these run
-anywhere -- no TPU / torch_tpu / tpu_raiden required. The on-device push path is
+anywhere -- no TPU / torch_tpu / tpu_sync required. The on-device push path is
 validated separately on a TPU VM.
 
 Run: python -m pytest test/manual/kv_transfer/test_reshard_schedule.py

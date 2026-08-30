@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -6,14 +7,60 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import FlushCacheReqInput
+from sglang.srt.managers.io_struct import FlushCacheReqInput, FlushCacheReqOutput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
+from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
 register_cpu_ci(est_time=14, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class _FakeTokenizerManager(TokenizerControlMixin):
+    def __init__(self, results):
+        self.requests = []
+
+        async def flush_cache_communicator(request):
+            self.requests.append(request)
+            return results
+
+        self.flush_cache_communicator = flush_cache_communicator
+        self.mm_processor = MagicMock()
+
+    def auto_create_handle_loop(self):
+        pass
+
+
+class TestTokenizerFlushCache(unittest.TestCase):
+    def test_reports_failure_if_any_dp_rank_fails(self):
+        manager = _FakeTokenizerManager(
+            [
+                FlushCacheReqOutput(success=True),
+                FlushCacheReqOutput(success=False, message="DP1 is busy"),
+            ]
+        )
+
+        output = asyncio.run(manager.flush_cache())
+
+        self.assertFalse(output.success)
+        self.assertIn("DP1 is busy", output.message)
+        manager.mm_processor.clear_preprocess_cache.assert_not_called()
+
+    def test_clears_processor_cache_after_all_dp_ranks_succeed(self):
+        manager = _FakeTokenizerManager(
+            [
+                FlushCacheReqOutput(success=True),
+                FlushCacheReqOutput(success=True),
+            ]
+        )
+
+        output = asyncio.run(manager.flush_cache(timeout_s=5.0))
+
+        self.assertTrue(output.success)
+        self.assertEqual(manager.requests[0].timeout_s, 5.0)
+        manager.mm_processor.clear_preprocess_cache.assert_called_once_with()
 
 
 class TestSchedulerFlushCache(unittest.TestCase):

@@ -65,6 +65,7 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    sliding_window_size: Optional[int]
     # for system dp
     system_dp_rank: int
     # for pp prefill

@@ -82,6 +82,18 @@ def align_to(x, a):
     return pl.cdiv(x, a) * a
 
 
+def lhs_sublane_tiling(dtype) -> int:
+    """The LHS sublane tiling the kernel requires ``size_m`` to be a multiple of.
+
+    8 native sublanes times the dtype's packing factor: 8 for f32, 16 for bf16,
+    32 for 8-bit, 64 for 4-bit. Callers that have to align ``size_m`` *before*
+    the call (``fused_moe_op`` pads its token count so that ``m_pad * topk``
+    lands on this) go through here rather than hardcoding the bf16 16, so the
+    constant has exactly one definition.
+    """
+    return pltpu.get_tpu_info().get_sublane_tiling(dtype)
+
+
 # Define data classes.
 
 
@@ -1116,7 +1128,7 @@ def validate_inputs(
 
     assert group_offset.shape == (1,)
 
-    size_lhs_sublane = pltpu.get_tpu_info().get_sublane_tiling(lhs.dtype)
+    size_lhs_sublane = lhs_sublane_tiling(lhs.dtype)
     size_lhs_sublane = min(size_lhs_sublane, size_m)
     if fuse_act is not None:
         assert size_n % 2 == 0, (

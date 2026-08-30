@@ -169,6 +169,7 @@ class TestTpuPlatformMemory(CustomTestCase):
 
     def setUp(self):
         self.platform = TpuSRTPlatform()
+        self.platform._backend_initialized = True
 
     def _patch_mem(self, free, limit):
         # get_device() builds torch.device("tpu", ...) which is invalid off-TPU;
@@ -177,6 +178,13 @@ class TestTpuPlatformMemory(CustomTestCase):
             patch.object(self.platform, "get_device", return_value=None),
             patch("torch.accelerator.get_memory_info", return_value=(free, limit)),
         )
+
+    def test_uninitialized_returns_zero_without_calling_runtime(self):
+        uninit_platform = TpuSRTPlatform()
+        with patch("torch.accelerator.get_memory_info") as mock_mem:
+            self.assertEqual(uninit_platform.get_device_total_memory(), 0)
+            self.assertEqual(uninit_platform.get_current_memory_usage(), 0.0)
+            mock_mem.assert_not_called()
 
     def test_total_memory_returns_reported_limit(self):
         dev, mem = self._patch_mem(10 << 30, 96 << 30)
@@ -220,6 +228,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             kv_cache_dtype="auto",
             use_ray=False,
             hicache_io_backend=None,
+            max_total_tokens=None,
             speculative_algorithm=None,
             speculative_eagle_topk=None,
             speculative_use_rejection_sampling=False,
@@ -411,14 +420,19 @@ class TestTpuPlatformFactoryMethods(CustomTestCase):
 
     def test_mha_kv_pool_cls(self):
         # get_mha_kv_pool_cls picks the pool by the resolved attention backend
-        # read off the global server args; a non-RPA backend yields the flat
-        # MHATokenToKVPool.
         with patch(
             "sglang.srt.server_args.get_global_server_args",
             return_value=SimpleNamespace(attention_backend="torch_native"),
         ):
             cls = self.platform.get_mha_kv_pool_cls()
         self.assertEqual(cls.__name__, "MHATokenToKVPool")
+
+        with patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=SimpleNamespace(attention_backend="pallas_tpu_rpa_v3"),
+        ):
+            cls = self.platform.get_mha_kv_pool_cls()
+        self.assertEqual(cls.__name__, "TpuFusedMHATokenToKVPool")
 
     def test_nsa_raises(self):
         with self.assertRaises(NotImplementedError):

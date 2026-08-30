@@ -1,6 +1,6 @@
 """On-device test: raiden KV offload piggybacks the speculative draft pool.
 
-Requires a TPU + a built tpu_raiden extension + torch_tpu. NOT a CI unit test
+Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_offload_unit.py for the host-only logic). Run with:
 
     PYTHONPATH=/path/to/sglang-torchtpu/python \
@@ -102,8 +102,6 @@ def _make_controller(target_dev, target_host, draft_dev, draft_host):
     controller.mem_pool_host_draft = None
     controller.layer_done_counter = BatchDoneCounter()
     target_dev.register_layer_transfer_counter(controller.layer_done_counter)
-    controller._async_h2d = False
-    controller._load_worker = None
     controller.write_queue = []
     controller.load_queue = []
     controller.ack_write_queue = []

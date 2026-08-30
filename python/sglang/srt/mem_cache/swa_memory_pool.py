@@ -266,28 +266,7 @@ class SWAKVPool(BaseSWAKVPool):
             return None
         if row_mask is None or bool(torch.all(row_mask).item()):
             return swa_kv_cpu
-
-        chunk_size = getattr(
-            self.swa_kv_pool, "cpu_offloading_chunk_size", len(row_mask)
-        )
-        filtered = []
-        for layer_chunks in swa_kv_cpu:
-            if len(layer_chunks) == 0:
-                filtered.append([])
-                continue
-
-            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
-            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
-            k_cpu = k_cpu[row_mask]
-            v_cpu = v_cpu[row_mask]
-
-            filtered_layer = []
-            for i in range(0, len(k_cpu), chunk_size):
-                filtered_layer.append(
-                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
-                )
-            filtered.append(filtered_layer)
-        return filtered
+        return self.swa_kv_pool.filter_cpu_copy(swa_kv_cpu, row_mask)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools

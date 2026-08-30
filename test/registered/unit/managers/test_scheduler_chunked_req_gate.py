@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -12,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -47,6 +48,7 @@ def _make_req(
     req.logprob_start_len = -1
     req.positional_embed_overrides = None
     req.extra_key = None
+    req.cache_salt = None
     req.mamba_pool_idx = None
     req.sampling_params = SimpleNamespace(max_new_tokens=128, ignore_eos=False)
     return req
@@ -175,6 +177,60 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+
+class TestChunkedAbortNativeReadDrain(CustomTestCase):
+    def _scheduler(self, req):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.chunked_req = req
+        scheduler._pending_chunked_abort_req = req
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
+        scheduler.enable_hicache_storage = False
+        scheduler.tree_cache = MagicMock()
+        scheduler.ipc_channels = MagicMock()
+        return scheduler
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    @patch("sglang.srt.managers.scheduler.maybe_release_metadata_buffer")
+    @patch("sglang.srt.managers.scheduler.prepare_abort")
+    def test_abort_defers_page_release_while_sender_is_not_drained(
+        self, _prepare_abort, _release_metadata, release_kv
+    ):
+        sender = MagicMock(group_failure_requires_drain=True)
+        sender.drained.return_value = False
+        req = SimpleNamespace(
+            rid="chunked-abort",
+            disagg_kv_sender=sender,
+            time_stats=SimpleNamespace(trace_ctx=MagicMock()),
+            to_finish=object(),
+            pending_bootstrap=True,
+        )
+        scheduler = self._scheduler(req)
+
+        scheduler.process_pending_chunked_abort()
+
+        sender.abort.assert_called_once_with()
+        release_kv.assert_not_called()
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+    @patch("sglang.srt.managers.scheduler.release_kv_cache")
+    def test_deferred_pages_release_only_after_sender_drains(self, release_kv):
+        sender = MagicMock()
+        sender.drained.side_effect = [False, True]
+        req = SimpleNamespace(disagg_kv_sender=sender)
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = MagicMock()
+        scheduler._deferred_chunked_sender_aborts = [req]
+
+        scheduler._drain_deferred_chunked_sender_aborts()
+        release_kv.assert_not_called()
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+
+        scheduler._drain_deferred_chunked_sender_aborts()
+        sender.clear.assert_called_once_with()
+        release_kv.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
 
 
 if __name__ == "__main__":

@@ -83,10 +83,14 @@ def per_step_draft_out_cache_loc(
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # contiguous() is load-bearing on TPU: without it the per-step rows stay
+    # lazy strided views, and a compiled graph binds a row's strided span over
+    # the base buffer instead of a dense [bs*topk] input (XLA e0102).
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
-        .reshape(num_steps, -1)
+        .contiguous()
+        .view(num_steps, -1)
     )
 
 
@@ -101,7 +105,10 @@ def _eagle_prefill_tail_tokens(
         for i, r in enumerate(batch.reqs):
             if r is batch.chunked_req:
                 tail_tokens = tail_tokens.clone()
-                tail_tokens[i] = next_prompt_token
+                # Keep the scalar as a kernel argument. Assigning a Python scalar
+                # through scalar indexing issues a pageable H2D copy and
+                # synchronizes the current CUDA stream before draft extend.
+                tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
 
@@ -953,6 +960,21 @@ def eagle_sample(
             topk=verify_input.tree_topk,
             next_token_logits=next_token_logits,
         )
+
+        if _is_hip:
+            # On ROCm, the per-rank draft tokens can differ, so ranks accept a
+            # different number of drafts, desynchronize the committed seq_lens, and
+            # deadlock the next TP collective. Broadcast from rank 0 to ensure
+            # consistency, the same way the sampling branch below does.
+            tp_group = (
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if _use_torch_native:
             top_k_renorm_prob = top_k_renorm_prob_func

@@ -14,7 +14,7 @@ H2D into pages it allocated itself. No device pointers ever cross the
 process boundary — see ``transfer.py`` for why that matters on TPU.
 
 For the backend-agnostic control-plane scaffolding and the seam a second
-backend (e.g. ``tpu_raiden``) plugs into, see ``base.py``.
+backend (e.g. ``tpu_sync``) plugs into, see ``base.py``.
 
 Threading model (critical on TPU)
 ---------------------------------
@@ -328,14 +328,24 @@ class TpuKVManager(TpuKVManagerBase):
             plans: list[PrefillTransferInfo] = []
             total_lanes = 0
             for info in bucket.values():
+                if info._reshard_error is not None:
+                    raise KVTransferError(room, info._reshard_error)
                 if not info.if_skip_sending:
                     plans.append(info)
                     total_lanes += len(page_indices) * info.n_lane_to_send
             logger.info("[pd_kv_resharding] prefill room=%s plans: %s", room, plans)
-            # If there is no plans to push for the prefill TP rank. Exit early.
+            # Register the room BEFORE recording any drain: _note_push_done()
+            # no-ops on an unregistered room. A rank with nothing to push (its
+            # KV-head lanes are replicated on a sibling rank, so it plans no
+            # sends) would otherwise stay at WaitingForInput forever, and the
+            # attn-TP MIN all-reduce in process_disagg_prefill_inflight_queue()
+            # would pin the whole group there -- the prefill never answers and
+            # the request hangs until the client times out.
+            self._note_push_submitted(room, total_lanes)
+            # No plans for this prefill TP rank: zero units to drain, so the
+            # room is already complete here.
             if not plans:
                 self._note_push_done(room, 0)
-            self._note_push_submitted(room, total_lanes)
             aux_blobs_all: list[bytes] = []
             if is_last_chunk and aux_index is not None:
                 aux_blobs_all = tpu_transfer.read_aux_row(self.kv_args, aux_index)

@@ -140,6 +140,18 @@ def npu_platform_plugin() -> str | None:
     )
 
 
+def tpu_platform_plugin() -> str | None:
+    # torch_tpu autoloads at ``import torch`` and registers ``torch.tpu`` (and
+    # the ``tpu`` dynamo backend) only when it finds hardware; an installed
+    # wheel alone must not select this platform.
+    import torch
+
+    if getattr(torch, "tpu", None) is not None:
+        logger.debug("torch.tpu is registered; selecting TPU platform")
+        return "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform"
+    return None
+
+
 def musa_platform_plugin() -> str | None:
     is_musa = False
 
@@ -188,6 +200,7 @@ builtin_platform_plugins = {
     "cpu": cpu_platform_plugin,
     "npu": npu_platform_plugin,
     "musa": musa_platform_plugin,
+    "tpu": tpu_platform_plugin,
 }
 
 
@@ -201,6 +214,7 @@ def resolve_current_platform_cls_qualname() -> str:
             "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
             "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
             "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+            "tpu": "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform",
         }
         qualname = forced_map.get(forced_platform.lower())
         if qualname is None:
@@ -239,6 +253,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to MUSA
     platform_cls_qualname = musa_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to TPU
+    platform_cls_qualname = tpu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

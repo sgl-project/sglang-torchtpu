@@ -99,16 +99,21 @@ def _make_per_tensor_scale_parameter(
     return scale
 
 
-try:
-    from flashinfer import mm_fp4 as flashinfer_fp4_gemm
-    from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
+from sglang.srt.utils.common import is_cuda, is_flashinfer_available
 
-    enable_flashinfer_fp4_gemm = True
-except ImportError:
-    enable_flashinfer_fp4_gemm = False
-    reorder_rows_for_gated_act_gemm = None
-    shuffle_matrix_a = None
-    shuffle_matrix_sf_a = None
+enable_flashinfer_fp4_gemm = False
+reorder_rows_for_gated_act_gemm = None
+shuffle_matrix_a = None
+shuffle_matrix_sf_a = None
+
+if is_cuda() and is_flashinfer_available():
+    try:
+        from flashinfer import mm_fp4 as flashinfer_fp4_gemm
+        from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
+
+        enable_flashinfer_fp4_gemm = True
+    except (ImportError, AttributeError):
+        pass
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -982,7 +987,7 @@ class TpuModelOptMixedPrecisionConfig(ModelOptMixedPrecisionConfig):
     def from_config(cls, config: Dict[str, Any]) -> TpuModelOptMixedPrecisionConfig:
         raise NotImplementedError(
             "ModelOpt MIXED_PRECISION checkpoints are not supported on TPU. "
-            "TPU packed-FP4 support requires the MoE-only block-512 "
+            "TPU packed-FP4 support requires the MoE-only block-128/256/512 "
             "modelopt_fp4 checkpoint schema."
         )
 
@@ -1342,13 +1347,14 @@ class ModelOptFp4Config(ModelOptQuantConfig):
       and checkpoint-provided scales.
     - Serialized + per-token FP32 activation scales: set
       `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1`; use
-      `flashinfer_trtllm` or `flashinfer_trtllm_routed`.
+      `flashinfer_trtllm`, `flashinfer_trtllm_routed`, or `flashinfer_cutedsl`
+      v2 with no A2A or FlashInfer A2A.
     - BF16/FP16/FP8 MoE + per-tensor FP32 activation scales: quantize expert
       weights on load, keep dense weights in source precision or FP8, and use
       1.0 when the checkpoint has no NVFP4 activation scale.
     - BF16/FP16/FP8 MoE + per-token FP32 activation scales: use `nvfp4_online`.
 
-    ``global_scale`` and ``scale_dtype`` describe the TPU block-512 extension,
+    ``global_scale`` and ``scale_dtype`` describe the TPU large-block extension,
     not standard NVIDIA NVFP4.  Standard NVFP4 methods require per-tensor
     global scales (``global_scale=True``) and FP8 block scales (represented by
     an absent ``scale_dtype``).  Keeping the extension metadata on the shared
@@ -1587,12 +1593,13 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
 
 class TpuModelOptCompatibleFp4Config(ModelOptFp4Config):
-    """TPU block-512 packed-FP4 checkpoint schema.
+    """TPU block-128/256/512 packed-FP4 checkpoint schema.
 
     Reuses ModelOpt tensor names and packed E2M1 weights, but is not standard
     NVIDIA NVFP4: block scales may use fp32/bf16/fp8, the per-tensor global
     scale may be absent, only MoE experts are quantized, and execution is W4A8
-    through Pallas rather than native Blackwell FP4.
+    (block 256/512) or W4A16 (block 128) through Pallas fused-RS rather than
+    native Blackwell FP4.
     """
 
     def get_quant_method(
@@ -1621,7 +1628,7 @@ class TpuModelOptCompatibleFp4Config(ModelOptFp4Config):
 
 
 def _validate_standard_modelopt_fp4_config(quant_config: ModelOptQuantConfig) -> None:
-    """Reject TPU block-512 extension metadata in standard NVFP4 methods."""
+    """Reject TPU large-block extension metadata in standard NVFP4 methods."""
     group_size = getattr(quant_config, "group_size", None)
     global_scale = getattr(quant_config, "global_scale", True)
     scale_dtype = getattr(quant_config, "scale_dtype", None)
@@ -1638,7 +1645,7 @@ def _validate_standard_modelopt_fp4_config(quant_config: ModelOptQuantConfig) ->
         raise ValueError(
             "Standard NVIDIA NVFP4 methods support only block-16 checkpoints "
             "with global_scale=True and no scale_dtype. The ModelOpt-compatible "
-            "block-512 extension is supported only by the TPU MoE method; got "
+            "large-block extension is supported only by the TPU MoE method; got "
             + ", ".join(unsupported)
             + "."
         )
@@ -2598,13 +2605,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
+        use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
+            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        )
+
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant
-                    if MOE_NVFP4_DISPATCH
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else None
+                    layer.w13_input_scale_quant if use_dispatch_fp4 else None
                 )
             }
         )
@@ -2665,17 +2673,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     interleave_w13_halves,
                 )
 
-                layer.w13_weight = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight",
                     interleave_w13_halves(
                         layer.w13_weight.view(torch.uint8), group_size=64, dim=1
                     ).contiguous(),
-                    requires_grad=False,
                 )
-                layer.w13_weight_scale = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight_scale",
                     interleave_w13_halves(
                         layer.w13_weight_scale, group_size=64, dim=1
                     ).contiguous(),
-                    requires_grad=False,
                 )
 
             # Process w13 weights
@@ -2736,6 +2746,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                     _FP4_SF_VEC_SIZE,
+                    refresh_cutedsl_standard_scales_for_weight_update,
                 )
 
                 sf_vec_size = _FP4_SF_VEC_SIZE
@@ -2744,7 +2755,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_k = layer.w13_weight.shape[2] * 2
                 w2_m = layer.w2_weight.shape[1]
                 w2_k = layer.w2_weight.shape[2] * 2
-                layer.w13_blockscale_mma = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_blockscale_mma",
                     convert_sf_to_mma_layout(
                         layer.w13_blockscale_swizzled.contiguous()
                         .view(torch.uint8)
@@ -2754,9 +2767,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_blockscale_mma = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w2_blockscale_mma",
                     convert_sf_to_mma_layout(
                         layer.w2_blockscale_swizzled.contiguous()
                         .view(torch.uint8)
@@ -2766,8 +2780,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
                     ),
-                    requires_grad=False,
                 )
+                if layer._cutedsl_wrapper is not None:
+                    refresh_cutedsl_standard_scales_for_weight_update(layer)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -2795,6 +2810,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+
+            layer._cutedsl_wrapper = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -2940,6 +2957,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 a1_scale=layer._cutedsl_input_scale,
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
+                use_per_token_activation=self.quant_config.use_per_token_activation,
             )
             return self.runner.run(dispatch_output, quant_info)
 
@@ -2981,12 +2999,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """TPU adapter for ModelOpt NVFP4 MoE checkpoints."""
 
+    SUPPORTED_GROUP_SIZES = (128, 256, 512)
+
     def __init__(self, quant_config: TpuModelOptCompatibleFp4Config):
         # Do not run the GPU backend/capability validation in the parent
         # constructor. TPU validates its checkpoint and runner contracts below.
-        if quant_config.group_size != 512:
+        if quant_config.group_size not in self.SUPPORTED_GROUP_SIZES:
             raise NotImplementedError(
-                "TPU NVFP4 MoE requires a block-512 checkpoint, "
+                "TPU NVFP4 MoE requires group_size in "
+                f"{self.SUPPORTED_GROUP_SIZES}, "
                 f"got group_size={quant_config.group_size}."
             )
         if not isinstance(quant_config.global_scale, bool):
@@ -3068,12 +3089,18 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
         moe_runner_backend = get_moe_runner_backend()
         if not (
-            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+            moe_runner_backend.is_auto()
+            or moe_runner_backend.is_pallas_tpu()
+            or moe_runner_backend.is_pallas_tpu_fused_rs()
         ):
             raise ValueError(
-                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
-                "pallas_tpu_fused_rs"
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto, "
+                "pallas_tpu, or pallas_tpu_fused_rs"
             )
+
+        if moe_runner_backend.is_pallas_tpu():
+            self.handles_moe_reduction = False
+            return
 
         unmet_requirements = unmet_tpu_nvfp4_fused_rs_requirements(
             layer,
@@ -3083,9 +3110,19 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         self.handles_moe_reduction = not unmet_requirements
         if self.handles_moe_reduction:
             logger.info("Using TPU Pallas NVFP4 fused-RS MoE backend")
-        elif moe_runner_backend.is_pallas_tpu_fused_rs():
+        elif (
+            self.quant_config.group_size != 512
+            or moe_runner_backend.is_pallas_tpu_fused_rs()
+        ):
+            block_size_requirement = (
+                f"TPU NVFP4 group_size={self.quant_config.group_size} requires "
+                "the fused-RS backend. "
+                if self.quant_config.group_size != 512
+                else ""
+            )
             raise ValueError(
-                "--moe-runner-backend pallas_tpu_fused_rs cannot honor this "
+                block_size_requirement
+                + "--moe-runner-backend pallas_tpu_fused_rs cannot honor this "
                 "TPU NVFP4 layer. Unmet requirements: " + ", ".join(unmet_requirements)
             )
 
@@ -3111,11 +3148,13 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if not (
-            moe_runner_backend.is_auto() or moe_runner_backend.is_pallas_tpu_fused_rs()
+            moe_runner_backend.is_auto()
+            or moe_runner_backend.is_pallas_tpu()
+            or moe_runner_backend.is_pallas_tpu_fused_rs()
         ):
             raise ValueError(
-                "TPU NVFP4 MoE supports only --moe-runner-backend auto or "
-                "pallas_tpu_fused_rs"
+                "TPU NVFP4 MoE supports only --moe-runner-backend auto, "
+                "pallas_tpu, or pallas_tpu_fused_rs"
             )
         # Compatibility is resolved after model setup in _resolve_fused_rs.
 

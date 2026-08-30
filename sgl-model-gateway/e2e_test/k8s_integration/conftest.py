@@ -101,6 +101,42 @@ def _wait_for_deployment_ready(
     )
 
 
+def _wait_for_ready_pod(selector: str, namespace: str = NAMESPACE, timeout: int = 180):
+    """Wait until every pod matching `selector` is Ready.
+
+    `_wait_for_deployment_ready` is not a substitute: `kubectl rollout status`
+    reads the Deployment's status subresource, which the controller writes
+    asynchronously. Right after the only replica is force-deleted that status
+    still advertises it as available, so the rollout check returns immediately
+    while the replacement pod is still Pending — and `kubectl port-forward`
+    then refuses it with "unable to forward port because pod is not running".
+    Gating on the pods themselves is the precondition callers actually need.
+
+    `kubectl wait` errors out when the selector matches nothing, so poll for a
+    pod to appear first.
+    """
+    logger.info(
+        "Waiting for pods matching %s to be ready (timeout=%ds)", selector, timeout
+    )
+    deadline = time.time() + timeout
+
+    def _exists() -> bool:
+        result = _kubectl("get", "pod", "-n", namespace, "-l", selector, "-o", "name")
+        return bool(result.stdout.strip())
+
+    _poll_until(_exists, f"a pod matching {selector}", timeout=timeout, interval=2)
+    _kubectl(
+        "wait",
+        "--for=condition=Ready",
+        "pod",
+        "-l",
+        selector,
+        "-n",
+        namespace,
+        f"--timeout={max(int(deadline - time.time()), 1)}s",
+    )
+
+
 def _get_gateway_url() -> str:
     """Return the gateway URL, assuming port-forward is active on localhost:30000."""
     return "http://127.0.0.1:30000"
@@ -179,9 +215,16 @@ def _poll_until(
 
 
 def _port_forward_start(
-    namespace: str, service: str, local_port: int, remote_port: int
+    namespace: str, service: str, local_port: int, remote_port: int, timeout: int = 60
 ) -> subprocess.Popen:
-    """Start kubectl port-forward and verify the port is reachable."""
+    """Start kubectl port-forward and verify the port is reachable.
+
+    Retried until `timeout`: `kubectl port-forward svc/...` resolves the
+    service to a concrete pod once, at startup, and exits non-zero if that pod
+    is not Running yet. Callers gate on readiness first, but the Endpoints
+    object can still lag a pod by a moment, so a single attempt is racy. A
+    genuinely broken deployment still fails, just at the deadline.
+    """
     cmd = [
         "kubectl",
         "--context",
@@ -192,10 +235,24 @@ def _port_forward_start(
         "-n",
         namespace,
     ]
-    logger.info("Starting port-forward: %s", " ".join(cmd))
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _wait_for_port(local_port, proc)
-    return proc
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        logger.info("Starting port-forward (attempt %d): %s", attempt, " ".join(cmd))
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            _wait_for_port(local_port, proc)
+            return proc
+        except (RuntimeError, TimeoutError) as e:
+            # Reap the attempt before retrying, otherwise a lingering kubectl
+            # keeps `local_port` bound and the next attempt fails with
+            # "address already in use" instead of the real reason.
+            _cleanup_port_forward(f"{service}:{local_port} attempt {attempt}", proc)
+            if time.time() >= deadline:
+                raise
+            logger.warning("Port-forward attempt %d failed, retrying: %s", attempt, e)
+            time.sleep(2)
 
 
 @pytest.fixture(scope="session")

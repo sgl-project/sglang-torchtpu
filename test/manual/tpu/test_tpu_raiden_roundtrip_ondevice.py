@@ -1,6 +1,6 @@
 """On-device raiden D2h/H2d round-trip test for the TPU KV-offload path.
 
-Requires a TPU + a built tpu_raiden extension + torch_tpu. NOT a CI unit test
+Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_offload_unit.py for the host-only logic). Run with:
 
     PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-raiden \

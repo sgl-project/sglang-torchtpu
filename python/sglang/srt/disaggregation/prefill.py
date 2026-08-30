@@ -250,6 +250,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.model_config.get_total_num_kv_heads()
             )
         kv_args.page_size = self.token_to_kv_pool.page_size
+        kv_args.sliding_window_size = self.scheduler.sliding_window_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()

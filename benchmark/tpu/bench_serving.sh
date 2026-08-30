@@ -17,10 +17,10 @@
 #
 # Example — Qwen3-32B concurrency/shape sweep:
 #   MODEL=Qwen/Qwen3-32B SWEEP="16:8192:512 64:8192:512" ./bench_serving.sh
-# Each SWEEP token is "concurrency:isl:osl". The server's max-running-requests
-# must be >= the largest concurrency. Per-tuple num_prompts defaults to
-# concurrency x PROMPTS_PER_CONCURRENCY (so each in-flight slot processes
-# that many requests in the run).
+# Each SWEEP token is "concurrency:isl:osl[:workload]". The server's
+# max-running-requests must be >= the largest concurrency. Per-tuple num_prompts
+# defaults to concurrency x PROMPTS_PER_CONCURRENCY (so each in-flight slot
+# processes that many requests in the run).
 #
 # Prereqs: an sglang server is up at $BASE_URL (default http://127.0.0.1:30000)
 # serving $MODEL. Start it with ./launch_server.sh. For torch profiler traces,
@@ -31,13 +31,22 @@
 # buckets, run ./warmup.sh once between launch and bench (stopgap; see README).
 #
 # Overridable env vars (defaults shown):
-#   MODEL=                          # REQUIRED — must match the served model
+#   MODEL=                          # REQUIRED — the tokenizer source: an HF id, or a
+#                                   # local checkpoint path
+#   SERVED_MODEL_NAME=              # the id requests carry and the name reported to
+#                                   # the dashboard; defaults to MODEL. Set it when
+#                                   # MODEL is a path, to the server's
+#                                   # --served-model-name
 #   BASE_URL=http://127.0.0.1:30000
 #   BACKEND=sglang
 #   DATASET_NAME=random
 #   TOKENIZE_PROMPT=0              # 1 sends exact input_ids; requires BACKEND=sglang
 #   ISL=8192                        # single-run input length
 #   OSL=1024                        # single-run output length
+#   WORKLOAD=                       # single-run workload name (e.g. "8k1k");
+#                                   # the dashboard's Workload dropdown shows it.
+#                                   # Unset -> the dashboard labels the series by
+#                                   # its shape ("8192→1024") instead.
 #   BATCH_SIZE=64                   # single-run max-concurrency
 #   NUM_PROMPTS=                    # single-run total prompts (defaults
 #                                   # to BATCH_SIZE * PROMPTS_PER_CONCURRENCY)
@@ -55,8 +64,10 @@
 #   PROFILE_OUTPUT_DIR=             # auto-generated when PROFILE=1
 #   OUTPUT_DIR=./results/<model-slug>-tpu/<ts>
 #                                   # JSONL summaries (one per sweep config) land here
-#   SWEEP=                          # space-separated "c:isl:osl" tuples
-#                                   # (overrides ISL/OSL/BATCH_SIZE/NUM_PROMPTS)
+#   SWEEP=                          # space-separated "c:isl:osl[:workload]" tuples
+#                                   # (overrides ISL/OSL/BATCH_SIZE/NUM_PROMPTS;
+#                                   # the workload name is per tuple, WORKLOAD is
+#                                   # ignored in sweep mode)
 #   HEALTH_TIMEOUT=600              # seconds to wait for /health -> 200
 #   DUMP_META=1                     # 1 → write <tag>.meta.json next to each
 #                                   # <tag>.jsonl (repro record for the CI
@@ -77,8 +88,15 @@ if [[ -z "$MODEL" ]]; then
     echo "ERROR: set MODEL, e.g. MODEL=Qwen/Qwen3-32B ./bench_serving.sh" >&2
     exit 2
 fi
+# The id requests carry, and the model's identity in the metadata record. Defaults to
+# MODEL, which is right whenever the server was launched from an HF id. Set it when
+# MODEL is a local checkpoint path -- then MODEL supplies the tokenizer while this
+# supplies the name, so a request matches --served-model-name and the dashboard keys
+# the series on a model name rather than on where its bytes happen to be mounted.
+SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
+MODEL_ID=${SERVED_MODEL_NAME:-$MODEL}
 # Slug for the default results dir / profile prefix: lowercase, non-alnum → '_'.
-MODEL_SLUG=$(printf '%s' "$MODEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
+MODEL_SLUG=$(printf '%s' "$MODEL_ID" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
 
 BASE_URL=${BASE_URL:-http://127.0.0.1:30000}
 BACKEND=${BACKEND:-sglang}
@@ -86,6 +104,7 @@ DATASET_NAME=${DATASET_NAME:-random}
 TOKENIZE_PROMPT=${TOKENIZE_PROMPT:-0}
 ISL=${ISL:-8192}
 OSL=${OSL:-1024}
+WORKLOAD=${WORKLOAD:-}
 BATCH_SIZE=${BATCH_SIZE:-64}
 PROMPTS_PER_CONCURRENCY=${PROMPTS_PER_CONCURRENCY:-10}
 NUM_PROMPTS=${NUM_PROMPTS:-}
@@ -145,6 +164,7 @@ run_one() {
     local isl="$2"
     local osl="$3"
     local num_prompts="$4"
+    local workload="${5:-}"   # dashboard series name; empty = unnamed
 
     local tag="c${bs}-isl${isl}-osl${osl}"
     local output_file="$OUTPUT_DIR/${tag}.jsonl"
@@ -170,6 +190,7 @@ run_one() {
         --seed "$SEED"
         --output-file "$output_file"
     )
+    [[ -n "$SERVED_MODEL_NAME" ]] && args+=(--served-model-name "$SERVED_MODEL_NAME")
     [[ "$TOKENIZE_PROMPT" == "1" ]] && args+=(--tokenize-prompt)
 
     if [[ "$PROFILE" == "1" ]]; then
@@ -187,6 +208,7 @@ run_one() {
     echo "==== bench_serving config ($tag) ===="
     echo "  base_url        = $BASE_URL"
     echo "  model           = $MODEL"
+    echo "  served_as       = $MODEL_ID"
     echo "  backend         = $BACKEND"
     echo "  dataset         = $DATASET_NAME"
     echo "  tokenize_prompt = $TOKENIZE_PROMPT"
@@ -214,7 +236,8 @@ run_one() {
         bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "${args[@]}")
         "$PYTHON" "$SCRIPT_DIR/dump_meta.py" --kind bench --out "$meta_file" \
             --json bench_argv="$bench_argv_json" \
-            --set model="$MODEL" \
+            --set model="$MODEL_ID" \
+            --set model_source="$MODEL" \
             --set model_slug="$MODEL_SLUG" \
             --set base_url="$BASE_URL" \
             --set backend="$BACKEND" \
@@ -222,6 +245,7 @@ run_one() {
             --set tokenize_prompt="$TOKENIZE_PROMPT" \
             --set isl="$isl" \
             --set osl="$osl" \
+            --set workload="$workload" \
             --set concurrency="$bs" \
             --set num_prompts="$num_prompts" \
             --set prompts_per_concurrency="$PROMPTS_PER_CONCURRENCY" \
@@ -241,17 +265,17 @@ if [[ -n "$SWEEP" ]]; then
     echo "  output_dir = $OUTPUT_DIR"
     echo "============================="
     for tuple in $SWEEP; do
-        IFS=':' read -r sw_bs sw_isl sw_osl <<<"$tuple"
+        IFS=':' read -r sw_bs sw_isl sw_osl sw_wl <<<"$tuple"
         if [[ -z "$sw_bs" || -z "$sw_isl" || -z "$sw_osl" ]]; then
-            echo "ERROR: malformed SWEEP token '$tuple' (expected c:isl:osl)" >&2
+            echo "ERROR: malformed SWEEP token '$tuple' (expected c:isl:osl[:workload])" >&2
             exit 2
         fi
         sw_num_prompts=$(( sw_bs * PROMPTS_PER_CONCURRENCY ))
-        run_one "$sw_bs" "$sw_isl" "$sw_osl" "$sw_num_prompts"
+        run_one "$sw_bs" "$sw_isl" "$sw_osl" "$sw_num_prompts" "$sw_wl"
     done
     echo "==== sweep done — JSONL summaries in $OUTPUT_DIR ===="
     ls -la "$OUTPUT_DIR"/*.jsonl 2>/dev/null || true
 else
     [[ -z "$NUM_PROMPTS" ]] && NUM_PROMPTS=$(( BATCH_SIZE * PROMPTS_PER_CONCURRENCY ))
-    run_one "$BATCH_SIZE" "$ISL" "$OSL" "$NUM_PROMPTS"
+    run_one "$BATCH_SIZE" "$ISL" "$OSL" "$NUM_PROMPTS" "$WORKLOAD"
 fi

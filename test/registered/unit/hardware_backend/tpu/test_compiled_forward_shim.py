@@ -12,6 +12,8 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     PowerBucketer,
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    _BS_FIELDS,
+    _TOKEN_FIELDS,
     DEFAULT_TPU_COMPILE_MAX_BS,
     CompiledForwardShim,
     _dp_attn_apply_bucket_metadata,
@@ -19,17 +21,20 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _extend_batch_cap,
     _matches_default,
     _pad_forward_batch_inputs,
+    _restore_forward_batch_inputs,
     _static_default_kwargs,
-    _zero_pad_1d,
+    _zero_pad_dim0,
     build_bucketers,
     reconcile_tpu_batch_limits,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
+    _DummyForwardBatchFields,
 )
-from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
-    Eagle3CompilePolicyMixin,
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+    Eagle3SpecDecodeCompilePolicyMixin,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -103,18 +108,51 @@ def _forward_batch(real_t, real_b, mode="extend", return_logprob=False):
         global_num_tokens_cpu=None,
         # Real ForwardBatch always carries spec_info (None when not spec).
         spec_info=None,
+        mm_inputs=None,
     )
 
 
-class TestZeroPad1d(CustomTestCase):
+class TestDummyFieldPadCoverage(CustomTestCase):
+    """Bookkeeping: every device tensor the precompile dummies place on a
+    ForwardBatch must be in the shim's pad lists, or live batches reach the
+    compiled graphs with shapes the trace never saw (XLA e0102 — happened
+    with `extend_start_loc`). Host mirrors (`*_cpu`) are not graph inputs."""
+
+    def test_extend_dummy_device_tensors_are_padded(self):
+        dummy = _DummyForwardBatchFields.default(
+            num_tokens=8,
+            bs=4,
+            is_extend=True,
+            tokens_per_req=2,
+            device="cpu",
+            slot=0,
+            out_cache_loc_dtype=torch.int32,
+        )
+        device_tensor_fields = {
+            name
+            for name in dummy.__struct_fields__
+            if isinstance(getattr(dummy, name), torch.Tensor)
+            and not name.endswith("_cpu")
+        }
+        self.assertLessEqual(device_tensor_fields, set(_TOKEN_FIELDS) | set(_BS_FIELDS))
+
+
+class TestZeroPadDim0(CustomTestCase):
     def test_pads_zeros_at_tail(self):
-        out = _zero_pad_1d(_t(1, 2, 3), target_size=5)
+        out = _zero_pad_dim0(_t(1, 2, 3), target_size=5)
         self.assertEqual(out.tolist(), [1, 2, 3, 0, 0])
 
     def test_no_op_when_already_at_size(self):
         x = _t(1, 2, 3)
-        self.assertIs(_zero_pad_1d(x, target_size=3), x)
-        self.assertIs(_zero_pad_1d(x, target_size=2), x)
+        self.assertIs(_zero_pad_dim0(x, target_size=3), x)
+        self.assertIs(_zero_pad_dim0(x, target_size=2), x)
+
+    def test_pads_2d_tensor_along_dim0(self):
+        x = torch.ones((3, 4), dtype=torch.float32)
+        out = _zero_pad_dim0(x, target_size=5)
+        self.assertEqual(out.shape, (5, 4))
+        self.assertTrue(torch.equal(out[:3], x))
+        self.assertTrue(torch.equal(out[3:], torch.zeros((2, 4), dtype=torch.float32)))
 
 
 class TestPadForwardBatchInputs(CustomTestCase):
@@ -305,6 +343,16 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertIs(fb.input_ids, orig_input_ids)
         self.assertIs(fb.seq_lens, orig_seq_lens)
 
+    def test_mm_inputs_none_becomes_a_padded_list(self):
+        fb = _forward_batch(real_t=4, real_b=1, mode="extend")
+        fb.mm_inputs = None
+        _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual(fb.mm_inputs, [None] * 4)
+
     def test_decode_cpu_list_fields_stay_none(self):
         # Non-extend batches keep the upstream None for the extend_*_cpu
         # lists. Consumers gate on forward_mode.is_extend(), and the decode
@@ -393,10 +441,30 @@ class TestPadForwardBatchInputs(CustomTestCase):
         self.assertEqual((real_q, real_b), (6, 3))
         self.assertEqual(fb.input_ids.shape[0], 8)  # pad_b(4) * width(2)
 
+    def test_pads_and_restores_input_embeds(self):
+        fb = _forward_batch(real_t=4, real_b=1, mode="extend")
+        fb.input_embeds = torch.ones((4, 16), dtype=torch.bfloat16)
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (4, 1))
+        self.assertEqual(fb.input_embeds.shape, (8, 16))
+        self.assertTrue(
+            torch.equal(fb.input_embeds[:4], torch.ones((4, 16), dtype=torch.bfloat16))
+        )
+        self.assertTrue(
+            torch.equal(fb.input_embeds[4:], torch.zeros((4, 16), dtype=torch.bfloat16))
+        )
 
-class TestSpecDecodeCompilePolicyPadding(CustomTestCase):
+        _restore_forward_batch_inputs(fb, real_q, real_b)
+        self.assertEqual(fb.input_embeds.shape, (4, 16))
+
+
+class TestEagle3SpecDecodeCompilePolicyPadding(CustomTestCase):
     def test_draft_decode_pads_req_pool_indices_cpu_to_bucket(self):
-        policy = object.__new__(Eagle3CompilePolicyMixin)
+        policy = object.__new__(Eagle3SpecDecodeCompilePolicyMixin)
         policy.b_bucketer = _bucketer("Bs", [1, 2, 4])
         fb = _forward_batch(real_t=3, real_b=3, mode="decode")
 
@@ -447,7 +515,7 @@ class TestCompiledForwardShim(CustomTestCase):
         padded_logits = torch.arange(4 * 10, dtype=torch.float32).reshape(4, 10)
         padded_hidden = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
         compiled = MagicMock(
-            return_value=SimpleNamespace(
+            return_value=LogitsProcessorOutput(
                 next_token_logits=padded_logits,
                 hidden_states=padded_hidden,
             )
@@ -461,7 +529,7 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertTrue(torch.equal(out.hidden_states, padded_hidden[:4]))
 
     def test_defers_output_unpadding_for_chained_forwards(self):
-        padded = SimpleNamespace(
+        padded = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 10),
             hidden_states=torch.zeros(8, 5),
         )
@@ -483,7 +551,9 @@ class TestCompiledForwardShim(CustomTestCase):
         self.assertEqual(fb.batch_size, 4)
 
     def test_passes_args_through(self):
-        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled = MagicMock(
+            return_value=LogitsProcessorOutput(next_token_logits=torch.empty(0))
+        )
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, "extra1", kw="extra2")
@@ -519,6 +589,21 @@ class TestCompiledForwardShim(CustomTestCase):
         fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
         shim("ids", "pos", fb, get_embedding=True)
         compiled.assert_called_once_with("ids", "pos", fb, get_embedding=True)
+
+    def test_syncs_input_embeds_kwarg_with_padded_forward_batch(self):
+        def forward(input_ids, positions, forward_batch, input_embeds=None):
+            pass
+
+        compiled = MagicMock(return_value=SimpleNamespace())
+        compiled.__signature__ = inspect.signature(forward)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        fb = self._forward_batch(_tpu_real_q=4, _tpu_real_b=2)
+        padded_embeds = torch.zeros((8, 16), dtype=torch.bfloat16)
+        fb.input_embeds = padded_embeds
+        stale_unpadded_embeds = torch.zeros((4, 16), dtype=torch.bfloat16)
+
+        shim("ids", "pos", fb, input_embeds=stale_unpadded_embeds)
+        compiled.assert_called_once_with("ids", "pos", fb, input_embeds=padded_embeds)
 
     def test_no_op_when_real_size_keys_missing(self):
         # Padding hook didn't run (e.g. forward_idle): output passes through.
@@ -661,10 +746,14 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
     explicit limits when no larger serving batch is reachable (Task #40)."""
 
     def _r(
-        self, torch_compile_max_bs=None, tpu_compile_bs=None, max_running_requests=None
+        self,
+        torch_compile_max_bs=None,
+        tpu_compile_bs=None,
+        max_running_requests=None,
+        attn_dp_size=1,
     ):
         return reconcile_tpu_batch_limits(
-            torch_compile_max_bs, tpu_compile_bs, max_running_requests
+            torch_compile_max_bs, tpu_compile_bs, max_running_requests, attn_dp_size
         )
 
     def test_default_neither_set(self):
@@ -685,6 +774,41 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
     def test_max_running_requests_grows_ceiling(self):
         # --max-running-requests 128 -> grid ceiling 128, served (not clamped 64).
         self.assertEqual(self._r(max_running_requests=128), (128, None, 128))
+
+    def test_max_running_requests_below_default_caps_grid(self):
+        # --max-running-requests 4 with no explicit compile limit -> the grid
+        # stops at 4 instead of compiling dead shapes up to 64.
+        self.assertEqual(self._r(max_running_requests=4), (4, None, 4))
+
+    def test_dp_attention_derives_per_worker_cap(self):
+        # --max-running-requests 32 across 4 attention-DP workers -> each
+        # worker batches at most 8, so the grid stops at 8.
+        self.assertEqual(
+            self._r(max_running_requests=32, attn_dp_size=4), (8, None, 32)
+        )
+
+    def test_dp_attention_grows_ceiling_per_worker_only(self):
+        # Explicit ceiling 16 with per-worker concurrency 32 (128/4) -> grown
+        # to 32, not to the global 128.
+        tcmb, _, mrr = self._r(
+            torch_compile_max_bs=16, max_running_requests=128, attn_dp_size=4
+        )
+        self.assertEqual((tcmb, mrr), (32, 128))
+
+    def test_dp_attention_bucket_list_grows_to_per_worker_cap(self):
+        tcmb, bs, mrr = self._r(
+            tpu_compile_bs=[1, 8], max_running_requests=64, attn_dp_size=4
+        )
+        self.assertEqual((tcmb, mrr), (16, 64))
+        self.assertEqual(bs, [1, 8, 16])
+
+    def test_dp_attention_default_concurrency_scales_with_workers(self):
+        # Nothing requested with 4 workers -> each worker compiles the default
+        # grid, so the global concurrency is 4x the per-worker ceiling.
+        self.assertEqual(
+            self._r(attn_dp_size=4),
+            (DEFAULT_TPU_COMPILE_MAX_BS, None, DEFAULT_TPU_COMPILE_MAX_BS * 4),
+        )
 
     def test_tpu_compile_bs_sets_ceiling_and_concurrency(self):
         tcmb, bs, mrr = self._r(tpu_compile_bs=[1, 8])
@@ -732,10 +856,11 @@ class TestReconcileTpuBatchLimits(CustomTestCase):
 class TestDpAttnSelectBucketShape(CustomTestCase):
     """Every DP rank must agree on the same (pad_t, pad_b) bucket."""
 
-    def _fb(self, mode, is_extend_in_batch=False):
+    def _fb(self, mode, is_extend_in_batch=False, num_tokens_per_req=4):
         return SimpleNamespace(
             forward_mode=_ForwardModeMock(mode),
             is_extend_in_batch=is_extend_in_batch,
+            spec_info=SimpleNamespace(num_tokens_per_req=num_tokens_per_req),
         )
 
     def test_decode_uses_bs_bucketer_for_both_axes(self):
@@ -778,9 +903,26 @@ class TestDpAttnSelectBucketShape(CustomTestCase):
         # Treated as decode: both axes from the bs bucketer.
         self.assertEqual((pad_t, pad_b), (8, 8))
 
+    def test_fixed_width_spec_uses_cross_rank_request_count(self):
+        t_b = _bucketer("Token", [64, 128])
+        b_b = _bucketer("Bs", [1, 2, 4, 8])
+        for mode in ("target_verify", "draft_extend_v2"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    _dp_attn_select_bucket_shape(
+                        self._fb(mode, num_tokens_per_req=4),
+                        t_b,
+                        b_b,
+                        max_tokens_per_rank=12,
+                        real_q=4,
+                        real_b=1,
+                    ),
+                    (16, 4),
+                )
+
 
 class TestDpAttnApplyBucketMetadata(CustomTestCase):
-    def _fb(self, dp_size=2):
+    def _fb(self, dp_size=2, mode="decode"):
         return SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int32),  # CPU -> device for gpu counts
             global_num_tokens_cpu=[3] * dp_size,
@@ -793,7 +935,7 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
             is_prefill_only=True,
             # Read to publish is_extend_in_batch to the flags tier; the
             # getattr default is evaluated eagerly, so it must always exist.
-            forward_mode=_ForwardModeMock("extend"),
+            forward_mode=_ForwardModeMock(mode),
         )
 
     def test_sets_uniform_padded_global_counts(self):
@@ -822,6 +964,55 @@ class TestDpAttnApplyBucketMetadata(CustomTestCase):
         fb = self._fb(dp_size=4)
         _dp_attn_apply_bucket_metadata(fb, pad_t=8, pad_b=8)
         self.assertEqual(fb.global_dp_buffer_len, 8 * 4)
+
+    def test_target_verify_uses_token_rows_for_logprob_gather(self):
+        fb = self._fb(dp_size=2, mode="target_verify")
+        _dp_attn_apply_bucket_metadata(fb, pad_t=16, pad_b=4)
+        self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [16, 16])
+        self.assertEqual(fb.global_num_tokens_for_logprob_gpu.tolist(), [16, 16])
+
+
+class TestHiCacheReloadGate(CustomTestCase):
+    """The shim must wait on the device pool's transfer counter per forward.
+
+    Regression: the gate looked the pool up on the ForwardBatch, which
+    carries no pool references, so the defensive lookup returned None and a
+    forward consumed hicache-reloaded pages while their host->device DMAs
+    were still in flight (garbage output on every reload-hit request; run
+    32933877240).
+    """
+
+    def _shim(self, counter):
+        policy = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            ),
+            finalize_forward_batch=lambda out, fb: out,
+        )
+        return CompiledForwardShim(lambda *a, **k: "out", policy=policy)
+
+    def test_forward_waits_on_reload_counter(self):
+        counter = MagicMock()
+        shim = self._shim(counter)
+        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        self.assertEqual(shim(None, None, fb), "out")
+        counter.wait.assert_called_once_with()
+
+    def test_forward_runs_without_counter(self):
+        # hicache off: the pool's counter slot stays None.
+        shim = self._shim(None)
+        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        self.assertEqual(shim(None, None, fb), "out")
+
+    def test_compiled_caller_does_not_trace_reload_counter(self):
+        counter = MagicMock()
+        shim = self._shim(counter)
+        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+
+        with unittest.mock.patch("torch.compiler.is_compiling", return_value=True):
+            self.assertEqual(shim(None, None, fb), "out")
+
+        counter.wait.assert_not_called()
 
 
 if __name__ == "__main__":

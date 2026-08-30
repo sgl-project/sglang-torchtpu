@@ -15,16 +15,27 @@ Per request (keyed by `bootstrap_room`): prefill `register_read`s its page
 block-ids; decode pushes a pull request with its rank endpoint; prefill replies
 with its block-ids + raiden endpoint + aux blob; decode issues `start_read`.
 Both sides drain `poll_stats()` in `poll()` — prefill frees on `done_sending`,
-decode runs on `done_recving`. Cross-rank gating is the framework's existing
-`poll_and_all_reduce` (min over ranks); no worker-side barrier. Page ids come
-from `kv_to_page_indices` in token order and are raiden block ids directly.
+decode runs on `done_recving`. Cross-rank status first reduces to the minimum
+over the complete attention-TP/CP group. If any rank fails, every Raiden poller
+tombstones the room before a second reduction confirms that accepted native
+I/O has drained on every rank; only then can the framework release KV pages.
+Page ids come from `kv_to_page_indices` in token order and are raiden block ids
+directly.
+
+KV moves chunk by chunk: as each chunked-prefill step commits its pages the
+prefill announces them, and the decode pulls each piece as soon as a staging
+slot is free, so only the last chunk's transfer is left after the prefill. The
+closing message carries the aux blob and the remaining pages. A request keeps
+one chunk in flight at a time, and pages the decode already holds from its own
+prefix cache are never announced. A hybrid model's sliding-window pages ride on
+the closing read, since the window is only settled when the prefill ends.
 
 ## Asymmetric attention TP (strided push-resharding)
 
 When decode TP < prefill TP (e.g. 8TP (P) -> 4TP2DP (D)), a decode rank
 holds a wider kv-head slice than any single prefill rank, so the whole-block pull
-cannot place it. That case uses raiden's push-resharding (on by default; set
-`SGLANG_RAIDEN_RESHARD=0` to disable): decode rank `r` is fed by prefill ranks
+cannot place it. That case uses raiden's push-resharding, engaged per request
+when a decode rank is fed by several prefill ranks: decode rank `r` is fed by prefill ranks
 `r*ratio`(`ratio = src_tp // dst_tp`). The strided interleave lands on the decode
 receiver, which then auto-H2Ds the assembled host staging into HBM.
 
@@ -36,8 +47,10 @@ Schedules are built in `reshard_schedule.py` (unit-tested in
 the total kv-head count evenly; the byte granule is one kv-head's contiguous K+V.
 
 DP-attention replicas that co-locate on a decode host get distinct raiden control
-ports via `base + 4*(attn_dp_rank*attn_tp_size + attn_tp_rank)` (reduces to
-`base + 4*attn_tp_rank` when `attn_dp_size == 1`); each rank owns 4 ports —
+ports via `base + 4*node_worker_rank`, where the node worker rank counts the
+attention-TP ranks of every context-parallel, attention-DP, and system-DP
+replica on the node (reduces to `base + 4*attn_tp_rank` for a single replica);
+each rank owns 4 ports —
 full-engine control/data, then SWA-engine control/data.
 
 ## Hybrid sliding-window models
@@ -68,12 +81,15 @@ reuse, `dst_tp > src_tp`.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*(dp_rank*tp_size + tp_rank)` (data = `+1`, SWA engine control/data = `+2`/`+3`) |
-| `SGLANG_RAIDEN_RESHARD` | `1` | on by default; activates only for asymmetric attn TP (`dst_tp < src_tp`) — symmetric traffic is unaffected. Set `0` to disable (asymmetric TP then raises) and keep the multi-slot host pool instead of the reshard device-shadow sizing. |
-| `SGLANG_RAIDEN_NUM_SLOTS` | `16` | raiden host-pool transfer slots |
-| `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | max pages/request; auto = `ceil(context_len/page_size)` |
+| `SGLANG_RAIDEN_KV_PORT` | `30000` | base control port; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
+| `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; the pool holds as many in-flight transfers as fit it, at most the running batch. Startup fails with the required and available sizes when not even one transfer fits |
+| `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
+| `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
+| `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden allocates host staging per transfer from the pool; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots and rejects asymmetric resharding, which needs per-transfer staging |
+
+A decode rank issues at most one pull per host staging slot; requests past that stay in the transfer queue and are retried as slots free, so the batch size does not have to fit the slot count.
 
 ## Launch (one host each, equal TP)
 

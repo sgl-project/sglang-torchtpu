@@ -14,16 +14,6 @@ warmup.sh            # optional compile-bucket pre-warmup (stopgap)
 warmup_buckets.py    # request-sender used by warmup.sh
 ```
 
-Multihost feature-combination tests (July-30 milestone) live in
-`test/manual/tpu/feature_combo/multihost/test_feature_combos.py` (single file, both rows;
-launches engines through the launchers here). Run the same command on every
-pod of the 2-host dev box — roles auto-detect from TPU_WORKER_ID:
-
-```
-python test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd    # prefix+KVoffload+P/D
-python test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec  # prefix+EAGLE3+KVoffload
-```
-
 ## Usage
 
 Run launch and bench in separate shells; set `MODEL` for both.
@@ -131,6 +121,18 @@ MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
 DATASET_NAME=random-ids TOKENIZE_PROMPT=1 \
 BATCH_SIZE=64 NUM_PROMPTS=64 ISL=1024 OSL=1024 \
 ./bench_serving.sh
+```
+
+Qwen3-Coder-480B FP8 **standard agentic benchmark** (the team's fixed contract:
+multi-turn 4k-per-round workload accumulating to 16k / 256k, tp=16 dp=4 colocated
+and tp=8 dp=2 P/D, prefix caching + KV offload, one results JSON, wired to a
+nightly workflow) — see
+[`recipe/qwen3_coder_480b/nightly/`](recipe/qwen3_coder_480b/nightly/README.md):
+
+```bash
+cd recipe/qwen3_coder_480b/nightly
+PROFILE=smoke MODE=colocated ./run_nightly.sh     # plumbing check
+SGLANG_USE_RAY=1 NNODES=2 MODE=colocated ./run_nightly.sh
 ```
 
 Optional warmup — run between launch and bench *only* while the in-server

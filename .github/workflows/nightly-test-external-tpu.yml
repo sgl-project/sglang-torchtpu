@@ -1,0 +1,78 @@
+# Nightly TPU e2e on the external cluster. Builds the image ONCE (same _tpu-build as the
+# in-project nightly; the external cluster's nodes pull it from the Project A Artifact
+# Registry), then discovers the `external-nightly-*` work and runs it as ONE matrix job PER
+# SLICE. The external cluster has no Kueue, so discovery buckets launch groups across each
+# shape's slices: slices run in PARALLEL (one job each), and the groups on a slice run serially
+# inside that job. Weights are served from the Project A GCS bucket over gcsfuse.
+# See .github/tpu-ci/external/README.md.
+#
+# SCAFFOLD: with no external-nightly-* test registered yet, `discover` outputs [] and `run`
+# is skipped -- the workflow is green and does nothing until a dev registers the first test.
+name: Nightly Test (External TPU)
+
+on:
+  schedule:
+    - cron: "30 10 * * *"   # 10:30 UTC daily; staggered after the in-project nightly (09:00)
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Discover the external-nightly work, bucketed into one entry PER SLICE (test-owned launch
+  # specs + round-robin over the shape's slices).
+  discover:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      slices: ${{ steps.d.outputs.slices }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: d
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1 || true
+          slices="$(python3 .github/tpu-ci/external/render_external_jobset.py --list-groups)"
+          echo "slices=$slices" >> "$GITHUB_OUTPUT"
+          echo "discovered external-nightly slices: $slices"
+          [ "$slices" = "[]" ] && echo "No external-nightly-* tests registered yet; run will be skipped."
+
+  # One matrix job PER SLICE (parallel across slices). Each runs its bucketed groups serially.
+  run:
+    needs: [build, discover]
+    if: needs.discover.outputs.slices != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(needs.discover.outputs.slices) }}
+    name: ${{ matrix.slice.name }}
+    uses: ./.github/workflows/_external-tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      suite: ${{ matrix.slice.suite }}
+      slice_name: ${{ matrix.slice.name }}
+      nodepool_var: ${{ matrix.slice.nodepool_var }}
+      groups_json: ${{ toJSON(matrix.slice.groups) }}
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write

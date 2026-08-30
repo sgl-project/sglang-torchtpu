@@ -50,6 +50,7 @@ mxfp4 path. ``"swiglu_oai"`` is supported for GPT-OSS.
 # strings and validation would reject them.
 
 import logging
+import math
 from typing import Optional
 
 import torch
@@ -78,6 +79,28 @@ _PALLAS_MOE_OP = None
 # ``fused_moe_op`` on a non-TPU host stays cheap (the only inbound paths to
 # this module are TPU-only: ``UnquantizedFusedMoEMethod.forward_tpu`` and the
 # op registration in ``FusedMoE.__init__``, which is gated on ``_is_tpu``).
+
+
+def _padded_token_count(m: int, topk: int, sublane: int) -> int:
+    """Smallest ``m_pad >= m`` with ``(m_pad * topk) % sublane == 0``.
+
+    gmm_v2 constrains the LHS row count, which after the permute is
+    ``m_pad * topk``, not the token count -- so the minimal token alignment is
+    ``sublane // gcd(sublane, topk)``, not a flat ``sublane``. When
+    ``topk=10`` against the bf16 tiling of 16, giving gcd 2 and an alignment of
+    8: a decode batch of 8 then pads to 8 instead of 16, and both the grouped
+    matmul and the permute see 80 routed rows instead of 160. ``topk=1`` or any
+    ``topk`` coprime with ``sublane`` resolves back to the full tiling, so this
+    only ever loosens the padding, never tightens it.
+
+    ``sublane`` is gmm_v2's ``lhs_sublane_tiling`` for the activation dtype --
+    16 for bf16, but 8 for f32 and 32/64 for 8-/4-bit -- passed in rather than
+    assumed, since a wider tiling than the one used here would under-pad.
+    """
+    token_align = sublane // math.gcd(sublane, topk)
+    m_pad = ((m + token_align - 1) // token_align) * token_align
+
+    return m_pad
 
 
 def _valid_rows_mask(group_sizes, expert_group_offset, local_num_experts, unsort_idx):
@@ -299,6 +322,7 @@ def _fused_moe_jax(
         apply_act_fn,
         calculate_tiling,
         gmm_v2,
+        lhs_sublane_tiling,
     )
 
     m, hidden_size = hidden_states.shape
@@ -321,18 +345,16 @@ def _fused_moe_jax(
         rhs_quant_dtype = jnp.int4
         maybe_quantize_lhs = False
 
-    # gmm_v2 needs the routed-row count ``m*topk`` to be a
-    # multiple of the bf16 sublane (16). Padding the *input* tokens here keeps
-    # the permute/gather operating on an already-aligned, fixed-bucket shape
-    # and removes the post-gather ``jnp.pad`` + ``group_sizes`` scatter that
-    # XLA was offloading to the SparseCore (and crashing on). Pad tokens route
-    # to expert 0 with zero weight, so they contribute nothing to any real
-    # token and are sliced off at the very end.
+    # gmm_v2 needs the routed-row count ``m*topk`` to be a multiple of its LHS
+    # sublane tiling (16 for the bf16 activations this path runs on). Padding
+    # the *input* tokens here keeps the permute/gather operating on an
+    # already-aligned, fixed-bucket shape and removes the post-gather
+    # ``jnp.pad`` + ``group_sizes`` scatter that XLA was offloading to the
+    # SparseCore (and crashing on). Pad tokens route to expert 0 with zero
+    # weight, so they contribute nothing to any real token and are sliced off
+    # at the very end.
     m_orig = m
-    TOKEN_ALIGN = (
-        16  # token bucket; m_pad % 16 == 0 => (m_pad*topk) % 16 == 0 for any topk
-    )
-    m_pad = ((m + TOKEN_ALIGN - 1) // TOKEN_ALIGN) * TOKEN_ALIGN
+    m_pad = _padded_token_count(m, topk, lhs_sublane_tiling(hidden_states.dtype))
     if m_pad != m:
         hidden_states = jnp.pad(hidden_states, ((0, m_pad - m), (0, 0)))
         topk_ids = jnp.pad(topk_ids, ((0, m_pad - m), (0, 0)))  # pad -> expert 0

@@ -1,0 +1,36 @@
+# Cloud Build: build the SGLang TPU base image and push to Artifact Registry.
+#
+substitutions:
+  _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base"
+  _TAG: "latest"
+
+serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
+
+# GCS copy of the build log, streamed into the GitHub Actions job log by
+# run_cloudbuild.py; see docker/cloudbuild.tpu.yaml for why.
+logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
+
+options:
+  logging: LEGACY
+  machineType: E2_HIGHCPU_8
+
+steps:
+  - id: build-base
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        TOKEN="$$(curl -sf -H 'Metadata-Flavor: Google' \
+          http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+          | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')"
+        printf '%s' "$$TOKEN" > /workspace/gcp_token
+        DOCKER_BUILDKIT=1 docker build \
+          -f docker/tpu-base.Dockerfile \
+          --secret id=gcp_token,src=/workspace/gcp_token \
+          -t "${_IMAGE}:${_TAG}" .
+        rm -f /workspace/gcp_token
+
+images:
+  - "${_IMAGE}:${_TAG}"

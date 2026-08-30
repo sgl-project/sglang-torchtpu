@@ -146,6 +146,23 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     )
 
 
+def _resolve_num_hidden_layers(server_args) -> int:
+    """Layer count from the model's HF config (lru-cached load), 0 when
+    unresolvable — an unloadable model fails later with its real error, and
+    the prefetch containment stays off rather than guessing."""
+    try:
+        from sglang.srt.utils.hf_transformers.config import get_config
+
+        hf_config = get_config(
+            server_args.model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
+        return int(getattr(hf_config, "num_hidden_layers", 0))
+    except Exception:
+        return 0
+
+
 class TpuSRTPlatform(SRTPlatform):
     """SGLang SRT platform for Google Cloud TPUs via torch_tpu."""
 
@@ -174,6 +191,15 @@ class TpuSRTPlatform(SRTPlatform):
         # torch_tpu.
         _prepare_tpu_env(
             server_args.tp_size, setup_slicebuilder=not server_args.use_ray
+        )
+
+        from sglang.srt.hardware_backend.tpu.env_override import (
+            apply_small_kv_pool_vmem_prefetch_override,
+        )
+
+        apply_small_kv_pool_vmem_prefetch_override(
+            max_total_tokens=server_args.max_total_tokens,
+            num_hidden_layers=_resolve_num_hidden_layers(server_args),
         )
 
         if server_args.dtype is None or server_args.dtype == "auto":
@@ -259,6 +285,8 @@ class TpuSRTPlatform(SRTPlatform):
                     raise NotImplementedError(
                         "EAGLE3 topk > 1 is not supported on TPU yet."
                     )
+            elif spec_algo == "DFLASH":
+                pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -268,7 +296,7 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE3 among builtin algorithms)."
+                        "yet (only EAGLE3 and DFLASH among builtin algorithms)."
                     )
 
         if server_args.enable_dp_attention:
@@ -526,10 +554,16 @@ class TpuSRTPlatform(SRTPlatform):
         # Per-process HBM limit. Each worker is pinned to one core
         # (TPU_VISIBLE_CHIPS=local_rank), so this already reflects v7 megacore
         # sharing (2 cores split a chip's HBM) — no cores-per-chip math needed.
+        # Guard against premature PjRt initialization in the parent/tokenizer
+        # process before init_backend() runs in worker subprocesses.
+        if not getattr(self, "_backend_initialized", False):
+            return 0
         _, limit = torch.accelerator.get_memory_info(self.get_device(device_id))
         return int(limit)
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
+        if not getattr(self, "_backend_initialized", False):
+            return 0.0
         if device is None:
             device = self.get_device(0)
         free, total = torch.accelerator.get_memory_info(device)

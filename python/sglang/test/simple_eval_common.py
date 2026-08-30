@@ -363,6 +363,8 @@ D) {D}
 # otherwise scored wrong. \b stops "Answer: Amsterdam" matching "A".
 ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*[\s\$\*\\()\[\]{}]*([A-D])\b"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
+# Reasoning models answer in \boxed{} regardless of the prompt's format ask.
+BOXED_PATTERN = r"\\boxed\{([^}]*)\}"
 
 
 EQUALITY_TEMPLATE = r"""

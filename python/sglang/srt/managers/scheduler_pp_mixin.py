@@ -241,6 +241,11 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                # This PP-specialized loop bypasses both batch getters that
+                # normally run the chunk-abort hook. Drive it once per
+                # microbatch so a locally aborted Raiden sender keeps polling
+                # and releases its retained pages when native reads drain.
+                self.process_pending_chunked_abort()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -278,6 +283,8 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
+                    if self.enable_staging:
+                        self.maybe_prefetch_staging_for_batch(cur_batch)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -1466,6 +1473,9 @@ class SchedulerPPMixin:
     def process_decode_transfer_queue(
         self: Scheduler, release_rids: Optional[List[str]]
     ):
+        # Resolve held deferred releases every call, independent of release_rids,
+        # so ack/timeout-driven releases still fire when no rids are being polled.
+        self.disagg_decode_transfer_queue.resolve_deferred_releases()
         if release_rids is not None:
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 release_rids

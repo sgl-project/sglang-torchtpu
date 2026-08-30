@@ -76,11 +76,11 @@ dependencies = [
   # torch-tpu wheels come from a private package server (see the
   # [[tool.uv.index]] block below); installing them requires registry
   # credentials (workload identity on CI, gcloud ADC on dev machines).
-  "torch-tpu==0.1.1.dev20260813160135",
+  "torch-tpu==0.1.1.dev20260817010134",
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
-  "tpu-raiden-torch==0.0.1.dev20260813160135",
+  "tpu-raiden-torch==0.0.1.dev20260825123352",
   "libtpu==0.0.44.1",
   "torch==2.11.0",
   "torchvision==0.26.0",
@@ -127,7 +127,24 @@ test = [
 # libtpu, torch, torchvision, jax, jaxlib) live in `dependencies`.
 srt_tpu = []
 all_tpu = []
-dev_tpu = ["sglang[all_tpu]", "sglang[test]", "sglang[ray]", "sglang[runai]"]
+# The `diffusion` extra minus CUDA-only kernels and model-specific tooling;
+# pins track pyproject.toml.
+diffusion_tpu = [
+  "addict==2.4.0",
+  "av==16.1.0",
+  "cache-dit==1.3.0",
+  "cloudpickle==3.1.2",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "PyYAML==6.0.1",
+]
+dev_tpu = [
+  "sglang[all_tpu]",
+  "sglang[test]",
+  "sglang[ray]",
+  "sglang[runai]",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"

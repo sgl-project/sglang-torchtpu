@@ -87,7 +87,7 @@ class _FakeGroup:
             self.entry_map[entry.name] = entry
 
 
-def _make_controller(async_h2d: bool = False) -> TpuRaidenHybridCacheController:
+def _make_controller() -> TpuRaidenHybridCacheController:
     ctrl = object.__new__(TpuRaidenHybridCacheController)
     full_pool = _FakeHostPool()
     swa_pool = _FakeHostPool()
@@ -101,12 +101,6 @@ def _make_controller(async_h2d: bool = False) -> TpuRaidenHybridCacheController:
     ctrl.ack_write_queue = []
     ctrl.ack_load_queue = []
     ctrl.layer_done_counter = BatchDoneCounter()
-    ctrl._async_h2d = async_h2d
-    ctrl._load_worker = None
-    if async_h2d:
-        from sglang.srt.hardware_backend.tpu.kv_copy_worker import TpuKvCopyWorker
-
-        ctrl._load_worker = TpuKvCopyWorker("test-hybrid-h2d")
     return ctrl
 
 
@@ -170,8 +164,8 @@ class TestHybridWrite(CustomTestCase):
 
 
 class TestHybridLoad(CustomTestCase):
-    def test_inline_load_issues_both_pools_and_gates_producer(self):
-        ctrl = _make_controller(async_h2d=False)
+    def test_load_issues_both_pools_and_gates_forward_on_both(self):
+        ctrl = _make_controller()
         ctrl.load_queue.append(_op())
         producer_id = ctrl.start_loading()
 
@@ -179,27 +173,17 @@ class TestHybridLoad(CustomTestCase):
         swa_pool = ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool
         self.assertEqual(len(full_pool.loads), 1)
         self.assertEqual(len(swa_pool.loads), 1)
-        # Inline path lands both DMAs before returning.
-        self.assertTrue(full_pool.load_futures[0].synchronized)
-        self.assertTrue(swa_pool.load_futures[0].synchronized)
-        # The whole-batch gate resolves for the consumer.
-        ctrl.layer_done_counter.set_consumer(producer_id)
-        ctrl.layer_done_counter.wait()
-
-    def test_async_load_worker_lands_both_pools(self):
-        ctrl = _make_controller(async_h2d=True)
-        ctrl.load_queue.append(_op())
-        producer_id = ctrl.start_loading()
-
+        # start_loading returns with the DMAs still in flight ...
+        self.assertFalse(full_pool.load_futures[0].synchronized)
+        self.assertFalse(swa_pool.load_futures[0].synchronized)
         (ack,) = ctrl.ack_load_queue
-        ack.finish_event.synchronize()
-        full_pool = ctrl.mem_pool_host.anchor_entry.host_pool
-        swa_pool = ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool
-        self.assertTrue(full_pool.load_futures[0].synchronized)
-        self.assertTrue(swa_pool.load_futures[0].synchronized)
+        self.assertFalse(ack.finish_event.query())
+        # ... and the whole-batch gate the consumer waits on lands both.
         ctrl.layer_done_counter.set_consumer(producer_id)
         ctrl.layer_done_counter.wait()
-        ctrl._load_worker.shutdown()
+        self.assertTrue(full_pool.load_futures[0].synchronized)
+        self.assertTrue(swa_pool.load_futures[0].synchronized)
+        self.assertTrue(ack.finish_event.query())
 
     def test_load_rewrites_tree_owned_transfer_in_place(self):
         # The SWA component's commit slices the same PoolTransfer object it
@@ -246,6 +230,7 @@ class TestAssemblerPlatformHook(CustomTestCase):
         # so TPU hybrid models got a CUDA host pool that died on the
         # page_first_fused layout. It must go through the platform hook.
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+        from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
         built = {}
@@ -260,14 +245,19 @@ class TestAssemblerPlatformHook(CustomTestCase):
 
         args = ServerArgs(model_path="dummy")
         kv_pool = object()
-        with patch("sglang.srt.platforms.current_platform", fake_platform):
-            pool = hybrid_pool_assembler.build_kv_host_pool(
-                kv_pool=kv_pool,
-                page_size=64,
-                server_args=args,
-                use_mla=False,
-                pool_label="swa",
-            )
+        reset_context()
+        publish(args, role="scheduler")
+        try:
+            with patch("sglang.srt.platforms.current_platform", fake_platform):
+                pool = hybrid_pool_assembler.build_kv_host_pool(
+                    kv_pool=kv_pool,
+                    page_size=64,
+                    server_args=args,
+                    use_mla=False,
+                    pool_label="swa",
+                )
+        finally:
+            reset_context()
 
         fake_platform.get_mha_kv_pool_host_cls.assert_called_once_with(kv_pool)
         self.assertIsInstance(pool, _RecordingPool)
@@ -313,7 +303,13 @@ class TestDraftSidecar(CustomTestCase):
         self.assertGreaterEqual(producer_id, 0)
         (ack,) = ctrl.ack_load_queue
         self.assertEqual(len(draft.host_pool.loads), 1)
-        self.assertTrue(draft.host_pool.load_futures[0].synchronized)
+        # Target pools landed, draft still in flight: the ack must stay closed.
+        anchor_fut = ctrl.mem_pool_host.anchor_entry.host_pool.load_futures[0]
+        swa_fut = ctrl.mem_pool_host.entry_map[PoolName.SWA].host_pool.load_futures[0]
+        anchor_fut.ready = True
+        swa_fut.ready = True
+        self.assertFalse(ack.finish_event.query())
+        draft.host_pool.load_futures[0].ready = True
         self.assertTrue(ack.finish_event.query())
 
 

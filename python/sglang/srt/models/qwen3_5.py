@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.compilation.support_torch_compile import support_torch_compile
 
 # Configs
 from sglang.srt.configs.qwen3_5 import (
@@ -145,6 +146,13 @@ _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _is_amx_available = cpu_has_amx_support()
+
+# Head-group ratios (num_v_heads // num_k_heads) served by the fused
+# split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
+# covered by the fused kernel, which removes the two `.contiguous()` copies
+# plus the `torch.cat` of the unfused fallback. Other backends keep the
+# original tuple so their control flow is unchanged.
+_GDN_FUSED_QKVZBA_RATIOS = (1, 2, 4, 8) if _use_aiter else (1, 2, 4)
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -669,7 +677,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         if (
-            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
             and not _is_npu
             # TPU has no Triton; fall through to the pure-torch split below.
             and not _is_tpu
@@ -720,7 +728,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = core_attn_out.reshape(
+            *core_attn_out.shape[:-2],
+            core_attn_out.shape[-2] * core_attn_out.shape[-1],
+        )
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -827,7 +838,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1266,7 +1277,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1831,6 +1842,29 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
+if current_platform.supports_torch_compile():
+    from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+        Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+    # Annotate the decoder boundary so TpuGraphRunner installs torch.compile on
+    # it. Both serving paths hold this same module -- Qwen3_5TextForCausalLM as
+    # `self.model`, the multimodal wrapper as `language_model_cls` -- so
+    # annotating here rather than at either wrapper is what makes both compile
+    # (Qwen3_5MoeForCausalLM inherits the attribute). Qwen3.5 does not use
+    # `Qwen3LLMModel`, the only decoder qwen3_vl annotates, so without this the
+    # decoder runs eager on both entries even with --enable-torch-compile -- the
+    # multimodal one still compiles its vision tower, the text-only one nothing.
+    #
+    # Qwen3VLDecoderTpuCompilePolicy subclasses the plain decoder policy and
+    # only diverges when the owner exposes the VL input_embeds path
+    # (`_uses_input_embeds`), so it is correct for both.
+    support_torch_compile(
+        Qwen3_5ForCausalLM,
+        policy=Qwen3VLDecoderTpuCompilePolicy,
+    )
+
+
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -2049,13 +2083,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return module_name.startswith("model.layers.")
 
     def _get_num_fused_shared_experts(self):
-        if not (
-            hasattr(self.model, "layers")
-            and len(self.model.layers) > 0
-            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
-        ):
+        if not hasattr(self.model, "layers"):
             return 0
-        return self.model.layers[0].mlp.num_fused_shared_experts
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            mlp = getattr(self.model.layers[layer_id], "mlp", None)
+            if hasattr(mlp, "num_fused_shared_experts"):
+                return mlp.num_fused_shared_experts
+        return 0
 
     def get_embed_and_head(self):
         embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None

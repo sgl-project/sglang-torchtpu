@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 
 import sglang.srt.model_executor.forward_batch_info as fbi
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -108,7 +109,7 @@ class TestForwardBatchPadding(CustomTestCase):
         fb.spec_info = SimpleNamespace()
         fb.hidden_states_backup = torch.zeros(2, 4)
         fb._original_batch_size = 2
-        logits_output = SimpleNamespace(
+        logits_output = LogitsProcessorOutput(
             next_token_logits=torch.zeros(4, 8),
             hidden_states=torch.zeros(4, 4),
         )
@@ -117,6 +118,21 @@ class TestForwardBatchPadding(CustomTestCase):
 
         self.assertEqual(fb.req_pool_indices.tolist(), [3, 7])
         self.assertEqual(fb.req_pool_indices_cpu.tolist(), [3, 7])
+
+    def test_tpu_idle_spec_allows_null_hidden_capture(self):
+        fb = _make_batch(bs=4, num_tokens=4)
+        fb.forward_mode = ForwardMode.IDLE
+        fb.spec_info = SimpleNamespace(keep_outputs_padded=True)
+        fb._original_batch_size = 0
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(4, 8),
+            hidden_states=None,
+        )
+
+        fb.post_forward_mlp_sync_batch(logits_output)
+
+        self.assertEqual(logits_output.next_token_logits.shape[0], 4)
+        self.assertIsNone(logits_output.hidden_states)
 
 
 class TestDeprecatedSkipKwargShim(CustomTestCase):

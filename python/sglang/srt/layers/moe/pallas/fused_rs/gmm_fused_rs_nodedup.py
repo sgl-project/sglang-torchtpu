@@ -1346,6 +1346,13 @@ def kernel_main_fused_rs(
                         sem=scale_local_write_sems_ref.at[_slot],
                     ).wait()
 
+    # A faster EP participant must not leave the kernel while a slower peer
+    # still owns nonzero per-slot send/local-write scratch semaphores. Under
+    # skewed routing, a nonzero scratch semaphore at kernel termination can
+    # surface as a Mosaic runtime failure.
+    # Rendezvous only after every participant has drained its per-slot state.
+    sync_barrier()
+
     # Drain recv_sem — each incoming remote DMA incremented it by 1.
     # Must be zero before kernel exit (Mosaic requirement).
     with jax.named_scope("drain_recv_sem"):
@@ -1524,6 +1531,7 @@ def kernel_main_fused_rs_fp8(
         "top_k",
         "fp8_direct_write",
         "use_in_kernel_recv_count",
+        "caller_tile_m",
     ],
 )
 def gmm_v2_fused_rs(
@@ -1549,6 +1557,7 @@ def gmm_v2_fused_rs(
     ep_size: int,
     ep_axis_name: str,
     max_num_gm: jax.Array,
+    caller_tile_m: int | None = None,
     top_k: int,
     fp8_direct_write: bool = False,
     use_in_kernel_recv_count: bool | None = None,
@@ -1627,6 +1636,16 @@ def gmm_v2_fused_rs(
         fp8_direct_write=fp8_direct_write,
     )
     tile_m = block_sizes.tile_m
+    # The caller sizes max_num_gm from an independent block-size lookup. A
+    # divergent lookup key can otherwise undercount the loop and leave the
+    # final gather DMA unawaited. Both values are static, so fail during trace
+    # instead of surfacing later as a leaked semaphore or device hang.
+    if caller_tile_m is not None and caller_tile_m != tile_m:
+        raise ValueError(
+            f"caller computed max_num_gm with tile_m={caller_tile_m}, but the "
+            f"kernel selected tile_m={tile_m}; check that quantization, "
+            "activation, variant, and FP8 direct-write lookup keys agree"
+        )
     tile_k1 = block_sizes.tile_k1
     tile_n1 = block_sizes.tile_n1
     tile_k2 = block_sizes.tile_k2
@@ -2247,6 +2266,7 @@ def run_gmm_fused_rs(
             ep_size=ep_size,
             ep_axis_name=ep_axis_name,
             max_num_gm=max_num_gm,
+            caller_tile_m=kernel_tile_m,
             top_k=top_k,
         )
 

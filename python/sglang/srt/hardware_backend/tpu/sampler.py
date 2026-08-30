@@ -14,12 +14,94 @@ from sglang.srt.layers.sampler import (
     sampling_from_probs_torch,
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
+from sglang.srt.model_executor.forward_batch_info import LogitsOutputMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 MAX_DISTRIBUTED_TOP_K = 64
 _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = max(
     1, envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE.get()
 )
+# Kill switch for the sort-free top-k/top-p/min-p filtering path.
+_BSEARCH_SAMPLING_ENABLED = envs.SGLANG_TPU_ENABLE_BSEARCH_SAMPLING.get()
+
+
+def distributed_top_k_min_batch_size() -> int:
+    return _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
+
+
+def distributed_top_k_candidate_width(logits_processor, lm_head) -> Optional[int]:
+    """Return the fixed candidate width supported by a TPU model layout."""
+
+    if (
+        not getattr(logits_processor, "use_tpu_distributed_top_k", False)
+        or not getattr(logits_processor, "do_tensor_parallel_all_gather", False)
+        or getattr(logits_processor, "do_tensor_parallel_all_gather_dp_attn", False)
+    ):
+        return None
+
+    from sglang.srt.hardware_backend.tpu.top_k import (
+        supports_distributed_tpu_top_k,
+    )
+
+    candidate_width = min(
+        MAX_DISTRIBUTED_TOP_K,
+        int(getattr(lm_head, "num_embeddings", 0)),
+        int(getattr(lm_head, "num_embeddings_per_partition", 0)),
+    )
+    if candidate_width <= 1 or not supports_distributed_tpu_top_k(
+        lm_head, candidate_width
+    ):
+        return None
+    return candidate_width
+
+
+def distributed_top_k_candidate_width_for_model(model) -> Optional[int]:
+    """Return the fixed candidate width supported by a model's output head."""
+
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    output_head = get_output_embeddings() if callable(get_output_embeddings) else None
+    if output_head is None:
+        output_head = getattr(model, "lm_head", None)
+    if output_head is None and getattr(
+        getattr(model, "config", None), "tie_word_embeddings", False
+    ):
+        output_head = getattr(getattr(model, "model", None), "embed_tokens", None)
+    if output_head is None:
+        return None
+    return distributed_top_k_candidate_width(
+        getattr(model, "logits_processor", None), output_head
+    )
+
+
+def _use_bsearch_filtering(probs: torch.Tensor) -> bool:
+    """The sort-free mask is a TPU custom op; CPU tensors (unit tests, other
+    devices) keep the generic torch fallback."""
+    return _BSEARCH_SAMPLING_ENABLED and probs.device.type == "tpu"
+
+
+def _filter_gathered_top_k_probs(
+    top_k_probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+) -> torch.Tensor:
+    """Apply top-p/min-p inside a gathered descending [bs, k] block.
+
+    Exact versus full-width filtering: a nucleus narrower than k finds the
+    same cutoff in the block, a wider one keeps the whole block (which is
+    what ANDing with top-k yields), and min-p's reference max is the block's
+    first column. Nothing renormalizes on this path, so gathered
+    probabilities stay directly comparable to full-row ones."""
+
+    from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+
+    return tpu_filter_probs(
+        top_k_probs,
+        sampling_info.top_ks,
+        sampling_info.top_ps,
+        sampling_info.min_ps,
+        need_top_k=False,  # gathering k columns already applied top-k
+        need_top_p=sampling_info.need_top_p_sampling,
+        need_min_p=sampling_info.need_min_p_sampling,
+    )
 
 
 def distributed_top_k_for_batch(
@@ -32,18 +114,27 @@ def distributed_top_k_for_batch(
 
     if sampling_backend != "tpu":
         return None
-    if forward_batch is None or getattr(forward_batch, "sampling_info", None) is None:
+    if forward_batch is None:
+        return None
+    # Draft and verify forwards carry spec_info even when their spec_algorithm
+    # field differs between precompile and serving. Return before reading either
+    # spec_algorithm or sampling_info so Dynamo does not guard those fields.
+    if getattr(forward_batch, "spec_info", None) is not None:
         return None
     spec_algorithm = getattr(forward_batch, "spec_algorithm", None)
     has_speculative_decode = spec_algorithm is not None and not spec_algorithm.is_none()
-    batch_size = getattr(
-        forward_batch,
-        "_tpu_real_b",
-        getattr(forward_batch, "batch_size", 0),
-    )
+    # Speculative decoding never uses the distributed TopK path. Check this
+    # before sampling_info so compiled speculative forwards do not specialize
+    # on request-specific sampling state.
+    if has_speculative_decode:
+        return None
+    if getattr(forward_batch, "sampling_info", None) is None:
+        return None
+    # Mode selection happens after TPU padding, so use the physical batch size.
+    # The logical size must not become a compile-time guard.
+    batch_size = getattr(forward_batch, "batch_size", 0)
     if (
         getattr(forward_batch, "return_logprob", False)
-        or has_speculative_decode
         or batch_size < _DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
     ):
         return None
@@ -81,13 +172,35 @@ def distributed_top_k_for_batch(
     return top_k
 
 
+def select_logits_output_mode(forward_batch, model) -> LogitsOutputMode:
+    """Select full-vocabulary logits or distributed TopK candidates."""
+
+    candidate_width = distributed_top_k_candidate_width_for_model(model)
+    if candidate_width is None:
+        return LogitsOutputMode.FULL_VOCAB
+    requested_top_k = distributed_top_k_for_batch(forward_batch, sampling_backend="tpu")
+    if requested_top_k is None or requested_top_k > candidate_width:
+        return LogitsOutputMode.FULL_VOCAB
+    return LogitsOutputMode.DISTRIBUTED_TOP_K
+
+
 def sample_from_global_top_k_logits(
     global_top_k_logits: torch.Tensor,
     temperatures: torch.Tensor,
+    top_ks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Normalize temperature-scaled global TopK logits and sample a position.
     Returned positions index global TopK token IDs, not the full vocabulary."""
 
+    if top_ks is not None:
+        positions = torch.arange(
+            global_top_k_logits.shape[-1],
+            dtype=top_ks.dtype,
+            device=global_top_k_logits.device,
+        )
+        global_top_k_logits = global_top_k_logits.masked_fill(
+            positions.unsqueeze(0) >= top_ks.unsqueeze(1), -torch.inf
+        )
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
     return sampling_from_probs_torch(global_top_k_probs)
 
@@ -124,6 +237,7 @@ class TpuSampler(Sampler):
         sampled_top_k_position = sample_from_global_top_k_logits(
             logits_output.next_token_global_top_k_logits,
             sampling_info.temperatures,
+            sampling_info.top_ks,
         )
         batch_next_token_ids = torch.gather(
             logits_output.next_token_global_top_k_token_ids,
@@ -151,17 +265,25 @@ class TpuSampler(Sampler):
                 positions=positions,
             )
         top_k = sampling_info.uniform_top_k
+        needs_top_p_or_min_p = (
+            sampling_info.need_top_p_sampling or sampling_info.need_min_p_sampling
+        )
         if (
             top_k is not None
             and 1 < top_k <= MAX_DISTRIBUTED_TOP_K
             and sampling_info.sampling_seed is None
             and sampling_info.need_top_k_sampling
-            and not sampling_info.need_top_p_sampling
-            and not sampling_info.need_min_p_sampling
+            and (not needs_top_p_or_min_p or _use_bsearch_filtering(probs))
         ):
             from sglang.srt.hardware_backend.tpu.top_k import tpu_top_k
 
             global_top_k_probs, global_top_k_token_ids = tpu_top_k(probs, top_k)
+            if needs_top_p_or_min_p:
+                # Filtering the gathered block replaces ~30 full-vocabulary
+                # reductions with ~30 reductions over top_k columns.
+                global_top_k_probs = _filter_gathered_top_k_probs(
+                    global_top_k_probs, sampling_info
+                )
             sampled_top_k_position = sampling_from_probs_torch(global_top_k_probs)
             return torch.gather(
                 global_top_k_token_ids,
@@ -169,6 +291,25 @@ class TpuSampler(Sampler):
                 index=sampled_top_k_position.to(torch.int64).view(-1, 1),
             ).view(-1)
 
+        if sampling_info.sampling_seed is None and _use_bsearch_filtering(probs):
+            # Sort-free path: the torch fallback below needs a full-vocab sort
+            # plus boolean-mask scatters, which run eagerly on TPU at ~415 ms
+            # per decode step. The binary-search mask is one compiled program;
+            # the remaining multinomial is the cheap tier-2 op.
+            from sglang.srt.hardware_backend.tpu.sampling_mask import tpu_filter_probs
+
+            filtered_probs = tpu_filter_probs(
+                probs,
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                need_top_k=sampling_info.need_top_k_sampling,
+                need_top_p=sampling_info.need_top_p_sampling,
+                need_min_p=sampling_info.need_min_p_sampling,
+            )
+            return sampling_from_probs_torch(filtered_probs)
+
+        # Seeded (deterministic) sampling keeps the sort-based reference path.
         return top_k_top_p_min_p_sampling_from_probs_torch(
             probs,
             sampling_info.top_ks,

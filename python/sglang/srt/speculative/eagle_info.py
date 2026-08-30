@@ -712,6 +712,9 @@ class EagleDraftInput(SpecInput):
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
 
+    # TPU RPA KV lengths for the current fused draft step.
+    rpa_draft_kv_lens: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 

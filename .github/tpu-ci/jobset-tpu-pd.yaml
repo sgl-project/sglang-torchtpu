@@ -1,0 +1,236 @@
+# P/D disaggregation test workload -- TWO replicated jobs (prefill, decode), each
+# scheduled onto its OWN TPU slice (the exclusive-topology annotation pins every
+# child Job inside one node pool; a GKE multihost TPU node pool is one slice).
+# Rendered by .github/tpu-ci/render_jobset.py --pd-prefill-hosts/--pd-decode-hosts.
+# Render vars (do NOT write them as dollar-brace tokens in these comments -- the
+# renderer would substitute them here too):
+#   IMAGE                digest-pinned image
+#   RUN_NAME             DNS-safe label; must not contain "prefill"/"decode"
+#                        (pods derive peer-slice hostnames by swapping the
+#                        replicated-job segment of their own hostname)
+#   EXEC_CMD             every pod of both slices runs this command; the test
+#                        dispatches roles from CI_PD_ROLE + the slice-local
+#                        TPU worker env, and the prefill leader's exit gates
+#   TEST_FILES           the file(s) EXEC_CMD runs; announced by every pod and
+#                        reported by the prefill leader in TIMINGS format, which
+#                        is what names this run's row on the CI dashboard
+#   ACTIVE_DEADLINE      per-Job runtime cap (seconds)
+#   PREFILL_HOSTS / DECODE_HOSTS           pods (= hosts) per slice
+#   PREFILL_TOPOLOGY / PREFILL_POOL        node labels for the prefill slice
+#   DECODE_TOPOLOGY / DECODE_POOL          node labels for the decode slice
+#   WEIGHTS_VOLUME / WEIGHTS_MOUNT         indented YAML blocks (may be empty)
+# Requires the target pools to hold one slice per role (two slices total).
+# ci-tpu-pools: ${POOL_LIST}
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  generateName: tpu-ci-${RUN_NAME}-
+  namespace: tpu-ci
+  labels:
+    # Created suspended; Kueue releases it when both roles' slices are free. One
+    # LocalQueue for the JobSet; each role's PodSet gets its own ResourceFlavor,
+    # which is what puts prefill and decode on different slices.
+    kueue.x-k8s.io/queue-name: ${QUEUE}
+${EXCLUSIVE_PLACEMENT}
+spec:
+  ttlSecondsAfterFinished: 7200
+  failurePolicy:
+    maxRestarts: 0
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - prefill
+  network:
+    enableDNSHostnames: true       # stable pod DNS for cross-slice rendezvous
+  replicatedJobs:
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${PREFILL_HOSTS}
+          parallelism: ${PREFILL_HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+${SERVICE_ACCOUNT}
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: ${PREFILL_TOPOLOGY}
+${PREFILL_POOL_AFFINITY}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+${WEIGHTS_VOLUME}
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: prefill
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # GKE treats a JobSet with two TPU replicated jobs as one
+                      # Multislice workload and injects MEGASCALE_* coordination
+                      # env spanning both slices; with it set, the TPU runtime
+                      # builds a cross-slice megascale client instead of a plain
+                      # per-slice client. The P/D engines are independent slices
+                      # (the KV transfer is application-level), so drop it.
+                      for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Name the test BEFORE anything can fail. A P/D run can
+                      # spend an hour in weight load and compile before dying,
+                      # and with no test named the dashboard files the red row
+                      # under the job -- which reads as a test that does not
+                      # exist. Printed unconditionally, as in jobset-tpu.yaml.
+                      echo "== test files: ${TEST_FILES} =="
+                      t0=$SECONDS
+                      ${EXEC_CMD}
+                      rc=$?
+                      # Only the prefill leader's verdict gates. On a non-leader
+                      # host teardown is expected in two shapes: SIGTERM (143), or
+                      # -- when the leader finishes the eval and exits first -- the
+                      # worker scheduler dying on the severed request-broadcast
+                      # socket (gloo Connection closed/reset by peer), which
+                      # sglang's crash handler then SIGKILLs to 137. Treat both as
+                      # success; the disconnect grep keeps a real 137 (e.g.
+                      # OOM-kill) red, and the leader gates every real failure.
+                      if [ "${TPU_WORKER_ID:-0}" != "0" ]; then
+                        if [ "$rc" = 143 ]; then
+                          echo "worker teardown SIGTERM; success"; rc=0
+                        elif [ "$rc" = 137 ] && grep -qsE "Connection (closed|reset) by peer" /tmp/pd*prefill*.log; then
+                          echo "worker teardown (leader closed request-broadcast socket); success"; rc=0
+                        fi
+                      fi
+                      # Per-file verdict in run_suite's TIMINGS format, so the
+                      # dashboard reads P/D, multi-host and single-host through
+                      # one parser. Leader only: all four pods run the same
+                      # command, but only rank 0's exit code carries the verdict
+                      # and four records would be four duplicate rows.
+                      if [ "${TPU_WORKER_ID:-0}" = "0" ]; then
+                        passed=true
+                        [ "$rc" -eq 0 ] || passed=false
+                        echo "========== TIMINGS BEGIN =========="
+                        printf '{"file": "%s", "passed": %s, "elapsed": %s}\n' \
+                          "${TEST_FILES}" "$passed" "$((SECONDS - t0))"
+                        echo "========== TIMINGS END =========="
+                      fi
+                      exit $rc
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+${WEIGHTS_MOUNT}
+                  securityContext:
+                    privileged: true
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          backoffLimit: 0
+          completions: ${DECODE_HOSTS}
+          parallelism: ${DECODE_HOSTS}
+          activeDeadlineSeconds: ${ACTIVE_DEADLINE}
+          template:
+            metadata:
+              labels:
+                app: tpu-ci
+            spec:
+              restartPolicy: Never
+${SERVICE_ACCOUNT}
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: ${DECODE_TOPOLOGY}
+${DECODE_POOL_AFFINITY}
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              volumes:
+                - name: dshm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+${WEIGHTS_VOLUME}
+              containers:
+                - name: test
+                  image: ${IMAGE}
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: CI_PD_ROLE
+                      value: decode
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                  command: ["bash", "-lc"]
+                  args:
+                    - |
+                      set -uo pipefail
+                      cd /sgl-workspace/sglang
+                      export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # GKE treats a JobSet with two TPU replicated jobs as one
+                      # Multislice workload and injects MEGASCALE_* coordination
+                      # env spanning both slices; with it set, the TPU runtime
+                      # builds a cross-slice megascale client instead of a plain
+                      # per-slice client. The P/D engines are independent slices
+                      # (the KV transfer is application-level), so drop it.
+                      for v in $(compgen -e | grep '^MEGASCALE'); do unset "$v"; done
+                      echo "run=${RUN_NAME} role=$CI_PD_ROLE rank=${TPU_WORKER_ID:-0}"
+                      # Same announcement as the prefill side; the verdict is
+                      # the prefill leader's alone, so no TIMINGS record here.
+                      echo "== test files: ${TEST_FILES} =="
+                      ${EXEC_CMD}
+                      rc=$?
+                      # Decode pods never gate the verdict, so a teardown exit is
+                      # success: SIGTERM (143), or a 137 whose log shows the peer
+                      # disconnect (leader closed the socket, sglang SIGKILLs its
+                      # tree). The disconnect grep keeps a real 137 (OOM-kill) red.
+                      if [ "$rc" = 143 ]; then
+                        echo "worker teardown SIGTERM; success"; rc=0
+                      elif [ "$rc" = 137 ] && grep -qsE "Connection (closed|reset) by peer" /tmp/pd*decode*.log; then
+                        echo "worker teardown (peer disconnect); success"; rc=0
+                      fi
+                      exit $rc
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      cpu: "4"
+                      memory: 32Gi
+                    limits:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+${WEIGHTS_MOUNT}
+                  securityContext:
+                    privileged: true

@@ -7,6 +7,12 @@ from typing import Dict, List, Optional
 
 import tabulate
 
+# Ensure the workspace's python/ directory takes precedence in sys.path
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_PYTHON_DIR = os.path.join(_REPO_ROOT, "python")
+if _PYTHON_DIR not in sys.path:
+    sys.path.insert(0, _PYTHON_DIR)
+
 from sglang.test.ci.ci_register import (
     CIRegistry,
     HWBackend,
@@ -14,6 +20,10 @@ from sglang.test.ci.ci_register import (
     collect_tests,
 )
 from sglang.test.ci.ci_utils import run_unittest_files
+
+# Defensive fallback in case sglang is loaded from an external environment missing TPU
+if not hasattr(HWBackend, "TPU"):
+    setattr(HWBackend, "TPU", object())
 
 HW_MAPPING = {
     "cpu": HWBackend.CPU,
@@ -145,9 +155,11 @@ NIGHTLY_SUITES = {
         "nightly-amd-1-gpu-zimage-turbo",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
         "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
+        "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
+        "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
     ],
@@ -156,11 +168,20 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
+        "nightly-1-npu-a2",
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
+        "nightly-acc-2-npu-a3",
+        "nightly-acc-4-npu-a3",
+        "nightly-acc-8-npu-a3",
+        "nightly-acc-16-npu-a3",
+        "nightly-perf-2-npu-a3",
+        "nightly-perf-4-npu-a3",
+        "nightly-perf-8-npu-a3",
+        "nightly-perf-16-npu-a3",
         "full-1-npu-a3",
         "full-2-npu-a3",
         "full-4-npu-a3",
@@ -170,7 +191,12 @@ NIGHTLY_SUITES = {
     HWBackend.TPU: [
         "nightly-tpu-4-v7",
         "nightly-tpu-multihost",
+        # One suite per perf model, so the nightly can fan them out as separate
+        # jobs on separate slices instead of one sequential single-host job.
+        "nightly-tpu-perf-gpt-oss-120b",
         "nightly-perf-tpu",
+        # One suite per accuracy model, for the same fan-out.
+        "nightly-tpu-accuracy-gpt-oss-120b",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",
@@ -328,10 +354,9 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py")
-        and not f.endswith("/__init__.py")
-        and not f.endswith("/cpu/utils.py")
-        and not f.endswith("/run_tests.py")
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
 
     # Strict: all discovered files must have proper registration
@@ -340,6 +365,16 @@ def run_a_suite(args):
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
+
+    if args.test_file:
+        requested = os.path.normpath(os.path.join(repo_root, args.test_file))
+        ci_tests = [
+            test for test in ci_tests if os.path.normpath(test.filename) == requested
+        ]
+        if not ci_tests:
+            raise ValueError(
+                f"Enabled test {args.test_file!r} was not found in suite {suite!r}"
+            )
 
     if auto_partition_size:
         live_est = load_live_est(args.partition_model_file, suite, repo_root)
@@ -388,6 +423,11 @@ def main():
         help="Hardware backend to run tests on.",
     )
     parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument(
+        "--test-file",
+        type=str,
+        help="Run only this registered file from the selected suite.",
+    )
     parser.add_argument(
         "--nightly",
         action="store_true",

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -179,6 +179,8 @@ def prepare_for_draft_extend(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
     )
+    # Normalize idle DP ranks before the shared sequence-length update.
+    draft_model_runner.compile_policy.normalize_spec_forward_batch(forward_batch)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
     forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
@@ -193,7 +195,8 @@ def prepare_for_draft_extend(
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
-    if not batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
+    # Plan materialized idle ranks at the same boundary as active peers.
+    if not forward_batch.forward_mode.is_idle() and not can_run_decode_cuda_graph:
         draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
         # Planned pre-pad; do NOT opt into post-pad re-plan. DSA's indexer
         # cannot rebuild its deep_gemm schedule_meta on a DP-padded batch
@@ -307,6 +310,9 @@ def prepare_for_draft(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=False,
     )
+    # Evaluate graph eligibility on the normalized physical DP shape.
+    if forward_batch.forward_mode.is_idle():
+        draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
     )
@@ -467,7 +473,6 @@ def run_eagle_verify(
     plan_stream: Any,
     plan_stream_ctx: Any,
     topk: int,
-    num_steps: int,
     num_draft_tokens: int,
     device: str,
     metadata_ready_pre_pad: bool,
@@ -506,6 +511,8 @@ def run_eagle_verify(
             batch,
             target_worker,
         )
+        # The forward batch may carry a distinct spec-info instance.
+        verify_forward_batch.spec_info.keep_outputs_padded = defer_output_unpadding
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
@@ -609,6 +616,7 @@ def run_eagle_verify(
             )
         )
         if defer_output_unpadding:
+            verify_forward_batch.spec_info.keep_outputs_padded = False
             logits_output = target_compile_policy.finalize_forward_batch(
                 logits_output, verify_forward_batch
             )
@@ -637,7 +645,7 @@ def run_eagle_verify(
     )
 
     if batch.return_logprob and not batch.forward_mode.is_idle():
-        compute_spec_v2_logprobs(batch, logits_output, predict, accept_index, num_steps)
+        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
 
     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
         # topk == 1 needs nothing here: the accepted path is already the front

@@ -1,45 +1,34 @@
-# Cloud Build: build the SGLang TPU test image and push to Artifact Registry.
-#
-# Runs AS the tpu-ci service account (serviceAccount below), so:
-#   * it pulls the private torch-tpu wheel using tpu-ci's own token fetched from
-#     the metadata server -- no personal/long-lived credential is ever handled
-#     (requires tpu-ci to be allowlisted on the torch-tpu-virtual-registry);
-#   * it pushes to the in-project Artifact Registry that GKE pulls from natively.
-#
-# Submit from the repo root:
-#   gcloud builds submit --config docker/cloudbuild.tpu.yaml \
-#     --substitutions=_TAG=tpu-$(git rev-parse --short HEAD) \
-#     --project sglang-torchtpu
+# Cloud Build: build the SGLang TPU test image from sglang-tpu-base and push to Artifact Registry.
 #
 substitutions:
   _IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu"
   _TAG: "latest"
+  _BASE_IMAGE: "us-central1-docker.pkg.dev/sglang-torchtpu/sglang-torchtpu-ci/sglang-tpu-base:latest"
 
 serviceAccount: "projects/sglang-torchtpu/serviceAccounts/tpu-ci@sglang-torchtpu.iam.gserviceaccount.com"
 
+# GCS copy of the build log, streamed into the GitHub Actions job log by
+# run_cloudbuild.py. External collaborators cannot open this project's Cloud
+# Console / Cloud Logging, so the Actions log is the only surface they can read.
+# LEGACY keeps the Cloud Logging / console log view working for maintainers.
+logsBucket: "gs://sglang-torchtpu_cloudbuild/logs"
+
 options:
-  logging: CLOUD_LOGGING_ONLY
+  logging: LEGACY
   machineType: E2_HIGHCPU_8
 
 steps:
-  - id: build
+  - id: build-final
     name: gcr.io/cloud-builders/docker
     entrypoint: bash
     args:
       - -c
       - |
         set -euo pipefail
-        # Access token for THIS build's own identity (tpu-ci), from the metadata
-        # server. Written only to the build workspace, removed before the step ends.
-        TOKEN="$$(curl -sf -H 'Metadata-Flavor: Google' \
-          http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
-          | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')"
-        printf '%s' "$$TOKEN" > /workspace/gcp_token
         DOCKER_BUILDKIT=1 docker build \
           -f docker/tpu.Dockerfile \
-          --secret id=gcp_token,src=/workspace/gcp_token \
+          --build-arg BASE_IMAGE="${_BASE_IMAGE}" \
           -t "${_IMAGE}:${_TAG}" .
-        rm -f /workspace/gcp_token
 
 images:
   - "${_IMAGE}:${_TAG}"

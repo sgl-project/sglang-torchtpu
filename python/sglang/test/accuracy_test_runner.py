@@ -39,6 +39,15 @@ class AccuracyTestParams:
     runner: Optional[Callable[[str], dict]] = None
     extra_eval_args: Optional[dict] = None  # merged into run_eval's namespace
     label: Optional[str] = None  # display/metric name; defaults to `dataset`
+    seed: Optional[int] = None  # pin for reproducibility when temperature > 0
+    # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
+    # of letting _run_sgl_eval infer it from the model name.
+    sgl_eval_thinking: Optional[bool] = None
+    # When set, run_accuracy_test dumps the measured score as `[METRIC] {name}=score`
+    # with these labels, whatever backend scored it. This is the one channel that
+    # feeds dashboards, so only declared gates are ever plotted; the backends' own
+    # dump_metric calls stay as stored-but-unplotted detail.
+    metric_labels: Optional[dict] = None
 
     @property
     def name(self) -> str:
@@ -136,6 +145,8 @@ def _run_simple_eval(
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
     api: Optional[str] = None,
+    seed: Optional[int] = None,
+    sgl_eval_thinking: Optional[bool] = None,
     extra_eval_args: Optional[dict] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
@@ -175,6 +186,12 @@ def _run_simple_eval(
 
         if repeat is not None:
             args.repeat = repeat
+
+        if seed is not None:
+            args.seed = seed
+
+        if sgl_eval_thinking is not None:
+            args.sgl_eval_thinking = sgl_eval_thinking
 
         for key, value in (extra_eval_args or {}).items():
             setattr(args, key, value)
@@ -522,6 +539,8 @@ def _dispatch_eval(
         top_k=params.top_k,
         repeat=params.repeat,
         api=params.api,
+        seed=params.seed,
+        sgl_eval_thinking=params.sgl_eval_thinking,
         extra_eval_args=params.extra_eval_args,
     )
 
@@ -573,6 +592,11 @@ def run_accuracy_test(
     if score is None:
         score = metrics.get("accuracy", 0.0)
     latency = metrics.get("latency")
+
+    # Dump per gate, not after the aggregate verdict: a sibling gate failing the
+    # file must not cost this one its datapoint.
+    if params.metric_labels is not None and score is not None:
+        dump_metric(params.name, score, labels=params.metric_labels)
 
     if "_passed" in metrics:
         # The runner gated itself (it owns thresholds we cannot see from here).

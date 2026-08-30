@@ -9,7 +9,7 @@ change to how the scale is computed (per-tensor, calibrated, chunked amax) would
 turn activations into NaN silently.
 
 Device equivalence of the unclamped form is covered on TPU by
-test/registered/tpu/test_fp8_linear.py; these run on CPU and cover the
+test/registered/tpu/unit/test_fp8_linear.py; these run on CPU and cover the
 arithmetic.
 """
 

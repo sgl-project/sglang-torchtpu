@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.speculative.spec_info import SpecInput
 
 __all__ = [
     "CompilePolicy",
@@ -65,6 +66,8 @@ class CompilePolicy(ABC):
 class DecoderCompilePolicy(CompilePolicy):
     """Compile policy for decoder boundaries driven by a ForwardBatch."""
 
+    b_bucketer: Any | None = None
+
     def precompile_draft(
         self, draft_attn_backend: Any, draft_extend_attn_backend: Any
     ) -> None:
@@ -80,8 +83,45 @@ class DecoderCompilePolicy(CompilePolicy):
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         """Finalize outputs and batch state after a normal or target forward."""
 
+    def get_dp_padded_token_counts(
+        self,
+        forward_batch: ForwardBatch,
+        model_runner: Any,
+        global_num_tokens: list[int],
+        global_num_tokens_for_logprob: list[int],
+        *,
+        attn_tp_size: int,
+        cp_align_size: int,
+    ) -> tuple[list[int], list[int]]:
+        """Return DP token counts after platform-neutral TP/CP alignment."""
+
+        def align(value: int, size: int) -> int:
+            return (value + size - 1) // size * size if size > 1 else value
+
+        def align_for_collectives(value: int) -> int:
+            return align(align(value, attn_tp_size), cp_align_size)
+
+        return (
+            [align_for_collectives(value) for value in global_num_tokens],
+            list(global_num_tokens_for_logprob),
+        )
+
+    def materialize_dp_idle_extend(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> bool:
+        """Materialize an idle DP rank for a shared extend shape, if supported."""
+        return False
+
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Prepare a speculative forward before attention planning."""
+
+    def normalize_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
+        """Normalize a speculative phase before phase-specific bookkeeping."""
+
+    def prepare_spec_draft_input(
+        self, forward_batch: ForwardBatch, draft_input: SpecInput
+    ) -> None:
+        """Prepare draft inputs consumed before the first model forward."""
 
     def finalize_spec_forward_batch(
         self, outputs: Any, forward_batch: ForwardBatch

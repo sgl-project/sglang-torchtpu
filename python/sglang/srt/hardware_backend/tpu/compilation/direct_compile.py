@@ -13,6 +13,7 @@ from typing import Any, Protocol
 
 import torch
 from jax import tree_util
+from torch._dynamo import eval_frame
 from torch._dynamo.utils import dynamo_timed
 from torch.nn.utils.stateless import _reparametrize_module
 from torch_tpu._internal import execution_mode
@@ -23,6 +24,8 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -201,6 +204,13 @@ class CompiledFunction:
         key = self.specialization_key(*args, **kwargs)
         artifact = self.cache.get(key)
         if artifact is None:
+            # set_stance has no public getter and replaces eval_frame._stance.
+            if self.cache and eval_frame._stance.stance == "fail_on_recompile":
+                raise RuntimeError(
+                    "Detected recompile when torch.compile stance is "
+                    "'fail_on_recompile'. direct_compile specialization key: "
+                    f"{key!r}"
+                )
             artifact = self._compile(args, kwargs)
             self.cache[key] = artifact
         return artifact((args, kwargs))
@@ -373,6 +383,9 @@ class CompiledFunction:
             model_inputs=tuple(model_inputs),
             kv_pool=self._kv_pool,
             tensor_inputs_key_paths=tuple(tensor_inputs_key_paths),
+            tensor_inputs_traced_shapes=tuple(
+                tuple(path_leaves[index][1].shape) for index in tensor_leaf_indices
+            ),
             output_treespec=output_treespec,
             output_count=len(output_leaves),
         )
@@ -386,6 +399,7 @@ class _CompiledArtifact:
     model_inputs: tuple[torch.Tensor, ...]
     kv_pool: KVPool | None
     tensor_inputs_key_paths: tuple[tree_util.KeyPath, ...]
+    tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...]
     output_treespec: Any
     output_count: int
 
@@ -393,13 +407,24 @@ class _CompiledArtifact:
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
         inputs = [*self.model_inputs, *kv_pool_inputs]
         # Resolve explicit inputs by path, similar to Dynamo sources.
-        for path in self.tensor_inputs_key_paths:
+        for path, traced_shape in zip(
+            self.tensor_inputs_key_paths, self.tensor_inputs_traced_shapes
+        ):
             value = _get_path(call, path)
             if not _is_tpu_tensor(value):
                 raise TypeError(
                     "A direct_compile tensor input changed type at runtime: "
                     f"{tree_util.keystr(path)} was traced as a TPU tensor but is "
                     f"now {type(value).__name__}"
+                )
+            if tuple(value.shape) != traced_shape:
+                # A mismatched buffer corrupts the launch (XLA e0102): the
+                # specialization key failed to distinguish this call.
+                raise ValueError(
+                    "A direct_compile tensor input changed shape at runtime: "
+                    f"{tree_util.keystr(path)} was traced as {traced_shape} but "
+                    f"is now {tuple(value.shape)} ({value.dtype}). The "
+                    "specialization key does not cover whatever varies here."
                 )
             inputs.append(value)
 
@@ -482,3 +507,5 @@ def _register_hidden_states_pytree(cls: type) -> None:
 
 _register_hidden_states_pytree(EagleDraftInput)
 _register_hidden_states_pytree(EagleDraftExtendInput)
+_register_hidden_states_pytree(DFlashDraftInputV2)
+tree_util.register_dataclass(DFlashVerifyInput)

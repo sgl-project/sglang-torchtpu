@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import warnings
 from abc import ABC
+from collections.abc import Callable
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING
 
 import msgspec
 import torch
 
+from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -45,9 +47,7 @@ class SpeculativeAlgorithm(Enum):
     NONE = auto()
 
     @classmethod
-    def from_string(
-        cls, name: Optional[str]
-    ) -> Union[SpeculativeAlgorithm, CustomSpecAlgo]:
+    def from_string(cls, name: str | None) -> SpeculativeAlgorithm | CustomSpecAlgo:
         if name is None:
             return cls.NONE
         upper = name.upper()
@@ -66,8 +66,8 @@ class SpeculativeAlgorithm(Enum):
         name: str,
         *,
         supports_overlap: bool = False,
-        validate_server_args: Optional[ServerArgsValidator] = None,
-        spec_class: Type[CustomSpecAlgo] = CustomSpecAlgo,
+        validate_server_args: ServerArgsValidator | None = None,
+        spec_class: type[CustomSpecAlgo] = CustomSpecAlgo,
     ) -> Callable[[WorkerFactory], WorkerFactory]:
         """Decorator to register a plugin speculative algorithm. The factory
         takes ``server_args`` and returns the worker class. Pass a
@@ -128,12 +128,6 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
-    def is_war_publish_phase(self, forward_mode) -> bool:
-        # The step's last shared-buffer-reading phase owns the WAR read-done publish.
-        if self.is_dflash_family():
-            return forward_mode.is_target_verify()
-        return forward_mode.is_draft_extend_v2()
-
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
@@ -150,7 +144,7 @@ class SpeculativeAlgorithm(Enum):
 
     def supports_tpu_direct_compile(self) -> bool:
         """Whether this algorithm supports TPU direct compilation."""
-        return self.is_eagle3()
+        return self.is_eagle3() or self.is_dflash()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -183,25 +177,22 @@ class SpeculativeAlgorithm(Enum):
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
-    ) -> Optional[SpecInput]:
+    ) -> SpecInput | None:
         if self.is_eagle():
             from sglang.srt.speculative.eagle_disaggregation import (
                 build_eagle_disagg_draft_input,
             )
 
-            return build_eagle_disagg_draft_input(
-                batch, server_args, last_tokens_tensor, future_map
-            )
+            return build_eagle_disagg_draft_input(batch, last_tokens_tensor, future_map)
         if self.is_dspark():
             from sglang.srt.speculative.dspark_disaggregation import (
                 build_dspark_disagg_draft_input,
             )
 
             return build_dspark_disagg_draft_input(
-                batch, server_args, last_tokens_tensor, future_map
+                batch, last_tokens_tensor, future_map
             )
         return None
 
@@ -266,7 +257,7 @@ class SpeculativeAlgorithm(Enum):
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+    ) -> type[BaseSpecWorker | TpModelWorker | NGRAMWorker] | None:
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -348,7 +339,7 @@ class SpecInput(ABC):
     # default, not an __init__ assignment: dataclass subclasses declare it as
     # a field and run __post_init__ -> super().__init__ *after* field
     # assignment, so an init-time default would clobber the passed layout.
-    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    ragged_verify_layout: RaggedVerifyLayout | None = None
 
     # Uniform per-request token width of this forward (and its logits-row
     # counterpart). Doubles as the DP-attention global_num_tokens multiplier
@@ -359,13 +350,13 @@ class SpecInput(ABC):
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
     # uniformly on any SpecInput; only the EAGLE-family inputs override them.
-    dsa_topk_indices: Optional[torch.Tensor] = None
+    dsa_topk_indices: torch.Tensor | None = None
     future_dsa_topk_indices_available: bool = False
-    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_capture: torch.Tensor | None = None
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
-        self.padding_state: Optional[SpecPaddingState] = None
+        self.padding_state: SpecPaddingState | None = None
         self.keep_outputs_padded: bool = False
 
     def record_padding(
@@ -412,9 +403,9 @@ class SpecInput(ABC):
 
 def spec_scale_global_num_tokens(
     spec_info: SpecInput,
-    global_num_tokens: List[int],
-    global_num_tokens_for_logprob: List[int],
-) -> Tuple[List[int], List[int]]:
+    global_num_tokens: list[int],
+    global_num_tokens_for_logprob: list[int],
+) -> tuple[list[int], list[int]]:
     """Scale the raw per-rank sync values (request counts on decode-family
     rounds) into this forward's token units using the spec input's uniform
     per-request widths."""
@@ -429,13 +420,14 @@ def spec_scale_global_num_tokens(
 
 def create_dummy_verify_input(
     spec_algorithm: SpeculativeAlgorithm,
-    server_args: ServerArgs,
     custom_mask: torch.Tensor,
     num_tokens_per_req: int,
     is_draft_worker: bool,
-) -> Optional[SpecInput]:
-    """Dummy verify ``SpecInput`` for CUDA-graph capture (per-algorithm dispatch)."""
+) -> SpecInput | None:
+    """Dummy verify SpecInput for CUDA-graph capture (per-algorithm dispatch)."""
     from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    spec = get_spec_config()
 
     spec_info = None
     if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
@@ -452,9 +444,9 @@ def create_dummy_verify_input(
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
                 retrieve_cum_len=None,
-                spec_steps=server_args.speculative_num_steps,
-                topk=server_args.speculative_eagle_topk,
-                draft_token_num=server_args.speculative_num_draft_tokens,
+                spec_steps=spec.speculative_num_steps,
+                topk=spec.speculative_eagle_topk,
+                draft_token_num=spec.speculative_num_draft_tokens,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
@@ -466,7 +458,7 @@ def create_dummy_verify_input(
         spec_info = DFlashVerifyInput(
             draft_token=None,
             positions=None,
-            draft_token_num=server_args.speculative_num_draft_tokens,
+            draft_token_num=spec.speculative_num_draft_tokens,
             custom_mask=None,
             capture_hidden_mode=(
                 CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL

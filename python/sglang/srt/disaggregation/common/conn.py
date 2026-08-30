@@ -160,6 +160,9 @@ class CommonKVManager(BaseKVManager):
         self.is_hybrid_mla_backend = getattr(args, "is_hybrid_mla_backend", False)
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_deferred_decode_kv_release = (
+            envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+        )
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -198,6 +201,11 @@ class CommonKVManager(BaseKVManager):
 
         # bind zmq socket
         self._zmq_ctx = zmq.Context()
+        # Raise libzmq's per-context socket cap because this manager caches two
+        # sockets per decode endpoint, so large fleets can exceed the default.
+        self._zmq_ctx.set(
+            zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get()
+        )
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
@@ -246,6 +254,10 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            # Deferred KV release: room -> prefill ranks that acked their transfer
+            # drained. Entry exists only while the room is held, so a stale/late
+            # ack for a reused bootstrap_room is dropped.
+            self._deferred_abort_ack_tracker: Dict[int, Set[int]] = {}
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -319,6 +331,12 @@ class CommonKVManager(BaseKVManager):
                 return
             self.request_status[bootstrap_room] = status
         else:
+            # Failed is terminal. In particular, a backend may admit native
+            # work under its state lock and then publish Transferring while a
+            # concurrent heartbeat/abort is failing the same room. Never let
+            # that later progress update revive a terminal request.
+            if self.request_status[bootstrap_room] == KVPoll.Failed:
+                return
             if status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
@@ -326,9 +344,34 @@ class CommonKVManager(BaseKVManager):
                     self.request_status[bootstrap_room], status
                 )
 
+    def clear_status(self, bootstrap_room: int) -> None:
+        self.request_status.pop(bootstrap_room, None)
+
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
+    def register_deferred_abort_room(self, bootstrap_room: int) -> None:
+        """Arm drain-ack accounting for a held room; a fresh set wipes stale acks
+        from a prior request that reused this bootstrap_room."""
+        self._deferred_abort_ack_tracker[bootstrap_room] = set()
+
+    def note_abort_ack(self, bootstrap_room: int, prefill_rank: int) -> None:
+        """Record a prefill rank's drain ack (decode receiver thread). Only counts
+        while the room is held; grabs the set by reference to avoid racing clear."""
+        acks = self._deferred_abort_ack_tracker.get(bootstrap_room)
+        if acks is not None:
+            acks.add(prefill_rank)
+
+    def is_abort_release_safe(self, bootstrap_room: int, required_acks: int) -> bool:
+        """True once every prefill rank that could still write these pages has acked."""
+        return (
+            len(self._deferred_abort_ack_tracker.get(bootstrap_room, ()))
+            >= required_acks
+        )
+
+    def clear_deferred_abort_state(self, bootstrap_room: int) -> None:
+        self._deferred_abort_ack_tracker.pop(bootstrap_room, None)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -741,6 +784,8 @@ class CommonKVManager(BaseKVManager):
         )
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
+        stale_sock = None
+        stale_monitor = None
         with self._socket_lock:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
@@ -756,11 +801,14 @@ class CommonKVManager(BaseKVManager):
                         disconnected = True
                 if not disconnected:
                     return sock
-                sock.close(linger=0)
-                if monitor is not None:
-                    monitor.close()
+                # Only unpublish here: a sender that fetched this socket may
+                # be inside send_multipart under the endpoint send lock, and
+                # zmq sockets must not be closed while another thread uses
+                # them. The close waits for that lock below.
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
+                stale_sock = sock
+                stale_monitor = monitor
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:
@@ -778,7 +826,12 @@ class CommonKVManager(BaseKVManager):
                 zmq.EVENT_DISCONNECTED
             )
             self._socket_send_locks.setdefault(endpoint, threading.Lock())
-            return sock
+        if stale_sock is not None:
+            with self._socket_send_locks[endpoint]:
+                if stale_monitor is not None:
+                    stale_monitor.close()
+                stale_sock.close(linger=0)
+        return sock
 
     def _send_multipart_locked(
         self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
@@ -1043,10 +1096,18 @@ class CommonKVManager(BaseKVManager):
 
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != KVPoll.Success
-            ):
+            # A room no longer in request_status has been cleared and is not
+            # affected. Backends whose check_status defaults a missing room
+            # (NIXL) rely on the membership test; backends whose check_status
+            # raises (Raiden) can still lose the room to a concurrent clear
+            # between the two lookups.
+            if room not in self.request_status:
+                continue
+            try:
+                status = self.check_status(room)
+            except KeyError:
+                continue
+            if status != KVPoll.Success:
                 self.record_failure(
                     room,
                     f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
@@ -1227,11 +1288,15 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.clear_status(self.bootstrap_room)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "_deferred_ack_targets"):
+            # Drop a held ack target if the room concluded without draining
+            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
+            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
 
     def abort(self):
         self.kv_mgr.record_failure(
@@ -1244,6 +1309,7 @@ class CommonKVSender(BaseKVSender):
 
 class CommonKVReceiver(BaseKVReceiver):
     _ctx = zmq.Context()
+    _ctx.set(zmq.MAX_SOCKETS, envs.SGLANG_DISAGGREGATION_ZMQ_MAX_SOCKETS.get())
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
@@ -1369,6 +1435,7 @@ class CommonKVReceiver(BaseKVReceiver):
             response = _get_bootstrap_session(self.bootstrap_addr).get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
+                bootstrap_info["pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(
@@ -1482,7 +1549,7 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.clear_status(self.bootstrap_room)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 

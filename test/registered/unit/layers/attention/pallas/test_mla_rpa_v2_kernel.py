@@ -55,9 +55,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sglang.srt.layers.attention.pallas.mla_ragged_paged_attention_v2 import (
-    DEFAULT_MASK_VALUE,
     align_to,
-    cdiv,
     get_dtype_packing,
     get_kv_cache_shape,
     mla_ragged_paged_attention,
@@ -75,6 +73,15 @@ _NUM_QUERIES_PER_BLOCK = (1, 1, 16)
 _DECODE_BATCH_SIZE = 4
 
 _RTOL, _ATOL = 2e-2, 1e-2
+
+# The re-vendored kernel dropped its module-level DEFAULT_MASK_VALUE (the
+# default is now derived from s_dtype); the tests pin the mask explicitly so
+# the fp32 numpy reference and the kernel always agree on it.
+_MASK_VALUE = -0.7 * float(np.finfo(np.float32).max)
+
+
+def _cdiv(a, b):
+    return (a + b - 1) // b
 
 
 def _cache_slots(seq_pages, positions, page_size, kv_packing):
@@ -118,7 +125,7 @@ def _build_case(lens, *, page_size, num_heads, dtype, seed):
     kv_lens = np.array([kv for _, kv in lens], dtype=np.int32)
     assert np.all(q_lens >= 1) and np.all(q_lens <= kv_lens)
 
-    pages_per_seq_list = [cdiv(int(kv), page_size) for kv in kv_lens]
+    pages_per_seq_list = [_cdiv(int(kv), page_size) for kv in kv_lens]
     pages_per_seq = max(pages_per_seq_list)
     total_num_pages = sum(pages_per_seq_list) + 8
     page_pool = rng.permutation(total_num_pages).astype(np.int32)
@@ -291,6 +298,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
         tuned_blocks=False,
         decode_batch_size=_DECODE_BATCH_SIZE,
         dtype=None,
+        s_dtype=None,
         seed=0,
     ):
         assert mode in ("extend", "decode")
@@ -327,7 +335,9 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             sm_scale=_SM_SCALE,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
+            mask_value=_MASK_VALUE,
             decode_batch_size=decode_batch_size,
+            **({} if s_dtype is None else {"s_dtype": s_dtype}),
             **block_kwargs,
         )
         jax.block_until_ready((out, updated_cache))
@@ -337,7 +347,7 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             sm_scale=_SM_SCALE,
             sliding_window=sliding_window,
             soft_cap=soft_cap,
-            mask_value=DEFAULT_MASK_VALUE,
+            mask_value=_MASK_VALUE,
         )
 
         got = np.asarray(out).astype(np.float32)
@@ -466,6 +476,15 @@ class TestMlaRaggedPagedAttentionV2(CustomTestCase):
             page_size=64,
             decode_batch_size=1,
         )
+
+    def test_extend_fp32_scores(self):
+        """s_dtype=fp32 anchors correctness independent of the bf16-scores
+        default the other tests exercise (upstream #2198 made bf16 the
+        default; fp32 removes that rounding term from the comparison)."""
+        self._run("extend", self.EXTEND_LENS, page_size=64, s_dtype=jnp.float32)
+
+    def test_decode_fp32_scores(self):
+        self._run("decode", self.DECODE_LENS, page_size=64, s_dtype=jnp.float32)
 
     def test_extend_sliding_window(self):
         self._run("extend", self.SWA_EXTEND_LENS, page_size=16, sliding_window=128)

@@ -1,0 +1,122 @@
+# TPU accuracy gates -- test/registered/tpu/nightly-accuracy/ via run_suite, ONE
+# JOB PER MODEL so they take separate slices and run in parallel, exactly like
+# perf-test-tpu.yml. The same jobs run nightly (nightly-test-tpu.yml); this action
+# is the isolated trigger, for collecting a datapoint on demand without waiting
+# for a nightly:
+#   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
+#
+# Single-host models go through run_suite (`accuracy`); the multihost ones parked out
+# of the nightly lane (DeepSeek-R1-0528, Kimi-K2.6) take the JobSet launch path
+# (`accuracy-multihost`).
+name: Accuracy Test (TPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      model:
+        description: "Which model to gate"
+        required: false
+        default: all
+        type: choice
+        options: [all, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
+
+concurrency:
+  # Keyed on ref so runs for different branches proceed in parallel; same ref
+  # still serializes, so a re-dispatch cannot race the previous run's scores.
+  group: tpu-accuracy-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  accuracy:
+    needs: build
+    if: ${{ contains(fromJSON('["all","gpt-oss-120b"]'), inputs.model || 'all') }}
+    strategy:
+      # A broken model must not cancel the others' scores.
+      fail-fast: false
+      matrix:
+        # matrix context is unavailable in job-level `if`, so selection shapes the
+        # matrix instead -- same trick as perf-test-tpu.yml. One model today; the
+        # next one adds a choice above and a branch here.
+        suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-accuracy-gpt-oss-120b"]'))
+                || fromJSON('["nightly-tpu-accuracy-gpt-oss-120b"]') }}
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      nightly: true
+      # gpt-oss-120b serves from the shared ROX disk at /weights.
+      weights_pvc: model-weights-rox
+      # est_time 2400 (GPQA at 8 repeats + MMLU at 2000 examples) plus bring-up.
+      timeout_per_file: 3600
+    permissions:
+      contents: read
+      id-token: write
+
+  # Discovers suite nightly-tpu-multihost-ondemand, which the nightly lane does not
+  # scan, so each test file keeps owning its launch spec. `model` filters the
+  # discovered groups by name (mh-deepseek-r1-0528-mh, mh-kimi-k26-mh).
+  discover-multihost:
+    needs: build
+    if: ${{ contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'all') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.d.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: d
+        env:
+          MODEL: ${{ inputs.model || 'all' }}
+        run: |
+          set -euo pipefail
+          groups="$(python3 .github/tpu-ci/discover_multihost.py \
+                      --suite nightly-tpu-multihost-ondemand)"
+          if [ "$MODEL" != "all" ]; then
+            groups="$(jq -c --arg m "$MODEL" \
+                        '[.[] | select(.name | contains($m))]' <<< "$groups")"
+          fi
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
+          echo "discovered groups: $groups"
+
+  accuracy-multihost:
+    needs: [build, discover-multihost]
+    if: needs.discover-multihost.outputs.groups != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.discover-multihost.outputs.groups) }}
+    name: ${{ matrix.group.name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      nightly: true
+      launch_script: ${{ matrix.group.launch_script }}
+      files: ${{ matrix.group.files }}
+      hosts: ${{ matrix.group.hosts }}
+      weights_pvc: ${{ matrix.group.weights_pvc }}
+      timeout_per_file: ${{ matrix.group.timeout_per_file }}
+      run_name: ${{ matrix.group.name }}
+    permissions:
+      contents: read
+      id-token: write
