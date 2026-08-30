@@ -110,7 +110,7 @@ picks it up and groups it automatically; identical setup joins an existing group
 build ─────────────────────────────────┐
   ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
   │    suite: nightly-tpu-4-v7
-  ├─▶ combo-mh-spec         (hosts=2)  │  exec: feature_combo spec
+  ├─▶ P/D feature gates     (hosts=2)  │  dedicated registered tests
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
 ```
 

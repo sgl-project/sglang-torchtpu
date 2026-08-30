@@ -14,16 +14,6 @@ warmup.sh            # optional compile-bucket pre-warmup (stopgap)
 warmup_buckets.py    # request-sender used by warmup.sh
 ```
 
-Multihost feature-combination tests (July-30 milestone) live in
-`test/manual/tpu/feature_combo/multihost/test_feature_combos.py` (single file, both rows;
-launches engines through the launchers here). Run the same command on every
-pod of the 2-host dev box — roles auto-detect from TPU_WORKER_ID:
-
-```
-python test/manual/tpu/feature_combo/multihost/test_feature_combos.py pd    # prefix+KVoffload+P/D
-python test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec  # prefix+EAGLE3+KVoffload
-```
-
 ## Usage
 
 Run launch and bench in separate shells; set `MODEL` for both.

@@ -26,12 +26,11 @@ on:
         options:
           - all
           - accuracy
-          - combo
-          - combo-mh
           - mh
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
           - pd-mh-gpt-120b-spec
+          - pd-mh-gpt-120b-pc-offload-spec
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
@@ -65,7 +64,6 @@ jobs:
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
       pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
       pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
-      combo_mh: ${{ steps.tests.outputs.combo_mh }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,7 +80,6 @@ jobs:
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
-          echo "combo_mh=$($discover_files --entry test/manual/tpu/feature_combo/multihost/test_feature_combos.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -114,8 +111,8 @@ jobs:
   # never earns a history row -- these jobs give them a nightly cadence and
   # therefore a green/red trend. Each engine role holds a whole 2x2x2 nightly
   # slice, so every P/D job holds BOTH nightly-2h slices at once; the shared
-  # tpu-pd-lock in _tpu-test.yml serializes them (and against pd-singlehost /
-  # pd-multihost below). See the runner-cap gap in .github/tpu-ci/README.md.
+  # tpu-pd-lock in _tpu-test.yml serializes them (and against pd-sh /
+  # pd-mh below). See the runner-cap gap in .github/tpu-ci/README.md.
   # P/D pods are named tpu-ci-<run_name>-<rand>-{prefill,decode}-<idx>; names
   # use compact abbreviations (pd-{sh,mh}-gpt-120b[-<feature>]) to stay well
   # under k8s's 63-char pod-name cap.
@@ -165,29 +162,9 @@ jobs:
       contents: read
       id-token: write
 
-  combo-multihost-spec:
-    # Unchained: Kueue queues the hosts=2 jobs, so this need not wait out multi-host.
-    # spec: gated Llama-3.1-8B from HF (HF_TOKEN needs Meta license access). The pd
-    # row was dropped -- it duplicated pd-mh-gpt-120b-pc-offload.
-    needs: [build, discover-tests]
-    if: ${{ contains(fromJSON('["all","combo","combo-mh"]'), inputs.only || 'all') }}
-    name: ${{ fromJSON(needs.discover-tests.outputs.combo_mh)[0].name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 2
-      exec_cmd: python3 test/manual/tpu/feature_combo/multihost/test_feature_combos.py spec
-      weights_pvc: model-weights-rox
-      run_name: ${{ fromJSON(needs.discover-tests.outputs.combo_mh)[0].run_name }}
-    permissions:
-      contents: read
-      id-token: write
-
   # One host per P/D engine isolates this gate from intra-engine multihost issues.
   # Kueue queues it against other P/D jobs contending for the nightly lane.
-  pd-singlehost:
+  pd-sh:
     needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-sh-gpt-120b"]'), inputs.only || 'all') }}
     name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].name }}
@@ -231,7 +208,7 @@ jobs:
       id-token: write
 
   # Multihost P/D GSM8K accuracy test with 2 prefill and 2 decode hosts.
-  pd-multihost:
+  pd-mh:
     needs: [build, discover-tests]
     if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b"]'), inputs.only || 'all') }}
     name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].name }}
@@ -253,7 +230,7 @@ jobs:
       id-token: write
 
   # Multihost P/D with 2 prefill + 2 decode hosts, EAGLE3 spec + prefix caching.
-  pd-multihost-spec:
+  pd-mh-spec:
     needs: build
     if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b-spec"]'), inputs.only || 'all') }}
     name: pd-mh-gpt-120b-spec
@@ -273,8 +250,29 @@ jobs:
       contents: read
       id-token: write
 
+  # GPT-OSS-120B 2P+2D gate with prefix cache, Raiden KV offload, and EAGLE3 spec.
+  pd-mh-gpt-120b-pc-offload-spec:
+    needs: build
+    if: ${{ contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload-spec"]'), inputs.only || 'all') }}
+    name: pd-mh-gpt-120b-pc-offload-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
+      weights_pvc: model-weights-rox
+      run_name: pd-mh-gpt-120b-pc-offload-spec
+    permissions:
+      contents: read
+      id-token: write
+
   # Throughput sweeps, one job per model so they take separate slices and run in
-  # parallel -- same exec-mode shape as the combo layers above. Also dispatchable
+  # parallel through the reusable TPU test workflow. Also dispatchable
   # on its own (perf-test-tpu.yml) to collect a datapoint without a full nightly.
   perf:
     needs: [build, discover-tests]
