@@ -38,6 +38,9 @@ from sglang.srt.disaggregation.raiden.conn import (
     get_raiden_kv_caches,
 )
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+from sglang.srt.disaggregation.raiden.metric_collector import (
+    NullTPURaidenMetricsCollector,
+)
 from sglang.srt.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -340,6 +343,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
+                mgr.metrics = NullTPURaidenMetricsCollector()
+                mgr.chunked_transfer = False
                 mgr._announced_at = {}
                 mgr._timeout_s = 120.0
                 mgr._aborted = {}
@@ -398,6 +403,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
+        mgr.chunked_transfer = False
         mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._aborted = {}
@@ -457,6 +464,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._aborted = {}
@@ -500,6 +508,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     ):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr.attn_tp_rank = 0
@@ -584,6 +593,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._aborted = {}
@@ -624,6 +634,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _decode_mgr(pool_pages, full_limit, swa_limit=None, swa_pool_pages=None):
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -936,6 +947,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
+        mgr.chunked_transfer = True
         mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._aborted = {}
@@ -1035,6 +1048,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _decode(room, local, pool_pages, swa_pool_pages=8):
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -2429,6 +2443,8 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_producer(self, decode_pages):
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
+        mgr.chunked_transfer = False
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
@@ -2465,6 +2481,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_receiver(self, local_blocks):
         mgr = object.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()

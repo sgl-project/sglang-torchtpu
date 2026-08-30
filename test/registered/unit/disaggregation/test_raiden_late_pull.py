@@ -8,6 +8,9 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+from sglang.srt.disaggregation.raiden.metric_collector import (
+    NullTPURaidenMetricsCollector,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -20,6 +23,7 @@ TIMEOUT_S = 120.0
 def _decode_manager(engine, chunked=False):
     """A decode-mode RaidenKVManager with one staging slot and a stub engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr.metrics = NullTPURaidenMetricsCollector()
     mgr.attn_tp_rank = 0
     mgr.request_status = {ROOM: KVPoll.WaitingForInput}
     mgr.failure_records = {}

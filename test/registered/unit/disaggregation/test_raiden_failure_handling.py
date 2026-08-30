@@ -16,6 +16,9 @@ from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVReceiver,
     RaidenKVSender,
 )
+from sglang.srt.disaggregation.raiden.metric_collector import (
+    NullTPURaidenMetricsCollector,
+)
 from sglang.srt.disaggregation.raiden.serde import MessageTag, PullReq, ReshardReq
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -33,6 +36,7 @@ def _abort_frame(room):
 def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr.metrics = NullTPURaidenMetricsCollector()
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
     mgr.request_status = {}
     mgr.failure_records = {}
@@ -249,6 +253,7 @@ def _decode_manager_stub(**overrides):
     )
     fields.update(overrides)
     mgr = SimpleNamespace(**fields)
+    mgr.metrics = NullTPURaidenMetricsCollector()
     mgr._mark_aborted_locked = types.MethodType(
         RaidenKVManager._mark_aborted_locked, mgr
     )
@@ -300,6 +305,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
 
         engine.start_read.side_effect = blocking_start
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
@@ -390,6 +396,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
 class TestSenderBootstrapTimeout(unittest.TestCase):
     def _sender(self, has_decode_request, bootstrap_timeout, age):
         mgr = SimpleNamespace(
+            metrics=NullTPURaidenMetricsCollector(),
             _drain_engine=lambda: None,
             is_dummy_cp_rank=False,
             is_failed=lambda room: False,
@@ -543,6 +550,7 @@ class TestSenderTerminalPrecedence(unittest.TestCase):
         )
         fields.update(overrides)
         mgr = SimpleNamespace(**fields)
+        mgr.metrics = NullTPURaidenMetricsCollector()
         mgr.check_status = lambda room: mgr.request_status[room]
         sender = RaidenKVSender.__new__(RaidenKVSender)
         sender.kv_mgr = mgr

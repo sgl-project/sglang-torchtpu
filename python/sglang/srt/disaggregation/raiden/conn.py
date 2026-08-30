@@ -54,6 +54,7 @@ from sglang.srt.disaggregation.raiden.host_pool import (
     slot_host_bytes,
     slots_within_budget,
 )
+from sglang.srt.disaggregation.raiden.metric_collector import TPURaidenMetricsCollector
 from sglang.srt.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -286,6 +287,10 @@ class RaidenKVManager(CommonKVManager):
         # skipped -- its pages then ride the closing transfer.
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self.metrics = TPURaidenMetricsCollector.init_new(
+            tp_rank=self.attn_tp_rank,
+            dp_rank=self.attn_dp_rank,
+        )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # room -> accumulated page block-ids, aux blob, decode reply addr
@@ -1235,6 +1240,8 @@ class RaidenKVManager(CommonKVManager):
         if not accepted:
             with self._state_lock:
                 self._discard_sender_read_locked(room, req_id)
+            return
+        self.metrics.transfer_started(room, chunked=self.chunked_transfer)
 
     def _discard_sender_read_locked(self, room: int, req_id: str) -> None:
         reads = self._send_reads.get(room)
@@ -1644,6 +1651,7 @@ class RaidenKVManager(CommonKVManager):
                 local_slice = [loc for _, loc in pairs]
                 self._chunk_reads.setdefault(room, []).append(req_id)
             engine.start_read(req_id, uuid, endpoint, remote_slice, local_slice)
+            self.metrics.transfer_started(room, chunked=self.chunked_transfer)
             if closing:
                 self._swa_engine.start_read(
                     self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
@@ -1738,6 +1746,7 @@ class RaidenKVManager(CommonKVManager):
             # takes: a Transferring write can never follow the abort's Failed.
             self.update_status(room, KVPoll.Transferring)
         engine.start_read(str(room), room, endpoint, remote, local)
+        self.metrics.transfer_started(room, chunked=self.chunked_transfer)
         if self._swa_engine is not None:
             self._swa_engine.start_read(
                 self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
@@ -3000,14 +3009,17 @@ class RaidenKVSender(CommonKVSender):
             if self.kv_mgr.sender_has_active_io(self.bootstrap_room):
                 return KVPoll.Transferring
             self.conclude_state = KVPoll.Failed
+            self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "failure")
             return KVPoll.Failed
         if self.kv_mgr.is_send_done(self.bootstrap_room):
             self._finalize_transfer_latency()
             self.conclude_state = KVPoll.Success
+            self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "success")
             return KVPoll.Success
         if status == KVPoll.Success:
             self._finalize_transfer_latency()
             self.conclude_state = status
+            self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "success")
             return status
         # Raiden is consumer-pull: the prefill computes without waiting for
         # the decode, so the handshake window is bounded here rather than by
@@ -3018,6 +3030,7 @@ class RaidenKVSender(CommonKVSender):
             self.bootstrap_room, self.init_time, self.kv_mgr.bootstrap_timeout
         ):
             self.conclude_state = KVPoll.Failed
+            self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "failure")
             return KVPoll.Failed
         return status
 
@@ -3060,6 +3073,7 @@ class RaidenKVSender(CommonKVSender):
             if self.kv_mgr.sender_has_active_io(self.bootstrap_room)
             else KVPoll.Failed
         )
+        self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "cancelled")
 
     def failure_exception(self):
         """Drop the room's state, then raise the recorded failure reason."""
@@ -3069,6 +3083,7 @@ class RaidenKVSender(CommonKVSender):
             )
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
+        self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "failure")
         self.clear()
         raise Exception(reason)
 
@@ -3128,6 +3143,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             return self._conclude_failed(notify=False)
         if self.kv_mgr.is_recv_done(self.bootstrap_room):
             self.conclude_state = KVPoll.Success
+            self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "success")
             return KVPoll.Success
         if self._check_waiting_timeout() is not None:
             return self._conclude_failed()
@@ -3140,6 +3156,7 @@ class RaidenKVReceiver(CommonKVReceiver):
     def abort(self):
         """Explicit local abort: same terminal path as any failure, so active
         transfers keep the room's pages until they settle."""
+        self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "cancelled")
         self._conclude_failed(reason="Aborted by AbortReq.")
 
     def drained(self) -> bool:
@@ -3186,6 +3203,7 @@ class RaidenKVReceiver(CommonKVReceiver):
         if self.kv_mgr.room_has_active_io(self.bootstrap_room):
             return KVPoll.Transferring
         self.conclude_state = KVPoll.Failed
+        self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "failure")
         return KVPoll.Failed
 
     def _notify_prefill_abort(self) -> None:
@@ -3201,6 +3219,7 @@ class RaidenKVReceiver(CommonKVReceiver):
             reason = self.kv_mgr.failure_records.pop(
                 self.bootstrap_room, "Raiden receive failed"
             )
+        self.kv_mgr.metrics.transfer_finished(self.bootstrap_room, "failure")
         raise Exception(reason)
 
     def clear(self) -> None:

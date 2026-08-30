@@ -7,6 +7,9 @@ from unittest.mock import Mock
 
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+from sglang.srt.disaggregation.raiden.metric_collector import (
+    NullTPURaidenMetricsCollector,
+)
 from sglang.srt.disaggregation.raiden.serde import Blocks
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -18,6 +21,7 @@ ROOM = 41
 def _decode_manager(hybrid):
     """A chunked-transfer decode manager with its room tables, no sockets."""
     mgr = object.__new__(RaidenKVManager)
+    mgr.metrics = NullTPURaidenMetricsCollector()
     mgr.attn_tp_rank = 0
     mgr.chunked_transfer = True
     mgr._state_lock = threading.Lock()

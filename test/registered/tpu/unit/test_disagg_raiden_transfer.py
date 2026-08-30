@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReq,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -144,6 +145,9 @@ class RaidenRendezvousTestCase(CustomTestCase):
     """
 
     def setUp(self):
+        config = get_context().override_server_args(enable_metrics=False)
+        config.install()
+        self.addCleanup(config.restore)
         self.inboxes: dict[str, _Inbox] = {}
         self._next_port = 41000
 
