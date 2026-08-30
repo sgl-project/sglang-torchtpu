@@ -80,33 +80,47 @@ class RaidenKVCacheGroups:
     swa: List[Any]
 
 
-def get_raiden_kv_caches(pool) -> RaidenKVCacheGroups:
+def get_raiden_kv_caches(pool, draft_pool=None) -> RaidenKVCacheGroups:
     """Group per-layer device KV tensors by their page-index namespace.
 
     The TPU fused KV pool stores one [num_blocks, page_size, ...] tensor per
     layer in ``kv_buffer`` and exposes them via ``get_fused_kv_buffer``. Hybrid
     SWA pools allocate full-attention and sliding-window pages independently, so
-    they must not share one Raiden block-id list.
+    they must not share one Raiden block-id list. Speculative decoding uses the
+    same page indices for target and draft KV, so append the draft tensors to
+    the matching namespace and move them in the same Raiden transfer.
     """
-    if hasattr(pool, "get_fused_kv_buffer"):
-        start = pool.start_layer
-        buffers = [pool.get_fused_kv_buffer(start + i) for i in range(pool.layer_num)]
-    elif hasattr(pool, "kv_buffer"):
-        buffers = list(pool.kv_buffer)
-    else:
-        raise RuntimeError(
-            f"Raiden backend requires a fused KV pool exposing kv_buffer; got "
-            f"{type(pool).__name__}"
-        )
-    layers_mapping = getattr(pool, "layers_mapping", None)
-    if layers_mapping:
-        full = []
-        swa = []
-        for offset, buf in enumerate(buffers):
-            layer_id = pool.start_layer + offset
-            (swa if layers_mapping[layer_id][1] else full).append(buf)
-    else:
-        full, swa = buffers, []
+
+    def group_one(current_pool) -> RaidenKVCacheGroups:
+        if hasattr(current_pool, "get_fused_kv_buffer"):
+            start = current_pool.start_layer
+            buffers = [
+                current_pool.get_fused_kv_buffer(start + i)
+                for i in range(current_pool.layer_num)
+            ]
+        elif hasattr(current_pool, "kv_buffer"):
+            buffers = list(current_pool.kv_buffer)
+        else:
+            raise RuntimeError(
+                "Raiden backend requires a fused KV pool exposing kv_buffer; got "
+                f"{type(current_pool).__name__}"
+            )
+        layers_mapping = getattr(current_pool, "layers_mapping", None)
+        if layers_mapping:
+            full = []
+            swa = []
+            for offset, buf in enumerate(buffers):
+                layer_id = current_pool.start_layer + offset
+                (swa if layers_mapping[layer_id][1] else full).append(buf)
+            return RaidenKVCacheGroups(full=full, swa=swa)
+        return RaidenKVCacheGroups(full=buffers, swa=[])
+
+    groups = group_one(pool)
+    full, swa = list(groups.full), list(groups.swa)
+    if draft_pool is not None and draft_pool is not pool:
+        draft_groups = group_one(draft_pool)
+        full.extend(draft_groups.full)
+        swa.extend(draft_groups.swa)
 
     for name, group in (("full", full), ("SWA", swa)):
         block_counts = {int(buf.shape[0]) for buf in group}

@@ -106,13 +106,33 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         class _KVPool:
             page_size = 128
             head_num = 4
+            start_layer = 0
+            layer_num = 1
+            buffers = [torch.empty(3, 4)]
 
             def get_contiguous_buf_infos(self):
                 return [11], [22], [33]
 
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        class _DraftKVPool:
+            start_layer = 0
+            layer_num = 1
+            buffers = [torch.empty(3, 4)]
+
+            def get_contiguous_buf_infos(self):
+                return [44], [55], [66]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
         class _Manager:
             def __init__(self, kv_args, *_args):
                 captured["kv_args"] = kv_args
+
+            def set_kv_caches(self, kv_caches):
+                captured["kv_caches"] = kv_caches
 
         def _get_kv_class(_backend, class_type):
             if class_type == KVClassType.KVARGS:
@@ -138,7 +158,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             server_args=SimpleNamespace(disaggregation_ib_device="mlx5_0"),
         )
         queue.token_to_kv_pool = _KVPool()
-        queue.draft_token_to_kv_pool = None
+        queue.draft_token_to_kv_pool = _DraftKVPool()
         queue.metadata_buffers = SimpleNamespace(
             get_buf_infos=Mock(return_value=([], [], []))
         )
@@ -163,6 +183,11 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(kv_args.sliding_window_size, 4096)
         self.assertEqual(kv_args.kv_head_num, 4)
         self.assertEqual(kv_args.total_kv_head_num, 8)
+        self.assertEqual(
+            captured["kv_caches"].full,
+            [_KVPool.buffers[0], _DraftKVPool.buffers[0]],
+        )
+        self.assertEqual(captured["kv_caches"].swa, [])
         model_config.get_total_num_kv_heads.assert_called_once_with()
 
     def test_sender_matches_base_api_contract(self):
@@ -224,6 +249,28 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         groups = get_raiden_kv_caches(_Pool())
         self.assertEqual(groups.full, [_Pool.buffers[0], _Pool.buffers[2]])
         self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
+
+    def test_speculative_draft_caches_join_target_page_namespaces(self):
+        class _TargetPool:
+            start_layer = 0
+            layer_num = 2
+            layers_mapping = {0: (0, False), 1: (0, True)}
+            buffers = [torch.empty(3, 4), torch.empty(2, 4)]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        class _DraftPool:
+            start_layer = 0
+            layer_num = 1
+            buffers = [torch.empty(3, 4)]
+
+            def get_fused_kv_buffer(self, layer_id):
+                return self.buffers[layer_id]
+
+        groups = get_raiden_kv_caches(_TargetPool(), draft_pool=_DraftPool())
+        self.assertEqual(groups.full, [_TargetPool.buffers[0], _DraftPool.buffers[0]])
+        self.assertEqual(groups.swa, [_TargetPool.buffers[1]])
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
