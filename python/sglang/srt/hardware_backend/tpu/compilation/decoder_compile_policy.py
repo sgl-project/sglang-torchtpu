@@ -1179,9 +1179,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         )
 
         if mode.is_decode() and self._decode_uses_input_ids():
-            # Mirror the wrapper's decode shortcut: input_ids in, no
-            # input_embeds. Note this still uses the VL positions (mrope when
-            # enabled) -- only the embedding moves, not the position layout.
+            # Positions stay mrope-shaped; only the embedding moves into the graph.
             return (forward_batch.input_ids, positions, forward_batch), {}
 
         embed_tokens = self.owner.get_input_embeddings()
