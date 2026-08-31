@@ -466,7 +466,7 @@ class TestVerifyBookkeepingEquivalence(unittest.TestCase):
 
             want_seq = seq_lens + accept_lens
             accept_tokens = predict[accept_index]
-            want_bonus = torch.empty_like(accept_lens, dtype=torch.int32)
+            want_bonus = torch.empty_like(accept_lens, dtype=torch.int64)
             for i in range(bs):
                 want_bonus[i] = accept_tokens.reshape(-1)[
                     width * i + int(accept_lens[i]) - 1

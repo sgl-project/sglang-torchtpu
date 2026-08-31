@@ -203,7 +203,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
-    def test_fused_steps_bypass_direct_tracer(self):
+    def test_fused_steps_support_both_compile_tracers(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
 
         with patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True):
@@ -211,10 +211,11 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             self.assertTrue(worker._should_fuse_draft_steps())
 
             worker.server_args.tpu_compile_tracer = "direct"
-            self.assertFalse(worker._should_fuse_draft_steps())
+            self.assertTrue(worker._should_fuse_draft_steps())
 
     def test_fused_steps_thread_per_step_inputs(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker.server_args.tpu_compile_tracer = "direct"
         worker.hot_token_id = None
 
         calls = []
@@ -266,6 +267,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.zeros((1, 2), device=DEVICE),
                 kv_lens,
                 out_cache_loc,
+                None,
             )
 
         self.assertEqual([token.item() for token in tokens], [100, 101, 102])
@@ -299,11 +301,13 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             observed_prefill_only.append(args[0].is_prefill_only)
             return tokens
 
-        worker._compiled_fused_steps = MagicMock(side_effect=compiled_fused_steps)
         reload_gate = MagicMock()
-        worker.draft_runner = SimpleNamespace(
-            compile_policy=SimpleNamespace(compiled_forward_shim=reload_gate)
+        compile_policy = SimpleNamespace(
+            compile_fused_draft_steps=MagicMock(return_value=compiled_fused_steps),
+            compiled_forward_shim=reload_gate,
         )
+        worker._compiled_fused_steps = None
+        worker.draft_runner = SimpleNamespace(compile_policy=compile_policy)
         worker.draft_attn_backend = SimpleNamespace(
             attn_backends=[
                 SimpleNamespace(
@@ -350,6 +354,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         self.assertEqual(observed_prefill_only, [False])
         self.assertTrue(forward_batch.is_prefill_only)
         reload_gate.wait_for_hicache_reload.assert_called_once_with()
+        compile_policy.compile_fused_draft_steps.assert_called_once_with(
+            worker._fused_draft_steps
+        )
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):

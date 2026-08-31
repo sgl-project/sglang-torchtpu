@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,6 +36,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import get_forward_context
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
@@ -159,6 +162,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self.speculative_algorithm = spec.speculative_algorithm
         self.speculative_eagle_topk = spec.speculative_eagle_topk or 1
         self.is_draft_worker = self.model_runner.is_draft_worker
+        self._draft_eager_backbone_forward: Callable[..., Any] | None = None
+        self._draft_eager_model_forward: Callable[..., Any] | None = None
+        self._draft_eager_logits_forward: Callable[..., Any] | None = None
 
         if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
             raise ValueError(
@@ -179,6 +185,112 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if self.is_draft_worker
             else 0
         )
+
+    def install(self) -> bool:
+        """Capture EAGLE's eager regions before the base policy replaces them."""
+        if self.is_draft_worker and self.owner is not None:
+            self._draft_eager_backbone_forward = self.owner.model.forward
+            self._draft_eager_model_forward = self.owner.forward
+            self._draft_eager_logits_forward = self.owner.logits_processor.forward
+        return super().install()
+
+    def compile_fused_draft_steps(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+        """Compile the multi-step EAGLE draft loop with the selected tracer."""
+        if self.tracer != "direct":
+            return torch.compile(
+                fn,
+                backend=self.backend or current_platform.get_compile_backend(),
+                fullgraph=False,
+                dynamic=False,
+            )
+        return self._direct_compile_fused_draft_steps(fn)
+
+    def _direct_compile_fused_draft_steps(
+        self, fn: Callable[..., Any]
+    ) -> Callable[..., Any]:
+        """Trace the complete EAGLE draft loop without nested compiled calls."""
+        if any(
+            value is None
+            for value in (
+                self._draft_eager_backbone_forward,
+                self._draft_eager_model_forward,
+                self._draft_eager_logits_forward,
+            )
+        ):
+            raise RuntimeError(
+                "Direct fused-draft compilation requires an installed draft "
+                "model compile policy"
+            )
+
+        from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+            direct_compile,
+        )
+
+        fn = torch.no_grad()(fn)
+        backbone = self.owner.model
+        logits_processor = self.owner.logits_processor
+
+        def trace_fused_draft(
+            attention_metadata: Any,
+            forward_batch: ForwardBatch,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            backend = get_forward_context().attn_backend
+            previous_metadata = backend.forward_metadata
+            previous_model_forward = self.owner.forward
+            previous_backbone_forward = backbone.forward
+            previous_logits_forward = logits_processor.forward
+            backend.forward_metadata = attention_metadata
+            # direct_compile executes this Python only while tracing. Restore
+            # the eager regions so the captured loop contains model, logits,
+            # sampling, and every draft step instead of trying to trace nested
+            # PJRT/Dynamo executable launches.
+            self.owner.forward = self._draft_eager_model_forward
+            backbone.forward = self._draft_eager_backbone_forward
+            logits_processor.forward = self._draft_eager_logits_forward
+            try:
+                return fn(forward_batch, *args, **kwargs)
+            finally:
+                logits_processor.forward = previous_logits_forward
+                backbone.forward = previous_backbone_forward
+                self.owner.forward = previous_model_forward
+                backend.forward_metadata = previous_metadata
+
+        def specialization_key(
+            _attention_metadata: Any,
+            forward_batch: ForwardBatch,
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> tuple[Any, ...]:
+            return (
+                forward_batch.forward_mode,
+                forward_batch.capture_hidden_mode,
+                forward_batch.batch_size,
+            )
+
+        compiled = direct_compile(
+            trace_fused_draft,
+            specialization_key=specialization_key,
+            model=self.model_runner.model,
+            model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
+            kv_pool=self.model_runner.token_to_kv_pool,
+            ignored_argnames=(
+                "forward_batch.sampling_info",
+                "forward_batch.orig_seq_lens",
+                "forward_batch.extend_input_logprob_token_ids_gpu",
+                "forward_batch.req_pool_indices_cpu",
+                "forward_batch.seq_lens_cpu",
+                *self._extra_ignored_argnames(),
+            ),
+        )
+
+        @functools.wraps(fn)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            backend = get_forward_context().attn_backend
+            return compiled(backend.forward_metadata, *args, **kwargs)
+
+        return call
 
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a draft forward before constructing attention metadata."""
@@ -893,7 +1005,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         """Build a warmup stub."""
         device = self.model_runner.device
         return EagleDraftInput(
-            bonus_tokens=torch.empty(0, device=device, dtype=torch.int32),
+            bonus_tokens=torch.empty(0, device=device, dtype=torch.int64),
             hidden_states=torch.empty(
                 (0, hidden_size), device=device, dtype=self.model_runner.dtype
             ),

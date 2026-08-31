@@ -284,6 +284,80 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         )
 
 
+class TestEagle3DirectCompile(_SpecPolicyTestCase):
+    def test_fused_draft_trace_temporarily_restores_eager_regions(self):
+        eager_backbone = MagicMock(name="eager_backbone")
+        eager_model = MagicMock(name="eager_model")
+        eager_logits = MagicMock(name="eager_logits")
+        compiled_backbone = MagicMock(name="compiled_backbone")
+        compiled_model = MagicMock(name="compiled_model")
+        compiled_logits = MagicMock(name="compiled_logits")
+        backbone = SimpleNamespace(forward=eager_backbone)
+        logits_processor = SimpleNamespace(forward=eager_logits)
+        model = SimpleNamespace(
+            model=backbone,
+            logits_processor=logits_processor,
+            forward=eager_model,
+        )
+        kv_pool = object()
+        model_runner = _spec_model_runner(is_draft_worker=True)
+        model_runner.model = model
+        model_runner.token_to_kv_pool = kv_pool
+        policy = SpecDecoderTpuCompilePolicy(
+            model_runner=model_runner,
+            owner=model,
+            tracer="direct",
+        )
+        with patch.object(
+            DecoderTpuCompilePolicy, "install", return_value=True
+        ) as base_install:
+            self.assertTrue(policy.install())
+        base_install.assert_called_once_with()
+
+        backbone.forward = compiled_backbone
+        model.forward = compiled_model
+        logits_processor.forward = compiled_logits
+
+        backend = SimpleNamespace(forward_metadata=object())
+        captured = {}
+
+        def fake_direct_compile(fn, **kwargs):
+            captured.update(fn=fn, kwargs=kwargs)
+            return fn
+
+        def fused_steps(forward_batch, value):
+            self.assertIs(model.forward, eager_model)
+            self.assertIs(backbone.forward, eager_backbone)
+            self.assertIs(logits_processor.forward, eager_logits)
+            self.assertIs(backend.forward_metadata, captured["trace_metadata"])
+            return (value + 1,)
+
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = fake_direct_compile
+
+        with (
+            patch.dict(sys.modules, {compile_module_name: compile_module}),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3.get_forward_context",
+                return_value=SimpleNamespace(attn_backend=backend),
+            ),
+        ):
+            compiled = policy._direct_compile_fused_draft_steps(fused_steps)
+            captured["trace_metadata"] = backend.forward_metadata
+            output = compiled(SimpleNamespace(), torch.tensor(1))
+
+        self.assertEqual(output[0].item(), 2)
+        self.assertIs(model.forward, compiled_model)
+        self.assertIs(backbone.forward, compiled_backbone)
+        self.assertIs(logits_processor.forward, compiled_logits)
+        self.assertIs(captured["kwargs"]["model"], model)
+        self.assertIs(captured["kwargs"]["kv_pool"], kv_pool)
+
+
 class TestLogitsOutputMode(_PolicyTestCase):
     def test_specialization_key_uses_selected_logits_mode(self):
         policy = _make_policy()

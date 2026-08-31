@@ -657,12 +657,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         steps_fn = self._compiled_fused_steps
         if steps_fn is None:
-            # Model forwards are already compiled; compile only the loop.
-            steps_fn = torch.compile(
-                self._fused_draft_steps,
-                backend="tpu",
-                fullgraph=False,
-                dynamic=False,
+            steps_fn = self.draft_runner.compile_policy.compile_fused_draft_steps(
+                self._fused_draft_steps
             )
             self._compiled_fused_steps = steps_fn
 
@@ -689,6 +685,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     hidden_states,
                     kv_lens_stack,
                     out_cache_loc,
+                    self.hot_token_id,
                 )
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
@@ -703,13 +700,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def _should_fuse_draft_steps(self) -> bool:
-        # The fused outer loop is a Dynamo graph around the compiled model
-        # forwards. The direct tracer deliberately bypasses Dynamo.
-        return (
-            _is_tpu
-            and self.speculative_num_steps > 1
-            and getattr(self.server_args, "tpu_compile_tracer", "dynamo") != "direct"
-        )
+        return _is_tpu and self.speculative_num_steps > 1
 
     def _fused_draft_steps(
         self,
@@ -719,6 +710,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         hidden_states: torch.Tensor,
         kv_lens_stack: torch.Tensor,
         out_cache_loc: torch.Tensor,
+        hot_token_id: torch.Tensor | None,
     ):
         """Run the compiled draft loop."""
         num_steps = self.speculative_num_steps
@@ -735,14 +727,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 break
 
             forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
-            forward_batch.spec_info.hidden_states.copy_(hidden_states)
+            if self.server_args.tpu_compile_tracer == "direct":
+                # direct_compile treats explicit inputs as immutable graph
+                # arguments. Rebind the traced ForwardBatch field instead of
+                # turning its hidden-state input into a deferred in-place op.
+                forward_batch.spec_info.hidden_states = hidden_states
+            else:
+                forward_batch.spec_info.hidden_states.copy_(hidden_states)
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
             logits_output = model.forward(input_ids, base_positions + i, forward_batch)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
+            if hot_token_id is not None:
+                topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
         return tokens
 
