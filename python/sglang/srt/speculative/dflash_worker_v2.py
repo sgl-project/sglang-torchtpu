@@ -251,6 +251,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
+        self.draft_model_runner._dflash_worker = self
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         draft_config = parse_dflash_draft_config(
@@ -394,23 +395,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             "update_mamba_state_after_mtp_verify",
         )
 
-    def init_cuda_graphs(self):
+    def _init_tpu_graphs(self) -> None:
+        """Initialize TPU draft graphs and precompile policies during warmup."""
+        target_model = self._target_worker.model_runner.model
+        if target_model.lm_head is None:
+            raise RuntimeError(
+                "Target model must have an lm_head for DFLASH TPU draft sampling."
+            )
+        self.draft_model.lm_head = target_model.lm_head
+        self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+        compile_policy = getattr(self.draft_model_runner, "compile_policy", None)
+        if compile_policy is not None:
+            compile_policy.precompile_draft(
+                self.draft_model_runner.attn_backend,
+                dflash_worker=self,
+            )
+
+    def init_cuda_graphs(self) -> None:
         if _is_tpu:
-            target_model = self._target_worker.model_runner.model
-            if target_model.lm_head is None:
-                raise RuntimeError(
-                    "Target model must have an lm_head for DFLASH TPU draft sampling."
-                )
-            self.draft_model.lm_head = target_model.lm_head
-            self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
-            if (
-                hasattr(self.draft_model_runner, "compile_policy")
-                and self.draft_model_runner.compile_policy is not None
-            ):
-                self.draft_model_runner.compile_policy.precompile_draft(
-                    self.draft_model_runner.attn_backend
-                )
-            return
+            return self._init_tpu_graphs()
 
         capture_decode_cuda_graph = (
             get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -1233,75 +1236,23 @@ class DFlashWorkerV2(BaseSpecWorker):
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
         only the live prefix rows without constructing masked/packed index tensors.
         """
-
         if target_hidden.numel() == 0:
             return
-        if target_hidden.ndim != 2:
-            raise ValueError(
-                "DFLASH target_hidden must be 2D, "
-                f"got shape={tuple(target_hidden.shape)}."
-            )
-        num_tokens = int(target_hidden.shape[0])
 
-        if cache_loc.ndim != 1:
-            raise ValueError(
-                f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
+        if _is_tpu:
+            return self.append_target_hidden_to_draft_kv_by_loc_tpu(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
             )
-        if positions.ndim != 1:
-            raise ValueError(
-                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+        target_hidden, cache_loc, positions, cache_loc_2d, commit_lens = (
+            self._append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
+                target_hidden, cache_loc, positions, cache_loc_2d, commit_lens
             )
-        if int(cache_loc.numel()) != num_tokens:
-            raise ValueError(
-                "DFLASH cache_loc length mismatch: "
-                f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
-            )
-        if int(positions.numel()) != num_tokens:
-            raise ValueError(
-                "DFLASH positions length mismatch: "
-                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
-            )
-        if cache_loc_2d is not None:
-            if cache_loc_2d.ndim != 2:
-                raise ValueError(
-                    "DFLASH cache_loc_2d must be 2D, "
-                    f"got shape={tuple(cache_loc_2d.shape)}."
-                )
-            if int(cache_loc_2d.numel()) != num_tokens:
-                raise ValueError(
-                    "DFLASH cache_loc_2d size mismatch: "
-                    f"cache_loc_2d={int(cache_loc_2d.numel())}, target_hidden={num_tokens}."
-                )
-            if commit_lens is None:
-                raise ValueError(
-                    "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
-                )
-
-        device = self.model_runner.device
-        if cache_loc.device != device:
-            cache_loc = cache_loc.to(device, non_blocking=True)
-        if positions.device != device:
-            positions = positions.to(device, non_blocking=True)
-        if target_hidden.device != device:
-            target_hidden = target_hidden.to(device, non_blocking=True)
-
-        if cache_loc.dtype != torch.int64:
-            cache_loc = cache_loc.to(torch.int64)
-        if positions.dtype != torch.int64:
-            positions = positions.to(torch.int64)
-        if cache_loc_2d is not None:
-            if cache_loc_2d.device != device:
-                cache_loc_2d = cache_loc_2d.to(device, non_blocking=True)
-            if cache_loc_2d.dtype != torch.int64:
-                cache_loc_2d = cache_loc_2d.to(torch.int64)
-        if commit_lens is not None:
-            if commit_lens.device != device:
-                commit_lens = commit_lens.to(device, non_blocking=True)
-            if commit_lens.dtype != torch.int32:
-                commit_lens = commit_lens.to(torch.int32)
-
-        grad_context = torch.no_grad if _is_tpu else torch.inference_mode
-        with grad_context():
+        )
+        with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
 
             if cache_loc_2d is not None:
@@ -1312,38 +1263,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                         f"cache_loc_2d={tuple(cache_loc_2d.shape)}, commit_lens={tuple(commit_lens.shape)}."
                     )
                 if bs == 0:
-                    return
-                if _is_tpu:
-                    row_offsets = torch.arange(
-                        cache_loc_2d.shape[1], device=cache_loc_2d.device
-                    )
-                    valid_mask = (
-                        row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
-                    ).reshape(-1)
-                    # Redirect uncommitted tokens to dummy slot 0 to maintain static shapes on TPU.
-                    safe_loc = torch.where(
-                        valid_mask,
-                        cache_loc_2d.reshape(-1),
-                        torch.zeros_like(cache_loc_2d.reshape(-1)),
-                    )
-                    for layer_idx, layer in enumerate(self.draft_model.layers):
-                        attn = layer.self_attn
-                        layer_ctx_hidden = (
-                            self.draft_model.prepare_context_hidden_for_kv(
-                                layer, ctx_hidden
-                            )
-                        )
-                        k, v = attn.kv_proj_only(layer_ctx_hidden)
-                        k = attn.apply_k_norm(k)
-                        k = attn.apply_k_rope(positions, k)
-                        k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-                        v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-                        self._write_layer_kv_tpu(
-                            layer_idx=layer_idx,
-                            loc=safe_loc,
-                            k=k,
-                            v=v,
-                        )
                     return
 
                 if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
@@ -1414,7 +1333,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
-        for layer_idx, layer in enumerate(self.draft_model.layers):
+        for layer in self.draft_model.layers:
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
@@ -1427,22 +1346,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            if _is_tpu:
-                self._write_layer_kv_tpu(
-                    layer_idx=layer_idx,
-                    loc=ctx_cache_loc,
-                    k=k,
-                    v=v,
-                )
-            else:
-                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
-                    attn.attn,
-                    ctx_cache_loc,
-                    k,
-                    v,
-                    attn.attn.k_scale,
-                    attn.attn.v_scale,
-                )
+            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                attn.attn,
+                ctx_cache_loc,
+                k,
+                v,
+                attn.attn.k_scale,
+                attn.attn.v_scale,
+            )
 
     def _append_target_hidden_fused(
         self,
@@ -1488,6 +1399,168 @@ class DFlashWorkerV2(BaseSpecWorker):
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
         )
+
+    def append_target_hidden_to_draft_kv_by_loc_tpu(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: torch.Tensor | None = None,
+        commit_lens: torch.Tensor | None = None,
+    ) -> None:
+        """Materialize target context features into the draft TPU KV buffer.
+
+        Args:
+          target_hidden: Context hidden states projected from the target model.
+          cache_loc: Flat 1D cache slot locations.
+          positions: Token position IDs.
+          cache_loc_2d: 2D padded cache slots [bs, max_len] during verify; None during prefill/extend.
+          commit_lens: Accept token counts [bs] during verify; None during prefill/extend.
+
+        Examples:
+          Prefill / Extend (cache_loc_2d and commit_lens are None):
+            target_hidden=(3605, 14400), ctx_hidden=(3605, 2880), positions=(3605,),
+            cache_loc=(3605,), cache_loc_2d=None, commit_lens=None
+
+          Verify / Decode (cache_loc_2d and commit_lens provided):
+            target_hidden=(10, 14400), ctx_hidden=(10, 2880), positions=(10,),
+            cache_loc=(10,), cache_loc_2d=(1, 10), commit_lens=(1,)
+        """
+        target_hidden, cache_loc, positions, cache_loc_2d, commit_lens = (
+            self._append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
+                target_hidden, cache_loc, positions, cache_loc_2d, commit_lens
+            )
+        )
+
+        with torch.no_grad():
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+
+            if cache_loc_2d is not None:
+                assert commit_lens is not None
+                bs = int(commit_lens.shape[0])
+                if int(cache_loc_2d.shape[0]) != bs:
+                    raise ValueError(
+                        "DFLASH cache_loc_2d batch size mismatch: "
+                        f"cache_loc_2d={tuple(cache_loc_2d.shape)},"
+                        f" commit_lens={tuple(commit_lens.shape)}."
+                    )
+                if bs == 0:
+                    return
+                row_offsets = torch.arange(
+                    cache_loc_2d.shape[1], device=cache_loc_2d.device
+                )
+                valid_mask = (
+                    row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+                ).reshape(-1)
+                cache_loc = torch.where(
+                    valid_mask,
+                    cache_loc_2d.reshape(-1),
+                    torch.zeros_like(cache_loc_2d.reshape(-1)),
+                )
+
+            self._append_target_hidden_sequential_tpu(
+                ctx_hidden=ctx_hidden,
+                ctx_positions=positions,
+                ctx_cache_loc=cache_loc,
+            )
+
+    def _append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
+        self,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: torch.Tensor | None = None,
+        commit_lens: torch.Tensor | None = None,
+    ):
+        if target_hidden.ndim != 2:
+            raise ValueError(
+                "DFLASH target_hidden must be 2D, "
+                f"got shape={tuple(target_hidden.shape)}."
+            )
+        num_tokens = int(target_hidden.shape[0])
+
+        if cache_loc.ndim != 1:
+            raise ValueError(
+                f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
+            )
+        if positions.ndim != 1:
+            raise ValueError(
+                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+            )
+        if int(cache_loc.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH cache_loc length mismatch: "
+                f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
+            )
+        if int(positions.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH positions length mismatch: "
+                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
+            )
+        if cache_loc_2d is not None:
+            if cache_loc_2d.ndim != 2:
+                raise ValueError(
+                    "DFLASH cache_loc_2d must be 2D, "
+                    f"got shape={tuple(cache_loc_2d.shape)}."
+                )
+            if int(cache_loc_2d.numel()) != num_tokens:
+                raise ValueError(
+                    "DFLASH cache_loc_2d size mismatch: "
+                    f"cache_loc_2d={int(cache_loc_2d.numel())}, target_hidden={num_tokens}."
+                )
+            if commit_lens is None:
+                raise ValueError(
+                    "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
+                )
+
+        device = self.model_runner.device
+        if cache_loc.device != device:
+            cache_loc = cache_loc.to(device, non_blocking=True)
+        if positions.device != device:
+            positions = positions.to(device, non_blocking=True)
+        if target_hidden.device != device:
+            target_hidden = target_hidden.to(device, non_blocking=True)
+
+        if cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+        if cache_loc_2d is not None:
+            if cache_loc_2d.device != device:
+                cache_loc_2d = cache_loc_2d.to(device, non_blocking=True)
+            if cache_loc_2d.dtype != torch.int64:
+                cache_loc_2d = cache_loc_2d.to(torch.int64)
+        if commit_lens is not None:
+            if commit_lens.device != device:
+                commit_lens = commit_lens.to(device, non_blocking=True)
+            if commit_lens.dtype != torch.int32:
+                commit_lens = commit_lens.to(torch.int32)
+        return (target_hidden, cache_loc, positions, cache_loc_2d, commit_lens)
+
+    def _append_target_hidden_sequential_tpu(
+        self,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        """Sequential 1D KV write for TPU draft model (prefill/extend)."""
+        for layer_idx, layer in enumerate(self.draft_model.layers):
+            attn = layer.self_attn
+            layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
+                layer, ctx_hidden
+            )
+            k, v = attn.kv_proj_only(layer_ctx_hidden)
+            k = attn.apply_k_norm(k)
+            k = attn.apply_k_rope(ctx_positions, k)
+            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            self._write_layer_kv_tpu(
+                layer_idx=layer_idx,
+                loc=ctx_cache_loc,
+                k=k,
+                v=v,
+            )
 
     def _update_target_mamba_state_after_verify(
         self,

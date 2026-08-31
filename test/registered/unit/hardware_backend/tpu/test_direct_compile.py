@@ -484,6 +484,80 @@ class TestDirectCompile(CustomTestCase):
         ):
             invalid(torch.ones(2), unexpected)
 
+    def test_mutation_only_function_compiles_without_output_leaves(self):
+        """Bug regression: the DFlash draft KV appender returns None and mutates
+        only the KV pool. An empty output-leaf list was rejected by the
+        must-be-TPU-tensor guard, aborting draft warmup."""
+        kv_pool = _KVPool(torch.zeros(2))
+        pool_input = kv_pool.value
+
+        def fn(*, value):
+            kv_pool.value.add_(value)
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda *, value: tuple(value.shape),
+            kv_pool=kv_pool,
+        )
+        pool_output = torch.full((2,), 5.0)
+
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ) as traverse,
+            patch.object(compiler, "execute", return_value=[pool_output]),
+        ):
+            output = compiled(value=torch.ones(2))
+
+        self.assertIsNone(output)
+        self.assertIs(kv_pool.value, pool_input)
+        self.assertTrue(torch.equal(kv_pool.value, pool_output))
+        self.assertEqual(len(traverse.call_args.args[0]), 1)
+
+    def test_rejects_function_with_neither_outputs_nor_mutations(self):
+        """Negative branch: without a KV pool, a fn returning None traces an
+        empty graph and must still be rejected."""
+        compiled = direct_compile.direct_compile(
+            lambda value: None,
+            specialization_key=lambda value: tuple(value.shape),
+        )
+
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                direct_compile.tpu_torch_compile,
+                "placeholder_like",
+                side_effect=lambda tensor: tensor.clone(),
+            ),
+            self.assertRaisesRegex(
+                TypeError, "TPU tensor outputs or KV-pool mutations"
+            ),
+        ):
+            compiled(torch.ones(2))
+
     def test_artifact_reports_runtime_tensor_structure_changes(self):
         value = torch.ones(2)
         artifact = _make_artifact(traced_shapes=((2,),))

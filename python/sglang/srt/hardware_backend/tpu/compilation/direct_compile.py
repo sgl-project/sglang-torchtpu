@@ -407,13 +407,19 @@ class CompiledFunction:
                 outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
 
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
-        if not output_leaves or not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
+        if not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
             raise TypeError("All direct_compile output leaves must be TPU tensors")
         result_tensors = output_leaves + kv_pool_trace_inputs
         # Forward hooks see Torch tensors here, not JAX values, and JAX export
         # cannot serialize host callbacks. Preserve callback values as extra
         # executable outputs, then invoke their Python callbacks after execute.
         result_tensors.extend(entry.tensor for entry in inserted_callbacks)
+        # A mutation-only fn (the DFlash draft KV appender) returns None and has
+        # no output leaves; the KV-pool copy-back is then the graph's only effect.
+        if not result_tensors:
+            raise TypeError(
+                "direct_compile requires TPU tensor outputs or KV-pool mutations"
+            )
 
         # Step 4: Finish lowering to MLIR, then compile it.
         logger.info(

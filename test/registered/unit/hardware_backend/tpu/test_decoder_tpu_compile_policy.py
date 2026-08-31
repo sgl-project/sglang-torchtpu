@@ -18,11 +18,18 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
+from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    CompiledForwardShim,
+)
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
     _materialize_out,
     _unpad_decoder_outputs,
+)
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
+    DFlashSpecDecoderTpuCompilePolicy,
+    _kv_appender_specialization_key,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
@@ -39,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -358,20 +366,23 @@ class TestInstallExtendCap(CustomTestCase):
         policy = DecoderTpuCompilePolicy(model_runner=model_runner, owner=model)
         policy.backend = "eager"
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "build_bucketers",
-            return_value=(t_bucketer, b_bucketer),
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "is_dp_attention_enabled",
-            return_value=dp_attention,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "torch.compile",
-            return_value=MagicMock(),
-        ), patch.object(
-            policy, "_install_dp_idle_as_decode"
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "build_bucketers",
+                return_value=(t_bucketer, b_bucketer),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=dp_attention,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "torch.compile",
+                return_value=MagicMock(),
+            ),
+            patch.object(policy, "_install_dp_idle_as_decode"),
         ):
             self.assertTrue(policy.install())
 
@@ -416,22 +427,26 @@ class TestInstallExtendCap(CustomTestCase):
         policy.backend = "eager"
         compiled_outer = MagicMock(name="compiled_outer")
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "build_bucketers",
-            return_value=(
-                Bucketer(name="Token", buckets=[64, 2048]),
-                Bucketer(name="Bs", buckets=[16, 32, 64]),
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "build_bucketers",
+                return_value=(
+                    Bucketer(name="Token", buckets=[64, 2048]),
+                    Bucketer(name="Bs", buckets=[16, 32, 64]),
+                ),
             ),
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "is_dp_attention_enabled",
-            return_value=False,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "torch.compile",
-            return_value=compiled_outer,
-        ) as compile_mock:
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "torch.compile",
+                return_value=compiled_outer,
+            ) as compile_mock,
+        ):
             self.assertTrue(policy.install())
 
         self.assertIs(model.model.forward, original_backbone)
@@ -470,22 +485,26 @@ class TestInstallExtendCap(CustomTestCase):
         compiled_backbone = MagicMock(name="compiled_backbone")
         compiled_logits = MagicMock(name="compiled_logits")
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "build_bucketers",
-            return_value=(
-                Bucketer(name="Token", buckets=[64, 2048]),
-                Bucketer(name="Bs", buckets=[16, 32, 64]),
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "build_bucketers",
+                return_value=(
+                    Bucketer(name="Token", buckets=[64, 2048]),
+                    Bucketer(name="Bs", buckets=[16, 32, 64]),
+                ),
             ),
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "is_dp_attention_enabled",
-            return_value=False,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "torch.compile",
-            side_effect=[compiled_backbone, compiled_logits],
-        ) as compile_mock:
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "torch.compile",
+                side_effect=[compiled_backbone, compiled_logits],
+            ) as compile_mock,
+        ):
             self.assertTrue(policy.install())
 
         self.assertEqual(compile_mock.call_count, 2)
@@ -519,22 +538,26 @@ class TestInstallExtendCap(CustomTestCase):
         policy.backend = "eager"
         compiled_model = MagicMock(name="compiled_model")
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "build_bucketers",
-            return_value=(
-                Bucketer(name="Token", buckets=[64, 2048]),
-                Bucketer(name="Bs", buckets=[16, 32, 64]),
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "build_bucketers",
+                return_value=(
+                    Bucketer(name="Token", buckets=[64, 2048]),
+                    Bucketer(name="Bs", buckets=[16, 32, 64]),
+                ),
             ),
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "is_dp_attention_enabled",
-            return_value=False,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "torch.compile",
-            return_value=compiled_model,
-        ) as compile_mock:
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "torch.compile",
+                return_value=compiled_model,
+            ) as compile_mock,
+        ):
             self.assertTrue(policy.install())
 
         self.assertEqual(compile_mock.call_count, 1)
@@ -570,11 +593,16 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
     def test_rejects_dp_attention_at_multimodal_install(self):
         policy = self._policy_for(multimodal=True)
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "is_dp_attention_enabled",
-            return_value=True,
-        ), self.assertRaisesRegex(NotImplementedError, "does not support DP attention"):
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                NotImplementedError, "does not support DP attention"
+            ),
+        ):
             policy.install()
 
     def test_allows_dp_attention_at_text_only_install(self):
@@ -582,13 +610,16 @@ class TestQwen3VLDecoderPolicy(CustomTestCase):
         # the VL machinery the DP restriction covers is reachable.
         policy = self._policy_for(multimodal=False)
 
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
-            "is_dp_attention_enabled",
-            return_value=True,
-        ), patch.object(
-            DecoderTpuCompilePolicy, "install", return_value=True
-        ) as base_install:
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
+        ):
             self.assertTrue(policy.install())
 
         base_install.assert_called_once()
@@ -794,8 +825,9 @@ class TestDpIdleDecodeMaterializationScope(CustomTestCase):
             spec_info=spec_info,
         )
 
-        with _dp_attention(True), patch(
-            _DECODER_POLICY + "_pad_forward_batch_inputs", return_value=(0, 0)
+        with (
+            _dp_attention(True),
+            patch(_DECODER_POLICY + "_pad_forward_batch_inputs", return_value=(0, 0)),
         ):
             policy.prepare_forward_batch(forward_batch)
 
@@ -822,8 +854,7 @@ class TestPrecompileLoops(CustomTestCase):
         policy = _make_distributed_top_k_policy()
 
         with patch(
-            "sglang.srt.hardware_backend.tpu.sampler."
-            "distributed_top_k_min_batch_size",
+            "sglang.srt.hardware_backend.tpu.sampler.distributed_top_k_min_batch_size",
             return_value=64,
         ):
             self.assertEqual(
@@ -977,13 +1008,16 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
         mr = _model_runner()
         policy = _make_policy(mr)
         cm = MagicMock()
-        with patch(
-            "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy.torch.no_grad",
-            return_value=cm,
-        ) as no_grad, patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "decoder_compile_policy.torch.inference_mode",
-            side_effect=AssertionError("inference_mode should not be used"),
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy.torch.no_grad",
+                return_value=cm,
+            ) as no_grad,
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.torch.inference_mode",
+                side_effect=AssertionError("inference_mode should not be used"),
+            ),
         ):
             policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         no_grad.assert_called_once_with()
@@ -1018,9 +1052,10 @@ class TestRunOneCallsCompiledForward(CustomTestCase):
             "torch_tpu._internal.sync": tt._internal.sync,
             "torch_tpu._internal.sync.sync": tt._internal.sync.sync,
         }
-        with patch.dict(sys.modules, stubs), patch(
-            "torch_tpu._internal.sync.sync.synchronize"
-        ) as sync:
+        with (
+            patch.dict(sys.modules, stubs),
+            patch("torch_tpu._internal.sync.sync.synchronize") as sync,
+        ):
             _materialize_out(
                 LogitsProcessorOutput(
                     next_token_logits=None,
@@ -1085,12 +1120,17 @@ def _make_spec_policy(
 ):
     if model_runner is None:
         model_runner = _spec_model_runner(**mr_kwargs)
-    return SpecDecoderTpuCompilePolicy(
+    policy = SpecDecoderTpuCompilePolicy(
         model_runner=model_runner,
         t_bucketer=Bucketer(name="Token", buckets=list(token_buckets)),
         b_bucketer=Bucketer(name="Bs", buckets=list(bs_buckets)),
         owner=model_runner.model,
     )
+    # install() normally creates this; these tests construct the policy directly.
+    policy.compiled_forward_shim = CompiledForwardShim(
+        model_runner.model.forward, policy=policy
+    )
+    return policy
 
 
 _SPEC_POLICY = (
@@ -1102,13 +1142,17 @@ _DECODER_POLICY = "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_p
 @contextlib.contextmanager
 def _dp_attention(enabled: bool, *, attn_tp_size: int = 1):
     """Override DP attention and its parallel width for policy tests."""
-    with patch(_SPEC_POLICY + "is_dp_attention_enabled", return_value=enabled), patch(
-        _DECODER_POLICY + "is_dp_attention_enabled", return_value=enabled
-    ), patch(
-        "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=enabled
-    ), patch(
-        _SPEC_POLICY + "get_parallel",
-        return_value=SimpleNamespace(attn_tp_size=attn_tp_size),
+    with (
+        patch(_SPEC_POLICY + "is_dp_attention_enabled", return_value=enabled),
+        patch(_DECODER_POLICY + "is_dp_attention_enabled", return_value=enabled),
+        patch(
+            "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+            return_value=enabled,
+        ),
+        patch(
+            _SPEC_POLICY + "get_parallel",
+            return_value=SimpleNamespace(attn_tp_size=attn_tp_size),
+        ),
     ):
         yield
 
@@ -1391,6 +1435,412 @@ class TestSpecDummyForwardBatch(CustomTestCase):
         req_to_token = mr.req_to_token_pool.req_to_token
         self.assertEqual(req_to_token[1, :4].tolist(), list(range(4, 8)))
         self.assertEqual(req_to_token[2, :4].tolist(), list(range(8, 12)))
+
+
+class TestDFlashCompilePolicy(CustomTestCase):
+    """Unit tests for DFlash compile policy KV append compilation, padding, and warmup."""
+
+    def _make_dflash_policy(
+        self,
+        token_buckets=(16, 64),
+        bs_buckets=(1, 4),
+        hidden_size=16,
+        target_hidden_size=32,
+        draft_token_num=4,
+        is_draft_worker=True,
+        tracer="dynamo",
+    ):
+        model = SimpleNamespace(
+            fc=SimpleNamespace(in_features=target_hidden_size),
+            forward=MagicMock(),
+            prepare_forward_batch=MagicMock(),
+            project_target_hidden=lambda h: h[:, :hidden_size],
+        )
+        model_runner = SimpleNamespace(
+            device="cpu",
+            dtype=torch.float32,
+            model=model,
+            attn_backend=_FakeAttnBackend(),
+            req_to_token_pool=SimpleNamespace(
+                size=16, req_to_token=torch.zeros(16, 4096, dtype=torch.int64)
+            ),
+            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_pages=torch.arange(4, dtype=torch.int32)
+            ),
+            model_config=SimpleNamespace(hidden_size=hidden_size),
+            is_draft_worker=is_draft_worker,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            server_args=SimpleNamespace(
+                speculative_num_draft_tokens=draft_token_num,
+                speculative_draft_model_path=None,
+                speculative_draft_model_revision=None,
+                speculative_num_steps=0,
+                speculative_algorithm="DFLASH",
+                page_size=1,
+                dp_size=1,
+                torch_compile_max_bs=4,
+                unsafe_save_torch_compile_bundle=None,
+                unsafe_load_torch_compile_bundle=None,
+            ),
+        )
+        t_bucketer = Bucketer(name="Token", buckets=list(token_buckets))
+        b_bucketer = Bucketer(name="Bs", buckets=list(bs_buckets))
+        policy = DFlashSpecDecoderTpuCompilePolicy(
+            model_runner=model_runner,
+            t_bucketer=t_bucketer,
+            b_bucketer=b_bucketer,
+            owner=model_runner.model,
+            tracer=tracer,
+        )
+        # install() normally creates this; these tests construct the policy directly.
+        policy.compiled_forward_shim = CompiledForwardShim(model.forward, policy=policy)
+        return policy, model_runner
+
+    def test_infer_dflash_block_size_from_server_args_and_fallback(self):
+        policy, mr = self._make_dflash_policy(draft_token_num=8)
+        self.assertEqual(policy.draft_token_num, 8)
+
+        mr.server_args.speculative_num_draft_tokens = None
+        mr.server_args.speculative_draft_model_path = None
+        new_policy = DFlashSpecDecoderTpuCompilePolicy(
+            model_runner=mr,
+            t_bucketer=policy.t_bucketer,
+            b_bucketer=policy.b_bucketer,
+            owner=mr.model,
+        )
+        self.assertEqual(new_policy.draft_token_num, 16)
+
+    def test_infer_dflash_hidden_sizes(self):
+        policy, mr = self._make_dflash_policy(
+            hidden_size=64, target_hidden_size=128, is_draft_worker=True
+        )
+        self.assertEqual(policy.dflash_hidden_size, 64)
+        self.assertEqual(policy.dflash_target_hidden_size, 128)
+
+        # Non-draft worker returns 0 for dflash_hidden_size.
+        non_draft_policy, _ = self._make_dflash_policy(is_draft_worker=False)
+        self.assertEqual(non_draft_policy.dflash_hidden_size, 0)
+        self.assertEqual(non_draft_policy._infer_dflash_hidden_size(), 0)
+
+        # Fallback when model has no fc layer.
+        mr.model = SimpleNamespace()
+        self.assertEqual(policy._infer_dflash_target_hidden_size(), 64)
+
+    def test_pad_append_target_hidden_tpu_prefill_extend(self):
+        policy, _ = self._make_dflash_policy(token_buckets=(16, 64))
+
+        # 10 tokens pad to next bucket 16.
+        target_hidden = torch.ones(10, 32)
+        cache_loc = torch.arange(10, dtype=torch.int64)
+        positions = torch.arange(10, dtype=torch.int64)
+        padded = policy.pad_append_target_hidden_tpu(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+        )
+        self.assertIsNotNone(padded)
+        p_target, p_loc, p_pos, p_loc2d, p_commit = padded
+        self.assertEqual(p_target.shape, (16, 32))
+        self.assertEqual(p_loc.shape, (16,))
+        self.assertEqual(p_pos.shape, (16,))
+        self.assertIsNone(p_loc2d)
+        self.assertIsNone(p_commit)
+
+        # Exact match (16 tokens) requires no padding.
+        target_hidden_16 = torch.ones(16, 32)
+        cache_loc_16 = torch.arange(16, dtype=torch.int64)
+        positions_16 = torch.arange(16, dtype=torch.int64)
+        padded_16 = policy.pad_append_target_hidden_tpu(
+            target_hidden=target_hidden_16,
+            cache_loc=cache_loc_16,
+            positions=positions_16,
+        )
+        self.assertIsNotNone(padded_16)
+        self.assertEqual(padded_16[0].shape, (16, 32))
+
+        # 0 tokens returns None.
+        empty = policy.pad_append_target_hidden_tpu(
+            target_hidden=torch.empty(0, 32),
+            cache_loc=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int64),
+        )
+        self.assertIsNone(empty)
+
+    def test_pad_append_target_hidden_tpu_verify_decode(self):
+        policy, _ = self._make_dflash_policy(
+            token_buckets=(16,), bs_buckets=(1, 4), draft_token_num=4
+        )
+
+        # bs=2 (8 tokens) pads to bs=4 (16 tokens).
+        bs, block_size = 2, 4
+        target_hidden = torch.ones(bs * block_size, 32)
+        cache_loc = torch.arange(bs * block_size, dtype=torch.int64)
+        positions = torch.arange(bs * block_size, dtype=torch.int64)
+        cache_loc_2d = torch.arange(bs * block_size, dtype=torch.int64).view(
+            bs, block_size
+        )
+        commit_lens = torch.tensor([3, 2], dtype=torch.int32)
+
+        padded = policy.pad_append_target_hidden_tpu(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+        self.assertIsNotNone(padded)
+        p_target, p_loc, p_pos, p_loc2d, p_commit = padded
+        self.assertEqual(p_target.shape, (16, 32))
+        self.assertEqual(p_loc.shape, (16,))
+        self.assertEqual(p_pos.shape, (16,))
+        self.assertEqual(p_loc2d.shape, (4, 4))
+        self.assertEqual(p_commit.shape, (4,))
+
+        # Empty batch (bs=0) returns None.
+        empty = policy.pad_append_target_hidden_tpu(
+            target_hidden=torch.empty(0, 32),
+            cache_loc=torch.empty(0, dtype=torch.int64),
+            positions=torch.empty(0, dtype=torch.int64),
+            cache_loc_2d=torch.empty(0, block_size, dtype=torch.int64),
+            commit_lens=torch.empty(0, dtype=torch.int32),
+        )
+        self.assertIsNone(empty)
+
+    def test_pad_append_target_hidden_tpu_verify_validation_errors(self):
+        policy, _ = self._make_dflash_policy(bs_buckets=(1, 4), draft_token_num=4)
+        target_hidden = torch.ones(8, 32)
+        cache_loc = torch.arange(8, dtype=torch.int64)
+        positions = torch.arange(8, dtype=torch.int64)
+        cache_loc_2d = torch.arange(8, dtype=torch.int64).view(2, 4)
+
+        # Missing commit_lens raises ValueError.
+        with self.assertRaisesRegex(ValueError, "requires commit_lens"):
+            policy.pad_append_target_hidden_tpu(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=None,
+            )
+
+        # Batch size mismatch raises ValueError.
+        mismatched_commit = torch.tensor([3, 2, 1], dtype=torch.int32)
+        with self.assertRaisesRegex(ValueError, "batch size mismatch"):
+            policy.pad_append_target_hidden_tpu(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=mismatched_commit,
+            )
+
+    def test_ensure_kv_appender_validation_and_compilation(self):
+        policy, _ = self._make_dflash_policy()
+        with self.assertRaisesRegex(ValueError, "cannot be None"):
+            policy._ensure_kv_appender(None)
+
+        worker = SimpleNamespace(
+            append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+        )
+        policy.backend = "eager"
+        policy._ensure_kv_appender(worker)
+        self.assertIsNotNone(policy._compiled_kv_appender)
+        self.assertEqual(
+            worker.append_target_hidden_to_draft_kv_by_loc_tpu,
+            policy.append_target_hidden_to_draft_kv_by_loc_tpu,
+        )
+
+    def test_ensure_kv_appender_honors_direct_tracer(self):
+        policy, mr = self._make_dflash_policy(tracer="direct")
+        worker = SimpleNamespace(
+            append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+        )
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
+            policy._ensure_kv_appender(worker)
+
+        compile_module.direct_compile.assert_called_once()
+        kwargs = compile_module.direct_compile.call_args.kwargs
+        self.assertIs(kwargs["model"], mr.model)
+        self.assertIs(kwargs["kv_pool"], mr.token_to_kv_pool)
+        self.assertIs(
+            policy._compiled_kv_appender, compile_module.direct_compile.return_value
+        )
+
+    def test_kv_appender_specialization_key_separates_verify_and_extend(self):
+        common = dict(
+            target_hidden=torch.zeros(8, 32),
+            cache_loc=torch.zeros(8, dtype=torch.int32),
+            positions=torch.zeros(8, dtype=torch.int64),
+        )
+        extend_key = _kv_appender_specialization_key(
+            **common, cache_loc_2d=None, commit_lens=None
+        )
+        verify_key = _kv_appender_specialization_key(
+            **common,
+            cache_loc_2d=torch.zeros(2, 4, dtype=torch.int32),
+            commit_lens=torch.zeros(2, dtype=torch.int32),
+        )
+        self.assertNotEqual(extend_key, verify_key)
+        self.assertEqual(
+            extend_key,
+            _kv_appender_specialization_key(
+                target_hidden=torch.ones(8, 32),
+                cache_loc=torch.ones(8, dtype=torch.int32),
+                positions=torch.ones(8, dtype=torch.int64),
+                cache_loc_2d=None,
+                commit_lens=None,
+            ),
+        )
+        self.assertNotEqual(
+            extend_key,
+            _kv_appender_specialization_key(
+                **{**common, "cache_loc": torch.zeros(8, dtype=torch.int64)},
+                cache_loc_2d=None,
+                commit_lens=None,
+            ),
+        )
+
+    def test_precompile_draft_replaces_worker_method_and_pads_extend(self):
+        policy, mr = self._make_dflash_policy(
+            token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
+        )
+        mock_append_kernel = MagicMock()
+        policy._compiled_kv_appender = mock_append_kernel
+        worker = SimpleNamespace(
+            draft_model=mr.model,
+            draft_model_runner=mr,
+            append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+        )
+
+        with get_parallel().override(tp_rank=1):
+            policy.precompile_draft(
+                draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
+            )
+
+        # Worker method was replaced with compiled policy method.
+        self.assertEqual(
+            worker.append_target_hidden_to_draft_kv_by_loc_tpu,
+            policy.append_target_hidden_to_draft_kv_by_loc_tpu,
+        )
+
+        # Extend call with 10 tokens pads to token bucket 16.
+        target_hidden = torch.ones(10, 32)
+        cache_loc = torch.arange(10, dtype=torch.int64)
+        positions = torch.arange(10, dtype=torch.int64)
+        worker.append_target_hidden_to_draft_kv_by_loc_tpu(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+        )
+        # 2 verify warmup calls + 2 extend warmup calls + 1 runtime call = 5 calls.
+        self.assertEqual(mock_append_kernel.call_count, 5)
+        kwargs = mock_append_kernel.call_args.kwargs
+        self.assertEqual(kwargs["target_hidden"].shape, (16, 32))
+        self.assertEqual(kwargs["positions"].shape, (16,))
+        self.assertEqual(kwargs["cache_loc"].shape, (16,))
+        self.assertIsNone(kwargs["cache_loc_2d"])
+        self.assertIsNone(kwargs["commit_lens"])
+
+    def test_precompile_draft_requires_worker(self):
+        policy, _ = self._make_dflash_policy()
+        with (
+            self.assertRaisesRegex(ValueError, "cannot be None"),
+            get_parallel().override(tp_rank=1),
+        ):
+            policy.precompile_draft(dflash_worker=None)
+
+    def test_precompile_draft_skipped_when_not_draft_worker(self):
+        policy, _ = self._make_dflash_policy(is_draft_worker=False)
+        worker = SimpleNamespace()
+        policy.precompile_draft(dflash_worker=worker)
+        self.assertIsNone(policy._compiled_kv_appender)
+
+    def test_verify_pads_by_batch_size(self):
+        policy, mr = self._make_dflash_policy(
+            token_buckets=(16,), bs_buckets=(1, 4), draft_token_num=4
+        )
+        mock_append_kernel = MagicMock()
+        policy._compiled_kv_appender = mock_append_kernel
+        worker = SimpleNamespace(
+            draft_model=mr.model,
+            draft_model_runner=mr,
+            append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+        )
+        policy._ensure_kv_appender(worker)
+
+        # Verify call with bs=2 (8 tokens) pads to bs=4 (16 tokens).
+        bs = 2
+        block_size = 4
+        target_hidden = torch.ones(bs * block_size, 32)
+        cache_loc = torch.arange(bs * block_size, dtype=torch.int64)
+        positions = torch.arange(bs * block_size, dtype=torch.int64)
+        cache_loc_2d = torch.arange(bs * block_size, dtype=torch.int64).view(
+            bs, block_size
+        )
+        commit_lens = torch.tensor([3, 2], dtype=torch.int32)
+
+        worker.append_target_hidden_to_draft_kv_by_loc_tpu(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
+        kwargs = mock_append_kernel.call_args.kwargs
+        self.assertEqual(kwargs["target_hidden"].shape, (16, 32))
+        self.assertEqual(kwargs["positions"].shape, (16,))
+        self.assertEqual(kwargs["cache_loc"].shape, (16,))
+        self.assertEqual(kwargs["cache_loc_2d"].shape, (4, 4))
+        self.assertEqual(kwargs["commit_lens"].shape, (4,))
+
+    def test_append_target_hidden_uncompiled_raises(self):
+        policy, _ = self._make_dflash_policy()
+        target_hidden = torch.ones(4, 32)
+        cache_loc = torch.arange(4, dtype=torch.int64)
+        positions = torch.arange(4, dtype=torch.int64)
+        with self.assertRaisesRegex(RuntimeError, "is not compiled"):
+            policy.append_target_hidden_to_draft_kv_by_loc_tpu(
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+            )
+
+    def test_make_null_and_verify_spec_info(self):
+        policy, _ = self._make_dflash_policy(draft_token_num=6)
+        null_info = policy.make_null_spec_info()
+        self.assertIsInstance(null_info, DFlashVerifyInput)
+        self.assertEqual(null_info.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertEqual(null_info.draft_token_num, 6)
+
+        verify_info = policy.make_verify_spec_info()
+        self.assertIsInstance(verify_info, DFlashVerifyInput)
+        self.assertEqual(verify_info.capture_hidden_mode, CaptureHiddenMode.FULL)
+        self.assertEqual(verify_info.draft_token_num, 6)
+
+    def test_make_dummy_forward_batch_draft_worker(self):
+        policy, _ = self._make_dflash_policy(
+            hidden_size=32, draft_token_num=4, is_draft_worker=True
+        )
+        spec_info = policy.make_null_spec_info()
+        fb = policy._make_dummy_forward_batch(
+            num_tokens=16,
+            bs=4,
+            mode=ForwardMode.TARGET_VERIFY,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            spec_info=spec_info,
+        )
+        self.assertEqual(fb.input_embeds.shape, (16, 32))
+        self.assertEqual(fb.extend_seq_lens.tolist(), [4] * 4)
+        self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
+        self.assertEqual(fb.extend_num_tokens, 16)
 
 
 class TestSpecDraftDecodePadding(CustomTestCase):
@@ -1957,11 +2407,13 @@ class TestSpecForwardBatchPreparation(CustomTestCase):
             is_extend_in_batch=False,
         )
 
-        with _dp_attention(True), patch(
-            "sglang.srt.layers.dp_attention.set_dp_buffer_len"
-        ) as set_buffer_len, patch(
-            "sglang.srt.layers.dp_attention.set_is_extend_in_batch"
-        ) as set_is_extend:
+        with (
+            _dp_attention(True),
+            patch("sglang.srt.layers.dp_attention.set_dp_buffer_len") as set_buffer_len,
+            patch(
+                "sglang.srt.layers.dp_attention.set_is_extend_in_batch"
+            ) as set_is_extend,
+        ):
             policy.refresh_fused_draft_dp_metadata(forward_batch)
 
         self.assertEqual(forward_batch.global_num_tokens_cpu, [8, 8])
@@ -2139,23 +2591,30 @@ def _serving_stubs():
         compiled_scaling_penalties,
     )
 
-    with patch.object(
-        repetition_penalty,
-        "apply_scaling_penalties",
-        eager_scaling_penalties,
-    ), patch("sglang.srt.speculative.eagle_utils._use_torch_native", True), patch(
-        "sglang.srt.distributed.get_tp_group",
-        return_value=SimpleNamespace(world_size=1),
-    ), patch(
-        "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
-        return_value=False,
-    ), patch(
-        "torch._dynamo.config.disable",
-        True,
-    ), get_context().override_server_args(
-        speculative_use_rejection_sampling=False,
-        speculative_accept_threshold_single=1.0,
-        speculative_accept_threshold_acc=1.0,
+    with (
+        patch.object(
+            repetition_penalty,
+            "apply_scaling_penalties",
+            eager_scaling_penalties,
+        ),
+        patch("sglang.srt.speculative.eagle_utils._use_torch_native", True),
+        patch(
+            "sglang.srt.distributed.get_tp_group",
+            return_value=SimpleNamespace(world_size=1),
+        ),
+        patch(
+            "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+            return_value=False,
+        ),
+        patch(
+            "torch._dynamo.config.disable",
+            True,
+        ),
+        get_context().override_server_args(
+            speculative_use_rejection_sampling=False,
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
+        ),
     ):
         yield
 

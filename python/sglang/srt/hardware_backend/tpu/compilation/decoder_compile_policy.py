@@ -786,6 +786,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             checker, model_label=model_label
         )
 
+    def snapshot_recompilation_baseline(self) -> None:
+        """Re-baseline the recompilation checker; no-op unless it is enabled."""
+        checker = self.compiled_forward_shim._recompilation_checker
+        if checker is not None:
+            checker.snapshot_baseline()
+
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
