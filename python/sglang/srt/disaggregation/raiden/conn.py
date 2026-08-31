@@ -247,10 +247,6 @@ class RaidenKVManager(CommonKVManager):
             # pushes still running, so the room counts as sent only after the
             # last one.
             self._reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = {}
-            # Page spans whose chunk plan this decode registered; the
-            # closing plan covers exactly the pages outside their union, so a
-            # chunk that lost its race anywhere in the range is not skipped.
-            self._reshard_covered: Dict[int, List[Tuple[int, int]]] = {}
             # Pages each decode declared for its closing push, from its
             # RESHARD_READY. The closing push moves exactly these.
             self._reshard_ready_pages: Dict[int, List[int]] = {}
@@ -296,6 +292,17 @@ class RaidenKVManager(CommonKVManager):
             # closing plan waits for them so completion never overtakes one.
             self._reshard_chunk_registering: Dict[int, Set[int]] = {}
             self._reshard_plans: Dict[int, Dict[str, int]] = {}
+            # Page spans whose chunk plan this decode registered; the closing
+            # plan covers exactly the pages outside their union, so a chunk
+            # that lost its race anywhere in the range is not skipped. Decode
+            # state: _on_reshard_chunk records the spans and
+            # _register_receiver_and_signal takes their complement. It used to
+            # be declared in the prefill branch above, where neither reader
+            # could see it -- the decode died with "object has no attribute
+            # '_reshard_covered'" the first time a resharding room announced a
+            # chunk. Nothing caught it because until now no CI run reached the
+            # decode-side chunked reshard path at all.
+            self._reshard_covered: Dict[int, List[Tuple[int, int]]] = {}
             self._uuid_seq = 0
 
         # Asymmetric-TP resharding state, populated lazily on the push path.
@@ -324,6 +331,10 @@ class RaidenKVManager(CommonKVManager):
         else:
             # room -> {src_prefill_rank: prefill_block_ids} and per-room meta.
             self._reshard_sources: Dict[int, Dict[int, List[int]]] = {}
+            # Same shape for the sliding-window pool: src_rank -> its SWA pages.
+            # A hybrid model's window is only settled when the prefill ends, so
+            # these arrive once, on the closing RESHARD_BLOCKS, never per chunk.
+            self._reshard_swa_sources: Dict[int, Dict[int, List[int]]] = {}
             self._reshard_meta: Dict[int, dict] = {}
             self._reshard_registered: Set[int] = set()
         self._listener = threading.Thread(target=self._listen, daemon=True)
@@ -331,17 +342,31 @@ class RaidenKVManager(CommonKVManager):
 
     # ----- resharding geometry / host-slot helpers --------------------------
 
-    def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int):
+    def _make_geometry(self, src_attn_tp: int, dst_attn_tp: int, *, swa: bool = False):
         """ReshardGeometry for a (src_attn_tp -> dst_attn_tp) transfer, sized from
         the local fused KV tensor (the K+V head-pair granule matches on both
         sides) and the global kv-head count.
+
+        ``swa`` sizes it from the sliding-window sub-pool instead. Its layers
+        carry the same kv-head count as the full pool -- windowing bounds how
+        many tokens are kept, not how the heads are sharded -- so only the
+        head-pair granule is read from the other tensor, and the head-slice math
+        is identical. Taking it from the SWA tensor rather than assuming it
+        matches keeps the two pools free to differ in dtype or head_dim.
         """
         from sglang.srt.disaggregation.raiden.reshard_schedule import (
             ReshardGeometry,
             head_pair_bytes,
         )
 
-        tensor = self._kv_caches[0]
+        tensors = self._swa_kv_caches if swa else self._kv_caches
+        if not tensors:
+            raise RuntimeError(
+                "Raiden has no "
+                + ("sliding-window" if swa else "full-attention")
+                + " KV tensors to build a reshard geometry from"
+            )
+        tensor = tensors[0]
         hp = head_pair_bytes(tensor)
         # Distinct model kv-head count (model_config.get_total_num_kv_heads()),
         # set on both the prefill and decode KVArgs.
@@ -1203,12 +1228,6 @@ class RaidenKVManager(CommonKVManager):
         bootstrap_infos: List[dict],
     ) -> None:
         if len(bootstrap_infos) != 1:
-            if self._swa_engine is not None:
-                raise NotImplementedError(
-                    "Raiden cannot reshard hybrid SWA KV caches: decode rank "
-                    f"received {len(bootstrap_infos)} prefill sources. Use "
-                    "symmetric attention TP for prefill and decode."
-                )
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
             # head-slice strided into the wider decode block. The plan stages
@@ -1223,12 +1242,16 @@ class RaidenKVManager(CommonKVManager):
                 )
             if not local_blocks:
                 # Full prefix-cache hit: decode already holds every page,
-                # nothing to receive.
+                # nothing to receive. A hybrid model's sliding-window pages sit
+                # inside that prefix, so its engine has nothing to receive
+                # either -- mark both so is_recv_done can settle.
                 with self._state_lock:
                     self._completed_recv.add(str(room))
+                    if self._swa_engine is not None:
+                        self._completed_recv.add(self._swa_req_id(room))
                 return
             self._register_reshard_request(
-                room, local_blocks, aux_index, bootstrap_infos
+                room, local_blocks, local_swa_blocks, aux_index, bootstrap_infos
             )
             self.update_status(room, KVPoll.WaitingForInput)
             return
@@ -1307,13 +1330,19 @@ class RaidenKVManager(CommonKVManager):
         """Drops a receiver plan whose push has settled.
 
         Raiden drops a timed-out plan itself, so one it no longer knows has
-        already been dropped.
+        already been dropped -- which is also why this can sweep both engines
+        unconditionally: a hybrid room registers the same uuid on each, and on
+        an engine that never held it the drop is the same no-op as for a plan
+        raiden already reaped.
         """
-        try:
-            self._engine.unregister_active_plan(uuid)
-        except RuntimeError as e:
-            if "not registered" not in str(e):
-                raise
+        for engine in (self._engine, self._swa_engine):
+            if engine is None:
+                continue
+            try:
+                engine.unregister_active_plan(uuid)
+            except RuntimeError as e:
+                if "not registered" not in str(e):
+                    raise
 
     def _reap_stale_plan(self, uuid: int, room: int, fut) -> None:
         """Waits out a parked plan's copy, then drops the plan.
@@ -1548,6 +1577,7 @@ class RaidenKVManager(CommonKVManager):
         self,
         room: int,
         local_blocks: List[int],
+        local_swa_blocks: List[int],
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
@@ -1558,18 +1588,26 @@ class RaidenKVManager(CommonKVManager):
         r = self.kv_args.engine_rank % self.attn_tp_size
         source_ranks = list(range(r * ratio, (r + 1) * ratio))
         push_endpoint = self._ensure_engine().transfer_address
+        # A hybrid model's sliding-window pool is a second block-id space on a
+        # second engine, so it needs its own destination pages and its own push
+        # target; both ride here rather than in a second handshake.
+        swa_push_endpoint = (
+            self._swa_engine.transfer_address if self._swa_engine is not None else ""
+        )
         ready_endpoints = [
             f"tcp://{info['rank_ip']}:{info['rank_port']}" for info in bootstrap_infos
         ]
         with self._state_lock:
             self._reshard_meta[room] = dict(
                 local_blocks=list(local_blocks),
+                local_swa_blocks=list(local_swa_blocks or []),
                 source_ranks=list(source_ranks),
                 src_attn_tp=int(src_attn_tp),
                 aux_index=aux_index,
                 ready_endpoints=ready_endpoints,
             )
             self._reshard_sources[room] = {}
+            self._reshard_swa_sources[room] = {}
             if aux_index is not None:
                 self._decode_aux_index[room] = aux_index
         payload = [
@@ -1580,19 +1618,23 @@ class RaidenKVManager(CommonKVManager):
             push_endpoint.encode("ascii"),
             pack_ints(list(local_blocks)),
             str(self.attn_tp_size).encode("ascii"),
+            pack_ints(list(local_swa_blocks or [])),
+            swa_push_endpoint.encode("ascii"),
         ]
         for info in bootstrap_infos:
             endpoint = f"tcp://{info['rank_ip']}:{info['rank_port']}"
             self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_REQ, 7)
+        self._require_frames(msg, MessageTag.RESHARD_REQ, 9)
         room = int(msg[1].decode("ascii"))
         decode_ip = msg[2].decode("ascii")
         decode_port = int(msg[3].decode("ascii"))
         push_endpoint = msg[4].decode("ascii")
         decode_blocks = unpack_ints(msg[5])
         dst_attn_tp = int(msg[6].decode("ascii"))
+        decode_swa_blocks = unpack_ints(msg[7])
+        swa_push_endpoint = msg[8].decode("ascii")
         with self._state_lock:
             if room in self._aborted:
                 return
@@ -1601,6 +1643,8 @@ class RaidenKVManager(CommonKVManager):
                 push_endpoint=push_endpoint,
                 decode_blocks=decode_blocks,
                 dst_attn_tp=dst_attn_tp,
+                decode_swa_blocks=decode_swa_blocks,
+                swa_push_endpoint=swa_push_endpoint,
             )
             held = self._held_chunks.pop(room, [])
             total_pages = self._send_total.get(room, 0)
@@ -1692,6 +1736,10 @@ class RaidenKVManager(CommonKVManager):
                 return
             addr = self._reshard_req[room]["reply_addr"]
             blocks = list(self._send_blocks.get(room, []))
+            # The sliding-window pages are settled by the time this reply is
+            # owed (it is sent once the send accumulation is finalized), so the
+            # closing push can carry them; earlier chunks never do.
+            swa_blocks = list(self._send_swa_blocks.get(room, []))
             aux_blob = self._send_aux.get(room, b"")
         with self._announce_lock:
             with self._state_lock:
@@ -1707,6 +1755,7 @@ class RaidenKVManager(CommonKVManager):
                 pack_ints(blocks),
                 str(self._local_rank).encode("ascii"),
                 aux_blob,
+                pack_ints(swa_blocks),
             ]
             self._send_multipart_locked(endpoint, payload)
 
@@ -1830,17 +1879,21 @@ class RaidenKVManager(CommonKVManager):
         return (start, start + length)
 
     def _on_reshard_blocks(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 5)
+        self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 6)
         room = int(msg[1].decode("ascii"))
         prefill_blocks = unpack_ints(msg[2])
         src_rank = int(msg[3].decode("ascii"))
         aux_blob = msg[4]
+        prefill_swa_blocks = unpack_ints(msg[5])
         ready = False
         aux_index = None
         with self._state_lock:
             if room not in self._reshard_meta or room in self._aborted:
                 return
             self._reshard_sources[room][src_rank] = prefill_blocks
+            self._reshard_swa_sources.setdefault(room, {})[
+                src_rank
+            ] = prefill_swa_blocks
             aux_index = self._reshard_meta[room].get("aux_index")
             src_attn_tp = self._reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._reshard_sources[room]}
@@ -1941,6 +1994,106 @@ class RaidenKVManager(CommonKVManager):
         self._unregister_plan(uuid)
         return False
 
+    def _register_reshard_swa_receiver(
+        self,
+        room: int,
+        src_attn_tp: int,
+        local_swa_blocks: List[int],
+        swa_sources_map: Dict[int, List[int]],
+    ) -> bool:
+        """Arm the sliding-window receive of a resharded room. True to continue.
+
+        Non-hybrid models have no second engine and skip this. The window is
+        whole -- it is settled only when the prefill ends, so it never chunks
+        and always travels with the closing push -- which is why this plan is
+        built once from the full SWA page list rather than a complement.
+
+        Pages pair by token order: both sides derive them from ``StateType.SWA``
+        over the same window, so the lists must be the same length. They can be
+        shorter on the decode after a prefix hit, in which case the tail pairs,
+        matching what the non-chunked full path does.
+        """
+        if self._swa_engine is None:
+            return True
+        if not local_swa_blocks:
+            # Let is_recv_done settle -- but this side has a window engine, so a
+            # room with no window pages to place means the two sides disagree
+            # about the model being hybrid. See the matching note on the push.
+            logger.warning(
+                "RaidenKVManager rank%d raiden reshard SWA receive SKIPPED "
+                "room=%s -- no local window pages, the window will not arrive",
+                self.attn_tp_rank,
+                room,
+            )
+            with self._state_lock:
+                self._completed_recv.add(self._swa_req_id(room))
+            return True
+
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            build_receiver_request,
+        )
+
+        n = len(local_swa_blocks)
+        sources: List[Tuple[int, List[int]]] = []
+        for p_rank in sorted(swa_sources_map):
+            pages = swa_sources_map[p_rank]
+            if len(pages) < n:
+                reason = (
+                    f"Raiden reshard SWA receive: source rank {p_rank} sent "
+                    f"{len(pages)} sliding-window pages, decode needs {n}"
+                )
+                logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+                with self._state_lock:
+                    self._failed.add(str(room))
+                    self.record_failure(room, reason)
+                return False
+            sources.append((p_rank, pages[-n:]))
+
+        geom = self._make_geometry(src_attn_tp, self.attn_tp_size, swa=True)
+        req = build_receiver_request(
+            pb2,
+            uuid=room,
+            req_id=self._swa_req_id(room),
+            peer=self._swa_engine.transfer_address,
+            decode_rank=self.attn_tp_rank,
+            geom=geom,
+            sources=sources,
+            dst_block_ids=local_swa_blocks,
+            live_tokens=[self.kv_args.page_size] * n,
+        )
+        try:
+            self._swa_engine.register_active_plan(room, req, is_sender=False)
+        except Exception as e:
+            reason = f"Raiden reshard SWA receive: cannot stage plan {room}: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                if room not in self._reshard_meta:
+                    return False
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
+            return False
+        with self._state_lock:
+            if room not in self._reshard_meta or room in self._aborted:
+                # Cleared while registering; drop the plan again so the pages
+                # cannot be written under their next owner.
+                self._unregister_plan(room)
+                return False
+            self._reshard_plans.setdefault(room, {})[self._swa_req_id(room)] = room
+        # INFO for the same reason as the push: without it a skipped window and
+        # a transferred one produce identical logs.
+        logger.info(
+            "raiden reshard SWA receive room=%s decode_rank=%d sources=%d "
+            "pages=%d layers=%d",
+            room,
+            self.attn_tp_rank,
+            len(sources),
+            n,
+            len(self._swa_kv_caches),
+        )
+        return True
+
     def _register_receiver_and_signal(self, room: int) -> None:
         from tpu_sync.rpc import raiden_service_pb2 as pb2
 
@@ -1954,9 +2107,20 @@ class RaidenKVManager(CommonKVManager):
             self._reshard_registered.add(room)
             meta = self._reshard_meta[room]
             local_blocks = list(meta["local_blocks"])
+            local_swa_blocks = list(meta.get("local_swa_blocks") or [])
             src_attn_tp = meta["src_attn_tp"]
             ready_endpoints = list(meta["ready_endpoints"])
             sources_map = dict(self._reshard_sources[room])
+            swa_sources_map = dict(self._reshard_swa_sources.get(room, {}))
+
+        # Arm the sliding-window receive before the READY goes out: the READY is
+        # what tells every source to push, and its closing push carries the SWA
+        # pages, so the second engine's plan has to be registered by then. A
+        # failure here fails the room, so no READY is sent either way.
+        if not self._register_reshard_swa_receiver(
+            room, src_attn_tp, local_swa_blocks, swa_sources_map
+        ):
+            return
 
         geom = self._make_geometry(src_attn_tp, self.attn_tp_size)
         n = len(local_blocks)
@@ -2111,6 +2275,142 @@ class RaidenKVManager(CommonKVManager):
                     ):
                         self._completed_send.add(str(room))
 
+    def _run_reshard_swa_push(
+        self, room: int, req_meta: dict, swa_blocks: List[int]
+    ) -> None:
+        """Push a resharded room's sliding-window pages on the second engine.
+
+        Mirrors the full-attention closing push: stage D2H, then one push per
+        SWA layer so the receiver's ``blocks * layers`` barrier completes. The
+        window is whole and unchunked, so this runs exactly once per room.
+
+        Marks the window sent on any outcome the room cannot recover from --
+        a raiden failure is reported through ``_failed``, and leaving
+        ``swa:<room>`` absent instead would hang ``is_send_done`` forever.
+        """
+        if self._swa_engine is None:
+            return
+        swa_req_id = self._swa_req_id(room)
+        decode_swa_blocks = list(req_meta.get("decode_swa_blocks") or [])
+        swa_push_endpoint = req_meta.get("swa_push_endpoint") or ""
+        n = len(decode_swa_blocks)
+        if not n or not swa_blocks or not swa_push_endpoint:
+            # Settle so the room is not held open on a transfer that will never
+            # be issued -- but say so. This side has a window engine, so a room
+            # arriving here with no window pages or no peer endpoint means the
+            # two sides disagree about the model being hybrid. Silence would let
+            # the run go green having moved only the full-attention KV, which
+            # accuracy alone may not catch.
+            logger.warning(
+                "RaidenKVManager rank%d raiden reshard SWA push SKIPPED room=%s "
+                "decode_pages=%d local_pages=%d peer=%r -- the window was not "
+                "transferred",
+                self.attn_tp_rank,
+                room,
+                n,
+                len(swa_blocks),
+                swa_push_endpoint,
+            )
+            with self._state_lock:
+                self._completed_send.add(swa_req_id)
+            return
+        if len(swa_blocks) > n:
+            # Decode kept fewer window pages (prefix hit); pair the tail, as the
+            # non-chunked full path does.
+            swa_blocks = swa_blocks[-n:]
+        elif len(swa_blocks) < n:
+            reason = (
+                f"Raiden reshard SWA push: prefill has {len(swa_blocks)} "
+                f"sliding-window pages, decode expects {n}"
+            )
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+                self._completed_send.add(swa_req_id)
+                self.record_failure(room, reason)
+            return
+
+        from tpu_sync.rpc import raiden_service_pb2 as pb2
+
+        from sglang.srt.disaggregation.raiden.reshard_schedule import (
+            build_sender_request,
+        )
+
+        geom = self._make_geometry(self.attn_tp_size, req_meta["dst_attn_tp"], swa=True)
+        req = build_sender_request(
+            pb2,
+            uuid=room,
+            req_id=swa_req_id,
+            peer=swa_push_endpoint,
+            prefill_rank=self.attn_tp_rank,
+            decode_rank=self.attn_tp_rank // geom.ratio,
+            geom=geom,
+            src_block_ids=swa_blocks,
+            dst_block_ids=decode_swa_blocks,
+            live_tokens=[self.kv_args.page_size] * n,
+        )
+        engine = self._swa_engine
+        fut = None
+        try:
+            engine.register_active_plan(room, req, is_sender=True)
+            host_blocks = engine.plan_host_blocks(room, swa_blocks)
+            fut = engine.d2h(swa_blocks, host_blocks, [1] * len(swa_blocks))
+            deadline = self._monotonic() + self._timeout_s
+            while fut is not None and not fut.is_ready():
+                if self._monotonic() > deadline:
+                    raise TimeoutError(
+                        f"raiden reshard SWA D2H stage for room {room} timed out"
+                    )
+                time.sleep(0.0005)
+            if fut is not None and not fut.ok():
+                raise RuntimeError(
+                    f"raiden reshard SWA D2H stage for room {room} failed: "
+                    f"{fut.error_message()}"
+                )
+            with self._reshard_push_lock:
+                for layer_idx in range(len(self._swa_kv_caches)):
+                    engine.push_registered_plan(
+                        room,
+                        swa_push_endpoint,
+                        swa_blocks,
+                        decode_swa_blocks,
+                        layer_idx,
+                    )
+            # INFO, not debug: this is the only evidence the window actually
+            # crossed. Everything else about a hybrid reshard looks identical
+            # whether or not it did, and the integration test greps for it.
+            logger.info(
+                "raiden reshard SWA pushed room=%s prefill_rank=%d decode_rank=%d "
+                "pages=%d layers=%d peer=%s",
+                room,
+                self.attn_tp_rank,
+                self.attn_tp_rank // geom.ratio,
+                n,
+                len(self._swa_kv_caches),
+                swa_push_endpoint,
+            )
+        except Exception as e:
+            reason = f"Raiden reshard SWA push for room {room} failed: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._failed.add(str(room))
+                self.record_failure(room, reason)
+        finally:
+            if fut is not None and not fut.is_ready():
+                with self._state_lock:
+                    self._stale_plans.append((room, room, fut))
+                threading.Thread(
+                    target=self._reap_stale_plan, args=(room, room, fut), daemon=True
+                ).start()
+            else:
+                try:
+                    engine.unregister_active_plan(room)
+                except RuntimeError as e:
+                    if "not registered" not in str(e):
+                        raise
+            with self._state_lock:
+                self._completed_send.add(swa_req_id)
+
     def _run_reshard_push(
         self, room: int, chunk: Optional[int] = None, uuid: Optional[int] = None
     ) -> None:
@@ -2127,10 +2427,19 @@ class RaidenKVManager(CommonKVManager):
             if chunk is None:
                 prefill_blocks = list(self._send_blocks[room])
                 ready_pages = list(self._reshard_ready_pages.get(room, []))
+                swa_blocks = list(self._send_swa_blocks.get(room, []))
                 start = 0
             else:
                 start, prefill_blocks = self._reshard_chunks[room].pop(chunk)
             total_pages = self._send_total.get(room, len(prefill_blocks))
+
+        # The window rides on the closing push only, and has to go out even when
+        # the closing full-attention push has nothing left to move: chunks can
+        # already cover every full page, and the window is never chunked, so
+        # returning early below would strand it and is_send_done would never
+        # settle.
+        if chunk is None:
+            self._run_reshard_swa_push(room, req_meta, swa_blocks)
 
         decode_blocks = req_meta["decode_blocks"]
         dst_attn_tp = req_meta["dst_attn_tp"]
@@ -2386,6 +2695,7 @@ class RaidenKVManager(CommonKVManager):
                 getattr(self, "_reshard_req", None),
                 getattr(self, "_reshard_meta", None),
                 getattr(self, "_reshard_sources", None),
+                getattr(self, "_reshard_swa_sources", None),
             ):
                 if d is not None:
                     d.pop(room, None)

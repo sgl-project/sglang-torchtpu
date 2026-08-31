@@ -128,6 +128,14 @@ ROLE_DECODE = "decode"
 # engaged even if the probe below were to pass on the device tier alone.
 RAIDEN_READY_MARKER = "Raiden KV transfer ready"
 
+# Emitted by RaidenKVManager once per room when a hybrid model's sliding-window
+# pool is actually pushed across the reshard. A hybrid model whose window never
+# transferred still answers -- the full-attention layers carry most of the
+# signal -- so accuracy alone does not catch it; gsm8k cleared its floor by 27
+# points on the first green run, which is ample room for a silently missing
+# window to hide in. This marker is the direct evidence.
+RAIDEN_SWA_RESHARD_MARKER = "raiden reshard SWA pushed"
+
 PREFILL_LOG = "/tmp/pd_prefill.log"
 DECODE_LOG = "/tmp/pd_decode.log"
 LB_LOG = "/tmp/pd_lb.log"
@@ -153,6 +161,10 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     # Appended after the launcher's default so it wins (argparse keeps the
     # last occurrence).
     disagg_transfer_backend: str = "raiden"
+    # Two KV pools with distinct page-id spaces, so raiden runs a second engine
+    # over the sliding-window one and the reshard has to move both. Gates the
+    # window-transfer assertion below; a single-pool model has nothing to check.
+    hybrid_swa: bool = False
     extra_server_args: Tuple[str, ...] = ()
     extra_launch_env: Dict[str, str] = {}
     reasoning_effort: Optional[str] = None
@@ -181,6 +193,7 @@ MODEL_PROFILES = {
         max_total_tokens=786_432,
         device_pool_tokens_hint=786_432,
         gsm8k_threshold=0.72,
+        hybrid_swa=True,
         extra_server_args=("--reasoning-parser", "gpt-oss"),
         # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
         # (dynamic token dim in the extend graph).
@@ -363,6 +376,13 @@ def _common_launch_env(
         "QUANTIZATION": profile.quantization,
         "KV_CACHE_DTYPE": profile.kv_cache_dtype,
         "DISABLE_RADIX_CACHE": "0",
+        # Raiden gives rank r the control port base + 4*r, so the default base
+        # of 30000 puts rank 0 exactly on PREFILL_PORT/DECODE_PORT. The engine
+        # binds first, then uvicorn fails with "[Errno 98] address already in
+        # use", shuts the app down and takes the process tree with it -- the
+        # server never becomes healthy and no transfer is ever attempted. Every
+        # other P/D test already moves the base to 31000; this one did not.
+        "SGLANG_RAIDEN_KV_PORT": values.get("SGLANG_RAIDEN_KV_PORT", "31000"),
         "ENABLE_TORCH_COMPILE": values.get("ENABLE_TORCH_COMPILE", "1"),
         "TORCH_COMPILE_MAX_BS": values.get("TORCH_COMPILE_MAX_BS", "8"),
         "TPU_ENABLE_DIAGNOSTIC_COORDINATOR": "0",
@@ -811,6 +831,40 @@ class TestPdTpResharding(unittest.TestCase):
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
 
+    def test_03_sliding_window_crossed_the_reshard(self) -> None:
+        """A hybrid model's window must actually be resharded, not just its
+        full-attention pool.
+
+        The two pools are separate engines with separate page-id spaces, and the
+        window one can be skipped without any request failing: the
+        full-attention layers still carry most of the signal, so the model keeps
+        answering. Accuracy is a weak detector of that -- the first green run
+        cleared its floor by 27 points -- and the push path marks the window
+        settled when it skips, so completion does not catch it either. Assert
+        the transfer directly instead. Runs after the probe and gsm8k, so the
+        leader has driven real traffic through prefill -> decode by now.
+        """
+        if not self.profile.hybrid_swa:
+            self.skipTest(f"{self.profile.key} has a single KV pool")
+        with open(PREFILL_LOG, "r", errors="replace") as f:
+            log = f.read()
+        self.assertIn(
+            RAIDEN_SWA_RESHARD_MARKER,
+            log,
+            f"{self.profile.display_name} is hybrid, but no sliding-window "
+            f"reshard push was logged in {PREFILL_LOG} -- the window did not "
+            "cross, so the decode attended over whatever its window pool "
+            "already held. Grep the log for 'SWA push SKIPPED' for the reason.",
+        )
+        pushes = log.count(RAIDEN_SWA_RESHARD_MARKER)
+        skipped = log.count("raiden reshard SWA push SKIPPED")
+        print(f"[leader] sliding-window reshard pushes={pushes} skipped={skipped}")
+        self.assertEqual(
+            skipped,
+            0,
+            f"{skipped} room(s) skipped the sliding-window reshard push",
+        )
+
 
 # ------------------------------ worker serving -------------------------------
 
@@ -942,6 +996,20 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
     def test_gpt_oss_does_not_force_quantization(self) -> None:
         env = build_prefill_env(MODEL_PROFILES["gpt_oss_120b"], 2, env={})
         self.assertEqual(env["QUANTIZATION"], "")
+
+    def test_raiden_port_does_not_collide_with_service_ports(self) -> None:
+        """Raiden binds base + 4*rank per rank, so a base of 30000 puts rank 0
+        on the HTTP port and uvicorn dies with EADDRINUSE before the server is
+        ever healthy -- observed as a bring-up crash with no transfer attempted
+        (combo run 33256868716). Same guard the other P/D tests carry."""
+        for profile in MODEL_PROFILES.values():
+            for env in (
+                build_prefill_env(profile, 2, env={}),
+                build_decode_env(profile, 2, env={}),
+            ):
+                raiden_base = int(env["SGLANG_RAIDEN_KV_PORT"])
+                for port in (PREFILL_PORT, DECODE_PORT, LB_PORT, BOOTSTRAP_PORT):
+                    self.assertNotIn(port, range(raiden_base, raiden_base + 4 * 16))
 
     def test_peer_hostname_maps_only_the_role_segment(self) -> None:
         self.assertEqual(
