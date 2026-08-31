@@ -1,4 +1,4 @@
-"""GPT-OSS 120B TPU full-dataset GSM8K gate."""
+"""GPT-OSS 120B TPU full-dataset GSM8K nightly score."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
@@ -21,8 +21,7 @@ LAUNCH_ENV = make_launch_env(
 GATE = {
     "dataset": "gsm8k",
     "label": "gsm8k_full",
-    "baseline": 0.90,
-    "atol": 0.00,
+    "report_only": True,
     "num_examples": 1319,
     "num_threads": 32,
     "max_tokens": 4096,

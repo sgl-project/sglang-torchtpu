@@ -39,6 +39,8 @@ Top level
                   gate, but nothing is plotted: a feature-validation test cannot
                   land on the tab by accident. (The performance tab works the same
                   way off the sweep gate's own workload labels.)
+    dashboard_model  Model-series label for dashboard metrics. Defaults to
+                  `test_name`; set it when jobs need distinct names but one series.
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
@@ -59,6 +61,8 @@ gates -- one entry per evaluation
                   descriptive name when `runner`/`lm_eval_config` does the scoring.
     baseline      Reference score, normally the model card's.
     atol          Tolerance below it: floor = baseline - atol.
+    report_only   True -> require and publish a numeric score without comparing it
+                  to a baseline. Backend and transport failures still fail the test.
     label         Name in reports and metrics. Defaults to `dataset`; set it when one
                   dataset is gated more than once.
     repeat        Passes to average. Small datasets need several before a tight
@@ -119,6 +123,7 @@ _CONFIG_KEYS = {
     "launch",
     "gates",
     "dashboard",
+    "dashboard_model",
     "skip_unless",
 }
 _LAUNCH_KEYS = {"recipe", "env", "tag", "health_timeout", "external"}
@@ -136,6 +141,7 @@ _GATE_PASSTHROUGH = {
     "top_k",
     "api",
     "runner",
+    "report_only",
 }
 # Gate keys needing translation.
 _GATE_TRANSLATED = {
@@ -185,6 +191,7 @@ def _build_gate(
     test_name: str = "",
     model: str = "",
     dashboard: Optional[str] = None,
+    dashboard_model: Optional[str] = None,
 ) -> AccuracyTestParams:
     _reject_unknown(gate, _GATE_PASSTHROUGH | _GATE_TRANSLATED, "gate")
     kwargs = {k: v for k, v in gate.items() if k in _GATE_PASSTHROUGH}
@@ -193,7 +200,18 @@ def _build_gate(
         # The dashboard plots only metrics that declare kind=accuracy; the stamp
         # is per-config so a copied gate cannot reach the tab undeclared. A sweep
         # gate is excluded: its points carry their own performance labels.
-        kwargs["metric_labels"] = {"model": test_name, "kind": "accuracy"}
+        kwargs["metric_labels"] = {
+            "model": dashboard_model or test_name,
+            "kind": "accuracy",
+        }
+
+    if gate.get("report_only"):
+        conflicting = sorted({"baseline", "atol"} & set(gate))
+        if conflicting:
+            raise ValueError(
+                f"a report-only gate must not set {conflicting}: it records the "
+                "measured score without a quality floor"
+            )
 
     if "baseline" in gate:
         kwargs["baseline_accuracy"] = gate["baseline"]
@@ -209,7 +227,9 @@ def _build_gate(
                 f"{gate['lm_eval_config']} instead, which is the only copy and is "
                 "what run_lm_eval.sh reads"
             )
-        kwargs["runner"] = lm_eval_runner(gate["lm_eval_config"])
+        kwargs["runner"] = lm_eval_runner(
+            gate["lm_eval_config"], report_only=gate.get("report_only", False)
+        )
 
     if "sweep" in gate:
         # A throughput gate. It shares the boot with this model's accuracy gates
@@ -240,10 +260,17 @@ def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
     model = str(config.get("model", ""))
     test_name = str(config.get("test_name", model))
     dashboard = config.get("dashboard")
+    dashboard_model = config.get("dashboard_model", test_name)
     if dashboard not in (None, "accuracy"):
         raise ValueError(f'dashboard must be "accuracy" or absent, got {dashboard!r}')
     return [
-        _build_gate(g, test_name=test_name, model=model, dashboard=dashboard)
+        _build_gate(
+            g,
+            test_name=test_name,
+            model=model,
+            dashboard=dashboard,
+            dashboard_model=dashboard_model,
+        )
         for g in config["gates"]
     ]
 
@@ -295,7 +322,7 @@ def build_test_case(config: Dict[str, Any], base_url: Optional[str] = None):
         if part
     )
     ModelConfigTest.__qualname__ = ModelConfigTest.__name__
-    ModelConfigTest.__doc__ = f"Accuracy gates for {name}, sharing one server boot."
+    ModelConfigTest.__doc__ = f"Accuracy evals for {name}, sharing one server boot."
 
     skip = config.get("skip_unless")
     if skip is not None:

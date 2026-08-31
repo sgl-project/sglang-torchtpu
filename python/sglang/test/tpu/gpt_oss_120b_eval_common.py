@@ -32,12 +32,13 @@ def make_launch_env(**overrides: str) -> dict[str, str]:
 def make_model_config(
     *, test_name: str, tag: str, launch_env: dict[str, str], gate: dict[str, Any]
 ) -> dict[str, Any]:
-    """Build one isolated model configuration for one eval gate."""
+    """Build one isolated model configuration for one eval."""
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": test_name,
         "variant": "TP8+EP8",
         "dashboard": "accuracy",
+        "dashboard_model": SERVED_MODEL_NAME,
         "launch": {
             "recipe": "recipe/gpt_oss_120b/server.sh",
             "env": launch_env,

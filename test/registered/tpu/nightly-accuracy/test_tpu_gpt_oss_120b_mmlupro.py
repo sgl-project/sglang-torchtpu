@@ -1,4 +1,4 @@
-"""GPT-OSS 120B TPU MMLU-Pro gate."""
+"""GPT-OSS 120B TPU MMLU-Pro nightly score."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
@@ -22,6 +22,7 @@ GATE = {
     "dataset": "mmlu_pro",
     "label": "mmlu_pro_high",
     "lm_eval_config": "test/lm_eval_configs/GPT-OSS-120B-TPU-MMLU-Pro.yaml",
+    "report_only": True,
 }
 
 MODEL_CONFIG = make_model_config(

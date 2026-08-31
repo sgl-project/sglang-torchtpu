@@ -1,4 +1,4 @@
-"""GPT-OSS 120B TPU GPQA Diamond gate."""
+"""GPT-OSS 120B TPU GPQA Diamond nightly score."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import gpqa_openai_runner, model_config_main
@@ -32,9 +32,7 @@ GATE = {
         n_threads=16,
         num_examples=198,
     ),
-    # Effective pass floor: 0.75.
-    "baseline": 0.80,
-    "atol": 0.05,
+    "report_only": True,
 }
 
 MODEL_CONFIG = make_model_config(

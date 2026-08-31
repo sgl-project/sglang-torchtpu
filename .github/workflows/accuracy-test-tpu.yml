@@ -1,7 +1,8 @@
 # Nightly TPU quality evals, with one TPU slice per suite.
+# Scores are emitted for longitudinal tracking without quality thresholds.
 # Manual dispatch:
-#   gh workflow run nightly-eval-tpu.yml -f model=gpt-oss-120b -f ref=<branch>
-name: Nightly Eval (TPU)
+#   gh workflow run accuracy-test-tpu.yml -f model=gpt-oss-120b -f ref=<branch>
+name: Accuracy Test (TPU)
 
 on:
   schedule:
@@ -22,7 +23,7 @@ on:
 
 concurrency:
   # Serialize runs for the same ref.
-  group: tpu-eval-${{ inputs.ref || github.ref }}
+  group: tpu-accuracy-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:

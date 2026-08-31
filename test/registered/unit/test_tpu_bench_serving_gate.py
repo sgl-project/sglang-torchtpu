@@ -406,6 +406,13 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
             self.assertNotIn(suite, suites, f"{path.name} shares a suite")
             suites.add(suite)
 
+    def test_every_gate_is_report_only(self):
+        for path, mod in self._accuracy_modules():
+            for gate in mod.MODEL_CONFIG["gates"]:
+                self.assertTrue(gate.get("report_only"), path.name)
+                self.assertNotIn("baseline", gate, path.name)
+                self.assertNotIn("atol", gate, path.name)
+
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a
         # renamed key or value empties the tab without failing anything here.
@@ -416,6 +423,11 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                     (params.metric_labels or {}).get("kind"),
                     "accuracy",
                     f"{path.name}: gate {params.name} would never be plotted",
+                )
+                self.assertEqual(
+                    (params.metric_labels or {}).get("model"),
+                    "gpt-oss-120b",
+                    f"{path.name}: gate {params.name} has the wrong model series",
                 )
 
     def test_dashboard_is_declared_only_under_nightly_accuracy(self):

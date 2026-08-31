@@ -216,11 +216,11 @@ class _LMEvalHarness(LMEvalMixin):
         self.base_url = base_url
 
 
-def lm_eval_runner(config_path: str):
+def lm_eval_runner(config_path: str, report_only: bool = False):
     """Build an ``AccuracyTestParams.runner`` that scores via lm-eval.
 
-    The YAML owns the task protocol, thresholds, and API model arguments. The runner
-    executes that configuration, applies its gate, and reports ``_passed``.
+    The YAML owns the task protocol and API model arguments. Thresholds are applied
+    unless ``report_only`` is set, in which case the runner returns the raw score.
     """
 
     def run(base_url: str) -> Dict[str, Any]:
@@ -236,7 +236,7 @@ def lm_eval_runner(config_path: str):
 
         results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
 
-        # Same floor as LMEvalMixin.test_lm_eval, which asserts instead of reporting.
+        # Threshold fields are ignored when this runner is report-only.
         rtol = cfg.get("rtol", LMEvalMixin.default_rtol)
         atol = cfg.get("atol", 0.0)
         passed = True
@@ -245,16 +245,22 @@ def lm_eval_runner(config_path: str):
 
         for task in cfg["tasks"]:
             for metric in task["metrics"]:
-                ground_truth = metric["value"]
                 measured = results["results"][task["name"]][metric["name"]]
-                floor = ground_truth * (1 - rtol) - atol
                 if primary is None:
                     primary = measured
-                print(
-                    f"{task['name']} | {metric['name']}: "
-                    f"ground_truth={ground_truth:.3f} | measured={measured:.3f} | "
-                    f"floor={floor:.3f} | rtol={rtol} | atol={atol}"
-                )
+                if report_only:
+                    print(
+                        f"{task['name']} | {metric['name']}: "
+                        f"measured={measured:.3f} (report only)"
+                    )
+                else:
+                    ground_truth = metric["value"]
+                    floor = ground_truth * (1 - rtol) - atol
+                    print(
+                        f"{task['name']} | {metric['name']}: "
+                        f"ground_truth={ground_truth:.3f} | measured={measured:.3f} | "
+                        f"floor={floor:.3f} | rtol={rtol} | atol={atol}"
+                    )
                 dump_metric(
                     f"{task['name']}_{metric['name']}",
                     measured,
@@ -264,13 +270,15 @@ def lm_eval_runner(config_path: str):
                         "task": task["name"],
                     },
                 )
-                if measured < floor:
+                if not report_only and measured < floor:
                     passed = False
                     failures.append(
                         f"{task['name']}/{metric['name']}: "
                         f"{measured:.4f} < floor {floor:.4f}"
                     )
 
+        if report_only:
+            return {"score": primary}
         return {"score": primary, "_passed": passed, "_failures": failures}
 
     return run

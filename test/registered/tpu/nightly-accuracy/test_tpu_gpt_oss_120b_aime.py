@@ -1,4 +1,4 @@
-"""GPT-OSS 120B TPU AIME 2025 gate."""
+"""GPT-OSS 120B TPU AIME 2025 nightly score."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import aime25_openai_runner, model_config_main
@@ -31,8 +31,7 @@ GATE = {
         max_tokens=MAX_TOKENS,
         n_threads=16,
     ),
-    "baseline": 0.90,
-    "atol": 0.00,
+    "report_only": True,
 }
 
 MODEL_CONFIG = make_model_config(

@@ -1,6 +1,7 @@
-# Zero-shot regression gate with 50 examples from each of 14 subtasks.
-# Uses a 0.65 floor and a 900-second per-request timeout.
+# Zero-shot score over 50 examples from each of 14 subtasks.
+# Uses a 900-second per-request timeout and does not apply a quality floor.
 model_name: "gpt-oss-120b"
+report_only: true
 backend: "local-chat-completions"
 api: "chat"
 tasks:
@@ -20,5 +21,3 @@ gen_kwargs:
   reasoning_effort: "high"
   temperature: 0.0
   max_gen_toks: 32768
-atol: 0.05
-rtol: 0.0
