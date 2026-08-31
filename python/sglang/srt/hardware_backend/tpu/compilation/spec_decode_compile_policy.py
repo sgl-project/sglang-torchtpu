@@ -25,7 +25,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -50,9 +52,11 @@ def _pad_first_dim(t: torch.Tensor | None, target_rows: int) -> torch.Tensor | N
 class BaseSpecDecodeCompilePolicyMixin:
     """Base mixin adding speculative decoding warmup and batch shaping to a decoder compile policy."""
 
+    model_runner: ModelRunner
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        server_args = self.model_runner.server_args
+        server_args: ServerArgs = self.model_runner.server_args
         self.speculative_num_steps = server_args.speculative_num_steps or 0
         self.speculative_algorithm = server_args.speculative_algorithm
         self.is_draft_worker = self.model_runner.is_draft_worker
@@ -71,8 +75,14 @@ class BaseSpecDecodeCompilePolicyMixin:
             )
             return
         super().precompile()
-        self._precompile_target_verify()
-        self._precompile_extend_full()
+        # A PD prefill pool has no SpeculativeState, so a TARGET_VERIFY dummy
+        # forward would trip the backend's pool-type assert; a PD decode server
+        # never runs prefill.
+        disagg_mode = self.model_runner.server_args.disaggregation_mode
+        if disagg_mode != "prefill":
+            self._precompile_target_verify()
+        if disagg_mode != "decode":
+            self._precompile_extend_full()
 
     def _precompile_target_verify(self) -> None:
         """Compile TARGET_VERIFY across the batch-size buckets."""

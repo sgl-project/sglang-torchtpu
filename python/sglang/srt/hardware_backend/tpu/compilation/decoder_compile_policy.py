@@ -5,7 +5,8 @@ from __future__ import annotations
 import functools
 import inspect
 import time
-from typing import Any, Callable, ClassVar, Literal, Optional
+from collections.abc import Callable
+from typing import Any, ClassVar, Literal
 
 import msgspec
 import torch
@@ -36,10 +37,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = get_logger(__name__)
@@ -88,7 +91,7 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
     tpu_sync(tensors, wait=True)
 
 
-def _get_hbm_usage_mb() -> Optional[tuple[float, float]]:
+def _get_hbm_usage_mb() -> tuple[float, float] | None:
     """Return (used_mb, total_mb) for the current TPU device, or None."""
     try:
         info = torch.accelerator.get_memory_info(torch.device("tpu"))
@@ -101,8 +104,8 @@ def _get_hbm_usage_mb() -> Optional[tuple[float, float]]:
 
 
 def _hbm_delta_str(
-    before: Optional[tuple[float, float]],
-    after: Optional[tuple[float, float]],
+    before: tuple[float, float] | None,
+    after: tuple[float, float] | None,
 ) -> str:
     """Format HBM delta + total as a suffix string, or empty if unavailable."""
     if before is None or after is None:
@@ -147,13 +150,13 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
     req_pool_indices: torch.Tensor
     req_pool_indices_cpu: torch.Tensor
     seq_lens_sum: int
-    extend_num_tokens: Optional[int]
-    extend_seq_lens: Optional[torch.Tensor]
-    extend_prefix_lens: Optional[torch.Tensor]
-    extend_start_loc: Optional[torch.Tensor]
-    extend_seq_lens_cpu: Optional[list[int]]
-    extend_prefix_lens_cpu: Optional[list[int]]
-    extend_logprob_start_lens_cpu: Optional[list[int]]
+    extend_num_tokens: int | None
+    extend_seq_lens: torch.Tensor | None
+    extend_prefix_lens: torch.Tensor | None
+    extend_start_loc: torch.Tensor | None
+    extend_seq_lens_cpu: list[int] | None
+    extend_prefix_lens_cpu: list[int] | None
+    extend_logprob_start_lens_cpu: list[int] | None
 
     @staticmethod
     def _extend_metadata_fields(
@@ -271,6 +274,7 @@ class _DummyForwardBatchFields(msgspec.Struct, frozen=True):
 class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     """Compile, pad, unpad, and precompile one decoder boundary."""
 
+    model_runner: ModelRunner
     platform = "tpu"
     fullgraph = True
     dynamic = False
@@ -787,8 +791,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
-        server_args = getattr(self.model_runner, "server_args", None)
-        disagg_mode = getattr(server_args, "disaggregation_mode", None)
+        server_args: ServerArgs = self.model_runner.server_args
+        disagg_mode = server_args.disaggregation_mode
         if disagg_mode != "decode":
             self._precompile_extend()
         if disagg_mode != "prefill":

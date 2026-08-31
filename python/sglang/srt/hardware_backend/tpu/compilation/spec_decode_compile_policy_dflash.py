@@ -182,6 +182,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
               target_hidden=(40, 14400), cache_loc=(40,), positions=(40,),
               cache_loc_2d=(4, 10), commit_lens=(4,)
         """
+        # Device/dtype normalization happens inside the compiled appender.
         if cache_loc_2d is not None:
             if commit_lens is None:
                 raise ValueError("DFLASH cache_loc_2d requires commit_lens.")
@@ -351,7 +352,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if dflash_worker is None:
             raise ValueError("DFlash worker cannot be None")
         overall = time.perf_counter()
-        self._precompile_draft_verify(draft_attn_backend)
+        if self.model_runner.server_args.disaggregation_mode != "prefill":
+            self._precompile_draft_verify(draft_attn_backend)
         self._precompile_append_target_hidden_to_draft_kv_by_loc_tpu(dflash_worker)
         logger.info(
             "[spec compile policy] DFLASH DRAFT precompile done in %.1fs.",
@@ -366,8 +368,11 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     ) -> None:
         """Warm up DFlash draft KV append across token buckets and batch size buckets."""
         self._ensure_kv_appender(dflash_worker)
-        self._precompile_draft_append_kv_verify()
-        self._precompile_draft_append_kv_extend()
+        disagg_mode = self.model_runner.server_args.disaggregation_mode
+        if disagg_mode != "prefill":
+            self._precompile_draft_append_kv_verify()
+        if disagg_mode != "decode":
+            self._precompile_draft_append_kv_extend()
 
     def _precompile_draft_append_kv_verify(self) -> None:
         """Compile DFLASH draft KV append across batch size buckets (verify/decode)."""

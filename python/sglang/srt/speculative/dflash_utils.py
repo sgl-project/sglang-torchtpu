@@ -772,7 +772,11 @@ def dflash_verify_bookkeeping_torch(
         matches = candidates[:, 1:] == target_predict[:, :-1]
         all_match = matches.all(dim=1)
         first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
-        accept_len = torch.where(all_match, block_size - 1, first_mismatch)
+        # argmax yields int64; int32 keeps commit_lens matching the eager/Triton
+        # paths, whose dtype the compiled draft KV appender guards on.
+        accept_len = torch.where(all_match, block_size - 1, first_mismatch).to(
+            torch.int32
+        )
     else:
         accept_len = torch.zeros((bs,), dtype=torch.int32, device=device)
 

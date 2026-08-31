@@ -409,7 +409,24 @@ def capture_prefill_graph(
 
 
 def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
-    """Capture device graphs."""
+    """Build the decode-phase graph runner for one model runner.
+
+    On CUDA-like devices this captures the decode (or target-verify) device
+    graph, matching the function name. On TPU nothing is captured or replayed:
+    this is the only place torch.compile gets installed, and the policy it
+    installs precompiles whatever forward modes the runner's role serves --
+    EXTEND on a PD prefill server, DECODE and TARGET_VERIFY elsewhere. A skip
+    added here for a CUDA-only reason therefore leaves the TPU model fully
+    eager unless it exempts TPU.
+
+    Args:
+      model_runner: Runner to capture a decode graph for, or on TPU to install
+        the torch.compile policy on.
+
+    Returns:
+      GraphCapture holding the runner (None when skipped) plus its startup
+      memory and time cost.
+    """
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
     elif model_runner.spec_algorithm.is_speculative():
@@ -425,10 +442,17 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
 
     # A PD prefill server never replays the target-verify graph, and its pool
     # is built without the spec-verify scratch the capture would need.
+    # TPU is exempt: its compile policies already skip target-verify under
+    # disaggregation_mode=prefill, and skipping here would instead drop the
+    # EXTEND graphs that a prefill server exists to run.
+    # FIXME: TPU piggybacks on this decode-named hook to install torch.compile,
+    # so every CUDA-motivated skip has to remember to exempt it. Give TPU its
+    # own install hook in capture_cuda_graphs and drop the device check here.
     if (
         model_runner.spec_algorithm.is_speculative()
         and not model_runner.is_draft_worker
         and model_runner.server_args.disaggregation_mode == "prefill"
+        and model_runner.device != "tpu"
     ):
         return no_capture
     if not model_runner.is_generation:

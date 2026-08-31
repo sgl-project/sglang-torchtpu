@@ -91,7 +91,7 @@ def _model_runner(device="cpu"):
         model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
-        server_args=SimpleNamespace(page_size=1, dp_size=1),
+        server_args=SimpleNamespace(page_size=1, dp_size=1, disaggregation_mode="null"),
     )
 
 
@@ -1240,6 +1240,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
             speculative_eagle_topk=1,
             page_size=1,
             dp_size=1,
+            disaggregation_mode="null",
         ),
     )
 
@@ -1611,6 +1612,7 @@ class TestDFlashCompilePolicy(CustomTestCase):
                 torch_compile_max_bs=4,
                 unsafe_save_torch_compile_bundle=None,
                 unsafe_load_torch_compile_bundle=None,
+                disaggregation_mode="null",
             ),
         )
         t_bucketer = Bucketer(name="Token", buckets=list(token_buckets))
@@ -1659,10 +1661,10 @@ class TestDFlashCompilePolicy(CustomTestCase):
     def test_pad_append_target_hidden_tpu_prefill_extend(self):
         policy, _ = self._make_dflash_policy(token_buckets=(16, 64))
 
-        # 10 tokens pad to next bucket 16.
+        # 10 tokens pad to next bucket 16; dtypes pass through untouched.
         target_hidden = torch.ones(10, 32)
-        cache_loc = torch.arange(10, dtype=torch.int64)
-        positions = torch.arange(10, dtype=torch.int64)
+        cache_loc = torch.arange(10, dtype=torch.int32)
+        positions = torch.arange(10, dtype=torch.int32)
         padded = policy.pad_append_target_hidden_tpu(
             target_hidden=target_hidden,
             cache_loc=cache_loc,
@@ -1672,7 +1674,9 @@ class TestDFlashCompilePolicy(CustomTestCase):
         p_target, p_loc, p_pos, p_loc2d, p_commit = padded
         self.assertEqual(p_target.shape, (16, 32))
         self.assertEqual(p_loc.shape, (16,))
+        self.assertEqual(p_loc.dtype, torch.int32)
         self.assertEqual(p_pos.shape, (16,))
+        self.assertEqual(p_pos.dtype, torch.int32)
         self.assertIsNone(p_loc2d)
         self.assertIsNone(p_commit)
 
@@ -1970,6 +1974,95 @@ class TestDFlashCompilePolicy(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens.tolist(), [4] * 4)
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
+
+    def test_precompile_draft_pd_prefill_mode_skips_verify(self):
+        policy, mr = self._make_dflash_policy(
+            token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
+        )
+        mr.server_args.disaggregation_mode = "prefill"
+        mock_append_kernel = MagicMock()
+        policy._compiled_kv_appender = mock_append_kernel
+        worker = SimpleNamespace(
+            draft_model=mr.model,
+            draft_model_runner=mr,
+            append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+        )
+
+        with get_parallel().override(tp_rank=1):
+            policy.precompile_draft(
+                draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
+            )
+
+        # In prefill mode: draft model forward is skipped (0 calls), only extend KV append runs (2 token buckets).
+        self.assertEqual(mr.model.forward.call_count, 0)
+        self.assertEqual(mock_append_kernel.call_count, 2)
+
+    def test_precompile_draft_pd_decode_mode_skips_extend(self):
+        policy, mr = self._make_dflash_policy(
+            token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4
+        )
+        mr.server_args.disaggregation_mode = "decode"
+        mock_append_kernel = MagicMock()
+        policy._compiled_kv_appender = mock_append_kernel
+        worker = SimpleNamespace(
+            draft_model=mr.model,
+            draft_model_runner=mr,
+            append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+        )
+
+        with get_parallel().override(tp_rank=1):
+            policy.precompile_draft(
+                draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
+            )
+
+        # In decode mode: draft model forward runs (2 bs buckets), only verify KV append runs (2 bs buckets).
+        self.assertEqual(mr.model.forward.call_count, 2)
+        self.assertEqual(mock_append_kernel.call_count, 2)
+
+    def test_dflash_build_disagg_draft_input(self):
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+        batch = SimpleNamespace(
+            seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+            enable_overlap=False,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+        )
+        last_tokens = torch.tensor([101, 102], dtype=torch.int64)
+        future_map = MagicMock()
+
+        draft_input = SpeculativeAlgorithm.DFLASH.build_disagg_draft_input(
+            batch, last_tokens, future_map
+        )
+        self.assertIsInstance(draft_input, DFlashDraftInputV2)
+        self.assertTrue(torch.equal(draft_input.bonus_tokens, last_tokens))
+        self.assertTrue(torch.equal(draft_input.new_seq_lens, batch.seq_lens))
+
+    def test_target_precompile_pd_modes(self):
+        policy, mr = self._make_dflash_policy(
+            token_buckets=(8, 64),
+            bs_buckets=(1, 4),
+            draft_token_num=4,
+            is_draft_worker=False,
+        )
+        mr.server_args.disaggregation_mode = "prefill"
+
+        with get_parallel().override(tp_rank=1):
+            policy.precompile()
+        # Prefill mode: EXTEND (2), EXTEND(FULL) (4) = 6 calls; DECODE and TARGET_VERIFY skipped.
+        self.assertEqual(mr.model.forward.call_count, 6)
+
+        policy_dec, mr_dec = self._make_dflash_policy(
+            token_buckets=(8, 64),
+            bs_buckets=(1, 4),
+            draft_token_num=4,
+            is_draft_worker=False,
+        )
+        mr_dec.server_args.disaggregation_mode = "decode"
+
+        with get_parallel().override(tp_rank=1):
+            policy_dec.precompile()
+        # Decode mode: DECODE (2), TARGET_VERIFY (2) = 4 calls; EXTEND and EXTEND(FULL) skipped.
+        self.assertEqual(mr_dec.model.forward.call_count, 4)
 
 
 class TestSpecDraftDecodePadding(CustomTestCase):
