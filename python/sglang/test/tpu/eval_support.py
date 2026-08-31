@@ -219,10 +219,8 @@ class _LMEvalHarness(LMEvalMixin):
 def lm_eval_runner(config_path: str):
     """Build an ``AccuracyTestParams.runner`` that scores via lm-eval.
 
-    Needed because these models' reference values are the cards' standard few-shot
-    numbers (5-shot ``mmlu_llama``, ``mmlu_pro``), which simple-evals does not
-    reproduce. The YAML is the only copy of the ground truths and tolerances, so the
-    runner gates itself and reports ``_passed``.
+    The YAML owns the task protocol, thresholds, and API model arguments. The runner
+    executes that configuration, applies its gate, and reports ``_passed``.
     """
 
     def run(base_url: str) -> Dict[str, Any]:
@@ -278,19 +276,84 @@ def lm_eval_runner(config_path: str):
     return run
 
 
+def _bound_gpt_oss_sampler(sampler: Any, sampler_module: Any) -> None:
+    """Keep a capped generation from turning into unbounded regeneration.
+
+    The reference sampler retries forever when Chat Completions returns reasoning
+    without final content. Local TPU evals intentionally cap generation, so preserve
+    that reasoning as the scoreable response and bound genuine request failures.
+    """
+
+    original_call = sampler.__class__.__call__
+    original_sleep = sampler_module.time.sleep
+
+    def bounded_call(self: Any, message_list: Any) -> Any:
+        if self.system_message:
+            message_list = [
+                self._pack_message("system", self.system_message)
+            ] + message_list
+
+        for trial in range(2):
+            try:
+                kwargs = {
+                    "model": self.model,
+                    "messages": message_list,
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                }
+                if self.reasoning_model:
+                    kwargs["reasoning_effort"] = self.reasoning_effort
+                response = self.client.chat.completions.create(**kwargs)
+                choice = response.choices[0]
+                reasoning = getattr(choice.message, "reasoning", None)
+                content = choice.message.content
+                if reasoning:
+                    message_list.append(self._pack_message("assistant", reasoning))
+                content = content or reasoning or "No response."
+                return sampler_module.SamplerResponse(
+                    response_text=content,
+                    response_metadata={"usage": response.usage},
+                    actual_queried_message_list=message_list,
+                )
+            except sampler_module.openai.BadRequestError as error:
+                print("Bad Request Error", error)
+                break
+            except Exception as error:
+                if trial == 1:
+                    print("Request failed after 2 attempts", error)
+                    break
+                delay = min(2**trial, 30)
+                print(f"Request failed; retrying once after {delay}s", error)
+                original_sleep(delay)
+
+        return sampler_module.SamplerResponse(
+            response_text="No response.",
+            response_metadata={"usage": None},
+            actual_queried_message_list=message_list,
+        )
+
+    sampler._sglang_original_call = original_call
+    sampler.__class__.__call__ = bounded_call
+
+
+def _restore_gpt_oss_sampler(sampler: Any) -> None:
+    sampler.__class__.__call__ = sampler._sglang_original_call
+    del sampler._sglang_original_call
+
+
 def gpqa_openai_runner(
     model: str,
     n_repeats: int,
     reasoning_effort: str,
     max_tokens: int,
     n_threads: int = 32,
+    num_examples: int | None = None,
 ):
     """Build an ``AccuracyTestParams.runner`` that scores GPQA via OpenAI's harness.
 
-    gpt_oss.evals is the only harness that reproduces the gpt-oss card's GPQA number --
-    it owns the permuted-choice prompt and the grader, and temperature 1.0 below is part
-    of that methodology. ``n_repeats`` is the caller's, because how many passes a tight
-    floor needs depends on the tolerance it is gated at.
+    ``gpt_oss.evals`` supplies the permuted-choice prompt and grader used here.
+    Temperature 1.0 follows that harness's protocol; the caller owns the repeat and
+    sample counts.
 
     ``model`` is both the id sent to the server and the metric label, so a gate cannot
     report under a name the server was never asked for.
@@ -300,12 +363,21 @@ def gpqa_openai_runner(
         # Pure-python eval code; --no-deps so its pins never touch the pinned
         # TPU torch stack. openai/pandas/blobfile are image deps (test extra).
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--no-deps",
+                "gpt-oss",
+            ],
             check=True,
         )
         # The openai client insists on a key even for a local base_url.
         os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
+        import gpt_oss.evals.chat_completions_sampler as sampler_module
         from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
         from gpt_oss.evals.gpqa_eval import GPQAEval
 
@@ -318,14 +390,70 @@ def gpqa_openai_runner(
             # Their CLI uses 131072; the caller caps it to fit CONTEXT_LEN.
             max_tokens=max_tokens,
         )
-        result = GPQAEval(n_repeats=n_repeats, n_threads=n_threads)(sampler)
+        _bound_gpt_oss_sampler(sampler, sampler_module)
+        try:
+            result = GPQAEval(
+                n_repeats=n_repeats,
+                n_threads=n_threads,
+                num_examples=num_examples,
+            )(sampler)
+        finally:
+            _restore_gpt_oss_sampler(sampler)
         print(
-            f"gpqa_diamond (openai harness, n_repeats={n_repeats}): "
+            f"gpqa_diamond (openai harness, n_repeats={n_repeats}, "
+            f"num_examples={num_examples}): "
             f"score={result.score:.4f} metrics={result.metrics}"
         )
         # Built-in backends dump their own metrics; a runner must do its own.
         dump_metric(
             "gpqa_diamond_openai_harness",
+            result.score,
+            labels={"model": model, "eval": "gpt_oss.evals"},
+        )
+        return {"score": result.score}
+
+    return run
+
+
+def aime25_openai_runner(
+    model: str,
+    n_repeats: int,
+    reasoning_effort: str,
+    max_tokens: int,
+    n_threads: int = 32,
+):
+    """Score AIME 2025 with OpenAI's GPT-OSS reference harness."""
+
+    def run(base_url: str) -> Dict[str, Any]:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
+            check=True,
+        )
+        os.environ.setdefault("OPENAI_API_KEY", "dummy")
+
+        import gpt_oss.evals.chat_completions_sampler as sampler_module
+        from gpt_oss.evals.aime_eval import AIME25Eval
+        from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
+
+        sampler = ChatCompletionsSampler(
+            model=model,
+            reasoning_model=True,
+            reasoning_effort=reasoning_effort,
+            temperature=1.0,
+            base_url=base_url.rstrip("/") + "/v1",
+            max_tokens=max_tokens,
+        )
+        _bound_gpt_oss_sampler(sampler, sampler_module)
+        try:
+            result = AIME25Eval(n_repeats=n_repeats, n_threads=n_threads)(sampler)
+        finally:
+            _restore_gpt_oss_sampler(sampler)
+        print(
+            f"aime25 (openai harness, n_repeats={n_repeats}): "
+            f"score={result.score:.4f} metrics={result.metrics}"
+        )
+        dump_metric(
+            "aime25_openai_harness",
             result.score,
             labels={"model": model, "eval": "gpt_oss.evals"},
         )

@@ -1,16 +1,12 @@
-# TPU accuracy gates -- test/registered/tpu/nightly-accuracy/ via run_suite, ONE
-# JOB PER MODEL so they take separate slices and run in parallel, exactly like
-# perf-test-tpu.yml. The same jobs run nightly (nightly-test-tpu.yml); this action
-# is the isolated trigger, for collecting a datapoint on demand without waiting
-# for a nightly:
-#   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
-#
-# Single-host models go through run_suite (`accuracy`); the multihost ones parked out
-# of the nightly lane (DeepSeek-R1-0528, Kimi-K2.6) take the JobSet launch path
-# (`accuracy-multihost`).
-name: Accuracy Test (TPU)
+# Nightly TPU quality evals, with one TPU slice per suite.
+# Manual dispatch:
+#   gh workflow run nightly-eval-tpu.yml -f model=gpt-oss-120b -f ref=<branch>
+name: Nightly Eval (TPU)
 
 on:
+  schedule:
+    - cron: "0 4 * * *"
+      timezone: "America/Los_Angeles"  # Two hours after functional nightly.
   workflow_dispatch:
     inputs:
       ref:
@@ -18,16 +14,15 @@ on:
         required: false
         default: main
       model:
-        description: "Which model to gate"
+        description: "Which model to evaluate"
         required: false
-        default: all
+        default: gpt-oss-120b
         type: choice
         options: [all, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
 
 concurrency:
-  # Keyed on ref so runs for different branches proceed in parallel; same ref
-  # still serializes, so a re-dispatch cannot race the previous run's scores.
-  group: tpu-accuracy-${{ inputs.ref || github.ref }}
+  # Serialize runs for the same ref.
+  group: tpu-eval-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -39,18 +34,16 @@ jobs:
       contents: read
       id-token: write
 
-  accuracy:
+  eval:
     needs: build
-    if: ${{ contains(fromJSON('["all","gpt-oss-120b"]'), inputs.model || 'all') }}
+    if: ${{ contains(fromJSON('["all","gpt-oss-120b"]'), inputs.model || 'gpt-oss-120b') }}
     strategy:
-      # A broken model must not cancel the others' scores.
+      # Preserve independent eval results when one fails.
       fail-fast: false
       matrix:
-        # matrix context is unavailable in job-level `if`, so selection shapes the
-        # matrix instead -- same trick as perf-test-tpu.yml. One model today; the
-        # next one adds a choice above and a branch here.
-        suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-accuracy-gpt-oss-120b"]'))
-                || fromJSON('["nightly-tpu-accuracy-gpt-oss-120b"]') }}
+        # One job per eval isolates failures and runtime budgets.
+        suite: ${{ fromJSON('["tpu-eval-gpt-oss-120b-aime",
+          "tpu-eval-gpt-oss-120b-gpqa","tpu-eval-gpt-oss-120b-gsm8k","tpu-eval-gpt-oss-120b-mmlupro"]') }}
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -60,20 +53,17 @@ jobs:
       hosts: 1
       suite: ${{ matrix.suite }}
       nightly: true
-      # gpt-oss-120b serves from the shared ROX disk at /weights.
+      # Admission is separate; each test file gets a 90-minute runtime budget.
       weights_pvc: model-weights-rox
-      # est_time 2400 (GPQA at 8 repeats + MMLU at 2000 examples) plus bring-up.
-      timeout_per_file: 3600
+      timeout_per_file: 5400
     permissions:
       contents: read
       id-token: write
 
-  # Discovers suite nightly-tpu-multihost-ondemand, which the nightly lane does not
-  # scan, so each test file keeps owning its launch spec. `model` filters the
-  # discovered groups by name (mh-deepseek-r1-0528-mh, mh-kimi-k26-mh).
+  # Multihost test files own their launch specifications.
   discover-multihost:
     needs: build
-    if: ${{ contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'all') }}
+    if: ${{ contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'gpt-oss-120b') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -85,7 +75,7 @@ jobs:
           ref: ${{ inputs.ref || 'main' }}
       - id: d
         env:
-          MODEL: ${{ inputs.model || 'all' }}
+          MODEL: ${{ inputs.model || 'gpt-oss-120b' }}
         run: |
           set -euo pipefail
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
@@ -97,7 +87,7 @@ jobs:
           echo "groups=$groups" >> "$GITHUB_OUTPUT"
           echo "discovered groups: $groups"
 
-  accuracy-multihost:
+  eval-multihost:
     needs: [build, discover-multihost]
     if: needs.discover-multihost.outputs.groups != '[]'
     strategy:

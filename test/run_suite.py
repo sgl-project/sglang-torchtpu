@@ -195,8 +195,11 @@ NIGHTLY_SUITES = {
         # jobs on separate slices instead of one sequential single-host job.
         "nightly-tpu-perf-gpt-oss-120b",
         "nightly-perf-tpu",
-        # One suite per accuracy model, for the same fan-out.
-        "nightly-tpu-accuracy-gpt-oss-120b",
+        # One suite per quality eval so each gets an independent TPU slice.
+        "tpu-eval-gpt-oss-120b-aime",
+        "tpu-eval-gpt-oss-120b-gpqa",
+        "tpu-eval-gpt-oss-120b-gsm8k",
+        "tpu-eval-gpt-oss-120b-mmlupro",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",

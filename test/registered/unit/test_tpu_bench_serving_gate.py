@@ -1,4 +1,4 @@
-"""Unit tests for the TPU throughput gate (no TPU, no server, no bench run).
+"""Unit tests for TPU eval helpers (no TPU, server, or benchmark run).
 
 The gate is an AccuracyTestParams.runner that shells out to
 benchmark/tpu/bench_serving.sh and reads the JSONL back. Two contracts with that
@@ -17,6 +17,7 @@ subprocess stubbed, since "measurement incomplete" is the only thing it gates.
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,6 +33,81 @@ COMPLETE = {
     "total_throughput": 12000.0,
     "median_ttft_ms": 2600.0,
 }
+
+
+class _FakeSampler:
+    system_message = None
+    model = "model"
+    temperature = 1.0
+    max_tokens = 16
+    reasoning_model = True
+    reasoning_effort = "high"
+
+    def __init__(self, create):
+        self.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+    def __call__(self, _messages):
+        raise AssertionError("the bounded implementation was not installed")
+
+    @staticmethod
+    def _pack_message(role, content):
+        return {"role": role, "content": content}
+
+
+class TestBoundedGptOssSampler(CustomTestCase):
+    @staticmethod
+    def _module(sleeps):
+        class BadRequestError(Exception):
+            pass
+
+        class SamplerResponse:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        return SimpleNamespace(
+            openai=SimpleNamespace(BadRequestError=BadRequestError),
+            time=SimpleNamespace(sleep=sleeps.append),
+            SamplerResponse=SamplerResponse,
+        )
+
+    @staticmethod
+    def _response(content=None, reasoning=None):
+        message = SimpleNamespace(content=content, reasoning=reasoning)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)], usage={"tokens": 16}
+        )
+
+    def test_reasoning_only_response_is_not_regenerated(self):
+        create = MagicMock(return_value=self._response(reasoning="Answer: B"))
+        sampler = _FakeSampler(create)
+        module = self._module([])
+        eval_support._bound_gpt_oss_sampler(sampler, module)
+        try:
+            result = sampler([{"role": "user", "content": "question"}])
+        finally:
+            eval_support._restore_gpt_oss_sampler(sampler)
+
+        self.assertEqual(result.response_text, "Answer: B")
+        create.assert_called_once()
+
+    def test_transport_failure_retries_once(self):
+        sleeps = []
+        create = MagicMock(
+            side_effect=[RuntimeError("temporary"), self._response(content="A")]
+        )
+        sampler = _FakeSampler(create)
+        module = self._module(sleeps)
+        eval_support._bound_gpt_oss_sampler(sampler, module)
+        try:
+            result = sampler([{"role": "user", "content": "question"}])
+        finally:
+            eval_support._restore_gpt_oss_sampler(sampler)
+
+        self.assertEqual(result.response_text, "A")
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(sleeps, [1])
 
 
 class TestSweepArg(CustomTestCase):

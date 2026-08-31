@@ -10,7 +10,8 @@ name: Nightly Test (TPU)
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # 09:00 UTC daily (low-PR hour); adjust as needed
+    - cron: "0 2 * * *"
+      timezone: "America/Los_Angeles"  # Two hours before quality evals.
   workflow_dispatch:
     inputs:
       ref:
@@ -25,7 +26,6 @@ on:
         type: choice
         options:
           - all
-          - accuracy
           - mh
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
@@ -58,7 +58,6 @@ jobs:
     outputs:
       single_host: ${{ steps.tests.outputs.single_host }}
       perf: ${{ steps.tests.outputs.perf }}
-      accuracy: ${{ steps.tests.outputs.accuracy }}
       pd_pc_offload: ${{ steps.tests.outputs.pd_pc_offload }}
       pd_tp_reshard: ${{ steps.tests.outputs.pd_tp_reshard }}
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
@@ -74,7 +73,6 @@ jobs:
           discover_files='python3 .github/tpu-ci/discover_files.py'
           echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
           echo "perf=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-perf-gpt-oss-120b --nightly)" >> "$GITHUB_OUTPUT"
-          echo "accuracy=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-accuracy-gpt-oss-120b --nightly)" >> "$GITHUB_OUTPUT"
           echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
           echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/integration/test_pd_tp_resharding.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
@@ -294,35 +292,6 @@ jobs:
       nightly: true
       weights_pvc: model-weights-rox
       timeout_per_file: 1800
-    permissions:
-      contents: read
-      id-token: write
-
-  # Accuracy gates, one job per model -- the same fan-out as perf, so a broken
-  # model costs the others nothing. Also dispatchable on its own
-  # (accuracy-test-tpu.yml) to collect a datapoint without a full nightly.
-  accuracy:
-    needs: [build, discover-tests]
-    if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') && needs.discover-tests.outputs.accuracy != '[]' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        test: ${{ fromJSON(needs.discover-tests.outputs.accuracy) }}
-    name: ${{ matrix.test.name }}
-    uses: ./.github/workflows/_tpu-test.yml
-    with:
-      ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
-      lane: nightly
-      hosts: 1
-      suite: ${{ matrix.test.suite }}
-      test_file: ${{ matrix.test.file }}
-      run_name: ${{ matrix.test.run_name }}
-      nightly: true
-      # gpt-oss-120b serves from the shared ROX disk at /weights.
-      weights_pvc: model-weights-rox
-      # est_time 2400 (GPQA at 8 repeats + MMLU at 2000 examples) plus bring-up.
-      timeout_per_file: 3600
     permissions:
       contents: read
       id-token: write

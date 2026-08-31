@@ -1,0 +1,24 @@
+# Zero-shot regression gate with 50 examples from each of 14 subtasks.
+# Uses a 0.65 floor and a 900-second per-request timeout.
+model_name: "gpt-oss-120b"
+backend: "local-chat-completions"
+api: "chat"
+tasks:
+- name: "mmlu_pro"
+  metrics:
+  - name: "exact_match,custom-extract"
+    value: 0.70
+limit: 50
+num_fewshot: 0
+num_concurrent: 32
+batch_size: "auto"
+apply_chat_template: true
+model_args:
+  timeout: 900
+  max_retries: 1
+gen_kwargs:
+  reasoning_effort: "high"
+  temperature: 0.0
+  max_gen_toks: 32768
+atol: 0.05
+rtol: 0.0
