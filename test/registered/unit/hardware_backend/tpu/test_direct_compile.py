@@ -303,6 +303,59 @@ class TestDirectCompile(CustomTestCase):
         self.assertIs(rebuilt[1].hidden_states, draft_extend_hidden_states)
         self.assertIsNone(rebuilt[1].input_ids)
 
+    def test_forward_hook_dispatches_inserted_callback(self):
+        model = torch.nn.Identity()
+        inserted = []
+        callback_values = []
+
+        def hook(_module, _args, output):
+            inserted.append(
+                direct_compile.insert_callback(
+                    output,
+                    lambda value: callback_values.append(value.clone()),
+                )
+            )
+
+        model.register_forward_hook(hook)
+        self.assertFalse(
+            direct_compile.insert_callback(torch.ones(2), callback_values.append)
+        )
+        self.assertEqual(callback_values, [])
+
+        compiled = direct_compile.direct_compile(
+            model,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+        )
+        result = torch.full((2,), 3.0)
+        callback_output = torch.full((2,), 4.0)
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ),
+            patch.object(compiler, "execute", return_value=[result, callback_output]),
+        ):
+            output = compiled(torch.zeros(2))
+
+        self.assertTrue(torch.equal(output, result))
+        self.assertEqual(inserted, [True])
+        self.assertEqual(len(callback_values), 1)
+        self.assertTrue(torch.equal(callback_values[0], callback_output))
+
     def test_artifact_dispatches_and_rebuilds_outputs(self):
         model = _Model()
         kv_pool = _KVPool(torch.zeros(2))

@@ -59,7 +59,17 @@ def _collect_callbacks() -> Iterator[list[_InsertedCallback]]:
 def insert_callback(
     tensor: torch.Tensor, callback: Callable[[torch.Tensor], None]
 ) -> bool:
-    """Invoke callback with tensor after each execution of the compiled function."""
+    """Register a callback for a tensor produced during direct compilation.
+
+    This is intended for module forward hooks::
+
+        def hook(_module, _args, output):
+            if not insert_callback(output, consume_output):
+                raise RuntimeError("direct compilation is not active")
+
+    Returns ``True`` while a direct-compile trace is collecting callbacks.
+    Otherwise returns ``False`` without invoking ``callback`` eagerly.
+    """
     callbacks = _ACTIVE_CALLBACKS.get()
     if callbacks is None:
         return False
