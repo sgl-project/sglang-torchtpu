@@ -514,6 +514,36 @@ class TestDraftTorchCompileInstall(CustomTestCase):
         decode_capture = self._call("cuda", True)
         decode_capture.assert_not_called()
 
+    def test_registers_tpu_forward_hooks_before_compilation(self):
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            capture_cuda_graphs,
+        )
+        from sglang.srt.runtime_context import get_flags
+
+        runner = self._runner("tpu")
+        runner.server_args.forward_hooks = [{"name": "capture"}]
+        events = []
+
+        with patch(
+            f"{self._SETUP_MOD}.GraphSharedOutput.create_for_model_runner"
+        ), patch(f"{self._SETUP_MOD}.EagerRunner"), patch(
+            f"{self._SETUP_MOD}.register_forward_hooks",
+            side_effect=lambda *_: events.append("hooks"),
+        ), patch(
+            f"{self._SETUP_MOD}.capture_prefill_graph",
+            side_effect=lambda **_: events.append("prefill") or MagicMock(),
+        ), patch(
+            f"{self._SETUP_MOD}.prealloc_symmetric_memory_pool"
+        ), patch(
+            f"{self._SETUP_MOD}.capture_decode_graph",
+            side_effect=lambda **_: events.append("decode") or MagicMock(),
+        ), get_flags().capture.override(
+            enable_torch_compile=True
+        ):
+            capture_cuda_graphs(model_runner=runner)
+
+        self.assertEqual(events, ["hooks", "prefill", "decode"])
+
 
 class TestDraftPrecompileOrdering(CustomTestCase):
     """Draft precompile must run after the policy is installed.

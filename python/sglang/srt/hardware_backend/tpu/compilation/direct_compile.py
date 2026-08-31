@@ -6,10 +6,11 @@ import functools
 import inspect
 import logging
 from collections.abc import Callable, Hashable, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 import torch
 from jax import tree_util
@@ -32,6 +33,39 @@ from sglang.srt.speculative.eagle_info import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _InsertedCallback:
+    tensor: torch.Tensor
+    callback: Callable[[torch.Tensor], None]
+
+
+_ACTIVE_CALLBACKS: ContextVar[list[_InsertedCallback] | None] = ContextVar(
+    "tpu_direct_compile_callbacks", default=None
+)
+
+
+@contextmanager
+def _collect_callbacks() -> Iterator[list[_InsertedCallback]]:
+    callbacks: list[_InsertedCallback] = []
+    token = _ACTIVE_CALLBACKS.set(callbacks)
+    try:
+        yield callbacks
+    finally:
+        _ACTIVE_CALLBACKS.reset(token)
+
+
+def insert_callback(
+    tensor: torch.Tensor, callback: Callable[[torch.Tensor], None]
+) -> bool:
+    """Invoke callback with tensor after each execution of the compiled function."""
+    callbacks = _ACTIVE_CALLBACKS.get()
+    if callbacks is None:
+        return False
+    callbacks.append(_InsertedCallback(tensor=tensor, callback=callback))
+    return True
+
 
 SpecializationKey = Callable[..., Hashable]
 _STATIC_INPUT_TYPES = (bool, int, float, str, Enum)
@@ -359,19 +393,26 @@ class CompiledFunction:
                 self._kv_pool.set_state(kv_pool_trace_inputs)
                 stack.callback(self._kv_pool.set_state, previous_state)
             trace_arguments = tree_util.tree_unflatten(input_treespec, trace_leaves)
-            outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
+            with _collect_callbacks() as inserted_callbacks:
+                outputs = self.fn(*trace_arguments[0], **trace_arguments[1])
 
         output_leaves, output_treespec = tree_util.tree_flatten(outputs)
         if not output_leaves or not all(_is_tpu_tensor(leaf) for leaf in output_leaves):
             raise TypeError("All direct_compile output leaves must be TPU tensors")
         result_tensors = output_leaves + kv_pool_trace_inputs
+        # Forward hooks see Torch tensors here, not JAX values, and JAX export
+        # cannot serialize host callbacks. Preserve callback values as extra
+        # executable outputs, then invoke their Python callbacks after execute.
+        result_tensors.extend(entry.tensor for entry in inserted_callbacks)
 
         # Step 4: Finish lowering to MLIR, then compile it.
         logger.info(
-            "[direct_compile] lowering %d inputs, %d outputs, and %d mutations",
+            "[direct_compile] lowering %d inputs, %d outputs, %d mutations, "
+            "and %d callbacks",
             len(graph_inputs),
             len(output_leaves),
             len(kv_pool_inputs),
+            len(inserted_callbacks),
         )
         with dynamo_timed("direct_compile_traverse_and_compile"):
             compile_result = tpu_torch_compile.traverse_and_compile(
@@ -388,6 +429,7 @@ class CompiledFunction:
             ),
             output_treespec=output_treespec,
             output_count=len(output_leaves),
+            callbacks=tuple(entry.callback for entry in inserted_callbacks),
         )
 
 
@@ -402,6 +444,7 @@ class _CompiledArtifact:
     tensor_inputs_traced_shapes: tuple[tuple[int, ...], ...]
     output_treespec: Any
     output_count: int
+    callbacks: tuple[Callable[[torch.Tensor], None], ...] = ()
 
     def __call__(self, call: tuple[tuple[Any, ...], dict[str, Any]]) -> Any:
         kv_pool_inputs = self.kv_pool.get_state() if self.kv_pool is not None else []
@@ -436,6 +479,15 @@ class _CompiledArtifact:
                 kv_pool_inputs, outputs[self.output_count :]
             ):
                 tensor.copy_(replacement)
+
+        callback_outputs = outputs[self.output_count + len(kv_pool_inputs) :]
+        if len(callback_outputs) != len(self.callbacks):
+            raise RuntimeError(
+                "direct_compile callback output count changed: "
+                f"expected={len(self.callbacks)} actual={len(callback_outputs)}"
+            )
+        for callback, tensor in zip(self.callbacks, callback_outputs):
+            callback(tensor)
 
         return tree_util.tree_unflatten(
             self.output_treespec, outputs[: self.output_count]
