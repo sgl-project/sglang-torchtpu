@@ -158,8 +158,8 @@ class LayerwiseOffloadManager:
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
         # layer indices that are already in gpu
         self._gpu_layers: Set[int] = set()
-        # layer_idx -> torch.get_device_module().Event for fine-grained sync, to make sure the weight is resident in pre-hook
-        self._prefetch_events: Dict[int, torch.get_device_module().Event] = {}
+        # layer_idx -> torch.Event for fine-grained sync, to make sure the weight is resident in pre-hook
+        self._prefetch_events: Dict[int, torch.Event] = {}
 
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}

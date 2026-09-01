@@ -147,7 +147,7 @@ class DiffusionTransferManager:
         stream: torch.Stream | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | list[torch.Tensor]],
-        torch.get_device_module().Event | None,
+        torch.Event | None,
     ]:
         """Load tensors from receive slot to GPU, returning a CUDA event.
 
