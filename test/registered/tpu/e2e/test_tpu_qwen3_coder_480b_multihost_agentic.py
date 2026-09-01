@@ -28,6 +28,7 @@ needed.
 import json
 import os
 import subprocess
+import sys
 import time
 import unittest
 
@@ -98,15 +99,30 @@ def _dump_leg_metrics(leg):
     Only the per-leg output_throughput carries `workload`, which is what routes it
     to the dashboard's performance tab; everything else the leg measured is dumped
     as kind=bench_detail -- stored in the dashboard's archive forever (a field not
-    recorded tonight cannot be back-filled once the job log expires), charted
-    nowhere. The leg tag is in the metric name because several legs share a run,
-    and the dashboard keys a night's point on (test_file, metric_name, model).
+    recorded tonight cannot be back-filled once the job log expires). The dashboard
+    still charts the bench_detail rows whose trailing field matches one of its
+    dropdown families (total/decode throughput, TTFT/TPOT/ITL). The leg tag is in
+    the metric name because several legs share a run, and the dashboard keys a
+    night's point on (test_file, metric_name, model).
     """
     tag = leg["tag"]
     numbers = {
         **(leg.get("metrics") or {}),
         **{f"derived.{k}": v for k, v in (leg.get("derived") or {}).items()},
     }
+    # bench_serving cannot account input tokens for a multi-turn replay, so its
+    # total_throughput degenerates to exactly output_throughput and its
+    # input_throughput to 0 (see nightly/README.md "Reading a result"). The
+    # dashboard picks its Total-throughput charts by the trailing field name, so
+    # dumping the degenerate value under `total_throughput` plotted a Total chart
+    # identical to the Decode one. Chart the corrected total (server-side prompt
+    # counter + output tokens, computed by summarize.py) under that name instead,
+    # and drop the two degenerate fields -- they carry no information to archive.
+    numbers.pop("input_throughput", None)
+    numbers.pop("total_throughput", None)
+    real_total = numbers.pop("derived.total_throughput", None)
+    if real_total is not None:
+        numbers["total_throughput"] = real_total
     for field, value in sorted(numbers.items()):
         if not isinstance(value, (int, float)):
             continue
@@ -455,6 +471,57 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
             )
             if clean:
                 _dump_leg_metrics(leg)
+
+
+class TestDumpLegMetricsShape(CustomTestCase):
+    """Host-side (no server): the dashboard contract of _dump_leg_metrics.
+
+    Guards the regression where the performance tab's Total-throughput charts
+    duplicated the Decode ones (observed through 2026-08-31): bench_serving
+    cannot account input tokens for a multi-turn replay, so its
+    total_throughput equals output_throughput exactly, and dumping it under the
+    family name charted the same series twice. The dashboard selects a chart
+    family by the metric name's trailing field, so the corrected derived total
+    must be the ONLY name ending in total_throughput, and a leg without the
+    server-side prompt counter must dump no total at all rather than the
+    degenerate one.
+    """
+
+    _LEG = {
+        "tag": "c1-long1",
+        "metrics": {
+            "output_throughput": 35.4,
+            "total_throughput": 35.4,  # degenerate: input tokens unaccounted
+            "input_throughput": 0.0,  # degenerate: input tokens unaccounted
+            "median_itl_ms": 25.0,
+        },
+        "derived": {"prompt_throughput": 1448.6, "total_throughput": 1484.0},
+    }
+
+    def _dumped(self, leg):
+        records = {}
+        module = sys.modules[__name__]
+        real = module.dump_metric
+        module.dump_metric = lambda name, value, labels=None: records.__setitem__(
+            name, (value, labels)
+        )
+        try:
+            _dump_leg_metrics(leg)
+        finally:
+            module.dump_metric = real
+        return records
+
+    def test_total_chart_gets_the_corrected_total(self):
+        records = self._dumped(self._LEG)
+        total_names = [n for n in records if n.endswith("total_throughput")]
+        self.assertEqual(total_names, ["c1-long1.total_throughput"])
+        self.assertEqual(records["c1-long1.total_throughput"][0], 1484.0)
+        self.assertNotIn("c1-long1.input_throughput", records)
+
+    def test_total_withheld_when_prompt_counter_missing(self):
+        records = self._dumped({**self._LEG, "derived": {}})
+        self.assertNotIn("c1-long1.total_throughput", records)
+        self.assertEqual(records["c1-long1.output_throughput"][0], 35.4)
 
 
 if __name__ == "__main__":
