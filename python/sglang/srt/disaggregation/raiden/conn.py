@@ -30,7 +30,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -63,6 +63,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
+
 logger = logging.getLogger(__name__)
 
 # Pages are announced to the decode in pieces of at least this many tokens. A
@@ -80,7 +83,9 @@ class RaidenKVCacheGroups:
     swa: List[Any]
 
 
-def get_raiden_kv_caches(pool, draft_pool=None) -> RaidenKVCacheGroups:
+def get_raiden_kv_caches(
+    pool: KVCache, draft_pool: Optional[KVCache] = None
+) -> RaidenKVCacheGroups:
     """Group per-layer device KV tensors by their page-index namespace.
 
     The TPU fused KV pool stores one [num_blocks, page_size, ...] tensor per
@@ -91,7 +96,7 @@ def get_raiden_kv_caches(pool, draft_pool=None) -> RaidenKVCacheGroups:
     the matching namespace and move them in the same Raiden transfer.
     """
 
-    def group_one(current_pool) -> RaidenKVCacheGroups:
+    def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
         if hasattr(current_pool, "get_fused_kv_buffer"):
             start = current_pool.start_layer
             buffers = [
