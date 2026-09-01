@@ -55,8 +55,15 @@ class TestTpuPlatformSurface(unittest.TestCase):
                 AttentionBackendEnum.FA, 128, torch.bfloat16
             )
 
-    def test_single_chip_distributed_backend_is_gloo(self):
-        self.assertEqual(TpuPlatform().get_torch_distributed_backend_str(), "gloo")
+    def test_lone_worker_distributed_backend_is_gloo(self):
+        with patch.dict(os.environ, {"WORLD_SIZE": "1"}):
+            self.assertEqual(TpuPlatform().get_torch_distributed_backend_str(), "gloo")
+
+    def test_multi_worker_distributed_backend_is_tpu_dist(self):
+        with patch.dict(os.environ, {"WORLD_SIZE": "16"}):
+            self.assertEqual(
+                TpuPlatform().get_torch_distributed_backend_str(), "tpu_dist"
+            )
 
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())
@@ -87,11 +94,6 @@ class TestWorkerInitOnce(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 TpuPlatform.set_device(torch.device("tpu", 0))
         self.assertFalse(TpuPlatform._worker_initialized)
-
-    def test_multi_rank_env_is_rejected(self):
-        with patch.dict(os.environ, {"WORLD_SIZE": "8"}):
-            with self.assertRaisesRegex(RuntimeError, "one worker"):
-                TpuPlatform._init_worker_process()
 
 
 @unittest.skipUnless(_HAS_TORCH_TPU, "torch_tpu not installed")

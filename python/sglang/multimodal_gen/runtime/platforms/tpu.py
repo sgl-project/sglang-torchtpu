@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""TPU platform backed by torch_tpu (PrivateUse1/PJRT). Single worker, one device."""
+"""TPU platform backed by torch_tpu (PrivateUse1/PJRT). One device per worker."""
 
 from __future__ import annotations
 
@@ -30,6 +30,13 @@ _DEVICE_MODULE_SHIMS = {
     "memory_reserved": lambda: _memory_stat("allocated_bytes.all.current"),
     "max_memory_reserved": lambda: _memory_stat("allocated_bytes.all.peak"),
 }
+
+
+_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE = 4 * 1024 * 1024 * 1024
+
+
+def _world_size() -> int:
+    return int(os.environ.get("WORLD_SIZE", "1"))
 
 
 def _memory_stat(key: str) -> int:
@@ -138,31 +145,35 @@ class TpuPlatform(Platform):
 
     @classmethod
     def _init_worker_process(cls) -> None:
-        from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang.srt.hardware_backend.tpu.patches import (
+            _patch_set_device_tolerate_mismatch,
+            _prepare_tpu_env,
+        )
 
-        # WORLD_SIZE is not set by gpu_worker yet; num_gpus == 1 is enforced earlier.
-        if os.environ.get("WORLD_SIZE", "1") != "1":
-            raise RuntimeError(
-                "TPU diffusion runs one worker, but WORLD_SIZE="
-                f"{os.environ['WORLD_SIZE']} was inherited."
-            )
         # srt's activate() selects CPU-only JAX for TorchTPU processes; the
         # worker cannot rely on that having run in the parent (entry-point
         # discovery), and _prepare_tpu_env refuses an unset value once JAX is
         # imported.
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
-        _prepare_tpu_env(resolve_single_host_topology=True)
+        # Host staging pool for multi-host DMA, sized as srt sizes it.
+        os.environ.setdefault(
+            "TPU_PREMAPPED_BUFFER_SIZE", str(_DEFAULT_TPU_PREMAPPED_BUFFER_SIZE)
+        )
+        _prepare_tpu_env(world_size=_world_size(), resolve_single_host_topology=True)
         import torch_tpu  # noqa: F401
 
         # Registers the "tpu" dynamo backend that simple_compile_backend names.
         import torch_tpu._internal.compile  # noqa: F401
 
+        # PJRT owns the chiplet binding; local_rank is only a label.
+        _patch_set_device_tolerate_mismatch()
+
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
 
     def get_torch_distributed_backend_str(self) -> str:
-        # tpu_dist requires one process per addressable device.
-        return "gloo"
+        # tpu_dist needs one addressable PJRT device; a lone worker has many.
+        return "gloo" if _world_size() == 1 else "tpu_dist"
 
     @classmethod
     def get_attn_backend_cls_str(

@@ -284,7 +284,7 @@ def init_distributed_environment(
         )
 
         # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
-        # TPU: gloo has no backend registered for the tpu device type
+        # TPU: PJRT owns the chiplet binding
         extra_args = (
             {}
             if (

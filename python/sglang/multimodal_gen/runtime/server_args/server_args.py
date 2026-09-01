@@ -142,6 +142,9 @@ WARMUP_MODES = ("off", "request", "server")
 # of different lengths share one captured graph.
 DEFAULT_BCG_TEXT_BUCKETS = (64, 128, 256, 512, 1024)
 
+# torch.distributed rendezvous port for a TPU slice, matching srt's DIST_PORT.
+_TPU_DIST_PORT = 10011
+
 BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
     {
         "comfy-org/ideogram-4",
@@ -1336,10 +1339,40 @@ class ServerArgs(DisaggServerArgsMixin):
             self.vae_cpu_offload = False
             self.cpu_offload_components = None
 
-        if current_platform.is_tpu() and self.num_gpus != 1:
+        if current_platform.is_tpu():
+            self._adjust_tpu_distributed()
+
+    def _adjust_tpu_distributed(self):
+        """Resolve the TPU distributed layout before any worker is spawned.
+
+        GKE injects an ordered TPU_WORKER_HOSTNAMES into every pod of a slice.
+        """
+        hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
+        if len(hosts) > 1:
+            if not self.is_arg_explicitly_set("nnodes"):
+                self.nnodes = len(hosts)
+            if not self.is_arg_explicitly_set("node_rank"):
+                self.node_rank = int(os.environ.get("TPU_WORKER_ID", "0"))
+            if self.dist_init_addr is None:
+                self.dist_init_addr = f"{hosts[0]}:{_TPU_DIST_PORT}"
+
+        if self.num_gpus > 1:
+            from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+
+            # Single-host ports are random, so pick them once for workers to inherit.
+            _prepare_tpu_env(
+                world_size=self.num_gpus, resolve_single_host_topology=False
+            )
+
+        if self.tp_size not in (None, 1):
             raise ValueError(
-                "TPU diffusion supports --num-gpus 1; distributed TPU support "
-                f"is a later milestone (got {self.num_gpus})."
+                "TPU diffusion has no tensor-parallel path yet; shard with "
+                f"--cfg-parallel-size / --sp-degree instead (got --tp-size {self.tp_size})."
+            )
+        if self.ring_degree not in (None, 1):
+            raise ValueError(
+                "TPU diffusion has no ring sequence-parallel path yet; use "
+                f"--ulysses-degree instead (got --ring-degree {self.ring_degree})."
             )
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:

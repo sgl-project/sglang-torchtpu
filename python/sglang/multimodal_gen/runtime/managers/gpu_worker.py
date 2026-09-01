@@ -228,16 +228,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        current_platform.set_device(current_platform.get_device(self.local_rank))
-        # num_gpus is the total world size across every node; the co-located,
-        # CPU-contending worker count on THIS host is num_gpus // nnodes.
-        local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
-        intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
-        if intra_op_threads is not None:
-            torch.set_num_threads(intra_op_threads)
         # Set environment variables for distributed initialization. Single
         # node rendezvous stays on loopback; cross-node rendezvous must use
         # an address every node can reach, so --dist-init-addr takes over.
+        # Set before set_device: a lazy backend reads WORLD_SIZE at first init.
         if self.server_args.nnodes > 1:
             rendezvous_addr = NetworkAddress.parse(self.server_args.dist_init_addr)
         else:
@@ -247,6 +241,13 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+        current_platform.set_device(current_platform.get_device(self.local_rank))
+        # num_gpus is the total world size across every node; the co-located,
+        # CPU-contending worker count on THIS host is num_gpus // nnodes.
+        local_num_gpus = self.server_args.num_gpus // self.server_args.nnodes
+        intra_op_threads = _worker_cpu_intra_op_threads(local_num_gpus)
+        if intra_op_threads is not None:
+            torch.set_num_threads(intra_op_threads)
         self._configure_persistent_torch_compile_cache()
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(

@@ -3011,7 +3011,7 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
                 tp_args._validate_direct_gpu_weight_loading()
 
 
-class TestTpuSingleWorkerValidation(unittest.TestCase):
+class TestTpuDistributedArgs(unittest.TestCase):
 
     def _args(self, num_gpus):
         with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
@@ -3031,10 +3031,55 @@ class TestTpuSingleWorkerValidation(unittest.TestCase):
         with self._on_tpu():
             self._args(1)._adjust_platform_specific()
 
-    def test_multi_gpu_is_rejected(self):
-        args = self._args(2)
-        with self._on_tpu():
-            with self.assertRaisesRegex(ValueError, "--num-gpus 1"):
+    @contextmanager
+    def _slice_env(self, **env):
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch("sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env") as prep,
+        ):
+            yield prep
+
+    def test_multi_gpu_seeds_the_slicebuilder_from_the_parent(self):
+        args = self._args(8)
+        with self._on_tpu(), self._slice_env() as prep:
+            args._adjust_platform_specific()
+        prep.assert_called_once_with(world_size=8, resolve_single_host_topology=False)
+
+    def test_slice_env_fills_the_multi_node_flags(self):
+        args = self._args(16)
+        with (
+            self._on_tpu(),
+            self._slice_env(TPU_WORKER_HOSTNAMES="host-a,host-b", TPU_WORKER_ID="1"),
+        ):
+            args._adjust_platform_specific()
+        self.assertEqual((args.nnodes, args.node_rank), (2, 1))
+        self.assertEqual(args.dist_init_addr, "host-a:10011")
+
+    def test_explicit_flags_beat_the_slice_env(self):
+        args = self._args(16)
+        args.nnodes, args.node_rank = 4, 3
+        args._explicit_arg_names |= {"nnodes", "node_rank"}
+        args.dist_init_addr = "chosen:1234"
+        with (
+            self._on_tpu(),
+            self._slice_env(TPU_WORKER_HOSTNAMES="host-a,host-b", TPU_WORKER_ID="1"),
+        ):
+            args._adjust_platform_specific()
+        self.assertEqual((args.nnodes, args.node_rank), (4, 3))
+        self.assertEqual(args.dist_init_addr, "chosen:1234")
+
+    def test_tensor_parallel_is_rejected(self):
+        args = self._args(8)
+        args.tp_size = 2
+        with self._on_tpu(), self._slice_env():
+            with self.assertRaisesRegex(ValueError, "tensor-parallel"):
+                args._adjust_platform_specific()
+
+    def test_ring_sequence_parallel_is_rejected(self):
+        args = self._args(8)
+        args.ring_degree = 2
+        with self._on_tpu(), self._slice_env():
+            with self.assertRaisesRegex(ValueError, "ring sequence-parallel"):
                 args._adjust_platform_specific()
 
     def test_other_platforms_are_unaffected(self):
