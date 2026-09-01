@@ -701,6 +701,9 @@ class TpuKVSender(TpuKVSenderBase):
     ):
         # Runs on the scheduler main thread; gather is inline (device-safe),
         # the network push is offloaded to a background thread.
+        if len(kv_indices) > 0 or state_indices is not None:
+            # Cover inline D2H gather, gaps between chunks, and network drain.
+            self._record_transfer_start()
         index_start = self.curr_idx
         self.curr_idx += len(kv_indices)
         is_last_chunk = self.curr_idx == self.num_kv_indices

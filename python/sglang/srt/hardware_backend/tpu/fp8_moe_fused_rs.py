@@ -14,6 +14,12 @@ import os
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+    get_tpu_fused_rs_post_expert_norm_weight,
+    has_tpu_fused_rs_post_expert_norm,
+    prepare_fused_moe_sequence_parallel_input,
+    prepare_tpu_fused_rs_post_expert_norm,
+)
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 
@@ -117,7 +123,12 @@ def fp8_fused_rs_unsupported_reason(
 
 def prepare_fp8_fused_rs(layer: torch.nn.Module) -> bool:
     """Eager, load-time prep for the FP8 fused-RS path. Returns True if enabled."""
-    return _prepare_fp8_fused_rs(layer, allow_no_combine=False)
+    has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)
+    prepare_tpu_fused_rs_post_expert_norm(layer)
+    return _prepare_fp8_fused_rs(
+        layer,
+        allow_no_combine=has_post_expert_norm,
+    )
 
 
 def _prepare_fp8_fused_rs(layer: torch.nn.Module, *, allow_no_combine: bool) -> bool:
@@ -172,7 +183,7 @@ def apply_fp8_fused_rs(
         layer=layer,
         dispatch_output=dispatch_output,
         activation=activation,
-        post_expert_norm_weight=None,
+        post_expert_norm_weight=get_tpu_fused_rs_post_expert_norm_weight(layer),
     )
 
 
@@ -183,6 +194,9 @@ def _apply_fp8_fused_rs(
     activation: str,
     post_expert_norm_weight: torch.Tensor | None = None,
 ) -> StandardCombineInput:
+    prepared_input = prepare_fused_moe_sequence_parallel_input(layer, dispatch_output)
+    dispatch_output = prepared_input.dispatch_output
+    keep_output_shard = prepared_input.plan.keep_output_shard
     x = dispatch_output.hidden_states
     has_post_expert_norm = post_expert_norm_weight is not None
     topk_weights, topk_ids, _ = dispatch_output.topk_output
@@ -217,10 +231,13 @@ def _apply_fp8_fused_rs(
         topk=topk,
         activation=activation,
         has_post_expert_norm=has_post_expert_norm,
-        # This wrapper gathers the returned shard in BF16. Enabling FP8 only
-        # for the in-kernel writes adds row quantization and scale DMAs without
-        # reducing the subsequent collective's traffic.
+        # Keep the fused-RS payload in BF16 for both the legacy all-gather and
+        # sequence-parallel local-shard paths. A direct FP8 write would add row
+        # quantization and scale DMAs before a BF16 consumer.
         fp8_direct_write=False,
-        physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+        tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
+        keep_token_shard=keep_output_shard,
     )
-    return StandardCombineInput(hidden_states=result[: x.shape[0]])
+    return StandardCombineInput(
+        hidden_states=result[: prepared_input.output_token_count]
+    )

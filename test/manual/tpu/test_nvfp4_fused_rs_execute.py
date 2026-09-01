@@ -178,6 +178,7 @@ def _make_fused_rs_kernel(
             activation="silu",
             has_post_expert_norm=False,
             fp8_direct_write=False,
+            tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
         )
 
     return kernel
@@ -205,7 +206,7 @@ def main() -> None:
 
     physical_id = tpu_distributed.global_device_id()
     group_offset = torch.tensor(
-        [rank * local_experts, physical_id], dtype=torch.int32, device=device
+        [rank * local_experts, rank], dtype=torch.int32, device=device
     )
     no_post_norm = torch.zeros(1, dtype=torch.bfloat16, device=device)
 
@@ -279,9 +280,7 @@ def main() -> None:
             )
             dist.all_reduce(reference, op=dist.ReduceOp.SUM)
             shard_tokens = padded_tokens // world_size
-            expected = reference[
-                physical_id * shard_tokens : (physical_id + 1) * shard_tokens
-            ].cpu()
+            expected = reference[rank * shard_tokens : (rank + 1) * shard_tokens].cpu()
 
             previous = None
             for iteration in range(2):

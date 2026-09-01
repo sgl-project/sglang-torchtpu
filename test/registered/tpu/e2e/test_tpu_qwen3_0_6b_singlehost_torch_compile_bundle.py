@@ -15,7 +15,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_tpu_ci(est_time=180, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(
+    est_time=180,
+    suite="stage-b-test-tpu-4-v7",
+    labels=["singlehost", "qwen3-0.6b", "torch-compile"],
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 

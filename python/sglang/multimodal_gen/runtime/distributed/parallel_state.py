@@ -284,6 +284,7 @@ def init_distributed_environment(
         )
 
         # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
+        # TPU: gloo has no backend registered for the tpu device type
         extra_args = (
             {}
             if (
@@ -292,6 +293,7 @@ def init_distributed_environment(
                 or current_platform.is_npu()
                 or current_platform.is_cpu()
                 or current_platform.is_xpu()
+                or current_platform.is_tpu()
             )
             else dict(device_id=device_id)
         )

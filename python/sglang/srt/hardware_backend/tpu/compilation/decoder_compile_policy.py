@@ -13,6 +13,7 @@ import tqdm
 
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
@@ -786,6 +787,12 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             checker, model_label=model_label
         )
 
+    def snapshot_recompilation_baseline(self) -> None:
+        """Re-baseline the recompilation checker; no-op unless it is enabled."""
+        checker = self.compiled_forward_shim._recompilation_checker
+        if checker is not None:
+            checker.snapshot_baseline()
+
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
@@ -818,6 +825,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             for num_tokens, bs, mode in compile_cases
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
+        # Input (prompt) logprobs need every prefill row, so they warm the
+        # FULL-capture variant instead of the NULL one -- a replacement, not an
+        # addition, because the shim then presents FULL on every extend and a
+        # single variant covers both. Off by default, which leaves this exactly
+        # the extend graph the backend has always compiled.
+        extend_capture_hidden_mode = (
+            CaptureHiddenMode.FULL
+            if envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
+            else CaptureHiddenMode.NULL
+        )
         logger.info(
             "[decoder compile policy] EXTEND/MIXED: %d graph variants "
             "(mode_caps=%s, token_buckets=%s)",
@@ -842,6 +859,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 bs=bs,
                 mode=mode,
                 logits_output_mode=logits_output_mode,
+                capture_hidden_mode=extend_capture_hidden_mode,
             )
             if get_parallel().tp_rank == 0:
                 elapsed = time.perf_counter() - start

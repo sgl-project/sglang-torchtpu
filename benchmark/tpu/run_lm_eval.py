@@ -98,7 +98,7 @@ def main() -> int:
             json.dump(results, f, indent=2, default=str)
         print(f"wrote {result_path}")
 
-    if args.skip_baseline_check:
+    if args.skip_baseline_check or config.get("report_only", False):
         return 0
 
     return 0 if _check_baselines(results, config) else 1

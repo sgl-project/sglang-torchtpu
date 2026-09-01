@@ -48,6 +48,8 @@ class AccuracyTestParams:
     # feeds dashboards, so only declared gates are ever plotted; the backends' own
     # dump_metric calls stay as stored-but-unplotted detail.
     metric_labels: Optional[dict] = None
+    # Report a completed score without comparing it to a quality floor.
+    report_only: bool = False
 
     @property
     def name(self) -> str:
@@ -590,15 +592,33 @@ def run_accuracy_test(
     if score is None:
         score = metrics.get("mean_score")
     if score is None:
-        score = metrics.get("accuracy", 0.0)
+        score = metrics.get("accuracy")
+    if params.report_only and score is None:
+        error = f"{params.name}: eval completed without a numeric score"
+        print(f"✗ {error}")
+        return AccuracyTestResult(
+            model=model.model_path,
+            dataset=params.name,
+            passed=False,
+            score=None,
+            baseline_accuracy=None,
+            error=error,
+            variant=model.variant,
+        )
     latency = metrics.get("latency")
+    if score is None:
+        score = 0.0
 
     # Dump per gate, not after the aggregate verdict: a sibling gate failing the
     # file must not cost this one its datapoint.
     if params.metric_labels is not None and score is not None:
         dump_metric(params.name, score, labels=params.metric_labels)
 
-    if "_passed" in metrics:
+    if params.report_only:
+        passed = True
+        error = None
+        print(f"✓ {params.name}: recorded score {score:.4f} (report only)")
+    elif "_passed" in metrics:
         # The runner gated itself (it owns thresholds we cannot see from here).
         passed = metrics["_passed"]
         error = None if passed else "; ".join(metrics.get("_failures") or [])

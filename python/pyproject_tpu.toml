@@ -137,6 +137,8 @@ diffusion_tpu = [
   "diffusers==0.37.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
+  # test/test_utils.py imports cv2 unconditionally; the server harness needs it.
+  "opencv-python-headless==4.10.0.84",
   "PyYAML==6.0.1",
 ]
 dev_tpu = [

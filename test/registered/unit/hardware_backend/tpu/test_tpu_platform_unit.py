@@ -372,9 +372,6 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         with (
             patch.dict(os.environ, {}, clear=True),
             patch(
-                "sglang.srt.hardware_backend.tpu.pallas_export.configure_jax_export_env"
-            ),
-            patch(
                 "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
             ),
             patch("builtins.__import__", side_effect=track_import),

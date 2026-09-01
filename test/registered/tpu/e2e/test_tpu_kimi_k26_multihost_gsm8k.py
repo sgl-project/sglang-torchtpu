@@ -26,7 +26,12 @@ from sglang.test.tpu import model_config_main
 # land: on-demand suite, discovered by accuracy-test-tpu.yml
 # (-f model=kimi-k26). `disabled=` did not park it -- discover_multihost.py does
 # not read that field -- so the suite name is what keeps it out of the nightly.
-register_tpu_ci(est_time=7200, suite="nightly-tpu-multihost-ondemand", nightly=True)
+register_tpu_ci(
+    est_time=7200,
+    suite="nightly-tpu-multihost-ondemand",
+    nightly=True,
+    labels=["multihost", "kimi-k2.6"],
+)
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,

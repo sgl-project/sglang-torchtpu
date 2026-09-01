@@ -142,6 +142,11 @@ class TestFusedMoEExpertParallel(CustomTestCase):
             ("tensor_core_prefill", 512, 0),
             # Decode-sized batch takes the kernels' small-input fallbacks.
             ("sparse_core_decode", 16, 1),
+            # Multi-block: the SC gather is restricted to this rank's routed-row
+            # window, so its grid must cover a strict subset of the blocks. At
+            # 512 tokens out_size is 2048 = one 2048-row block on v7x, which
+            # makes the window a no-op and hides any clipping bug.
+            ("sparse_core_multiblock", 4096, 1),
         ]
         for name, tokens, use_sc_gather in cases:
             with self.subTest(name=name):
@@ -150,6 +155,43 @@ class TestFusedMoEExpertParallel(CustomTestCase):
                 partials = self.run_all_ranks(inputs, use_sc_gather=use_sc_gather)
                 actual = jnp.stack(partials).sum(axis=0)
                 self.assert_close(actual, expected, context=name)
+
+    def test_sc_window_matches_tensorcore_multiblock(self):
+        """The windowed SparseCore gather must agree per-rank with the
+        full-range TensorCore gather.
+
+        ``test_ep_sum_matches_full_moe`` compares a *sum* over ranks, which can
+        hide a clipping bug that moves contribution between ranks. This compares
+        each rank against a path that never narrows its gather, at a token count
+        where the window spans several SC blocks.
+
+        Repeated: rows outside the window are left uninitialized, and a fresh
+        HBM buffer is often zero, so a clipping bug can pass once and fail only
+        after the allocator hands back a dirty buffer.
+        """
+        tokens = 4096  # out_size = tokens * TOPK = 16384 = 8 blocks of 2048
+        local = self.GLOBAL_EXPERTS // self.EP_SIZE
+        for attempt in range(5):
+            inputs = self.make_inputs(tokens=tokens, seed=attempt)
+            x, w1, w2, topk_weights, topk_ids = inputs
+            for rank in range(self.EP_SIZE):
+                offset = rank * local
+                kw = dict(
+                    x=x,
+                    w1=w1[offset : offset + local],
+                    w2=w2[offset : offset + local],
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    global_num_experts=self.GLOBAL_EXPERTS,
+                    expert_group_offset=offset,
+                )
+                windowed = self.run_kernel(use_sc_gather=1, **kw)
+                full_range = self.run_kernel(use_sc_gather=0, **kw)
+                self.assert_close(
+                    windowed,
+                    full_range,
+                    context=f"attempt={attempt} rank={rank}",
+                )
 
     def test_rank_without_tokens(self):
         """A rank whose expert window receives no routed tokens contributes

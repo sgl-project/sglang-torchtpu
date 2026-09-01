@@ -1,4 +1,4 @@
-# TPU Nightly CI & Dashboard Redesign (Proposal)
+# TPU Nightly CI & Dashboard — Design
 
 
 ## Motivation
@@ -53,8 +53,8 @@ others, and improvements proposed here.
 | category | protocol |
 |---|---|
 | **Feature validation** | Tests a *feature* (P/D, spec decoding, KV offload, …) on some model. Register into a nightly suite → tracked (Overview on failure, History for 7 days). One job ↔ one test file. No metric dump needed — pass/fail comes from the TIMINGS record. |
-| **Accuracy** | Model backbone only: basic serving config, **no feature flags**. One file, one suite per model. Dumps the required accuracy fields/labels below. Stable `id`, never renamed. |
-| **Perf** | Specific model + specific serving config, built on `RecipeLauncher` + `bench_serving.sh` **only** (that is what puts the server/bench config panels on the dashboard). Optional smoke legs first. Dumps the required perf fields/labels below. Stable `id`, never renamed. |
+| **Accuracy** | Model backbone only: basic serving config, **no feature flags**. One file and one suite **per benchmark** (a slow AIME must not cost GPQA its score or its runtime budget), all sharing one per-model config module (`gpt_oss_120b_eval_common.py`) so the serving config stays one copy. Scores are `report_only` — the trend is the regression detector, same philosophy as perf. Dumps the required accuracy fields/labels below. Stable per-benchmark `id`, never renamed. |
+| **Perf** | Specific model + specific serving config, built on `RecipeLauncher` + `bench_serving.sh` **only** (that is what puts the server/bench config panels on the dashboard). Optional smoke legs first. Dumps the required perf fields/labels below, and emits the whole measurement once more as the framed JSON payload (`emit_result_payload`, §B.3a). Stable `id`, never renamed. |
 
 Required dump fields and labels — a pr-gate unit test (label lint) fails any
 PR whose test is missing one:
@@ -82,22 +82,25 @@ def main():
     ...  # assert the FEATURE against the live server; raise on failure
 ```
 
-**Accuracy** — eval gates against one basic-config server boot:
+**Accuracy** — one eval per file, against one basic-config server boot; the
+serving config lives once in the model's common module:
 
 ```python
-# test/registered/tpu/nightly-accuracy/test_tpu_mymodel_singlehost_smoke.py
-register_tpu_ci(est_time=2400, suite="nightly-tpu-accuracy-mymodel", nightly=True)
+# test/registered/tpu/nightly-accuracy/test_tpu_mymodel_gsm8k.py
+register_tpu_ci(
+    est_time=2700, suite="nightly-tpu-accuracy-mymodel-gsm8k", nightly=True
+)
 
-MODEL_CONFIG = {
-    "id": "accuracy-mymodel",        # series join key — never renamed
-    "display_name": "MyModel 120B",  # cosmetic, free to change
-    "model": "org/mymodel-120b",     # canonical HF id
-    "launch": {"recipe": "recipe/mymodel/server.sh", "env": {}},  # BASIC config only
-    "gates": [{"dataset": "mmlu", "label": "mmlu_low",
-               "baseline": 0.859, "atol": 0.03}],
-}
-# each gate score → dump_metric("mmlu_low", score,
-#     labels={"kind": "accuracy", "model": MODEL, "eval": "mmlu"})
+MODEL_CONFIG = make_model_config(     # from mymodel_eval_common.py
+    test_name="mymodel-gsm8k",
+    series_id="accuracy-mymodel-gsm8k",  # join key — never renamed
+    tag="gsm8k-e2e",
+    launch_env=make_launch_env(OSL="4096", CONCUR="32"),  # eval-sized deltas only
+    gate={"dataset": "gsm8k", "label": "gsm8k_full", "report_only": True},
+)
+# the gate score → dump_metric("gsm8k_full", score, labels={"kind": "accuracy",
+#     "model": "mymodel-120b", "id": "accuracy-mymodel-gsm8k",
+#     "display_name": "MyModel 120B"})
 
 model_config_main(MODEL_CONFIG, base_url=BASE_URL)
 ```
@@ -160,8 +163,8 @@ test/registered/tpu/
 ├── integration/                feature validation — cross-component gates
 ├── unit/                       pr-gate unit tests (incl. the dashboard-contract checks)
 ├── legacy/                     not tracked by the nightly dashboard
-├── nightly-accuracy/           accuracy — one file, one suite per model
-│   └── test_tpu_<model>_singlehost_smoke.py
+├── nightly-accuracy/           accuracy — one file, one suite per benchmark
+│   └── test_tpu_<model>_<benchmark>.py   (config via <model>_eval_common.py)
 └── nightly-perf/               perf — one file, one suite per model
     └── test_tpu_perf_<model>.py
 
@@ -306,6 +309,25 @@ Contract for a perf suite:
    the investigation (what config failed to even smoke?) happens on the
    dashboard.
 
+#### B.3a The framed result payload (perf standard)
+
+Set by `test_tpu_qwen3_coder_480b_multihost_agentic.py` and hoisted into
+`sglang.test.tpu.emit_result_payload`, which `bench_serving_runner` also calls:
+every perf measurement ends with one machine-readable summary printed between
+the `=== TPU_BENCH_RESULT_JSON BEGIN/END ===` markers (_tpu-test.yml lifts the
+block into a run artifact + job summary; the marker text never changes).
+
+The order of egress is the contract:
+
+1. **Digest lines first** — one short line per leg with the fields the gates
+   read. The payload is the fragile half (a streamed pod log can die on the
+   BEGIN marker), so triage never depends on it surviving.
+2. **`dump_metric` per number, clean legs only** — a failed leg complains via
+   the gate's failure text and the ✕ record (§B.3) instead of dumping numbers.
+3. **The framed payload last** — the whole summary (clean legs with their full
+   record, failed legs with their reason), pretty-printed so the 16 KiB CRI
+   log-record cap can only split it BETWEEN tokens.
+
 #### B.4 Feature-validation rows
 
 No metric dump needed — the `Test Summary` / `TIMINGS` block (or the
@@ -335,6 +357,16 @@ schema is open in both directions — extra labels and extra record fields:
    the forward-compatibility guarantee. A new axis of analysis is one extra
    label in the test, zero keel changes.
 
+2a. **Two label layers.** The labels above are *metric* labels (per
+   `dump_metric` record). Separately, every `register_tpu_ci(...)` may carry
+   **test-level** `labels=["gpt-oss-120b", "pd", ...]` — free-form tags parsed
+   from source (AST, runtime no-op) that keel renders as clickable chips
+   filtering the dashboard's TEST LIST (Overview / History): checking
+   `gpt-oss-120b` shows only that model's tests, multiple checks OR together.
+   Vocabulary in use: topology (`singlehost`/`multihost`), model slug, and
+   feature tags (`pd`, `spec`, `dpa`, `prefix-cache`, `kv-offload`, ...).
+   They never affect scheduling.
+
 3. **Reserved keys live here.** The contract owns exactly:
    `kind`, `id`, `display_name`, `model`, `workload`, `eval`, `reason`.
    Everything else is custom. A future contract key is added to this list
@@ -358,6 +390,12 @@ schema is open in both directions — extra labels and extra record fields:
    visible on the dashboard but has no chart for (environment fingerprints,
    artifact links, tuning notes) ships as an info record today and can be
    promoted to first-class rendering later — the data is already flowing.
+
+   `info` is a **label value, not an API**: it rides the existing
+   `dump_metric` v1 JSONL exactly like every other record — there is no
+   separate dump function to maintain. A scalar goes in `value` as-is; a
+   bulky payload goes in `value` as a `json.dumps` string (v1 values are
+   int/float/str).
 
 ---
 

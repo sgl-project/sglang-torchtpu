@@ -2,7 +2,6 @@
 
 """Unit tests for the TPU fused-RS Torch wrapper."""
 
-import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -39,50 +38,44 @@ class TestFusedMoeRsOp(CustomTestCase):
         layer.w13_weight = torch.empty(1)
 
         with (
-            patch.dict(
-                os.environ,
-                {"TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS": "false"},
-            ),
             patch.object(
                 fused_moe_rs_op,
-                "_get_physical_rank_metadata",
+                "_get_tp_rank_to_device_id_mapping",
                 return_value=(4, (0, 1, 6, 7, 2, 3, 4, 5)),
             ),
             patch(
-                "sglang.srt.distributed.parallel_state." "get_moe_expert_parallel_rank",
-                return_value=2,
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=Mock(moe_ep_rank=2),
             ),
             patch.object(fused_moe_rs_op, "_build_fused_moe_rs_op") as build,
         ):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
-            self.assertEqual(
-                os.environ["TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS"],
-                "false",
-            )
 
         torch.testing.assert_close(
-            layer._tpu_fused_rs_physical_order,
-            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int64),
+            layer._tpu_fused_rs_tp_rank_to_device_id,
+            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int32),
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
-            torch.tensor([32, 4], dtype=torch.int32),
+            torch.tensor([32, 2], dtype=torch.int32),
         )
-        self.assertIn("_tpu_fused_rs_physical_order", layer._buffers)
+        self.assertIn("_tpu_fused_rs_tp_rank_to_device_id", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
-        self.assertIn("_tpu_fused_rs_physical_order", layer._non_persistent_buffers_set)
+        self.assertIn(
+            "_tpu_fused_rs_tp_rank_to_device_id", layer._non_persistent_buffers_set
+        )
         self.assertIn("_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set)
         self.assertEqual(build.call_count, 2)
 
     def test_gather_reorders_tp_ranks_to_physical_device_order(self):
-        rank_order_shards = torch.tensor([[0], [1], [4], [5], [6], [7], [2], [3]])
-        physical_order_to_tp_rank = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5])
+        rank_order_shards = torch.tensor([[0], [1], [2], [3], [4], [5], [6], [7]])
+        tp_rank_to_device_id = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int32)
         tp_group = Mock(
             world_size=8,
             all_gather=Mock(return_value=rank_order_shards),
         )
-        token_shard = torch.zeros(1, 1)
+        token_shard = torch.zeros(2, 1)
 
         with (
             patch(
@@ -109,11 +102,101 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=True,
-                physical_order_to_tp_rank=physical_order_to_tp_rank,
+                tp_rank_to_device_id=tp_rank_to_device_id,
             )
 
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
         tp_group.all_gather.assert_called_once_with(token_shard, dim=0)
+
+    def test_keep_token_shard_skips_gather(self):
+        token_shard = torch.tensor([[4], [5]], dtype=torch.bfloat16)
+        tp_group = Mock(world_size=8)
+
+        with (
+            patch("sglang.srt.distributed.get_tp_group", return_value=tp_group),
+            patch.object(
+                fused_moe_rs_op,
+                "fused_moe_rs_call",
+                return_value=token_shard,
+            ),
+        ):
+            output = fused_moe_rs_op.fused_moe_rs_gather(
+                hidden_states=torch.zeros(16, 1),
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=torch.ones(16, 1),
+                topk_ids=torch.zeros(16, 1, dtype=torch.int32),
+                post_expert_norm_weight=torch.empty(1),
+                group_offset=torch.empty(1),
+                topk=8,
+                activation="silu",
+                has_post_expert_norm=False,
+                fp8_direct_write=False,
+                tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
+                keep_token_shard=True,
+            )
+
+        torch.testing.assert_close(output, token_shard)
+        tp_group.all_gather.assert_not_called()
+
+    def test_keep_token_shard_pads_each_logical_rank_block(self):
+        hidden_states = torch.arange(8, dtype=torch.bfloat16).reshape(8, 1)
+        topk_weights = hidden_states.clone()
+        topk_ids = torch.arange(8, dtype=torch.int32).reshape(8, 1)
+        token_shard = torch.tensor([[5], [0]], dtype=torch.bfloat16)
+
+        with patch.object(
+            fused_moe_rs_op,
+            "fused_moe_rs_call",
+            return_value=token_shard,
+        ) as fused:
+            output = fused_moe_rs_op.fused_moe_rs_gather(
+                hidden_states=hidden_states,
+                w1=torch.empty(1),
+                w2=torch.empty(1),
+                w1_scale=torch.empty(1),
+                w2_scale=torch.empty(1),
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                post_expert_norm_weight=torch.empty(1),
+                group_offset=torch.empty(1),
+                topk=1,
+                activation="silu",
+                has_post_expert_norm=False,
+                fp8_direct_write=False,
+                tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
+                keep_token_shard=True,
+            )
+
+        expected = torch.tensor(
+            [
+                [0],
+                [0],
+                [1],
+                [0],
+                [2],
+                [0],
+                [3],
+                [0],
+                [4],
+                [0],
+                [5],
+                [0],
+                [6],
+                [0],
+                [7],
+                [0],
+            ],
+            dtype=torch.bfloat16,
+        )
+        torch.testing.assert_close(fused.call_args.kwargs["hidden_states"], expected)
+        torch.testing.assert_close(fused.call_args.kwargs["topk_weights"], expected)
+        torch.testing.assert_close(
+            fused.call_args.kwargs["topk_ids"], expected.to(torch.int32)
+        )
+        torch.testing.assert_close(output, torch.tensor([[5]], dtype=torch.bfloat16))
 
 
 if __name__ == "__main__":

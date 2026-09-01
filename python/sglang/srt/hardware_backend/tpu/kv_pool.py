@@ -443,7 +443,12 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     def get_contiguous_buf_infos(self):
         kv_data_ptrs = [buf.data_ptr() for buf in self.kv_buffer]
         kv_data_lens = [buf.nbytes for buf in self.kv_buffer]
-        kv_item_lens = [buf[0].nbytes * self.page_size for buf in self.kv_buffer]
+        # One item = one page. The fused buffers are page-major -- every layout
+        # under this class leads with ``num_blocks`` (see ``_create_buffers`` here
+        # and in TpuSeqAlongLaneKVPool) -- so ``buf[0]`` already spans the page's
+        # ``page_size`` token slots. Multiplying by ``page_size`` again counted
+        # them twice and inflated every KV-transfer byte count by that factor.
+        kv_item_lens = [buf[0].nbytes for buf in self.kv_buffer]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
 

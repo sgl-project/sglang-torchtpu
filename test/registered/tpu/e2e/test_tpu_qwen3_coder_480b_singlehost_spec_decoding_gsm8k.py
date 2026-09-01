@@ -13,6 +13,7 @@ register_tpu_ci(
     est_time=3600,
     suite="stage-b-test-tpu-4-v7",
     disabled="Removed from CI",
+    labels=["singlehost", "qwen3-coder-480b", "spec"],
 )
 
 SERVED_MODEL_NAME = "qwen3-coder-480b"

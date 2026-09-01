@@ -553,7 +553,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if hasattr(kv_manager, "set_kv_caches"):
             from sglang.srt.disaggregation.raiden.conn import get_raiden_kv_caches
 
-            kv_manager.set_kv_caches(get_raiden_kv_caches(self.token_to_kv_pool))
+            kv_manager.set_kv_caches(
+                get_raiden_kv_caches(
+                    self.token_to_kv_pool,
+                    draft_pool=self.draft_token_to_kv_pool,
+                )
+            )
         return kv_manager
 
     def add(

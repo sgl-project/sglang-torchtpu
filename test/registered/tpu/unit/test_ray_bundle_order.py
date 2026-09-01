@@ -338,9 +338,6 @@ class TestComputeSingleHostTpuEnv(CustomTestCase):
 
         with (
             mock.patch(
-                "sglang.srt.hardware_backend.tpu.pallas_export.configure_jax_export_env"
-            ),
-            mock.patch(
                 "sglang.srt.hardware_backend.tpu.env_override.apply_tpu_env_overrides"
             ),
             mock.patch(

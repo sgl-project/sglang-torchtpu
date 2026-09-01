@@ -157,27 +157,45 @@ def main():
     physical_id = tpu_distributed.global_device_id()
     local_expert = rank
     kernel_topk_ids = topk_ids
-    if test_divergent_ids and physical_id != 0:
+    if test_divergent_ids and rank != 0:
         # A synthetic mismatch ensures that the synchronized ID slice remains
         # in the compiled dataflow. It does not imply that production routing
         # IDs have been observed to diverge.
-        kernel_topk_ids = (topk_ids + physical_id) % world_size
+        kernel_topk_ids = (topk_ids + rank) % world_size
     kernel_topk_weights = topk_weights
-    if test_divergent_weights and physical_id != 0:
-        # The compiled fused-RS path must consume physical device 0's routing
+    if test_divergent_weights and rank != 0:
+        # The compiled fused-RS path must consume rank 0's routing
         # weights. Keep IDs identical because production ablations do not show
         # that routing IDs diverge or need to be canonicalized.
-        kernel_topk_weights = topk_weights * (physical_id + 1)
+        kernel_topk_weights = topk_weights * (rank + 1)
 
     from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
         _build_fused_moe_rs_op,
+        _get_tp_rank_to_device_id_mapping,
         fused_moe_rs_call,
         fused_moe_rs_padded_tokens,
     )
 
     _build_fused_moe_rs_op()
+    _, tp_rank_to_device_id = _get_tp_rank_to_device_id_mapping()
+    tp_rank_to_device_id_tensor = torch.tensor(
+        tp_rank_to_device_id,
+        dtype=torch.int32,
+        device=device,
+    )
 
-    def kernel(x, w1, w2, s1, s2, weights, ids, group_offset, norm_weight):
+    def kernel(
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        weights,
+        ids,
+        group_offset,
+        norm_weight,
+        tp_rank_to_dev_id,
+    ):
         valid = ids >= 0
         ids = torch.where(valid, ids, torch.zeros_like(ids))
         weights = weights * valid.to(weights.dtype)
@@ -201,6 +219,7 @@ def main():
                     activation="silu",
                     has_post_expert_norm=test_post_expert_norm,
                     fp8_direct_write=fp8_direct_write,
+                    tp_rank_to_device_id=tp_rank_to_dev_id,
                 )
             )
         return outputs[0] if layers == 1 else tuple(outputs)
@@ -219,7 +238,7 @@ def main():
         w2_scale_local.to(device),
         kernel_topk_weights.to(device),
         kernel_topk_ids.to(device),
-        torch.tensor([local_expert, physical_id], dtype=torch.int32, device=device),
+        torch.tensor([local_expert, rank], dtype=torch.int32, device=device),
     )
     actual_outputs = compiled(
         *kernel_args,
@@ -228,6 +247,7 @@ def main():
             if test_post_expert_norm
             else torch.zeros(1, dtype=torch.bfloat16, device=device)
         ),
+        tp_rank_to_device_id_tensor,
     )
     if layers == 1:
         actual_outputs = (actual_outputs,)
@@ -238,7 +258,7 @@ def main():
     if expected is not None and padded_tokens != tokens:
         expected = torch.nn.functional.pad(expected, (0, 0, 0, padded_tokens - tokens))
     shard_size = padded_tokens // world_size
-    shard = slice(physical_id * shard_size, (physical_id + 1) * shard_size)
+    shard = slice(rank * shard_size, (rank + 1) * shard_size)
     for layer, actual in enumerate(actual_outputs):
         actual = actual.cpu()
         if layers == 1:

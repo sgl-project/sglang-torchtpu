@@ -2,9 +2,11 @@
 (live-server mode), the colocated half of the team's standard 480B contract.
 
 Its MULTIHOST_LAUNCH forms its own launch group: recipe/qwen3_coder_480b_agentic_mh.sh
-on 2 hosts, i.e. tp=16 / ep=16 / dp=4 -> attention_tp=4, prefix caching + HiCache
+on 2 hosts, i.e. tp=16 / ep=16 / dp=2 -> attention_tp=8, prefix caching + HiCache
 KV offload on, 1M server context. The CI runs this file on rank-0 against the
-server the JobSet brought up; it skips unless a live server is provided.
+server the JobSet brought up; it skips unless a live server is provided. DP size
+is config.sh's COLOCATED_DP and is overridable, so nothing here hardcodes it --
+the prefix-cache gate reads dp_size back off the run.
 
 WHAT IS ASSERTED, and what is not. Throughput is *recorded*, never gated: the TPU
 slice is shared, so a tok/s floor would be a flake generator, and regression
@@ -17,9 +19,10 @@ that the run is trustworthy at all:
   * the server admitted the work without retracting or aborting requests
 Those are the invariants that make a number mean what it says.
 
-First-run watch items: the tp=16 dp=4 DP-attention decode precompile --
-attn_tp=4 is the shape PR #279 fixed. The weights are already on the shared
-model-weights-rox PVC, so no hydration step is needed.
+Watch items: the tp=16 dp=2 DP-attention decode precompile at attn_tp=8 (PR #279
+fixed the attn_tp=4 shape this ran at before COLOCATED_DP dropped to 2). The
+weights are already on the shared model-weights-rox PVC, so no hydration step is
+needed.
 """
 
 import json
@@ -32,8 +35,14 @@ import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
+from sglang.test.tpu import emit_result_payload
 
-register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
+register_tpu_ci(
+    est_time=1800,
+    suite="nightly-tpu-multihost",
+    nightly=True,
+    labels=["multihost", "qwen3-coder-480b", "agentic"],
+)
 
 # Own launch group: the 480B agentic recipe + the shared ROX weights volume.
 MULTIHOST_LAUNCH = {
@@ -58,25 +67,24 @@ HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
 # the template gave a file 1800s and the sweep was described as two legs.)
 SWEEP_TIMEOUT = int(os.environ.get("SWEEP_TIMEOUT", "2700"))
 PROFILE = os.environ.get("PROFILE", "ci")
-# Fraction of the ACHIEVABLE prefix-cache hit rate a leg must reach. The
-# achievable rate is set by the workload shape, not by the server: round 1 of a
-# session is always a miss, so a 3-round session (the 16k default) tops out near
-# 56% while a 25-round one reaches ~94%. A fixed threshold is wrong at one end or
-# the other -- 90% fails every 16k leg, 30% would let a 128k leg silently fall to
-# a third of its hit rate and still pass. Set MIN_PREFIX_HIT_RATE to gate on an
-# absolute rate instead.
+# Fraction of the REACHABLE prefix-cache hit rate a leg must reach. The reachable
+# rate is set by the workload shape AND the DP count: the first D rounds of a
+# session can never hit, so a 6-round session at dp=2 tops out near 51% while the
+# same session against one shared cache would reach 76%. A fixed threshold is
+# wrong at one end or the other -- 90% fails every 16k leg, 30% would let a 128k
+# leg silently fall to a third of its hit rate and still pass. Set
+# MIN_PREFIX_HIT_RATE to gate on an absolute rate instead.
 MIN_PREFIX_HIT_FRACTION = float(os.environ.get("MIN_PREFIX_HIT_FRACTION", "0.6"))
 MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
-
-# The only egress from a TPU JobSet is the streamed pod log, so the results JSON is
-# printed between these markers; .github/workflows/_tpu-test.yml lifts it out into
-# a run artifact + the job summary.
-RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
-RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
 
 # Dashboard series key. The canonical HF id, not the mount path the recipe serves
 # from -- remounting the weights elsewhere must not split the trend in two.
 MODEL_LABEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
+# Stable series join key + its cosmetic display half, same contract as the
+# MODEL_CONFIG-driven perf tests: `id` is never renamed (forced renames go
+# through .github/tpu-ci/dashboard_aliases.json), the display name is free.
+SERIES_ID = "perf-qwen3-coder-480b-agentic"
+DISPLAY_NAME = "Qwen3-Coder-480B agentic"
 
 
 def _direction(field: str) -> str:
@@ -108,11 +116,16 @@ def _dump_leg_metrics(leg):
     for field, value in sorted(numbers.items()):
         if not isinstance(value, (int, float)):
             continue
-        labels = {"model": MODEL_LABEL, "direction": _direction(field)}
+        labels = {
+            "model": MODEL_LABEL,
+            "direction": _direction(field),
+            "id": SERIES_ID,
+        }
         if field == "output_throughput":
             labels["kind"] = "performance"
             labels["workload"] = tag
             labels["headline"] = "1"
+            labels["display_name"] = DISPLAY_NAME
         else:
             labels["kind"] = "info"
             labels["workload_name"] = tag
@@ -124,7 +137,7 @@ def _print_workload_digest(summary) -> None:
 
     "workload" matches the metric labels; summary.json's schema still says legs.
 
-    The payload is the fragile half of the egress (see `_emit_result_json`), and
+    The payload is the fragile half of the egress (see `emit_result_payload`), and
     on 2026-08-26 and 08-28 the job log ended on the RESULT_BEGIN marker -- so the
     gsm8k-style verdict, the failing assertion and the TIMINGS record were all
     lost behind it and the red run said nothing about why. These lines are a few
@@ -142,40 +155,32 @@ def _print_workload_digest(summary) -> None:
         )
 
 
-def _emit_result_json(summary) -> None:
-    """Print the summary between the markers, shaped to survive the log stream.
-
-    The only egress from a TPU JobSet is the streamed pod log, and containerd caps
-    a single log record at 16 KiB -- a summary emitted as one long line is split
-    into CRI partial records and has twice taken the rest of the job log with it.
-    `indent` keeps every line short without changing what the consumer sees:
-    _tpu-test.yml's awk rejoins the block with newlines, and pretty-printed JSON
-    only ever breaks BETWEEN tokens, so the rejoined text parses identically.
-    Chunking a single line at a fixed width would not -- it would drop a newline
-    inside a string literal and corrupt the payload.
-    """
-    try:
-        blob = json.dumps(summary, sort_keys=True, default=str, indent=1)
-    except (TypeError, ValueError) as exc:
-        # sort_keys raises on mixed-type keys. A lost payload is recoverable from
-        # the digest above; an exception here happens in setUpClass and would take
-        # down every gate in the file, reporting nothing about the sweep itself.
-        print(f"{RESULT_BEGIN}\n{RESULT_END}", flush=True)
-        print(f"[480b-agentic] summary not serializable, payload skipped: {exc!r}")
-        return
-    print(RESULT_BEGIN, flush=True)
-    print(blob, flush=True)
-    print(RESULT_END, flush=True)
-
-
-def _achievable_prefix_hit_rate(config):
-    """Prefix-cache hit rate a leg of this shape would get with a perfect cache.
+def _reachable_prefix_hit_rate(config, dp_size):
+    """Prefix-cache hit rate a leg of this shape can reach at this DP count.
 
     A session of R rounds re-sends its whole history every round, so with I new
     input tokens per round and O output tokens the prompt of round r is
-    I + (r-1)*(I+O) and only the new I tokens can miss:
+    I + (r-1)*(I+O) and the leg sends
 
-        prompt tokens = R*I + (I+O)*R*(R-1)/2      misses = R*I
+        prompt tokens = R*I + (I+O)*R*(R-1)/2
+
+    How much of that a PERFECT cache can serve is set by the DP count, not by the
+    shape alone. Every DP rank owns its own radix tree and dispatch is round_robin
+    (no sglang load_balance_method is cache-aware), so round r lands on the rank
+    that last saw round r-D and can reuse only THAT round's stored sequence -- its
+    prompt plus its reply, i.e. (I+O)*(r-D) tokens:
+
+        cached tokens = (I+O)*(R-D)*(R-D+1)/2
+
+    the same (R-D)(R-D+1)/(R(R-1)) fraction of the single-cache ideal that
+    config.sh derives when it picks COLOCATED_DP. It is ZERO whenever R <= D --
+    the state PR #574 found at dp=4 against 3-round sessions, where every c1 leg
+    measured 0.0%. D=1 recovers the single-cache ideal, (I+O)*R*(R-1)/2.
+
+    Exact at concurrency 1, where a session's rounds strictly alternate ranks. At
+    higher concurrency round_robin interleaves sessions and some land consecutive
+    rounds on one rank, so this is a LOWER bound there (measured c16-long0 53.6%
+    against 50.5% predicted) -- safe for a floor, which is all it is used for.
 
     Summed over the leg's normal and long sessions (the long ones ramp at
     long_ramp_tokens). Returns None if the leg meta lacks the round counts.
@@ -186,7 +191,7 @@ def _achievable_prefix_hit_rate(config):
     if None in (out, sessions, num_long):
         return None
 
-    prompt_tokens = misses = 0
+    prompt_tokens = cached_tokens = 0
     for count, new_tokens_key, rounds_key in (
         (
             int(sessions) - int(num_long),
@@ -205,10 +210,11 @@ def _achievable_prefix_hit_rate(config):
         prompt_tokens += count * (
             rounds * new_tokens + growth * rounds * (rounds - 1) // 2
         )
-        misses += count * rounds * new_tokens
+        reuses = max(0, rounds - dp_size)
+        cached_tokens += count * growth * reuses * (reuses + 1) // 2
     if prompt_tokens <= 0:
         return None
-    return 1.0 - misses / prompt_tokens
+    return cached_tokens / prompt_tokens
 
 
 @unittest.skipUnless(
@@ -304,7 +310,7 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
         with open(summary_path) as f:
             summary = json.load(f)
         _print_workload_digest(summary)
-        _emit_result_json(summary)
+        emit_result_payload(summary)
         return summary
 
     def _legs(self):
@@ -326,8 +332,19 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
         self.assertEqual(missing, [], f"legs produced no metrics: {missing}")
 
     def test_prefix_caching_hit(self):
-        """A hit rate far under what the leg's shape allows means the cache is off
-        or thrashing, which invalidates every throughput number in the leg."""
+        """A hit rate far under what the leg can reach means the cache is off or
+        thrashing, which invalidates every throughput number in the leg.
+
+        Gated against the REACHABLE rate, not the single-cache ideal. Those differ
+        by a third at dp=2, and a floor derived from the ideal can sit above what
+        the deployment permits -- an assertion no correct server can pass, which is
+        what reddened this file on 2026-08-30 and 08-31 (c1-long1 measured 30.2%
+        against a 36.9% floor, with 30.7% reachable). Green here therefore means
+        "the cache does what round_robin over dp ranks allows", NOT "prefix caching
+        is being exploited": at dp=2 a 6-round session leaves a third of the ideal
+        on the table no matter how well the cache behaves, and only cache-aware
+        routing (sgl-model-gateway, not this repo) closes that.
+        """
         for leg in self._legs():
             rate = (leg.get("feature_derived") or {}).get("prefix_cache_hit_rate")
             self.assertIsNotNone(
@@ -335,19 +352,39 @@ class TestTpuQwen3Coder480bMultihostAgentic(CustomTestCase):
                 f"{leg['tag']}: no prefix-cache hit rate recorded -- was the server "
                 "launched with --enable-metrics?",
             )
-            achievable = _achievable_prefix_hit_rate(leg.get("config") or {})
             if MIN_PREFIX_HIT_RATE is not None:
                 floor, how = float(MIN_PREFIX_HIT_RATE), "MIN_PREFIX_HIT_RATE"
             else:
+                # Read back off the run: COLOCATED_DP is overridable, and a gate
+                # that hardcoded the DP count would go stale the next time the
+                # parallelism moves -- silently, as an unreachable floor.
+                dp_size = (leg.get("server_info") or {}).get("dp_size")
                 self.assertIsNotNone(
-                    achievable,
+                    dp_size,
+                    f"{leg['tag']}: leg meta records no dp_size, so the reachable "
+                    "prefix-hit ceiling cannot be derived; set MIN_PREFIX_HIT_RATE",
+                )
+                reachable = _reachable_prefix_hit_rate(
+                    config=leg.get("config") or {}, dp_size=int(dp_size)
+                )
+                self.assertIsNotNone(
+                    reachable,
                     f"{leg['tag']}: leg meta lacks the round counts needed to "
                     "derive a prefix-hit floor; set MIN_PREFIX_HIT_RATE",
                 )
-                floor = MIN_PREFIX_HIT_FRACTION * achievable
+                self.assertGreater(
+                    reachable,
+                    0.0,
+                    f"{leg['tag']}: no round can reach a cached prefix at "
+                    f"dp={dp_size} -- round r lands on the rank that last saw "
+                    f"round r-{dp_size}, so a session must outlast the DP count. "
+                    "Raise the round count (TARGET_CONTEXT / LONG_TARGET_CONTEXT) "
+                    "or lower COLOCATED_DP; the leg measures nothing as it is.",
+                )
+                floor = MIN_PREFIX_HIT_FRACTION * reachable
                 how = (
-                    f"{MIN_PREFIX_HIT_FRACTION:.0%} of the {achievable:.1%} this "
-                    "leg's round counts allow"
+                    f"{MIN_PREFIX_HIT_FRACTION:.0%} of the {reachable:.1%} this "
+                    f"leg's round counts reach at dp={dp_size}"
                 )
             self.assertGreaterEqual(
                 rate,

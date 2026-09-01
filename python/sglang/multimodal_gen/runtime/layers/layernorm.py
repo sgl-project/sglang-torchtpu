@@ -36,6 +36,7 @@ _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
+_is_tpu = current_platform.is_tpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 
 if _is_cuda or _is_xpu:
@@ -57,7 +58,8 @@ if USE_AITER:
 if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
-if not _is_cpu:
+# TPU has no triton runtime, so it joins CPU here.
+if not _is_cpu and not _is_tpu:
     from sglang.kernels.ops.diffusion import norm_infer, rms_norm_fn
 
 
@@ -392,7 +394,9 @@ class LayerNorm(CustomOp):
 
     @torch.compile(
         backend="inductor",
-        disable=current_platform.is_npu() or current_platform.is_rocm(),
+        disable=current_platform.is_npu()
+        or current_platform.is_rocm()
+        or current_platform.is_tpu(),
     )
     def forward_native(
         self,
@@ -677,7 +681,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
+    @torch.compile(
+        disable=current_platform.is_npu()
+        or current_platform.is_rocm()
+        or current_platform.is_tpu(),
+    )
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -843,7 +851,11 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
+    @torch.compile(
+        disable=current_platform.is_npu()
+        or current_platform.is_rocm()
+        or current_platform.is_tpu(),
+    )
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:

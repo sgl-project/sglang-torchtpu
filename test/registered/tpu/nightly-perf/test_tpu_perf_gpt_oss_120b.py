@@ -56,7 +56,12 @@ from sglang.test.tpu import model_config_main
 # One bring-up (weight load + per-shape compile, ~10 min with the single-bucket
 # compile below) plus one sweep leg. Drives the JobSet poll budget, so an
 # under-estimate kills the run. Not auto-refreshed: update_est_time.py omits tpu.
-register_tpu_ci(est_time=1800, suite="nightly-tpu-perf-gpt-oss-120b", nightly=True)
+register_tpu_ci(
+    est_time=1800,
+    suite="nightly-tpu-perf-gpt-oss-120b",
+    nightly=True,
+    labels=["singlehost", "gpt-oss-120b", "perf"],
+)
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))

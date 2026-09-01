@@ -6,7 +6,12 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.test.tpu import model_config_main
 
-register_tpu_ci(est_time=3600, suite="nightly-tpu-multihost", nightly=True)
+register_tpu_ci(
+    est_time=3600,
+    suite="nightly-tpu-multihost",
+    nightly=True,
+    labels=["multihost", "gpt-oss-120b", "spec"],
+)
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,

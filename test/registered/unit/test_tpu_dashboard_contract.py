@@ -1,6 +1,6 @@
 """pr-gate checks for the TPU nightly dashboard contract (no TPU).
 
-The contract (.github/tpu-ci/nightly-and-dashboard-redesign.md) is what keeps
+The contract (.github/tpu-ci/tpu-nightly-dashboard.design) is what keeps
 the dashboard trustworthy, and every clause here is one that fails silently at
 runtime -- a mislabelled metric is stored but never charted, a renamed id splits
 a trend in two, a test not wired to a job simply never runs. These checks turn
@@ -41,6 +41,7 @@ ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
 # The dashboard's contract kinds (redesign doc B.5.3): anything else is stored
 # but charted nowhere, which is exactly the silent failure this lint prevents.
 CONTRACT_KINDS = {"accuracy", "performance", "info"}
+
 
 def _discover(script: str, *args: str) -> list:
     """Run a .github/tpu-ci discovery script exactly as the workflows do."""

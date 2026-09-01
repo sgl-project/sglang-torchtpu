@@ -5,7 +5,7 @@ description: The TPU nightly CI & dashboard contract — test taxonomy, required
 
 # TPU Nightly CI & Dashboard Contract
 
-Full design: [.github/tpu-ci/nightly-and-dashboard-redesign.md](../../../.github/tpu-ci/nightly-and-dashboard-redesign.md).
+Full design: [.github/tpu-ci/tpu-nightly-dashboard.design](../../../.github/tpu-ci/tpu-nightly-dashboard.design).
 Enforced by the pr-gate lints in `test/registered/unit/test_tpu_dashboard_contract.py`
 (plus `test_tpu_bench_serving_gate.py`) — run them locally before pushing:
 
@@ -18,8 +18,8 @@ python3 -m pytest test/registered/unit/test_tpu_dashboard_contract.py -q
 | category | where | protocol |
 |---|---|---|
 | **Feature validation** | `test/registered/tpu/e2e/`, `integration/` | Tests a *feature* on some model. `register_tpu_ci(suite=..., nightly=True)` is the whole dashboard contract — pass/fail comes from the TIMINGS record, no metric dump needed. One job ↔ one test file. |
-| **Accuracy** | `test/registered/tpu/nightly-accuracy/` | Model backbone only: basic serving config, **no feature flags**. One file, one suite per model. |
-| **Perf** | `test/registered/tpu/nightly-perf/` | Specific model + serving config, through `RecipeLauncher` + `bench_serving.sh` **only** (that is what puts the server/bench config panels on the dashboard). |
+| **Accuracy** | `test/registered/tpu/nightly-accuracy/` | Model backbone only: basic serving config, **no feature flags**. One file and one suite per **benchmark**, sharing the model's `*_eval_common.py` config module; scores are `report_only` (the trend detects regressions). |
+| **Perf** | `test/registered/tpu/nightly-perf/` | Specific model + serving config, through `RecipeLauncher` + `bench_serving.sh` **only** (that is what puts the server/bench config panels on the dashboard). Egress order: digest lines → `dump_metric` per number (clean legs only) → the framed `emit_result_payload` summary. |
 
 The nightly (`nightly-test-tpu.yml`) builds once, then fans out the three stage
 workflows **in parallel** — slice contention is Kueue's job, and a red stage costs the
@@ -54,9 +54,16 @@ fields and don't hand-roll `dump_metric` labels in nightly tests.
   the ✕ with `reason` on hover — instead of numbers. Never plot partial numbers.
 - **One job ↔ one test file.** A new nightly registration must be reachable from
   exactly one job: single-host via `discover_tests.py` (automatic), multi-host via a
-  `MULTIHOST_LAUNCH` dict (automatic, one row per file), accuracy/perf via one suite
-  per model wired into the stage workflow's matrix, static P/D via a hand-written job
-  in `feature-validation-tpu.yml`.
+  `MULTIHOST_LAUNCH` dict (automatic, one row per file), accuracy via one suite per
+  benchmark and perf via one suite per model, wired into the stage workflow's
+  matrix; static P/D via a hand-written job in `feature-validation-tpu.yml`.
+- **Test-list filter chips come from `register_tpu_ci(labels=[...])`.** Every
+  nightly TPU test registration carries free-form tags — topology
+  (`singlehost`/`multihost`), model slug (`gpt-oss-120b`, `qwen3-coder-480b`, …),
+  feature (`pd`, `spec`, `dpa`, `prefix-cache`, `kv-offload`, …). keel scans them
+  from source and renders chips that OR-filter the dashboard's test list. A new
+  test copies the vocabulary of its neighbors; labels never affect scheduling.
+  These are distinct from the *metric* labels `dump_metric` records carry.
 - **Publishing:** scheduled runs always ingest; a dispatch ingests only with
   `update-dashboard: true` (stamps `[publish]` into the run name) and only on main.
   Reruns replace datapoints — records are keyed `(run_id, attempt)`.

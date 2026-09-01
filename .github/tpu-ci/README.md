@@ -106,7 +106,7 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 `on: schedule` (daily) plus `workflow_dispatch` with an `only` filter (a stage, or a
 single feature-validation leg) and an `update-dashboard` publish opt-in (appendix A of
-[the redesign doc](nightly-and-dashboard-redesign.md)).
+[the design doc](tpu-nightly-dashboard.design)).
 
 ```
 build (once)
@@ -228,7 +228,7 @@ _TODO._
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
 | `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → stages [1] feature validation, [2] accuracy, [3] perf in parallel |
 | `.github/workflows/feature-validation-tpu.yml` | Stage [1], also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
-| `.github/workflows/accuracy-test-tpu.yml` | Stage [2], also dispatchable alone: one job per model via run_suite; ondemand multihost accuracy models (dispatch-only) |
+| `.github/workflows/accuracy-test-tpu.yml` | Stage [2], also dispatchable alone: one job per benchmark via run_suite (suites `nightly-tpu-accuracy-<model>-<benchmark>`); ondemand multihost accuracy models (dispatch-only) |
 | `.github/workflows/perf-test-tpu.yml` | Stage [3], also dispatchable alone: one job per model via run_suite |
 | `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by keel at render time (pr-gate lint) |
 

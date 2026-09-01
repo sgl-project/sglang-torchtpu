@@ -534,6 +534,11 @@ class TpuKVSenderBase(CommonKVSender):
         self.kv_mgr = cast(TpuKVManagerBase, self.kv_mgr)
         self.conclude_state = None
         self.init_time = time.time()
+        self._transfer_start_time: float | None = None
+
+    def _record_transfer_start(self) -> None:
+        if self._transfer_start_time is None:
+            self._transfer_start_time = time.perf_counter()
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
@@ -560,6 +565,14 @@ class TpuKVSenderBase(CommonKVSender):
         self._pre_poll()
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
+            if (
+                status == KVPoll.Success
+                and self._transfer_start_time is not None
+                and self._transfer_metric.transfer_latency_s is None
+            ):
+                self._transfer_metric.transfer_latency_s = (
+                    time.perf_counter() - self._transfer_start_time
+                )
             self.conclude_state = status
         elif status == KVPoll.Bootstrapping and self.init_time is not None:
             elapsed = time.time() - self.init_time

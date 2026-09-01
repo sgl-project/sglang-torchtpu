@@ -13,7 +13,6 @@ from torch.nn import Parameter
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.weight_attrs import make_synced_weight_loader
 
 logger = init_logger(__name__)
 
@@ -38,19 +37,6 @@ class BasevLLMParameter(Parameter):
 
         :returns: a torch.nn.parameter
         """
-
-        # During weight loading, we often do something like:
-        # narrowed_tensor = param.data.narrow(0, offset, len)
-        # narrowed_tensor.copy_(real_weight)
-        # expecting narrowed_tensor and param.data to share the same storage.
-        # However, on TPUs, narrowed_tensor will lazily propagate to the base
-        # tensor, which is param.data, leading to the redundant memory usage.
-        # This sometimes causes OOM errors during model loading. To avoid this,
-        # we sync the param tensor after its weight loader is called.
-        from sglang.multimodal_gen.runtime.platforms import current_platform
-
-        if current_platform.is_tpu():
-            weight_loader = make_synced_weight_loader(weight_loader)
 
         self._weight_loader = weight_loader
 

@@ -1,5 +1,5 @@
 # Nightly TPU e2e. Builds the image ONCE, then fans out the three stages of the
-# redesign (.github/tpu-ci/nightly-and-dashboard-redesign.md) IN PARALLEL:
+# redesign (.github/tpu-ci/tpu-nightly-dashboard.design) IN PARALLEL:
 #
 #   [1] feature validation | [2] accuracy | [3] perf
 #
@@ -20,7 +20,8 @@ run-name: "Nightly Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # 09:00 UTC daily (low-PR hour); adjust as needed
+    - cron: "0 2 * * *"
+      timezone: "America/Los_Angeles"  # Quality evals run inside this run (stage [2]).
   workflow_dispatch:
     inputs:
       ref:
@@ -83,7 +84,7 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [2]: accuracy gates, one job per model. `model: nightly` is every
+  # Stage [2]: accuracy evals, one job per benchmark. `model: nightly` is every
   # single-host accuracy suite but not the ondemand multihost models parked out
   # of the nightly lane.
   accuracy:

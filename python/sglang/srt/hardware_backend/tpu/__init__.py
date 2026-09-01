@@ -8,9 +8,6 @@ the fully-qualified platform class name when TPU hardware is available.
 import importlib.util
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
-from sglang.srt.hardware_backend.tpu.pallas_export import (
-    configure_jax_export_platform,
-)
 
 logger = get_logger(__name__)
 
@@ -33,10 +30,6 @@ def activate():
 
     if not torch_tpu_available:
         return None
-
-    # Ownership violations must fail explicitly rather than making platform
-    # discovery report that an installed TorchTPU backend is unavailable.
-    configure_jax_export_platform()
 
     logger.info("TPU plugin detected (torch_tpu installable).")
     return "sglang.srt.hardware_backend.tpu.tpu_platform:TpuSRTPlatform"

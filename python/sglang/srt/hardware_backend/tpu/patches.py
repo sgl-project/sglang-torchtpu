@@ -232,14 +232,6 @@ def _prepare_tpu_env(
     if world_size is None:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        configure_jax_export_env,
-    )
-
-    # JAX is an export frontend in the TorchTPU runtime. Configure one distinct
-    # logical CPU device per global Torch rank before any JAX backend starts.
-    configure_jax_export_env(world_size)
-
     # Apply LIBTPU_INIT_ARGS overrides before the early return and before
     # any torch_tpu import; libtpu reads these flags at load time.
     from sglang.srt.hardware_backend.tpu.env_override import (

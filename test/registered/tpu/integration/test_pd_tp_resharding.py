@@ -103,7 +103,11 @@ except ModuleNotFoundError as exc:
 
 # One invocation runs ONE model profile: two engines (weight load + compile),
 # the cache probe with device-pool churn, and gsm8k.
-register_tpu_ci(est_time=10800, suite="tpu-integration")
+register_tpu_ci(
+    est_time=10800,
+    suite="tpu-integration",
+    labels=["multihost", "gpt-oss-120b", "pd", "tp-reshard"],
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))
@@ -127,6 +131,14 @@ ROLE_DECODE = "decode"
 # and DMA engine finish initializing; its absence means offload silently never
 # engaged even if the probe below were to pass on the device tier alone.
 RAIDEN_READY_MARKER = "Raiden KV transfer ready"
+
+# Emitted by RaidenKVManager once per room when a hybrid model's sliding-window
+# pool is actually pushed across the reshard. A hybrid model whose window never
+# transferred still answers -- the full-attention layers carry most of the
+# signal -- so accuracy alone does not catch it; gsm8k cleared its floor by 27
+# points on the first green run, which is ample room for a silently missing
+# window to hide in. This marker is the direct evidence.
+RAIDEN_SWA_RESHARD_MARKER = "raiden reshard SWA pushed"
 
 PREFILL_LOG = "/tmp/pd_prefill.log"
 DECODE_LOG = "/tmp/pd_decode.log"
@@ -153,6 +165,10 @@ class ModelProfile(msgspec.Struct, frozen=True, kw_only=True):
     # Appended after the launcher's default so it wins (argparse keeps the
     # last occurrence).
     disagg_transfer_backend: str = "raiden"
+    # Two KV pools with distinct page-id spaces, so raiden runs a second engine
+    # over the sliding-window one and the reshard has to move both. Gates the
+    # window-transfer assertion below; a single-pool model has nothing to check.
+    hybrid_swa: bool = False
     extra_server_args: Tuple[str, ...] = ()
     extra_launch_env: Dict[str, str] = {}
     reasoning_effort: Optional[str] = None
@@ -181,6 +197,7 @@ MODEL_PROFILES = {
         max_total_tokens=786_432,
         device_pool_tokens_hint=786_432,
         gsm8k_threshold=0.72,
+        hybrid_swa=True,
         extra_server_args=("--reasoning-parser", "gpt-oss"),
         # The SparseCore ragged-gather MoE path cannot be lowered for GPT-OSS
         # (dynamic token dim in the extend graph).
@@ -810,6 +827,37 @@ class TestPdTpResharding(unittest.TestCase):
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
+
+    def test_03_sliding_window_crossed_the_reshard(self) -> None:
+        """A hybrid model's window must actually be resharded, not just its
+        full-attention pool.
+
+        The two pools are separate engines with separate page-id spaces, and the
+        window one can be skipped without any request failing: the
+        full-attention layers still carry most of the signal, so the model keeps
+        answering. Accuracy is a weak detector of that -- the first green run
+        cleared its floor by 27 points. The push path now fails a room it cannot
+        send the window for, so a silent skip is no longer possible; what stays
+        undetected is the window path never being reached at all. Assert the
+        transfer directly. Runs after the probe and gsm8k, so the leader has
+        driven real traffic through prefill -> decode by now.
+        """
+        if not self.profile.hybrid_swa:
+            self.skipTest(f"{self.profile.key} has a single KV pool")
+        with open(PREFILL_LOG, "r", errors="replace") as f:
+            log = f.read()
+        self.assertIn(
+            RAIDEN_SWA_RESHARD_MARKER,
+            log,
+            f"{self.profile.display_name} is hybrid, but no sliding-window "
+            f"reshard push was logged in {PREFILL_LOG} -- the window did not "
+            "cross, so the decode attended over whatever its window pool "
+            "already held. Grep the log for 'Raiden reshard SWA push' for a "
+            "room that failed on the way there.",
+        )
+        print(
+            f"[leader] sliding-window reshard pushes={log.count(RAIDEN_SWA_RESHARD_MARKER)}"
+        )
 
 
 # ------------------------------ worker serving -------------------------------

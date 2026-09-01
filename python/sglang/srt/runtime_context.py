@@ -498,6 +498,8 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        # Explicit producer/consumer layout contract for TPU fused-RS MoE.
+        "tpu_fused_rs_sequence_parallel_plan": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -512,6 +514,7 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "tpu_fused_rs_sequence_parallel_plan",
         }
     )
 

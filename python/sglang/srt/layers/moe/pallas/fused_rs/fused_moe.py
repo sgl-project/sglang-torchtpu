@@ -128,7 +128,8 @@ def moe_gmm_local_rs_nodedup(
     group_offset: jax.Array,
     topk_weights: jax.Array,
     topk_indices: jax.Array,
-    post_expert_norm_weight_input: jax.Array | None = None,
+    post_expert_norm_weight_input: jax.Array | None,
+    tp_rank_to_device_id: jax.Array | None,
     *,
     activation: str,
     topk: int,
@@ -264,6 +265,7 @@ def moe_gmm_local_rs_nodedup(
         caller_tile_m=tile_m,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
+        tp_rank_to_device_id=tp_rank_to_device_id,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
@@ -336,6 +338,7 @@ def expert_parallel_gmm_rs(
     w1_global_scale: jax.Array | None = None,
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    tp_rank_to_device_id: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -351,9 +354,7 @@ def expert_parallel_gmm_rs(
     sp_enabled = False
     hidden_in_spec = data_p_spec if sp_enabled else P()
     moe_out_spec = (
-        P(combine_partition_axes(MLP_DATA, expert_axis))
-        if sp_enabled
-        else P(expert_axis)
+        P(combine_partition_axes(MLP_DATA, expert_axis)) if sp_enabled else P()
     )
     fp8_direct_write = (
         (not sp_enabled)
@@ -375,13 +376,20 @@ def expert_parallel_gmm_rs(
         if group_offset_input is not None
         else jnp.arange(0, num_experts, num_experts_per_shard)
     )
+    assert (
+        tp_rank_to_device_id is not None
+    ), "tp_rank_to_device_id must be explicitly provided and cannot be None"
 
-    w1_scale_spec = None if w1_scale is None else ep_p_spec
-    w1_bias_spec = None if w1_bias is None else ep_p_spec
-    w2_scale_spec = None if w2_scale is None else ep_p_spec
-    w2_bias_spec = None if w2_bias is None else ep_p_spec
-    w1_gs_spec = None if w1_global_scale is None else ep_p_spec
-    w2_gs_spec = None if w2_global_scale is None else ep_p_spec
+    # Weight tensors and group_offset are already partitioned per-rank on the PyTorch side.
+    # Specify P() so shard_map does not attempt to partition local expert tensors across the mesh.
+    weight_p_spec = P()
+
+    w1_scale_spec = None if w1_scale is None else weight_p_spec
+    w1_bias_spec = None if w1_bias is None else weight_p_spec
+    w2_scale_spec = None if w2_scale is None else weight_p_spec
+    w2_bias_spec = None if w2_bias is None else weight_p_spec
+    w1_gs_spec = None if w1_global_scale is None else weight_p_spec
+    w2_gs_spec = None if w2_global_scale is None else weight_p_spec
 
     _has_pn_rs = post_expert_norm_weight is not None
     _pnw_rs = (
@@ -403,18 +411,19 @@ def expert_parallel_gmm_rs(
         mesh=mesh,
         in_specs=(
             hidden_in_spec,  # hidden_states (replicated when SP off)
-            ep_p_spec,  # w1
+            weight_p_spec,  # w1 (local per-rank experts)
             w1_scale_spec,
             w1_bias_spec,
-            ep_p_spec,  # w2
+            weight_p_spec,  # w2 (local per-rank experts)
             w2_scale_spec,
             w2_bias_spec,
             w1_gs_spec,  # w1_global_scale
             w2_gs_spec,  # w2_global_scale
-            ep_p_spec,  # group_offset
+            weight_p_spec,  # group_offset (local per-rank tensor)
             topk_w_spec,  # topk_weights (SP-sharded local chunk; replicated when SP off)
             topk_i_spec,  # topk_indices (replicated when SP off)
             P(),  # post_expert_norm_weight (replicated)
+            P(),  # tp_rank_to_device_id (replicated)
         ),
         out_specs=moe_out_spec,
         # SP on: token sharded over data plus the runtime expert axes;
@@ -434,6 +443,7 @@ def expert_parallel_gmm_rs(
         topk_weights,
         topk_indices,
         _pnw_rs,
+        tp_rank_to_device_id,
     )
 
     return result
@@ -477,6 +487,7 @@ def fused_moe_func_rs(
     topk_indices: jax.Array | None = None,
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
+    tp_rank_to_device_id: jax.Array | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -535,6 +546,7 @@ def fused_moe_func_rs(
         mesh=mesh,
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
+        tp_rank_to_device_id=tp_rank_to_device_id,
     )
 
     return result[:num_tokens, :hidden_size]

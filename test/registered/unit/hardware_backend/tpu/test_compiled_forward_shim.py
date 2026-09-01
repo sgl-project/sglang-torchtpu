@@ -7,24 +7,30 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _BS_FIELDS,
+    _PINNED_LOGPROB_FIELDS,
     _TOKEN_FIELDS,
     DEFAULT_TPU_COMPILE_MAX_BS,
     CompiledForwardShim,
+    _attach_input_logprobs,
     _dp_attn_apply_bucket_metadata,
     _dp_attn_select_bucket_shape,
     _extend_batch_cap,
     _matches_default,
     _pad_forward_batch_inputs,
+    _pin_fields,
+    _restore_fields,
     _restore_forward_batch_inputs,
     _static_default_kwargs,
     _zero_pad_dim0,
     build_bucketers,
+    needs_input_logprob,
     reconcile_tpu_batch_limits,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
@@ -35,6 +41,7 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagl
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -381,18 +388,20 @@ class TestPadForwardBatchInputs(CustomTestCase):
         )
         self.assertIsNone(fb.extend_seq_lens)
 
-    def test_input_logprob_rejected(self):
-        # An extend request that also asks for INPUT/prompt (echo) logprobs
-        # (start_len < extend_len) still can't run on the compiled backend: the
-        # LogitsProcessor would compute them over dynamically-pruned states.
+    def test_input_logprob_pads_like_any_other_extend(self):
+        # Input/prompt (echo) logprobs used to be rejected here. They are now
+        # served by capturing every prefill row and gathering eagerly after the
+        # forward, which leaves padding itself unaffected: this batch must
+        # bucket exactly like the output-logprob case below.
         fb = _forward_batch(real_t=4, real_b=1, return_logprob=True)
         fb.extend_logprob_start_lens_cpu = [0]  # extend_len(4) - start_len(0) > 0
-        with self.assertRaisesRegex(NotImplementedError, "input/prompt logprobs"):
-            _pad_forward_batch_inputs(
-                fb,
-                t_bucketer=_bucketer("Token", [64]),
-                b_bucketer=_bucketer("Bs", [1]),
-            )
+        real_q, real_b = _pad_forward_batch_inputs(
+            fb,
+            t_bucketer=_bucketer("Token", [8, 64]),
+            b_bucketer=_bucketer("Bs", [1, 4]),
+        )
+        self.assertEqual((real_q, real_b), (4, 1))
+        self.assertEqual(fb.input_ids.shape[0], 8)
 
     def test_output_logprob_passes(self):
         # OUTPUT (next-token) logprobs only: start_len == extend_len, so there
@@ -507,6 +516,17 @@ class TestCompiledForwardShim(CustomTestCase):
             "is_prefill_only": False,
             "seq_lens": torch.zeros(4, dtype=torch.int32),
             "spec_info": None,
+            # The logprob pin reads these on every call, and a real
+            # ForwardBatch always carries them. Default to decode so the
+            # existing cases stay on the path that touches nothing.
+            "forward_mode": _ForwardModeMock("decode"),
+            "return_logprob": False,
+            "top_logprobs_nums": None,
+            "token_ids_logprobs": None,
+            "extend_input_logprob_token_ids_gpu": None,
+            "extend_seq_lens_cpu": None,
+            "extend_logprob_start_lens_cpu": None,
+            "capture_hidden_mode": CaptureHiddenMode.NULL,
         }
         defaults.update(kwargs)
         return SimpleNamespace(**defaults)
@@ -994,25 +1014,451 @@ class TestHiCacheReloadGate(CustomTestCase):
     def test_forward_waits_on_reload_counter(self):
         counter = MagicMock()
         shim = self._shim(counter)
-        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        fb = SimpleNamespace(
+            is_prefill_only=False,
+            spec_info=None,
+            forward_mode=_ForwardModeMock("decode"),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+        )
         self.assertEqual(shim(None, None, fb), "out")
         counter.wait.assert_called_once_with()
 
     def test_forward_runs_without_counter(self):
         # hicache off: the pool's counter slot stays None.
         shim = self._shim(None)
-        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        fb = SimpleNamespace(
+            is_prefill_only=False,
+            spec_info=None,
+            forward_mode=_ForwardModeMock("decode"),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+        )
         self.assertEqual(shim(None, None, fb), "out")
 
     def test_compiled_caller_does_not_trace_reload_counter(self):
         counter = MagicMock()
         shim = self._shim(counter)
-        fb = SimpleNamespace(is_prefill_only=False, spec_info=None)
+        fb = SimpleNamespace(
+            is_prefill_only=False,
+            spec_info=None,
+            forward_mode=_ForwardModeMock("decode"),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+        )
 
         with unittest.mock.patch("torch.compiler.is_compiling", return_value=True):
             self.assertEqual(shim(None, None, fb), "out")
 
         counter.wait.assert_not_called()
+
+
+def _policy(model, *, pp_size=1, dp_size=1, enable_dp_attention=False):
+    """Policy whose model_runner exposes just what the shim reads."""
+    policy = DecoderTpuCompilePolicy()
+    policy.model_runner = SimpleNamespace(
+        model=model,
+        # Read by the HiCache reload gate on every eager call.
+        token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+        server_args=SimpleNamespace(
+            pp_size=pp_size,
+            dp_size=dp_size,
+            enable_dp_attention=enable_dp_attention,
+        ),
+    )
+    return policy
+
+
+class TestNeedsInputLogprob(CustomTestCase):
+    """Distinguishes input (prompt) logprobs from output logprobs."""
+
+    @staticmethod
+    def _fb(mode="extend", return_logprob=True, starts=(0, 0), lens=(4, 4)):
+        return SimpleNamespace(
+            forward_mode=_ForwardModeMock(mode),
+            return_logprob=return_logprob,
+            # None is reachable: ForwardBatch leaves both unset off the
+            # extend path.
+            extend_seq_lens_cpu=None if lens is None else list(lens),
+            extend_logprob_start_lens_cpu=None if starts is None else list(starts),
+        )
+
+    def test_true_when_prefill_positions_are_requested(self):
+        self.assertTrue(needs_input_logprob(self._fb()))
+
+    def test_false_without_return_logprob(self):
+        self.assertFalse(needs_input_logprob(self._fb(return_logprob=False)))
+
+    def test_false_on_decode(self):
+        # Output-only logprobs: the eager Sampler handles them after the
+        # forward, so nothing about the graph changes.
+        self.assertFalse(needs_input_logprob(self._fb(mode="decode")))
+
+    def test_false_on_target_verify(self):
+        # TARGET_VERIFY is an extend-family mode but carries no prompt to echo.
+        self.assertFalse(needs_input_logprob(self._fb(mode="target_verify")))
+
+    def test_false_when_start_equals_length(self):
+        # Every prompt position already returned; nothing left to gather.
+        self.assertFalse(needs_input_logprob(self._fb(starts=(4, 4), lens=(4, 4))))
+
+    def test_true_when_any_request_wants_positions(self):
+        self.assertTrue(needs_input_logprob(self._fb(starts=(4, 1), lens=(4, 4))))
+
+    def test_false_on_empty_metadata(self):
+        self.assertFalse(needs_input_logprob(self._fb(starts=(), lens=())))
+
+    def test_false_when_metadata_is_none(self):
+        self.assertFalse(needs_input_logprob(self._fb(starts=None, lens=None)))
+
+
+class TestPinFields(CustomTestCase):
+    """Freezes logprob metadata for the compiled call and puts it back."""
+
+    def test_records_and_applies_only_changed_fields(self):
+        fb = SimpleNamespace(
+            return_logprob=True,
+            top_logprobs_nums=[5],
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=torch.zeros(3),
+        )
+        saved = _pin_fields(fb, _PINNED_LOGPROB_FIELDS)
+
+        self.assertFalse(fb.return_logprob)
+        self.assertIsNone(fb.top_logprobs_nums)
+        self.assertIsNone(fb.extend_input_logprob_token_ids_gpu)
+        # Already at its pinned value, so it is neither written nor recorded.
+        self.assertNotIn("token_ids_logprobs", saved)
+        self.assertEqual(saved["top_logprobs_nums"], [5])
+
+    def test_no_logprob_batch_is_left_untouched(self):
+        fb = SimpleNamespace(
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+        )
+        self.assertEqual(_pin_fields(fb, _PINNED_LOGPROB_FIELDS), {})
+
+    def test_restore_round_trips(self):
+        original = {
+            "return_logprob": True,
+            "top_logprobs_nums": [3],
+            "token_ids_logprobs": [[7]],
+            "extend_input_logprob_token_ids_gpu": None,
+        }
+        fb = SimpleNamespace(**original)
+        _restore_fields(fb, _pin_fields(fb, _PINNED_LOGPROB_FIELDS))
+        for field, value in original.items():
+            self.assertEqual(getattr(fb, field), value, field)
+
+
+class TestShimInputLogprobPath(CustomTestCase):
+    """Presents FULL capture to the graph and gathers logprobs eagerly."""
+
+    @staticmethod
+    def _fb(mode="extend", return_logprob=True, starts=(0, 0)):
+        return SimpleNamespace(
+            is_prefill_only=False,
+            spec_info=None,
+            seq_lens=torch.zeros(2, dtype=torch.int32),
+            forward_mode=_ForwardModeMock(mode),
+            return_logprob=return_logprob,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids_gpu=None,
+            extend_seq_lens_cpu=[4, 4],
+            extend_logprob_start_lens_cpu=list(starts),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            input_ids=torch.arange(8, dtype=torch.int32),
+            _tpu_real_q=8,
+            _tpu_real_b=2,
+        )
+
+    def _shim(self, seen, *, model=None, enabled=True, pp_size=1, **policy_kw):
+        def compiled(input_ids, positions, forward_batch, *a, **kw):
+            # Snapshot what the graph actually sees.
+            seen["capture_hidden_mode"] = forward_batch.capture_hidden_mode
+            seen["return_logprob"] = forward_batch.return_logprob
+            seen["start_lens"] = list(forward_batch.extend_logprob_start_lens_cpu or [])
+            return LogitsProcessorOutput(
+                next_token_logits=torch.zeros(2, 10),
+                hidden_states=torch.zeros(8, 5),
+            )
+
+        # Constructed inside the override on purpose: the flag decides which
+        # extend variant warmup compiled, so the shim reads it once and cannot
+        # honour a later change.
+        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(enabled):
+            return CompiledForwardShim(
+                compiled, policy=_policy(model, pp_size=pp_size, **policy_kw)
+            )
+
+    def test_graph_sees_full_capture_and_no_logprob_request(self):
+        seen, fb = {}, self._fb()
+        model = _StubModel()
+        self._shim(seen, model=model)(None, None, fb)
+
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.FULL)
+        # Pinned: warmup only ever compiled the no-logprob values.
+        self.assertFalse(seen["return_logprob"])
+        # One zero per padded request: a stable guard length that asks for
+        # every position.
+        self.assertEqual(seen["start_lens"], [0, 0])
+
+    def test_caller_state_is_restored_after_the_forward(self):
+        fb = self._fb(starts=(2, 3))
+        self._shim({}, model=_StubModel())(None, None, fb)
+
+        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertTrue(fb.return_logprob)
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [2, 3])
+        self.assertFalse(fb.is_prefill_only)
+
+    def test_state_is_restored_even_when_the_forward_raises(self):
+        with envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.override(True):
+            shim = CompiledForwardShim(
+                MagicMock(side_effect=RuntimeError("boom")),
+                policy=_policy(_StubModel()),
+            )
+        fb = self._fb(starts=(1, 1))
+
+        with self.assertRaises(RuntimeError):
+            shim(None, None, fb)
+
+        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertTrue(fb.return_logprob)
+        self.assertEqual(fb.extend_logprob_start_lens_cpu, [1, 1])
+
+    def test_input_logprobs_are_attached(self):
+        model = _StubModel()
+        out = self._shim({}, model=model)(None, None, self._fb())
+        self.assertIsNotNone(out.input_token_logprobs)
+        self.assertTrue(torch.equal(out.input_token_logprobs, _StubModel.LOGPROBS))
+
+    def test_decode_batch_keeps_its_capture_mode_and_skips_the_gather(self):
+        seen, fb = {}, self._fb(mode="decode", return_logprob=True)
+        model = _StubModel()
+        out = self._shim(seen, model=model)(None, None, fb)
+
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.NULL)
+        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+        self.assertEqual(model.calls, 0)
+        self.assertIsNone(out.input_token_logprobs)
+
+    def test_output_only_logprob_request_skips_the_gather(self):
+        # return_logprob=True but no prompt positions requested: still pinned
+        # for the graph, but no eager pass.
+        model = _StubModel()
+        fb = self._fb(starts=(4, 4))
+        self._shim({}, model=model)(None, None, fb)
+        self.assertEqual(model.calls, 0)
+
+    # --- Disabled by default. Serving prompt logprobs makes the compiled
+    # extend return every prefill row, which costs ~8% of prefill for everyone,
+    # so the no-regression guarantee has to be structural rather than measured:
+    # with the flag off, none of the above runs. Each case below goes red if
+    # the gate is dropped and the cost becomes unconditional again.
+
+    def test_disabled_leaves_the_extend_batch_untouched(self):
+        seen = {}
+        fb = self._fb(return_logprob=False)
+        starts_before = fb.extend_logprob_start_lens_cpu
+        self._shim(seen, model=_StubModel(), enabled=False)(None, None, fb)
+
+        # The graph sees the caller's capture mode -- the NULL-capture extend
+        # variant warmup has always compiled -- not FULL.
+        self.assertIs(seen["capture_hidden_mode"], CaptureHiddenMode.NULL)
+        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+        # Identity, not equality: the list is never even swapped out.
+        self.assertIs(fb.extend_logprob_start_lens_cpu, starts_before)
+
+    def test_disabled_never_runs_the_eager_gather(self):
+        model = _StubModel()
+        self._shim({}, model=model, enabled=False)(
+            None, None, self._fb(return_logprob=False)
+        )
+        self.assertEqual(model.calls, 0)
+
+    def test_disabled_rejects_a_prompt_logprob_request(self):
+        # Fail loud and name the flag rather than silently returning nothing.
+        with self.assertRaisesRegex(
+            NotImplementedError, "SGLANG_TPU_ENABLE_PROMPT_LOGPROB"
+        ):
+            self._shim({}, model=_StubModel(), enabled=False)(None, None, self._fb())
+
+    def test_dp_attention_rejects_prompt_logprobs(self):
+        # The eager gather re-runs the LogitsProcessor, whose logits path
+        # enters the attention-TP/DP collectives. Wanting input logprobs is a
+        # property of the local batch, so under DP attention one rank would
+        # join a collective its peers never reach: the worker group hangs
+        # rather than failing. Reject up front instead.
+        model = _StubModel()
+        shim = self._shim({}, model=model, dp_size=2, enable_dp_attention=True)
+        with self.assertRaisesRegex(NotImplementedError, "DP attention"):
+            shim(None, None, self._fb())
+        self.assertEqual(model.calls, 0)
+
+    def test_pipeline_parallelism_rejects_prompt_logprobs(self):
+        # Non-final PP stages return PPProxyTensors, which carries no hidden
+        # states, so the gather would fail on an attribute that isn't there.
+        model = _StubModel()
+        with self.assertRaisesRegex(NotImplementedError, "pipeline"):
+            self._shim({}, model=model, pp_size=2)(None, None, self._fb())
+        self.assertEqual(model.calls, 0)
+
+    def test_single_rank_config_is_not_rejected(self):
+        # The negative side of the two guards above: the ordinary
+        # attn_dp_size == 1, pp_size == 1 server must still serve them.
+        model = _StubModel()
+        out = self._shim({}, model=model)(None, None, self._fb())
+        self.assertIsNotNone(out.input_token_logprobs)
+
+    def test_disabled_still_serves_output_logprobs(self):
+        # The pin is unconditional and must stay so: an output-logprob request
+        # guard-misses the warmed graph without it, which is fatal under
+        # set_stance("fail_on_recompile"). This is not part of the opt-in.
+        seen = {}
+        fb = self._fb(starts=(4, 4))
+        self._shim(seen, model=_StubModel(), enabled=False)(None, None, fb)
+        self.assertFalse(seen["return_logprob"])
+        self.assertTrue(fb.return_logprob)
+
+
+class TestAttachInputLogprobs(CustomTestCase):
+    """Delegates the gather to the model and fails loudly when it cannot."""
+
+    def test_raises_without_captured_hidden_states(self):
+        out = LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4))
+        with self.assertRaisesRegex(RuntimeError, "CaptureHiddenMode.FULL"):
+            _attach_input_logprobs(
+                logits_output=out,
+                forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+                model=_StubModel(),
+            )
+
+    def test_raises_when_the_model_returns_no_input_logprobs(self):
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 4)
+        )
+        with self.assertRaisesRegex(RuntimeError, "input_token_logprobs"):
+            _attach_input_logprobs(
+                logits_output=out,
+                forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+                model=_StubModel(input_token_logprobs=None),
+            )
+
+    def test_compute_flag_is_restored_even_on_failure(self):
+        model = _StubModel(input_token_logprobs=None)
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 4)
+        )
+        with self.assertRaises(RuntimeError):
+            _attach_input_logprobs(
+                logits_output=out,
+                forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+                model=model,
+            )
+        self.assertFalse(model.logits_processor.compute_input_logprobs)
+
+    def test_gather_runs_with_the_compute_flag_set(self):
+        model = _StubModel()
+        out = LogitsProcessorOutput(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 4)
+        )
+        _attach_input_logprobs(
+            logits_output=out,
+            forward_batch=SimpleNamespace(input_ids=torch.zeros(2)),
+            model=model,
+        )
+        # The reference gather only emits input logprobs when the flag is on,
+        # so the model must observe it set.
+        self.assertTrue(model.flag_during_call)
+        self.assertFalse(model.logits_processor.compute_input_logprobs)
+
+
+class TestGatherMatchesRealLogitsProcessor(CustomTestCase):
+    """Bookkeeping against the real LogitsProcessor, not the stub.
+
+    An earlier revision gathered via `model.process_logit(...)`, which exists on
+    no upstream model. Every unit test passed -- a stub is free to implement an
+    API that is not there -- and the server died on AttributeError under the
+    first real request. These assertions run against the real class, so they go
+    red if the contract the shim depends on moves.
+    """
+
+    def test_logits_processor_takes_the_arguments_the_shim_passes(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        params = list(inspect.signature(LogitsProcessor.forward).parameters)
+        self.assertEqual(
+            params[:5],
+            ["self", "input_ids", "hidden_states", "lm_head", "logits_metadata"],
+        )
+
+    def test_stub_mirrors_the_real_signature(self):
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        real = list(inspect.signature(LogitsProcessor.forward).parameters)[:5]
+        stub = list(inspect.signature(_StubLogitsProcessor.__call__).parameters)
+        self.assertEqual(stub, real)
+
+    def test_compute_input_logprobs_is_a_real_attribute(self):
+        # The shim toggles this around the eager gather; if it is renamed the
+        # toggle silently stops working and prompt logprobs come back empty.
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        source = inspect.getsource(LogitsProcessor.__init__)
+        self.assertIn("self.compute_input_logprobs", source)
+
+
+class _StubLogitsProcessor:
+    """Stands in for LogitsProcessor.
+
+    The signature is copied from `LogitsProcessor.forward` deliberately. An
+    earlier version of this stub exposed a `process_logit(...)` method that
+    exists only on some models; the unit tests passed against it while the real
+    server died on AttributeError, because a stub is free to implement an API
+    that isn't there. Keep this in step with the real signature.
+    """
+
+    def __init__(self, input_token_logprobs):
+        self.compute_input_logprobs = False
+        self._input_token_logprobs = input_token_logprobs
+        self.calls = 0
+        self.flag_during_call = None
+
+    def __call__(self, input_ids, hidden_states, lm_head, logits_metadata):
+        self.calls += 1
+        self.flag_during_call = self.compute_input_logprobs
+        return LogitsProcessorOutput(
+            next_token_logits=torch.zeros(1, 4),
+            input_token_logprobs=self._input_token_logprobs,
+        )
+
+
+class _StubModel:
+    """A model as the shim sees it: a logits_processor and an lm_head."""
+
+    LOGPROBS = torch.tensor([-0.5, -1.5, -2.5])
+
+    def __init__(self, input_token_logprobs=LOGPROBS):
+        self.logits_processor = _StubLogitsProcessor(input_token_logprobs)
+        self.lm_head = object()
+
+    @property
+    def calls(self):
+        return self.logits_processor.calls
+
+    @property
+    def flag_during_call(self):
+        return self.logits_processor.flag_during_call
 
 
 if __name__ == "__main__":

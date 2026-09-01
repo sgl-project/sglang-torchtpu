@@ -154,6 +154,9 @@ class TpuPlatform(Platform):
         _prepare_tpu_env(resolve_single_host_topology=True)
         import torch_tpu  # noqa: F401
 
+        # Registers the "tpu" dynamo backend that simple_compile_backend names.
+        import torch_tpu._internal.compile  # noqa: F401
+
         _install_device_module_shims()
         torch.zeros(1, device="tpu")
 

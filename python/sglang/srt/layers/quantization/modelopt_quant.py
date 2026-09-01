@@ -3079,8 +3079,10 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     def _resolve_fused_rs(self, layer: torch.nn.Module) -> None:
         """Resolve the TPU MoE backend after the model publishes its contract."""
         from sglang.srt.hardware_backend.tpu.fp4_moe import (
-            has_tpu_fused_rs_post_expert_norm,
             unmet_tpu_nvfp4_fused_rs_requirements,
+        )
+        from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+            has_tpu_fused_rs_post_expert_norm,
         )
 
         has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)

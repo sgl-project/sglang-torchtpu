@@ -17,6 +17,7 @@ register_tpu_ci(
     est_time=3600,
     suite="stage-b-test-tpu-4-v7",
     disabled="TPU PR runners are not provisioned yet",
+    labels=["singlehost", "qwen3-coder-30b", "accuracy"],
 )
 
 MODEL_PATH = "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8"

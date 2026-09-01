@@ -79,6 +79,8 @@ class CustomOp(nn.Module):
             return self.forward_xpu
         elif current_platform.is_musa():
             return self.forward_musa
+        elif current_platform.is_tpu():
+            return self.forward_tpu
         else:
             return self.forward_native
 

@@ -14,6 +14,12 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.hardware_backend.tpu.fp8_moe import _clear_replaced_param
+from sglang.srt.hardware_backend.tpu.fused_rs_sequence_parallel import (
+    get_tpu_fused_rs_post_expert_norm_weight,
+    has_tpu_fused_rs_post_expert_norm,
+    prepare_fused_moe_sequence_parallel_input,
+    prepare_tpu_fused_rs_post_expert_norm,
+)
 from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 from sglang.srt.layers.moe.tpu_moe_utils import mask_tpu_moe_non_local_experts
@@ -30,54 +36,11 @@ TPU_NVFP4_GROUP_SIZE = 512
 TPU_NVFP4_SUPPORTED_GROUP_SIZES = (128, 256, TPU_NVFP4_GROUP_SIZE)
 PACKING = 2  # two FP4 codes per uint8 byte
 
-# Models with post-expert normalization opt in and provide the semantic hooks;
-# the NVFP4 adapter only validates and caches that downstream-owned contract.
-_POST_EXPERT_NORM_CAPABILITY = "supports_tpu_fused_rs_post_expert_norm"
-_POST_EXPERT_NORM_WEIGHT_GETTER = "tpu_fused_rs_post_expert_norm_weight"
-
 # Load-bearing, not a tuning knob: a single fused-RS invocation over a full
 # 4096-token prefill reproducibly triggered RuntimeUnexpectedCoreHalt during the
 # EXTEND4096 precompile on tpu7x. Chunking the call at 1024 tokens avoids it, so
 # do not raise this without re-validating that precompile shape on device.
 _FUSED_RS_MAX_TOKENS_PER_CALL = 1024
-
-
-def has_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> bool:
-    return bool(getattr(layer, _POST_EXPERT_NORM_CAPABILITY, False))
-
-
-def prepare_tpu_fused_rs_post_expert_norm(layer: torch.nn.Module) -> None:
-    """Validate and cache the downstream-owned post-expert norm contract."""
-    has_post_expert_norm = has_tpu_fused_rs_post_expert_norm(layer)
-    layer.__dict__["_tpu_fused_rs_has_post_expert_norm"] = has_post_expert_norm
-    if not has_post_expert_norm:
-        return
-
-    weight_getter = getattr(layer, _POST_EXPERT_NORM_WEIGHT_GETTER, None)
-    if not callable(weight_getter):
-        raise TypeError(
-            "TPU fused-RS post-expert norm requires a model-provided weight hook"
-        )
-
-    # The model hook owns semantic validation (norm type, gain convention, and
-    # epsilon). Calling it after weight loading also proves the weight exists.
-    weight = weight_getter()
-    if not isinstance(weight, torch.Tensor):
-        raise TypeError("TPU fused-RS post-expert norm weight must be a tensor")
-    if weight.ndim != 1 or weight.numel() != layer.hidden_size:
-        raise RuntimeError(
-            "TPU fused-RS post-expert norm weight must have shape "
-            f"({layer.hidden_size},), got {tuple(weight.shape)}"
-        )
-    if weight.device != layer.w2_weight.device:
-        raise RuntimeError(
-            "TPU fused-RS post-expert norm weight must be on the MoE device"
-        )
-    layer.register_buffer(
-        "_tpu_fused_rs_post_expert_norm_weight",
-        weight,
-        persistent=False,
-    )
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:
@@ -349,6 +312,11 @@ def apply_tpu_nvfp4_moe(
             fused_moe_rs_gather,
         )
 
+        prepared_input = prepare_fused_moe_sequence_parallel_input(
+            layer, dispatch_output
+        )
+        dispatch_output = prepared_input.dispatch_output
+        keep_output_shard = prepared_input.plan.keep_output_shard
         hidden_states = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
         topk_weights = topk_weights.to(hidden_states.dtype)
@@ -357,43 +325,71 @@ def apply_tpu_nvfp4_moe(
         topk_ids = torch.where(valid, topk_ids, torch.zeros_like(topk_ids))
         topk_weights = topk_weights * valid.to(topk_weights.dtype)
 
-        # Cached by prepare_tpu_fused_rs_post_expert_norm at load time; the
-        # can_use_tpu_nvfp4_fused_rs gate guarantees no_combine agrees with it.
-        has_post_expert_norm = layer._tpu_fused_rs_has_post_expert_norm
-        post_expert_norm_weight = (
-            layer._tpu_fused_rs_post_expert_norm_weight
-            if has_post_expert_norm
-            else hidden_states.new_zeros((1,))
-        )
-        outputs = []
-        for token_start in range(
-            0, hidden_states.shape[0], _FUSED_RS_MAX_TOKENS_PER_CALL
-        ):
-            token_end = min(
-                token_start + _FUSED_RS_MAX_TOKENS_PER_CALL,
-                hidden_states.shape[0],
+        post_expert_norm_weight = get_tpu_fused_rs_post_expert_norm_weight(layer)
+        has_post_expert_norm = post_expert_norm_weight is not None
+        if post_expert_norm_weight is None:
+            post_expert_norm_weight = hidden_states.new_zeros((1,))
+
+        tp_world_size = int(layer._tpu_fused_rs_tp_rank_to_device_id.numel())
+        if keep_output_shard:
+            expected_global_rows = prepared_input.output_token_count * tp_world_size
+            if hidden_states.shape[0] != expected_global_rows:
+                raise RuntimeError(
+                    "TPU fused-RS sequence-parallel input has an unexpected "
+                    f"token count: got {hidden_states.shape[0]}, expected "
+                    f"{expected_global_rows}"
+                )
+            partition_count = tp_world_size
+            rows_per_partition = prepared_input.output_token_count
+        else:
+            partition_count = 1
+            rows_per_partition = hidden_states.shape[0]
+
+        rows_per_call = _FUSED_RS_MAX_TOKENS_PER_CALL // partition_count
+        if rows_per_call == 0:
+            raise RuntimeError(
+                "TPU fused-RS world size exceeds the NVFP4 token limit: "
+                f"TP={tp_world_size}, limit={_FUSED_RS_MAX_TOKENS_PER_CALL}"
             )
+
+        hidden_by_partition = hidden_states.reshape(
+            partition_count, rows_per_partition, hidden_states.shape[-1]
+        )
+        weights_by_partition = topk_weights.reshape(
+            partition_count, rows_per_partition, topk_weights.shape[-1]
+        )
+        ids_by_partition = topk_ids.reshape(
+            partition_count, rows_per_partition, topk_ids.shape[-1]
+        )
+
+        outputs = []
+        for token_start in range(0, rows_per_partition, rows_per_call):
+            token_end = min(token_start + rows_per_call, rows_per_partition)
+            output_rows = token_end - token_start
+            chunk_hidden = hidden_by_partition[:, token_start:token_end].flatten(0, 1)
+            chunk_weights = weights_by_partition[:, token_start:token_end].flatten(0, 1)
+            chunk_ids = ids_by_partition[:, token_start:token_end].flatten(0, 1)
+
             output = fused_moe_rs_gather(
-                hidden_states=hidden_states[token_start:token_end],
+                hidden_states=chunk_hidden,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
-                topk_weights=topk_weights[token_start:token_end],
-                topk_ids=topk_ids[token_start:token_end],
+                topk_weights=chunk_weights,
+                topk_ids=chunk_ids,
                 post_expert_norm_weight=post_expert_norm_weight,
                 group_offset=layer._tpu_fused_rs_group_offset,
                 topk=int(topk_ids.shape[-1]),
                 activation=activation,
                 has_post_expert_norm=has_post_expert_norm,
-                # Keep the fused-RS payload in bf16. Block-128 uses W4A16, while
-                # block-256/512 already quantize the GMM activation on their W4A8
-                # path; fp8 direct-write would either change the block-128 mode or
-                # re-quantize an already-lossy intermediate.
+                # Block-128 uses W4A16; block-256/512 already quantize the
+                # GMM activation. A direct FP8 write would add another loss.
                 fp8_direct_write=False,
-                physical_order_to_tp_rank=layer._tpu_fused_rs_physical_order,
+                tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
+                keep_token_shard=keep_output_shard,
             )
-            outputs.append(output[: token_end - token_start])
+            outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
 
     x = dispatch_output.hidden_states

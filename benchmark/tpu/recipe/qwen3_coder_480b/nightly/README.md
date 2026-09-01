@@ -79,10 +79,14 @@ Check two things before trusting a number; `metrics_probe.py` raises both as
 `warnings`:
 
 - `feature_derived.prefix_cache_hit_rate` should be close to what the round count
-  allows — round 1 of a session is always a miss, so a 3-round session tops out near
-  **56%** and a 25-round one near 94%. Much lower means the cache is not being reused,
-  which invalidates every number in the leg. The CI test derives its floor the same
-  way (60% of achievable).
+  and the DP count together allow. Each DP rank owns its own radix tree and dispatch
+  is round_robin, so round *r* can only reuse round *r−dp*: a session of R rounds
+  reaches `(R−dp)(R−dp+1)/(R(R−1))` of the single-cache ideal, and **nothing at all**
+  when R ≤ dp. At the `ci` profile's dp=2 that is 51% for a 6-round session, against
+  the 76% one shared cache would give. Much lower than the reachable figure means the
+  cache is not being reused, which invalidates every number in the leg. The CI test
+  derives its floor the same way (60% of reachable), reading `dp_size` back off the
+  run — see `_reachable_prefix_hit_rate` in the test.
 - `feature_derived.kv_offload_written_tokens` / `..._reloaded_tokens` should both be
   non-zero on the legs with long sessions. Written-but-not-reloaded means prefixes are evicted and
   recomputed; zero written means the working set fit in HBM and the leg did not

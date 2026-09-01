@@ -109,13 +109,7 @@ class TestTpuFp8MoE(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        with patch.object(
-            fused_moe_op_module,
-            "cpu_export_jax_op",
-            wraps=fused_moe_op_module.cpu_export_jax_op,
-        ) as cpu_export_jax_op:
-            _build_fused_moe_op()
-        cls.cpu_export_registration_calls = cpu_export_jax_op.call_count
+        _build_fused_moe_op()
 
     def test_prepare_weights_transposes_on_device_by_default(self):
         w13 = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
@@ -262,9 +256,7 @@ class TestTpuFp8MoE(CustomTestCase):
             torch.tensor([[4, 5], [0, 7]], dtype=torch.int32),
         )
 
-    def test_fp8_moe_runs_through_cpu_export_jax_op_eager_and_compiled(self):
-        self.assertEqual(self.cpu_export_registration_calls, 1)
-
+    def test_fp8_moe_runs_eager_and_compiled(self):
         device = torch.device("tpu")
         num_tokens = 8
         hidden_size = 128

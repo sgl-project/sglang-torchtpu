@@ -508,6 +508,10 @@ class TestAbortIsTerminal(unittest.TestCase):
                 b"10.0.0.2:31000",
                 b"",
                 b"4",
+                # SWA pages + SWA push endpoint: empty for a non-hybrid model,
+                # but the frames are part of RESHARD_REQ either way.
+                b"",
+                b"",
             ]
         )
         self.assertNotIn(ROOM, mgr._decode_addr)

@@ -1,4 +1,4 @@
-"""Unit tests for the TPU throughput gate (no TPU, no server, no bench run).
+"""Unit tests for TPU eval helpers (no TPU, server, or benchmark run).
 
 The gate is an AccuracyTestParams.runner that shells out to
 benchmark/tpu/bench_serving.sh and reads the JSONL back. Two contracts with that
@@ -17,6 +17,7 @@ subprocess stubbed, since "measurement incomplete" is the only thing it gates.
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,6 +33,81 @@ COMPLETE = {
     "total_throughput": 12000.0,
     "median_ttft_ms": 2600.0,
 }
+
+
+class _FakeSampler:
+    system_message = None
+    model = "model"
+    temperature = 1.0
+    max_tokens = 16
+    reasoning_model = True
+    reasoning_effort = "high"
+
+    def __init__(self, create):
+        self.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+
+    def __call__(self, _messages):
+        raise AssertionError("the bounded implementation was not installed")
+
+    @staticmethod
+    def _pack_message(role, content):
+        return {"role": role, "content": content}
+
+
+class TestBoundedGptOssSampler(CustomTestCase):
+    @staticmethod
+    def _module(sleeps):
+        class BadRequestError(Exception):
+            pass
+
+        class SamplerResponse:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        return SimpleNamespace(
+            openai=SimpleNamespace(BadRequestError=BadRequestError),
+            time=SimpleNamespace(sleep=sleeps.append),
+            SamplerResponse=SamplerResponse,
+        )
+
+    @staticmethod
+    def _response(content=None, reasoning=None):
+        message = SimpleNamespace(content=content, reasoning=reasoning)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)], usage={"tokens": 16}
+        )
+
+    def test_reasoning_only_response_is_not_regenerated(self):
+        create = MagicMock(return_value=self._response(reasoning="Answer: B"))
+        sampler = _FakeSampler(create)
+        module = self._module([])
+        eval_support._bound_gpt_oss_sampler(sampler, module)
+        try:
+            result = sampler([{"role": "user", "content": "question"}])
+        finally:
+            eval_support._restore_gpt_oss_sampler(sampler)
+
+        self.assertEqual(result.response_text, "Answer: B")
+        create.assert_called_once()
+
+    def test_transport_failure_retries_once(self):
+        sleeps = []
+        create = MagicMock(
+            side_effect=[RuntimeError("temporary"), self._response(content="A")]
+        )
+        sampler = _FakeSampler(create)
+        module = self._module(sleeps)
+        eval_support._bound_gpt_oss_sampler(sampler, module)
+        try:
+            result = sampler([{"role": "user", "content": "question"}])
+        finally:
+            eval_support._restore_gpt_oss_sampler(sampler)
+
+        self.assertEqual(result.response_text, "A")
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(sleeps, [1])
 
 
 class TestSweepArg(CustomTestCase):
@@ -85,6 +161,51 @@ class TestOutputDir(CustomTestCase):
         env = {k: v for k, v in os.environ.items() if k != "TPU_CI_BENCH_OUTPUT_ROOT"}
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(eval_support.bench_output_dir("m"), "")
+
+
+class TestResultPayload(CustomTestCase):
+    """The framed-payload egress every perf test shares (emit_result_payload)."""
+
+    @staticmethod
+    def _emit(summary):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            eval_support.emit_result_payload(summary)
+        return buf.getvalue()
+
+    def test_payload_is_framed_and_reparses(self):
+        # Bug regression (2026-08-26/28): a summary emitted as ONE long line is
+        # split by containerd's 16 KiB CRI record cap and corrupted the rest of
+        # the job log. The contract is a marker-framed, pretty-printed block:
+        # line breaks only ever fall BETWEEN JSON tokens, so the rejoined text
+        # parses back to exactly what was emitted.
+        summary = {
+            "legs": [
+                {
+                    "workload": "8k1k",
+                    "status": "clean",
+                    "metrics": {"total_throughput": 12000.0},
+                }
+            ]
+        }
+        out = self._emit(summary).splitlines()
+        self.assertEqual(out[0], eval_support.RESULT_BEGIN)
+        self.assertEqual(out[-1], eval_support.RESULT_END)
+        body = "\n".join(out[1:-1])
+        self.assertGreater(len(out), 3, "payload must be multi-line, not one record")
+        self.assertEqual(json.loads(body), summary)
+
+    def test_unserializable_summary_skips_payload_without_raising(self):
+        # sort_keys raises on mixed-type keys. The payload is the fragile half
+        # of the egress; an exception here would take down the caller and every
+        # gate behind it, reporting nothing about the measurement itself.
+        out = self._emit({1: "a", "b": 2})
+        self.assertIn(eval_support.RESULT_BEGIN, out)
+        self.assertIn(eval_support.RESULT_END, out)
+        self.assertIn("payload skipped", out)
 
 
 def _run_gate(tmp, record, returncode=0, seen=None, **runner_kw):
@@ -174,9 +295,7 @@ class TestGate(CustomTestCase):
         with patch.object(
             eval_support,
             "dump_metric",
-            side_effect=lambda name, value, labels=None: dumped.append(
-                (name, labels)
-            ),
+            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
         ), patch.object(
             eval_support.subprocess, "run", side_effect=lambda *a, **k: ran.append(a)
         ):
@@ -193,9 +312,7 @@ class TestGate(CustomTestCase):
         with patch.object(
             eval_support,
             "dump_metric",
-            side_effect=lambda name, value, labels=None: dumped.append(
-                (name, labels)
-            ),
+            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
         ):
             _run_gate(
                 self.tmp,
@@ -367,9 +484,7 @@ class TestSmokeLegs(CustomTestCase):
         with patch.object(
             eval_support,
             "dump_metric",
-            side_effect=lambda name, value, labels=None: dumped.append(
-                (name, labels)
-            ),
+            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
         ), patch.object(
             eval_support.subprocess, "run", side_effect=lambda *a, **k: ran.append(a)
         ):
@@ -482,6 +597,13 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
             self.assertNotIn(suite, suites, f"{path.name} shares a suite")
             suites.add(suite)
 
+    def test_every_gate_is_report_only(self):
+        for path, mod in self._accuracy_modules():
+            for gate in mod.MODEL_CONFIG["gates"]:
+                self.assertTrue(gate.get("report_only"), path.name)
+                self.assertNotIn("baseline", gate, path.name)
+                self.assertNotIn("atol", gate, path.name)
+
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a
         # renamed key or value empties the tab without failing anything here.
@@ -492,6 +614,11 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                     (params.metric_labels or {}).get("kind"),
                     "accuracy",
                     f"{path.name}: gate {params.name} would never be plotted",
+                )
+                self.assertEqual(
+                    (params.metric_labels or {}).get("model"),
+                    "gpt-oss-120b",
+                    f"{path.name}: gate {params.name} has the wrong model series",
                 )
 
     def test_dashboard_is_declared_only_under_nightly_accuracy(self):

@@ -47,9 +47,6 @@ from sglang.srt.layers.moe.pallas.fused_rs.tuned_block_sizes import (
 )
 from sglang.srt.layers.moe.pallas.gmm_v2 import recover_quant_block_size
 
-# TODO(rupliu) when the model is small, latency bound, needs to increase pipeline depth
-_IN_KERNEL_RECV_COUNT_MAX_M = 2048
-
 # =============================================================================
 # Phase 1: Pre-kernel metadata computation (JAX level)
 # =============================================================================
@@ -340,10 +337,10 @@ def kernel_main_fused_rs(
     lhs_indices_ref,
     topk_indices_ref,
     max_num_gm_ref,  # (1,) int32 — max gm tiles across all chips
-    total_recv_count_ref,  # (1,) int32 — precomputed for large prefill
     w1_gs_gate_ref,  # (E,) GMM1 gate global_scale
     w1_gs_up_ref,  # (E,) GMM1 up global_scale
     w2_gs_ref,  # (E,) GMM2 global_scale
+    tp_rank_to_device_id_ref,
     # In (7)
     hidden_states_ref,
     w1_ref,
@@ -407,7 +404,6 @@ def kernel_main_fused_rs(
     top_k: int,
     pack_indices: bool = True,
     fp8_direct_write: bool = False,
-    use_in_kernel_recv_count: bool = True,
 ):
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write kernel.
 
@@ -422,53 +418,45 @@ def kernel_main_fused_rs(
     """
     dims = fused_dims
     num_lanes = pltpu.get_tpu_info().num_lanes
-    my_id = (
-        group_offset_ref[1]
-        if group_offset_ref.shape[0] > 1
-        else lax.axis_index(ep_axis_name)
-    )
+    my_rank = group_offset_ref[0] // dims.size_group
+    my_id = my_rank
     max_num_gm = max_num_gm_ref[0]
 
-    if use_in_kernel_recv_count:
-        # Derive the receive count from the same scalar-prefetched routing refs
-        # used by metadata construction and direct writes. A separate VMEM view
-        # can cross a different materialization boundary in a compiled model
-        # graph and disagree with the rows that actually issue remote DMAs.
-        with jax.named_scope("routing_scalar_prologue"):
-            group_offset = group_offset_ref[0]
-            local_start = group_start_ref[0]
+    # Derive the receive count directly from the same scalar-prefetched routing refs
+    # used by metadata construction and direct writes.
+    with jax.named_scope("routing_scalar_prologue"):
+        group_offset = group_offset_ref[0]
+        local_start = group_start_ref[0]
 
-            def _sum_local_group_size(local_group_id, count):
-                return count + lhs_group_sizes_ref[group_offset + local_group_id]
+        def _sum_local_group_size(local_group_id, count):
+            return count + lhs_group_sizes_ref[group_offset + local_group_id]
 
-            local_end = local_start + lax.fori_loop(
-                0,
-                dims.size_group,
-                _sum_local_group_size,
-                jnp.int32(0),
+        local_end = local_start + lax.fori_loop(
+            0,
+            dims.size_group,
+            _sum_local_group_size,
+            jnp.int32(0),
+        )
+
+        def _count_remote_receive(assignment_row, count):
+            gathered_index = lhs_indices_ref[assignment_row]
+            if pack_indices:
+                gathered_index = gathered_index // top_k
+            destination_chip = gathered_index // chunk_size
+            row_is_local = jnp.logical_and(
+                assignment_row >= local_start, assignment_row < local_end
             )
-
-            def _count_remote_receive(assignment_row, count):
-                gathered_index = lhs_indices_ref[assignment_row]
-                if pack_indices:
-                    gathered_index = gathered_index // top_k
-                destination_chip = gathered_index // chunk_size
-                row_is_local = jnp.logical_and(
-                    assignment_row >= local_start, assignment_row < local_end
-                )
-                is_remote_receive = jnp.logical_and(
-                    destination_chip == my_id, jnp.logical_not(row_is_local)
-                )
-                return count + is_remote_receive.astype(jnp.int32)
-
-            total_recv = lax.fori_loop(
-                0,
-                dims.size_m,
-                _count_remote_receive,
-                jnp.int32(0),
+            is_remote_receive = jnp.logical_and(
+                destination_chip == my_id, jnp.logical_not(row_is_local)
             )
-    else:
-        total_recv = total_recv_count_ref[0]
+            return count + is_remote_receive.astype(jnp.int32)
+
+        total_recv = lax.fori_loop(
+            0,
+            dims.size_m,
+            _count_remote_receive,
+            jnp.int32(0),
+        )
 
     @jax.named_scope("sync_barrier_signal")
     def sync_barrier_signal():
@@ -491,14 +479,8 @@ def kernel_main_fused_rs(
 
     # Zero-init the output buffer (which is ALSO the ICI DMA landing pad for
     # peers) and WAIT for it BEFORE signaling the entry barrier. A peer only
-    # issues its remote writes after its DEFERRED barrier wait releases, and
-    # that wait cannot release until every chip has signaled -- i.e. after every
-    # chip has finished zeroing. Ordering the zero-init ahead of the signal
-    # therefore guarantees no remote write lands in an out_buf that is still
-    # being zeroed. Previously the signal came first and the async zero-init
-    # raced incoming ICI writes: a received row was nondeterministically
-    # overwritten with 0, dropping one expert's contribution -> wrong output
-    # and greedy-decode divergence.
+    # issues its remote writes after its barrier releases, guaranteeing
+    # no remote write lands in an out_buf that is still being zeroed.
     zero_src = (
         scatter_fp8_staging_3x_ref.at[0]
         if fp8_direct_write
@@ -507,11 +489,8 @@ def kernel_main_fused_rs(
     zero_size = zero_out_start_3d(out_buf_ref, zero_src, zero_sem_ref)
     zero_out_end_3d(out_buf_ref, zero_sem_ref, zero_size)
 
-    # Entry barrier: signal now, DEFER the matching wait until right before this
-    # chip issues its first remote a2a write (gm_id==0, before direct_write_rows)
-    # to overlap the barrier latency with tile-0 compute. Chips with no compute
-    # drain the barrier in the ``local_num_gm == 0`` fallback below.
-    sync_barrier_signal()
+    # Entry barrier: synchronize across all cores after output buffer zeroing
+    sync_barrier()
 
     # Build metadata.
     meta_dims = Dimensions(
@@ -880,44 +859,6 @@ def kernel_main_fused_rs(
         sem_id = gm_id % 2
         stg_id = gm_id % 3
 
-        # Drain the staging slot we're about to reuse. With triple buffering,
-        # this slot was last used 3 iterations ago — giving 2 full iterations
-        # of compute overlap for its DMAs to complete.
-        @jax.named_scope("drain_prev_dmas")
-        @pl.when(gm_id >= 3)
-        def _():
-            prev_send = gm_id_ref[1 + stg_id]
-            send_wait_ref = (
-                scatter_fp8_staging_3x_ref
-                if fp8_direct_write
-                else scatter_staging_3x_ref
-            )
-            pltpu.make_async_copy(
-                src_ref=send_wait_ref.at[stg_id, pl.ds(0, prev_send), :, :],
-                dst_ref=send_wait_ref.at[stg_id, pl.ds(0, prev_send), :, :],
-                sem=send_sems_ref.at[stg_id],
-            ).wait()
-            prev_local = gm_id_ref[4 + stg_id]
-            pltpu.make_async_copy(
-                src_ref=out_buf_ref.at[pl.ds(0, prev_local), :, :],
-                dst_ref=out_buf_ref.at[pl.ds(0, prev_local), :, :],
-                sem=local_write_sems_ref.at[stg_id],
-            ).wait()
-            if fp8_direct_write:
-                pltpu.make_async_copy(
-                    src_ref=scatter_scale_3x_ref.at[stg_id, pl.ds(0, prev_send), :],
-                    dst_ref=scatter_scale_3x_ref.at[stg_id, pl.ds(0, prev_send), :],
-                    sem=scale_send_sems_ref.at[stg_id],
-                ).wait()
-                pltpu.make_async_copy(
-                    src_ref=out_scale_ref.at[pl.ds(0, prev_local), :],
-                    dst_ref=out_scale_ref.at[pl.ds(0, prev_local), :],
-                    sem=scale_local_write_sems_ref.at[stg_id],
-                ).wait()
-            # Reset counts for this slot's new use.
-            gm_id_ref[1 + stg_id] = jnp.int32(0)
-            gm_id_ref[4 + stg_id] = jnp.int32(0)
-
         # Steps 1-9: Only when this chip still has compute work.
         @pl.when(is_active)
         def _():
@@ -1213,6 +1154,7 @@ def kernel_main_fused_rs(
 
                         @pl.when(~is_local)
                         def _():
+                            target_device_id = tp_rank_to_device_id_ref[dest_chip]
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_fp8_staging_3x_ref.at[
                                     stg_id, pl.ds(row_idx, 1), :, :
@@ -1220,19 +1162,20 @@ def kernel_main_fused_rs(
                                 dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
                                 send_sem=send_sems_ref.at[stg_id],
                                 recv_sem=recv_sem_ref.at[0],
-                                device_id={ep_axis_name: dest_chip},
+                                device_id={ep_axis_name: target_device_id},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
-                            pltpu.make_async_remote_copy(
-                                src_ref=scatter_scale_3x_ref.at[
-                                    stg_id, pl.ds(row_idx, 1), :
-                                ],
-                                dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
-                                send_sem=scale_send_sems_ref.at[stg_id],
-                                recv_sem=scale_recv_sem_ref.at[0],
-                                device_id={ep_axis_name: dest_chip},
-                                device_id_type=pltpu.DeviceIdType.MESH,
-                            ).start()
+                            if fp8_direct_write:
+                                pltpu.make_async_remote_copy(
+                                    src_ref=scatter_scale_3x_ref.at[
+                                        stg_id, pl.ds(row_idx, 1), :
+                                    ],
+                                    dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
+                                    send_sem=scale_send_sems_ref.at[stg_id],
+                                    recv_sem=scale_recv_sem_ref.at[0],
+                                    device_id={ep_axis_name: target_device_id},
+                                    device_id_type=pltpu.DeviceIdType.MESH,
+                                ).start()
 
                         @pl.when(is_local)
                         def _():
@@ -1243,18 +1186,20 @@ def kernel_main_fused_rs(
                                 dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
                                 sem=local_write_sems_ref.at[stg_id],
                             ).start()
-                            pltpu.make_async_copy(
-                                src_ref=scatter_scale_3x_ref.at[
-                                    stg_id, pl.ds(row_idx, 1), :
-                                ],
-                                dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
-                                sem=scale_local_write_sems_ref.at[stg_id],
-                            ).start()
+                            if fp8_direct_write:
+                                pltpu.make_async_copy(
+                                    src_ref=scatter_scale_3x_ref.at[
+                                        stg_id, pl.ds(row_idx, 1), :
+                                    ],
+                                    dst_ref=out_scale_ref.at[pl.ds(write_pos, 1), :],
+                                    sem=scale_local_write_sems_ref.at[stg_id],
+                                ).start()
 
                     else:
 
                         @pl.when(~is_local)
                         def _():
+                            target_device_id = tp_rank_to_device_id_ref[dest_chip]
                             pltpu.make_async_remote_copy(
                                 src_ref=scatter_staging_3x_ref.at[
                                     stg_id, pl.ds(row_idx, 1), :, :
@@ -1262,7 +1207,7 @@ def kernel_main_fused_rs(
                                 dst_ref=out_buf_ref.at[pl.ds(write_pos, 1), :, :],
                                 send_sem=send_sems_ref.at[stg_id],
                                 recv_sem=recv_sem_ref.at[0],
-                                device_id={ep_axis_name: dest_chip},
+                                device_id={ep_axis_name: target_device_id},
                                 device_id_type=pltpu.DeviceIdType.MESH,
                             ).start()
 
@@ -1281,92 +1226,42 @@ def kernel_main_fused_rs(
                         local_sz + lax.select(is_local, jnp.int32(1), jnp.int32(0)),
                     )
 
-                return lax.fori_loop(
+                send_sz, local_sz = lax.fori_loop(
                     0, num_valid, _write_row, (jnp.int32(0), jnp.int32(0))
                 )
+                gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + send_sz
+                gm_id_ref[4 + stg_id] = gm_id_ref[4 + stg_id] + local_sz
 
-            # Deferred entry-barrier wait: overlaps with tile-0 gather + GMM
-            # compute above. Must complete before the first remote a2a write.
-            @pl.when(gm_id == 0)
-            def _():
-                sync_barrier_wait()
+                @pl.when(local_sz > 0)
+                def _():
+                    pl.semaphore_wait(local_write_sems_ref.at[stg_id], local_sz)
+                    if fp8_direct_write:
+                        pl.semaphore_wait(
+                            scale_local_write_sems_ref.at[stg_id], local_sz
+                        )
 
-            send_sz, local_sz = _do_direct_write()
-            gm_id_ref[1 + stg_id] = gm_id_ref[1 + stg_id] + send_sz
-            gm_id_ref[4 + stg_id] = gm_id_ref[4 + stg_id] + local_sz
+                @pl.when(send_sz > 0)
+                def _():
+                    pl.semaphore_wait(send_sems_ref.at[stg_id], send_sz)
+                    if fp8_direct_write:
+                        pl.semaphore_wait(scale_send_sems_ref.at[stg_id], send_sz)
+
+            _do_direct_write()
 
         return _
 
     lax.fori_loop(0, max_num_gm, gm_loop_body, None)
 
-    # Chips with no compute never reach the deferred in-loop barrier wait, so
-    # drain the entry barrier here to avoid leaking barrier_sem signals.
-    @pl.when(local_num_gm == 0)
-    def _():
-        sync_barrier_wait()
-
-    # Epilogue: drain remaining per-slot DMA counts.
-    @jax.named_scope("epilogue_drain")
-    @pl.when(max_num_gm > 0)
-    def _():
-        for _slot in range(3):
-
-            @pl.when(max_num_gm > _slot)
-            def _():
-                remaining_send = gm_id_ref[1 + _slot]
-                send_wait_ref = (
-                    scatter_fp8_staging_3x_ref
-                    if fp8_direct_write
-                    else scatter_staging_3x_ref
-                )
-                pltpu.make_async_copy(
-                    src_ref=send_wait_ref.at[_slot, pl.ds(0, remaining_send), :, :],
-                    dst_ref=send_wait_ref.at[_slot, pl.ds(0, remaining_send), :, :],
-                    sem=send_sems_ref.at[_slot],
-                ).wait()
-                remaining_local = gm_id_ref[4 + _slot]
-                pltpu.make_async_copy(
-                    src_ref=out_buf_ref.at[pl.ds(0, remaining_local), :, :],
-                    dst_ref=out_buf_ref.at[pl.ds(0, remaining_local), :, :],
-                    sem=local_write_sems_ref.at[_slot],
-                ).wait()
-                if fp8_direct_write:
-                    pltpu.make_async_copy(
-                        src_ref=scatter_scale_3x_ref.at[
-                            _slot, pl.ds(0, remaining_send), :
-                        ],
-                        dst_ref=scatter_scale_3x_ref.at[
-                            _slot, pl.ds(0, remaining_send), :
-                        ],
-                        sem=scale_send_sems_ref.at[_slot],
-                    ).wait()
-                    pltpu.make_async_copy(
-                        src_ref=out_scale_ref.at[pl.ds(0, remaining_local), :],
-                        dst_ref=out_scale_ref.at[pl.ds(0, remaining_local), :],
-                        sem=scale_local_write_sems_ref.at[_slot],
-                    ).wait()
-
-    # A faster EP participant must not leave the kernel while a slower peer
-    # still owns nonzero per-slot send/local-write scratch semaphores. Under
-    # skewed routing, a nonzero scratch semaphore at kernel termination can
-    # surface as a Mosaic runtime failure.
-    # Rendezvous only after every participant has drained its per-slot state.
+    # Post-Scatter Cross-Rank Optical Barrier
     sync_barrier()
 
-    # Drain recv_sem — each incoming remote DMA incremented it by 1.
-    # Must be zero before kernel exit (Mosaic requirement).
-    with jax.named_scope("drain_recv_sem"):
-        pltpu.make_async_copy(
-            src_ref=out_buf_ref.at[pl.ds(0, total_recv), :, :],
-            dst_ref=out_buf_ref.at[pl.ds(0, total_recv), :, :],
-            sem=recv_sem_ref.at[0],
-        ).wait()
+    # Drain incoming receive semaphores using in-kernel computed total_recv
+    @pl.when(total_recv > 0)
+    def _():
+        pl.semaphore_wait(recv_sem_ref.at[0], total_recv)
         if fp8_direct_write:
-            pltpu.make_async_copy(
-                src_ref=out_scale_ref.at[pl.ds(0, total_recv), :],
-                dst_ref=out_scale_ref.at[pl.ds(0, total_recv), :],
-                sem=scale_recv_sem_ref.at[0],
-            ).wait()
+            pl.semaphore_wait(scale_recv_sem_ref.at[0], total_recv)
+
     # All ICI DMA writes go directly to out_buf_ref (the pallas_call output).
     # No input_output_aliases needed — avoids XLA tiling copy on weight inputs.
 
@@ -1378,10 +1273,10 @@ def kernel_main_fused_rs_fp8(
     lhs_indices_ref,
     topk_indices_ref,
     max_num_gm_ref,
-    total_recv_count_ref,
     w1_gs_gate_ref,
     w1_gs_up_ref,
     w2_gs_ref,
+    tp_rank_to_device_id_ref,
     hidden_states_ref,
     w1_ref,
     w2_ref,
@@ -1440,7 +1335,6 @@ def kernel_main_fused_rs_fp8(
     ep_axis_name: str,
     top_k: int,
     pack_indices: bool = True,
-    use_in_kernel_recv_count: bool = True,
 ):
     """FP8 direct-write wrapper with output refs ordered for pallas_call."""
     return kernel_main_fused_rs(
@@ -1450,10 +1344,10 @@ def kernel_main_fused_rs_fp8(
         lhs_indices_ref,
         topk_indices_ref,
         max_num_gm_ref,
-        total_recv_count_ref,
         w1_gs_gate_ref,
         w1_gs_up_ref,
         w2_gs_ref,
+        tp_rank_to_device_id_ref,
         hidden_states_ref,
         w1_ref,
         w2_ref,
@@ -1512,7 +1406,6 @@ def kernel_main_fused_rs_fp8(
         top_k=top_k,
         pack_indices=pack_indices,
         fp8_direct_write=True,
-        use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
 
 
@@ -1530,7 +1423,6 @@ def kernel_main_fused_rs_fp8(
         "ep_axis_name",
         "top_k",
         "fp8_direct_write",
-        "use_in_kernel_recv_count",
         "caller_tile_m",
     ],
 )
@@ -1560,7 +1452,7 @@ def gmm_v2_fused_rs(
     caller_tile_m: int | None = None,
     top_k: int,
     fp8_direct_write: bool = False,
-    use_in_kernel_recv_count: bool | None = None,
+    tp_rank_to_device_id: jax.Array | None,
 ) -> jax.Array:
     """Fused gather + GMM1 + act + GMM2 + ICI direct-write.
 
@@ -1571,8 +1463,6 @@ def gmm_v2_fused_rs(
     _, size_k2, size_n2 = w2.shape
     size_m = lhs_indices.shape[0]
     chunk_size = output_size // ep_size
-    if use_in_kernel_recv_count is None:
-        use_in_kernel_recv_count = size_m <= _IN_KERNEL_RECV_COUNT_MAX_M
 
     is_quantized = w1_scale is not None
     if is_quantized:
@@ -1956,11 +1846,11 @@ def gmm_v2_fused_rs(
         pltpu.SemaphoreType.DMA((1,)),
         # --- ICI direct-write buffers ---
         # send_sems_ref (per-staging-slot, 3 slots)
-        pltpu.SemaphoreType.DMA((3,)),
+        pltpu.SemaphoreType.REGULAR((3,)),
         # local_write_sems_ref (per-staging-slot, 3 slots)
-        pltpu.SemaphoreType.DMA((3,)),
-        # recv_sem_ref (for incoming remote writes)
-        pltpu.SemaphoreType.DMA((1,)),
+        pltpu.SemaphoreType.REGULAR((3,)),
+        # recv_sem_ref (for incoming remote writes, 1 slot)
+        pltpu.SemaphoreType.REGULAR((1,)),
     ]
 
     # Keep the ID shared so identical MoE layers reuse one Mosaic compilation.
@@ -1976,41 +1866,6 @@ def gmm_v2_fused_rs(
     w1_bias_input = w1_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     w2_bias_input = w2_bias if has_bias else jnp.zeros((1, 1, 1), jnp.float32)
     max_num_gm_arr = jnp.array([max_num_gm], dtype=jnp.int32)
-
-    if use_in_kernel_recv_count:
-        total_recv_count_input = jnp.zeros((1,), dtype=jnp.int32)
-    else:
-        with jax.named_scope("precomputed_recv_count"):
-            group_ids = jnp.arange(group_sizes.shape[0], dtype=jnp.int32)
-            group_offset_scalar = group_offset[0]
-            local_start = group_start[0]
-            local_end = local_start + jnp.sum(
-                jnp.where(
-                    jnp.logical_and(
-                        group_ids >= group_offset_scalar,
-                        group_ids < group_offset_scalar + size_group,
-                    ),
-                    group_sizes,
-                    0,
-                )
-            )
-            assignment_rows = jnp.arange(size_m, dtype=jnp.int32)
-            destination_chips = output_indices // chunk_size
-            row_is_local = jnp.logical_and(
-                assignment_rows >= local_start, assignment_rows < local_end
-            )
-            physical_mesh_id = (
-                group_offset[1]
-                if group_offset.shape[0] > 1
-                else lax.axis_index(ep_axis_name)
-            )
-            to_this_chip_remote = jnp.logical_and(
-                destination_chips == physical_mesh_id,
-                jnp.logical_not(row_is_local),
-            )
-            total_recv_count_input = jnp.array(
-                [jnp.sum(to_this_chip_remote.astype(jnp.int32))], dtype=jnp.int32
-            )
 
     # Output buffer — also serves as ICI DMA target. In the FP8 direct-write
     # path this stores quantized payload rows; row scales are returned as a
@@ -2043,6 +1898,10 @@ def gmm_v2_fused_rs(
         primary_idx_ref = lhs_indices
         secondary_idx_ref = topk_indices
 
+    assert (
+        tp_rank_to_device_id is not None
+    ), "tp_rank_to_device_id mapping is required for gmm_v2_fused_rs"
+
     pallas_inputs = (
         group_sizes,
         group_offset,
@@ -2050,10 +1909,10 @@ def gmm_v2_fused_rs(
         primary_idx_ref,
         secondary_idx_ref,
         max_num_gm_arr,
-        total_recv_count_input,
         _w1_gs_gate,
         _w1_gs_up,
         _w2_gs,
+        tp_rank_to_device_id,
         hidden_3d,
         w1,
         w2,
@@ -2086,7 +1945,6 @@ def gmm_v2_fused_rs(
         ep_axis_name=ep_axis_name,
         top_k=top_k,
         pack_indices=pack_indices,
-        use_in_kernel_recv_count=use_in_kernel_recv_count,
     )
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.HBM),  # hidden_states_3d
@@ -2100,9 +1958,9 @@ def gmm_v2_fused_rs(
 
     if fp8_direct_write:
         fp8_scratch_shapes = scratch_shapes + [
-            pltpu.SemaphoreType.DMA((3,)),
-            pltpu.SemaphoreType.DMA((3,)),
-            pltpu.SemaphoreType.DMA((1,)),
+            pltpu.SemaphoreType.REGULAR((3,)),
+            pltpu.SemaphoreType.REGULAR((3,)),
+            pltpu.SemaphoreType.REGULAR((1,)),
             pltpu.VMEM((3, tile_m, n2_cols, num_lanes), jnp.float8_e4m3fn),
             pltpu.VMEM((3, tile_m, 128), jnp.float32),
         ]

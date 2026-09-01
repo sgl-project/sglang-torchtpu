@@ -648,14 +648,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             "[spec compile policy] DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
-        # The serving-time recompilation checker snapped its baseline at
-        # graph-runner init, before this deferred precompile; re-snapshot so
-        # the graphs compiled here aren't reported as serving-time recompiles
-        # on the first draft forward.
-        shim = self.compiled_forward_shim
-        checker = shim._recompilation_checker if shim is not None else None
-        if checker is not None:
-            checker.snapshot_baseline()
+        # The checker snapped its baseline at graph-runner init, before this
+        # deferred precompile; re-snapshot so the graphs compiled here aren't
+        # reported as serving-time recompiles on the first draft forward.
+        self.snapshot_recompilation_baseline()
 
     def _precompile_shapes(
         self, desc: str, items: list[Any], run: Callable[[Any], str]

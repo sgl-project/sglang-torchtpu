@@ -18,11 +18,13 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -267,6 +269,100 @@ def _dp_attn_prepare_padding(
     return pad_t, pad_b, real_q_out, real_b_out
 
 
+def needs_input_logprob(forward_batch: Any) -> bool:
+    """True when this batch wants INPUT (prompt / echo) logprobs on a prefill.
+
+    Output (next-token) logprobs are computed by the eager Sampler after the
+    compiled forward returns next_token_logits, so they never reach the graph.
+    Input logprobs are different: the LogitsProcessor gathers them over
+    per-request slices of the prefill, which is data-dependent and cannot be
+    expressed with static shapes. They are served instead by capturing every
+    prefill row (CaptureHiddenMode.FULL) and running that gather eagerly after
+    the forward -- see CompiledForwardShim.__call__.
+    """
+    if not forward_batch.return_logprob:
+        return False
+    mode = forward_batch.forward_mode
+    if not mode.is_extend() or mode.is_target_verify():
+        return False
+    extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu or []
+    start_lens_cpu = forward_batch.extend_logprob_start_lens_cpu or []
+    return any(
+        extend_len - start_len > 0
+        for extend_len, start_len in zip(extend_seq_lens_cpu, start_lens_cpu)
+    )
+
+
+# Logprob request metadata that the compiled forward reads, and that Dynamo
+# therefore guards on. Warmup only ever compiles the no-logprob values, so a
+# request asking for logprobs would miss every cached graph and recompile --
+# fatal once the scheduler arms set_stance("fail_on_recompile"). None of it is
+# needed inside the graph: the eager Sampler and _attach_input_logprobs read the
+# real values after the forward returns.
+_PINNED_LOGPROB_FIELDS: dict[str, Any] = {
+    "return_logprob": False,
+    "top_logprobs_nums": None,
+    "token_ids_logprobs": None,
+    "extend_input_logprob_token_ids_gpu": None,
+}
+
+
+def _pin_fields(forward_batch: Any, pinned: dict[str, Any]) -> dict[str, Any]:
+    """Set each field to its pinned value; return only the ones actually changed.
+
+    Writing nothing when a value already matches keeps the no-logprob path at a
+    handful of attribute reads.
+    """
+    saved: dict[str, Any] = {}
+    for field, value in pinned.items():
+        current = getattr(forward_batch, field)
+        if current is value:
+            continue
+        saved[field] = current
+        setattr(forward_batch, field, value)
+    return saved
+
+
+def _restore_fields(forward_batch: Any, saved: dict[str, Any]) -> None:
+    for field, value in saved.items():
+        setattr(forward_batch, field, value)
+
+
+def _attach_input_logprobs(
+    *, logits_output: Any, forward_batch: Any, model: Any
+) -> None:
+    """Gather input (prompt) logprobs eagerly from the captured prefill rows.
+
+    Re-runs the model's own LogitsProcessor rather than reimplementing the
+    gather: the off-by-one between a position's logits and the token it predicts
+    is already baked into extend_input_logprob_token_ids_gpu, and duplicating
+    that is how logprobs end up silently attached to the wrong tokens. Every
+    model reaches its logits through this same `logits_processor(input_ids,
+    hidden_states, lm_head, forward_batch)` call, so this stays model-agnostic.
+    """
+    hidden_states = logits_output.hidden_states
+    if hidden_states is None:
+        raise RuntimeError(
+            "input logprobs need CaptureHiddenMode.FULL, but the compiled "
+            "forward returned no hidden states"
+        )
+    logits_processor = model.logits_processor
+    previous = logits_processor.compute_input_logprobs
+    logits_processor.compute_input_logprobs = True
+    try:
+        eager = logits_processor(
+            forward_batch.input_ids, hidden_states, model.lm_head, forward_batch
+        )
+    finally:
+        logits_processor.compute_input_logprobs = previous
+    if eager.input_token_logprobs is None:
+        raise RuntimeError(
+            "the logits processor returned no input_token_logprobs despite "
+            "compute_input_logprobs being set"
+        )
+    logits_output.input_token_logprobs = eager.input_token_logprobs
+
+
 def _pad_forward_batch_inputs(
     forward_batch: Any,
     t_bucketer: Bucketer,
@@ -274,29 +370,6 @@ def _pad_forward_batch_inputs(
     extend_bs: int | None = None,
 ) -> tuple[int, int]:
     """Pad ForwardBatch tensors to next bucket shape and return original sizes."""
-    if forward_batch.return_logprob:
-        # Output (next-token) logprobs are computed by the eager Sampler AFTER
-        # the compiled forward returns next_token_logits, so they don't affect
-        # the compiled graph's shapes. Only INPUT/prompt logprobs (echo) run
-        # inside the LogitsProcessor over dynamically-pruned states, which would
-        # break the static-shape compiled forward. Reject only that case.
-        needs_input_logprob = False
-        if (
-            forward_batch.forward_mode.is_extend()
-            and not forward_batch.forward_mode.is_target_verify()
-        ):
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu or []
-            start_lens_cpu = forward_batch.extend_logprob_start_lens_cpu or []
-            for extend_len, start_len in zip(extend_seq_lens_cpu, start_lens_cpu):
-                if extend_len - start_len > 0:
-                    needs_input_logprob = True
-                    break
-        if needs_input_logprob:
-            raise NotImplementedError(
-                "input/prompt logprobs (echo) are not supported on the TPU "
-                "compiled backend yet; only output (next-token) logprobs are."
-            )
-
     is_decode = forward_batch.forward_mode.is_decode()
     is_draft_extend_v2 = forward_batch.forward_mode.is_draft_extend_v2()
     real_q = forward_batch.input_ids.shape[0]
@@ -527,11 +600,56 @@ class CompiledForwardShim:
         self.policy = policy
         self._recompilation_checker = None
         self._model_label = ""
+        # Read once: the flag decides which extend variant warmup compiled, so
+        # it is frozen for this shim's lifetime. Caching it also keeps the
+        # disabled path at a single attribute read per forward.
+        self._prompt_logprob_enabled = envs.SGLANG_TPU_ENABLE_PROMPT_LOGPROB.get()
         signature = getattr(compiled_fn, "__signature__", None)
         if signature is not None:
             self.__signature__ = signature
         self._default_kwargs = _static_default_kwargs(compiled_fn)
         functools.update_wrapper(self, compiled_fn)
+
+    def _prompt_logprob_rejection(self) -> str | None:
+        """Why this server cannot serve input logprobs, or None if it can.
+
+        Consulted only for requests that actually ask for them, so none of this
+        lands on anyone else's forward.
+        """
+        if not self._prompt_logprob_enabled:
+            return (
+                "input/prompt logprobs (echo) need "
+                "SGLANG_TPU_ENABLE_PROMPT_LOGPROB=1 on the TPU compiled "
+                "backend; only output (next-token) logprobs are served by "
+                "default."
+            )
+        server_args = self.policy.model_runner.server_args
+        # Read off server_args rather than get_attention_dp_size(), which
+        # asserts on process-global state that only a live DP server sets.
+        attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        # _attach_input_logprobs re-runs the LogitsProcessor, whose logits path
+        # enters the attention-TP/DP collectives. Wanting input logprobs is a
+        # property of the local batch, so under DP attention a rank holding
+        # such a request would join a collective its peers never reach and the
+        # worker group would hang.
+        if attn_dp_size > 1:
+            return (
+                "input/prompt logprobs are not supported with DP attention "
+                "(attn_dp_size > 1): the eager gather re-enters the logits "
+                "collectives, which only the ranks holding such a request "
+                "would reach. TODO: reduce the request flag across the DP "
+                "group and have every rank run the gather."
+            )
+        # Non-final pipeline stages return PPProxyTensors, which carries no
+        # hidden states for the gather to read.
+        if server_args.pp_size > 1:
+            return (
+                "input/prompt logprobs are not supported with pipeline "
+                "parallelism (pp_size > 1): non-final stages return "
+                "PPProxyTensors, which carries no hidden states. TODO: run "
+                "the gather on the last stage only."
+            )
+        return None
 
     def set_recompilation_checker(self, checker: Any, model_label: str = "") -> None:
         """Set the serving-time recompilation checker."""
@@ -585,13 +703,51 @@ class CompiledForwardShim:
         # raises.
         orig_prefill_only = forward_batch.is_prefill_only
         forward_batch.is_prefill_only = False
+        # Input (prompt) logprobs, when enabled. FULL capture is then presented
+        # on *every* extend, not only the batches asking for logprobs:
+        # capture_hidden_mode is part of the graph's guard, so two values would
+        # mean two extend variants (measured: 828s of precompile against 113s).
+        # That is precisely why this is opt-in -- returning every prefill row
+        # costs ~8% of prefill, and nobody who did not ask should pay it. With
+        # the flag off nothing below runs, the batch is never touched, and the
+        # extend graph is the NULL-capture one warmup has always compiled.
+        wants_input_logprob = needs_input_logprob(forward_batch)
+        if wants_input_logprob:
+            rejection = self._prompt_logprob_rejection()
+            if rejection is not None:
+                raise NotImplementedError(rejection)
+        saved: dict[str, Any] = {}
+        if self._prompt_logprob_enabled and forward_batch.forward_mode.is_extend():
+            saved["capture_hidden_mode"] = forward_batch.capture_hidden_mode
+            forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            # LogitsMetadata reads len(extend_logprob_start_lens_cpu), so the
+            # graph guards on it. One zero per padded request is both a stable
+            # length and a request for every position; the real starts, which
+            # the eager gather needs, go back in the finally below.
+            saved["extend_logprob_start_lens_cpu"] = (
+                forward_batch.extend_logprob_start_lens_cpu
+            )
+            forward_batch.extend_logprob_start_lens_cpu = [0] * int(
+                forward_batch.seq_lens.shape[0]
+            )
+        saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
         try:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
+            spec_info = forward_batch.spec_info
+            if spec_info is None or not spec_info.keep_outputs_padded:
+                out = self.policy.finalize_forward_batch(out, forward_batch)
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
-        spec_info = forward_batch.spec_info
-        if spec_info is None or not spec_info.keep_outputs_padded:
-            out = self.policy.finalize_forward_batch(out, forward_batch)
+            _restore_fields(forward_batch, saved)
+
+        # After the restore: LogitsMetadata.from_forward_batch branches on
+        # capture_hidden_mode, so the gather must see the caller's value.
+        if wants_input_logprob:
+            _attach_input_logprobs(
+                logits_output=out,
+                forward_batch=forward_batch,
+                model=self.policy.model_runner.model,
+            )
 
         # Check for serving-time XLA recompilation (once per forward call).
         # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).

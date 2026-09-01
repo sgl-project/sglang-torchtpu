@@ -109,6 +109,15 @@ def capture_cuda_graphs(
     # batch.
     eager_runner = EagerRunner(model_runner)
 
+    post_graph_hook_specs = model_runner.server_args.forward_hooks or []
+    if (
+        post_graph_hook_specs
+        and model_runner.device == "tpu"
+        and get_flags().capture.enable_torch_compile
+    ):
+        register_forward_hooks(model_runner.model, post_graph_hook_specs)
+        post_graph_hook_specs = []
+
     if model_runner.is_draft_worker:
         moe_runner_backend = (
             model_runner.server_args.speculative_moe_runner_backend
@@ -194,14 +203,10 @@ def capture_cuda_graphs(
             capture_time=0,
         )
 
-    # Register forward hooks AFTER cuda-graph capture so their tensor ops are
-    # not traced into any captured graph — capture stays hook-free and hooks
-    # fire only on the eager forward path (capture replay never runs Python
-    # hooks anyway).
-    if model_runner.server_args.forward_hooks:
-        register_forward_hooks(
-            model_runner.model, model_runner.server_args.forward_hooks
-        )
+    # Compiled TPU execution registers hooks before capture above. Other
+    # backends retain the existing post-capture registration behavior.
+    if post_graph_hook_specs:
+        register_forward_hooks(model_runner.model, post_graph_hook_specs)
 
     prealloc_symmetric_memory_pool(
         is_draft_worker=model_runner.is_draft_worker,

@@ -1513,6 +1513,13 @@ class Envs:
     # TPU
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
+    # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
+    # is not free for anyone else: the compiled extend must return every prefill
+    # row (CaptureHiddenMode.FULL), and capture_hidden_mode is part of the
+    # graph's guard, so the mode is a property of the warmed variant rather than
+    # of the request. Off keeps the extend graph and the serving path exactly as
+    # they are today, and a request asking for prompt logprobs is rejected.
+    SGLANG_TPU_ENABLE_PROMPT_LOGPROB = EnvBool(False)
 
     # Build the RoPE cos/sin cache at the served context length instead of the
     # checkpoint's max_position_embeddings: Qwen3.5 declares 262144 positions

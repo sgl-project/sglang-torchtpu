@@ -216,13 +216,11 @@ class _LMEvalHarness(LMEvalMixin):
         self.base_url = base_url
 
 
-def lm_eval_runner(config_path: str):
+def lm_eval_runner(config_path: str, report_only: bool = False):
     """Build an ``AccuracyTestParams.runner`` that scores via lm-eval.
 
-    Needed because these models' reference values are the cards' standard few-shot
-    numbers (5-shot ``mmlu_llama``, ``mmlu_pro``), which simple-evals does not
-    reproduce. The YAML is the only copy of the ground truths and tolerances, so the
-    runner gates itself and reports ``_passed``.
+    The YAML owns the task protocol and API model arguments. Thresholds are applied
+    unless ``report_only`` is set, in which case the runner returns the raw score.
     """
 
     def run(base_url: str) -> Dict[str, Any]:
@@ -238,7 +236,7 @@ def lm_eval_runner(config_path: str):
 
         results = _LMEvalHarness(base_url).launch_lm_eval(cfg)
 
-        # Same floor as LMEvalMixin.test_lm_eval, which asserts instead of reporting.
+        # Threshold fields are ignored when this runner is report-only.
         rtol = cfg.get("rtol", LMEvalMixin.default_rtol)
         atol = cfg.get("atol", 0.0)
         passed = True
@@ -247,16 +245,22 @@ def lm_eval_runner(config_path: str):
 
         for task in cfg["tasks"]:
             for metric in task["metrics"]:
-                ground_truth = metric["value"]
                 measured = results["results"][task["name"]][metric["name"]]
-                floor = ground_truth * (1 - rtol) - atol
                 if primary is None:
                     primary = measured
-                print(
-                    f"{task['name']} | {metric['name']}: "
-                    f"ground_truth={ground_truth:.3f} | measured={measured:.3f} | "
-                    f"floor={floor:.3f} | rtol={rtol} | atol={atol}"
-                )
+                if report_only:
+                    print(
+                        f"{task['name']} | {metric['name']}: "
+                        f"measured={measured:.3f} (report only)"
+                    )
+                else:
+                    ground_truth = metric["value"]
+                    floor = ground_truth * (1 - rtol) - atol
+                    print(
+                        f"{task['name']} | {metric['name']}: "
+                        f"ground_truth={ground_truth:.3f} | measured={measured:.3f} | "
+                        f"floor={floor:.3f} | rtol={rtol} | atol={atol}"
+                    )
                 dump_metric(
                     f"{task['name']}_{metric['name']}",
                     measured,
@@ -266,16 +270,83 @@ def lm_eval_runner(config_path: str):
                         "task": task["name"],
                     },
                 )
-                if measured < floor:
+                if not report_only and measured < floor:
                     passed = False
                     failures.append(
                         f"{task['name']}/{metric['name']}: "
                         f"{measured:.4f} < floor {floor:.4f}"
                     )
 
+        if report_only:
+            return {"score": primary}
         return {"score": primary, "_passed": passed, "_failures": failures}
 
     return run
+
+
+def _bound_gpt_oss_sampler(sampler: Any, sampler_module: Any) -> None:
+    """Keep a capped generation from turning into unbounded regeneration.
+
+    The reference sampler retries forever when Chat Completions returns reasoning
+    without final content. Local TPU evals intentionally cap generation, so preserve
+    that reasoning as the scoreable response and bound genuine request failures.
+    """
+
+    original_call = sampler.__class__.__call__
+    original_sleep = sampler_module.time.sleep
+
+    def bounded_call(self: Any, message_list: Any) -> Any:
+        if self.system_message:
+            message_list = [
+                self._pack_message("system", self.system_message)
+            ] + message_list
+
+        for trial in range(2):
+            try:
+                kwargs = {
+                    "model": self.model,
+                    "messages": message_list,
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                }
+                if self.reasoning_model:
+                    kwargs["reasoning_effort"] = self.reasoning_effort
+                response = self.client.chat.completions.create(**kwargs)
+                choice = response.choices[0]
+                reasoning = getattr(choice.message, "reasoning", None)
+                content = choice.message.content
+                if reasoning:
+                    message_list.append(self._pack_message("assistant", reasoning))
+                content = content or reasoning or "No response."
+                return sampler_module.SamplerResponse(
+                    response_text=content,
+                    response_metadata={"usage": response.usage},
+                    actual_queried_message_list=message_list,
+                )
+            except sampler_module.openai.BadRequestError as error:
+                print("Bad Request Error", error)
+                break
+            except Exception as error:
+                if trial == 1:
+                    print("Request failed after 2 attempts", error)
+                    break
+                delay = min(2**trial, 30)
+                print(f"Request failed; retrying once after {delay}s", error)
+                original_sleep(delay)
+
+        return sampler_module.SamplerResponse(
+            response_text="No response.",
+            response_metadata={"usage": None},
+            actual_queried_message_list=message_list,
+        )
+
+    sampler._sglang_original_call = original_call
+    sampler.__class__.__call__ = bounded_call
+
+
+def _restore_gpt_oss_sampler(sampler: Any) -> None:
+    sampler.__class__.__call__ = sampler._sglang_original_call
+    del sampler._sglang_original_call
 
 
 def gpqa_openai_runner(
@@ -284,13 +355,13 @@ def gpqa_openai_runner(
     reasoning_effort: str,
     max_tokens: int,
     n_threads: int = 32,
+    num_examples: int | None = None,
 ):
     """Build an ``AccuracyTestParams.runner`` that scores GPQA via OpenAI's harness.
 
-    gpt_oss.evals is the only harness that reproduces the gpt-oss card's GPQA number --
-    it owns the permuted-choice prompt and the grader, and temperature 1.0 below is part
-    of that methodology. ``n_repeats`` is the caller's, because how many passes a tight
-    floor needs depends on the tolerance it is gated at.
+    ``gpt_oss.evals`` supplies the permuted-choice prompt and grader used here.
+    Temperature 1.0 follows that harness's protocol; the caller owns the repeat and
+    sample counts.
 
     ``model`` is both the id sent to the server and the metric label, so a gate cannot
     report under a name the server was never asked for.
@@ -300,12 +371,21 @@ def gpqa_openai_runner(
         # Pure-python eval code; --no-deps so its pins never touch the pinned
         # TPU torch stack. openai/pandas/blobfile are image deps (test extra).
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--quiet",
+                "--no-deps",
+                "gpt-oss",
+            ],
             check=True,
         )
         # The openai client insists on a key even for a local base_url.
         os.environ.setdefault("OPENAI_API_KEY", "dummy")
 
+        import gpt_oss.evals.chat_completions_sampler as sampler_module
         from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
         from gpt_oss.evals.gpqa_eval import GPQAEval
 
@@ -318,14 +398,70 @@ def gpqa_openai_runner(
             # Their CLI uses 131072; the caller caps it to fit CONTEXT_LEN.
             max_tokens=max_tokens,
         )
-        result = GPQAEval(n_repeats=n_repeats, n_threads=n_threads)(sampler)
+        _bound_gpt_oss_sampler(sampler, sampler_module)
+        try:
+            result = GPQAEval(
+                n_repeats=n_repeats,
+                n_threads=n_threads,
+                num_examples=num_examples,
+            )(sampler)
+        finally:
+            _restore_gpt_oss_sampler(sampler)
         print(
-            f"gpqa_diamond (openai harness, n_repeats={n_repeats}): "
+            f"gpqa_diamond (openai harness, n_repeats={n_repeats}, "
+            f"num_examples={num_examples}): "
             f"score={result.score:.4f} metrics={result.metrics}"
         )
         # Built-in backends dump their own metrics; a runner must do its own.
         dump_metric(
             "gpqa_diamond_openai_harness",
+            result.score,
+            labels={"model": model, "eval": "gpt_oss.evals"},
+        )
+        return {"score": result.score}
+
+    return run
+
+
+def aime25_openai_runner(
+    model: str,
+    n_repeats: int,
+    reasoning_effort: str,
+    max_tokens: int,
+    n_threads: int = 32,
+):
+    """Score AIME 2025 with OpenAI's GPT-OSS reference harness."""
+
+    def run(base_url: str) -> Dict[str, Any]:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
+            check=True,
+        )
+        os.environ.setdefault("OPENAI_API_KEY", "dummy")
+
+        import gpt_oss.evals.chat_completions_sampler as sampler_module
+        from gpt_oss.evals.aime_eval import AIME25Eval
+        from gpt_oss.evals.chat_completions_sampler import ChatCompletionsSampler
+
+        sampler = ChatCompletionsSampler(
+            model=model,
+            reasoning_model=True,
+            reasoning_effort=reasoning_effort,
+            temperature=1.0,
+            base_url=base_url.rstrip("/") + "/v1",
+            max_tokens=max_tokens,
+        )
+        _bound_gpt_oss_sampler(sampler, sampler_module)
+        try:
+            result = AIME25Eval(n_repeats=n_repeats, n_threads=n_threads)(sampler)
+        finally:
+            _restore_gpt_oss_sampler(sampler)
+        print(
+            f"aime25 (openai harness, n_repeats={n_repeats}): "
+            f"score={result.score:.4f} metrics={result.metrics}"
+        )
+        dump_metric(
+            "aime25_openai_harness",
             result.score,
             labels={"model": model, "eval": "gpt_oss.evals"},
         )
@@ -403,6 +539,42 @@ def read_bench_point(out_dir: str, point: Dict[str, Any]) -> Optional[Dict[str, 
             if line:
                 record = json.loads(line)
     return record
+
+
+# The framed-payload egress every TPU perf test shares (the standard set by
+# test_tpu_qwen3_coder_480b_multihost_agentic.py): metrics are dumped per-number
+# via dump_metric when a leg is clean, and the WHOLE measurement summary is also
+# printed once, machine-readable, between these markers. Keel keys on the marker
+# text, so it never changes.
+RESULT_BEGIN = "=== TPU_BENCH_RESULT_JSON BEGIN ==="
+RESULT_END = "=== TPU_BENCH_RESULT_JSON END ==="
+
+
+def emit_result_payload(summary: Any) -> None:
+    """Print ``summary`` between the RESULT markers, shaped to survive the log.
+
+    The only egress from a TPU JobSet is the streamed pod log, and containerd
+    caps a single log record at 16 KiB -- a summary emitted as one long line is
+    split into CRI partial records and has twice (2026-08-26, 08-28) taken the
+    rest of the job log with it. ``indent`` keeps every line short without
+    changing what the consumer sees: _tpu-test.yml's awk rejoins the block with
+    newlines, and pretty-printed JSON only ever breaks BETWEEN tokens, so the
+    rejoined text parses identically. Chunking a single line at a fixed width
+    would not -- it would drop a newline inside a string literal and corrupt the
+    payload.
+    """
+    try:
+        blob = json.dumps(summary, sort_keys=True, default=str, indent=1)
+    except (TypeError, ValueError) as exc:
+        # sort_keys raises on mixed-type keys. A lost payload is recoverable from
+        # the digest lines printed before it; an exception here would take down
+        # the caller, reporting nothing about the measurement itself.
+        print(f"{RESULT_BEGIN}\n{RESULT_END}", flush=True)
+        print(f"[payload] summary not serializable, payload skipped: {exc!r}")
+        return
+    print(RESULT_BEGIN, flush=True)
+    print(blob, flush=True)
+    print(RESULT_END, flush=True)
 
 
 # Every numeric field bench_serving writes per sweep point, and how to read it.
@@ -511,7 +683,9 @@ def bench_serving_runner(
     def dump_cross(point: Dict[str, Any], reason: str) -> None:
         # The ✕ record: same routing labels as the numbers it replaces, so the
         # server/bench config panels stay attached to the failed night too.
-        dump_metric("smoke_failed", 1, labels={**dashboard_labels(point), "reason": reason})
+        dump_metric(
+            "smoke_failed", 1, labels={**dashboard_labels(point), "reason": reason}
+        )
 
     def run(base_url: str) -> Dict[str, Any]:
         smoke_failures = (smoke_state or {}).get("failures") or []
@@ -521,6 +695,21 @@ def bench_serving_runner(
             reason = "; ".join(smoke_failures)
             for point in sweep:
                 dump_cross(point, reason)
+            emit_result_payload(
+                {
+                    "test": test_name,
+                    "model": model or test_name,
+                    "legs": [
+                        {
+                            "workload": point["workload"],
+                            "concurrency": point["concurrency"],
+                            "status": "withheld",
+                            "reason": reason,
+                        }
+                        for point in sweep
+                    ],
+                }
+            )
             return {
                 "score": 0.0,
                 "_passed": False,
@@ -556,34 +745,51 @@ def bench_serving_runner(
             failures.append(f"bench_serving.sh exited {proc.returncode}")
 
         headline = None
+        legs = []
+
+        def fail_point(point, reason):
+            failures.append(reason)
+            dump_cross(point, reason)
+            legs.append(
+                {
+                    "workload": point["workload"],
+                    "concurrency": point["concurrency"],
+                    "status": "failed",
+                    "reason": reason,
+                }
+            )
+
         for point in sweep:
             label = f"{test_name} {point['workload']} c{point['concurrency']}"
             record = read_bench_point(search_dir, point)
             if record is None:
-                reason = f"{label}: no JSONL -- the point never ran"
-                failures.append(reason)
-                dump_cross(point, reason)
+                fail_point(point, f"{label}: no JSONL -- the point never ran")
                 continue
             expected = point["concurrency"] * prompts_per_concurrency
             if record.get("completed") != expected:
-                reason = (
+                # A partial point must not be published as a number: charted next
+                # to complete ones it poisons the trend (the 2026-08-24 gsm8k 0.0
+                # was exactly this shape of bug). The ✕ record explains the gap.
+                fail_point(
+                    point,
                     f"{label}: {record.get('completed')} of {expected} requests "
-                    "completed; the rest errored, so its throughput is not comparable"
+                    "completed; the rest errored, so its throughput is not "
+                    "comparable",
                 )
-                failures.append(reason)
-                # And for the same reason it must not be published as a number: a
-                # partial point charted next to complete ones poisons the trend
-                # (the 2026-08-24 gsm8k 0.0 was exactly this shape of bug). The ✕
-                # record is what explains the gap instead.
-                dump_cross(point, reason)
                 continue
             total = record.get("total_throughput")
             if not total or total <= 0:
-                reason = f"{label}: total_throughput is {total}"
-                failures.append(reason)
-                dump_cross(point, reason)
+                fail_point(point, f"{label}: total_throughput is {total}")
                 continue
             headline = headline or total
+            legs.append(
+                {
+                    "workload": point["workload"],
+                    "concurrency": point["concurrency"],
+                    "status": "clean",
+                    "metrics": record,
+                }
+            )
             print(
                 f"[perf] {label}: {total:.0f} tok/s total, "
                 f"ttft {record.get('median_ttft_ms', float('nan')):.0f} ms",
@@ -623,6 +829,13 @@ def bench_serving_runner(
                     if series_id:
                         labels["id"] = series_id
                 dump_metric(f"{stem}.{field}", value, labels=labels)
+
+        # The framed one-block summary, after the per-number dumps: clean legs
+        # carry their full record, failed ones their reason -- the same egress
+        # shape as the 480B agentic sweep.
+        emit_result_payload(
+            {"test": test_name, "model": model or test_name, "legs": legs}
+        )
 
         return {
             "score": headline or 0.0,

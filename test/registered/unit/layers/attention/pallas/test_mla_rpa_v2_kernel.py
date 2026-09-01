@@ -72,7 +72,11 @@ _NUM_KV_PAGES_PER_BLOCK = (3, 1, 1)
 _NUM_QUERIES_PER_BLOCK = (1, 1, 16)
 _DECODE_BATCH_SIZE = 4
 
-_RTOL, _ATOL = 2e-2, 1e-2
+# atol must absorb a few bf16 ulps at the output scale (1 ulp in [2, 4) is
+# 0.015625); observed kernel-vs-reference deviations are sparse (<0.005% of
+# elements) and hardware-dependent (up to 0.031 on v7x). Upstream tpu-inference
+# tests this kernel at atol=0.1/rtol=0.2.
+_RTOL, _ATOL = 2e-2, 4e-2
 
 # The re-vendored kernel dropped its module-level DEFAULT_MASK_VALUE (the
 # default is now derived from s_dtype); the tests pin the mask explicitly so

@@ -19,6 +19,7 @@ register_tpu_ci(
     est_time=3600,
     suite="stage-b-test-tpu-4-v7",
     disabled="TPU PR runners are not provisioned yet",
+    labels=["singlehost", "qwen3-0.6b", "accuracy"],
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
