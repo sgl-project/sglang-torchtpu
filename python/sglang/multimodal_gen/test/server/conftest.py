@@ -6,20 +6,21 @@ import pytest
 print("[CONFTEST] Loading conftest.py at import time")
 
 
-def pytest_configure(config):
-    """
-    Create the perf results StashKey once and store it in config.
-    This hook runs once per test session, before module double-import issues.
+def _perf_results_key(config):
+    """One key per session, not per copy of this module.
+
+    No `__init__.py` here, so pytest imports this file as top-level `conftest`
+    while test_server_common imports it by dotted path. Created on demand
+    because `pytest_configure` never runs for out-of-tree suites.
     """
     if not hasattr(config, "_diffusion_perf_key"):
         config._diffusion_perf_key = pytest.StashKey[list]()
-        print(f"[CONFTEST] Created perf_results_key: {config._diffusion_perf_key}")
+    return config._diffusion_perf_key
 
 
 def add_perf_results(config, results: list):
     """Add performance results to the shared stash."""
-    # Get the shared key from config (created once in pytest_configure)
-    key = config._diffusion_perf_key
+    key = _perf_results_key(config)
     existing = config.stash.get(key, [])
     existing.extend(results)
     config.stash[key] = existing
@@ -98,9 +99,7 @@ def pytest_sessionfinish(session):
     This hook is called by pytest at the end of the entire test session.
     It prints a consolidated summary of all performance results.
     """
-    # Get results from stash using the shared key from config
-    key = session.config._diffusion_perf_key
-    results = session.config.stash.get(key, [])
+    results = session.config.stash.get(_perf_results_key(session.config), [])
     print(f"\n[DEBUG] pytest_sessionfinish called, has {len(results)} entries")
     if not results:
         print("[DEBUG] No results collected, skipping summary output")
