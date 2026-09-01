@@ -447,12 +447,9 @@ def kv_offload_runner(
                 )
             ]
 
-            # kind=info: stored and shown in the point's details, charted on no
-            # tab -- `probe` is the tag that keeps these filterable.
             labels = {
                 "model": test_name,
-                "kind": "info",
-                "probe": "kv_offload",
+                "kind": "kv_offload",
                 "dp_rank": str(dp_rank),
             }
             dump_metric(

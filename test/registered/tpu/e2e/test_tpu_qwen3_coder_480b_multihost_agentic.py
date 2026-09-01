@@ -37,12 +37,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
 from sglang.test.tpu import emit_result_payload
 
-register_tpu_ci(
-    est_time=1800,
-    suite="nightly-tpu-multihost",
-    nightly=True,
-    labels=["multihost", "qwen3-coder-480b", "agentic"],
-)
+register_tpu_ci(est_time=1800, suite="nightly-tpu-multihost", nightly=True)
 
 # Own launch group: the 480B agentic recipe + the shared ROX weights volume.
 MULTIHOST_LAUNCH = {
@@ -80,11 +75,6 @@ MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
 # Dashboard series key. The canonical HF id, not the mount path the recipe serves
 # from -- remounting the weights elsewhere must not split the trend in two.
 MODEL_LABEL = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-# Stable series join key + its cosmetic display half, same contract as the
-# MODEL_CONFIG-driven perf tests: `id` is never renamed (forced renames go
-# through .github/tpu-ci/dashboard_aliases.json), the display name is free.
-SERIES_ID = "perf-qwen3-coder-480b-agentic"
-DISPLAY_NAME = "Qwen3-Coder-480B agentic"
 
 
 def _direction(field: str) -> str:
@@ -100,11 +90,12 @@ def _direction(field: str) -> str:
 def _dump_leg_metrics(leg):
     """One [METRIC] line per number, same label contract as bench_serving_runner.
 
-    Only the per-leg output_throughput carries kind=performance plus `workload`,
-    which is what routes it to the dashboard's performance tab; everything else
-    the leg measured is dumped as kind=info -- stored in the dashboard's archive
-    forever (a field not recorded tonight cannot be back-filled once the job log
-    expires), shown in the point's details, charted nowhere. The leg tag is in
+    Only the per-leg output_throughput carries `workload`, which is what routes it
+    to the dashboard's performance tab; everything else the leg measured is dumped
+    as kind=bench_detail -- stored in the dashboard's archive forever (a field not
+    recorded tonight cannot be back-filled once the job log expires). The dashboard
+    still charts the bench_detail rows whose trailing field matches one of its
+    dropdown families (total/decode throughput, TTFT/TPOT/ITL). The leg tag is in
     the metric name because several legs share a run, and the dashboard keys a
     night's point on (test_file, metric_name, model).
     """
@@ -113,21 +104,28 @@ def _dump_leg_metrics(leg):
         **(leg.get("metrics") or {}),
         **{f"derived.{k}": v for k, v in (leg.get("derived") or {}).items()},
     }
+    # bench_serving cannot account input tokens for a multi-turn replay, so its
+    # total_throughput degenerates to exactly output_throughput and its
+    # input_throughput to 0 (see nightly/README.md "Reading a result"). The
+    # dashboard picks its Total-throughput charts by the trailing field name, so
+    # dumping the degenerate value under `total_throughput` plotted a Total chart
+    # identical to the Decode one. Chart the corrected total (server-side prompt
+    # counter + output tokens, computed by summarize.py) under that name instead,
+    # and drop the two degenerate fields -- they carry no information to archive.
+    numbers.pop("input_throughput", None)
+    numbers.pop("total_throughput", None)
+    real_total = numbers.pop("derived.total_throughput", None)
+    if real_total is not None:
+        numbers["total_throughput"] = real_total
     for field, value in sorted(numbers.items()):
         if not isinstance(value, (int, float)):
             continue
-        labels = {
-            "model": MODEL_LABEL,
-            "direction": _direction(field),
-            "id": SERIES_ID,
-        }
+        labels = {"model": MODEL_LABEL, "direction": _direction(field)}
         if field == "output_throughput":
-            labels["kind"] = "performance"
             labels["workload"] = tag
             labels["headline"] = "1"
-            labels["display_name"] = DISPLAY_NAME
         else:
-            labels["kind"] = "info"
+            labels["kind"] = "bench_detail"
             labels["workload_name"] = tag
         dump_metric(f"{tag}.{field}", value, labels=labels)
 

@@ -76,11 +76,7 @@ except ModuleNotFoundError as exc:
 
 # One invocation runs two GPT-OSS-120B engines (weight load + compile), the
 # cache probe with device-pool churn, and GSM8K.
-register_tpu_ci(
-    est_time=10800,
-    suite="tpu-integration",
-    labels=["multihost", "gpt-oss-120b", "pd", "prefix-cache", "kv-offload"],
-)
+register_tpu_ci(est_time=10800, suite="tpu-integration")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

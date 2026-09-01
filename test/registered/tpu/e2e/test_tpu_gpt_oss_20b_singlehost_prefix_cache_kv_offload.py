@@ -11,11 +11,7 @@ from sglang.test.tpu import model_config_main
 from sglang.test.tpu.kv_offload_probe import kv_offload_runner
 
 # Expected runtime includes model download, compilation, and the eviction probe.
-register_tpu_ci(
-    est_time=1800,
-    suite="stage-b-test-tpu-4-v7",
-    labels=["singlehost", "gpt-oss-20b", "prefix-cache", "kv-offload"],
-)
+register_tpu_ci(est_time=1800, suite="stage-b-test-tpu-4-v7")
 
 SERVED_MODEL_NAME = "gpt-oss-20b"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")

@@ -9,12 +9,7 @@ from sglang.test.tpu.gpt_oss_120b_eval_common import (
     make_model_config,
 )
 
-register_tpu_ci(
-    est_time=4500,
-    suite="nightly-tpu-accuracy-gpt-oss-120b-gpqa",
-    nightly=True,
-    labels=["singlehost", "gpt-oss-120b", "accuracy"],
-)
+register_tpu_ci(est_time=4500, suite="tpu-eval-gpt-oss-120b-gpqa", nightly=True)
 
 MAX_TOKENS = 65536
 
@@ -42,7 +37,6 @@ GATE = {
 
 MODEL_CONFIG = make_model_config(
     test_name="gpt-oss-120b-gpqa",
-    series_id="accuracy-gpt-oss-120b-gpqa",
     tag="gpqa-e2e",
     launch_env=LAUNCH_ENV,
     gate=GATE,
