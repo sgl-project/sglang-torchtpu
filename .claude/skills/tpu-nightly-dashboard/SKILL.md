@@ -67,13 +67,3 @@ fields and don't hand-roll `dump_metric` labels in nightly tests.
 - **Publishing:** scheduled runs always ingest; a dispatch ingests only with
   `update-dashboard: true` (stamps `[publish]` into the run name) and only on main.
   Reruns replace datapoints — records are keyed `(run_id, attempt)`.
-
-## Before waiting a night
-
-Check your log against the keel parser (README § Dashboard sanity-check commands):
-
-```bash
-export GITHUB_TOKEN=$(gh auth token)   # from a radixark/keel checkout
-python3 ci-monitor/src/tpu_ci.py sync --limit 3 --db-dir /tmp/tpu-ci
-python3 ci-monitor/src/tpu_dashboard.py --db-dir /tmp/tpu-ci --out /tmp/tpu-ci.html
-```
