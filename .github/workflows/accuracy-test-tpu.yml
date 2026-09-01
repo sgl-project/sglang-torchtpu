@@ -85,9 +85,9 @@ jobs:
         # One suite (= one file, one job, one slice) per benchmark. The next
         # model adds its suites here and a choice above; selection stays in the
         # job-level `if` while a single model is the only single-host entrant.
-        # The stacked relabel PR renames these to nightly-tpu-accuracy-* per
-        # the design doc's suite scheme; the strings must match the files'
-        # register_tpu_ci(suite=...) at every point of the stack.
+        # The stacked relabel PR renames these to nightly-tpu-accuracy-*; the
+        # strings must match the files' register_tpu_ci(suite=...) at every
+        # point of the stack.
         suite: ${{ fromJSON('["tpu-eval-gpt-oss-120b-aime",
           "tpu-eval-gpt-oss-120b-gpqa",
           "tpu-eval-gpt-oss-120b-gsm8k",

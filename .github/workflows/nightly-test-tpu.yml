@@ -1,5 +1,5 @@
 # Nightly TPU e2e. Builds the image ONCE, then fans out the three stages of the
-# redesign (.github/tpu-ci/tpu-nightly-dashboard.design) IN PARALLEL:
+# redesign (.github/tpu-ci/README.md, § Pipelines and § Dashboard) IN PARALLEL:
 #
 #   [1] feature validation | [2] accuracy | [3] perf
 #

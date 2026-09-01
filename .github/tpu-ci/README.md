@@ -105,8 +105,8 @@ picks it up and groups it automatically; identical setup joins an existing group
 ### Nightly — `nightly-test-tpu.yml`
 
 `on: schedule` (daily) plus `workflow_dispatch` with an `only` filter (a stage, or a
-single feature-validation leg) and an `update-dashboard` publish opt-in (appendix A of
-[the design doc](tpu-nightly-dashboard.design)).
+single feature-validation leg) and an `update-dashboard` publish opt-in (see
+[Dashboard](#dashboard--making-a-new-test-show-up) below).
 
 ```
 build (once)
@@ -488,7 +488,17 @@ legacy inference rows (`workload` ⇒ performance, `eval` ⇒ accuracy) are kept
 migration and will be removed. Labels are open: any extra label
 (`variant`, `quant`, `ep_size`, …) is stored, shown on hover, and offered as a
 filter/group-by — never an error. Keep label values low-cardinality; bulky one-off
-payloads go in a `kind: info` record instead.
+payloads go in a `kind: info` record instead (as a `json.dumps` string value — `info`
+is a label on the ordinary `dump_metric` record, not a separate API). The reserved
+label keys are `kind`, `id`, `display_name`, `model`, `workload`, `eval`, `reason`;
+a future contract key joins that list (and the lint) first, so it can never collide
+with a label some test already uses.
+
+**Test-list and chart filters come from `register_tpu_ci(labels=[...])`** — free-form
+topology / model / feature tags (`multihost`, `gpt-oss-120b`, `pd`, `spec`, …),
+AST-scanned from source by keel and rendered as filter dropdowns on every tab. These
+are *test* properties, one declaration per file; `dump_metric` labels are
+*measurement* properties — don't restate one in the other.
 
 **Series identity.** `id` is the join key across nights: never renamed, never shown.
 `display_name` is cosmetic and free to change. When an `id` truly must change, record
@@ -503,6 +513,17 @@ itself is incomplete, which `bench_serving_runner` checks unconditionally — th
 dumps no numbers. It dumps one `smoke_failed` record per point instead, with the same
 routing labels plus a free-text `reason`, and the dashboard renders that night as a ✕
 with the reason on hover, config panels still attached.
+
+**Every perf measurement also ends with one framed payload.** After the digest
+lines and the per-number `dump_metric` calls (clean legs only — a failed leg
+complains and dumps a ✕ instead), `sglang.test.tpu.emit_result_payload` prints the
+whole summary between `=== TPU_BENCH_RESULT_JSON BEGIN/END ===` markers, which
+`_tpu-test.yml` lifts into a run artifact + the job summary. The payload is
+pretty-printed on purpose: containerd caps a log record at 16 KiB, and an indent
+means a split only ever falls BETWEEN JSON tokens, so the rejoined block parses
+identically — a one-line dump has twice corrupted the rest of a job log. The
+digest lines come first because the payload is the fragile half: triage must never
+depend on it surviving.
 
 **Server / bench config panels come free** for a perf test that launches through
 `RecipeLauncher` and measures with `benchmark/tpu/bench_serving.sh`. The launcher

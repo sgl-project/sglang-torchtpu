@@ -5,7 +5,7 @@ description: The TPU nightly CI & dashboard contract — test taxonomy, required
 
 # TPU Nightly CI & Dashboard Contract
 
-Full design: [.github/tpu-ci/tpu-nightly-dashboard.design](../../../.github/tpu-ci/tpu-nightly-dashboard.design).
+Full contract: [.github/tpu-ci/README.md § Dashboard](../../../.github/tpu-ci/README.md#dashboard--making-a-new-test-show-up).
 Enforced by the pr-gate lints in `test/registered/unit/test_tpu_dashboard_contract.py`
 (plus `test_tpu_bench_serving_gate.py`) — run them locally before pushing:
 

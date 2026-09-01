@@ -72,7 +72,6 @@ def register_cpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -86,7 +85,6 @@ def register_cuda_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -100,7 +98,6 @@ def register_amd_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -114,7 +111,6 @@ def register_musa_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -128,7 +124,6 @@ def register_npu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -142,7 +137,6 @@ def register_xpu_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -170,7 +164,6 @@ def register_musa_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -184,7 +177,6 @@ def register_mlx_ci(
     *,
     stage: Optional[str] = None,
     runner_config: Optional[str] = None,
-    labels: Optional[List[str]] = None,
 ):
     """Marker for MLX CI registration (parsed via AST; runtime no-op)."""
     return None
