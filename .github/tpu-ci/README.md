@@ -104,12 +104,25 @@ picks it up and groups it automatically; identical setup joins an existing group
 
 ### Nightly — `nightly-test-tpu.yml`
 
-`on: schedule` (daily) plus `workflow_dispatch` with an `only` filter to run a single leg.
+`on: schedule` (daily) plus `workflow_dispatch` with an `only` filter (a stage, or a
+single feature-validation leg) and an `update-dashboard` publish opt-in (appendix A of
+[the redesign doc](nightly-and-dashboard-redesign.md)).
 
 ```
-build ─────────────────────────────────┐
-  ├─▶ single-host           (hosts=1)  3 LPT shards, max-parallel: 1
-  │    suite: nightly-tpu-4-v7
+build (once)
+  ├─▶ [1] feature validation   feature-validation-tpu.yml
+  ├─▶ [2] accuracy             accuracy-test-tpu.yml
+  └─▶ [3] perf                 perf-test-tpu.yml
+      all three in parallel: slice contention is Kueue's job (the nightly
+      lane's quota queues the jobs), and a red stage costs the others nothing
+```
+
+Each stage is a reusable workflow the nightly calls with the shared image, and ALSO its
+own `workflow_dispatch` trigger (with its own build) for running one stage — or one
+test — without a full nightly. Inside stage [1]:
+
+```
+  ├─▶ single-host           (hosts=1)  one job per nightly-tpu-4-v7 test
   ├─▶ P/D feature gates     (hosts=2)  │  dedicated registered tests
   └─▶ discover ─▶ multi-host (hosts=2) ┘  matrix over discovered launch groups
 ```
@@ -166,8 +179,9 @@ hosted runners) minus this job's own runtime, the bind/pull window and setup. Th
 figure must OUTLAST the JobSet's `activeDeadlineSeconds` so the JobSet — not the poll loop —
 reports the outcome.
 
-The nightly single-host suite uses three deterministic LPT partitions with
-`max-parallel: 1`, so the shards reuse one image build and one TPU slice.
+The nightly single-host jobs are ONE JOB PER TEST FILE (`discover_tests.py` renders the
+matrix), so a red job names its test directly — the dashboard contract. Kueue queues
+them against the nightly lane's single-host quota, and they all reuse one image build.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
@@ -212,7 +226,11 @@ _TODO._
 | `.github/workflows/_tpu-build.yml` | Reusable: build once → output digest |
 | `.github/workflows/_tpu-test.yml` | Reusable: render JobSet (suite or group) → wait for Kueue admission → stream logs → gate on JobSet condition |
 | `.github/workflows/pr-test-tpu.yml` | `on: pull_request` (path-or-`tpu`-label gated); decide → build → single-host test |
-| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build → fixed single-host LPT matrix + discover → multi-host **matrix** over groups |
+| `.github/workflows/nightly-test-tpu.yml` | `on: schedule` + dispatch; build once → stages [1] feature validation, [2] accuracy, [3] perf in parallel |
+| `.github/workflows/feature-validation-tpu.yml` | Stage [1], also dispatchable alone: single-host matrix (one job per test) + static P/D gates + discover → multi-host matrix over groups |
+| `.github/workflows/accuracy-test-tpu.yml` | Stage [2], also dispatchable alone: one job per model via run_suite; ondemand multihost accuracy models (dispatch-only) |
+| `.github/workflows/perf-test-tpu.yml` | Stage [3], also dispatchable alone: one job per model via run_suite |
+| `.github/tpu-ci/dashboard_aliases.json` | Series-id rename registry: old-id → new-id, applied by keel at render time (pr-gate lint) |
 
 ## Cluster infra
 
@@ -434,35 +452,57 @@ the multi-host loop's per-file records:
 register_tpu_ci(est_time=3000, suite="nightly-tpu-4-v7", nightly=True)
 ```
 
-Only **scheduled** nightlies are ingested; a `workflow_dispatch` run is not a data point.
+**Scheduled** nightlies are always ingested. A `workflow_dispatch` run is ingested only
+when dispatched with `update-dashboard: true` — that stamps `[publish]` into the run
+name, and the ingester honors it only on `main`, so a branch experiment can never write
+the main trend. Rerun jobs freely: records are keyed `(run_id, attempt)` and the latest
+attempt replaces the datapoint.
 
 **Accuracy and performance tabs are driven by `dump_metric` labels.** A metric lands in
-a tab because the test said so, never because the dashboard pattern-matched its name:
+a tab because the test said so, never because the dashboard pattern-matched its name.
+For a `MODEL_CONFIG` test (nightly-accuracy / nightly-perf) the labels come from the
+config — declare `id`, `display_name`, `model` and the machinery stamps every record;
+a pr-gate lint (`test/registered/unit/test_tpu_dashboard_contract.py`) fails a PR whose
+config misses one:
 
 ```python
 from sglang.test.test_utils import dump_metric
 
 # -> accuracy tab
-dump_metric("mmlu_score", 0.82, labels={"model": MODEL, "eval": "simple-evals"})
+dump_metric("mmlu_score", 0.82,
+            labels={"kind": "accuracy", "model": MODEL,
+                    "id": "accuracy-mymodel", "display_name": "MyModel 120B"})
 
 # -> performance tab
 dump_metric(f"{test_name}.{workload}.total_throughput", tok_s,
-            labels={"model": MODEL, "workload": workload, "c": concurrency})
+            labels={"kind": "performance", "model": MODEL, "workload": workload,
+                    "id": "perf-mymodel", "display_name": "MyModel 120B", "c": 16})
+
+# -> no chart; stored forever, shown in the point's details panel
+dump_metric("tuning_notes", json.dumps({"kv_dtype": "fp8"}),
+            labels={"kind": "info", "model": MODEL})
 ```
 
-Resolution order, highest first:
+The contract kinds are exactly `accuracy` / `performance` / `info` (pr-gate lint); the
+legacy inference rows (`workload` ⇒ performance, `eval` ⇒ accuracy) are kept for
+migration and will be removed. Labels are open: any extra label
+(`variant`, `quant`, `ep_size`, …) is stored, shown on hover, and offered as a
+filter/group-by — never an error. Keep label values low-cardinality; bulky one-off
+payloads go in a `kind: info` record instead.
 
-| what the test passes | tab |
-|---|---|
-| `labels={"kind": "accuracy"}` or `{"kind": "performance"}` | that one, unconditionally |
-| `labels={"workload": ...}` | performance |
-| `labels={"eval": ...}` | accuracy |
-| none of the above | **neither** — the build prints a `warning: N metric(s) carry no kind` naming them |
+**Series identity.** `id` is the join key across nights: never renamed, never shown.
+`display_name` is cosmetic and free to change. When an `id` truly must change, record
+it once in [`dashboard_aliases.json`](dashboard_aliases.json) (old → new; keel merges
+at render time, so history needs no rewrite). A pr-gate lint keeps the map acyclic,
+its targets live, and every live `id` unique. `labels["model"]` groups a model's
+charts, so keep it stable too — the canonical HF id, not a mount path.
 
-Use the explicit `kind` for anything that is not a throughput sweep or an eval score;
-the other two rows are just the shapes the existing emitters already happen to pass.
-`labels["model"]` is what keys a chart's series, so keep it stable — a model that is
-sometimes an HF id and sometimes a mount path becomes two unrelated trends.
+**A failed perf run is explained, not hidden.** A perf suite may declare smoke legs
+(`"smoke": True` gates, listed before the sweep); if one fails — or the measurement
+itself is incomplete, which `bench_serving_runner` checks unconditionally — the sweep
+dumps no numbers. It dumps one `smoke_failed` record per point instead, with the same
+routing labels plus a free-text `reason`, and the dashboard renders that night as a ✕
+with the reason on hover, config panels still attached.
 
 **Server / bench config panels come free** for a perf test that launches through
 `RecipeLauncher` and measures with `benchmark/tpu/bench_serving.sh`. The launcher
@@ -482,11 +522,12 @@ slices announces the files; only the prefill leader emits the TIMINGS record,
 because the other three run the same command but do not carry the verdict, and
 four records would be four duplicate rows for one test.
 
-**A dispatch-only workflow earns no history row.** Only scheduled runs are
-ingested, so a test that lives solely in `integration-test-tpu.yml`
-(`workflow_dispatch` only) never trends no matter how well-formed its log is. It
-needs a leg in `nightly-test-tpu.yml` too — that is what the
-`pd-mh-gpt-120b-pc-offload` and `pd-mh-gpt-120b-tp-reshard` jobs are.
+**A dispatch-only workflow earns no history row.** Ingestion covers scheduled runs
+plus `update-dashboard` dispatches on main, so a test that lives solely in
+`integration-test-tpu.yml` (`workflow_dispatch` only, no publish opt-in) never
+trends no matter how well-formed its log is. It needs a leg in the nightly's
+feature-validation stage too — that is what the `pd-mh-gpt-120b-pc-offload` and
+`pd-mh-gpt-120b-tp-reshard` jobs in `feature-validation-tpu.yml` are.
 
 Sanity-check a new test's log against the parser before waiting a night for it:
 

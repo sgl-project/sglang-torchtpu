@@ -2,10 +2,12 @@
 # JOB PER MODEL so they take separate slices and run in parallel.
 # A model that fails costs the others nothing, and each gets its own
 # --timeout-per-file rather than sharing one with every other model.
-# The same jobs run nightly (nightly-test-tpu.yml); this action is the isolated
-# trigger, for collecting a datapoint on demand without waiting for a nightly:
+# Stage [3] of the nightly (nightly-test-tpu.yml calls this workflow with a
+# prebuilt image); this action is also the isolated trigger, for collecting a
+# datapoint on demand without waiting for a nightly:
 #   gh workflow run perf-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
 name: Perf Test (TPU)
+run-name: "Perf Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
   workflow_dispatch:
@@ -20,16 +22,44 @@ on:
         default: all
         type: choice
         options: [all, gpt-oss-120b]
+      image:
+        description: "Prebuilt image digest (repo@sha256:...); empty builds one"
+        required: false
+        default: ""
+      update-dashboard:
+        description: "Publish this run's results to the dashboard (main only)"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: main
+        type: string
+      model:
+        required: false
+        default: all
+        type: string
+      image:
+        required: false
+        default: ""
+        type: string
 
 concurrency:
-  # Keyed on ref so runs for different branches proceed in parallel; the nightly
-  # lane has 3 single-host slices to absorb them. Same ref still serializes, so a
-  # re-dispatch cannot race the previous run's numbers into the same window.
+  # Only governs standalone dispatches (a called workflow rides the caller's
+  # group). Keyed on ref so runs for different branches proceed in parallel; the
+  # nightly lane has 3 single-host slices to absorb them. Same ref still
+  # serializes, so a re-dispatch cannot race the previous run's numbers into the
+  # same window.
   group: tpu-perf-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # Standalone runs build their own image; the nightly passes one in so every
+  # stage of the run tests a single build.
   build:
+    if: ${{ (inputs.image || '') == '' }}
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -39,6 +69,8 @@ jobs:
 
   perf:
     needs: build
+    # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
+    if: ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success') }}
     strategy:
       # A slow or broken model must not cancel the other's measurement.
       fail-fast: false
@@ -52,7 +84,7 @@ jobs:
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}

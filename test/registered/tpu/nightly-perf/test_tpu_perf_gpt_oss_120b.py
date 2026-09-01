@@ -1,21 +1,24 @@
 """Throughput sweep for gpt-oss-120b on the 8k1k workload.
 
-ADDING A MODEL: copy this file, and change five things.
+ADDING A MODEL: copy this file, and change six things.
 
   1. the filename and its `suite=` -- ONE FILE AND ONE SUITE PER MODEL. That is
      what makes the models run as separate nightly jobs on separate slices; a
      shared suite would put them back into one sequential job, where a slow model
      delays the others and a failing one costs them their measurement entirely.
-     Add the new suite name to run_suite.py's TPU list and to the matrices in
-     perf-test-tpu.yml and nightly-test-tpu.yml.
-  2. `est_time` -- one bring-up (weight load + per-shape compile) plus the sweep.
+     Add the new suite name to run_suite.py's TPU list and to the matrix in
+     perf-test-tpu.yml (the nightly calls that workflow).
+  2. `id` and `display_name` -- `id` is the dashboard's series join key, NEVER
+     renamed after the first nightly (a forced rename goes through
+     .github/tpu-ci/dashboard_aliases.json); `display_name` is cosmetic and free.
+  3. `est_time` -- one bring-up (weight load + per-shape compile) plus the sweep.
      It drives the JobSet poll budget, so an under-estimate kills the run. Not
      auto-refreshed: update_est_time.py omits tpu.
-  3. `MODEL` and `launch.recipe` -- point at the recipe that already knows how to
+  4. `MODEL` and `launch.recipe` -- point at the recipe that already knows how to
      serve this model, then list ONLY the deltas the measurement needs in `env`.
-  4. the shape (ISL/OSL/CONCUR/WORKLOAD), if this model is measured at a
+  5. the shape (ISL/OSL/CONCUR/WORKLOAD), if this model is measured at a
      different one. `WORKLOAD` is the name the dashboard's dropdown shows.
-  5. `launch.tag` -- what the boot line is labelled with in the log.
+  6. `launch.tag` -- what the boot line is labelled with in the log.
 
 Deliberately duplicated rather than shared across perf files: the point of one of
 these is that you can read how a model is served without jumping between files,
@@ -73,6 +76,12 @@ WEIGHTS = "/weights/gpt-oss-120b"
 MODEL_CONFIG = {
     "model": MODEL,
     "test_name": "gpt-oss-120b",
+    # The dashboard's series join key: never renamed, never shown. A forced
+    # rename is recorded in .github/tpu-ci/dashboard_aliases.json instead.
+    "id": "perf-gpt-oss-120b",
+    # Cosmetic, free to change at will -- the split from `id` is what makes a
+    # display rename a non-event for the trend.
+    "display_name": "GPT-OSS 120B",
     "variant": "TP8+EP8",
     "launch": {
         # server.sh's own sample usage is `ISL=8192 OSL=1024 CONCUR=N ./server.sh`

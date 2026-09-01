@@ -31,6 +31,13 @@ Top level
     launch        How to bring the server up (see below).
     test_name     Report label, and the basis of the generated TestCase name.
                   Defaults to `model`.
+    id            Stable series slug, e.g. "accuracy-gpt-oss-120b". The dashboard's
+                  join key across nights: NEVER renamed, never shown. A forced
+                  rename is recorded once in .github/tpu-ci/dashboard_aliases.json
+                  instead of edited here. Required for nightly-accuracy and
+                  nightly-perf configs (pr-gate label lint).
+    display_name  What the dashboard calls the series. Cosmetic, free to change --
+                  the split from `id` is what makes a rename a non-event.
     variant       Distinguishes launch configs of the same model in reports, e.g.
                   "TP8+EP8". Cosmetic while a model has one config.
     dashboard     "accuracy" -> each non-sweep gate's score is dumped as
@@ -81,6 +88,14 @@ gates -- one entry per evaluation
                   `baseline`/`atol` must not be set alongside it.
     bench_env     Extra environment for a `sweep` gate's bench_serving.sh
                   (DATASET_NAME, TOKENIZE_PROMPT, ...). Geometry comes from `sweep`.
+    smoke         True marks this gate a SMOKE LEG guarding the sweep: it must be
+                  listed before every sweep gate and must bring its own self-gating
+                  `runner` (returning "_passed"). If a smoke leg fails, the sweep
+                  dumps no numbers -- each point gets a `smoke_failed` record
+                  carrying the reason, which the dashboard renders as a ✕ -- so an
+                  inaccurately measured night can never look like a normal
+                  datapoint. Optional: with no smoke legs, the sweep still gates
+                  itself on measurement completeness, which takes the same ✕ path.
     num_examples, num_threads, max_tokens, temperature, top_p, top_k, api
                   Passed straight through to run_eval.
 
@@ -115,6 +130,8 @@ _TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
 _CONFIG_KEYS = {
     "model",
     "test_name",
+    "id",
+    "display_name",
     "variant",
     "launch",
     "gates",
@@ -144,6 +161,7 @@ _GATE_TRANSLATED = {
     "lm_eval_config",
     "sweep",
     "bench_env",
+    "smoke",
 }
 
 
@@ -180,11 +198,35 @@ def _build_launcher(launch: Dict[str, Any]):
     )
 
 
+def _smoke_wrapped(runner, smoke_state: Dict[str, Any], name: str):
+    """Record a smoke leg's failure so the sweep can withhold its numbers.
+
+    The reason is taken from the actual failure -- the runner's own "_failures"
+    text, or the exception -- because it is what the dashboard shows on the ✕.
+    """
+
+    def run(base_url: str) -> Dict[str, Any]:
+        try:
+            result = runner(base_url)
+        except Exception as exc:
+            smoke_state["failures"].append(f"smoke leg {name}: {exc}")
+            raise
+        if result.get("_passed") is False:
+            reasons = [str(r) for r in result.get("_failures") or []]
+            smoke_state["failures"].extend(reasons or [f"smoke leg {name} failed"])
+        return result
+
+    return run
+
+
 def _build_gate(
     gate: Dict[str, Any],
     test_name: str = "",
     model: str = "",
     dashboard: Optional[str] = None,
+    series_id: str = "",
+    display_name: str = "",
+    smoke_state: Optional[Dict[str, Any]] = None,
 ) -> AccuracyTestParams:
     _reject_unknown(gate, _GATE_PASSTHROUGH | _GATE_TRANSLATED, "gate")
     kwargs = {k: v for k, v in gate.items() if k in _GATE_PASSTHROUGH}
@@ -193,7 +235,14 @@ def _build_gate(
         # The dashboard plots only metrics that declare kind=accuracy; the stamp
         # is per-config so a copied gate cannot reach the tab undeclared. A sweep
         # gate is excluded: its points carry their own performance labels.
+        # `id` joins the series across nights (renames go through
+        # dashboard_aliases.json, never through this value); display_name is
+        # cosmetic and free to change.
         kwargs["metric_labels"] = {"model": test_name, "kind": "accuracy"}
+        if series_id:
+            kwargs["metric_labels"]["id"] = series_id
+        if display_name:
+            kwargs["metric_labels"]["display_name"] = display_name
 
     if "baseline" in gate:
         kwargs["baseline_accuracy"] = gate["baseline"]
@@ -210,6 +259,26 @@ def _build_gate(
                 "what run_lm_eval.sh reads"
             )
         kwargs["runner"] = lm_eval_runner(gate["lm_eval_config"])
+
+    if gate.get("smoke"):
+        # A smoke leg guards the sweep, so its verdict must be observable here:
+        # only a self-gating runner reports one ("_passed"); a baseline-graded
+        # gate is scored outside this module and its failure would go unseen.
+        if "sweep" in gate:
+            raise ValueError("a gate is a smoke leg or a sweep, not both")
+        conflicting = sorted({"baseline", "atol", "lm_eval_config"} & set(gate))
+        if conflicting:
+            raise ValueError(
+                f"a smoke gate must not set {conflicting}: it needs a self-gating "
+                '"runner", whose verdict is what withholds the sweep'
+            )
+        if "runner" not in gate:
+            raise ValueError('a smoke gate needs a self-gating "runner"')
+        if smoke_state is None:
+            raise ValueError("smoke gates are only valid inside a MODEL_CONFIG")
+        kwargs["runner"] = _smoke_wrapped(
+            gate["runner"], smoke_state, gate.get("label") or gate["dataset"]
+        )
 
     if "sweep" in gate:
         # A throughput gate. It shares the boot with this model's accuracy gates
@@ -228,6 +297,9 @@ def _build_gate(
             test_name=test_name or gate.get("label") or gate["dataset"],
             model=model,
             bench_env=gate.get("bench_env"),
+            series_id=series_id,
+            display_name=display_name,
+            smoke_state=smoke_state,
         )
     elif "bench_env" in gate:
         raise ValueError('bench_env is only meaningful alongside "sweep"')
@@ -242,9 +314,29 @@ def build_gates(config: Dict[str, Any]) -> List[AccuracyTestParams]:
     dashboard = config.get("dashboard")
     if dashboard not in (None, "accuracy"):
         raise ValueError(f'dashboard must be "accuracy" or absent, got {dashboard!r}')
+
+    # Smoke legs run first because gates run in list order; a smoke leg after a
+    # sweep would validate a measurement that has already been published.
+    gates = config["gates"]
+    sweep_indices = [i for i, g in enumerate(gates) if "sweep" in g]
+    smoke_indices = [i for i, g in enumerate(gates) if g.get("smoke")]
+    if smoke_indices and sweep_indices and max(smoke_indices) > min(sweep_indices):
+        raise ValueError("smoke gates must be listed before every sweep gate")
+
+    # Shared between the smoke legs (writers) and the sweep runners (readers):
+    # what withholds a sweep's numbers when a leg has already failed.
+    smoke_state: Dict[str, Any] = {"failures": []}
     return [
-        _build_gate(g, test_name=test_name, model=model, dashboard=dashboard)
-        for g in config["gates"]
+        _build_gate(
+            g,
+            test_name=test_name,
+            model=model,
+            dashboard=dashboard,
+            series_id=str(config.get("id", "")),
+            display_name=str(config.get("display_name", "")),
+            smoke_state=smoke_state,
+        )
+        for g in gates
     ]
 
 

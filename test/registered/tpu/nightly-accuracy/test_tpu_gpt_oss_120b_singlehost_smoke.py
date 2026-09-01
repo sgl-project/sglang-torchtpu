@@ -1,23 +1,25 @@
 """gpt-oss-120b single-host e2e accuracy: GPQA Diamond and MMLU.
 
-ADDING A MODEL: copy this file, and change five things.
+ADDING A MODEL: copy this file, and change six things.
 
   1. the filename and its `suite=` -- ONE FILE AND ONE SUITE PER MODEL, exactly as
      the perf tests (see test/registered/tpu/nightly-perf/test_tpu_perf_gpt_oss_120b.py):
      separate nightly jobs on separate slices, so a broken model costs the others
      nothing. Add the new suite name to run_suite.py's TPU list and to the
-     matrices in accuracy-test-tpu.yml and nightly-test-tpu.yml. The filename is
-     also the dashboard's series key, so treat it as permanent.
-  2. `est_time` -- bring-up plus every gate; it drives the JobSet poll budget, so
+     matrix in accuracy-test-tpu.yml (the nightly calls that workflow).
+  2. `id` and `display_name` -- `id` is the dashboard's series join key, NEVER
+     renamed after the first nightly (a forced rename goes through
+     .github/tpu-ci/dashboard_aliases.json); `display_name` is cosmetic and free.
+  3. `est_time` -- bring-up plus every gate; it drives the JobSet poll budget, so
      an under-estimate kills the run. Not auto-refreshed for tpu.
-  3. `MODEL` and `launch.recipe` -- point at the recipe that already serves this
+  4. `MODEL` and `launch.recipe` -- point at the recipe that already serves this
      model; list ONLY the eval deltas in `env`, each justified inline.
-  4. the gates -- baseline and atol come from the model card, and the atol must be
+  5. the gates -- baseline and atol come from the model card, and the atol must be
      sized against the dataset's sampling sigma (see the GPQA/MMLU notes below).
      `"dashboard": "accuracy"` is what plots the gate scores on the dashboard's
      accuracy tab; without it they are stored but never shown, which is the
      contract that keeps feature-validation gsm8k gates off the tab.
-  5. `launch.tag` -- what the boot line is labelled with in the log.
+  6. `launch.tag` -- what the boot line is labelled with in the log.
 
 Two gates against one server boot, both anchored on the model card's low-effort,
 no-tools column (Table 3, arXiv:2508.10925): GPQA 0.671, MMLU 0.859.
@@ -144,6 +146,12 @@ LAUNCH_ENV = {
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b",
+    # The dashboard's series join key: never renamed, never shown. A forced
+    # rename is recorded in .github/tpu-ci/dashboard_aliases.json instead.
+    "id": "accuracy-gpt-oss-120b",
+    # Cosmetic, free to change at will -- the split from `id` is what makes a
+    # display rename a non-event for the trend.
+    "display_name": "GPT-OSS 120B",
     "variant": "TP8+EP8",
     # Plots each gate's score on the dashboard's accuracy tab (see point 4 above).
     "dashboard": "accuracy",

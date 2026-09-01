@@ -92,12 +92,13 @@ def _direction(field: str) -> str:
 def _dump_leg_metrics(leg):
     """One [METRIC] line per number, same label contract as bench_serving_runner.
 
-    Only the per-leg output_throughput carries `workload`, which is what routes it
-    to the dashboard's performance tab; everything else the leg measured is dumped
-    as kind=bench_detail -- stored in the dashboard's archive forever (a field not
-    recorded tonight cannot be back-filled once the job log expires), charted
-    nowhere. The leg tag is in the metric name because several legs share a run,
-    and the dashboard keys a night's point on (test_file, metric_name, model).
+    Only the per-leg output_throughput carries kind=performance plus `workload`,
+    which is what routes it to the dashboard's performance tab; everything else
+    the leg measured is dumped as kind=info -- stored in the dashboard's archive
+    forever (a field not recorded tonight cannot be back-filled once the job log
+    expires), shown in the point's details, charted nowhere. The leg tag is in
+    the metric name because several legs share a run, and the dashboard keys a
+    night's point on (test_file, metric_name, model).
     """
     tag = leg["tag"]
     numbers = {
@@ -109,10 +110,11 @@ def _dump_leg_metrics(leg):
             continue
         labels = {"model": MODEL_LABEL, "direction": _direction(field)}
         if field == "output_throughput":
+            labels["kind"] = "performance"
             labels["workload"] = tag
             labels["headline"] = "1"
         else:
-            labels["kind"] = "bench_detail"
+            labels["kind"] = "info"
             labels["workload_name"] = tag
         dump_metric(f"{tag}.{field}", value, labels=labels)
 

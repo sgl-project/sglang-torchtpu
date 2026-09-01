@@ -1,0 +1,366 @@
+# TPU feature validation -- stage [1] of the nightly (nightly-test-tpu.yml calls
+# this workflow with a prebuilt image), and its own dispatchable trigger for
+# running the stage, or a single test, without a full nightly:
+#   gh workflow run feature-validation-tpu.yml [-f only=<job>] [-f ref=<branch>]
+#
+# Jobs:
+#   * single-host  -> one job per nightly-tpu-4-v7 test (discover_tests.py).
+#   * multi-host   -> discover_multihost.py finds multi-host test files
+#                     (MULTIHOST_LAUNCH) registered to nightly-tpu-multihost and
+#                     GROUPS them by launch spec; one JobSet per group (launch
+#                     once, rank-0 runs the group's files).
+#   * pd-*         -> static P/D disaggregation gates (2 engines per job).
+# Every job runs in the `nightly` lane (topology.yaml) and maps to exactly ONE
+# test file, so a red job names its test (the dashboard contract).
+name: Feature Validation (TPU)
+run-name: "Feature Validation (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test"
+        required: false
+        default: main
+      only:
+        description: "Run only one part"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - mh
+          - pd-mh-gpt-120b
+          - pd-mh-gpt-120b-pc-offload
+          - pd-mh-gpt-120b-spec
+          - pd-mh-gpt-120b-pc-offload-spec
+          - pd-mh-gpt-120b-tp-reshard
+          - pd-sh-gpt-120b
+          - pd-sh-gpt-120b-spec
+          - sh
+      image:
+        description: "Prebuilt image digest (repo@sha256:...); empty builds one"
+        required: false
+        default: ""
+      update-dashboard:
+        description: "Publish this run's results to the dashboard (main only)"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: main
+        type: string
+      only:
+        required: false
+        default: all
+        type: string
+      image:
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  # Only governs standalone dispatches (a called workflow rides the caller's
+  # group). Keyed on ref so branches proceed in parallel; same ref serializes.
+  group: tpu-feature-validation-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Standalone runs build their own image; the nightly passes one in so every
+  # stage of the run tests a single build.
+  build:
+    if: ${{ (inputs.image || '') == '' }}
+    uses: ./.github/workflows/_tpu-build.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+    permissions:
+      contents: read
+      id-token: write
+
+  discover-tests:
+    needs: build
+    # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
+    if: ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      single_host: ${{ steps.tests.outputs.single_host }}
+      pd_pc_offload: ${{ steps.tests.outputs.pd_pc_offload }}
+      pd_tp_reshard: ${{ steps.tests.outputs.pd_tp_reshard }}
+      pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
+      pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
+      pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: tests
+        run: |
+          set -euo pipefail
+          discover_files='python3 .github/tpu-ci/discover_files.py'
+          echo "single_host=$(python3 .github/tpu-ci/discover_tests.py --suite nightly-tpu-4-v7 --nightly)" >> "$GITHUB_OUTPUT"
+          echo "pd_pc_offload=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/integration/test_pd_tp_resharding.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
+
+  single-host:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && ((inputs.only || 'all') == 'all' || inputs.only == 'sh')
+          && needs.discover-tests.outputs.single_host != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test: ${{ fromJSON(needs.discover-tests.outputs.single_host) }}
+    name: ${{ matrix.test.name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      suite: ${{ matrix.test.suite }}
+      test_file: ${{ matrix.test.file }}
+      nightly: true
+      run_name: ${{ matrix.test.run_name }}
+      # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
+      # the ROX weights disk at /weights; harmless for tests that don't use it.
+      weights_pvc: model-weights-rox
+    permissions:
+      contents: read
+      id-token: write
+
+  # P/D disaggregation integration tests: same JobSets as the standalone
+  # integration-test-tpu.yml action, which is workflow_dispatch-only. Only
+  # SCHEDULED runs are ingested by the CI dashboard, so a dispatch-only test
+  # never earns a history row -- these jobs give them a nightly cadence and
+  # therefore a green/red trend. Each engine role holds a whole 2x2x2 nightly
+  # slice, so every P/D job holds BOTH nightly-2h slices at once; the shared
+  # tpu-pd-lock in _tpu-test.yml serializes them (and against pd-sh /
+  # pd-mh below). See the runner-cap gap in .github/tpu-ci/README.md.
+  # P/D pods are named tpu-ci-<run_name>-<rand>-{prefill,decode}-<idx>; names
+  # use compact abbreviations (pd-{sh,mh}-gpt-120b[-<feature>]) to stay well
+  # under k8s's 63-char pod-name cap.
+  pd-mh-gpt-120b-pc-offload:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      # hosts feeds only the slice concurrency group; the P/D topology below
+      # sizes the JobSet (2-host prefill slice + 2-host decode slice).
+      hosts: 2
+      # The nightly lane is the only one owning two 2x2x2 slices, which is what
+      # a prefill engine and a decode engine need at the same time.
+      lane: nightly
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
+      weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  pd-mh-gpt-120b-tp-reshard:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-mh-gpt-120b-tp-reshard"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      hosts: 2
+      lane: nightly
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/integration/test_pd_tp_resharding.py
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/integration/test_pd_tp_resharding.py
+      weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_tp_reshard)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # One host per P/D engine isolates this gate from intra-engine multihost issues.
+  # Kueue queues it against other P/D jobs contending for the nightly lane.
+  pd-sh:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-gpt-120b"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
+      # Names the dashboard row and the TIMINGS record; required in P/D mode.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
+      weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Keep the CI identifier compact: <category>-<topology>-<model>-<feature>.
+  # The full model and testcase remain visible in the dashboard file key.
+  pd-sh-gpt-120b-spec:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-gpt-120b-spec"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
+      weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Multihost P/D GSM8K accuracy test with 2 prefill and 2 decode hosts.
+  pd-mh:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-mh-gpt-120b"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
+      # Used for dashboard and timing records.
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
+      weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Multihost P/D with 2 prefill + 2 decode hosts, EAGLE3 spec + prefix caching.
+  pd-mh-spec:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","pd-mh-gpt-120b-spec"]'), inputs.only || 'all') }}
+    name: pd-mh-gpt-120b-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
+      weights_pvc: model-weights-rox
+      run_name: pd-mh-gpt-120b-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # GPT-OSS-120B 2P+2D gate with prefix cache, Raiden KV offload, and EAGLE3 spec.
+  pd-mh-gpt-120b-pc-offload-spec:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload-spec"]'), inputs.only || 'all') }}
+    name: pd-mh-gpt-120b-pc-offload-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
+      weights_pvc: model-weights-rox
+      run_name: pd-mh-gpt-120b-pc-offload-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # Discover multi-host launch groups from the test files (test-owned launch specs).
+  discover:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && ((inputs.only || 'all') == 'all' || inputs.only == 'mh') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      groups: ${{ steps.d.outputs.groups }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - id: d
+        run: |
+          set -euo pipefail
+          groups="$(python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost)"
+          echo "groups=$groups" >> "$GITHUB_OUTPUT"
+          echo "discovered groups: $groups"
+
+  # One JobSet per launch group. matrix.group is a discovered object.
+  multi-host:
+    needs: [build, discover]
+    if: >-
+      ${{ !cancelled() && needs.discover.result == 'success'
+          && needs.discover.outputs.groups != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.discover.outputs.groups) }}
+    name: ${{ matrix.group.name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      nightly: true
+      launch_script: ${{ matrix.group.launch_script }}
+      files: ${{ matrix.group.files }}
+      hosts: ${{ matrix.group.hosts }}
+      weights_pvc: ${{ matrix.group.weights_pvc }}
+      timeout_per_file: ${{ matrix.group.timeout_per_file }}
+      run_name: ${{ matrix.group.run_name }}
+    permissions:
+      contents: read
+      id-token: write

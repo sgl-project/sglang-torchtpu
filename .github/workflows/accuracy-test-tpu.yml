@@ -1,14 +1,15 @@
 # TPU accuracy gates -- test/registered/tpu/nightly-accuracy/ via run_suite, ONE
 # JOB PER MODEL so they take separate slices and run in parallel, exactly like
-# perf-test-tpu.yml. The same jobs run nightly (nightly-test-tpu.yml); this action
-# is the isolated trigger, for collecting a datapoint on demand without waiting
-# for a nightly:
+# perf-test-tpu.yml. Stage [2] of the nightly (nightly-test-tpu.yml calls this
+# workflow with a prebuilt image); this action is also the isolated trigger, for
+# collecting a datapoint on demand without waiting for a nightly:
 #   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
 #
 # Single-host models go through run_suite (`accuracy`); the multihost ones parked out
 # of the nightly lane (DeepSeek-R1-0528, Kimi-K2.6) take the JobSet launch path
 # (`accuracy-multihost`).
 name: Accuracy Test (TPU)
+run-name: "Accuracy Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
   workflow_dispatch:
@@ -18,20 +19,50 @@ on:
         required: false
         default: main
       model:
+        # `nightly` is what nightly-test-tpu.yml passes: every single-host
+        # accuracy suite, but NOT the ondemand multihost models parked out of
+        # the nightly lane (their slices are dispatch-only on purpose).
         description: "Which model to gate"
         required: false
         default: all
         type: choice
-        options: [all, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
+        options: [all, nightly, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
+      image:
+        description: "Prebuilt image digest (repo@sha256:...); empty builds one"
+        required: false
+        default: ""
+      update-dashboard:
+        description: "Publish this run's results to the dashboard (main only)"
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        required: false
+        default: main
+        type: string
+      model:
+        required: false
+        default: all
+        type: string
+      image:
+        required: false
+        default: ""
+        type: string
 
 concurrency:
-  # Keyed on ref so runs for different branches proceed in parallel; same ref
-  # still serializes, so a re-dispatch cannot race the previous run's scores.
+  # Only governs standalone dispatches (a called workflow rides the caller's
+  # group). Keyed on ref so runs for different branches proceed in parallel; same
+  # ref still serializes, so a re-dispatch cannot race the previous run's scores.
   group: tpu-accuracy-${{ inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # Standalone runs build their own image; the nightly passes one in so every
+  # stage of the run tests a single build.
   build:
+    if: ${{ (inputs.image || '') == '' }}
     uses: ./.github/workflows/_tpu-build.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -41,7 +72,10 @@ jobs:
 
   accuracy:
     needs: build
-    if: ${{ contains(fromJSON('["all","gpt-oss-120b"]'), inputs.model || 'all') }}
+    # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","nightly","gpt-oss-120b"]'), inputs.model || 'all') }}
     strategy:
       # A broken model must not cancel the others' scores.
       fail-fast: false
@@ -55,7 +89,7 @@ jobs:
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}
@@ -73,7 +107,9 @@ jobs:
   # discovered groups by name (mh-deepseek-r1-0528-mh, mh-kimi-k26-mh).
   discover-multihost:
     needs: build
-    if: ${{ contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'all') }}
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'all') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -99,7 +135,9 @@ jobs:
 
   accuracy-multihost:
     needs: [build, discover-multihost]
-    if: needs.discover-multihost.outputs.groups != '[]'
+    if: >-
+      ${{ !cancelled() && needs.discover-multihost.result == 'success'
+          && needs.discover-multihost.outputs.groups != '[]' }}
     strategy:
       fail-fast: false
       matrix:
@@ -108,7 +146,7 @@ jobs:
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
-      image: ${{ needs.build.outputs.digest }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
       lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}
