@@ -10,9 +10,8 @@ PyTorch/Python and need no JAX / torch_tpu / TPU device:
   req_to_token, distribution = [bs,bs,bs] decode / [0,bs,bs] extend).
 * :meth:`TpuPallasRpaV3AttnBackend.init_forward_metadata` populates
   ``self.forward_metadata``.
-* :meth:`TpuPallasRpaV3AttnBackend.forward_decode` flattens a 3D ``q`` to 2D
-  before delegating — the workaround for the torch.compile rotary_emb shape
-  bug (mirrors TorchNativeAttnBackend).
+* The shared RPA forward adapter converts SGLang's left-window span to the
+  kernel's total-token count.
 * Capability flags: ``support_triton()`` is False, fill value is 0.
 
 Kernel numerics live in ``test_ragged_paged_attention_v3.py`` (JAX+TPU
@@ -47,9 +46,8 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
     """Backend instance that skips the JAX-requiring kernel-op registration.
 
     ``__init__`` in the production class calls ``_build_pallas_kernel_op()``
-    which imports JAX + torch_tpu. The methods exercised here
-    (``_build_metadata`` / ``init_forward_metadata`` / ``forward_decode``'s
-    reshape) never touch ``self._op``, so leaving it as ``None`` is safe.
+    which imports JAX + torch_tpu. Tests that exercise ``_forward`` replace
+    ``self._op`` with a CPU-only recording function.
     """
 
     def __init__(
@@ -120,6 +118,84 @@ def _build_meta(backend, fb) -> PallasForwardMetadata:
     """Mirror ``init_forward_metadata``."""
     non_empty_bs = backend._non_empty_batch_size(fb)
     return backend._build_metadata(fb, non_empty_bs)
+
+
+class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
+    """The shared adapter translates SGLang window spans for RPA kernels."""
+
+    def _forward_with_window(self, sliding_window_size):
+        backend = _BackendUnderTest(
+            page_size=16,
+            req_to_token=_build_req_to_token(num_reqs=1, max_context_len=16),
+        )
+        backend.kv_cache_quant_dtype = None
+        backend.forward_metadata = PallasForwardMetadata(
+            kv_lens=torch.tensor([1], dtype=torch.int32),
+            cu_q_lens=torch.tensor([0, 1], dtype=torch.int32),
+            cu_kv_lens=torch.tensor([0, 16], dtype=torch.int32),
+            page_indices=torch.tensor([0], dtype=torch.int32),
+            distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
+            active_num_tokens=torch.tensor(1, dtype=torch.int32),
+        )
+        backend.token_to_kv_pool = types.SimpleNamespace(
+            get_fused_kv_buffer=lambda _layer_id: torch.empty(0)
+        )
+
+        captured = {}
+
+        def recording_op(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            sinks,
+            scaling,
+            sliding_window,
+            soft_cap,
+            k_scale,
+            v_scale,
+        ):
+            captured["sliding_window"] = sliding_window
+            return torch.zeros_like(q)
+
+        backend._op = recording_op
+        layer = types.SimpleNamespace(
+            tp_q_head_num=2,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            qk_head_dim=4,
+            v_head_dim=4,
+            layer_id=0,
+            sliding_window_size=sliding_window_size,
+            logit_cap=0,
+            scaling=1.0,
+        )
+        forward_batch = types.SimpleNamespace(
+            spec_info=None,
+            capture_hidden_mode=None,
+        )
+
+        backend._forward(
+            q=torch.zeros(1, 8),
+            k=torch.zeros(1, 4),
+            v=torch.zeros(1, 4),
+            layer=layer,
+            forward_batch=forward_batch,
+        )
+        return captured["sliding_window"]
+
+    def test_positive_window_is_converted_to_total_token_count(self):
+        self.assertEqual(self._forward_with_window(7), 8)
+
+    def test_disabled_window_is_passed_as_none(self):
+        for sliding_window_size in (None, 0, -1):
+            with self.subTest(sliding_window_size=sliding_window_size):
+                self.assertIsNone(self._forward_with_window(sliding_window_size))
 
 
 class TestPallasRpaV3MetadataDecode(CustomTestCase):

@@ -862,6 +862,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         sliding_window = getattr(layer, "sliding_window_size", None)
         if sliding_window is not None and sliding_window <= 0:
             sliding_window = None
+        elif sliding_window is not None:
+            # SGLang stores the left span, while RPA expects the total number
+            # of attended tokens, including the current token.
+            sliding_window += 1
 
         # For hybrid-SWA models, SWA layers index into the SWA sub-pool;
         # full-attention layers (or non-hybrid models) use the full-pool indices.
