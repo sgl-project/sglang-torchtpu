@@ -17,7 +17,18 @@ from sglang.test.test_utils import CustomTestCase
 
 _HAS_TORCH_TPU = hasattr(torch, "tpu")
 
+_LAYERNORM = "sglang.multimodal_gen.runtime.layers.layernorm"
 _MANAGER = "sglang.multimodal_gen.runtime.disaggregation.transport.manager"
+_VOCAB_EMBEDDING = "sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding"
+
+# These three name a literal backend, so the override alone reaches them.
+_HOST_SAFE_COMPILE_SITES = (
+    (_LAYERNORM, "LayerNorm.forward_native"),
+    (_LAYERNORM, "_ScaleResidualNormScaleShift.forward_native"),
+    (_LAYERNORM, "_NormScaleShift.forward_native"),
+)
+# This one names the platform backend, which torch.compile resolves eagerly.
+_TPU_BACKEND_COMPILE_SITES = ((_VOCAB_EMBEDDING, "get_masked_input_and_mask"),)
 
 
 def _run_probe(source: str, **env_overrides: str) -> subprocess.CompletedProcess:
@@ -96,6 +107,36 @@ class TestVariableAnnotations(CustomTestCase):
                     )
         self.assertEqual(offenders, [], "\n".join(offenders))
         self.assertGreater(scanned, 100, f"only {scanned} files under {root}")
+
+
+class TestCompileSitesAreDisabledOnTpu(CustomTestCase):
+    """`backend="tpu"` cannot lower a symbolic-shape graph -- it raises
+    `Cannot call storage_offset() on tensor with symbolic sizes/strides` once
+    torch.compile generalizes past the first shape."""
+
+    def _assert_left_undecorated(self, sites) -> None:
+        completed = _run_probe(
+            f"""
+            import functools, importlib
+
+            for module_name, qualname in {sites!r}:
+                module = importlib.import_module(module_name)
+                fn = functools.reduce(getattr, qualname.split("."), module)
+                # torch.compile(disable=True) returns the function untouched.
+                assert not hasattr(fn, "_torchdynamo_orig_callable"), qualname
+            """,
+            SGLANG_DIFFUSION_PLATFORM_OVERRIDE="tpu",
+        )
+        self.assertEqual(
+            completed.returncode, 0, f"subprocess stderr:\n{completed.stderr[-4000:]}"
+        )
+
+    def test_layernorm_sites_are_left_undecorated(self):
+        self._assert_left_undecorated(_HOST_SAFE_COMPILE_SITES)
+
+    @unittest.skipUnless(_HAS_TORCH_TPU, "resolving backend='tpu' needs torch_tpu")
+    def test_the_platform_backend_site_is_left_undecorated(self):
+        self._assert_left_undecorated(_TPU_BACKEND_COMPILE_SITES)
 
 
 class TestLayernormDoesNotImportTritonNormOnTpu(CustomTestCase):

@@ -394,7 +394,9 @@ class LayerNorm(CustomOp):
 
     @torch.compile(
         backend="inductor",
-        disable=current_platform.is_npu() or current_platform.is_rocm(),
+        disable=current_platform.is_npu()
+        or current_platform.is_rocm()
+        or current_platform.is_tpu(),
     )
     def forward_native(
         self,
@@ -679,7 +681,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
+    @torch.compile(
+        disable=current_platform.is_npu()
+        or current_platform.is_rocm()
+        or current_platform.is_tpu(),
+    )
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -845,7 +851,11 @@ class _NormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
-    @torch.compile(disable=current_platform.is_npu() or current_platform.is_rocm())
+    @torch.compile(
+        disable=current_platform.is_npu()
+        or current_platform.is_rocm()
+        or current_platform.is_tpu(),
+    )
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
