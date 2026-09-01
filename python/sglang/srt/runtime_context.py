@@ -523,18 +523,28 @@ class DpFlags(_FlagGroupBase):
 
 
 @dataclasses.dataclass
+class SpFlags(_FlagGroupBase):
+    """LayerNorm sequence-parallelism flags, materialized by
+    ``initialize_layernorm_sp`` (after distributed setup; reads the model
+    config). See ``layers.layernorm_sp``."""
+
+    enabled: bool = False
+
+
+@dataclasses.dataclass
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
     Resolved configuration lives in the config bags below (projected from the
     declarations at publish) — this tier only carries genuine runtime
     state whose value is not a function of the configuration alone, grouped
-    by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
+    by lifecycle (``capture``) or subsystem (``moe`` / ``dp`` / ``sp``).
     """
 
     capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
     moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)
+    sp: SpFlags = dataclasses.field(default_factory=SpFlags)
 
 
 @dataclasses.dataclass
@@ -608,6 +618,8 @@ class ForwardFlags:
         "flashinfer_trtllm_bypass": False,
         # Explicit producer/consumer layout contract for TPU fused-RS MoE.
         "tpu_fused_rs_sequence_parallel_plan": None,
+        # LayerNorm sequence parallelism region; see layers/layernorm_sp.py.
+        "sp_active": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -623,6 +635,7 @@ class ForwardFlags:
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
             "tpu_fused_rs_sequence_parallel_plan",
+            "sp_active",
         }
     )
 
