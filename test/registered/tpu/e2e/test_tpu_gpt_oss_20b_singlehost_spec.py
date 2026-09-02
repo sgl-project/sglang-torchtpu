@@ -35,6 +35,15 @@ def spec_decoding_runner(base_url: str):
     verify_count = meta.get("spec_verify_ct", 0)
     proposed = meta.get("spec_num_proposed_drafts", 0)
     correct_drafts = meta.get("spec_num_correct_drafts", 0)
+    num_accept_tokens = correct_drafts + verify_count
+    accept_rate = correct_drafts / proposed if proposed > 0 else 0.0
+    print(
+        "Speculative decoding metrics: "
+        f"spec_verify_ct={verify_count}, "
+        f"num_accept_tokens={num_accept_tokens}, "
+        f"num_proposed_drafts={proposed}, "
+        f"accept_rate={accept_rate:.4f}"
+    )
     failures = []
     if verify_count <= 0:
         failures.append(f"speculative verification did not run: {verify_count=}")
