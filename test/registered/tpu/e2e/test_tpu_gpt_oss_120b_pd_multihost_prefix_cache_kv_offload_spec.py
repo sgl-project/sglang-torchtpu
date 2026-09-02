@@ -42,7 +42,12 @@ except ModuleNotFoundError as exc:
         return None
 
 
-register_tpu_ci(est_time=10800, suite="tpu-integration", nightly=True)
+register_tpu_ci(
+    est_time=10800,
+    suite="tpu-integration",
+    nightly=True,
+    labels=["multihost", "gpt-oss-120b", "pd", "prefix-cache", "kv-offload", "spec"],
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

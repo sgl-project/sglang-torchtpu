@@ -13,7 +13,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_tpu_ci(est_time=600, suite="stage-b-test-tpu-4-v7")
+register_tpu_ci(
+    est_time=600,
+    suite="stage-b-test-tpu-4-v7",
+    labels=["singlehost", "qwen3-0.6b", "compile-tracer"],
+)
 
 MODEL = "Qwen/Qwen3-0.6B"
 EAGLE3_MODEL = "Qwen/Qwen3-1.7B"

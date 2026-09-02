@@ -37,6 +37,7 @@ register_tpu_ci(
     est_time=600,
     suite="stage-b-test-tpu-4-v7",
     disabled="Deprecated: superseded by test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload.py",
+    labels=["singlehost", "qwen3-0.6b", "prefix-cache"],
 )
 
 import os

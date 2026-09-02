@@ -22,7 +22,12 @@ from sglang.test.tpu.kv_offload_probe import kv_offload_runner
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
-register_tpu_ci(est_time=4200, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=4200,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "gpt-oss-120b", "prefix-cache", "kv-offload"],
+)
 
 SERVED_MODEL_NAME = "gpt-oss-120b"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")

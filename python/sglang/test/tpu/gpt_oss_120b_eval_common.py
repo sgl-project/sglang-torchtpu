@@ -30,12 +30,23 @@ def make_launch_env(**overrides: str) -> dict[str, str]:
 
 
 def make_model_config(
-    *, test_name: str, tag: str, launch_env: dict[str, str], gate: dict[str, Any]
+    *,
+    test_name: str,
+    series_id: str,
+    tag: str,
+    launch_env: dict[str, str],
+    gate: dict[str, Any],
 ) -> dict[str, Any]:
     """Build one isolated model configuration for one eval."""
     return {
         "model": SERVED_MODEL_NAME,
         "test_name": test_name,
+        # The dashboard's series join key: never renamed, never shown. A forced
+        # rename is recorded in .github/tpu-ci/dashboard_aliases.json instead.
+        "id": series_id,
+        # Cosmetic and free to change -- the split from `id` is what makes a
+        # display rename a non-event for the trend.
+        "display_name": "GPT-OSS 120B",
         "variant": "TP8+EP8",
         "dashboard": "accuracy",
         "dashboard_model": SERVED_MODEL_NAME,

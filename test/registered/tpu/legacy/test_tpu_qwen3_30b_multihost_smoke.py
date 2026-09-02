@@ -13,6 +13,7 @@ register_tpu_ci(
     suite="nightly-tpu-multihost",
     nightly=True,
     disabled="Qwen3-30B-A3B-FP8 multihost coverage is no longer needed (retired, not broken)",
+    labels=["multihost", "qwen3-30b", "smoke"],
 )
 
 # Own launch group: 30B-A3B-FP8 MoE recipe + the ROX weights volume.

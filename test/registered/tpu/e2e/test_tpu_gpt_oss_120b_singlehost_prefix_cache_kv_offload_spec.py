@@ -7,7 +7,12 @@ from sglang.test.tpu import model_config_main
 from sglang.test.tpu.kv_offload_probe import kv_offload_runner
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
-register_tpu_ci(est_time=2700, suite="nightly-tpu-4-v7", nightly=True)
+register_tpu_ci(
+    est_time=2700,
+    suite="nightly-tpu-4-v7",
+    nightly=True,
+    labels=["singlehost", "gpt-oss-120b", "prefix-cache", "kv-offload", "spec"],
+)
 
 SERVED_MODEL_NAME = "gpt-oss-120b"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")

@@ -8,7 +8,12 @@ from sglang.test.tpu.gpt_oss_120b_eval_common import (
     make_model_config,
 )
 
-register_tpu_ci(est_time=2700, suite="tpu-eval-gpt-oss-120b-gsm8k", nightly=True)
+register_tpu_ci(
+    est_time=2700,
+    suite="nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
+    nightly=True,
+    labels=["singlehost", "gpt-oss-120b", "accuracy"],
+)
 
 LAUNCH_ENV = make_launch_env(
     MAX_TOTAL_TOKENS="262144",
@@ -31,6 +36,7 @@ GATE = {
 
 MODEL_CONFIG = make_model_config(
     test_name="gpt-oss-120b-gsm8k",
+    series_id="accuracy-gpt-oss-120b-gsm8k",
     tag="gsm8k-e2e",
     launch_env=LAUNCH_ENV,
     gate=GATE,

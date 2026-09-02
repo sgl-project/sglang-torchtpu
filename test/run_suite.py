@@ -196,10 +196,10 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gpt-oss-120b",
         "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
-        "tpu-eval-gpt-oss-120b-aime",
-        "tpu-eval-gpt-oss-120b-gpqa",
-        "tpu-eval-gpt-oss-120b-gsm8k",
-        "tpu-eval-gpt-oss-120b-mmlupro",
+        "nightly-tpu-accuracy-gpt-oss-120b-aime",
+        "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
+        "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
+        "nightly-tpu-accuracy-gpt-oss-120b-mmlupro",
     ],
     HWBackend.XPU: [
         "nightly-xpu-1-gpu",

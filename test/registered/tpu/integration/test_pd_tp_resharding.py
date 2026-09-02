@@ -103,7 +103,11 @@ except ModuleNotFoundError as exc:
 
 # One invocation runs ONE model profile: two engines (weight load + compile),
 # the cache probe with device-pool churn, and gsm8k.
-register_tpu_ci(est_time=10800, suite="tpu-integration")
+register_tpu_ci(
+    est_time=10800,
+    suite="tpu-integration",
+    labels=["multihost", "gpt-oss-120b", "pd", "tp-reshard"],
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, *[".."] * 4))

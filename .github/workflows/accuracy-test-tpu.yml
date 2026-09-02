@@ -29,10 +29,6 @@ on:
         default: all
         type: choice
         options: [all, nightly, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
-      image:
-        description: "Prebuilt image digest (repo@sha256:...); empty builds one"
-        required: false
-        default: ""
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -85,13 +81,10 @@ jobs:
         # One suite (= one file, one job, one slice) per benchmark. The next
         # model adds its suites here and a choice above; selection stays in the
         # job-level `if` while a single model is the only single-host entrant.
-        # The stacked relabel PR renames these to nightly-tpu-accuracy-*; the
-        # strings must match the files' register_tpu_ci(suite=...) at every
-        # point of the stack.
-        suite: ${{ fromJSON('["tpu-eval-gpt-oss-120b-aime",
-          "tpu-eval-gpt-oss-120b-gpqa",
-          "tpu-eval-gpt-oss-120b-gsm8k",
-          "tpu-eval-gpt-oss-120b-mmlupro"]') }}
+        suite: ${{ fromJSON('["nightly-tpu-accuracy-gpt-oss-120b-aime",
+          "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
+          "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
+          "nightly-tpu-accuracy-gpt-oss-120b-mmlupro"]') }}
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:

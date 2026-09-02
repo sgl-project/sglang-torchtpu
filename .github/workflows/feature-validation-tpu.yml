@@ -38,10 +38,6 @@ on:
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - sh
-      image:
-        description: "Prebuilt image digest (repo@sha256:...); empty builds one"
-        required: false
-        default: ""
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
