@@ -37,8 +37,8 @@ def dflash_write_draft_kv(
       kv_pool: Fused TPU KV pool the draft layers write into.
       ctx_hidden: Projected context hidden states [num_tokens, hidden].
       ctx_positions: Token position IDs [num_tokens].
-      ctx_cache_loc: Flat destination slot per token [num_tokens]; on the
-        verify path uncommitted slots are already masked to 0.
+      ctx_cache_loc: Flat destination slot per token [num_tokens]; unused on
+        the verify path, where the spans come from cache_loc_2d.
       cache_loc_2d: Verify's dense slots [bs, block_size], or None on extend.
         Kept unflattened so the span table can be built from it.
       commit_lens: Verify's accepted counts [bs], or None on extend.

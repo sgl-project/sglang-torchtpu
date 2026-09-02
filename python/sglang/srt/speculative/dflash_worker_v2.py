@@ -1399,17 +1399,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                 if bs == 0:
                     return
-                row_offsets = torch.arange(
-                    cache_loc_2d.shape[1], device=cache_loc_2d.device
-                )
-                valid_mask = (
-                    row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
-                ).reshape(-1)
-                cache_loc = torch.where(
-                    valid_mask,
-                    cache_loc_2d.reshape(-1),
-                    torch.zeros_like(cache_loc_2d.reshape(-1)),
-                )
 
             dflash_write_draft_kv(
                 draft_model=self.draft_model,
