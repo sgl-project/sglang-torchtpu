@@ -255,7 +255,9 @@ def _addressed(
     """Flatten a span table back into the (slot, source) pairs it writes."""
     dsts: list[int] = []
     srcs: list[int] = []
-    for d, s, n in zip(dst_starts.tolist(), src_starts.tolist(), span_lens.tolist()):
+    for d, s, n in zip(
+        dst_starts.cpu().tolist(), src_starts.cpu().tolist(), span_lens.cpu().tolist()
+    ):
         assert n <= PAGE_SIZE, f"span of {n} tokens cannot stay inside a page"
         dsts.extend(range(d, d + n))
         srcs.extend(range(s, s + n))
@@ -288,7 +290,9 @@ def test_extend_spans_reconstruct_slots() -> None:
         for pages, offset, count in reqs:
             slots.extend(_paged_slots(pages, offset, count))
         num_real = len(slots)
-        cache_loc = torch.tensor(slots + [0] * pad, dtype=torch.int64)
+        # On device: the extend branch is compiled in production, and the TPU
+        # backend rejects op patterns that CPU tracing never sees.
+        cache_loc = torch.tensor(slots + [0] * pad, dtype=torch.int64).to(DEVICE)
 
         dst_starts, src_starts, span_lens, max_span_len = get_contiguous_slot_spans(
             page_size=PAGE_SIZE,
@@ -324,13 +328,13 @@ def test_verify_spans_reconstruct_slots() -> None:
     reqs = [([3, 8], 0, 10), ([12, 5], 44, 3), ([17, 2], 120, 10), ([9, 6], 127, 7)]
     rows = [_paged_slots(pages, offset, block) for pages, offset, _ in reqs]
     commits = [c for _, _, c in reqs]
-    cache_loc_2d = torch.tensor(rows, dtype=torch.int64)
+    cache_loc_2d = torch.tensor(rows, dtype=torch.int64).to(DEVICE)
 
     dst_starts, src_starts, span_lens, max_span_len = get_contiguous_slot_spans(
         page_size=PAGE_SIZE,
-        cache_loc=torch.zeros(len(reqs) * block, dtype=torch.int64),
+        cache_loc=torch.zeros(len(reqs) * block, dtype=torch.int64, device=DEVICE),
         cache_loc_2d=cache_loc_2d,
-        commit_lens=torch.tensor(commits, dtype=torch.int32),
+        commit_lens=torch.tensor(commits, dtype=torch.int32, device=DEVICE),
         max_num_reqs=MAX_NUM_REQS,
     )
     assert max_span_len == block, max_span_len
@@ -425,8 +429,10 @@ def test_matches_real_apply_k_rope() -> None:
 
 if __name__ == "__main__":
     test_matches_real_apply_k_rope()
+    print(f"TPU chips: {torch.tpu.device_count()}")
+    # A device allocation brings the pjrt client up; .to(DEVICE) alone does not.
+    torch.zeros(1, device=DEVICE)
     test_extend_spans_reconstruct_slots()
     test_verify_spans_reconstruct_slots()
-    print(f"TPU chips: {torch.tpu.device_count()}")
     test_matches_eager_reference()
     print("\nFUSED ROPE + KV WRITE TEST PASSED")

@@ -231,18 +231,23 @@ def _verify_spans(
         f"DFLASH verify block ({block_size}) must fit in a page ({page_size}) "
         "for the two-span split to cover it"
     )
+    # int32 end to end: the TPU backend fails to lower dynamic indexing over
+    # int64, and slots fit comfortably.
+    slots = cache_loc_2d.to(torch.int32)
     src_starts = torch.arange(
-        0, bs * block_size, block_size, device=cache_loc_2d.device
+        0, bs * block_size, block_size, dtype=torch.int32, device=slots.device
     )
-    head_dst = cache_loc_2d[:, 0]
+    head_dst = slots[:, 0]
     lens = commit_lens.to(torch.int32)
     head_lens = torch.minimum(lens, (page_size - head_dst % page_size).to(torch.int32))
     tail_lens = lens - head_lens
-    # Clamped only to keep the gather in range when the commit never spills; the
-    # slot it then picks is paired with a zero length.
-    tail_dst = cache_loc_2d.gather(
-        1, head_lens.to(torch.int64).clamp(max=block_size - 1).unsqueeze(1)
-    ).squeeze(1)
+    # Where the spill lands, selected without a gather. A commit that stays in
+    # its page picks some unwritten slot, or none at all when it fills the row;
+    # either way the tail length is zero.
+    offsets = torch.arange(block_size, dtype=torch.int32, device=slots.device)
+    tail_dst = (slots * (offsets[None, :] == head_lens[:, None])).sum(
+        dim=1, dtype=torch.int32
+    )
     return (
         torch.cat([head_dst, tail_dst]),
         torch.cat([src_starts, src_starts + head_lens]),
@@ -273,7 +278,9 @@ def _extend_spans(
     """
     num_tokens = int(cache_loc.shape[0])
     device = cache_loc.device
-    loc = cache_loc.to(torch.int64)
+    # Stay in int32 end to end: the TPU backend fails to lower a dynamic gather
+    # over int64, and both slots and token counts fit comfortably.
+    loc = cache_loc.to(torch.int32)
     # Pages handed out back to back are address-adjacent, so a page start ends a
     # run even where the addresses continue -- otherwise a span could outrun
     # max_span_len.
@@ -281,7 +288,7 @@ def _extend_spans(
     run_ids = torch.cat(
         [
             torch.zeros(1, dtype=torch.int32, device=device),
-            torch.cumsum(breaks.to(torch.int32), dim=0),
+            torch.cumsum(breaks.to(torch.int32), dim=0, dtype=torch.int32),
         ]
     )
     num_spans = num_tokens // page_size + min(max_num_reqs, num_tokens) + 1
@@ -291,10 +298,10 @@ def _extend_spans(
     edges = torch.arange(num_spans + 1, device=device, dtype=torch.int32)
     # run_ids is non-decreasing over the real tokens, so counting the tokens
     # below each edge gives every run's source offset.
-    bounds = (run_ids[None, :] < edges[:, None]).sum(dim=1)
+    bounds = (run_ids[None, :] < edges[:, None]).sum(dim=1, dtype=torch.int32)
     src_starts = bounds[:-1]
     return (
-        loc[src_starts.clamp(max=num_tokens - 1)],
+        torch.index_select(loc, 0, src_starts.clamp(max=num_tokens - 1)),
         src_starts,
         bounds[1:] - src_starts,
         page_size,
