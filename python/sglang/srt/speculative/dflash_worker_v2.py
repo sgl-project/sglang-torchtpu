@@ -649,58 +649,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             extend_num_tokens,
         )
 
-    def _write_layer_kv_tpu(
-        self,
-        layer_idx: int,
-        loc: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> None:
-        """Scatter K and V directly into the TPU 5D fused KV buffer.
-
-        Args:
-          layer_idx: Layer index in draft model.
-          loc: 1D token slot indices [num_tokens].
-          k: Key tensor [num_tokens, head_num, head_dim].
-          v: Value tensor [num_tokens, head_num, v_head_dim].
-        """
-        pool = self.draft_model_runner.token_to_kv_pool
-        buf = pool.get_fused_kv_buffer(layer_idx)
-
-        num_tokens = int(loc.shape[0])
-        if num_tokens == 0:
-            return
-
-        head_num = pool.head_num
-        head_dim = pool.head_dim
-        v_head_dim = pool.v_head_dim
-        padded_head_dim = pool.padded_head_dim
-        num_kv_heads_x2 = pool.num_kv_heads_x2
-        store_dtype = pool.store_dtype
-
-        k = k.view(num_tokens, head_num, head_dim)
-        v = v.view(num_tokens, head_num, v_head_dim)
-        if v_head_dim < head_dim:
-            v = torch.nn.functional.pad(v, (0, head_dim - v_head_dim))
-
-        # Interleave K and V heads along the heads axis: [num_tokens, 2 * head_num, head_dim].
-        kv = torch.stack([k, v], dim=2).reshape(num_tokens, head_num * 2, head_dim)
-
-        dim_pad = padded_head_dim - head_dim
-        head_pad = num_kv_heads_x2 - head_num * 2
-        if dim_pad > 0 or head_pad > 0:
-            kv = torch.nn.functional.pad(kv, (0, dim_pad, 0, head_pad))
-
-        loc_dev = loc.to(device=buf.device, dtype=torch.long)
-        kv_dev = kv.to(device=buf.device, dtype=store_dtype)
-
-        # Reshape kv_dev to match the 5D slice shape [num_tokens, kv_heads_packed, kv_packing, padded_head_dim].
-        if buf.ndim == 5:
-            kv_dev = kv_dev.view(num_tokens, *buf.shape[2:])
-
-        flat_buf = buf.flatten(0, 1)
-        flat_buf.index_copy_(0, loc_dev, kv_dev)
-
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
         # the backing field so a lookup before __init__ sets it raises
@@ -1427,6 +1375,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=(10, 14400), ctx_hidden=(10, 2880), positions=(10,),
             cache_loc=(10,), cache_loc_2d=(1, 10), commit_lens=(1,)
         """
+        from sglang.srt.hardware_backend.tpu.dflash_draft_kv_write import (
+            dflash_write_draft_kv,
+        )
+
         target_hidden, cache_loc, positions, cache_loc_2d, commit_lens = (
             self._append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
                 target_hidden, cache_loc, positions, cache_loc_2d, commit_lens
@@ -1459,10 +1411,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     torch.zeros_like(cache_loc_2d.reshape(-1)),
                 )
 
-            self._append_target_hidden_sequential_tpu(
+            dflash_write_draft_kv(
+                draft_model=self.draft_model,
+                kv_pool=self.draft_model_runner.token_to_kv_pool,
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
             )
 
     def _append_target_hidden_to_draft_kv_by_loc_prepare_inputs(
@@ -1537,30 +1493,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
         return (target_hidden, cache_loc, positions, cache_loc_2d, commit_lens)
-
-    def _append_target_hidden_sequential_tpu(
-        self,
-        ctx_hidden: torch.Tensor,
-        ctx_positions: torch.Tensor,
-        ctx_cache_loc: torch.Tensor,
-    ) -> None:
-        """Sequential 1D KV write for TPU draft model (prefill/extend)."""
-        for layer_idx, layer in enumerate(self.draft_model.layers):
-            attn = layer.self_attn
-            layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
-                layer, ctx_hidden
-            )
-            k, v = attn.kv_proj_only(layer_ctx_hidden)
-            k = attn.apply_k_norm(k)
-            k = attn.apply_k_rope(ctx_positions, k)
-            k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self._write_layer_kv_tpu(
-                layer_idx=layer_idx,
-                loc=ctx_cache_loc,
-                k=k,
-                v=v,
-            )
 
     def _update_target_mamba_state_after_verify(
         self,
