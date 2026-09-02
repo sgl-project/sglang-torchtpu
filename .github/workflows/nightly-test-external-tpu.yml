@@ -6,8 +6,6 @@
 # inside that job. Weights are served from the Project A GCS bucket over gcsfuse.
 # See .github/tpu-ci/external/README.md.
 #
-# SCAFFOLD: with no external-nightly-* test registered yet, `discover` outputs [] and `run`
-# is skipped -- the workflow is green and does nothing until a dev registers the first test.
 name: Nightly Test (External TPU)
 
 on:
