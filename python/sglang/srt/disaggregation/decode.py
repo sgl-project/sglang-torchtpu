@@ -908,21 +908,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return
         attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
 
-        # With CP, every row must enter the TP -> CP vote even when this row is
-        # already waiting; a peer may still be Bootstrapping. Without CP, keep
-        # the old shortcut, except when an aborted receiver still needs to be
-        # observed.
-        if (
-            self.pp_size <= 1
-            and attn_cp_cpu_group is None
-            and all(decode_req.waiting_for_input for decode_req in self.queue)
-            and not any(
-                decode_req.kv_receiver.conclude_state == KVPoll.Failed
-                for decode_req in self.queue
-            )
-        ):
-            return
-
+        # Receiver polling observes asynchronous failures while KV allocation
+        # is blocked.
         if self.pp_size > 1:
             polls = poll_and_all_reduce_pp(
                 (decode_req.req.rid for decode_req in self.queue),
