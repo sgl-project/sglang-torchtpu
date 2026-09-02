@@ -1179,7 +1179,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_ctx:
             if can_run_decode_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+                    forward_batch, select_index
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
@@ -1224,7 +1224,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 forward_batch=forward_batch,
             )
             ret_draft_probs = None
-        else:
+        # CUDA graphs now return selected rows directly. The eager non-TPU
+        # path still needs to apply the selection here; TPU keeps selection
+        # and top-1 sampling fused in its compile policy above.
+        elif not can_run_decode_cuda_graph:
             draft_logits_output.next_token_logits = (
                 draft_logits_output.next_token_logits[select_index]
             )
@@ -1232,8 +1235,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
                 ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
         if current_platform.is_tpu():
             pass
         elif get_spec().speculative_use_rejection_sampling:
