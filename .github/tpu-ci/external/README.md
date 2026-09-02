@@ -4,10 +4,10 @@ Runs sglang-torchtpu TPU e2e tests on **the external Ironwood (tpu7x) cluster**,
 serving model weights from the in-project CI GCS bucket over **gcsfuse**.
 
 > **Status: active.** The `test_tpu_bench_*` benchmark matrix (GPT-OSS-120B and
-> Qwen3-Coder-480B x {1-host prefix-cache, 1-host +EAGLE3+KV-offload} x {agentic, 8k1k}
-> — see `benchmark/tpu/recipe/bench_matrix/`) fills the four 2x2x2 slices, one launch
-> group per slice. Add further tests as below; a shape's groups beyond its slice count
-> serialize within the slice's job.
+> Qwen3-Coder-480B x {1-host prefix-cache, 1-host +EAGLE3+KV-offload, 4-host 2P+2D P/D} x
+> {agentic, 8k1k} — see `benchmark/tpu/recipe/bench_matrix/`) fills all six slices,
+> one launch group per slice. Add further tests as below; a shape's groups beyond its
+> slice count serialize within the slice's job.
 
 ## Architecture
 

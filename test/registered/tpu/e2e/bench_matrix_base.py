@@ -104,7 +104,7 @@ MODEL_DISPLAY_NAMES = {
     "gpt_oss_120b": "GPT-OSS 120B",
     "qwen3_coder_480b": "Qwen3-Coder-480B",
 }
-SPEC_RECIPES = {"1host_pc_spec_kvoff"}
+SPEC_RECIPES = {"1host_pc_spec_kvoff", "pd_2p2d_pc_spec_kvoff"}
 
 
 def _direction(field: str) -> str:
@@ -201,8 +201,26 @@ def _reachable_prefix_hit_rate(config, dp_size):
 
 
 def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
-    """Where the spec gauges live: the engine that decodes. For the 1-host
-    recipes that is the one server."""
+    """Where the spec gauges live: the engine that decodes.
+
+    For P/D that is the decode leader (hosts[2] of the slice), never the
+    mini-LB -- the LB serves no /metrics, and a request-level probe through
+    it is not a reliable oracle on this P/D setup. For 1-host recipes the
+    one server is the decode.
+    """
+    if bench_recipe.startswith("pd_"):
+        # Engine leaders follow PHYSICAL host order (serve_group.sh's
+        # rendezvous writes the map on this pod), not pod-index order.
+        try:
+            with open("/tmp/bench_matrix_phys_hosts") as f:
+                hosts = [line.strip() for line in f if line.strip()]
+        except OSError:
+            hosts = [
+                h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h
+            ]
+        if len(hosts) >= 3:
+            port = os.environ.get("PD_DECODE_PORT", "30002")
+            return f"http://{hosts[2]}:{port}"
     return base_url
 
 

@@ -44,6 +44,7 @@ MODELS = ("gpt_oss_120b", "qwen3_coder_480b")
 RECIPES = {
     "1host_pc": "external-nightly-2x2x2",
     "1host_pc_spec_kvoff": "external-nightly-2x2x2",
+    "pd_2p2d_pc_spec_kvoff": "external-nightly-2x2x4",
 }
 WORKLOADS = ("agentic", "8k1k")
 

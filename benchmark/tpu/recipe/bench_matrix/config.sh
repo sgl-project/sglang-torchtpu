@@ -8,6 +8,9 @@
 #   BENCH_MODEL   gpt_oss_120b | qwen3_coder_480b
 #   BENCH_RECIPE  1host_pc               1 host, tp=8, prefix caching
 #                 1host_pc_spec_kvoff    + EAGLE3 spec + KV offload (raiden)
+#                 pd_2p2d_pc_spec_kvoff  4 hosts: 2 prefill + 2 decode engines
+#                                        (single-host tp=8 each) over raiden
+#                                        P/D, prefix caching + spec + KV offload
 #   WORKLOAD      agentic  multi-turn agentic (the 480B nightly's shape:
 #                          4k in + 1k out per round, 2 rounds = 8k of input;
 #                          long sessions ramp to LONG_TARGET_CONTEXT)
@@ -32,7 +35,7 @@ REPO_ROOT=$(cd -- "$TPU_BENCH_DIR/../.." && pwd)
 NIGHTLY_TOOLS_DIR="$TPU_BENCH_DIR/recipe/qwen3_coder_480b/nightly"
 
 BENCH_MODEL=${BENCH_MODEL:?set BENCH_MODEL=gpt_oss_120b|qwen3_coder_480b}
-BENCH_RECIPE=${BENCH_RECIPE:?set BENCH_RECIPE=1host_pc|1host_pc_spec_kvoff}
+BENCH_RECIPE=${BENCH_RECIPE:?set BENCH_RECIPE=1host_pc|1host_pc_spec_kvoff|pd_2p2d_pc_spec_kvoff}
 WORKLOAD=${WORKLOAD:-agentic}
 PROFILE=${PROFILE:-ci}
 
@@ -246,6 +249,15 @@ case "$BENCH_RECIPE" in
         RECIPE_HOSTS=1; TP_SIZE=8; EP_SIZE=8
         PREFIX_CACHE=1; KV_OFFLOAD=1; SPEC_DECODE=1; PD_DISAGG=0
         ;;
+    pd_2p2d_pc_spec_kvoff)
+        # FOUR single-host tp=8 engines (2 prefill + 2 decode) behind the
+        # mini-LB -- the raiden-validated topology. (Two-host tp=16 engines
+        # subdivided from the slice also bring up; see serve_group.sh for why
+        # they are untested rather than known-broken.)
+        RECIPE_HOSTS=4; TP_SIZE=8; EP_SIZE=8     # per engine, 1 host each
+        PD_PREFILL_ENGINES=2   # the mini-LB pairs requests with a random one
+        PREFIX_CACHE=1; KV_OFFLOAD=1; SPEC_DECODE=1; PD_DISAGG=1
+        ;;
     *)
         echo "ERROR: unknown BENCH_RECIPE='$BENCH_RECIPE'" >&2
         exit 2
@@ -266,7 +278,24 @@ fi
 # KV pool, scaled with TP so the per-rank HBM cost stays constant (scaling a
 # tp=8 engine's pool further starves the EXTEND-graph capture and OOMs
 # bring-up).
+# In the P/D recipe each single-host decode engine holds ~half the running
+# batch (two decodes behind the LB), so the tp=8 pool covers the grid's
+# heaviest working set with ample headroom.
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS-$((MAX_TOTAL_TOKENS_TP8 * TP_SIZE / 8))}
+MAX_TOTAL_TOKENS_PREFILL=${MAX_TOTAL_TOKENS_PREFILL-$MAX_TOTAL_TOKENS_TP8}
+
+# P/D disaggregation timeouts: stock 300s. A longer window never rescues a
+# stuck transfer -- it only delays the abort sweep that frees the batch -- so
+# the stock value stays. Overridable for experiments.
+#
+# Two separate knobs bound the two sides of a handoff: the decode's wait for
+# its KV (WAITING) and the prefill's wait for the decode to ask (BOOTSTRAP --
+# raiden is consumer-pull; fail_decode_silence(bootstrap_timeout),
+# raiden/conn.py:2529).
+if [[ "$PD_DISAGG" == "1" ]]; then
+    [[ -n "${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-}" ]] && export SGLANG_DISAGGREGATION_WAITING_TIMEOUT
+    [[ -n "${SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT:-}" ]] && export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT
+fi
 
 # KV offload (HiCache) io backend: raiden skips the fused pool's whole-pool D2H
 # precompile staging (which needs ~2x the KV pool in HBM); ratio 1 keeps the
@@ -289,9 +318,16 @@ CHUNKED_PREFILL_SIZE=${CHUNKED_PREFILL_SIZE:-8192}
 
 # ---------------------------------------------------------------------------
 # Ports / endpoints. The CI JobSet's rank-0 health-gates and benches
-# 127.0.0.1:30000, so that port is the single-host server.
+# 127.0.0.1:30000, so that port is the single-host server, or the mini-LB in
+# the P/D recipe (engines then sit on the PD_* ports).
 # ---------------------------------------------------------------------------
 PORT=${PORT:-30000}
+PD_PREFILL_PORT=${PD_PREFILL_PORT:-30001}
+PD_DECODE_PORT=${PD_DECODE_PORT:-30002}
+PD_BOOTSTRAP_PORT=${PD_BOOTSTRAP_PORT:-8998}
+# raiden data-plane base port: each rank listens at base+rank (must not
+# collide with any of the HTTP/bootstrap ports above).
+RAIDEN_KV_BASE_PORT=${RAIDEN_KV_BASE_PORT:-31000}
 
 
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-3600}
@@ -352,6 +388,7 @@ log_config() {
   prefix_caching         = $([[ "$PREFIX_CACHE" == "1" ]] && echo ENABLED || echo disabled)
   kv_offload (hicache)   = $([[ "$KV_OFFLOAD" == "1" ]] && echo "ENABLED (io=$HICACHE_IO_BACKEND ratio=$HICACHE_RATIO)" || echo disabled)
   spec_decode (EAGLE3)   = $([[ "$SPEC_DECODE" == "1" ]] && echo "ENABLED (draft=$DRAFT_MODEL)" || echo disabled)
+  pd_disaggregation      = $([[ "$PD_DISAGG" == "1" ]] && echo "ENABLED (2P+2D raiden, tp=$TP_SIZE/engine)" || echo disabled)
   --- workload ---
   turn input / output    = $TURN_INPUT_TOKENS / $TURN_OUTPUT_TOKENS tokens
   target context         = $TARGET_CONTEXT (normal) / $LONG_TARGET_CONTEXT (long)
