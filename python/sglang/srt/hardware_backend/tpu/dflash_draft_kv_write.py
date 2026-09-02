@@ -25,6 +25,7 @@ def dflash_write_draft_kv(
     ctx_cache_loc: torch.Tensor,
     cache_loc_2d: torch.Tensor | None,
     commit_lens: torch.Tensor | None,
+    max_num_reqs: int,
 ) -> None:
     """Write context K/V into the draft pool, covering extend and verify.
 
@@ -41,6 +42,7 @@ def dflash_write_draft_kv(
       cache_loc_2d: Verify's dense slots [bs, block_size], or None on extend.
         Kept unflattened so the span table can be built from it.
       commit_lens: Verify's accepted counts [bs], or None on extend.
+      max_num_reqs: Upper bound on requests in one extend batch.
     """
     # kv_fused_rope_write imports jax eagerly; keep the span math and the rope
     # gather above importable without it.
@@ -53,6 +55,7 @@ def dflash_write_draft_kv(
         cache_loc=ctx_cache_loc,
         cache_loc_2d=cache_loc_2d,
         commit_lens=commit_lens,
+        max_num_reqs=max_num_reqs,
     )
     cos, sin = _rope_tables(
         draft_model=draft_model, positions=ctx_positions, dtype=ctx_hidden.dtype
@@ -174,23 +177,21 @@ def get_contiguous_slot_spans(
     cache_loc: torch.Tensor,
     cache_loc_2d: torch.Tensor | None,
     commit_lens: torch.Tensor | None,
+    max_num_reqs: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Decompose a draft KV write into spans of contiguous destination slots.
 
-    Verify: one span per request, length straight from commit_lens, so
-    uncommitted slots go unwritten instead of being masked onto slot 0.
-
-    Extend: spans break at page boundaries, since slots are consecutive only
-    within a page -- the same invariant the RPA attention kernel relies on. The
-    first span is short when the request resumes mid-page. The span count is
-    fixed at the worst case over head alignments so the shape does not vary with
-    alignment; unused spans come out empty and cost a no-op DMA.
+    Slots are consecutive only within a page -- the invariant the RPA attention
+    kernel relies on too -- so every span has to stay inside one page. Both
+    branches pad their span count to a static worst case; unused spans come out
+    empty and the kernel skips them.
 
     Args:
       page_size: Draft KV pool page size.
       cache_loc: Flat destination slot per token [num_tokens].
       cache_loc_2d: Verify's dense slots [bs, block_size], or None.
       commit_lens: Verify's accepted counts [bs], or None.
+      max_num_reqs: Upper bound on requests in one extend batch.
 
     Returns:
       Tuple of dst_starts, src_starts, span_lens (each [num_spans]) and the span
@@ -198,25 +199,106 @@ def get_contiguous_slot_spans(
     """
     if cache_loc_2d is not None:
         assert commit_lens is not None
-        block_size = int(cache_loc_2d.shape[1])
-        src_starts = torch.arange(
-            0,
-            int(cache_loc_2d.shape[0]) * block_size,
-            block_size,
-            device=cache_loc_2d.device,
+        return _verify_spans(
+            page_size=page_size, cache_loc_2d=cache_loc_2d, commit_lens=commit_lens
         )
-        return cache_loc_2d[:, 0], src_starts, commit_lens, block_size
+    return _extend_spans(
+        page_size=page_size, cache_loc=cache_loc, max_num_reqs=max_num_reqs
+    )
 
+
+def _verify_spans(
+    *, page_size: int, cache_loc_2d: torch.Tensor, commit_lens: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Split each request's committed prefix at its page boundary.
+
+    A commit is at most block_size tokens and block_size fits in a page, so a
+    request needs two spans: what fits in the page its prefix ends on, and the
+    remainder, which starts wherever the next page landed. Uncommitted slots go
+    unwritten instead of being masked onto slot 0.
+
+    Args:
+      page_size: Draft KV pool page size.
+      cache_loc_2d: Verify's dense slots [bs, block_size].
+      commit_lens: Verify's accepted counts [bs].
+
+    Returns:
+      Tuple of dst_starts, src_starts, span_lens (each [2 * bs]) and the span
+      length bound.
+    """
+    bs, block_size = (int(d) for d in cache_loc_2d.shape)
+    assert block_size <= page_size, (
+        f"DFLASH verify block ({block_size}) must fit in a page ({page_size}) "
+        "for the two-span split to cover it"
+    )
+    src_starts = torch.arange(
+        0, bs * block_size, block_size, device=cache_loc_2d.device
+    )
+    head_dst = cache_loc_2d[:, 0]
+    lens = commit_lens.to(torch.int32)
+    head_lens = torch.minimum(lens, (page_size - head_dst % page_size).to(torch.int32))
+    tail_lens = lens - head_lens
+    # Clamped only to keep the gather in range when the commit never spills; the
+    # slot it then picks is paired with a zero length.
+    tail_dst = cache_loc_2d.gather(
+        1, head_lens.to(torch.int64).clamp(max=block_size - 1).unsqueeze(1)
+    ).squeeze(1)
+    return (
+        torch.cat([head_dst, tail_dst]),
+        torch.cat([src_starts, src_starts + head_lens]),
+        torch.cat([head_lens, tail_lens]),
+        block_size,
+    )
+
+
+def _extend_spans(
+    *, page_size: int, cache_loc: torch.Tensor, max_num_reqs: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Cut a flat extend write into runs, reading the runs off the slots.
+
+    An extend batch concatenates requests, and each one resumes at its own page
+    offset, so the run structure cannot be derived from the first slot's
+    alignment. Deriving it from the slots themselves covers page boundaries and
+    request boundaries alike. A batch of R requests over N tokens yields at most
+    N / page_size + R runs, which bounds the span count.
+
+    Args:
+      page_size: Draft KV pool page size.
+      cache_loc: Flat destination slot per token [num_tokens].
+      max_num_reqs: Upper bound on requests in one extend batch.
+
+    Returns:
+      Tuple of dst_starts, src_starts, span_lens (each [num_spans]) and the span
+      length bound.
+    """
     num_tokens = int(cache_loc.shape[0])
-    head = page_size - cache_loc[0] % page_size
-    # Worst case is a one-token head, which pushes the tail one page further
-    # than a page-aligned write needs.
-    num_spans = (num_tokens + page_size - 2) // page_size + 1
-    spans = torch.arange(num_spans, device=cache_loc.device)
-    src_starts = (head + (spans - 1) * page_size).clamp(min=0, max=num_tokens)
-    span_ends = (head + spans * page_size).clamp(max=num_tokens)
-    dst_starts = cache_loc[src_starts.clamp(max=num_tokens - 1)]
-    return dst_starts, src_starts, span_ends - src_starts, page_size
+    device = cache_loc.device
+    loc = cache_loc.to(torch.int64)
+    # Pages handed out back to back are address-adjacent, so a page start ends a
+    # run even where the addresses continue -- otherwise a span could outrun
+    # max_span_len.
+    breaks = (loc[1:] != loc[:-1] + 1) | (loc[1:] % page_size == 0)
+    run_ids = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(breaks.to(torch.int32), dim=0),
+        ]
+    )
+    num_spans = num_tokens // page_size + min(max_num_reqs, num_tokens) + 1
+    # Page 0 is the pool's dummy page, so slot 0 only ever marks a token the
+    # caller padded in. Park those past the last span rather than writing them.
+    run_ids = torch.where(loc != 0, run_ids, num_spans)
+    edges = torch.arange(num_spans + 1, device=device, dtype=torch.int32)
+    # run_ids is non-decreasing over the real tokens, so counting the tokens
+    # below each edge gives every run's source offset.
+    bounds = (run_ids[None, :] < edges[:, None]).sum(dim=1)
+    src_starts = bounds[:-1]
+    return (
+        loc[src_starts.clamp(max=num_tokens - 1)],
+        src_starts,
+        bounds[1:] - src_starts,
+        page_size,
+    )
 
 
 def _rope_tables(

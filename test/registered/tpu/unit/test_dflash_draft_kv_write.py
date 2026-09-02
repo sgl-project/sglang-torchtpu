@@ -46,6 +46,9 @@ BLOCK_SIZE = 10
 # over page_size 128 (~1 GB per rank across 8 layers); override both to compare.
 NUM_PAGES = int(os.environ.get("DFLASH_KV_WRITE_PAGES", "2048"))
 PAGE_SIZE = int(os.environ.get("DFLASH_KV_WRITE_PAGE_SIZE", "128"))
+# Bounds the extend span table, so it sets the fused kernel's grid. Production
+# passes req_to_token_pool.size.
+MAX_NUM_REQS = int(os.environ.get("DFLASH_KV_WRITE_MAX_REQS", "256"))
 DTYPE = torch.bfloat16
 # gpt-oss DFlash draft rope. yarn matters: it folds mscale into cos_sin_cache,
 # so the gather-based fused path stays correct only because the scaling never
@@ -181,17 +184,18 @@ def _shape_key(**kwargs: torch.Tensor | None) -> tuple[object, ...]:
     )
 
 
-def _compiled(fn, *, draft_model: nn.Module, kv_pool: object):
+def _compiled(fn, *, draft_model: nn.Module, kv_pool: object, **statics: int):
     """Compile a write path the way DFlashSpecDecodeCompilePolicyMixin does.
 
-    draft_model and kv_pool are bound into a closure rather than passed at call
-    time: direct_compile lifts their tensors itself, and a module or pool cannot
-    be a graph input.
+    draft_model, kv_pool and the static ints are bound into a closure rather
+    than passed at call time: direct_compile lifts the model's tensors itself,
+    a module or pool cannot be a graph input, and _shape_key only keys tensors.
 
     Args:
       fn: dflash_write_draft_kv or dflash_write_draft_kv_ref.
       draft_model: Draft model whose params and buffers get lifted.
       kv_pool: Fused TPU KV pool; the one mutable input, copied back per call.
+      **statics: Non-tensor kwargs of fn, e.g. max_num_reqs on the fused path.
 
     Returns:
       The compiled callable, taking fn's remaining tensor kwargs.
@@ -201,7 +205,7 @@ def _compiled(fn, *, draft_model: nn.Module, kv_pool: object):
     )
 
     def bound(**kwargs: torch.Tensor | None) -> None:
-        fn(draft_model=draft_model, kv_pool=kv_pool, **kwargs)
+        fn(draft_model=draft_model, kv_pool=kv_pool, **statics, **kwargs)
 
     return direct_compile(
         torch.no_grad()(bound),
@@ -265,7 +269,10 @@ class TestDflashDraftKvWrite(CustomTestCase):
         fused_pool, ref_pool = self._make_pool(), self._make_pool()
 
         _compiled(
-            dflash_write_draft_kv, draft_model=self.draft_model, kv_pool=fused_pool
+            dflash_write_draft_kv,
+            draft_model=self.draft_model,
+            kv_pool=fused_pool,
+            max_num_reqs=MAX_NUM_REQS,
         )(
             ctx_hidden=ctx_hidden,
             ctx_positions=positions,
@@ -363,6 +370,7 @@ class TestDflashDraftKvWrite(CustomTestCase):
             dflash_write_draft_kv,
             draft_model=self.draft_model,
             kv_pool=self._make_pool(),
+            max_num_reqs=MAX_NUM_REQS,
         )
         ref = _compiled(
             dflash_write_draft_kv_ref,
@@ -395,7 +403,8 @@ class TestDflashDraftKvWrite(CustomTestCase):
         mb = buf.numel() * buf.element_size() * LAYERS / 2**20
         print(
             f"\n== draft KV write, {LAYERS} layers, hidden {HIDDEN}, page "
-            f"{PAGE_SIZE} x {NUM_PAGES} pages = {slots} slots, {mb:.0f} MB pool =="
+            f"{PAGE_SIZE} x {NUM_PAGES} pages = {slots} slots, {mb:.0f} MB pool, "
+            f"max_num_reqs {MAX_NUM_REQS} =="
         )
         print(f"{'case':>14} {'tokens':>7} {'fused':>9} {'ref':>9} {'speedup':>8}")
         for name, num_tokens, kwargs in cases:

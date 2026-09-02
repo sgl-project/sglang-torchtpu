@@ -8,8 +8,9 @@ scatter chain.
 The grid walks spans, not tokens: a span is a stretch of source tokens whose
 destination slots are contiguous, so the scatter lives in a DMA address rather
 than in the grid -- a 4096-token extend costs ~32 DMAs per layer instead of
-4096. Extend fills whole pages, verify writes each request's committed prefix,
-so one loop serves both. BlockSpec pipelining cannot cover the source side
+4096. A span never crosses a page, since that is as far as destination slots
+stay consecutive; extend and verify differ only in how they are cut, so one
+loop serves both. BlockSpec pipelining cannot cover the source side
 because a span's source offset is arbitrary, so the kernel issues its own async
 copies out of HBM, mirroring ragged_paged_attention_v3's _update_kv_cache.
 
@@ -55,63 +56,74 @@ def _kernel(dst_ref, src_ref, len_ref, k_hbm, v_hbm, cos_hbm, sin_hbm, *rest):
     span = pl.program_id(0)
     n, src, dst = len_ref[span], src_ref[span], dst_ref[span]
 
-    reads = [
-        pltpu.make_async_copy(
-            cos_hbm.at[pl.ds(src, n)], cos_vmem.at[pl.ds(0, n)], in_sem.at[0]
-        ),
-        pltpu.make_async_copy(
-            sin_hbm.at[pl.ds(src, n)], sin_vmem.at[pl.ds(0, n)], in_sem.at[1]
-        ),
-    ]
-    for layer in range(num_layers):
-        reads.append(
+    # Span tables are padded to a static worst case, so most grids end in empty
+    # spans; the rope and packing below cost a full max_span_len regardless of
+    # n, hence the guard rather than relying on zero-length DMAs.
+    @pl.when(n > 0)
+    def _write_span():
+        reads = [
             pltpu.make_async_copy(
-                k_hbm.at[layer, pl.ds(src, n)],
-                k_vmem.at[layer, pl.ds(0, n)],
-                in_sem.at[2 + 2 * layer],
-            )
-        )
-        reads.append(
+                cos_hbm.at[pl.ds(src, n)], cos_vmem.at[pl.ds(0, n)], in_sem.at[0]
+            ),
             pltpu.make_async_copy(
-                v_hbm.at[layer, pl.ds(src, n)],
-                v_vmem.at[layer, pl.ds(0, n)],
-                in_sem.at[3 + 2 * layer],
+                sin_hbm.at[pl.ds(src, n)], sin_vmem.at[pl.ds(0, n)], in_sem.at[1]
+            ),
+        ]
+        for layer in range(num_layers):
+            reads.append(
+                pltpu.make_async_copy(
+                    k_hbm.at[layer, pl.ds(src, n)],
+                    k_vmem.at[layer, pl.ds(0, n)],
+                    in_sem.at[2 + 2 * layer],
+                )
             )
-        )
-    for copy in reads:
-        copy.start()
-    for copy in reads:
-        copy.wait()
+            reads.append(
+                pltpu.make_async_copy(
+                    v_hbm.at[layer, pl.ds(src, n)],
+                    v_vmem.at[layer, pl.ds(0, n)],
+                    in_sem.at[3 + 2 * layer],
+                )
+            )
+        for copy in reads:
+            copy.start()
+        for copy in reads:
+            copy.wait()
 
-    cos, sin = cos_vmem[...], sin_vmem[...]
-    half = cos.shape[-1]
-    writes = []
-    for layer in range(num_layers):
-        k, v = k_vmem[layer], v_vmem[layer]
-        x1, x2 = k[..., :half], k[..., half:]
-        rotated = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-        # Interleave per head into the fused pool's K/V-adjacent layout.
-        max_span_len, heads, head_dim = k.shape
-        kv = jnp.stack([rotated, v], axis=2).reshape(max_span_len, 2 * heads, head_dim)
-        shape = out_vmem.shape
-        heads_pad = shape[2] * shape[3] - kv.shape[1]
-        dim_pad = shape[4] - kv.shape[2]
-        if heads_pad or dim_pad:
-            kv = jnp.pad(kv, ((0, 0), (0, heads_pad), (0, dim_pad)))
-        out_vmem[layer] = kv.reshape(max_span_len, *shape[2:]).astype(out_vmem.dtype)
-        buf = outs[layer]
-        flat = buf.reshape(buf.shape[0] * buf.shape[1], *buf.shape[2:])
-        writes.append(
-            pltpu.make_async_copy(
-                out_vmem.at[layer, pl.ds(0, n)],
-                flat.at[pl.ds(dst, n)],
-                out_sem.at[layer],
+        cos, sin = cos_vmem[...], sin_vmem[...]
+        half = cos.shape[-1]
+        writes = []
+        for layer in range(num_layers):
+            k, v = k_vmem[layer], v_vmem[layer]
+            x1, x2 = k[..., :half], k[..., half:]
+            rotated = jnp.concatenate(
+                [x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1
             )
-        )
-    for copy in writes:
-        copy.start()
-    for copy in writes:
-        copy.wait()
+            # Interleave per head into the fused pool's K/V-adjacent layout.
+            max_span_len, heads, head_dim = k.shape
+            kv = jnp.stack([rotated, v], axis=2).reshape(
+                max_span_len, 2 * heads, head_dim
+            )
+            shape = out_vmem.shape
+            heads_pad = shape[2] * shape[3] - kv.shape[1]
+            dim_pad = shape[4] - kv.shape[2]
+            if heads_pad or dim_pad:
+                kv = jnp.pad(kv, ((0, 0), (0, heads_pad), (0, dim_pad)))
+            out_vmem[layer] = kv.reshape(max_span_len, *shape[2:]).astype(
+                out_vmem.dtype
+            )
+            buf = outs[layer]
+            flat = buf.reshape(buf.shape[0] * buf.shape[1], *buf.shape[2:])
+            writes.append(
+                pltpu.make_async_copy(
+                    out_vmem.at[layer, pl.ds(0, n)],
+                    flat.at[pl.ds(dst, n)],
+                    out_sem.at[layer],
+                )
+            )
+        for copy in writes:
+            copy.start()
+        for copy in writes:
+            copy.wait()
 
 
 def fused_rope_write_kv_jax(

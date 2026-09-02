@@ -1419,6 +1419,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_cache_loc=cache_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
+                max_num_reqs=int(self.model_runner.req_to_token_pool.size),
             )
 
     def _append_target_hidden_to_draft_kv_by_loc_prepare_inputs(

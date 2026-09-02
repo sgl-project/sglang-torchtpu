@@ -5,14 +5,15 @@ Requires a TPU + torch_tpu + a jax with Pallas. NOT a CI unit test. Run with:
     PYTHONPATH=/path/to/sglang-torchtpu/python \
         python3 test/manual/tpu/test_tpu_kv_fused_rope_write.py
 
-Three orthogonal properties, one per test:
+Three orthogonal properties:
 
 - Packing and addressing: fused_rope_write_kv against fused_rope_write_kv_ref,
   which spells the same steps out per token in eager torch. Divergence means
   the kernel drifted from what the fused KV pool expects.
-- Span decomposition: get_contiguous_slot_spans' boundary math must reproduce
-  the original slots exactly, including a mid-page start and the trailing empty
-  span a page-aligned write leaves behind.
+- Span decomposition: get_contiguous_slot_spans must reproduce the original
+  slots exactly, on both branches. Slots are consecutive only within a page, so
+  a span that outlives its page writes over a neighbour's KV -- and runs off the
+  pool when it sits in the top page.
 - Rotation angle: _rope_tables' cos/sin rows fed through that rotation must
   equal the draft's real apply_k_rope. A wrong angle does not crash -- it
   silently degrades draft quality and costs accept length.
@@ -39,6 +40,7 @@ HEADS = 1
 HEAD_DIM = 64
 NUM_PAGES = 32
 PAGE_SIZE = 128
+MAX_NUM_REQS = 8
 # Trailing dims of a fused layer buffer: kv_heads_packed, kv_packing,
 # padded_head_dim. Full buffer shape is [NUM_PAGES, PAGE_SIZE, *TAIL].
 TAIL = (1, 4, 128)
@@ -199,55 +201,150 @@ def test_matches_eager_reference() -> None:
         what="verify per-request commit lens",
         loc=torch.where(valid, loc2d, torch.zeros_like(loc2d)).reshape(-1).to(DEVICE),
     )
-
-
-def _spans_for(cache_loc: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """Drive the real get_contiguous_slot_spans extend branch."""
-    return get_contiguous_slot_spans(
-        page_size=PAGE_SIZE, cache_loc=cache_loc, cache_loc_2d=None, commit_lens=None
+    # Verify spilling across a page: the request's tail lives in the page the
+    # allocator handed out next, not the physically adjacent one.
+    rows = [_paged_slots([6, 13], 122, block), _paged_slots([1, 20], 0, block)]
+    commits = [10, 4]
+    _compare(
+        spec=[
+            (rows[0][0], 0, 6),
+            (rows[0][6], 6, 4),
+            (rows[1][0], block, 4),
+            (rows[1][4], block + 4, 0),
+        ],
+        max_span_len=block,
+        num_tokens=len(rows) * block,
+        seed=3,
+        what="verify commit spilling across a page",
+        loc=torch.tensor(
+            [
+                s if i < c else 0
+                for row, c in zip(rows, commits)
+                for i, s in enumerate(row)
+            ],
+            dtype=torch.int64,
+            device=DEVICE,
+        ),
     )
 
 
-def test_extend_spans_reconstruct_slots() -> None:
-    """get_contiguous_slot_spans' extend branch reproduces the flat slots it decomposes."""
-    print("== extend span decomposition ==")
-    for head_offset, num_tokens in ((0, 256), (91, 300), (127, 129), (5, 7)):
-        pages = [4, 1, 9, 6, 2, 11]
-        loc = []
-        offset, page = head_offset, 0
-        while len(loc) < num_tokens:
-            take = min(PAGE_SIZE - offset, num_tokens - len(loc))
-            base = pages[page] * PAGE_SIZE + offset
-            loc.extend(range(base, base + take))
-            offset, page = 0, page + 1
-        cache_loc = torch.tensor(loc, dtype=torch.int64)
+def _paged_slots(pages: list[int], offset: int, count: int) -> list[int]:
+    """Slots one request occupies, laid out the way the paged allocator does.
 
-        dst_starts, src_starts, span_lens, max_span_len = _spans_for(cache_loc)
+    Args:
+      pages: Page ids the request holds, in order.
+      offset: Page offset the request resumes at.
+      count: Tokens to place.
+
+    Returns:
+      count slot indices, consecutive within a page and jumping between pages.
+    """
+    slots: list[int] = []
+    page = 0
+    while len(slots) < count:
+        take = min(PAGE_SIZE - offset, count - len(slots))
+        base = pages[page] * PAGE_SIZE + offset
+        slots.extend(range(base, base + take))
+        offset, page = 0, page + 1
+    return slots
+
+
+def _addressed(
+    dst_starts: torch.Tensor, src_starts: torch.Tensor, span_lens: torch.Tensor
+) -> tuple[list[int], list[int]]:
+    """Flatten a span table back into the (slot, source) pairs it writes."""
+    dsts: list[int] = []
+    srcs: list[int] = []
+    for d, s, n in zip(dst_starts.tolist(), src_starts.tolist(), span_lens.tolist()):
+        assert n <= PAGE_SIZE, f"span of {n} tokens cannot stay inside a page"
+        dsts.extend(range(d, d + n))
+        srcs.extend(range(s, s + n))
+    return dsts, srcs
+
+
+def test_extend_spans_reconstruct_slots() -> None:
+    """get_contiguous_slot_spans' extend branch reproduces the flat slots it decomposes.
+
+    Covers the multi-request batch a PD prefill server actually sends: each
+    request resumes at its own page offset, so a decomposition derived from the
+    first slot's alignment writes later requests' tokens into the first
+    request's pages. Padding is included because the caller zero-pads to a
+    compile bucket and those tokens must go unwritten.
+    """
+    print("== extend span decomposition ==")
+    cases = [
+        ([(([4, 1, 9, 6, 2, 11]), 0, 256)], 0),
+        ([(([4, 1, 9, 6, 2, 11]), 91, 300)], 0),
+        ([(([4, 1]), 127, 129)], 0),
+        ([(([4]), 5, 7)], 0),
+        # Three requests, none page-aligned, plus bucket padding.
+        (
+            [([3, 8], 0, 100), ([12, 5], 44, 150), ([17], 120, 8)],
+            54,
+        ),
+    ]
+    for reqs, pad in cases:
+        slots: list[int] = []
+        for pages, offset, count in reqs:
+            slots.extend(_paged_slots(pages, offset, count))
+        num_real = len(slots)
+        cache_loc = torch.tensor(slots + [0] * pad, dtype=torch.int64)
+
+        dst_starts, src_starts, span_lens, max_span_len = get_contiguous_slot_spans(
+            page_size=PAGE_SIZE,
+            cache_loc=cache_loc,
+            cache_loc_2d=None,
+            commit_lens=None,
+            max_num_reqs=MAX_NUM_REQS,
+        )
         assert max_span_len == PAGE_SIZE, max_span_len
-        rebuilt = torch.cat(
-            [
-                torch.arange(int(d), int(d) + int(n))
-                for d, n in zip(dst_starts, span_lens)
-                if int(n) > 0
-            ]
-        )
-        srcs = torch.cat(
-            [
-                torch.arange(int(s), int(s) + int(n))
-                for s, n in zip(src_starts, span_lens)
-                if int(n) > 0
-            ]
-        )
+        dsts, srcs = _addressed(dst_starts, src_starts, span_lens)
         print(
-            f"  head={head_offset:>3} tokens={num_tokens:>4}: "
+            f"  reqs={len(reqs)} tokens={num_real:>4} pad={pad:>3}: "
             f"{len(span_lens)} spans, {int(span_lens.sum())} written"
         )
-        assert torch.equal(
-            rebuilt, cache_loc
-        ), f"head={head_offset} tokens={num_tokens}: spans address the wrong slots"
-        assert torch.equal(
-            srcs, torch.arange(num_tokens)
-        ), f"head={head_offset} tokens={num_tokens}: spans skip or repeat sources"
+        assert dsts == slots, f"reqs={reqs} pad={pad}: spans address the wrong slots"
+        assert srcs == list(
+            range(num_real)
+        ), f"reqs={reqs} pad={pad}: spans skip or repeat sources"
+
+
+def test_verify_spans_reconstruct_slots() -> None:
+    """get_contiguous_slot_spans' verify branch reproduces each committed prefix.
+
+    A commit block starting near the end of a page runs off it, and the tokens
+    past the boundary live in whatever page the allocator handed out next. A
+    single span per request writes them into the physically adjacent page
+    instead -- corrupting a neighbour, and running off the pool entirely when
+    the block sits in the top page.
+    """
+    print("== verify span decomposition ==")
+    block = 10
+    # Offsets 0 and 44 stay inside a page; 120 and 127 spill across.
+    reqs = [([3, 8], 0, 10), ([12, 5], 44, 3), ([17, 2], 120, 10), ([9, 6], 127, 7)]
+    rows = [_paged_slots(pages, offset, block) for pages, offset, _ in reqs]
+    commits = [c for _, _, c in reqs]
+    cache_loc_2d = torch.tensor(rows, dtype=torch.int64)
+
+    dst_starts, src_starts, span_lens, max_span_len = get_contiguous_slot_spans(
+        page_size=PAGE_SIZE,
+        cache_loc=torch.zeros(len(reqs) * block, dtype=torch.int64),
+        cache_loc_2d=cache_loc_2d,
+        commit_lens=torch.tensor(commits, dtype=torch.int32),
+        max_num_reqs=MAX_NUM_REQS,
+    )
+    assert max_span_len == block, max_span_len
+    dsts, srcs = _addressed(dst_starts, src_starts, span_lens)
+
+    want_dsts: list[int] = []
+    want_srcs: list[int] = []
+    for i, (row, commit) in enumerate(zip(rows, commits)):
+        want_dsts.extend(row[:commit])
+        want_srcs.extend(range(i * block, i * block + commit))
+    print(f"  reqs={len(reqs)} commits={commits}: {len(span_lens)} spans")
+    assert sorted(zip(srcs, dsts)) == sorted(
+        zip(want_srcs, want_dsts)
+    ), "verify spans address the wrong slots"
 
 
 def _real_rope(device: str) -> YaRNScalingRotaryEmbedding:
@@ -329,6 +426,7 @@ def test_matches_real_apply_k_rope() -> None:
 if __name__ == "__main__":
     test_matches_real_apply_k_rope()
     test_extend_spans_reconstruct_slots()
+    test_verify_spans_reconstruct_slots()
     print(f"TPU chips: {torch.tpu.device_count()}")
     test_matches_eager_reference()
     print("\nFUSED ROPE + KV WRITE TEST PASSED")
