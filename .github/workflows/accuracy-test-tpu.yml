@@ -79,16 +79,12 @@ jobs:
       fail-fast: false
       matrix:
         # One suite (= one file, one job, one slice) per benchmark, each paired
-        # with the k8s name its pods get. Suites stay spelled out: the pr-gate
-        # lint (test_tpu_dashboard_contract.py) greps this file for the literal
-        # suite of every nightly-accuracy registration. The next model adds its
-        # legs here and a choice above; selection stays in the job-level `if`
-        # while a single model is the only single-host entrant.
-        #
-        # run_name only names Kubernetes objects -- pods are
-        # tpu-ci-<run_name>-<rand>-slice-<idx> against a 63-char cap, and the
-        # suite would spend four of those on a "tpu" that "tpu-ci-" already
-        # carries. Cosmetic: the dashboard keys off the metric `id`, not this.
+        # with the shorter name its pods get (tpu-ci-<run_name>-<rand>-slice-<idx>
+        # against a 63-char cap; the suite spends four of those on a "tpu" the
+        # prefix already carries). Suites stay spelled out -- the pr-gate lint
+        # greps this file for each nightly-accuracy registration's literal suite.
+        # The next model adds its legs here and a choice above; selection stays in
+        # the job-level `if` while a single model is the only single-host entrant.
         include:
           - suite: nightly-tpu-accuracy-gpt-oss-120b-aime
             run_name: nightly-accuracy-gpt-oss-120b-aime
@@ -98,9 +94,8 @@ jobs:
             run_name: nightly-accuracy-gpt-oss-120b-gsm8k
           - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
             run_name: nightly-accuracy-gpt-oss-120b-mmlupro
-    # A check reads "<this name> / <the called job's name>", so the stage tag
-    # goes here and the suite in display_name -- what a red check ends with is
-    # the eval that failed.
+    # Stage tag here, suite in display_name, so a red check ends with the eval
+    # that failed (see README, "Two names per job").
     name: accuracy
     uses: ./.github/workflows/_tpu-test.yml
     with:

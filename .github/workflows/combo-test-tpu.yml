@@ -32,7 +32,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
-      # Last segment of the check name; the job name above carries the tag.
+      # Last segment of the check name; the job name above holds the tag.
       display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
       lane: nightly
       hosts: 2

@@ -76,8 +76,8 @@ jobs:
         # next one adds a choice above and a branch here.
         suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-perf-gpt-oss-120b"]'))
                 || fromJSON('["nightly-tpu-perf-gpt-oss-120b"]') }}
-    # A check reads "<this name> / <the called job's name>"; the suite lands in
-    # display_name so the check ends with the perf gate that ran.
+    # Stage tag here, suite in display_name, so the check ends with the gate that
+    # ran (see README, "Two names per job").
     name: perf
     uses: ./.github/workflows/_tpu-test.yml
     with:

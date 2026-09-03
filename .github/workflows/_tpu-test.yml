@@ -65,10 +65,8 @@ on:
         required: false
         type: string
         default: ""
-      # GitHub renders a called job as "<caller job> / <called job>", so this job's
-      # name is the LAST segment of the check name -- the half a reader looks at.
-      # Callers pass the test this leg runs (a file stem, or the compact tag for a
-      # P/D gate); the fallbacks keep a caller that passes nothing informative.
+      # Last segment of the check name ("<caller job> / <this job>"): the test this
+      # leg runs. The fallbacks keep a caller that passes nothing informative.
       display_name:
         required: false
         type: string

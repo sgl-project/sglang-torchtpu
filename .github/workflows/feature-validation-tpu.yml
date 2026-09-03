@@ -115,9 +115,8 @@ jobs:
       fail-fast: false
       matrix:
         test: ${{ fromJSON(needs.discover-tests.outputs.single_host) }}
-    # A check reads "<this name> / <the called job's name>", so the stage tag
-    # goes here and the test file stem goes in display_name -- the test name is
-    # what the check ends with.
+    # Stage tag here, test file stem in display_name, so the check ends with the
+    # test (see README, "Two names per job").
     name: single-host
     uses: ./.github/workflows/_tpu-test.yml
     with:
