@@ -472,9 +472,8 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     ``num_kv_heads * 2`` is a plain axis here rather than something packed into
     32-bit lanes, so it carries no padding. At one KV head per rank that makes
     an fp8 cache half the size of the fused layout's, which rounds two heads up
-    to ``kv_packing``. The flip side is that nothing written against the fused
-    5D row layout works on this buffer, so the host-offload paths below refuse
-    rather than reinterpret it.
+    to ``kv_packing``. Host copies retain this native packing while translating
+    between token indices and their page/lane coordinates.
     """
 
     def _head_dim_lanes(self) -> int:
@@ -546,16 +545,97 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
         )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout: "
-            "a token is a lane, not a row, so the fused pool's row gather does "
-            "not apply. Use --attention-backend pallas_tpu_rpa_batched or v3."
-        )
+        """Copy selected token lanes to the fused pool's host-row format."""
+        backup = self._raiden_backup()
+        if backup is not None:
+            self.device_module.synchronize()
+            handle = backup.try_save(indices)
+            if handle is not None:
+                return handle
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        self.device_module.synchronize()
+        if indices.numel() == 0:
+            return [[] for _ in range(self.layer_num)]
+
+        device = self.kv_buffer[0].device
+        chunk_specs = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for i in range(0, len(indices), chunk_size):
+            chunk_indices = indices[i : i + chunk_size]
+            blocks, block_pos = torch.unique(
+                chunk_indices // self.page_size, return_inverse=True
+            )
+            chunk_specs.append(
+                (blocks.to(device), block_pos, chunk_indices % self.page_size)
+            )
+
+        pending_pages = []
+        for layer_id in range(self.layer_num):
+            layer_pages = []
+            for blocks, block_pos, offsets in chunk_specs:
+                pages = self.kv_buffer[layer_id].index_select(0, blocks)
+                layer_pages.append(
+                    (pages.to("cpu", non_blocking=True), block_pos, offsets)
+                )
+            pending_pages.append(layer_pages)
+
+        self.device_module.synchronize()
+        return [
+            [pages[block_pos, ..., offsets] for pages, block_pos, offsets in chunks]
+            for chunks in pending_pages
+        ]
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        raise NotImplementedError(
-            "CPU offloading is not supported for the SEQ_ALONG_LANE KV layout."
+        """Restore host rows with page-bounded device writes."""
+        from sglang.srt.hardware_backend.tpu.kv_page_write import write_pages_torch
+        from sglang.srt.hardware_backend.tpu.raiden_kv_backup import (
+            RaidenKVBackupHandle,
         )
+
+        if isinstance(kv_cache_cpu, RaidenKVBackupHandle):
+            self.device_module.synchronize()
+            self._raiden_backup().restore(kv_cache_cpu, indices)
+            self.device_module.synchronize()
+            return
+
+        indices = indices.to(device="cpu", dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        page = self.page_size
+        blocks = indices // page
+        offsets = indices % page
+        uniq_blocks, block_pos = torch.unique(blocks, return_inverse=True)
+        full = torch.bincount(block_pos, minlength=uniq_blocks.numel()) == page
+        full_rows = full[block_pos]
+        full_pos = torch.cumsum(full.long(), 0) - 1
+        part_pos = torch.cumsum((~full).long(), 0) - 1
+        device = self.kv_buffer[0].device
+        full_blocks = uniq_blocks[full].to(device)
+        part_blocks = uniq_blocks[~full].to(device)
+        full_page_pos = full_pos[block_pos][full_rows]
+        full_offsets = offsets[full_rows]
+        part_page_pos = part_pos[block_pos][~full_rows].to(device)
+        part_offsets = offsets[~full_rows].to(device)
+
+        self.device_module.synchronize()
+        for layer_id in range(self.layer_num):
+            rows = torch.cat(kv_cache_cpu[layer_id], dim=0)
+            assert rows.shape[0] == indices.numel()
+            dst = self.kv_buffer[layer_id]
+            if full_blocks.numel():
+                pages = torch.empty(
+                    (full_blocks.numel(), *rows.shape[1:], page), dtype=rows.dtype
+                )
+                pages[full_page_pos, ..., full_offsets] = rows[full_rows]
+                write_pages_torch(full_blocks, pages.to(device, non_blocking=True), dst)
+            if part_blocks.numel():
+                pages = dst[part_blocks]
+                pages[part_page_pos, ..., part_offsets] = rows[~full_rows].to(
+                    device, non_blocking=True
+                )
+                write_pages_torch(part_blocks, pages, dst)
+        self.device_module.synchronize()
 
 
 class TpuFusedMLATokenToKVPool(MLATokenToKVPool):

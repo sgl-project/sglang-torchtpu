@@ -33,7 +33,12 @@ def _has_tpu_via_jax() -> bool:
         return False
 
 
+def _has_tpu_via_torch() -> bool:
+    return hasattr(torch, "tpu") and torch.tpu.is_available()
+
+
 _SKIP_REASON = "Requires torch_tpu + JAX with a TPU backend visible to jax.devices()"
+_TORCH_TPU_SKIP_REASON = "Requires a TPU backend visible to torch.tpu"
 
 DEV = "tpu"
 PAGE_SIZE = 16
@@ -258,6 +263,66 @@ class TestTpuFusedHostPool(CustomTestCase):
         _assert_backup_load_roundtrip(
             self, dev, host, [2, 5, 8], host_indices=reused, free=False
         )
+
+
+@unittest.skipUnless(_has_tpu_via_torch(), _TORCH_TPU_SKIP_REASON)
+class TestTpuSeqAlongLaneCpuCopy(CustomTestCase):
+    PAGE_SIZE = 256
+
+    def _make_pool(self):
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        pool = TpuSeqAlongLaneKVPool(
+            size=self.PAGE_SIZE * 4,
+            page_size=self.PAGE_SIZE,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=128,
+            layer_num=2,
+            device=DEV,
+            enable_memory_saver=False,
+        )
+        pool.cpu_offloading_chunk_size = 3
+        for buf in pool.kv_buffer:
+            buf.copy_(torch.randn(buf.shape, dtype=torch.bfloat16).to(DEV))
+        return pool
+
+    def test_partial_and_full_page_round_trip(self):
+        cases = (
+            (
+                "partial",
+                torch.tensor([3, 258, 5, 513]),
+                torch.tensor([516, 7, 257, 514]),
+                (6, 8, 256, 258, 513, 515, 517),
+            ),
+            (
+                "full",
+                torch.arange(256, 512),
+                torch.arange(512, 768),
+                (256, 511, 768, 1023),
+            ),
+        )
+        for name, source, destination, untouched in cases:
+            with self.subTest(name=name):
+                pool = self._make_pool()
+                payload = pool.get_cpu_copy(source)
+                expected = [torch.cat(chunks) for chunks in payload]
+
+                for buf in pool.kv_buffer:
+                    buf.fill_(-1)
+                pool.load_cpu_copy(payload, destination)
+
+                destination_device = destination.to(DEV)
+                blocks = destination_device // self.PAGE_SIZE
+                offsets = destination_device % self.PAGE_SIZE
+                for layer, buf in enumerate(pool.kv_buffer):
+                    restored = buf[blocks, ..., offsets].cpu()
+                    self.assertTrue(torch.equal(restored, expected[layer]))
+                    for index in untouched:
+                        block, offset = divmod(index, self.PAGE_SIZE)
+                        self.assertTrue(
+                            bool(torch.all(buf[block, ..., offset].cpu() == -1))
+                        )
 
 
 @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON)

@@ -22,7 +22,10 @@ try:
 except Exception:
     _HAS_JAX = False
 
-from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+from sglang.srt.hardware_backend.tpu.kv_pool import (
+    TpuFusedMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.test_utils import CustomTestCase
@@ -63,6 +66,20 @@ def _make_mha_pool(size, layer_num):
         enable_memory_saver=False,
     )
     pool.cpu_offloading_chunk_size = CHUNK_SIZE
+    return pool
+
+
+def _make_seq_along_lane_pool(middle_shape, page_size=4, layer_num=2):
+    pool = object.__new__(TpuSeqAlongLaneKVPool)
+    pool.page_size = page_size
+    pool.layer_num = layer_num
+    pool.cpu_offloading_chunk_size = CHUNK_SIZE
+    pool.device_module = torch.get_device_module("cpu")
+    pool._raiden_backup_obj = None
+    pool.kv_buffer = [
+        torch.empty((5, *middle_shape, page_size), dtype=torch.bfloat16)
+        for _ in range(layer_num)
+    ]
     return pool
 
 
@@ -156,6 +173,55 @@ class TestFusedPoolFilterCpuCopy(CustomTestCase):
         self.assertEqual(
             _row_values(buf, [6, 7, 14, 15]), [SWA_OFFSET + r for r in [6, 7, 14, 15]]
         )
+
+
+class TestSeqAlongLanePoolCpuCopy(CustomTestCase):
+    def test_round_trip_preserves_unselected_lanes(self):
+        for middle_shape in ((2, 3), (2, 3, 2)):
+            with self.subTest(middle_shape=middle_shape):
+                pool = _make_seq_along_lane_pool(middle_shape)
+                for layer, buffer in enumerate(pool.kv_buffer):
+                    values = (
+                        torch.arange(buffer.shape[0] * pool.page_size)
+                        + layer * LAYER_STRIDE
+                    )
+                    buffer.copy_(
+                        values.reshape(
+                            buffer.shape[0],
+                            *([1] * len(middle_shape)),
+                            pool.page_size,
+                        ).expand_as(buffer)
+                    )
+
+                source = [buffer.clone() for buffer in pool.kv_buffer]
+                source_indices = torch.tensor([0, 1, 2, 3, 5, 11])
+                payload = pool.get_cpu_copy(source_indices)
+                self.assertEqual(
+                    [[chunk.shape[0] for chunk in chunks] for chunks in payload],
+                    [[CHUNK_SIZE, CHUNK_SIZE]] * pool.layer_num,
+                )
+
+                for buffer in pool.kv_buffer:
+                    buffer.add_(SWA_OFFSET)
+                expected = [buffer.clone() for buffer in pool.kv_buffer]
+                destination_indices = torch.tensor([12, 13, 14, 15, 9, 6])
+                for layer in range(pool.layer_num):
+                    for source_index, destination_index in zip(
+                        source_indices.tolist(), destination_indices.tolist()
+                    ):
+                        source_block, source_offset = divmod(
+                            source_index, pool.page_size
+                        )
+                        destination_block, destination_offset = divmod(
+                            destination_index, pool.page_size
+                        )
+                        expected[layer][destination_block, ..., destination_offset] = (
+                            source[layer][source_block, ..., source_offset]
+                        )
+
+                pool.load_cpu_copy(payload, destination_indices)
+                for actual, wanted in zip(pool.kv_buffer, expected):
+                    self.assertTrue(torch.equal(actual, wanted))
 
 
 class TestKvPageWriteKernel(CustomTestCase):
