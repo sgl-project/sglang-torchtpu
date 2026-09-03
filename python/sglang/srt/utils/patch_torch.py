@@ -16,6 +16,7 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_musa, is_npu, torch_release
 
 _is_npu = is_npu()
@@ -124,6 +125,13 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     os.environ["LOCAL_RANK"] = str(tp_rank % local_world_size)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+
+    if envs.SGLANG_TPU_PD_COLOCATED.get():
+        assert not server_args.use_ray, "TPU P/D co-location does not support Ray"
+        local_rank = tp_rank % local_world_size
+        physical_device = server_args.base_gpu_id + local_rank * server_args.gpu_id_step
+        # Assign an individual TPU device to each rank.
+        os.environ["TPU_VISIBLE_DEVICES"] = str(physical_device)
 
     # Multihost: every rank must rendezvous at rank-0's node. TPU_WORKER_HOSTNAMES
     # is ordered by TPU_WORKER_ID (physical slice order), so hosts[0] is where

@@ -24,6 +24,8 @@ _TORCHRUN_ENV_VARS = (
     "MASTER_ADDR",
     "MASTER_PORT",
     "TPU_WORKER_HOSTNAMES",
+    "TPU_VISIBLE_DEVICES",
+    "SGLANG_TPU_PD_COLOCATED",
 )
 
 
@@ -89,6 +91,49 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
         initialize_torch_tpu_worker(args, tp_rank=0)
         self.assertEqual(os.environ["MASTER_ADDR"], "10.0.0.1")
         self.assertEqual(os.environ["MASTER_PORT"], "12345")
+
+    def test_colocation_is_disabled_by_default(self):
+        args = SimpleNamespace(
+            device="tpu",
+            tp_size=4,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            base_gpu_id=4,
+            gpu_id_step=1,
+        )
+        initialize_torch_tpu_worker(args, tp_rank=2)
+        self.assertNotIn("TPU_VISIBLE_DEVICES", os.environ)
+
+    def test_colocation_maps_rank_from_base_device_and_step(self):
+        os.environ["SGLANG_TPU_PD_COLOCATED"] = "1"
+        args = SimpleNamespace(
+            device="tpu",
+            tp_size=4,
+            nnodes=1,
+            node_rank=0,
+            use_ray=False,
+            base_gpu_id=1,
+            gpu_id_step=2,
+        )
+        initialize_torch_tpu_worker(args, tp_rank=2)
+        self.assertEqual(os.environ["TPU_VISIBLE_DEVICES"], "5")
+
+    def test_colocation_rejects_ray(self):
+        os.environ["SGLANG_TPU_PD_COLOCATED"] = "1"
+        args = SimpleNamespace(
+            device="tpu",
+            tp_size=4,
+            nnodes=1,
+            node_rank=0,
+            use_ray=True,
+            base_gpu_id=0,
+            gpu_id_step=1,
+        )
+        with self.assertRaisesRegex(
+            AssertionError, "TPU P/D co-location does not support Ray"
+        ):
+            initialize_torch_tpu_worker(args, tp_rank=2)
 
 
 if __name__ == "__main__":

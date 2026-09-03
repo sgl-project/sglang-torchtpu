@@ -1572,6 +1572,11 @@ class Envs:
     # and the step runs more blocks than it needs. Rounded up to a page
     # multiple. Unset (None) means the wrapper's own search decides.
     SGLANG_TPU_FORCE_RPA_PREFILL_BKV = EnvInt(None)
+    # Enable prefill and decode co-location on the same single- or multi-host
+    # TPU slice by assigning half the chips to prefill and half to decode.
+    # This is intended primarily for development and is not for production use.
+    SGLANG_TPU_PD_COLOCATED = EnvBool(False)
+
     # Plugin system
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
