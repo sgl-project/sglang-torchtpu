@@ -521,6 +521,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    uno_target_max_top_k: Optional[int] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -643,7 +644,13 @@ def run_eagle_verify(
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)
     try:
-        verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+        verify_result = eagle_sample(
+            verify_input,
+            batch,
+            logits_output,
+            grammar_mask,
+            uno_target_max_top_k=uno_target_max_top_k,
+        )
         post_predict, post_accept_lens, post_accept_index = verify_result
         # Sampling and bookkeeping must use the same physical rows, including
         # padded idle DP peers. finalize_spec_verify restores the logical batch.
