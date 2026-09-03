@@ -21,40 +21,13 @@ def fused_moe_rs_padded_tokens(num_tokens: int, topk: int, ep_size: int) -> int:
     return ((num_tokens + token_alignment - 1) // token_alignment) * token_alignment
 
 
-def _get_global_device_id() -> int:
-    """Return the physical TPU device ID, defaulting to 0 if unavailable."""
-    try:
-        from torch_tpu._internal.distributed import tpu_distributed
+from sglang.srt.hardware_backend.tpu.topology import (
+    get_global_device_id,
+    get_tp_rank_to_device_id_mapping,
+)
 
-        return int(tpu_distributed.global_device_id())
-    except Exception:
-        return 0
-
-
-@functools.cache
-def _get_tp_rank_to_device_id_mapping() -> tuple[int, tuple[int, ...]]:
-    """Return (global_device_id, tp_rank_to_device_id) for the active TP communication group."""
-    import torch.distributed as dist
-
-    global_device_id = _get_global_device_id()
-    if not dist.is_initialized():
-        return global_device_id, (global_device_id,)
-
-    try:
-        from sglang.srt.distributed import get_tp_group
-
-        tp_group = get_tp_group()
-        group, world_size = tp_group.cpu_group, tp_group.world_size
-    except (AssertionError, RuntimeError):
-        # Fallback for standalone unit tests running raw torch.distributed without SGLang parallel_state
-        group, world_size = None, dist.get_world_size()
-
-    physical_ids = [None] * world_size
-    dist.all_gather_object(physical_ids, global_device_id, group=group)
-    if sorted(physical_ids) != list(range(world_size)):
-        raise RuntimeError(f"Unexpected TPU physical device IDs: {physical_ids}")
-
-    return global_device_id, tuple(int(x) for x in physical_ids)
+_get_global_device_id = get_global_device_id
+_get_tp_rank_to_device_id_mapping = get_tp_rank_to_device_id_mapping
 
 
 def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:

@@ -1536,6 +1536,8 @@ class Envs:
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
     SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE = EnvInt(64)
+    # Rollout kill switch: production falls back to full-vocabulary sampling.
+    SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K = EnvBool(False)
     # Filter top-k/top-p/min-p with the sort-free binary-search cutoff instead
     # of the full-vocabulary torch sort. Disable to A/B the sampled
     # distribution against the reference path.

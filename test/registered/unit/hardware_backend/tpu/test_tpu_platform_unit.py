@@ -134,10 +134,12 @@ class TestTpuCompileCache(CustomTestCase):
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_base.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_batched.py",
                 srt_root / "hardware_backend/tpu/attention_pallas_rpa_v3.py",
+                srt_root / "hardware_backend/tpu/top_k.py",
                 srt_root / "hardware_backend/tpu/kernels/kernel.py",
                 srt_root / "hardware_backend/tpu/pallas_export.py",
                 srt_root / "hardware_backend/tpu/pallas_jax_op.py",
                 srt_root / "hardware_backend/tpu/quantized_matmul.py",
+                srt_root / "hardware_backend/tpu/topology.py",
             )
             for source_file in source_files:
                 source_file.parent.mkdir(parents=True, exist_ok=True)

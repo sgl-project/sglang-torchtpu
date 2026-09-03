@@ -399,17 +399,36 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        from sglang.srt.environ import envs
+
+        disable_pallas = getattr(
+            envs, "SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K", None
+        )
+        is_pallas_disabled = (
+            disable_pallas.get() if disable_pallas is not None else False
+        )
+
         self.use_tpu_distributed_top_k = (
             not requires_full_next_token_logits
             and _is_tpu
+            and not is_pallas_disabled
             and get_exec().kernel.sampling_backend == "tpu"
         )
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
             # the logits processor. StableHLO export itself remains lazy.
             from sglang.srt.hardware_backend.tpu.top_k import register_tpu_top_k_ops
+            from sglang.srt.hardware_backend.tpu.topology import (
+                get_tp_rank_to_device_id_mapping,
+            )
 
             register_tpu_top_k_ops()
+            _, mapping = get_tp_rank_to_device_id_mapping()
+            self.register_buffer(
+                "_tpu_topk_tp_rank_to_device_id",
+                torch.tensor(mapping, dtype=torch.int32),
+                persistent=False,
+            )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -818,6 +837,7 @@ class LogitsProcessor(nn.Module):
             TpuVocabShard.from_lm_head(lm_head),
             top_k,
             group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
+            tp_rank_to_device_id=getattr(self, "_tpu_topk_tp_rank_to_device_id", None),
         )
         if self.final_logit_softcapping:
             global_top_k_logits = self.final_logit_softcapping * torch.tanh(

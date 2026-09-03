@@ -618,6 +618,43 @@ class TestTpuTopKLayout(CustomTestCase):
             ),
         )
 
+    def test_real_qwen_vocab_sharding_tp8_and_tp16(self):
+        vocab_size = 151_936
+        for tp_size in (8, 16):
+            with self.subTest(tp_size=tp_size):
+                shard_width = vocab_size // tp_size
+                shard = VocabParallelEmbeddingShardIndices(
+                    padded_org_vocab_start_index=0,
+                    padded_org_vocab_end_index=shard_width,
+                    padded_added_vocab_start_index=shard_width,
+                    padded_added_vocab_end_index=shard_width,
+                    org_vocab_start_index=0,
+                    org_vocab_end_index=shard_width,
+                    added_vocab_start_index=shard_width,
+                    added_vocab_end_index=shard_width,
+                )
+                lm_head = SimpleNamespace(
+                    enable_tp=True,
+                    shard_indices=shard,
+                    num_embeddings=vocab_size,
+                    num_embeddings_per_partition=shard_width,
+                )
+                self.assertTrue(supports_distributed_tpu_top_k(lm_head, shard_width))
+                parsed = TpuVocabShard.from_lm_head(lm_head)
+                self.assertEqual(
+                    parsed,
+                    TpuVocabShard(
+                        width=shard_width,
+                        global_vocab_size=vocab_size,
+                        org_vocab_start=0,
+                        org_vocab_count=shard_width,
+                        org_vocab_padded_count=shard_width,
+                        added_vocab_start=shard_width,
+                        added_vocab_count=0,
+                        org_vocab_size=vocab_size,
+                    ),
+                )
+
     def test_primitive_rejects_cpu_tensor_before_tpu_dependencies_load(self):
         with self.assertRaisesRegex(ValueError, "requires a TPU tensor"):
             tpu_top_k(torch.ones(1, 8), 4)

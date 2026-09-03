@@ -27,10 +27,12 @@ def get_pallas_kernel_sources() -> tuple[str, ...]:
         "hardware_backend/tpu/attention_pallas_rpa_base.py",
         "hardware_backend/tpu/attention_pallas_rpa_batched.py",
         "hardware_backend/tpu/attention_pallas_rpa_v3.py",
+        "hardware_backend/tpu/top_k.py",
         "hardware_backend/tpu/kernels",
         "hardware_backend/tpu/pallas_export.py",
         "hardware_backend/tpu/pallas_jax_op.py",
         "hardware_backend/tpu/quantized_matmul.py",
+        "hardware_backend/tpu/topology.py",
     )
 
 
