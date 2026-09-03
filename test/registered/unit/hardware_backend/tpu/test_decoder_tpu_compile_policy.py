@@ -88,6 +88,7 @@ def _model_runner(device="cpu"):
         token_to_kv_pool_allocator=SimpleNamespace(
             free_pages=torch.arange(4, dtype=torch.int32)
         ),
+        model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         server_args=SimpleNamespace(page_size=1, dp_size=1),
@@ -1223,6 +1224,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False, num_steps=3):
         model_config=SimpleNamespace(
             hidden_size=16,
             spec_hidden_size=16,
+            model_is_mrope=False,
             hf_config=SimpleNamespace(
                 eagle_config={"use_aux_hidden_state": False},
             ),
@@ -1595,7 +1597,7 @@ class TestDFlashCompilePolicy(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(
                 free_pages=torch.arange(4, dtype=torch.int32)
             ),
-            model_config=SimpleNamespace(hidden_size=hidden_size),
+            model_config=SimpleNamespace(hidden_size=hidden_size, model_is_mrope=False),
             is_draft_worker=is_draft_worker,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             server_args=SimpleNamespace(
@@ -2679,7 +2681,7 @@ def _policy():
     model_runner = SimpleNamespace(
         model=SimpleNamespace(forward=None, prepare_forward_batch=None),
         is_draft_worker=False,
-        model_config=SimpleNamespace(hidden_size=16),
+        model_config=SimpleNamespace(hidden_size=16, model_is_mrope=False),
         server_args=SimpleNamespace(
             speculative_num_steps=DRAFT_TOKEN_NUM - 1,
             speculative_num_draft_tokens=DRAFT_TOKEN_NUM,
