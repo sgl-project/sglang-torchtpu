@@ -168,7 +168,11 @@ jobs:
       hosts: ${{ matrix.group.hosts }}
       weights_pvc: ${{ matrix.group.weights_pvc }}
       timeout_per_file: ${{ matrix.group.timeout_per_file }}
-      run_name: ${{ matrix.group.name }}
+      # The group's COMPACT name (discovery hashes the path): the file stem here
+      # would push `tpu-ci-<run_name>-<rand>-slice-0` past k8s's 63 chars for
+      # deepseek-r1-0528. The test stays legible in display_name and in the
+      # job's own "== test files: ... ==" line.
+      run_name: ${{ matrix.group.run_name }}
     permissions:
       contents: read
       id-token: write
