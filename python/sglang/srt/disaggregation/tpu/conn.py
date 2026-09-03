@@ -4,9 +4,8 @@ This is the **default** TPU backend. It reuses the device-agnostic control
 plane (bootstrap discovery, ZMQ coordination, the ``KVPoll`` state machine)
 captured in ``base.py`` and plugs in a host *push* data plane:
 
-    decode  --TRSFR--> prefill        (small control msg: "room R ready,
-                                        send my pages, here is my sink addr")
-    prefill --KVDATA-> decode         (raw KV page bytes + aux row)
+    decode  --TRANSFER-------> prefill  (room R is ready; send its pages here)
+    prefill --KV_DATA_CHANNEL-> decode  (raw KV page bytes and auxiliary data)
 
 The prefill side gathers its KV pages off-device (D2H), pushes the bytes to
 the decode manager's ``server_socket``, and the decode side scatters them
@@ -65,7 +64,6 @@ from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
 # keep resolving ``from ...tpu.conn import KVTransferError, _tcp_endpoint``.
 from sglang.srt.disaggregation.tpu.base import (  # noqa: F401
     KVTransferError,
-    MessageTag,
     TpuKVBootstrapServerBase,
     TpuKVManagerBase,
     TpuKVReceiverBase,
@@ -77,6 +75,7 @@ from sglang.srt.disaggregation.tpu.host_staging import (
     StageBuf,
     default_pool_max_bytes,
 )
+from sglang.srt.disaggregation.tpu.serde import KVDataChannelHeader, MessageTag
 from sglang.srt.disaggregation.tpu.transfer import (
     DecodeTransferState,
     PendingChunk,
@@ -87,7 +86,7 @@ logger = logging.getLogger(__name__)
 
 # prefill -> decode, one frame per parallel channel (#3, opt-in). Each carries a
 # contiguous slice of the layers; the decode reassembles across channels.
-# MessageTag.KVDATA_CH is re-exported from base.py.
+# MessageTag defines the TPU wire protocol in serde.py.
 
 # Background threads per prefill rank for the (host-only) ZMQ push — i.e. how
 # many distinct transfers (rooms/chunks) a rank pushes concurrently. Orthogonal
@@ -192,7 +191,7 @@ class TpuKVManager(TpuKVManagerBase):
         # total (not by an is_last push), mirroring the decode. See _note_push_*.
         self._push_progress: dict[int, dict] = {}
         self._push_progress_lock = threading.Lock()
-        self._serve(MessageTag.TRSFR, self._handle_transfer)
+        self._serve(MessageTag.TRANSFER, self._handle_transfer)
 
     def _init_decode(self) -> None:
         self.decode_states: dict[int, DecodeTransferState] = {}
@@ -212,13 +211,12 @@ class TpuKVManager(TpuKVManagerBase):
         # Multi-channel reassembly buffer (#3), keyed by (room, index_start).
         self._chan_reasm: dict = {}
         self._chan_reasm_lock = threading.Lock()
-        # Accept both the single-message (TAG_KVDATA) and per-channel
-        # (TAG_KVDATA_CH) formats on the one PULL socket. copy=False so the recv
-        # thread can copy each layer frame *once*, straight into pinned staging
-        # (see _recv_layers), rather than wire -> bytes -> staging.
+        # Receive every KV data channel on one PULL socket. copy=False lets the
+        # receive thread copy each layer frame directly into pinned staging
+        # rather than first materializing an intermediate bytes object.
         self._serve_router(
             {
-                MessageTag.KVDATA_CH: self._handle_kvdata_ch,
+                MessageTag.KV_DATA_CHANNEL: self._handle_kvdata_ch,
             },
             copy=False,
         )
@@ -467,11 +465,12 @@ class TpuKVManager(TpuKVManagerBase):
         d2h_future: Any | None,
         n_ch: int,
     ) -> None:
-        """Background thread (#3): send one endpoint's chunk as ``n_ch`` messages
-        over ``n_ch`` parallel sockets, each carrying a contiguous layer slice.
-        Aux rides channel 0. Frame: ``[TAG_KVDATA_CH, room, index_start,
-        num_pages, dst_lane_start, num_lanes, ch, n_ch, layer_lo, num_layers,
-        num_aux] + aux + layer_slice``."""
+        """Send one chunk across parallel sockets from a background thread.
+
+        Each channel carries a contiguous layer slice using the
+        KV_DATA_CHANNEL wire layout. Channel 0 also carries the auxiliary
+        frames.
+        """
 
         n_layers = len(layer_frames)
         try:
@@ -497,23 +496,17 @@ class TpuKVManager(TpuKVManagerBase):
             for ch in range(n_ch):
                 lo, hi = bounds[ch], bounds[ch + 1]
                 aux = aux_blobs if ch == 0 else []
-                msg = (
-                    [
-                        MessageTag.KVDATA_CH,
-                        # Add almost 0 latency for better
-                        # readability/extensibility.
-                        info.to_json().encode(),
-                        str(index_start).encode(),
-                        str(num_pages).encode(),
-                        str(ch).encode(),
-                        str(n_ch).encode(),
-                        str(lo).encode(),
-                        str(n_layers).encode(),
-                        str(len(aux)).encode(),
-                    ]
-                    + aux
-                    + layer_frames[lo:hi]
+                header = KVDataChannelHeader(
+                    info=info,
+                    index_start=index_start,
+                    num_pages=num_pages,
+                    channel=ch,
+                    num_channels=n_ch,
+                    layer_start=lo,
+                    num_layers=n_layers,
+                    num_aux=len(aux),
                 )
+                msg = header.to_frames(aux, layer_frames[lo:hi])
                 sock = socks[ch]
                 with self._endpoint_locks[(info.decode_endpoint, ch)]:
                     if copy_false:
@@ -579,28 +572,26 @@ class TpuKVManager(TpuKVManagerBase):
             if isinstance(b, StageBuf):
                 b.release()
 
-    def _handle_kvdata_ch(self, msg: list[zmq.Frame]) -> None:
+    def _handle_kvdata_ch(self, msg: list[zmq.Frame | bytes]) -> None:
         """Background thread (#3): reassemble one channel's layer slice into the
         per-(room, index_start) buffer; once all channels have arrived, enqueue
         the complete chunk for the main-thread scatter (same as _handle_kvdata).
         Each channel's layer frames are copied once, straight into pinned staging
         (``_recv_layers``)."""
         recv_time = time.time()
-        # [TAG, room, index_start, num_pages, dst_lane_start, num_lanes,
-        #  ch, n_ch, lo, n_layers, num_aux]
-        info = PrefillTransferInfo.from_json(bytes(msg[1]).decode())
+        header, aux_frames, layer_frames = KVDataChannelHeader.from_frames(msg)
+        info = header.info
         room = info.room
-        index_start = int(bytes(msg[2]).decode())
-        num_pages = int(bytes(msg[3]).decode())
+        index_start = header.index_start
+        num_pages = header.num_pages
         num_lanes = info.n_lane_to_send
-        ch = int(bytes(msg[4]).decode())
-        n_ch = int(bytes(msg[5]).decode())
-        lo = int(bytes(msg[6]).decode())
-        n_layers = int(bytes(msg[7]).decode())
-        num_aux = int(bytes(msg[8]).decode())
-        aux_blobs = [bytes(f) for f in msg[9 : 9 + num_aux]]
+        ch = header.channel
+        n_ch = header.num_channels
+        lo = header.layer_start
+        n_layers = header.num_layers
+        aux_blobs = [bytes(f) for f in aux_frames]
         # One copy: wire -> pinned staging (or bytes on the CPU fallback path).
-        staged = self._recv_layers(msg[9 + num_aux :])
+        staged = self._recv_layers(layer_frames)
         _nbytes = sum(b.nbytes if isinstance(b, StageBuf) else len(b) for b in staged)
         if info.push_start_time > 0:
             push_to_recv_secs = max(0.0, recv_time - info.push_start_time)
@@ -616,8 +607,24 @@ class TpuKVManager(TpuKVManagerBase):
                     "aux": [],
                     "num_pages": num_pages,
                     "num_lanes": num_lanes,
+                    "num_channels": n_ch,
                 }
                 self._chan_reasm[key] = ent
+            elif (
+                ent["num_pages"] != num_pages
+                or ent["num_lanes"] != num_lanes
+                or ent["num_channels"] != n_ch
+                or len(ent["layers"]) != n_layers
+            ):
+                self._release_staged(
+                    PendingChunk(index_start, num_pages, staged, [], info)
+                )
+                raise ValueError(f"inconsistent KV_DATA_CHANNEL metadata for {key}")
+            if ch in ent["got"]:
+                self._release_staged(
+                    PendingChunk(index_start, num_pages, staged, [], info)
+                )
+                raise ValueError(f"duplicate KV_DATA_CHANNEL channel {ch} for {key}")
             for i, st in enumerate(staged):
                 ent["layers"][lo + i] = st
             if ch == 0 and aux_blobs:
@@ -640,7 +647,7 @@ class TpuKVManager(TpuKVManagerBase):
             lo,
             lo + len(staged),
             n_layers,
-            num_aux,
+            len(aux_blobs),
             _nbytes,
             info.src_attn_tp_size,
             info.dst_attn_tp_size,

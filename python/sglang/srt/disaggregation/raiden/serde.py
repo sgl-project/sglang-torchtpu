@@ -1,7 +1,7 @@
-"""Wire-format helpers for the raiden disaggregation rendezvous.
+"""Raiden wire messages and auxiliary-buffer serialization.
 
-Kept free of heavy deps (no zmq/torch/sglang) so the byte protocol can be unit
-tested in isolation.
+Each typed Raiden message uses the shared ``[TAG, JSON payload]`` framing.
+``ABORT`` retains the common receiver's legacy positional layout.
 """
 
 from __future__ import annotations
@@ -9,17 +9,18 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import List
+from typing import ClassVar, List
 
-import numpy as np
+import msgspec
+
+from sglang.srt.disaggregation.tpu.wire import WireMessage, require_non_negative
 
 
 class MessageTag(bytes, enum.Enum):
-    """First frame of every ZMQ multipart header on the per-rank PULL sockets.
+    """Identify the message type in the first ZMQ frame.
 
-    A ``bytes`` enum so members compare and serialize as their raw wire value:
-    ``msg[0] == MessageTag.PULL_REQ`` matches the bytes read off the socket, and
-    a member can be placed directly into a ``send_multipart`` frame list.
+    The bytes-valued members can be sent directly and compared with the first
+    frame received from a per-rank PULL socket.
     """
 
     # Symmetric-TP pull path (decode TP == prefill TP).
@@ -38,25 +39,151 @@ class MessageTag(bytes, enum.Enum):
         b"RAIDEN_RESHARD_CHUNK_READY"  # decode -> prefill: chunk registered, push it
     )
 
-    # Backend-agnostic abort sent by ``CommonKVReceiver`` to the prefill rank
-    # that owns the room: decode gave up on the request.
+    # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
 
 
-def pack_ints(values: List[int]) -> bytes:
-    return np.asarray(values, dtype=np.int64).tobytes()
+def _require_port(port: int) -> None:
+    if not 1 <= port <= 65535:
+        raise ValueError(f"invalid decode_port: expected 1..65535, got {port}")
 
 
-def unpack_ints(buf: bytes) -> List[int]:
-    return np.frombuffer(buf, dtype=np.int64).tolist()
+class PullReq(WireMessage):
+    """Ask a prefill rank to publish one room's KV blocks."""
+
+    TAG: ClassVar[bytes] = MessageTag.PULL_REQ
+    room: int
+    decode_ip: str
+    decode_port: int
+    decode_pages: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.decode_pages, "decode_pages")
+        _require_port(self.decode_port)
 
 
-def pack_blocks(block_ids: List[int]) -> bytes:
-    return np.asarray(block_ids, dtype=np.int64).tobytes()
+class Blocks(WireMessage):
+    """Return symmetric-TP KV block locations and auxiliary data."""
+
+    TAG: ClassVar[bytes] = MessageTag.BLOCKS
+    room: int
+    blocks: list[int]
+    endpoint: str
+    swa_blocks: list[int]
+    swa_endpoint: str
+    aux_blob: bytes
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
 
 
-def unpack_blocks(buf: bytes) -> List[int]:
-    return np.frombuffer(buf, dtype=np.int64).tolist()
+class Chunk(WireMessage):
+    """Publish one chunk of a symmetric-TP prefill transfer."""
+
+    TAG: ClassVar[bytes] = MessageTag.CHUNK
+    room: int
+    req_id: str
+    uuid: int
+    start: int
+    total_pages: int
+    blocks: list[int]
+    endpoint: str
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.uuid, "uuid")
+        require_non_negative(self.start, "start")
+        require_non_negative(self.total_pages, "total_pages")
+
+
+class ReshardReq(WireMessage):
+    """Request a push transfer into an asymmetric-TP decode layout."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_REQ
+    room: int
+    decode_ip: str
+    decode_port: int
+    push_endpoint: str
+    decode_blocks: list[int]
+    dst_attn_tp: int
+    decode_swa_blocks: list[int]
+    swa_push_endpoint: str
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        _require_port(self.decode_port)
+        if self.dst_attn_tp < 1:
+            raise ValueError(
+                f"invalid dst_attn_tp: expected >= 1, got {self.dst_attn_tp}"
+            )
+
+
+class ReshardBlocks(WireMessage):
+    """Publish source blocks for a complete resharded transfer."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_BLOCKS
+    room: int
+    prefill_blocks: list[int]
+    src_rank: int
+    aux_blob: bytes
+    prefill_swa_blocks: list[int]
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.src_rank, "src_rank")
+
+
+class ReshardReady(WireMessage):
+    """Confirm that decode registered the destination reshard plan."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_READY
+    room: int
+    pages: list[int] = msgspec.field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+
+
+class ReshardChunk(WireMessage):
+    """Publish source blocks for one chunk of a resharded transfer."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_CHUNK
+    room: int
+    index: int
+    start: int
+    total_pages: int
+    blocks: list[int]
+    src_rank: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.index, "index")
+        require_non_negative(self.start, "start")
+        require_non_negative(self.total_pages, "total_pages")
+        require_non_negative(self.src_rank, "src_rank")
+
+
+class ReshardChunkReady(WireMessage):
+    """Confirm that decode registered one chunk's reshard plan."""
+
+    TAG: ClassVar[bytes] = MessageTag.RESHARD_CHUNK_READY
+    room: int
+    index: int
+    uuid: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.index, "index")
+        require_non_negative(self.uuid, "uuid")
+
+
+def decode_text(frame: bytes, field: str) -> str:
+    """Decode a named ASCII frame from the legacy ABORT message."""
+    try:
+        return frame.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"invalid {field}: expected ASCII text") from exc
 
 
 def read_aux_blob(

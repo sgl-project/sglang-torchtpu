@@ -28,9 +28,7 @@ between treated as an opaque dtype-tagged blob.
 from __future__ import annotations
 
 import ctypes
-import dataclasses
 import enum
-import json
 import logging
 import time
 from collections import deque
@@ -249,13 +247,6 @@ class PrefillTransferInfo:
         when a sub-range was gathered, else this rank's full lane set."""
         return self.n_lane_to_send if self.require_slicing else self.total_lanes
 
-    def to_json(self) -> str:
-        return json.dumps(dataclasses.asdict(self))
-
-    @staticmethod
-    def from_json(obj: str) -> PrefillTransferInfo:
-        return PrefillTransferInfo(**json.loads(obj))
-
 
 @dataclass
 class DecodeTransferState:
@@ -284,7 +275,7 @@ class DecodeTransferState:
 
 @dataclass
 class PendingChunk:
-    """Received KVDATA chunk awaiting main-thread scatter.
+    """Received KV data chunk awaiting main-thread scatter.
 
     Attributes:
       index_start: Starting page index for the chunk.

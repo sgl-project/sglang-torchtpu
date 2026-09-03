@@ -34,15 +34,19 @@ import torch
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
-from sglang.srt.disaggregation.raiden.serde import MessageTag, unpack_blocks
+from sglang.srt.disaggregation.raiden.serde import (
+    Blocks,
+    Chunk,
+    MessageTag,
+    PullReq,
+    ReshardBlocks,
+    ReshardChunk,
+    ReshardChunkReady,
+    ReshardReady,
+    ReshardReq,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.test_utils import CustomTestCase
-
-# Frame counts the handlers enforce via _require_frames. Duplicated from the
-# production side on purpose: these are the wire contract, so a change on one
-# side should have to be made deliberately on the other.
-PULL_REQ_FRAMES = 5
-BLOCKS_FRAMES = 7
 
 
 class _Inbox:
@@ -228,20 +232,19 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
     @staticmethod
     def _pull_req_frames(decode, room, pages):
-        """The PULL_REQ a decode rank sends, as _on_pull_req expects it."""
-        return [
-            MessageTag.PULL_REQ,
-            str(room).encode("ascii"),
-            decode.local_ip.encode("ascii"),
-            str(decode.rank_port).encode("ascii"),
-            str(pages).encode("ascii"),
-        ]
+        """Build the typed PULL_REQ frames sent by a decode rank."""
+        return PullReq(
+            room=room,
+            decode_ip=decode.local_ip,
+            decode_port=decode.rank_port,
+            decode_pages=pages,
+        ).to_frames()
 
 
 class TestRaidenPullHandshake(RaidenRendezvousTestCase):
     def test_decode_request_emits_a_well_formed_pull_req(self):
         """The decode names itself and its page count so the prefill can size
-        the reply; the frame count is the contract _require_frames enforces."""
+        the reply; the typed message schema is the wire contract."""
         prefill, decode = self._prefill(), self._decode()
         room = 7001
         local_blocks = [4, 9, 2]
@@ -255,11 +258,11 @@ class TestRaidenPullHandshake(RaidenRendezvousTestCase):
         )
 
         frames = self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ)
-        self.assertEqual(len(frames), PULL_REQ_FRAMES)
-        self.assertEqual(int(frames[1]), room)
-        self.assertEqual(frames[2].decode(), decode.local_ip)
-        self.assertEqual(int(frames[3]), decode.rank_port)
-        self.assertEqual(int(frames[4]), len(local_blocks))
+        req = PullReq.from_frames(frames)
+        self.assertEqual(req.room, room)
+        self.assertEqual(req.decode_ip, decode.local_ip)
+        self.assertEqual(req.decode_port, decode.rank_port)
+        self.assertEqual(req.decode_pages, len(local_blocks))
 
     def test_reply_waits_for_both_the_request_and_the_finalize(self):
         """Neither half alone may trigger BLOCKS: the prefill needs the decode's
@@ -311,10 +314,10 @@ class TestRaidenPullHandshake(RaidenRendezvousTestCase):
         prefill.finalize_send(room, aux_index=None)
 
         frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
-        self.assertEqual(len(frames), BLOCKS_FRAMES)
-        self.assertEqual(int(frames[1]), room)
-        self.assertEqual(unpack_blocks(frames[2]), [11, 12, 13])
-        self.assertEqual(frames[3].decode(), prefill.raiden_endpoint)
+        reply = Blocks.from_frames(frames)
+        self.assertEqual(reply.room, room)
+        self.assertEqual(reply.blocks, [11, 12, 13])
+        self.assertEqual(reply.endpoint, prefill.raiden_endpoint)
 
     def test_reply_registers_exactly_the_blocks_it_announced(self):
         """Raiden blocks the consumer's read until a matching producer
@@ -328,10 +331,10 @@ class TestRaidenPullHandshake(RaidenRendezvousTestCase):
 
         frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
         self.assertEqual(prefill._engine.reads, [(str(room), room, blocks)])
-        self.assertEqual(unpack_blocks(frames[2]), blocks)
+        self.assertEqual(Blocks.from_frames(frames).blocks, blocks)
 
     def test_malformed_pull_req_is_rejected_before_it_is_indexed(self):
-        """A short header must raise rather than IndexError deep in the handler."""
+        """A missing JSON payload must produce a protocol validation error."""
         prefill, decode = self._prefill(), self._decode()
         frames = self._pull_req_frames(decode, 7006, 1)[:-1]
 
@@ -402,8 +405,7 @@ class TestRaidenAuxSidecar(RaidenRendezvousTestCase):
         prefill.finalize_send(room, aux_index=None)
 
         frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
-        self.assertEqual(len(frames), BLOCKS_FRAMES)
-        self.assertEqual(frames[6], b"")
+        self.assertEqual(Blocks.from_frames(frames).aux_blob, b"")
 
 
 class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
@@ -463,6 +465,60 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
 
         self.assertEqual(prefill._decode_addr[room], ("127.0.0.1", decode.rank_port))
         self.assertEqual(prefill._decode_pages[room], pages)
+
+
+class TestRaidenMessageValidation(CustomTestCase):
+    def test_all_message_types_round_trip(self):
+        messages = [
+            PullReq(1, "127.0.0.1", 1234, 2),
+            Blocks(1, [2, 3], "tcp://kv", [4], "tcp://swa", b"aux"),
+            Chunk(1, "req", 2, 0, 2, [3, 4], "tcp://kv"),
+            ReshardReq(
+                room=1,
+                decode_ip="127.0.0.1",
+                decode_port=1234,
+                push_endpoint="tcp://push",
+                decode_blocks=[2, 3],
+                dst_attn_tp=2,
+                decode_swa_blocks=[4],
+                swa_push_endpoint="tcp://swa",
+            ),
+            ReshardBlocks(1, [2, 3], 0, b"aux", [4]),
+            ReshardReady(1, [0, 2]),
+            ReshardChunk(1, 0, 0, 2, [3, 4], 0),
+            ReshardChunkReady(1, 0, 2),
+        ]
+
+        for message in messages:
+            with self.subTest(message_type=type(message).__name__):
+                self.assertEqual(
+                    type(message).from_frames(message.to_frames()), message
+                )
+
+    def test_rejects_wrong_frame_count(self):
+        with self.assertRaisesRegex(ValueError, "expected 2 frames, got 1"):
+            PullReq.from_frames([MessageTag.PULL_REQ])
+
+    def test_rejects_wrong_tag(self):
+        message = PullReq(1, "127.0.0.1", 1234, 2)
+        with self.assertRaisesRegex(ValueError, "expected tag"):
+            PullReq.from_frames([MessageTag.BLOCKS, message.to_frames()[1]])
+
+    def test_rejects_unknown_fields(self):
+        with self.assertRaises(ValueError):
+            PullReq.from_frames([MessageTag.PULL_REQ, b'{"unexpected":1}'])
+
+    def test_constructor_validates_ranges(self):
+        with self.assertRaisesRegex(ValueError, "decode_port"):
+            PullReq(room=1, decode_ip="127.0.0.1", decode_port=65536, decode_pages=1)
+
+    def test_decode_validates_ranges_with_message_context(self):
+        payload = (
+            b'{"room":1,"decode_ip":"127.0.0.1",'
+            b'"decode_port":65536,"decode_pages":1}'
+        )
+        with self.assertRaisesRegex(ValueError, "malformed PullReq payload"):
+            PullReq.from_frames([MessageTag.PULL_REQ, payload])
 
 
 if __name__ == "__main__":

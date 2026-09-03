@@ -14,9 +14,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.raiden.serde import (
     MessageTag,
-    pack_blocks,
     read_aux_blob,
-    unpack_blocks,
     write_aux_blob,
 )
 
@@ -31,10 +29,6 @@ def kv_to_page_indices(kv_indices, page_size):
 class TestRaidenSerde(unittest.TestCase):
     def test_headers_distinct(self):
         self.assertNotEqual(MessageTag.PULL_REQ, MessageTag.BLOCKS)
-
-    def test_block_pack_roundtrip(self):
-        for blocks in ([], [0], [20, 8, 2], list(range(1000))):
-            self.assertEqual(unpack_blocks(pack_blocks(blocks)), blocks)
 
     def test_page_indices_preserve_token_order(self):
         # 3 full pages (page_size=4); page ids must stay in token order, NOT be
