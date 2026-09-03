@@ -305,9 +305,9 @@ class SpeculativeAlgorithm(Enum):
     ) -> type[BaseSpecWorker | TpModelWorker | NGRAMWorker] | None:
 
         cfg = resolving_view(server_args)
-        assert (
-            not self.is_none()
-        ), "Cannot create worker for NONE speculative algorithm."
+        assert not self.is_none(), (
+            "Cannot create worker for NONE speculative algorithm."
+        )
 
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it

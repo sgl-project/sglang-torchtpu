@@ -248,7 +248,6 @@ class TopKConfig:
 
 
 class TopKOutputChecker:
-
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
         # ===== TO BE REFACTORED ====
@@ -622,7 +621,6 @@ class TopK(BaseFusedOp):
         # ===== TO BE REFACTORED ====
         elif get_moe_runner_backend().is_experimental_sgl_trtllm():
             try:
-
                 use_standard_for_lora = bool(get_lora().enable_lora)
             except ValueError:
                 use_standard_for_lora = False
@@ -845,9 +843,9 @@ def fused_topk_torch_native(
         topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
-        assert (
-            hidden_states.shape[0] == gating_output.shape[0]
-        ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+        assert hidden_states.shape[0] == gating_output.shape[0], (
+            f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+        )
         topk_weights = scoring_func_impl(gating_output.float())
         topk_weights, topk_ids = _stable_topk(topk_weights, topk)
 
@@ -868,9 +866,9 @@ def fused_topk_softmax_torch_raw_logits(
     topk: int,
     renormalize: bool,
 ):
-    assert (
-        hidden_states.shape[0] == gating_output.shape[0]
-    ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+    assert hidden_states.shape[0] == gating_output.shape[0], (
+        f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
+    )
 
     _, topk_ids = torch.topk(gating_output, k=topk, dim=-1, sorted=False)
     logits = gating_output.float()
@@ -976,7 +974,6 @@ def fused_topk(
 
     if scoring_func == "softmax":
         if _use_aiter:
-
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
             topk_weights, topk_ids = aiter_fused_topk(
                 hidden_states,
@@ -1408,8 +1405,9 @@ def biased_topk_jit_kernel_impl(
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
-        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
-            torch.int32
+        topk_weights, topk_ids = (
+            topk_weights.to(torch.float32),
+            topk_ids.to(torch.int32),
         )
         return topk_weights, topk_ids
 
@@ -1735,9 +1733,9 @@ def biased_grouped_topk_gpu(
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
-        assert (
-            hidden_states.shape[0] == gating_output.shape[0]
-        ), f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        assert hidden_states.shape[0] == gating_output.shape[0], (
+            f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
+        )
         bias = correction_bias.to(dtype=gating_output.dtype)
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
 
@@ -1897,7 +1895,6 @@ def biased_grouped_topk_gpu(
             and num_experts <= 256
             and topk <= 8
         ):
-
             scale = (
                 routed_scaling_factor
                 if (
@@ -2282,9 +2279,9 @@ def _post_process_topk_ids(
     ):
         # Standard EP all-reduces the per-rank shared-expert outputs; without the
         # supplied 1/ep_size factor the shared contribution is summed ep_size times.
-        topk_weights[
-            :, -num_fused_shared_experts:
-        ] *= fused_shared_experts_scaling_factor
+        topk_weights[:, -num_fused_shared_experts:] *= (
+            fused_shared_experts_scaling_factor
+        )
 
     if _is_hip and not _skip_hip_pad_mask:
         # Shared-expert append/remap can introduce non-zero weights after the
@@ -2377,9 +2374,9 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in fused_topk_native"
+        assert num_token_non_padded is None, (
+            "num_token_non_padded is not yet supported in fused_topk_native"
+        )
         assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = fused_topk_native(

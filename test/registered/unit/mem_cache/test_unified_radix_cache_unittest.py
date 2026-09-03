@@ -341,11 +341,11 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
         core.node_by_id.side_effect = nodes.__getitem__
         core.components_by_type = {ComponentType.FULL: mock.Mock()}
         core.full_host_duplicates = {}
-        core._is_settled_full_host_duplicate.side_effect = (
-            lambda node: UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
+        core._is_settled_full_host_duplicate.side_effect = lambda node: (
+            UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
         )
-        core._update_duplicate_tracking.side_effect = (
-            lambda node: UnifiedTreeCore._update_duplicate_tracking(core, node)
+        core._update_duplicate_tracking.side_effect = lambda node: (
+            UnifiedTreeCore._update_duplicate_tracking(core, node)
         )
         return core, shared, anchor_a, anchor_b
 
@@ -1307,7 +1307,6 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
 
 
 class UnifiedRadixCacheSuite:
-
     cfg: CacheConfig
     _rid: int = 0
 
@@ -3614,8 +3613,9 @@ class UnifiedRadixCacheSuite:
             self.assertIn(n, pipeline.inflight_backup_node_ids)
         self._pump_hicache_until(
             cache,
-            lambda: not pipeline.inflight_backup_node_ids
-            and not pipeline.ongoing_backup,
+            lambda: (
+                not pipeline.inflight_backup_node_ids and not pipeline.ongoing_backup
+            ),
             "buffer backup pipeline did not drain",
         )
 
@@ -3731,8 +3731,10 @@ class UnifiedRadixCacheSuite:
         self.assertEqual((stats["attempts"], stats["issued"]), (1, 1))
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
         # Staged: bounce occupies host staging; nothing device-side; span
@@ -3795,8 +3797,10 @@ class UnifiedRadixCacheSuite:
         # loaded KV bytes equal the producer's.
         self._pump_hicache_until(
             cons,
-            lambda: not cons.buffer_pipeline.ongoing_buffer_load_back
-            and self._host_avail_sizes(cons) == avail0,
+            lambda: (
+                not cons.buffer_pipeline.ongoing_buffer_load_back
+                and self._host_avail_sizes(cons) == avail0
+            ),
             "load-back ack did not free the bounce",
         )
         mc = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
@@ -3860,8 +3864,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(root_req)
-            and cons.buffer_pipeline.has_staged(root_req),
+            lambda: (
+                cons.check_prefetch_progress(root_req)
+                and cons.buffer_pipeline.has_staged(root_req)
+            ),
             "salted root prefetch did not stage",
         )
         held = cons.buffer_pipeline.staged_prefetches[root_req]
@@ -3930,8 +3936,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons2,
-            lambda: cons2.check_prefetch_progress(anchored_req)
-            and cons2.buffer_pipeline.has_staged(anchored_req),
+            lambda: (
+                cons2.check_prefetch_progress(anchored_req)
+                and cons2.buffer_pipeline.has_staged(anchored_req)
+            ),
             "salted mid-tree prefetch did not stage",
         )
         self._consume_staged_prefetch(
@@ -3992,8 +4000,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "retried prefetch did not stage",
         )
         self.assertFalse(cons.pop_storage_prefetch_miss(req_id))
@@ -4089,8 +4099,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
 
@@ -4193,8 +4205,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
         cons.pop_prefetch_loaded_tokens(req_id)
@@ -4264,8 +4278,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
         cons.pop_prefetch_loaded_tokens(req_id)
@@ -4373,8 +4389,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
         cons.pop_prefetch_loaded_tokens(req_id)
@@ -4440,8 +4458,10 @@ class UnifiedRadixCacheSuite:
         )
         self._pump_hicache_until(
             cons,
-            lambda: cons.check_prefetch_progress(req_id)
-            and cons.buffer_pipeline.has_staged(req_id),
+            lambda: (
+                cons.check_prefetch_progress(req_id)
+                and cons.buffer_pipeline.has_staged(req_id)
+            ),
             "prefetch did not stage",
         )
         cons.pop_prefetch_loaded_tokens(req_id)
@@ -4561,8 +4581,10 @@ class UnifiedRadixCacheSuite:
             )
             self._pump_hicache_until(
                 cons2,
-                lambda: cons2.check_prefetch_progress("subwin-req")
-                and cons2.buffer_pipeline.has_staged("subwin-req"),
+                lambda: (
+                    cons2.check_prefetch_progress("subwin-req")
+                    and cons2.buffer_pipeline.has_staged("subwin-req")
+                ),
                 "sub-window prefetch did not stage",
             )
             self.assertTrue(
@@ -7123,7 +7145,6 @@ class UnifiedRadixCacheSuite:
 
 
 class UnifiedLRUListBoundedRefreshTest(CustomTestCase):
-
     components = (ComponentType.FULL, ComponentType.SWA)
 
     def _make_node(self, key_len: int) -> UnifiedTreeNode:

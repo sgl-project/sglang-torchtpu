@@ -135,7 +135,6 @@ def _resolve_vision_tp(
 
 
 class Qwen3_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -215,7 +214,6 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
 
 class Qwen3_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -293,7 +291,6 @@ class Qwen3_VisionBlock(nn.Module):
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -358,7 +355,6 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
@@ -1115,7 +1111,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             loaded_params.add(name)
         return loaded_params
 
-    def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
+    def _prepare_graph_inputs(
+        self, x: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1232,7 +1230,6 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3LLMModel(Qwen3Model):
-
     def __init__(
         self,
         *,
@@ -1244,7 +1241,9 @@ class Qwen3LLMModel(Qwen3Model):
         if not self.pp_group.is_first_rank:
             assert self.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
-            ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            ), (
+                "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            )
 
         self.hidden_size = config.hidden_size
         self.deepstack_embed_to_decoder_layer = range(
@@ -1489,9 +1488,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
-        assert (
-            embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
-        ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
+            f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        )
 
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]

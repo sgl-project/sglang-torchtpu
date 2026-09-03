@@ -142,7 +142,6 @@ class SingletonCache:
 
 @dataclasses.dataclass
 class VisionAttentionMetadata:
-
     cu_seqlens: torch.Tensor
     seq_lens: torch.Tensor
     max_seqlen: int
@@ -247,9 +246,9 @@ def resolve_seqlens(
         resolved_seqlens = cu_seqlens.get_data()
     else:
         resolved_seqlens = cu_seqlens
-    assert isinstance(
-        resolved_seqlens, torch.Tensor
-    ), "cu_seqlens must be a torch.Tensor"
+    assert isinstance(resolved_seqlens, torch.Tensor), (
+        "cu_seqlens must be a torch.Tensor"
+    )
     return resolved_seqlens
 
 
@@ -825,7 +824,6 @@ class VisionAiterAttention(nn.Module):
 
 
 class VisionAscendAttention(nn.Module):
-
     def __init__(
         self,
         **kwargs,
@@ -1647,7 +1645,6 @@ class VisionAttention(nn.Module):
         if self.qk_normalization and not self.qk_normalization_by_head_size:
             # jit kernel
             if can_use_jit_qk_norm(self.head_size, q.dtype):
-
                 # q: [tokens, head, head_size]  ->  [tokens, embed_dim]
                 head_dim_for_norm = head * self.head_size
 

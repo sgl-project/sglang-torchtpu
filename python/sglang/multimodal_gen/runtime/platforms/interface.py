@@ -404,8 +404,7 @@ class Platform:
         """
         if cls.supported_quantization and quant not in cls.supported_quantization:
             raise ValueError(
-                f"{quant} quantization is currently not supported in "
-                f"{cls.device_name}."
+                f"{quant} quantization is currently not supported in {cls.device_name}."
             )
 
     @classmethod
