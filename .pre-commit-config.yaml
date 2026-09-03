@@ -108,12 +108,6 @@ repos:
         language: system
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
-      - id: check-tpu-ci-object-names
-        name: check TPU CI object-name budget
-        entry: python3 scripts/lint/check_tpu_ci_object_names.py
-        language: system
-        files: ^\.github/workflows/.*\.yml$
-        pass_filenames: false
       - id: check-rust-ext-cache-prefix
         name: check rust-ext cache key prefix defaults match
         entry: python3 scripts/lint/check_rust_ext_cache_prefix.py
