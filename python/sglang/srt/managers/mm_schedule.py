@@ -5,16 +5,18 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
-from sglang.srt.utils import is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_tpu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _is_xpu = is_xpu()
 
 embedding_cache: Optional[MultiModalStaticCache] = None
@@ -282,6 +284,94 @@ class PerImageRequestInfo:
     )
 
 
+def _tpu_vit_patch_budget() -> int:
+    """Patch count of the top ViT bucket the server actually warmed.
+
+    The env vars only bound the ladder, so they are a fallback for before
+    precompile runs.
+    """
+    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+        warmed_patch_budget,
+    )
+
+    warmed = warmed_patch_budget()
+    if warmed is not None:
+        return warmed
+    explicit_sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()
+    if explicit_sizes:
+        return max(int(size) for size in explicit_sizes)
+    return envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
+
+
+def _item_patch_count(item: MultimodalDataItem) -> int:
+    grid = item.video_grid_thw if item.is_video() else item.image_grid_thw
+    return int(torch.as_tensor(grid).prod().item())
+
+
+def _split_items_by_patch_budget(
+    items: List[MultimodalDataItem], budget: int
+) -> List[List[MultimodalDataItem]]:
+    """Greedily pack items into groups whose total patch count fits one bucket."""
+    groups: List[List[MultimodalDataItem]] = []
+    current: List[MultimodalDataItem] = []
+    current_patches = 0
+    for item in items:
+        patches = _item_patch_count(item)
+        if current and current_patches + patches > budget:
+            groups.append(current)
+            current, current_patches = [], 0
+        current.append(item)
+        current_patches += patches
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _encode_vision_items(
+    data_embedding_func: DataEmbeddingFunc,
+    items: List[MultimodalDataItem],
+) -> torch.Tensor | list:
+    """Encode items, splitting the call on TPU to stay inside a precompiled bucket.
+
+    Every image in the batch is concatenated into one ViT call; a patch total
+    above the top bucket gets no padding and recompiles, which is fatal once
+    fail_on_recompile is armed.
+    """
+    if not _is_tpu or not items:
+        return data_embedding_func(items)
+
+    budget = _tpu_vit_patch_budget()
+    groups = _split_items_by_patch_budget(items, budget)
+    largest_item = max(_item_patch_count(item) for item in items)
+    if largest_item > budget:
+        logger.warning(
+            "[tpu] One image needs %d patches, above the top precompiled ViT "
+            "bucket (%d); it will recompile. Lower max_pixels via "
+            "--mm-process-config, or raise "
+            "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
+            largest_item,
+            budget,
+        )
+    if len(groups) == 1:
+        return data_embedding_func(items)
+
+    logger.info(
+        "[tpu] Splitting ViT batch: %d images / %d patches exceed the top "
+        "precompiled bucket (%d), so it runs as %d calls of %s patches.",
+        len(items),
+        sum(_item_patch_count(item) for item in items),
+        budget,
+        len(groups),
+        [sum(_item_patch_count(item) for item in group) for group in groups],
+    )
+    outputs = [data_embedding_func(group) for group in groups]
+    if isinstance(outputs[0], list):
+        return [embedding for output in outputs for embedding in output]
+    return torch.concat(
+        [output.reshape(-1, output.shape[-1]) for output in outputs], dim=0
+    )
+
+
 def _batch_encode_per_image_misses(
     data_embedding_func: DataEmbeddingFunc,
     per_image_requests: List[PerImageRequestInfo],
@@ -328,7 +418,7 @@ def _batch_encode_per_image_misses(
 
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_items, device)
-        all_miss_embedding = data_embedding_func(miss_items)
+        all_miss_embedding = _encode_vision_items(data_embedding_func, miss_items)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns
@@ -397,7 +487,7 @@ def _get_chunked_embedding_by_item(
         miss_item_list = [item for _, item, _, _ in miss_items]
         if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
-        all_miss_embedding = data_embedding_func(miss_item_list)
+        all_miss_embedding = _encode_vision_items(data_embedding_func, miss_item_list)
 
         if isinstance(all_miss_embedding, list):
             # Per-item embeddings: no split needed, and each cache entry owns

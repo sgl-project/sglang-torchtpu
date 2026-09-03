@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 # without warming a huge grid.
 _DEFAULT_MAX_PATCHES = 4900
 
+# The env cap only bounds the ladder; the real ceiling is the largest square under
+# it (4900 = 70^2 by default), so batching callers must read the warmed value.
+_warmed_patch_budget: int | None = None
+
+
+def warmed_patch_budget() -> int | None:
+    """Largest ViT patch count warmed by precompile, or None if none ran."""
+    return _warmed_patch_budget
+
 
 def _compute_patch_counts(
     merge_size: int, min_patches: int = 196, max_patches: int = _DEFAULT_MAX_PATCHES
@@ -220,6 +229,9 @@ class VisionTpuCompilePolicy(CompilePolicy):
                 "not installed."
             )
             return
+
+        global _warmed_patch_budget
+        _warmed_patch_budget = max(patch_counts)
 
         logger.info(
             "VisionTpuCompilePolicy.precompile: warming %d patch counts %s.",

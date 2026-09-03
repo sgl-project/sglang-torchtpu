@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.graph_runner import (
+    vit_tpu_compile_runner as vit_runner,
+)
 from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
@@ -19,6 +22,7 @@ from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
     _build_tpu_segment_ids,
 )
+from sglang.srt.managers import mm_schedule
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
@@ -161,6 +165,48 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             self.assertEqual(policy.resolve_patch_buckets(), [196])
         with sizes.override("324"):
             self.assertEqual(policy.resolve_patch_buckets(), [196])
+
+    def test_env_cap_bounds_the_ladder_but_is_not_its_top_bucket(self):
+        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
+        with _unset(
+            envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+        ), envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000):
+            ladder = policy.compute_patch_buckets()
+        # 72^2 = 5184 overshoots the cap, so the real ceiling stays 70^2. Callers
+        # sizing a batch must read the warmed value rather than the cap.
+        self.assertEqual(ladder[-1], 4900)
+
+    def test_precompile_publishes_the_top_warmed_bucket(self):
+        policy = _FakeVisionPolicy()
+        policy.owner = SimpleNamespace()
+        policy.compiled_fn = MagicMock(return_value=torch.zeros(1))
+        with patch.object(vit_runner, "_warmed_patch_budget", None), patch.object(
+            vit_runner, "tpu_sync"
+        ):
+            self.assertIsNone(vit_runner.warmed_patch_budget())
+            policy.precompile(patch_counts=[196, 324, 4900])
+            self.assertEqual(vit_runner.warmed_patch_budget(), 4900)
+
+    def test_precompile_publishes_nothing_when_warming_is_disabled(self):
+        policy = _FakeVisionPolicy()
+        policy.owner = SimpleNamespace()
+        policy.compiled_fn = MagicMock(return_value=torch.zeros(1))
+        with patch.object(vit_runner, "_warmed_patch_budget", None):
+            policy.precompile(patch_counts=[])
+            self.assertIsNone(vit_runner.warmed_patch_budget())
+
+    def test_batching_budget_prefers_the_warmed_ladder_over_the_env_cap(self):
+        with patch.object(vit_runner, "_warmed_patch_budget", 2304):
+            self.assertEqual(mm_schedule._tpu_vit_patch_budget(), 2304)
+
+    def test_batching_budget_falls_back_to_env_before_precompile_runs(self):
+        unwarmed = patch.object(vit_runner, "_warmed_patch_budget", None)
+        with unwarmed, _unset(
+            envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
+        ), envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600):
+            self.assertEqual(mm_schedule._tpu_vit_patch_budget(), 1600)
+        with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
+            self.assertEqual(mm_schedule._tpu_vit_patch_budget(), 1024)
 
     def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
