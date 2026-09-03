@@ -50,9 +50,19 @@ def object_name(run_name: str, role: str) -> str:
 
 
 MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_.]+)\s*\}\}")
-# A matrix key can be a plain list, or an expression whose literals are spelled
-# out inline (perf picks its suite with a `fromJSON('["..."]')` branch).
+# A matrix key can be a plain list, or an expression whose values are spelled
+# out inline (perf picks its suite with a `fromJSON('["..."]')` branch). Read
+# only the fromJSON payloads: the rest of such an expression holds literals that
+# are conditions, not values (`inputs.model == 'gpt-oss-120b'`).
+FROM_JSON = re.compile(r"fromJSON\(\s*'([^']*)'\s*\)")
 INLINE_LITERAL = re.compile(r"""["']([a-z0-9][a-z0-9._-]*)["']""")
+
+
+def inline_literals(text: str) -> list:
+    """The values an expression spells out inline, in order, deduplicated."""
+    payloads = FROM_JSON.findall(text)
+    found = INLINE_LITERAL.findall(" ".join(payloads) if payloads else text)
+    return list(dict.fromkeys(found))
 
 
 def matrix_legs(job: dict) -> list:
@@ -74,7 +84,7 @@ def matrix_legs(job: dict) -> list:
         if isinstance(value, list):
             candidates = [str(v) for v in value if isinstance(v, (str, int, float))]
         else:
-            candidates = INLINE_LITERAL.findall(str(value))
+            candidates = inline_literals(str(value))
         if not candidates:
             continue
         keys.append(key)
