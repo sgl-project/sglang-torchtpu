@@ -2,7 +2,7 @@
 
 import unittest
 from array import array
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -14,6 +14,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.utils.common import Range
@@ -231,6 +232,199 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         sender.clear.assert_called_once_with()
         release_kv.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
+
+
+class TestChunkedReqAdmissionAccounting(CustomTestCase):
+    """Admission gates in ``_get_new_batch_prefill_raw``.
+
+    A request that already owns a ``req_pool_idx`` -- a continuing chunked
+    prefill -- must not be charged against ``available_size()``:
+    ``ReqToTokenPool.alloc`` leaves it out of ``need_size`` and its row is not
+    in ``free_slots``, so charging it costs one admission per pass. It must
+    still be charged against ``pp_max_micro_batch_size``, which bounds every
+    member of the micro-batch and does not see the chunk through ``running_bs``
+    (``self.chunked_req`` is deliberately excluded from ``running_batch``).
+    """
+
+    NO_CHUNK = "none"
+    CHUNK_CONTINUES = "continues"  # add_chunked_req returns the req
+    CHUNK_LAST = "last"  # final chunk: returns None, req is still in the batch
+
+    def _admit(
+        self,
+        *,
+        chunk,
+        available_size,
+        pp_max_micro_batch_size=1024,
+        running_bs=0,
+        disaggregation_mode=DisaggregationMode.NULL,
+        num_waiting=64,
+    ):
+        """Run one prefill pass and report how many new requests were admitted."""
+        adder = MagicMock()
+        adder.can_run_list = []
+        adder.preempt_list = []
+        adder.new_chunked_req = None
+        # Use the real predicate rather than restating it: this is the accounting
+        # under test, and it must agree with ReqToTokenPool.alloc's need_size.
+        adder.num_slot_reusing_reqs = MethodType(
+            PrefillAdder.num_slot_reusing_reqs, adder
+        )
+
+        def add_chunked_req(req):
+            adder.can_run_list.append(req)
+            return None if chunk == self.CHUNK_LAST else req
+
+        def add_new_req(req, **_):
+            adder.can_run_list.append(req)
+            return AddReqResult.CONTINUE
+
+        adder.add_chunked_req.side_effect = add_chunked_req
+        adder.add_one_req.side_effect = add_new_req
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.grammar_manager = MagicMock()
+        scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_priority_preemption = False
+        scheduler.is_hybrid_swa = False
+        scheduler.min_free_slots_delayer = None
+        scheduler.policy = MagicMock()
+        scheduler.chunked_prefill_size = 2048
+        scheduler.enable_dynamic_chunking = False
+        scheduler.tp_worker = MagicMock()
+        scheduler.tp_worker.model_runner.attn_backend = SimpleNamespace()
+        scheduler.tp_worker.model_runner.prefill_aware_swa = False
+        scheduler.page_size = 1
+        scheduler.tree_cache = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        # Real available_size() so get_num_allocatable_reqs is exercised, not mocked.
+        scheduler.req_to_token_pool = SimpleNamespace(
+            mamba_allocator=None,
+            available_size=lambda: available_size,
+        )
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=0.5)
+        scheduler.max_prefill_tokens = 2048
+        scheduler.is_mixed_chunk = False
+        scheduler.priority_scheduling_preemption_threshold = 0
+        scheduler.max_prefill_bs = 0
+        scheduler.max_running_requests = 1024
+        scheduler.prefill_delayer = None
+        scheduler.dllm_config = None
+        scheduler.enable_lora = False
+        scheduler.disaggregation_mode = disaggregation_mode
+        scheduler.enable_hicache_storage = False
+        scheduler.truncation_align_size = None
+        scheduler.model_config = MagicMock()
+        scheduler.enable_overlap = True
+        scheduler.spec_algorithm = MagicMock()
+        scheduler.enable_priority_scheduling = False
+        scheduler.server_args = MagicMock()
+        scheduler.load_inquirer = MagicMock()
+        scheduler.load_inquirer._get_num_pending_tokens.return_value = 0
+
+        running_batch = MagicMock()
+        running_batch.reqs = [MagicMock() for _ in range(running_bs)]
+        running_batch.batch_is_full = False
+        running_batch.is_empty.return_value = running_bs == 0
+
+        if chunk == self.NO_CHUNK:
+            scheduler.chunked_req = None
+        else:
+            chunked_req = MagicMock()
+            # The row this request already owns -- the whole point of the gate.
+            chunked_req.req_pool_idx = 3
+            chunked_req.inflight_middle_chunks = 0
+            chunked_req.extend_range = SimpleNamespace(length=128)
+            scheduler.chunked_req = chunked_req
+
+        waiting_reqs = []
+        for _ in range(num_waiting):
+            req = MagicMock()
+            req.req_pool_idx = None  # a fresh request draws a new row
+            waiting_reqs.append(req)
+        scheduler.waiting_queue = list(waiting_reqs)
+
+        with (
+            patch("sglang.srt.managers.scheduler.PrefillAdder", return_value=adder),
+            patch("sglang.srt.managers.scheduler.get_memory") as get_memory,
+            patch("sglang.srt.managers.scheduler.get_schedule") as get_schedule,
+            patch("sglang.srt.managers.scheduler.get_parallel") as get_parallel,
+            patch(
+                "sglang.srt.managers.scheduler.ScheduleBatch.init_new",
+                return_value=MagicMock(),
+            ),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+            patch(
+                "sglang.srt.managers.scheduler.PrefillStats.from_adder",
+                return_value=MagicMock(),
+            ),
+        ):
+            get_memory.return_value.enable_flexkv = False
+            get_schedule.return_value.prefill_max_requests = None
+            get_parallel.return_value.pp_max_micro_batch_size = pp_max_micro_batch_size
+            Scheduler._get_new_batch_prefill_raw(
+                scheduler,
+                prefill_delayer_single_pass=None,
+                running_batch=running_batch,
+            )
+
+        return adder.add_one_req.call_count, running_batch, adder
+
+    def test_continuing_chunk_does_not_consume_a_new_request_slot(self):
+        # The chunk holds row 3 already, so all 15 free rows stay available.
+        admitted, running_batch, adder = self._admit(
+            chunk=self.CHUNK_CONTINUES, available_size=15
+        )
+        self.assertEqual(admitted, 15)
+        self.assertIs(adder.can_run_list[0], adder.add_chunked_req.call_args[0][0])
+        self.assertTrue(running_batch.batch_is_full)
+
+    def test_final_chunk_still_holds_its_row(self):
+        # add_chunked_req returns None on the last chunk, clearing
+        # self.chunked_req, but the request is in can_run_list and still owns
+        # its row -- accounting must key off req_pool_idx, not chunked_req.
+        admitted, _, _ = self._admit(chunk=self.CHUNK_LAST, available_size=15)
+        self.assertEqual(admitted, 15)
+
+    def test_no_chunk_charges_every_admitted_request(self):
+        # Nothing is reused, so the pool budget is spent entirely on new reqs.
+        admitted, _, _ = self._admit(chunk=self.NO_CHUNK, available_size=15)
+        self.assertEqual(admitted, 15)
+
+    def test_disagg_prefill_gate_also_excludes_the_chunk(self):
+        # The PREFILL-only gate compares against available_size() directly and
+        # is strictly tighter than the general gate on a prefill node, so it
+        # has to make the same exclusion or the fix is a no-op there.
+        admitted, _, _ = self._admit(
+            chunk=self.CHUNK_CONTINUES,
+            available_size=15,
+            disaggregation_mode=DisaggregationMode.PREFILL,
+        )
+        self.assertEqual(admitted, 15)
+
+    def test_chunk_still_counts_against_the_micro_batch_cap(self):
+        # pp_max_micro_batch_size bounds the whole micro-batch. With 7 running
+        # plus the chunk, the cap of 8 is already met: admit nothing, even
+        # though the request pool has room.
+        admitted, running_batch, _ = self._admit(
+            chunk=self.CHUNK_CONTINUES,
+            available_size=1024,
+            pp_max_micro_batch_size=8,
+            running_bs=7,
+        )
+        self.assertEqual(admitted, 0)
+        self.assertTrue(running_batch.batch_is_full)
+
+    def test_micro_batch_cap_is_not_relaxed_without_a_chunk(self):
+        # Same cap, no chunk: the eighth slot is genuinely free.
+        admitted, _, _ = self._admit(
+            chunk=self.NO_CHUNK,
+            available_size=1024,
+            pp_max_micro_batch_size=8,
+            running_bs=7,
+        )
+        self.assertEqual(admitted, 1)
 
 
 if __name__ == "__main__":

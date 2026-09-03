@@ -622,6 +622,15 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+    def num_slot_reusing_reqs(self) -> int:
+        """Requests already in ``can_run_list`` that own a request-pool row.
+
+        Mirrors the predicate ``ReqToTokenPool.alloc`` uses to compute
+        ``need_size``, so the scheduler's admission gates can subtract exactly
+        the requests that will not draw from ``free_slots``.
+        """
+        return sum(1 for req in self.can_run_list if req.req_pool_idx is not None)
+
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
 
@@ -1227,6 +1236,12 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # Both caps below bound the composition of the prefill batch, not the
+        # request pool, so they count every member of can_run_list -- including
+        # a continuing chunk, which is forwarded in this batch like any other
+        # request. This is deliberately unlike the scheduler's slot gate, which
+        # subtracts num_slot_reusing_reqs() because those rows are already held.
+
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.

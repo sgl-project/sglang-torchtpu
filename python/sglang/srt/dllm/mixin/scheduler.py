@@ -309,10 +309,17 @@ class SchedulerDllmMixin:
     ) -> AddReqResult:
         """Process incoming DLLM requests with resource allocation and preemption."""
         res = AddReqResult.CONTINUE
+        # Staging reqs were already appended to can_run_list by
+        # process_dllm_staging_reqs and keep the request-pool rows they own, so
+        # they must not be charged against the rows available to new requests.
+        num_reused_reqs = adder.num_slot_reusing_reqs()
         for req in reqs:
             # Check if batch is full
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_new_reqs = len(adder.can_run_list) - num_reused_reqs
+            if num_new_reqs >= self.get_num_allocatable_reqs(
+                running_bs, num_reused_reqs
+            ):
                 running_batch.batch_is_full = True
 
             # Try preemption if batch is full

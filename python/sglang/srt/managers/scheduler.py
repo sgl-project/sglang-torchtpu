@@ -3279,8 +3279,22 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
-    def get_num_allocatable_reqs(self, running_bs):
-        res = get_parallel().pp_max_micro_batch_size - running_bs
+    def get_num_allocatable_reqs(self, running_bs, num_reused_reqs: int = 0):
+        """Number of *new* requests that may still be admitted this pass.
+
+        ``num_reused_reqs`` is how many requests already in the adder hold a
+        ``req_pool_idx`` (a continuing chunked prefill, or a DLLM staging req).
+        The two budgets treat them differently:
+
+        - Concurrency: they are members of the micro-batch, so they consume
+          ``pp_max_micro_batch_size`` even though they are not in ``running_bs``
+          (``self.chunked_req`` is excluded from ``running_batch`` on purpose).
+        - Request-pool rows: they keep the row they already own, so
+          ``ReqToTokenPool.alloc`` leaves them out of ``need_size`` and their
+          rows are not in ``free_slots``. ``available_size()`` is therefore
+          already the number of rows available to *new* requests.
+        """
+        res = get_parallel().pp_max_micro_batch_size - running_bs - num_reused_reqs
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
@@ -3347,8 +3361,9 @@ class Scheduler(
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
+        # A continuing chunk keeps the req_to_token_pool row it already owns
+        # (cache_unfinished_req never frees req_pool_idx), so that row is not in
+        # free_slots and num_allocatable_reqs may legitimately be 0 here.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
@@ -3406,6 +3421,9 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+        # A continuing chunk keeps the request-pool row it already owns, so it
+        # must not be charged against the rows available to new requests.
+        num_reused_reqs = adder.num_slot_reusing_reqs()
 
         if self.enable_lora:
             running_loras = {
@@ -3429,12 +3447,15 @@ class Scheduler(
                 continue
 
             running_bs = len(running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            num_new_reqs = len(adder.can_run_list) - num_reused_reqs
+            if num_new_reqs >= self.get_num_allocatable_reqs(
+                running_bs, num_reused_reqs
+            ):
                 running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+                if num_new_reqs >= self.req_to_token_pool.available_size():
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
