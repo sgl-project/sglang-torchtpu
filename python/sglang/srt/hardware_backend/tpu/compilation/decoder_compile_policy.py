@@ -1056,6 +1056,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """
         return
 
+    @property
+    def _model_is_mrope(self) -> bool:
+        return self.model_runner.model_config.model_is_mrope
+
     def _make_dummy_forward_batch(
         self,
         num_tokens: int,
@@ -1072,7 +1076,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         # MROPE runtime positions are real [3, num_tokens] tensors. Keep strides
         # identical here so Dynamo does not guard-miss after precompile.
         mrope_positions = None
-        if getattr(self.model_runner, "model_is_mrope", False):
+        if self._model_is_mrope:
             mrope_positions = layout.positions.unsqueeze(0).expand(3, -1).contiguous()
 
         sampling_info = (
@@ -1215,10 +1219,6 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     def _num_deepstack(self) -> int:
         model = getattr(self.model_runner, "model", None)
         return int(getattr(model, "num_deepstack_embeddings", 0) or 0)
-
-    @property
-    def _model_is_mrope(self) -> bool:
-        return bool(getattr(self.model_runner, "model_is_mrope", False))
 
     def _uses_input_embeds(self, target: Any) -> bool:
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
