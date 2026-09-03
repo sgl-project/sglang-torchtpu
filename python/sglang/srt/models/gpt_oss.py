@@ -81,6 +81,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_device,
     is_cpu,
     is_cuda,
     is_flashinfer_available,
@@ -1023,11 +1024,10 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
-        # Use the model's existing parameter device (handles TPU as well as CUDA).
-        target_device = next(self.parameters()).device
+        weight_device = next(iter(params_dict.values())).device
 
         for name, weight in weights:
-            weight = weight.to(target_device)
+            weight = weight.to(weight_device)
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1424,12 +1424,9 @@ def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
 
     original_device = w_blocks.device
 
-    # Stage on the device that's actually available (handles TPU + CPU paths;
-    # ``dequant_mxfp4`` is hardware-agnostic but the original upstream version
-    # assumed CUDA. Keep CUDA when present, fall through otherwise.)
-    if torch.cuda.is_available():
-        w_blocks = w_blocks.cuda()
-        w_scales = w_scales.cuda()
+    device = get_device()
+    w_blocks = w_blocks.to(device)
+    w_scales = w_scales.to(device)
 
     w_bf16 = dequant_mxfp4(w_block=w_blocks, w_scale=w_scales, out_dtype=torch.bfloat16)
     w_bf16 = w_bf16.transpose(-2, -1).contiguous()
