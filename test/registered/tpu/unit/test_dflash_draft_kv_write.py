@@ -184,7 +184,7 @@ def _shape_key(**kwargs: torch.Tensor | None) -> tuple[object, ...]:
     )
 
 
-def _compiled(fn, *, draft_model: nn.Module, kv_pool: object, **statics: int):
+def _compiled(fn, *, draft_model: nn.Module, kv_pool: object, **static_args: int):
     """Compile a write path the way DFlashSpecDecodeCompilePolicyMixin does.
 
     draft_model, kv_pool and the static ints are bound into a closure rather
@@ -195,7 +195,7 @@ def _compiled(fn, *, draft_model: nn.Module, kv_pool: object, **statics: int):
       fn: dflash_write_draft_kv or dflash_write_draft_kv_ref.
       draft_model: Draft model whose params and buffers get lifted.
       kv_pool: Fused TPU KV pool; the one mutable input, copied back per call.
-      **statics: Non-tensor kwargs of fn, e.g. max_num_reqs on the fused path.
+      **static_args: Non-tensor kwargs of fn, e.g. max_num_reqs on the fused path.
 
     Returns:
       The compiled callable, taking fn's remaining tensor kwargs.
@@ -205,7 +205,7 @@ def _compiled(fn, *, draft_model: nn.Module, kv_pool: object, **statics: int):
     )
 
     def bound(**kwargs: torch.Tensor | None) -> None:
-        fn(draft_model=draft_model, kv_pool=kv_pool, **statics, **kwargs)
+        fn(draft_model=draft_model, kv_pool=kv_pool, **static_args, **kwargs)
 
     return direct_compile(
         torch.no_grad()(bound),

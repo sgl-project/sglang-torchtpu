@@ -244,7 +244,7 @@ def _create_dflash_worker_for_tpu(
         ),
         prefill_attention_backend_str="torch_native",
         attn_backend=_MockAttnBackend(),
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token_table),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token_table, size=8),
         decode_cuda_graph_runner=None,
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         server_args=SimpleNamespace(enable_lora=False),
