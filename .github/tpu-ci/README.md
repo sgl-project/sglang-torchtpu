@@ -183,6 +183,16 @@ The nightly single-host jobs are ONE JOB PER TEST FILE (`discover_tests.py` rend
 matrix), so a red job names its test directly — the dashboard contract. Kueue queues
 them against the nightly lane's single-host quota, and they all reuse one image build.
 
+**Two names per job, and they are not interchangeable.** GitHub renders a called job as
+`<caller job name> / <called job name>`, so the stage workflow's job carries the compact
+STAGE TAG (`single-host`, `multi-host`, `accuracy`, `perf`, `pd-sh-gpt-120b`, …) and
+passes the test it runs as `display_name` to `_tpu-test.yml`. A check therefore ENDS with
+the test — `feature-validation / single-host / test_diffusion_wan22_ti2v_5b`, not a
+truncated tag followed by the word `test`. Separately, `run_name` names only Kubernetes
+objects (pods are `tpu-ci-<run_name>-<rand>-slice-<idx>`, capped at 63 chars), so it stays
+short and DNS-safe and never repeats the `tpu` the prefix already carries. Neither name is
+a dashboard key: series identity is the metric `id`.
+
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict
 registered to `nightly-tpu-multihost` — discovery groups it automatically, and an identical

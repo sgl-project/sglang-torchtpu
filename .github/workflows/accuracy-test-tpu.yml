@@ -78,14 +78,30 @@ jobs:
       # A broken benchmark must not cancel the others' scores.
       fail-fast: false
       matrix:
-        # One suite (= one file, one job, one slice) per benchmark. The next
-        # model adds its suites here and a choice above; selection stays in the
-        # job-level `if` while a single model is the only single-host entrant.
-        suite: ${{ fromJSON('["nightly-tpu-accuracy-gpt-oss-120b-aime",
-          "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
-          "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",
-          "nightly-tpu-accuracy-gpt-oss-120b-mmlupro"]') }}
-    name: ${{ matrix.suite }}
+        # One suite (= one file, one job, one slice) per benchmark, each paired
+        # with the k8s name its pods get. Suites stay spelled out: the pr-gate
+        # lint (test_tpu_dashboard_contract.py) greps this file for the literal
+        # suite of every nightly-accuracy registration. The next model adds its
+        # legs here and a choice above; selection stays in the job-level `if`
+        # while a single model is the only single-host entrant.
+        #
+        # run_name only names Kubernetes objects -- pods are
+        # tpu-ci-<run_name>-<rand>-slice-<idx> against a 63-char cap, and the
+        # suite would spend four of those on a "tpu" that "tpu-ci-" already
+        # carries. Cosmetic: the dashboard keys off the metric `id`, not this.
+        include:
+          - suite: nightly-tpu-accuracy-gpt-oss-120b-aime
+            run_name: nightly-accuracy-gpt-oss-120b-aime
+          - suite: nightly-tpu-accuracy-gpt-oss-120b-gpqa
+            run_name: nightly-accuracy-gpt-oss-120b-gpqa
+          - suite: nightly-tpu-accuracy-gpt-oss-120b-gsm8k
+            run_name: nightly-accuracy-gpt-oss-120b-gsm8k
+          - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
+            run_name: nightly-accuracy-gpt-oss-120b-mmlupro
+    # A check reads "<this name> / <the called job's name>", so the stage tag
+    # goes here and the suite in display_name -- what a red check ends with is
+    # the eval that failed.
+    name: accuracy
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -93,6 +109,8 @@ jobs:
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}
+      display_name: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights.
       weights_pvc: model-weights-rox
@@ -142,11 +160,12 @@ jobs:
       fail-fast: false
       matrix:
         group: ${{ fromJSON(needs.discover-multihost.outputs.groups) }}
-    name: ${{ matrix.group.name }}
+    name: accuracy-multihost
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.group.name }}
       lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}

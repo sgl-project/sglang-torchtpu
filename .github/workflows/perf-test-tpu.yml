@@ -76,7 +76,9 @@ jobs:
         # next one adds a choice above and a branch here.
         suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-perf-gpt-oss-120b"]'))
                 || fromJSON('["nightly-tpu-perf-gpt-oss-120b"]') }}
-    name: ${{ matrix.suite }}
+    # A check reads "<this name> / <the called job's name>"; the suite lands in
+    # display_name so the check ends with the perf gate that ran.
+    name: perf
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -84,6 +86,7 @@ jobs:
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}
+      display_name: ${{ matrix.suite }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights; harmless for the
       # model that pulls from HF instead.
