@@ -813,6 +813,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 ):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
+                # This becomes a compiled graph input. XLA cannot handle its storage
+                # offset changing between calls, so clone it. See
+                # https://github.com/google-pytorch/torch_tpu/issues/3370 for details.
+                if _is_tpu:
+                    forward_batch.out_cache_loc = forward_batch.out_cache_loc.clone()
                 spec_info.hidden_states = hidden_states
 
                 canary_index_ctx = (

@@ -130,6 +130,50 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
 
+    @patch("sglang.srt.speculative.eagle_worker_v2._is_tpu", True)
+    def test_tpu_draft_owns_per_step_cache_loc(self):
+        worker = _make_worker(num_steps=3, num_draft_tokens=4)
+        worker.hot_token_id = None
+        worker.index_share_for_mtp_iteration = False
+        worker.seed_dsa_topk_from_draft_extend = False
+        worker.draft_attn_backend = SimpleNamespace(attn_backends=[None, None])
+        worker._rebuild_topk1_chain_buffers()
+
+        observed_cache_locs = []
+
+        def draft_forward(forward_batch):
+            observed_cache_locs.append(forward_batch.out_cache_loc)
+            return SimpleNamespace(
+                logits_output=SimpleNamespace(
+                    next_token_logits=torch.zeros((1, 2), device=DEVICE),
+                    hidden_states=forward_batch.spec_info.hidden_states,
+                )
+            )
+
+        worker.draft_runner = SimpleNamespace(
+            canary_manager=None,
+            forward=draft_forward,
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"])
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            input_ids=None,
+            out_cache_loc=torch.arange(3, device=DEVICE),
+            positions=torch.zeros(1, dtype=torch.long, device=DEVICE),
+            spec_info=SimpleNamespace(
+                topk_p=torch.ones((1, 1), device=DEVICE),
+                topk_index=torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
+                hidden_states=torch.zeros((1, 2), device=DEVICE),
+            ),
+        )
+
+        worker.draft_forward(forward_batch)
+
+        self.assertEqual([loc.item() for loc in observed_cache_locs], [0, 1])
+        self.assertTrue(all(loc._base is None for loc in observed_cache_locs))
+
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
     def test_fused_steps_bypass_direct_tracer(self):
