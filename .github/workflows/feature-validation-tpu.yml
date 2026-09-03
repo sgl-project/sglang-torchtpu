@@ -10,6 +10,7 @@
 #                     GROUPS them by launch spec; one JobSet per group (launch
 #                     once, rank-0 runs the group's files).
 #   * pd-*         -> static P/D disaggregation gates (2 engines per job).
+#   * static exec  -> no server, every host runs the file (exec mode).
 # Every job runs in the `nightly` lane (topology.yaml) and maps to exactly ONE
 # test file, so a red job names its test (the dashboard contract).
 name: Feature Validation (TPU)
@@ -30,6 +31,7 @@ on:
         options:
           - all
           - mh
+          - diffusion-mh-collectives
           - pd-mh-gpt-120b
           - pd-mh-gpt-120b-pc-offload
           - pd-mh-gpt-120b-spec
@@ -90,6 +92,7 @@ jobs:
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
       pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
       pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
+      diffusion_mh_collectives: ${{ steps.tests.outputs.diffusion_mh_collectives }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,6 +107,7 @@ jobs:
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
+          echo "diffusion_mh_collectives=$($discover_files --entry test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py)" >> "$GITHUB_OUTPUT"
 
   single-host:
     needs: [build, discover-tests]
@@ -308,6 +312,28 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
       weights_pvc: model-weights-rox
       run_name: pd-mh-gpt-120b-pc-offload-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # tpu_dist collectives across a 2x2x2 slice. No server: exec mode, because the
+  # file spawns each host's ranks itself and a launch group runs it on rank 0 alone.
+  diffusion-mh-collectives:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","diffusion-mh-collectives"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
+      # Names the dashboard row and the TIMINGS record.
+      files: test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.diffusion_mh_collectives)[0].run_name }}
     permissions:
       contents: read
       id-token: write

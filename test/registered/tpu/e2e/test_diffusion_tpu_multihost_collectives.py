@@ -12,9 +12,16 @@ import torch.multiprocessing as mp
 
 from sglang.test.ci.ci_register import register_tpu_ci
 
-register_tpu_ci(est_time=600, suite="nightly-tpu-multihost", nightly=True)
+# Hand-wired in exec mode (diffusion-mh-collectives): every host runs this file,
+# which a MULTIHOST_LAUNCH group cannot do.
+register_tpu_ci(
+    est_time=600,
+    suite="tpu-integration",
+    nightly=True,
+    labels=["multihost", "diffusion", "collectives"],
+)
 
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 DIST_PORT = 10011
 # tpu7x: 4 chips per host, 2 cores per chip.
@@ -89,7 +96,11 @@ class TestTpuDistCollectivesMultihost(CustomTestCase):
     def test_collectives_across_the_slice(self):
         hosts = _slice_hosts()
         if len(hosts) < 2:
-            self.skipTest(f"needs a multi-host slice, TPU_WORKER_HOSTNAMES={hosts}")
+            # A skip is exit 0: in CI that is a green job that measured nothing.
+            message = f"needs a multi-host slice, TPU_WORKER_HOSTNAMES={hosts}"
+            if is_in_ci():
+                self.fail(message)
+            self.skipTest(message)
         node_rank = int(os.environ.get("TPU_WORKER_ID", "0"))
 
         ctx = mp.get_context("spawn")

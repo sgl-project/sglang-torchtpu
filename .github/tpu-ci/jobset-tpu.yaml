@@ -108,11 +108,24 @@ ${WEIGHTS_VOLUME}
                       # Exec mode (render_jobset.py --exec): every host runs the same
                       # command; pod exit codes gate the JobSet. Empty unless --exec.
                       if [ -n "${EXEC_CMD}" ]; then
+                        # Name the test before anything can fail, as both other modes do.
+                        echo "== test files: ${TEST_FILES} =="
+                        t0=$SECONDS
                         ${EXEC_CMD}
                         rc=$?
                         # Teardown SIGTERMs surviving workers; rank-0 gates real failures.
                         if [ "$RANK" != "0" ] && [ "$rc" = 143 ]; then
                           echo "worker rank=$RANK: SIGTERM during teardown; success"; rc=0
+                        fi
+                        # Per-file verdict in TIMINGS format, rank 0 only: every pod runs
+                        # the same command, and N records would be N rows for one test.
+                        if [ "$RANK" = "0" ] && [ -n "${TEST_FILES}" ]; then
+                          passed=true
+                          [ "$rc" -eq 0 ] || passed=false
+                          echo "========== TIMINGS BEGIN =========="
+                          printf '{"file": "%s", "passed": %s, "elapsed": %s}\n' \
+                            "${TEST_FILES}" "$passed" "$((SECONDS - t0))"
+                          echo "========== TIMINGS END =========="
                         fi
                         exit $rc
                       fi

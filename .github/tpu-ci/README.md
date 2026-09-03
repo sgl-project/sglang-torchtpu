@@ -100,6 +100,12 @@ and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a fil
 `MULTIHOST_LAUNCH` dict (+ a recipe) registered to `nightly-tpu-multihost` — discovery
 picks it up and groups it automatically; identical setup joins an existing group's server.
 
+A test with **no server that every host must run** (a collectives probe spawning its
+own ranks) fits neither, since a launch group runs the files on rank 0 alone. That
+shape is `--exec`: register it to `tpu-integration` and hand-wire a job with `files:`
+(see `diffusion-mh-collectives` in `feature-validation-tpu.yml`). Registered to
+`nightly-tpu-multihost` instead, discovery drops it and the pr-gate lint reds the PR.
+
 ## Pipelines
 
 ### Nightly — `nightly-test-tpu.yml`
@@ -542,6 +548,9 @@ the job. Keep that line ahead of anything that can fail.
 slices announces the files; only the prefill leader emits the TIMINGS record,
 because the other three run the same command but do not carry the verdict, and
 four records would be four duplicate rows for one test.
+
+**Exec mode emits both markers too, and needs the same `files` input.** `--exec`
+without `--files` runs, but never reaches the dashboard.
 
 **A dispatch-only workflow earns no history row.** Ingestion covers scheduled runs
 plus `update-dashboard` dispatches on main, so a test that lives solely in
