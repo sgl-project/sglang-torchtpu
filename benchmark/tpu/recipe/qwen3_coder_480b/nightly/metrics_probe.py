@@ -32,6 +32,7 @@ from typing import Dict, List, Optional
 _COUNTERS = (
     "sglang:prompt_tokens_total",
     "sglang:generation_tokens_total",
+    "sglang:spec_verify_calls_total",
     "sglang:cached_tokens_total",  # prefix-cache hits
     "sglang:num_requests_total",
     "sglang:num_aborted_requests_total",
@@ -161,6 +162,11 @@ def _snapshot(url: str, timeout: int) -> Dict:
                     "disaggregation_mode",
                     "enable_metrics",
                     "enable_cache_report",
+                    "speculative_algorithm",
+                    "speculative_draft_model_path",
+                    "speculative_num_steps",
+                    "speculative_eagle_topk",
+                    "speculative_num_draft_tokens",
                 )
                 if key in info
             }
@@ -174,6 +180,23 @@ def _snapshot(url: str, timeout: int) -> Dict:
                     )
                     if key in first
                 }
+            if isinstance(states, list):
+                record["server"]["scheduler_states"] = [
+                    {
+                        "scheduler_index": index,
+                        **{
+                            key: state.get(key)
+                            for key in (
+                                "effective_max_running_requests_per_dp",
+                                "avg_spec_accept_length",
+                                "waiting_queue_len",
+                            )
+                            if key in state
+                        },
+                    }
+                    for index, state in enumerate(states)
+                    if isinstance(state, dict)
+                ]
     return record
 
 
@@ -232,6 +255,38 @@ def _check(delta: Dict, pre: Dict, post: Dict, args) -> List[str]:
                 "none -- prefixes are being evicted and then recomputed rather "
                 "than reloaded"
             )
+
+    if server.get("speculative_algorithm"):
+        verify_calls = counters.get("sglang:spec_verify_calls_total", 0.0)
+        delta["derived"]["spec_verify_calls"] = verify_calls
+        if verify_calls <= 0:
+            warnings.append(
+                "speculative decoding is configured but spec_verify_calls_total "
+                "did not increase during this leg -- the workload silently ran "
+                "without draft verification"
+            )
+
+        states = server.get("scheduler_states") or []
+        accept_lengths = [
+            state.get("avg_spec_accept_length")
+            for state in states
+            if state.get("avg_spec_accept_length") is not None
+        ]
+        delta["derived"]["spec_accept_length_by_scheduler"] = accept_lengths
+        if len(accept_lengths) != len(states) or not accept_lengths:
+            warnings.append(
+                "speculative decoding is configured but at least one scheduler "
+                "reported no avg_spec_accept_length"
+            )
+        else:
+            min_accept_length = min(float(value) for value in accept_lengths)
+            delta["derived"]["min_spec_accept_length"] = min_accept_length
+            if min_accept_length <= args.min_spec_accept_length:
+                warnings.append(
+                    f"minimum speculative accept length {min_accept_length:.3f} "
+                    f"did not exceed the configured floor "
+                    f"{args.min_spec_accept_length:.3f}"
+                )
 
     retracted = counters.get("sglang:num_retracted_requests_total", 0.0)
     if retracted > 0:
@@ -311,6 +366,14 @@ def main() -> int:
         "the achievable rate depends on rounds per session (~56%% at 3 rounds, "
         "~94%% at 25), so this only catches a cache that is not being reused at "
         "all (default 0.2)",
+    )
+    dif.add_argument(
+        "--min-spec-accept-length",
+        type=float,
+        default=1.0,
+        help="warn unless every scheduler's lifetime speculative accept length "
+        "strictly exceeds this value (default 1.0, which proves that at least "
+        "one draft token was accepted)",
     )
 
     args = ap.parse_args()

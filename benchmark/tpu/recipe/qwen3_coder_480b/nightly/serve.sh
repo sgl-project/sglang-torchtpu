@@ -114,13 +114,24 @@ export DISABLE_RADIX_CACHE=0
 export HICACHE_IO_BACKEND
 export HICACHE_MEM_LAYOUT=page_first_fused
 
+# The shared recipe is non-speculative by default. Its multi-host CI shim opts
+# in by setting DRAFT_MODEL to the draft checkpoint on the weights PVC.
+SPEC_ARGS=""
+if [[ -n "$DRAFT_MODEL" ]]; then
+    SPEC_ARGS="--speculative-algorithm EAGLE3 \
+--speculative-draft-model-path $DRAFT_MODEL \
+--speculative-num-steps $SPECULATIVE_NUM_STEPS \
+--speculative-eagle-topk $SPECULATIVE_EAGLE_TOPK \
+--speculative-num-draft-tokens $SPECULATIVE_NUM_DRAFT_TOKENS"
+fi
+
 # Advertise this pod's cluster IP so the peer engine can reach the bootstrap
 # server and the KV sockets (hostname -i may list several; take the first).
 if [[ "$ROLE" != "colocated" ]]; then
     export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
 fi
 
-export EXTRA_ARGS="$ROLE_ARGS ${EXTRA_ARGS:-}"
+export EXTRA_ARGS="$ROLE_ARGS $SPEC_ARGS ${EXTRA_ARGS:-}"
 
 log_config "$ROLE"
 

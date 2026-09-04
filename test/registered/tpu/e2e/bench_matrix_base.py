@@ -131,6 +131,8 @@ def _print_workload_digest(summary) -> None:
         print(
             f"[workload] {leg.get('tag')} status={leg.get('status')} "
             f"prefix_cache_hit_rate={derived.get('prefix_cache_hit_rate')} "
+            f"min_spec_accept_length={derived.get('min_spec_accept_length')} "
+            f"spec_verify_calls={derived.get('spec_verify_calls')} "
             f"kv_offload_written={derived.get('kv_offload_written_tokens')} "
             f"kv_offload_reloaded={derived.get('kv_offload_reloaded_tokens')} "
             f"output_throughput={metrics.get('output_throughput')}",
@@ -250,6 +252,7 @@ def build_bench_test(
     sweep_timeout_default: int,
     gate_prefix_hits: bool,
     spec_metrics_url_fn=None,
+    spec_contract: dict | None = None,
     metric_namespace: str | None = None,
 ):
     """Return a live-server benchmark TestCase class (cluster-agnostic).
@@ -278,6 +281,10 @@ def build_bench_test(
     spec_metrics_url_fn  base_url -> metrics endpoint of the DECODING engine;
                          non-None declares the recipe claims spec decoding
                          and adds the accept-length gate.
+    spec_contract        expected per-leg EAGLE server configuration and
+                         minimum scheduler accept length. The supported keys
+                         are algorithm, draft_model_suffix, num_steps,
+                         eagle_topk, num_draft_tokens, and min_accept_length.
     metric_namespace     optional prefix for metric names, for files whose
                          legs alone don't disambiguate (the matrix prefixes
                          the workload). None keeps bare leg tags -- an
@@ -507,6 +514,69 @@ def build_bench_test(
                     "decoding never ran during the sweep",
                 )
 
+        if spec_contract is not None:
+
+            def test_spec_decoding_active_and_accepting(self):
+                """Prove every leg ran the requested speculative configuration
+                and every DP scheduler accepted at least one draft token."""
+                expected_fields = {
+                    "speculative_num_steps": spec_contract["num_steps"],
+                    "speculative_eagle_topk": spec_contract["eagle_topk"],
+                    "speculative_num_draft_tokens": spec_contract["num_draft_tokens"],
+                }
+                min_accept_length = float(spec_contract["min_accept_length"])
+                for leg in self._legs():
+                    server_info = leg.get("server_info") or {}
+                    self.assertEqual(
+                        str(server_info.get("speculative_algorithm")).upper(),
+                        str(spec_contract["algorithm"]).upper(),
+                        f"{leg['tag']}: server resolved the wrong speculative "
+                        "algorithm",
+                    )
+                    self.assertTrue(
+                        str(
+                            server_info.get("speculative_draft_model_path", "")
+                        ).endswith(spec_contract["draft_model_suffix"]),
+                        f"{leg['tag']}: wrong or missing speculative draft model",
+                    )
+                    for field, expected in expected_fields.items():
+                        self.assertEqual(
+                            server_info.get(field),
+                            expected,
+                            f"{leg['tag']}: {field} does not match the test contract",
+                        )
+
+                    derived = leg.get("feature_derived") or {}
+                    self.assertGreater(
+                        derived.get("spec_verify_calls") or 0.0,
+                        0.0,
+                        f"{leg['tag']}: spec_verify_calls_total did not increase; "
+                        "the leg ran without speculative verification",
+                    )
+                    accept_lengths = (
+                        derived.get("spec_accept_length_by_scheduler") or []
+                    )
+                    dp_size = int(server_info.get("dp_size") or 0)
+                    self.assertGreater(
+                        dp_size,
+                        0,
+                        f"{leg['tag']}: server_info records no positive dp_size",
+                    )
+                    self.assertEqual(
+                        len(accept_lengths),
+                        dp_size,
+                        f"{leg['tag']}: expected one accept length per DP scheduler "
+                        f"(dp_size={dp_size}), got {accept_lengths}",
+                    )
+                    for scheduler_index, accept_length in enumerate(accept_lengths):
+                        self.assertGreater(
+                            float(accept_length),
+                            min_accept_length,
+                            f"{leg['tag']}: scheduler {scheduler_index} accept "
+                            f"length {accept_length} did not exceed "
+                            f"{min_accept_length}",
+                        )
+
         def test_throughput_recorded(self):
             """Not a performance gate -- proves the numbers the dashboard
             ingests are present and non-zero, then dumps them for it."""
@@ -538,6 +608,38 @@ def build_bench_test(
                         "sglang:num_aborted_requests_total",
                     )
                 )
+                if spec_contract is not None:
+                    features = leg.get("feature_derived") or {}
+                    server_info = leg.get("server_info") or {}
+                    accept_lengths = (
+                        features.get("spec_accept_length_by_scheduler") or []
+                    )
+                    expected_fields = {
+                        "speculative_num_steps": spec_contract["num_steps"],
+                        "speculative_eagle_topk": spec_contract["eagle_topk"],
+                        "speculative_num_draft_tokens": spec_contract[
+                            "num_draft_tokens"
+                        ],
+                    }
+                    clean = clean and (
+                        str(server_info.get("speculative_algorithm")).upper()
+                        == str(spec_contract["algorithm"]).upper()
+                        and str(
+                            server_info.get("speculative_draft_model_path", "")
+                        ).endswith(spec_contract["draft_model_suffix"])
+                        and all(
+                            server_info.get(field) == expected
+                            for field, expected in expected_fields.items()
+                        )
+                        and (features.get("spec_verify_calls") or 0.0) > 0.0
+                        and len(accept_lengths) == int(server_info.get("dp_size") or 0)
+                        and len(accept_lengths) > 0
+                        and all(
+                            float(accept_length)
+                            > float(spec_contract["min_accept_length"])
+                            for accept_length in accept_lengths
+                        )
+                    )
                 if clean:
                     self._dump_leg_metrics(leg)
 

@@ -48,6 +48,12 @@ Read these before comparing two runs. The full *why* for each sits next to the c
 - **One server serves every leg**, sized for the largest concurrency in the sweep;
   the client's semaphore is what varies. Reloading 480 GB per leg would dominate the
   run.
+- **The EAGLE3 multi-host CI launch** uses the matching Qwen3-Coder draft, with
+  3 draft steps, top-k 1, and 4 draft tokens. It is a separate test and launch
+  group from the original non-spec agentic benchmark. The generic recipe stays
+  non-speculative unless `DRAFT_MODEL` is set, so existing hand-run and P/D
+  comparisons do not silently change configuration. Its dashboard series id is
+  `perf-qwen3-coder-480b-agentic-eagle3`, separate from historical non-spec runs.
 - **Profiles time-box the long sessions only** — the normal sessions keep their round
   granularity in every profile:
 
@@ -75,8 +81,9 @@ so an existing renderer works on it as-is. Values this harness computes live in
 - `metrics.cache_report.total_prompt_tokens` is rounds × the first round's estimate,
   not a prompt volume. Its device/host/storage split is meaningful.
 
-Check two things before trusting a number; `metrics_probe.py` raises both as
-`warnings`:
+Check these signals before trusting a number; `metrics_probe.py` raises them as
+`warnings`, and the multi-host CI test gates the prefix-cache and speculative
+signals:
 
 - `feature_derived.prefix_cache_hit_rate` should be close to what the round count
   and the DP count together allow. Each DP rank owns its own radix tree and dispatch
@@ -91,3 +98,12 @@ Check two things before trusting a number; `metrics_probe.py` raises both as
   non-zero on the legs with long sessions. Written-but-not-reloaded means prefixes are evicted and
   recomputed; zero written means the working set fit in HBM and the leg did not
   exercise offload at all.
+- `feature_derived.spec_verify_calls` must increase in every leg, proving the
+  requests traversed speculative verification. The paired
+  `spec_accept_length_by_scheduler` reads every DP scheduler rather than only rank
+  zero. The per-leg cache flush also resets these scheduler metrics, so the values
+  apply to that leg rather than the whole server run. Each must be strictly greater
+  than `MIN_SPEC_ACCEPT_LENGTH` (1.0 by default), proving that at least one draft
+  token was accepted. This intentionally starts at the non-fallback boundary
+  because the trace uses vocabulary-sampled inputs; the 1.90 GSM8K floor is not
+  transferable to this workload.

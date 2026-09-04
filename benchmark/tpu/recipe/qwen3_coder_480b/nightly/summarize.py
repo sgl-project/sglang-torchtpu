@@ -269,6 +269,7 @@ def _markdown(summary: Dict) -> str:
     lines.append(
         f"- features: prefix caching **{features['prefix_caching']}**, "
         f"KV offload **{features['kv_offload']}**, "
+        f"speculative decoding **{features['speculative_decoding']}**, "
         f"chunked prefill **{features['chunked_prefill_per_rank']}/rank**, "
         f"server context length **{features['server_context_len']}**"
     )
@@ -292,15 +293,17 @@ def _markdown(summary: Dict) -> str:
     header = (
         "| mode | conc | long reqs | status | reqs | out tok/s | "
         "prompt tok/s | TTFT p50/p99 ms | ITL p50/p99 ms | prefix hit | "
-        "KV offload w/r (tok) |"
+        "spec accept min | spec verify | KV offload w/r (tok) |"
     )
-    sep = "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|"
+    sep = "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     lines += [header, sep]
     for leg in summary["legs"]:
         metrics = leg.get("metrics") or {}  # bench_serving's keys
         derived = leg.get("derived") or {}  # ours
         features = leg.get("feature_derived") or {}
         hit = features.get("prefix_cache_hit_rate")
+        spec_accept = features.get("min_spec_accept_length")
+        spec_verify = features.get("spec_verify_calls")
         written = features.get("kv_offload_written_tokens")
         reloaded = features.get("kv_offload_reloaded_tokens")
         lines.append(
@@ -314,6 +317,8 @@ def _markdown(summary: Dict) -> str:
             f"| {_fmt(metrics.get('median_itl_ms'), '.1f')}/"
             f"{_fmt(metrics.get('p99_itl_ms'), '.1f')} "
             f"| {(f'{hit:.1%}' if hit is not None else '-')} "
+            f"| {_fmt(spec_accept, '.3f')} "
+            f"| {_fmt(spec_verify, '.0f')} "
             f"| {_fmt(written, '.0f')}/{_fmt(reloaded, '.0f')} |"
         )
     lines.append("")
@@ -382,9 +387,13 @@ def main() -> int:
     # by construction) and fall back to the environment for a run whose every
     # leg died before writing one.
     first_config: Dict = {}
+    first_server_info: Dict = {}
     for leg in legs:
         if leg["config"]:
             first_config = leg["config"]
+        if leg["server_info"]:
+            first_server_info = leg["server_info"]
+        if first_config and first_server_info:
             break
 
     def cfg(key: str, default=None):
@@ -423,6 +432,17 @@ def main() -> int:
                 "server_context_len": cfg("server_context_len", 1048576),
                 "quantization": "fp8",
                 "kv_cache_dtype": "fp8_e4m3",
+                "speculative_decoding": (
+                    first_server_info.get("speculative_algorithm") or "off"
+                ),
+                "speculative_num_steps": first_server_info.get("speculative_num_steps"),
+                "speculative_eagle_topk": first_server_info.get(
+                    "speculative_eagle_topk"
+                ),
+                "speculative_num_draft_tokens": first_server_info.get(
+                    "speculative_num_draft_tokens"
+                ),
+                "min_spec_accept_length": cfg("min_spec_accept_length", 1.0),
             },
             "workload": {
                 "turn_input_tokens": cfg("turn_input_tokens", 4096),

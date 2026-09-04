@@ -25,7 +25,7 @@
 # ============================================================================
 #   model                Qwen3-Coder-480B-A35B-Instruct-FP8
 #   quantization         fp8 weights + fp8_e4m3 KV
-#   parallelism          colocated: tp=16, dp=4  -> attn_tp=4
+#   parallelism          colocated: tp=16, dp=2  -> attn_tp=8
 #                        P/D:       tp=8,  dp=2  -> attn_tp=4  (per engine)
 #   server context len   1048576 ALWAYS
 #   workload             multi-turn agentic, 4k new input tokens + 1k output
@@ -35,6 +35,8 @@
 #   long-request sweep   0, 1, 2, 4 concurrent long-context sessions
 #   chunked prefill      4096 tokens per DP rank (= one round's new input)
 #   features             prefix caching ON, KV offload (HiCache) ON
+#   CI-only feature      the spec multi-host launch shim supplies the matching
+#                        Qwen3 draft (3 steps / topk 1 / 4 tokens)
 #
 # The parallelism, precision, features and server context length are asserted.
 # The workload shape (the four length knobs + chunked prefill) has the contract
@@ -154,6 +156,21 @@ CHUNKED_PREFILL_PER_RANK=${CHUNKED_PREFILL_PER_RANK:-4096}
 # ===== FIXED: features under test =====
 PREFIX_CACHE=1                  # -> --disable-radix-cache is NOT passed
 KV_OFFLOAD=1                    # -> --enable-hierarchical-cache (torch_tpu io)
+
+# Optional EAGLE3 draft. The generic benchmark recipe remains non-speculative
+# unless its caller supplies DRAFT_MODEL; the spec multi-host CI shim does,
+# because speculative decoding is part of that test's contract. Keeping this switch
+# avoids changing the recipe's P/D and hand-run defaults just because the CI
+# launch group gained another feature.
+DRAFT_MODEL=${DRAFT_MODEL:-}
+SPECULATIVE_NUM_STEPS=3
+SPECULATIVE_EAGLE_TOPK=1
+SPECULATIVE_NUM_DRAFT_TOKENS=4
+# The synthetic vocabulary-sampled workload has intentionally low semantic
+# predictability, so its first calibrated gate is the non-fallback boundary:
+# strictly above 1.0 proves that the draft contributed at least one token.
+# Override after enough nightly data exists to ratchet this into a quality floor.
+MIN_SPEC_ACCEPT_LENGTH=${MIN_SPEC_ACCEPT_LENGTH:-1.0}
 
 # ===== FIXED: sweeps =====
 # Concurrency (client-side max in-flight sessions).
@@ -415,6 +432,8 @@ log_config() {
   --- features ---
   prefix_caching         = $([[ "$PREFIX_CACHE" == "1" ]] && echo ENABLED || echo disabled)
   kv_offload (hicache)   = $([[ "$KV_OFFLOAD" == "1" ]] && echo "ENABLED (io=$HICACHE_IO_BACKEND, layout=page_first_fused, host/device ratio=$HICACHE_RATIO)" || echo disabled)
+  speculative decoding   = $([[ -n "$DRAFT_MODEL" ]] && echo "EAGLE3 (draft=$DRAFT_MODEL, steps/topk/draft_tokens=$SPECULATIVE_NUM_STEPS/$SPECULATIVE_EAGLE_TOPK/$SPECULATIVE_NUM_DRAFT_TOKENS)" || echo disabled)
+  min spec accept length = > $MIN_SPEC_ACCEPT_LENGTH (every scheduler)
   chunked_prefill        = ENABLED
   metrics endpoint       = $([[ "$ENABLE_METRICS" == "1" ]] && echo ENABLED || echo disabled)
   cache report           = $([[ "$ENABLE_CACHE_REPORT" == "1" ]] && echo ENABLED || echo disabled)

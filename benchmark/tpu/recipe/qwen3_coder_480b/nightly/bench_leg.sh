@@ -252,7 +252,9 @@ fi
     --post "$OUTPUT_DIR/${TAG}.metrics.post.json" \
     --out "$OUTPUT_DIR/${TAG}.metrics.delta.json" \
     --expect-context "$expect_context" \
-    --expect-concurrency "$BS" 2>&1 | tee -a "$BENCH_LOG" || true
+    --expect-concurrency "$BS" \
+    --min-spec-accept-length "$MIN_SPEC_ACCEPT_LENGTH" \
+    2>&1 | tee -a "$BENCH_LOG" || true
 
 # Repro record, same shape as bench_serving.sh's (kind=bench) so the existing
 # dashboard ingest works unchanged.
@@ -286,6 +288,7 @@ bench_argv_json=$("$PYTHON" -c 'import json,sys; print(json.dumps(sys.argv[1:]))
     --set prefix_cache="$PREFIX_CACHE" \
     --set kv_offload="$KV_OFFLOAD" \
     --set hicache_ratio="$HICACHE_RATIO" \
+    --set min_spec_accept_length="$MIN_SPEC_ACCEPT_LENGTH" \
     --set seed="$SEED" \
     --set max_leg_seconds="$MAX_LEG_SECONDS" \
     --set status="$(cat "$STATUS_FILE")" \
