@@ -667,17 +667,6 @@ class ModelRunner:
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
 
-        # The final output head is now stable: post-load transforms and LoRA
-        # may replace or wrap it. Negotiate distributed TopK before any TPU
-        # graph can trace the logits path; draft models initialize separately
-        # after borrowing the target LM head.
-        if _is_tpu and not self.is_draft_worker:
-            from sglang.srt.hardware_backend.tpu.sampler import (
-                initialize_distributed_top_k_for_model,
-            )
-
-            initialize_distributed_top_k_for_model(self.model)
-
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver

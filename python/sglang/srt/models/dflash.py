@@ -14,7 +14,6 @@ from torch import nn
 
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed import (
-    get_attn_tp_group,
     get_tp_group,
     model_parallel_is_initialized,
 )
@@ -47,33 +46,6 @@ _is_tpu = is_tpu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
-
-
-def _get_dflash_lm_head_tp_group(lm_head):
-    """Return the LM head's actual TP group, or None for a replicated head."""
-
-    head_tp_size = int(getattr(lm_head, "tp_size", 1))
-    head_is_sharded = (
-        bool(getattr(lm_head, "enable_tp", head_tp_size > 1)) and head_tp_size > 1
-    )
-    if not head_is_sharded:
-        return None
-    if not model_parallel_is_initialized():
-        raise RuntimeError(
-            "DFLASH received a sharded target LM head before model-parallel "
-            "initialization"
-        )
-    tp_group = (
-        get_attn_tp_group()
-        if getattr(lm_head, "use_attn_tp_group", False)
-        else get_tp_group()
-    )
-    if int(tp_group.world_size) != head_tp_size:
-        raise RuntimeError(
-            "DFLASH target LM-head TP group does not match the head: "
-            f"group_size={int(tp_group.world_size)}, head_tp_size={head_tp_size}"
-        )
-    return tp_group
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -440,122 +412,6 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
         self.lm_head: nn.Module | None = None
-        self.register_buffer(
-            "_tpu_full_vocab_indices",
-            None,
-            persistent=False,
-        )
-        self._tpu_distributed_top_k_config = None
-        self._tpu_distributed_top_k_init_key = None
-        self._tpu_distributed_top_k_initialized = False
-        self._tpu_full_vocab_group = None
-
-    def set_lm_head_from_target(
-        self, lm_head: nn.Module, *, target_config=None
-    ) -> None:
-        """Install the target LM head and prepare TPU sampling contracts."""
-
-        if not _is_tpu:
-            self.lm_head = lm_head
-            return
-
-        tp_group = _get_dflash_lm_head_tp_group(lm_head)
-        expected_dtype = (
-            getattr(target_config, "output_dtype", None)
-            if target_config is not None
-            else getattr(lm_head.weight, "dtype", None)
-        )
-        group_signature = (
-            int(getattr(tp_group, "world_size", 1)) if tp_group is not None else 1,
-            getattr(tp_group, "rank_in_group", 0) if tp_group is not None else 0,
-            tuple(getattr(tp_group, "ranks", ())) if tp_group is not None else (),
-        )
-        init_key = (id(lm_head), group_signature, expected_dtype)
-        if getattr(self, "_tpu_distributed_top_k_initialized", False):
-            if getattr(self, "_tpu_distributed_top_k_init_key", None) != init_key:
-                raise RuntimeError(
-                    "DFLASH distributed TPU TopK cannot be reinitialized for a "
-                    "different LM head, group, or dtype"
-                )
-            return
-
-        mapping = (
-            lm_head.get_sharded_to_full_mapping()
-            if hasattr(lm_head, "get_sharded_to_full_mapping")
-            else None
-        )
-        if mapping is None and tp_group is not None:
-            raise RuntimeError(
-                "DFLASH TPU full-vocabulary fallback requires a sharded-to-full "
-                "LM-head mapping"
-            )
-        if mapping is None:
-            shard = getattr(lm_head, "shard_indices", None)
-            if shard is None:
-                mapping = list(range(int(lm_head.num_embeddings)))
-            else:
-                mapping = list(range(int(shard.num_org_elements)))
-                added_start = int(shard.num_org_elements_padded)
-                mapping.extend(
-                    range(added_start, added_start + int(shard.num_added_elements))
-                )
-        self._tpu_full_vocab_indices = torch.tensor(
-            mapping[: int(lm_head.num_embeddings)],
-            dtype=torch.long,
-            device=lm_head.weight.device,
-        )
-        self.lm_head = lm_head
-        self._tpu_full_vocab_group = tp_group
-
-        config = None
-        fallback_reason = "the target LM head is replicated"
-        if tp_group is not None:
-            from sglang.srt.hardware_backend.tpu.top_k import (
-                negotiate_pallas_distributed_top_k_config,
-                pallas_distributed_top_k_config_matches,
-                register_tpu_top_k_ops,
-            )
-
-            if target_config is not None:
-                if not pallas_distributed_top_k_config_matches(
-                    target_config,
-                    lm_head,
-                    group=tp_group,
-                    expected_dtype=expected_dtype,
-                ):
-                    raise RuntimeError(
-                        "DFLASH cannot reuse a target Pallas contract for a "
-                        "different LM head, group, or dtype"
-                    )
-                config = target_config
-                fallback_reason = None
-            else:
-                negotiation = negotiate_pallas_distributed_top_k_config(
-                    lm_head,
-                    group=tp_group,
-                    expected_dtype=expected_dtype,
-                )
-                config = negotiation.config
-                fallback_reason = negotiation.fallback_reason
-            if config is not None:
-                register_tpu_top_k_ops(config.world_size)
-
-        self._tpu_distributed_top_k_config = config
-        self._tpu_distributed_top_k_init_key = init_key
-        self._tpu_distributed_top_k_initialized = True
-        if tp_group is None or getattr(tp_group, "rank_in_group", None) == 0:
-            if config is None:
-                logger.info(
-                    "DFLASH Pallas distributed TopK disabled; using full-vocabulary "
-                    "argmax: %s",
-                    fallback_reason,
-                )
-            else:
-                logger.info(
-                    "DFLASH reuses Pallas distributed TopK for Top-1: TP%d dtype=%s",
-                    config.world_size,
-                    config.output_dtype,
-                )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
@@ -583,45 +439,47 @@ class DFlashDraftModel(nn.Module):
         """Sample draft tokens on TPU using target lm_head."""
         if self.lm_head is None:
             raise ValueError("DFlash draft on TPU requires lm_head.")
-        if not getattr(self, "_tpu_distributed_top_k_initialized", False):
-            raise RuntimeError("DFLASH TPU sampling was not initialized")
         hs_3d = hidden_states.view(-1, self.block_size, hidden_states.shape[-1])
         bs = hs_3d.shape[0]
         hs_1d = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
-        config = getattr(self, "_tpu_distributed_top_k_config", None)
-        if config is not None and config.output_dtype == torch.float32:
-            local_logits = torch.matmul(
-                hs_1d.to(torch.float32),
-                self.lm_head.weight.to(torch.float32).T,
-            )
-        else:
-            hs = (
-                hs_1d
-                if hs_1d.dtype == self.lm_head.weight.dtype
-                else hs_1d.to(self.lm_head.weight.dtype)
-            )
-            local_logits = torch.matmul(hs, self.lm_head.weight.T)
-        if config is not None:
-            from sglang.srt.hardware_backend.tpu.top_k import distributed_tpu_top_k
+        hs = (
+            hs_1d
+            if hs_1d.dtype == self.lm_head.weight.dtype
+            else hs_1d.to(self.lm_head.weight.dtype)
+        )
 
-            _, global_token_ids = distributed_tpu_top_k(local_logits, config, k=1)
+        tp_size = (
+            int(get_tp_group().world_size) if model_parallel_is_initialized() else 1
+        )
+
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            TpuVocabShard,
+            distributed_tpu_top_k,
+            supports_distributed_tpu_top_k,
+        )
+
+        if tp_size > 1 and supports_distributed_tpu_top_k(self.lm_head, top_k=1):
+            local_logits = torch.matmul(hs, self.lm_head.weight.T)
+            _, global_token_ids = distributed_tpu_top_k(
+                local_logits,
+                TpuVocabShard.from_lm_head(self.lm_head),
+                k=1,
+                group=get_tp_group(),
+            )
             tokens = global_token_ids.squeeze(-1).to(torch.long)
             return tokens.view(bs, self.block_size - 1)
 
-        tp_group = self._tpu_full_vocab_group
-        full_logits = (
-            tp_group.all_gather(local_logits, dim=-1)
-            if tp_group is not None
-            else local_logits
-        )
-        if self._tpu_full_vocab_indices is None:
-            raise RuntimeError("DFLASH TPU full-vocabulary mapping was not prepared")
-        full_logits = torch.index_select(
-            full_logits,
-            dim=-1,
-            index=self._tpu_full_vocab_indices,
-        )
-        tokens = torch.argmax(full_logits, dim=-1).to(torch.long)
+        shard = getattr(self.lm_head, "shard_indices", None)
+        num_org = int(shard.num_org_elements) if shard is not None else 0
+        org_vocab_start = int(shard.org_vocab_start_index) if shard is not None else 0
+        if num_org > 0:
+            local_logits = torch.matmul(hs, self.lm_head.weight[:num_org].T)
+        else:
+            local_logits = torch.matmul(hs, self.lm_head.weight.T)
+
+        tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
+        if org_vocab_start > 0:
+            tokens.add_(org_vocab_start)
         return tokens.view(bs, self.block_size - 1)
 
     @torch.no_grad()

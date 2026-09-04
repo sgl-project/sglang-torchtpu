@@ -19,7 +19,6 @@ from sglang.srt.hardware_backend.tpu.sampler import (
     TpuSampler,
     distributed_top_k_candidate_width,
     distributed_top_k_for_batch,
-    initialize_distributed_top_k_for_model,
     sample_from_global_top_k_logits,
     select_logits_output_mode,
 )
@@ -29,7 +28,6 @@ from sglang.srt.hardware_backend.tpu.top_k import (
     TpuVocabShard,
     distributed_tpu_top_k,
     negotiate_pallas_distributed_top_k_config,
-    pallas_distributed_top_k_config_matches,
     supports_distributed_tpu_top_k,
     tpu_top_k,
 )
@@ -106,25 +104,29 @@ def _distributed_top_k_config(
 
 
 def _distributed_top_k_model(shard_width=202_048 // 16):
-    return SimpleNamespace(
-        logits_processor=SimpleNamespace(
-            use_tpu_distributed_top_k=True,
-            do_tensor_parallel_all_gather=True,
-            do_tensor_parallel_all_gather_dp_attn=False,
-            _tpu_distributed_top_k_initialized=True,
-            _tpu_distributed_top_k_config=_distributed_top_k_config(
-                shard_width=shard_width
-            ),
-        ),
-        lm_head=SimpleNamespace(
-            enable_tp=True,
-            num_embeddings=202_048,
-            org_vocab_size=202_048,
-            num_embeddings_per_partition=shard_width,
-            weight=torch.empty(0, dtype=torch.bfloat16),
-            shard_indices=object(),
-        ),
+    processor = SimpleNamespace(
+        use_tpu_distributed_top_k=True,
+        do_tensor_parallel_all_gather=True,
+        do_tensor_parallel_all_gather_dp_attn=False,
     )
+    lm_head = SimpleNamespace(
+        enable_tp=True,
+        num_embeddings=202_048,
+        org_vocab_size=202_048,
+        num_embeddings_per_partition=shard_width,
+        weight=torch.empty(0, dtype=torch.bfloat16),
+        shard_indices=object(),
+    )
+    config = _distributed_top_k_config(shard_width=shard_width)
+    tpu_sampler_module._DISTRIBUTED_TOP_K_STATES[id(processor)] = (
+        tpu_sampler_module._DistributedTopKState(
+            logits_processor=processor,
+            lm_head=lm_head,
+            config=config,
+            fallback_reason=None,
+        )
+    )
+    return SimpleNamespace(logits_processor=processor, lm_head=lm_head)
 
 
 class TestDistributedTopKEligibility(CustomTestCase):
@@ -179,28 +181,27 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 LogitsOutputMode.FULL_VOCAB,
             )
 
-            lm_head.num_embeddings_per_partition = 32
-            processor._tpu_distributed_top_k_config = None
-            self.assertIs(
-                select_logits_output_mode(
-                    _forward_batch(batch_size=1, uniform_top_k=50), model
-                ),
-                LogitsOutputMode.FULL_VOCAB,
-            )
+    def test_cached_candidate_width_is_fullgraph_safe(self):
+        model = _distributed_top_k_model()
+        processor, lm_head = model.logits_processor, model.lm_head
 
-    def test_candidate_contract_is_negotiated_once(self):
+        compiled = torch.compile(
+            lambda value: value + distributed_top_k_candidate_width(processor, lm_head),
+            backend="eager",
+            fullgraph=True,
+        )
+
+        torch.testing.assert_close(compiled(torch.tensor(1)), torch.tensor(65))
+
+    def test_candidate_contract_is_negotiated_lazily_once(self):
         config = _distributed_top_k_config(shard_width=32, world_size=8)
         processor = SimpleNamespace(
             use_tpu_distributed_top_k=True,
             do_tensor_parallel_all_gather=True,
             do_tensor_parallel_all_gather_dp_attn=False,
             use_attn_tp_group=False,
-            _tpu_distributed_top_k_initialized=False,
-            _tpu_distributed_top_k_config=None,
-            _tpu_distributed_top_k_init_key=None,
         )
         lm_head = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
-        model = SimpleNamespace(logits_processor=processor, lm_head=lm_head)
         group = SimpleNamespace(world_size=8, rank_in_group=0, ranks=list(range(8)))
 
         with (
@@ -216,13 +217,15 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 "negotiate_pallas_distributed_top_k_config",
                 return_value=PallasDistributedTopKNegotiation(config, None),
             ) as negotiate,
-            patch.object(tpu_top_k_module, "register_tpu_top_k_ops") as register,
+            patch(
+                "sglang.srt.hardware_backend.tpu.distributed_topk_pallas."
+                "register_pallas_distributed_top_k_op"
+            ) as register,
         ):
-            self.assertIs(initialize_distributed_top_k_for_model(model), config)
-            self.assertIs(initialize_distributed_top_k_for_model(model), config)
+            self.assertEqual(distributed_top_k_candidate_width(processor, lm_head), 64)
             self.assertEqual(distributed_top_k_candidate_width(processor, lm_head), 64)
 
-        self.assertEqual(get_group.call_count, 2)
+        get_group.assert_called_once()
         negotiate.assert_called_once_with(
             lm_head,
             group=group,
@@ -231,19 +234,23 @@ class TestDistributedTopKEligibility(CustomTestCase):
         )
         register.assert_called_once_with(8)
 
-    def test_candidate_getter_never_negotiates_lazily(self):
+    def test_candidate_getter_waits_for_model_parallel_initialization(self):
         processor = SimpleNamespace(
             use_tpu_distributed_top_k=True,
             do_tensor_parallel_all_gather=True,
             do_tensor_parallel_all_gather_dp_attn=False,
-            _tpu_distributed_top_k_initialized=False,
-            _tpu_distributed_top_k_config=None,
         )
         lm_head = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
 
-        with patch.object(
-            tpu_top_k_module, "negotiate_pallas_distributed_top_k_config"
-        ) as negotiate:
+        with (
+            patch(
+                "sglang.srt.distributed.model_parallel_is_initialized",
+                return_value=False,
+            ),
+            patch.object(
+                tpu_top_k_module, "negotiate_pallas_distributed_top_k_config"
+            ) as negotiate,
+        ):
             self.assertIsNone(distributed_top_k_candidate_width(processor, lm_head))
 
         negotiate.assert_not_called()
@@ -255,9 +262,6 @@ class TestDistributedTopKEligibility(CustomTestCase):
             do_tensor_parallel_all_gather=True,
             do_tensor_parallel_all_gather_dp_attn=False,
             use_attn_tp_group=False,
-            _tpu_distributed_top_k_initialized=False,
-            _tpu_distributed_top_k_config=None,
-            _tpu_distributed_top_k_init_key=None,
         )
         model = SimpleNamespace(
             logits_processor=processor,
@@ -276,12 +280,15 @@ class TestDistributedTopKEligibility(CustomTestCase):
                 "negotiate_pallas_distributed_top_k_config",
                 return_value=PallasDistributedTopKNegotiation(config, None),
             ),
-            patch.object(tpu_top_k_module, "register_tpu_top_k_ops"),
+            patch(
+                "sglang.srt.hardware_backend.tpu.distributed_topk_pallas."
+                "register_pallas_distributed_top_k_op"
+            ),
         ):
-            initialize_distributed_top_k_for_model(model)
+            distributed_top_k_candidate_width(processor, model.lm_head)
             model.lm_head = SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))
             with self.assertRaisesRegex(RuntimeError, "cannot be reinitialized"):
-                initialize_distributed_top_k_for_model(model)
+                distributed_top_k_candidate_width(processor, model.lm_head)
 
     def test_measured_default_uses_distributed_top_k_from_batch_64(self):
         cutoff = envs.SGLANG_TPU_DISTRIBUTED_TOP_K_MIN_BATCH_SIZE
@@ -816,67 +823,6 @@ class TestTpuTopKLayout(CustomTestCase):
         self.assertEqual(config.world_size, 16)
         self.assertEqual(config.output_dtype, torch.float32)
 
-    def test_existing_config_matches_the_exact_consumer(self):
-        group = self._capability_group()
-        lm_head = self._capability_lm_head()
-        config = PallasDistributedTopKConfig(
-            shard=TpuVocabShard.from_lm_head(lm_head),
-            world_size=8,
-            model_rank=0,
-            candidate_width=64,
-            output_dtype=torch.bfloat16,
-        )
-
-        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
-            self.assertTrue(
-                pallas_distributed_top_k_config_matches(
-                    config,
-                    lm_head,
-                    group=group,
-                    expected_dtype=torch.bfloat16,
-                )
-            )
-
-    def test_existing_config_rejects_changed_consumer_or_kill_switch(self):
-        group = self._capability_group()
-        lm_head = self._capability_lm_head()
-        config = PallasDistributedTopKConfig(
-            shard=TpuVocabShard.from_lm_head(lm_head),
-            world_size=8,
-            model_rank=0,
-            candidate_width=64,
-            output_dtype=torch.bfloat16,
-        )
-
-        with patch.object(tpu_top_k_module, "_group_spans_world", return_value=True):
-            self.assertFalse(
-                pallas_distributed_top_k_config_matches(
-                    config,
-                    lm_head,
-                    group=group,
-                    expected_dtype=torch.float32,
-                )
-            )
-            group.rank_in_group = 1
-            self.assertFalse(
-                pallas_distributed_top_k_config_matches(
-                    config,
-                    lm_head,
-                    group=group,
-                    expected_dtype=torch.bfloat16,
-                )
-            )
-            group.rank_in_group = 0
-            with envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.override(True):
-                self.assertFalse(
-                    pallas_distributed_top_k_config_matches(
-                        config,
-                        lm_head,
-                        group=group,
-                        expected_dtype=torch.bfloat16,
-                    )
-                )
-
     def test_subgroup_is_rejected_before_negotiation(self):
         group = self._capability_group()
         with patch.object(tpu_top_k_module, "_group_spans_world", return_value=False):
@@ -932,20 +878,6 @@ class TestTpuTopKLayout(CustomTestCase):
                 expected_dtype=torch.bfloat16,
             ).config
         self.assertIsNone(config)
-
-    def test_kill_switch_participates_in_rank_consensus(self):
-        group = self._capability_group()
-        with (
-            envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.override(True),
-            patch.object(tpu_top_k_module, "_group_spans_world", return_value=True),
-        ):
-            config = negotiate_pallas_distributed_top_k_config(
-                self._capability_lm_head(),
-                group=group,
-                expected_dtype=torch.bfloat16,
-            ).config
-        self.assertIsNone(config)
-        group.all_gather_object.assert_called_once()
 
     def test_consumer_ineligibility_participates_in_rank_consensus(self):
         group = self._capability_group()
@@ -1039,13 +971,7 @@ class TestTpuTopKLayout(CustomTestCase):
 
     def test_empty_distributed_input_bypasses_the_pallas_grid(self):
         shard = self._canonical_shard(0)
-        config = PallasDistributedTopKConfig(
-            shard=shard,
-            world_size=8,
-            model_rank=0,
-            candidate_width=64,
-            output_dtype=torch.bfloat16,
-        )
+        group = SimpleNamespace(world_size=8, rank_in_group=0)
 
         class EmptyTpuTensor:
             device = SimpleNamespace(type="tpu")
@@ -1057,7 +983,7 @@ class TestTpuTopKLayout(CustomTestCase):
             def new_empty(shape, *, dtype):
                 return torch.empty(shape, dtype=dtype)
 
-        values, ids = distributed_tpu_top_k(EmptyTpuTensor(), config, 64)
+        values, ids = distributed_tpu_top_k(EmptyTpuTensor(), shard, 64, group=group)
         self.assertEqual(values.shape, (0, 64))
         self.assertEqual(values.dtype, torch.float32)
         self.assertEqual(ids.shape, (0, 64))

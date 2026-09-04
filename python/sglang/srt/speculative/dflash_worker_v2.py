@@ -402,16 +402,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "Target model must have an lm_head for DFLASH TPU draft sampling."
             )
-        target_logits_processor = getattr(target_model, "logits_processor", None)
-        target_config = getattr(
-            target_logits_processor,
-            "_tpu_distributed_top_k_config",
-            None,
-        )
-        self.draft_model.set_lm_head_from_target(
-            target_model.lm_head,
-            target_config=target_config,
-        )
+        self.draft_model.lm_head = target_model.lm_head
         self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         compile_policy = getattr(self.draft_model_runner, "compile_policy", None)
         if compile_policy is not None:

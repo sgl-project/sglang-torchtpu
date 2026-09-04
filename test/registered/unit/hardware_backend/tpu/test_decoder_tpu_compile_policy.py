@@ -18,6 +18,7 @@ from sglang.srt.compilation.support_torch_compile import (
     support_torch_compile,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu import sampler as tpu_sampler_module
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
@@ -123,20 +124,12 @@ def _enable_distributed_top_k(model_runner):
         added_vocab_start=202_048,
         added_vocab_count=0,
     )
-    model_runner.model.logits_processor = SimpleNamespace(
+    logits_processor = SimpleNamespace(
         use_tpu_distributed_top_k=True,
         do_tensor_parallel_all_gather=True,
         do_tensor_parallel_all_gather_dp_attn=False,
-        _tpu_distributed_top_k_initialized=True,
-        _tpu_distributed_top_k_config=PallasDistributedTopKConfig(
-            shard=shard,
-            world_size=16,
-            model_rank=0,
-            candidate_width=64,
-            output_dtype=torch.bfloat16,
-        ),
     )
-    model_runner.model.lm_head = SimpleNamespace(
+    lm_head = SimpleNamespace(
         enable_tp=True,
         num_embeddings=202_048,
         org_vocab_size=202_048,
@@ -144,6 +137,23 @@ def _enable_distributed_top_k(model_runner):
         num_embeddings_per_partition=shard_width,
         shard_indices=object(),
     )
+    config = PallasDistributedTopKConfig(
+        shard=shard,
+        world_size=16,
+        model_rank=0,
+        candidate_width=64,
+        output_dtype=torch.bfloat16,
+    )
+    tpu_sampler_module._DISTRIBUTED_TOP_K_STATES[id(logits_processor)] = (
+        tpu_sampler_module._DistributedTopKState(
+            logits_processor=logits_processor,
+            lm_head=lm_head,
+            config=config,
+            fallback_reason=None,
+        )
+    )
+    model_runner.model.logits_processor = logits_processor
+    model_runner.model.lm_head = lm_head
     return model_runner
 
 

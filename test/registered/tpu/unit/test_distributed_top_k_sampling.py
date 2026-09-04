@@ -257,21 +257,18 @@ def _run_distributed_worker() -> None:
         added_vocab_start=_VOCAB_SIZE,
         added_vocab_count=0,
     )
-    top_k_module.register_tpu_top_k_ops(world_size)
+    from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
+        register_pallas_distributed_top_k_op,
+    )
 
-    def _config(shard, dtype):
-        return top_k_module.PallasDistributedTopKConfig(
-            shard=shard,
-            world_size=world_size,
-            model_rank=rank,
-            candidate_width=64,
-            output_dtype=dtype,
-        )
+    top_k_module.register_tpu_top_k_ops()
+    register_pallas_distributed_top_k_op(world_size)
 
     empty_values, empty_ids = top_k_module.distributed_tpu_top_k(
         torch.empty((0, local_vocab), dtype=torch.bfloat16, device="tpu"),
-        _config(shard, torch.bfloat16),
+        shard,
         64,
+        group=group,
     )
     if empty_values.shape != (0, 64) or empty_values.dtype != torch.float32:
         raise AssertionError("empty TopK values have the wrong contract")
@@ -315,8 +312,9 @@ def _run_distributed_worker() -> None:
         for top_k in top_ks:
             actual_values, actual_ids = top_k_module.distributed_tpu_top_k(
                 correctness_logits,
-                _config(shard, dtype),
+                shard,
                 top_k,
+                group=group,
             )
             torch.testing.assert_close(
                 actual_values,
@@ -344,8 +342,9 @@ def _run_distributed_worker() -> None:
     def _compiled_distributed_top_k(logits):
         return top_k_module.distributed_tpu_top_k(
             logits,
-            _config(shard, torch.bfloat16),
+            shard,
             50,
+            group=group,
         )
 
     compiled_distributed_top_k = torch.compile(
@@ -366,74 +365,6 @@ def _run_distributed_worker() -> None:
     ):
         raise AssertionError("compiled Pallas TopK returned incorrect token IDs")
 
-    # DFLASH borrows the target LM head. Exercise both compile-static branches:
-    # eligible drafts call this same Pallas op for Top-1, while an ineligible
-    # contract gathers and reindexes the complete vocabulary before argmax.
-    from types import SimpleNamespace
-
-    from sglang.srt.models.dflash import DFlashDraftModel
-
-    winner_rank = world_size - 1
-    winner_position = 7
-    draft_weight = torch.zeros(
-        local_vocab,
-        1,
-        dtype=torch.bfloat16,
-        device="tpu",
-    )
-    if rank == winner_rank:
-        draft_weight[winner_position, 0] = 16
-    draft_hidden_states = torch.tensor(
-        [[0], [1]],
-        dtype=torch.bfloat16,
-        device="tpu",
-    )
-    expected_draft_token = winner_rank * local_vocab + winner_position
-
-    dflash_pallas = SimpleNamespace(
-        block_size=2,
-        lm_head=SimpleNamespace(weight=draft_weight),
-        _tpu_distributed_top_k_initialized=True,
-        _tpu_distributed_top_k_config=_config(shard, torch.bfloat16),
-        _tpu_full_vocab_group=group,
-        _tpu_full_vocab_indices=None,
-    )
-    compiled_dflash_pallas = torch.compile(
-        lambda states: DFlashDraftModel._sample_draft_tokens_tpu(dflash_pallas, states),
-        backend="tpu",
-        fullgraph=True,
-        dynamic=False,
-    )
-    pallas_draft_token = compiled_dflash_pallas(draft_hidden_states)
-    if pallas_draft_token.cpu().item() != expected_draft_token:
-        raise AssertionError("compiled DFLASH Pallas Top-1 returned the wrong token")
-
-    dflash_full_vocab = SimpleNamespace(
-        block_size=2,
-        lm_head=SimpleNamespace(weight=draft_weight),
-        _tpu_distributed_top_k_initialized=True,
-        _tpu_distributed_top_k_config=None,
-        _tpu_full_vocab_group=group,
-        _tpu_full_vocab_indices=torch.arange(
-            _VOCAB_SIZE,
-            dtype=torch.long,
-            device="tpu",
-        ),
-    )
-    compiled_dflash_full_vocab = torch.compile(
-        lambda states: DFlashDraftModel._sample_draft_tokens_tpu(
-            dflash_full_vocab, states
-        ),
-        backend="tpu",
-        fullgraph=True,
-        dynamic=False,
-    )
-    full_vocab_draft_token = compiled_dflash_full_vocab(draft_hidden_states)
-    if full_vocab_draft_token.cpu().item() != expected_draft_token:
-        raise AssertionError(
-            "compiled DFLASH full-vocabulary fallback returned the wrong token"
-        )
-
     # Exercise skewed entry and rapid shape reuse. A peer may enter the direct-
     # HBM region before rank zero, and consecutive invocations must not consume
     # stale semaphore state from a prior shape.
@@ -444,8 +375,9 @@ def _run_distributed_worker() -> None:
         time.sleep(0.25)
     actual_values, actual_ids = top_k_module.distributed_tpu_top_k(
         delayed_logits,
-        _config(shard, torch.bfloat16),
+        shard,
         64,
+        group=group,
     )
     torch.testing.assert_close(actual_values, delayed_values[:, :64], rtol=0, atol=0)
     if not torch.equal(actual_ids.cpu(), delayed_ids[:, :64].to(torch.int32).cpu()):
@@ -455,8 +387,9 @@ def _run_distributed_worker() -> None:
         replay_logits = _make_local_logits(replay_batch, local_vocab, rank)
         replay_values, replay_ids = top_k_module.distributed_tpu_top_k(
             replay_logits,
-            _config(shard, torch.bfloat16),
+            shard,
             1,
+            group=group,
         )
         reference = group.all_gather(replay_logits, dim=-1).float()
         reference_values, reference_ids = reference.max(dim=-1, keepdim=True)
@@ -501,8 +434,9 @@ def _run_distributed_worker() -> None:
     padded_logits[:, org_padded_width + added_vocab_count :] = 199
     padded_values, padded_ids = top_k_module.distributed_tpu_top_k(
         padded_logits.to("tpu"),
-        _config(padded_shard, torch.bfloat16),
+        padded_shard,
         1,
+        group=group,
     )
     if padded_values.cpu().item() != 100:
         raise AssertionError("a padded vocabulary column entered the candidate set")
@@ -516,8 +450,9 @@ def _run_distributed_worker() -> None:
     )
     padded_top64_values, padded_top64_ids = top_k_module.distributed_tpu_top_k(
         padded_logits.to("tpu"),
-        _config(padded_shard, torch.bfloat16),
+        padded_shard,
         64,
+        group=group,
     )
     torch.testing.assert_close(
         padded_top64_values,
@@ -535,8 +470,9 @@ def _run_distributed_worker() -> None:
     tie_logits[:, :local_tie_count] = 1
     tie_values, tie_ids = top_k_module.distributed_tpu_top_k(
         tie_logits,
-        _config(shard, torch.bfloat16),
+        shard,
         64,
+        group=group,
     )
     if not torch.all(tie_values == 1).item():
         raise AssertionError("the cutoff tie returned a non-maximum value")
@@ -590,8 +526,9 @@ def _run_distributed_worker() -> None:
             global_top_k_logits, global_top_k_token_ids = (
                 top_k_module.distributed_tpu_top_k(
                     local_logits,
-                    _config(shard, torch.bfloat16),
+                    shard,
                     _TOP_K,
+                    group=group,
                 )
             )
             sampled = sample_from_global_top_k_logits(global_top_k_logits, temperatures)

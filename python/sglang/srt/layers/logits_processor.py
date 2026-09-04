@@ -404,13 +404,9 @@ class LogitsProcessor(nn.Module):
             and _is_tpu
             and get_exec().kernel.sampling_backend == "tpu"
         )
-        self._tpu_distributed_top_k_config = None
-        self._tpu_distributed_top_k_init_key = None
-        self._tpu_distributed_top_k_initialized = False
         if self.use_tpu_distributed_top_k:
             # Register before an optional fullgraph torch.compile trace reaches
-            # the generic local TopK primitive. The distributed schema is
-            # registered only after eager all-rank capability negotiation.
+            # the logits processor. StableHLO export itself remains lazy.
             from sglang.srt.hardware_backend.tpu.top_k import register_tpu_top_k_ops
 
             register_tpu_top_k_ops()
@@ -434,30 +430,6 @@ class LogitsProcessor(nn.Module):
         # TPU compilation disables prompt logprobs before tracing the model.
         self.compute_input_logprobs = True
 
-    def get_tpu_distributed_top_k_output_dtype(
-        self,
-        lm_head: VocabParallelEmbedding,
-    ) -> Optional[torch.dtype]:
-        """Return the compile-static LM-head dtype, or None if it is unclear."""
-
-        if self.use_fp32_lm_head:
-            return torch.float32
-        if self.rl_on_policy_target is not None:
-            return torch.bfloat16
-
-        # Quantized or wrapped heads may not expose a plain weight. Probe
-        # defensively so dtype resolution can use config metadata and, if it
-        # remains unknown, select the rank-consistent full-vocabulary path.
-        weight = getattr(lm_head, "weight", None)
-        weight_dtype = getattr(weight, "dtype", None)
-        if weight_dtype in (torch.bfloat16, torch.float32):
-            return weight_dtype
-
-        config_dtype = getattr(self.config, "torch_dtype", None)
-        if config_dtype in (torch.bfloat16, torch.float32):
-            return config_dtype
-        return None
-
     def forward(
         self,
         input_ids,
@@ -474,12 +446,13 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_output_mode = logits_metadata.logits_output_mode
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
-                config = self._tpu_distributed_top_k_config
-                if not self._tpu_distributed_top_k_initialized or config is None:
-                    raise RuntimeError(
-                        "DISTRIBUTED_TOP_K was selected without an eager Pallas contract"
-                    )
-                distributed_top_k = config.candidate_width
+                from sglang.srt.hardware_backend.tpu.sampler import (
+                    distributed_top_k_candidate_width,
+                )
+
+                distributed_top_k = distributed_top_k_candidate_width(self, lm_head)
+                if distributed_top_k is None:
+                    raise RuntimeError("DISTRIBUTED_TOP_K is unsupported by this model")
             logits_metadata = LogitsMetadata.from_forward_batch(
                 logits_metadata,
                 compute_input_logprobs=self.compute_input_logprobs,
@@ -827,28 +800,24 @@ class LogitsProcessor(nn.Module):
         """Reduce sharded LM-head logits into an exact global TopK.
         Monotonic final softcapping is applied after the global merge."""
 
-        from sglang.srt.hardware_backend.tpu.top_k import distributed_tpu_top_k
+        from sglang.srt.distributed import get_attn_tp_group, get_tp_group
+        from sglang.srt.hardware_backend.tpu.top_k import (
+            TpuVocabShard,
+            distributed_tpu_top_k,
+        )
 
         logits = self._compute_lm_head(hidden_states, lm_head)
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
         sanitize_nan_logits(logits, "distributed TPU top-k: local logits")
 
-        from sglang.srt.hardware_backend.tpu.top_k import TpuVocabShard
-
-        config = self._tpu_distributed_top_k_config
-        if config is None:
-            raise RuntimeError(
-                "DISTRIBUTED_TOP_K was selected without a negotiated Pallas contract"
-            )
-        if TpuVocabShard.from_lm_head(lm_head) != config.shard:
-            raise RuntimeError(
-                "distributed TPU TopK LM-head metadata changed after negotiation"
-            )
+        # Select k logits per vocabulary shard, then merge them into the exact
+        # global TopK shared by every tensor-parallel rank.
         global_top_k_logits, global_top_k_token_ids = distributed_tpu_top_k(
             logits,
-            config,
+            TpuVocabShard.from_lm_head(lm_head),
             top_k,
+            group=get_attn_tp_group() if self.use_attn_tp_group else get_tp_group(),
         )
         if self.final_logit_softcapping:
             global_top_k_logits = self.final_logit_softcapping * torch.tanh(

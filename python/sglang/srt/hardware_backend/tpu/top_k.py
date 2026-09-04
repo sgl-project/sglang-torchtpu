@@ -6,8 +6,6 @@ from typing import NamedTuple
 
 import torch
 
-from sglang.srt.environ import envs
-
 _TPU_TOP_K_OP: Callable | None = None
 
 
@@ -140,6 +138,16 @@ def _is_canonical_pallas_shard(
     )
 
 
+def _pallas_shards_cover_vocab(shard: TpuVocabShard, world_size: int) -> bool:
+    """Whether the canonical shard widths cover both vocabulary segments."""
+
+    added_width = shard.width - shard.org_vocab_padded_count
+    return (
+        shard.org_vocab_padded_count * world_size >= shard.org_vocab_size
+        and added_width * world_size >= shard.global_vocab_size - shard.org_vocab_size
+    )
+
+
 def _group_spans_world(group) -> bool:
     """Return whether the selected TP group is the complete distributed world."""
 
@@ -213,9 +221,7 @@ def negotiate_pallas_distributed_top_k_config(
 
     fallback_reason = local_fallback_reason
     if fallback_reason is None:
-        if envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.get():
-            fallback_reason = "SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K is set"
-        elif expected_dtype not in (torch.bfloat16, torch.float32):
+        if expected_dtype not in (torch.bfloat16, torch.float32):
             fallback_reason = f"logits dtype {expected_dtype} is unsupported"
         elif candidate_width != MAX_DISTRIBUTED_TOP_K:
             fallback_reason = (
@@ -305,11 +311,7 @@ def negotiate_pallas_distributed_top_k_config(
                 None, f"rank {rank}: vocabulary metadata disagrees across ranks"
             )
 
-    added_width = shard.width - shard.org_vocab_padded_count
-    if (
-        shard.org_vocab_padded_count * world_size < shard.org_vocab_size
-        or added_width * world_size < shard.global_vocab_size - shard.org_vocab_size
-    ):
+    if not _pallas_shards_cover_vocab(shard, world_size):
         return PallasDistributedTopKNegotiation(
             None, "the canonical shards do not cover the complete vocabulary"
         )
@@ -323,39 +325,6 @@ def negotiate_pallas_distributed_top_k_config(
             output_dtype=expected_dtype,
         ),
         None,
-    )
-
-
-def pallas_distributed_top_k_config_matches(
-    config: PallasDistributedTopKConfig,
-    lm_head,
-    *,
-    group,
-    expected_dtype: torch.dtype | None,
-) -> bool:
-    """Whether an existing immutable config is valid for this exact consumer."""
-
-    from sglang.srt.hardware_backend.tpu.kernels.distributed_topk import (
-        MAX_DISTRIBUTED_TOP_K,
-        SUPPORTED_WORLD_SIZES,
-    )
-
-    try:
-        shard = TpuVocabShard.from_lm_head(lm_head)
-        model_rank = int(group.rank_in_group)
-        world_size = int(group.world_size)
-    except (AttributeError, TypeError, ValueError):
-        return False
-    return (
-        not envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.get()
-        and config.candidate_width == MAX_DISTRIBUTED_TOP_K
-        and config.shard == shard
-        and config.world_size == world_size
-        and config.model_rank == model_rank
-        and config.output_dtype == expected_dtype
-        and world_size in SUPPORTED_WORLD_SIZES
-        and _group_spans_world(group)
-        and _is_canonical_pallas_shard(shard, model_rank, world_size)
     )
 
 
@@ -403,27 +372,24 @@ def tpu_top_k(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
     return _get_tpu_top_k_op()(values, k)
 
 
-def register_tpu_top_k_ops(world_size: int | None = None) -> None:
-    """Register custom-op schemas before full-graph tracing begins."""
-
+def register_tpu_top_k_ops() -> None:
+    """Register the local TopK schema before full-graph tracing begins."""
     _get_tpu_top_k_op()
-    if (
-        world_size is not None
-        and not envs.SGLANG_TPU_DISABLE_PALLAS_DISTRIBUTED_TOP_K.get()
-    ):
-        from sglang.srt.hardware_backend.tpu.distributed_topk_pallas import (
-            register_pallas_distributed_top_k_op,
-        )
-
-        register_pallas_distributed_top_k_op(world_size)
 
 
 def distributed_tpu_top_k(
     local_logits: torch.Tensor,
-    config: PallasDistributedTopKConfig,
+    shard: TpuVocabShard,
     k: int,
+    *,
+    group,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the sole distributed candidate-reduction implementation."""
+    """Run exact distributed TopK through the direct-HBM Pallas ring."""
+
+    from sglang.srt.hardware_backend.tpu.kernels.distributed_topk import (
+        MAX_DISTRIBUTED_TOP_K,
+        SUPPORTED_WORLD_SIZES,
+    )
 
     if local_logits.device.type != "tpu":
         raise ValueError(
@@ -434,16 +400,32 @@ def distributed_tpu_top_k(
             "distributed_tpu_top_k expects a 2D tensor, "
             f"got shape {local_logits.shape}"
         )
-    if local_logits.shape[-1] != config.shard.width:
+    if local_logits.shape[-1] != shard.width:
         raise RuntimeError(
             "distributed TPU TopK local width changed after capability negotiation"
         )
-    if local_logits.dtype != config.output_dtype:
+    if local_logits.dtype not in (torch.bfloat16, torch.float32):
         raise RuntimeError(
-            "distributed TPU TopK output dtype changed after capability negotiation"
+            f"distributed TPU TopK does not support {local_logits.dtype}"
         )
-    if not 0 < k <= config.candidate_width:
-        raise ValueError(f"k must be in [1, {config.candidate_width}], got {k}")
+    world_size = int(group.world_size)
+    model_rank = int(group.rank_in_group)
+    if world_size not in SUPPORTED_WORLD_SIZES:
+        raise RuntimeError(f"Pallas distributed TopK does not support TP{world_size}")
+    if not _is_canonical_pallas_shard(shard, model_rank, world_size):
+        raise RuntimeError(
+            "distributed TPU TopK vocabulary shard changed after negotiation"
+        )
+    if min(shard.width, shard.global_vocab_size) < MAX_DISTRIBUTED_TOP_K:
+        raise RuntimeError(
+            "distributed TPU TopK shard cannot supply the fixed candidate width"
+        )
+    if not _pallas_shards_cover_vocab(shard, world_size):
+        raise RuntimeError(
+            "distributed TPU TopK shards do not cover the complete vocabulary"
+        )
+    if not 0 < k <= MAX_DISTRIBUTED_TOP_K:
+        raise ValueError(f"k must be in [1, {MAX_DISTRIBUTED_TOP_K}], got {k}")
     if local_logits.shape[0] == 0:
         shape = (0, k)
         return (
@@ -457,10 +439,10 @@ def distributed_tpu_top_k(
 
     return pallas_distributed_top_k(
         local_logits,
-        org_vocab_size=config.shard.org_vocab_size,
-        global_vocab_size=config.shard.global_vocab_size,
-        org_vocab_padded_count=config.shard.org_vocab_padded_count,
+        org_vocab_size=shard.org_vocab_size,
+        global_vocab_size=shard.global_vocab_size,
+        org_vocab_padded_count=shard.org_vocab_padded_count,
         k=k,
-        world_size=config.world_size,
-        model_rank=config.model_rank,
+        world_size=world_size,
+        model_rank=model_rank,
     )
