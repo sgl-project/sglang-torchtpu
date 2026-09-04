@@ -20,7 +20,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=750, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=856, stage="base-c", runner_config="8-gpu-b300")
 
 
 class TestGLM52DSACacheLayerSplit(PDDisaggregationServerBase, GSM8KMixin):
