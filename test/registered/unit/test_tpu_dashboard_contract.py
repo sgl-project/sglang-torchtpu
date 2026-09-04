@@ -90,6 +90,28 @@ def _config_modules(subdir: str):
         yield path, mod
 
 
+def _external_group_files() -> list:
+    """Files reached by the external-cluster nightly, one entry per file.
+
+    The external pipeline (`external-nightly-*` suites) is a job source of its
+    own: no Kueue, so render_external_jobset.py round-robins each suite's
+    launch groups across the slices in external-topology.yaml. Unlike the
+    in-project multi-host groups, an external group deliberately bundles the
+    files that share a server bring-up -- rank 0 runs them back-to-back and
+    the JobSet emits one TIMINGS record PER FILE, so a red run still names the
+    file that failed and the one-job-one-test attribution survives the
+    bundling.
+    """
+    return [
+        file
+        for row in _discover(
+            "external/render_external_jobset.py", "--list-groups", "--nightly"
+        )
+        for group in row["groups"]
+        for file in group["files"].split()
+    ]
+
+
 def _static_pd_files() -> list:
     """The `files:` values hand-wired into feature-validation-tpu.yml.
 
@@ -131,6 +153,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             "discover_multihost.py", "--suite", "nightly-tpu-multihost-ondemand"
         )
         cls.static_pd = _static_pd_files()
+        cls.external = _external_group_files()
 
     def test_multihost_groups_carry_exactly_one_file(self):
         # `files` is space-separated by contract; a group bundling two files
@@ -154,6 +177,7 @@ class TestJobMapsToOneTest(CustomTestCase):
             [row["file"] for row in self.single_host]
             + [row["files"] for row in self.multihost]
             + list(self.static_pd)
+            + list(self.external)
         )
         accuracy_perf_files = []
         for suite in self.registered:

@@ -1,7 +1,7 @@
 """Shared live-server machinery for TPU serving-benchmark tests.
 
-A benchmark test file is a thin shell around build_bench_test(): the file
-itself carries only what the CI
+A benchmark test file is a thin shell around build_bench_test() (or the
+matrix wrapper build_matrix_test()): the file itself carries only what the CI
 scanners read via AST -- register_tpu_ci(suite=...) and the literal
 MULTIHOST_LAUNCH dict -- plus one factory call. Nothing in the test body
 binds it to a particular TPU cluster: the body only ever sees BASE_URL, and
@@ -13,9 +13,15 @@ gcsfuse bucket; "weights_pvc" + "hosts": the in-project PVC pipeline). Both
 scanners ignore keys they don't read, so a file may carry both and flip
 clusters by editing only its suite.
 
-Consumer: test_tpu_qwen3_coder_480b_multihost_agentic (the 480B nightly),
-via build_bench_test() over its own harness
-(recipe/qwen3_coder_480b/nightly/run_nightly.sh).
+Consumers:
+  * the benchmark matrix cells (test_tpu_bench_*: GPT-OSS-120B /
+    Qwen3-Coder-480B across serving recipes and workloads) via
+    build_matrix_test(); their sweep harness is
+    benchmark/tpu/recipe/bench_matrix/run_sweep.sh, and two files sharing a
+    (suite, launch_script, weights) triple share one server;
+  * test_tpu_qwen3_coder_480b_multihost_agentic (the 480B nightly) via
+    build_bench_test() over its own harness
+    (recipe/qwen3_coder_480b/nightly/run_nightly.sh).
 
 WHAT IS ASSERTED, and what is not: throughput is *recorded*, never gated
 (the TPU slice is shared, so a tok/s floor would be a flake generator, and
@@ -23,8 +29,8 @@ regression tracking is the dashboard's job); what is gated is that the run
 is trustworthy at all:
   * every planned leg finished,
   * prefix caching actually hit where the workload makes hits reachable
-    (multi-turn shapes; a single-turn session cannot re-see a prefix, so
-    there the rate is recorded but not gated),
+    (multi-turn agentic; a single-turn 8k1k session cannot re-see a prefix,
+    so there the rate is recorded but not gated),
   * the server admitted the work without retracting or aborting requests,
   * EAGLE3 actually drafted, on the recipes that claim it (a spec config
     that silently fell back to plain decode would benchmark the wrong thing).
@@ -52,10 +58,29 @@ register_tpu_ci(
     disabled="helper module, no tests",
 )
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.abspath(os.path.join(HERE, *[".."] * 4))
+MATRIX_SWEEP_SCRIPT = os.path.join(
+    REPO_ROOT, "benchmark", "tpu", "recipe", "bench_matrix", "run_sweep.sh"
+)
+
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
 
+# --- The matrix cells' slice of the time-budget chain (see config.sh's "THE
+# TIME-BUDGET CHAIN"). TIMEOUT_PER_FILE_BUDGET is what every cell's
+# MULTIHOST_LAUNCH declares literally as timeout_per_file (the CI scanner
+# reads it via AST, so the files cannot compute it); the matrix ratchet
+# asserts the literals match this constant and that the chain holds.
+TIMEOUT_PER_FILE_BUDGET = 8100
 # Re-checking a server the JobSet already gated healthy.
-HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
+HEALTH_RECHECK_BUDGET = 600
+# Headroom after the sweep for summarize + digest + result-JSON printing.
+RESULT_EGRESS_MARGIN = 300
+SWEEP_TIMEOUT_DEFAULT = (
+    TIMEOUT_PER_FILE_BUDGET - HEALTH_RECHECK_BUDGET - RESULT_EGRESS_MARGIN
+)
+
+HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", str(HEALTH_RECHECK_BUDGET)))
 # Fraction of the REACHABLE prefix-cache hit rate a gated leg must reach. The
 # reachable rate is set by the workload shape AND the DP count: the first D
 # rounds of a session can never hit, so a 6-round session at dp=2 tops out
@@ -65,6 +90,21 @@ HEALTH_TIMEOUT = int(os.environ.get("HEALTH_TIMEOUT", "600"))
 # still pass. Set MIN_PREFIX_HIT_RATE to gate on an absolute rate instead.
 MIN_PREFIX_HIT_FRACTION = float(os.environ.get("MIN_PREFIX_HIT_FRACTION", "0.6"))
 MIN_PREFIX_HIT_RATE = os.environ.get("MIN_PREFIX_HIT_RATE")
+
+# Dashboard series keys for the matrix cells: the canonical HF ids, not the
+# mount paths the recipes serve from -- restaging the weights must not split
+# a trend in two.
+MODEL_LABELS = {
+    "gpt_oss_120b": "openai/gpt-oss-120b",
+    "qwen3_coder_480b": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+}
+# The cosmetic half of the series identity, free to change (unlike the id
+# derived below). Same vocabulary as the nightly-perf MODEL_CONFIGs.
+MODEL_DISPLAY_NAMES = {
+    "gpt_oss_120b": "GPT-OSS 120B",
+    "qwen3_coder_480b": "Qwen3-Coder-480B",
+}
+SPEC_RECIPES = {"1host_pc_spec_kvoff"}
 
 
 def _direction(field: str) -> str:
@@ -160,6 +200,12 @@ def _reachable_prefix_hit_rate(config, dp_size):
     return cached_tokens / prompt_tokens
 
 
+def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
+    """Where the spec gauges live: the engine that decodes. For the 1-host
+    recipes that is the one server."""
+    return base_url
+
+
 def _read_spec_accept_length(metrics_url: str) -> float:
     """Max sglang:spec_accept_length across ranks; 0.0 when spec never ran."""
     with urllib.request.urlopen(metrics_url.rstrip("/") + "/metrics", timeout=60) as r:
@@ -215,8 +261,8 @@ def build_bench_test(
                          non-None declares the recipe claims spec decoding
                          and adds the accept-length gate.
     metric_namespace     optional prefix for metric names, for files whose
-                         legs alone don't disambiguate. None keeps bare
-                         leg tags -- an
+                         legs alone don't disambiguate (the matrix prefixes
+                         the workload). None keeps bare leg tags -- an
                          existing file must keep its metric names or its
                          dashboard trend splits.
     """
@@ -532,6 +578,51 @@ def build_bench_test(
 
     BenchTest.__qualname__ = BenchTest.__name__ = class_name
     return BenchTest
+
+
+def build_matrix_test(*, bench_model: str, bench_recipe: str, workload: str):
+    """Return the TestCase class for one matrix (model, recipe, workload) cell.
+
+    The series id is DERIVED from the cell coordinates rather than spelled out
+    per file, so a new cell cannot forget one or collide with a sibling. That
+    makes the coordinates load-bearing: renaming bench_model/bench_recipe/
+    workload renames the id and splits the dashboard trend, so a forced rename
+    is recorded in .github/tpu-ci/dashboard_aliases.json like any other.
+    """
+    spec_expected = bench_recipe in SPEC_RECIPES
+    cell = "-".join(
+        part.replace("_", "-") for part in (bench_model, bench_recipe, workload)
+    )
+    return build_bench_test(
+        class_name=f"TestBench_{bench_model}_{bench_recipe}_{workload}",
+        label=f"{bench_model}/{bench_recipe}/{workload}",
+        model_label=MODEL_LABELS[bench_model],
+        series_id=f"perf-{cell}",
+        display_name=(
+            f"{MODEL_DISPLAY_NAMES[bench_model]} "
+            f"{bench_recipe.replace('_', '-')} {workload}"
+        ),
+        sweep_script=MATRIX_SWEEP_SCRIPT,
+        sweep_env={
+            "BENCH_MODEL": bench_model,
+            "BENCH_RECIPE": bench_recipe,
+            "WORKLOAD": workload,
+        },
+        run_root_default=f"/tmp/bench-{bench_model}-{bench_recipe}-{workload}",
+        profile=os.environ.get("BENCH_PROFILE", "ci"),
+        sweep_timeout_default=SWEEP_TIMEOUT_DEFAULT,
+        # A single-turn 8k1k session never re-sees its prefix, so the hit-rate
+        # gate only applies to the multi-turn agentic workload.
+        gate_prefix_hits=workload == "agentic",
+        spec_metrics_url_fn=(
+            (lambda base_url: _matrix_spec_metrics_url(bench_recipe, base_url))
+            if spec_expected
+            else None
+        ),
+        # Several cells share a model, so the workload disambiguates the
+        # metric names.
+        metric_namespace=workload,
+    )
 
 
 if __name__ == "__main__":
