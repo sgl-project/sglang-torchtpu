@@ -119,8 +119,6 @@ jobs:
       fail-fast: false
       matrix:
         test: ${{ fromJSON(needs.discover-tests.outputs.single_host) }}
-    # From the matrix: a static name here makes GitHub append every matrix value
-    # in parentheses (README, "Two names per leg").
     name: ${{ matrix.test.name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -278,7 +276,7 @@ jobs:
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
           && contains(fromJSON('["all","pd-mh-gpt-120b-spec"]'), inputs.only || 'all') }}
-    name: test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k
+    name: pd-mh-gpt-120b-spec
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -301,7 +299,7 @@ jobs:
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
           && contains(fromJSON('["all","pd-mh-gpt-120b-pc-offload-spec"]'), inputs.only || 'all') }}
-    name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
+    name: pd-mh-gpt-120b-pc-offload-spec
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}

@@ -100,13 +100,6 @@ env:
 
 jobs:
   test:
-    # GitHub renders a called job as "<caller job> / <this job>". The caller's
-    # line is the test; this one is where it ran, so the pair never repeats.
-    name: >-
-      ${{ inputs.lane }} lane,
-      ${{ inputs.pd_prefill_hosts > 0
-          && format('{0}P+{1}D', inputs.pd_prefill_hosts, inputs.pd_decode_hosts)
-          || format('{0} host{1}', inputs.hosts, inputs.hosts > 1 && 's' || '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360   # GitHub's hard cap for hosted runners; cannot be raised
     steps:

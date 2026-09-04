@@ -76,8 +76,6 @@ jobs:
         # next one adds a choice above and a branch here.
         suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-perf-gpt-oss-120b"]'))
                 || fromJSON('["nightly-tpu-perf-gpt-oss-120b"]') }}
-    # From the matrix: a static name here makes GitHub append every matrix value
-    # in parentheses (README, "Two names per leg").
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:

@@ -95,8 +95,6 @@ jobs:
             run_name: accuracy-gpt-oss-120b-gsm8k
           - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
             run_name: accuracy-gpt-oss-120b-mmlupro
-    # From the matrix: a static name here makes GitHub append every matrix value
-    # in parentheses (README, "Two names per leg").
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
