@@ -1927,6 +1927,7 @@ class Scheduler(
             # not PyTorch MPS streams.
             # Also, this avoids having another stream for
             # single-stream backends(TPU)
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
             return
 
@@ -1949,6 +1950,7 @@ class Scheduler(
         # which exposes .stream() but not necessarily .StreamContext, still
         # enters its schedule stream; equivalent to StreamContext on CUDA.
         with self.device_module.stream(self.schedule_stream):
+            self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
@@ -1973,8 +1975,11 @@ class Scheduler(
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -2017,8 +2022,11 @@ class Scheduler(
 
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs:
+                self.metrics_reporter.record_scheduler_active()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                self._record_scheduler_state_for_paused_engine()
                 continue
 
             # Get the next batch to run
@@ -4262,6 +4270,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4778,7 +4787,9 @@ class Scheduler(
         # path spins without sleeping, so a wall-clock floor bounds the
         # O(queue) get_loads for both sinks; the fully-idle publish runs
         # post-flush below.
-        if not self.is_fully_idle():
+        fully_idle = self.is_fully_idle()
+        if not fully_idle:
+            self.metrics_reporter.record_scheduler_active()
             now = time.monotonic()
             if now - self._last_stall_publish_ts >= LOAD_STALL_REFRESH_S:
                 self._last_stall_publish_ts = now
@@ -4787,6 +4798,7 @@ class Scheduler(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
             return
+        self.metrics_reporter.record_scheduler_idle()
 
         if self.forward_ct > 0 and not self.recompile_stance_set:
             self.recompile_stance_set = True
@@ -4843,6 +4855,13 @@ class Scheduler(
 
         # sleep until next event
         self.maybe_sleep_on_idle()
+        self.metrics_reporter.record_scheduler_idle()
+
+    def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.is_fully_idle():
+            self.metrics_reporter.record_scheduler_idle()
+        else:
+            self.metrics_reporter.record_scheduler_active()
 
     def is_fully_idle(self, for_health_check=False) -> bool:
         # Health check piggybacks on running requests in process_output.
