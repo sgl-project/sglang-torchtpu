@@ -1241,7 +1241,10 @@ class PrefillAdder:
         total_tokens = cand_extend_input_len + max_new + self.page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
+        # Read before `init_load_back` binds `req.mamba_pool_idx` — after that
+        # this returns 0, so the debit sites below reuse the value.
+        mamba_gap_reserve = self._mamba_gap_budget_for_req(req)
+        total_tokens += mamba_gap_reserve
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
@@ -1388,7 +1391,7 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_gap_reserve=mamba_gap_reserve,
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
             else:
@@ -1435,7 +1438,7 @@ class PrefillAdder:
                     trunc_len,
                     0,
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    mamba_gap_reserve=mamba_gap_reserve,
                 )
                 self._account_prefill_cache_admission(req, prefix_len)
 
