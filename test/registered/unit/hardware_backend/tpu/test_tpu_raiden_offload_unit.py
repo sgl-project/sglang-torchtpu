@@ -1196,6 +1196,59 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertEqual(pages, list(range(0, 16)) + list(range(32, 64)))
         self.assertEqual(blocks, remote[0:16] + remote[32:64])
 
+    def test_discarded_waiter_does_not_block_closing_read(self):
+        from sglang.srt.disaggregation.raiden.serde import pack_blocks
+
+        room = 48
+        mgr = self._decode(room, list(range(200, 208)), pool_pages=8)
+        mgr._remote_blocks = {}
+        mgr._remote_endpoint = {}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_swa_endpoint = {}
+        mgr._decode_aux_index = {}
+
+        # Leave only two pages free, so the four-page chunk becomes the
+        # head-of-line waiter.
+        self.assertTrue(mgr._pulling.admit("holder", 6))
+        mgr._on_chunk(
+            [
+                MessageTag.CHUNK,
+                str(room).encode("ascii"),
+                b"48#0",
+                b"48",
+                b"0",
+                b"8",
+                pack_blocks(list(range(4))),
+                b"127.0.0.1:31020",
+            ]
+        )
+        self.assertFalse(mgr.maybe_start_pull(room))
+        self.assertEqual(mgr._pulling.waiting, "48#0")
+
+        # The final metadata moves the decode's retained suffix past that
+        # chunk and queues a replacement closing read. BLOCKS itself does not
+        # release staging capacity: the holder still owns its six pages.
+        mgr._on_blocks(
+            [
+                MessageTag.BLOCKS,
+                str(room).encode("ascii"),
+                pack_blocks(list(range(20))),
+                b"127.0.0.1:31020",
+                pack_blocks([]),
+                b"",
+                b"",
+            ]
+        )
+        self.assertEqual(mgr._pulling.pages(), 6)
+        self.assertFalse(mgr.maybe_start_pull(room))
+        self.assertEqual(mgr._pulling.pages(), 6)
+
+        # Once the holder completes, all eight pages are available. The
+        # discarded chunk must not remain as the head-of-line waiter.
+        mgr._pulling.release("holder")
+        self.assertEqual(mgr._pulling.pages(), 0)
+        self.assertTrue(mgr.maybe_start_pull(room))
+
     def test_room_failure_does_not_settle_its_closing_read(self):
         # An abort shares its id with the closing read; only the engine's own
         # report may release the pages the read still writes.
