@@ -1,16 +1,30 @@
 """Regression tests for fused-RS tuned-table composition."""
 
+import importlib.util
+import unittest
+from pathlib import Path
+
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-from sglang.srt.layers.moe.pallas.fused_rs.v2_fused_rs_tuned_block_sizes import (
-    FUSED_RS_TUNED_BLOCK_SIZES,
+_REPO_ROOT = next(
+    parent
+    for parent in Path(__file__).resolve().parents
+    if (parent / "python" / "sglang").is_dir()
 )
-from sglang.test.test_utils import CustomTestCase
+_TABLE_PATH = (
+    _REPO_ROOT
+    / "python/sglang/srt/layers/moe/pallas/fused_rs/v2_fused_rs_tuned_block_sizes.py"
+)
+_SPEC = importlib.util.spec_from_file_location("fused_rs_tuned_table", _TABLE_PATH)
+assert _SPEC is not None and _SPEC.loader is not None
+_TABLE_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_TABLE_MODULE)
+FUSED_RS_TUNED_BLOCK_SIZES = _TABLE_MODULE.FUSED_RS_TUNED_BLOCK_SIZES
 
 
-class TestFusedRsTunedBlockSizes(CustomTestCase):
+class TestFusedRsTunedBlockSizes(unittest.TestCase):
     def test_large_routed_bucket_uses_established_schedule(self):
         dtype_table = FUSED_RS_TUNED_BLOCK_SIZES["TPU7x"][
             "lhs_bfloat16_rhs_float4_e2m1fn"
@@ -23,6 +37,4 @@ class TestFusedRsTunedBlockSizes(CustomTestCase):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
