@@ -125,6 +125,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.test.name }}
       lane: nightly
       suite: ${{ matrix.test.suite }}
       test_file: ${{ matrix.test.file }}
@@ -158,6 +159,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload
       # hosts feeds only the slice concurrency group; the P/D topology below
       # sizes the JobSet (2-host prefill slice + 2-host decode slice).
       hosts: 2
@@ -185,6 +187,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_pd_tp_resharding
       hosts: 2
       lane: nightly
       pd_prefill_hosts: 2
@@ -210,6 +213,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_singlehost
       lane: nightly
       hosts: 1
       pd_prefill_hosts: 1
@@ -235,6 +239,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_singlehost_spec
       lane: nightly
       hosts: 1
       pd_prefill_hosts: 1
@@ -258,6 +263,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -282,6 +288,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -305,6 +312,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -329,6 +337,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_diffusion_tpu_multihost_collectives
       lane: nightly
       hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py
@@ -357,6 +366,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2
@@ -406,6 +416,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.group.name }}
       lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}

@@ -65,6 +65,13 @@ on:
         required: false
         type: string
         default: ""
+      # Names this job. Nested two deep (nightly -> stage -> here) the Actions
+      # sidebar shows ONLY this job's name per leg, so it must be the test; the
+      # fallbacks cover callers whose suite already is the test.
+      display_name:
+        required: false
+        type: string
+        default: ""
       # --- exec mode: every host runs this command; pod exit codes gate the JobSet ---
       exec_cmd:
         required: false
@@ -100,6 +107,7 @@ env:
 
 jobs:
   test:
+    name: ${{ inputs.display_name || inputs.suite || inputs.run_name || 'test' }}
     runs-on: ubuntu-latest
     timeout-minutes: 360   # GitHub's hard cap for hosted runners; cannot be raised
     steps:
