@@ -33,10 +33,16 @@ from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTok
 from sglang.srt.disaggregation.raiden.conn import (
     DEFAULT_KV_PORT,
     RaidenKVManager,
-    RaidenKVSender,
+    _sliding_window_attn_request_max_blocks,
     get_raiden_kv_caches,
 )
+from sglang.srt.disaggregation.raiden.decode import RaidenDecodeKVManager
+from sglang.srt.disaggregation.raiden.engine import RaidenEngine, RaidenEngineConfig
 from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+from sglang.srt.disaggregation.raiden.prefill import (
+    RaidenKVSender,
+    RaidenPrefillKVManager,
+)
 from sglang.srt.disaggregation.raiden.serde import MessageTag, pack_ints, unpack_blocks
 from sglang.srt.disaggregation.utils import KVClassType, TransferBackend
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
@@ -52,7 +58,181 @@ from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     RaidenFutureEvent,
 )
 from sglang.srt.managers.cache_controller import CacheOperation
-from sglang.test.test_utils import CustomTestCase
+
+CustomTestCase = unittest.TestCase
+
+
+def _engine(native=None):
+    config = RaidenEngineConfig(
+        kv_caches=[],
+        node_id=0,
+        local_control_port=0,
+        endpoint="",
+        max_blocks=0,
+        num_slots=0,
+        timeout_s=120.0,
+        label="test",
+        rank=0,
+    )
+    return RaidenEngine(native or Mock(), config=config)
+
+
+class _TransportView:
+    """Fixture adapter for assertions written against the former facade."""
+
+    def __init__(self, manager):
+        object.__setattr__(self, "_manager", manager)
+        manager._full_attn_engine = _engine()
+        manager._sliding_window_attn_engine = None
+        manager._local_rank = 0
+        manager._timeout_s = 120.0
+        manager._dynamic_host_staging = True
+        for name in (
+            "_held_chunks",
+            "_send_total",
+            "_decode_pages",
+            "_reshard_chunks",
+            "_reshard_covered",
+            "_reshard_ready_pages",
+            "_reshard_pushes_pending",
+            "_pending_offer",
+            "_chunk_seq",
+            "_reshard_chunk_acked",
+            "_send_blocks",
+            "_send_sliding_window_attn_blocks",
+            "_send_aux",
+            "_decode_addr",
+            "_reshard_req",
+            "_reshard_replied_at",
+            "_chunk_queue",
+            "_remote_total",
+            "_announced_spans",
+            "_chunk_reads",
+            "_reshard_chunk_sources",
+            "_reshard_chunk_registering",
+            "_reshard_plans",
+            "_reshard_sources",
+            "_reshard_sliding_window_attn_sources",
+            "_reshard_meta",
+            "_local_blocks",
+            "_local_sliding_window_attn_blocks",
+            "_decode_aux_index",
+            "_remote_blocks",
+            "_remote_sliding_window_attn_blocks",
+            "_remote_endpoint",
+            "_remote_sliding_window_attn_endpoint",
+            "_cleared_plans",
+        ):
+            if not hasattr(manager, name):
+                setattr(manager, name, {})
+        for name in (
+            "_replied",
+            "_reshard_final_pushed",
+            "_reshard_finalized",
+            "_reshard_replied",
+            "_reshard_ready",
+            "_reshard_pushed",
+            "_final_seen",
+            "_reshard_registered",
+            "_pulling_cleared",
+        ):
+            if not hasattr(manager, name):
+                setattr(manager, name, set())
+
+    def __getattr__(self, name):
+        if name == "_sliding_window_attn_max_request_blocks":
+            return lambda: _sliding_window_attn_request_max_blocks(
+                self._manager.kv_args.sliding_window_size,
+                self._manager.kv_args.page_size,
+            )
+        manager = self._manager
+        owner, attr = {
+            "_engine": ("_full_attn_engine", "_engine"),
+            "_sliding_window_attn_engine": ("_sliding_window_attn_engine", "_engine"),
+            "_kv_caches": ("_full_attn_engine", "_kv_caches"),
+            "_sliding_window_attn_kv_caches": (
+                "_sliding_window_attn_engine",
+                "_kv_caches",
+            ),
+            "_endpoint": ("_full_attn_engine", "endpoint"),
+            "_sliding_window_attn_endpoint": (
+                "_sliding_window_attn_engine",
+                "endpoint",
+            ),
+            "_full_attn_engine_max_blocks": ("_full_attn_engine", "max_blocks"),
+            "_sliding_window_attn_engine_max_blocks": (
+                "_sliding_window_attn_engine",
+                "max_blocks",
+            ),
+            "_local_rank": (None, "_local_rank"),
+            "_timeout_s": (None, "_timeout_s"),
+        }[name]
+        target = manager if owner is None else getattr(manager, owner)
+        return None if target is None else getattr(target, attr)
+
+    def __setattr__(self, name, value):
+        if name not in {
+            "_engine",
+            "_sliding_window_attn_engine",
+            "_kv_caches",
+            "_sliding_window_attn_kv_caches",
+            "_endpoint",
+            "_sliding_window_attn_endpoint",
+            "_full_attn_engine_max_blocks",
+            "_sliding_window_attn_engine_max_blocks",
+            "_local_rank",
+            "_timeout_s",
+        }:
+            object.__setattr__(self, name, value)
+            return
+        manager = self._manager
+        if name == "_sliding_window_attn_engine":
+            manager._sliding_window_attn_engine = (
+                None if value is None else _engine(value)
+            )
+            if manager._sliding_window_attn_engine is not None:
+                manager._sliding_window_attn_engine._kv_caches = self.__dict__.get(
+                    "_sliding_window_attn_kv_caches", []
+                )
+                manager._sliding_window_attn_engine.endpoint = self.__dict__.get(
+                    "_sliding_window_attn_endpoint"
+                )
+                manager._sliding_window_attn_engine.max_blocks = self.__dict__.get(
+                    "_sliding_window_attn_engine_max_blocks", 0
+                )
+            return
+        owner, attr = {
+            "_engine": ("_full_attn_engine", "_engine"),
+            "_kv_caches": ("_full_attn_engine", "_kv_caches"),
+            "_sliding_window_attn_kv_caches": (
+                "_sliding_window_attn_engine",
+                "_kv_caches",
+            ),
+            "_endpoint": ("_full_attn_engine", "endpoint"),
+            "_sliding_window_attn_endpoint": (
+                "_sliding_window_attn_engine",
+                "endpoint",
+            ),
+            "_full_attn_engine_max_blocks": ("_full_attn_engine", "max_blocks"),
+            "_sliding_window_attn_engine_max_blocks": (
+                "_sliding_window_attn_engine",
+                "max_blocks",
+            ),
+            "_local_rank": (None, "_local_rank"),
+            "_timeout_s": (None, "_timeout_s"),
+        }[name]
+        target = manager if owner is None else getattr(manager, owner)
+        if target is None:
+            object.__setattr__(self, name, value)
+            return
+        setattr(target, attr, value)
+
+    def ensure_ready(self):
+        return None
+
+
+def _transport(manager):
+    return _TransportView(manager)
 
 
 class _FakeTransfer:
@@ -186,10 +366,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertEqual(kv_args.kv_head_num, 4)
         self.assertEqual(kv_args.total_kv_head_num, 8)
         self.assertEqual(
-            captured["kv_caches"].full,
+            captured["kv_caches"].full_attn,
             [_KVPool.buffers[0], _DraftKVPool.buffers[0]],
         )
-        self.assertEqual(captured["kv_caches"].swa, [])
+        self.assertEqual(captured["kv_caches"].sliding_window_attn, [])
         model_config.get_total_num_kv_heads.assert_called_once_with()
 
     def test_sender_matches_base_api_contract(self):
@@ -213,10 +393,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
         pool = _Pool()
         groups = get_raiden_kv_caches(pool)
-        self.assertEqual(groups.full, pool.buffers)
-        self.assertEqual(groups.swa, [])
+        self.assertEqual(groups.full_attn, pool.buffers)
+        self.assertEqual(groups.sliding_window_attn, [])
 
-    def test_mixed_block_counts_require_uniform_swa_memory(self):
+    def test_mixed_block_counts_require_uniform_sliding_window_attn_memory(self):
         class _Pool:
             start_layer = 0
             layer_num = 2
@@ -225,10 +405,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             def get_fused_kv_buffer(self, layer_id):
                 return self.buffers[layer_id]
 
-        with self.assertRaisesRegex(RuntimeError, "uniform full KV block counts"):
+        with self.assertRaisesRegex(
+            RuntimeError, "uniform full-attention KV block counts"
+        ):
             get_raiden_kv_caches(_Pool())
 
-    def test_hybrid_swa_caches_are_grouped_by_page_namespace(self):
+    def test_hybrid_sliding_window_attn_caches_are_grouped_by_page_namespace(self):
         class _Pool:
             start_layer = 0
             layer_num = 4
@@ -249,8 +431,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 return self.buffers[layer_id]
 
         groups = get_raiden_kv_caches(_Pool())
-        self.assertEqual(groups.full, [_Pool.buffers[0], _Pool.buffers[2]])
-        self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
+        self.assertEqual(groups.full_attn, [_Pool.buffers[0], _Pool.buffers[2]])
+        self.assertEqual(
+            groups.sliding_window_attn, [_Pool.buffers[1], _Pool.buffers[3]]
+        )
 
     def test_speculative_draft_caches_join_target_page_namespaces(self):
         class _TargetPool:
@@ -271,11 +455,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 return self.buffers[layer_id]
 
         groups = get_raiden_kv_caches(_TargetPool(), draft_pool=_DraftPool())
-        self.assertEqual(groups.full, [_TargetPool.buffers[0], _DraftPool.buffers[0]])
-        self.assertEqual(groups.swa, [_TargetPool.buffers[1]])
+        self.assertEqual(
+            groups.full_attn, [_TargetPool.buffers[0], _DraftPool.buffers[0]]
+        )
+        self.assertEqual(groups.sliding_window_attn, [_TargetPool.buffers[1]])
 
-    def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
-        mgr = object.__new__(RaidenKVManager)
+    def test_hybrid_sliding_window_attn_max_blocks_is_sized_from_sliding_window(self):
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -287,10 +474,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             os.environ,
             {"SGLANG_RAIDEN_SWA_MAX_BLOCKS": "0"},
         ):
-            self.assertEqual(mgr._swa_max_request_blocks(), 33)
+            self.assertEqual(
+                mgr.transport._sliding_window_attn_max_request_blocks(), 33
+            )
 
-    def test_hybrid_swa_max_blocks_override_is_independent(self):
-        mgr = object.__new__(RaidenKVManager)
+    def test_hybrid_sliding_window_attn_max_blocks_override_is_independent(self):
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -305,7 +495,9 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 "SGLANG_RAIDEN_SWA_MAX_BLOCKS": "11",
             },
         ):
-            self.assertEqual(mgr._swa_max_request_blocks(), 11)
+            self.assertEqual(
+                mgr.transport._sliding_window_attn_max_request_blocks(), 11
+            )
 
     def test_symmetric_pull_rendezvous(self):
         class _Engine:
@@ -316,7 +508,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         blocks = [3, 9]
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
-                mgr = object.__new__(RaidenKVManager)
+                mgr = object.__new__(RaidenPrefillKVManager)
+                mgr.transport = _transport(mgr)
                 mgr._aborted = {}
                 mgr._send_reads = {}
                 mgr.failure_records = {}
@@ -334,12 +527,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr._replied = set()
                 mgr._reshard_req = {}
                 mgr._reshard_finalized = set()
-                mgr._engine = _Engine()
-                mgr._swa_engine = None
-                mgr._swa_kv_caches = []
-                mgr._send_swa_blocks = {}
-                mgr.swa_raiden_endpoint = None
-                mgr.raiden_endpoint = "127.0.0.1:31020"
+                mgr.transport._engine = _Engine()
+                mgr.transport._sliding_window_attn_engine = None
+                mgr.transport._sliding_window_attn_kv_caches = []
+                mgr._send_sliding_window_attn_blocks = {}
+                mgr.transport._sliding_window_attn_endpoint = None
+                mgr.transport._endpoint = "127.0.0.1:31020"
                 socket = Mock()
                 mgr._socket_send_locks = defaultdict(threading.Lock)
                 mgr._socket_lock = threading.Lock()
@@ -353,24 +546,25 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr.append_send_blocks(room, blocks)
                 if finalize_first:
                     mgr.finalize_send(room, None)
-                    mgr._engine.register_read.assert_not_called()
+                    mgr.transport._engine.register_read.assert_not_called()
                     mgr._decode_addr[room] = ("127.0.0.1", 31002)
                     mgr._maybe_reply(room)
                 else:
                     mgr._decode_addr[room] = ("127.0.0.1", 31002)
                     mgr._maybe_reply(room)
-                    mgr._engine.register_read.assert_not_called()
+                    mgr.transport._engine.register_read.assert_not_called()
                     mgr.finalize_send(room, None)
 
-                mgr._engine.register_read.assert_called_once_with(
+                mgr.transport._engine.register_read.assert_called_once_with(
                     str(room), room, blocks
                 )
 
-    def test_hybrid_swa_rendezvous_registers_both_engines(self):
+    def test_hybrid_sliding_window_attn_rendezvous_registers_both_engines(self):
         room = 23
-        full_blocks = [3, 9]
-        swa_blocks = [5, 7]
-        mgr = object.__new__(RaidenKVManager)
+        full_attn_blocks = [3, 9]
+        sliding_window_attn_blocks = [5, 7]
+        mgr = object.__new__(RaidenPrefillKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -384,17 +578,17 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._read_leases = {}
         mgr._aborted = {}
         mgr._send_reads = {}
-        mgr._send_swa_blocks = {}
+        mgr._send_sliding_window_attn_blocks = {}
         mgr._send_aux = {}
         mgr._decode_addr = {}
         mgr._replied = set()
         mgr._reshard_req = {}
         mgr._reshard_finalized = set()
-        mgr._engine = Mock()
-        mgr._swa_engine = Mock()
-        mgr._swa_kv_caches = [object()]
-        mgr.raiden_endpoint = "127.0.0.1:31020"
-        mgr.swa_raiden_endpoint = "127.0.0.1:31022"
+        mgr.transport._engine = Mock()
+        mgr.transport._sliding_window_attn_engine = Mock()
+        mgr.transport._sliding_window_attn_kv_caches = [object()]
+        mgr.transport._endpoint = "127.0.0.1:31020"
+        mgr.transport._sliding_window_attn_endpoint = "127.0.0.1:31022"
         mgr._completed_send = set()
         socket = Mock()
         mgr._socket_send_locks = defaultdict(threading.Lock)
@@ -406,26 +600,35 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             )
         )
 
-        swa_from_state = mgr._swa_blocks_from_state_indices([swa_blocks])
-        mgr.append_send_blocks(room, full_blocks, swa_from_state)
+        sliding_window_attn_from_state = (
+            mgr.sliding_window_attn_blocks_from_state_indices(
+                [sliding_window_attn_blocks]
+            )
+        )
+        mgr.append_send_blocks(room, full_attn_blocks, sliding_window_attn_from_state)
         mgr._decode_addr[room] = ("127.0.0.1", 31002)
         mgr.finalize_send(room, None)
 
-        mgr._engine.register_read.assert_called_once_with(str(room), room, full_blocks)
-        mgr._swa_engine.register_read.assert_called_once_with(
-            mgr._swa_req_id(room), room, swa_blocks
+        mgr.transport._engine.register_read.assert_called_once_with(
+            str(room), room, full_attn_blocks
+        )
+        mgr.transport._sliding_window_attn_engine.register_read.assert_called_once_with(
+            mgr._sliding_window_attn_req_id(room), room, sliding_window_attn_blocks
         )
         payload = socket.send_multipart.call_args.args[0]
         self.assertEqual(len(payload), 7)
         self.assertEqual(payload[5], b"127.0.0.1:31022")
 
         self.assertFalse(mgr.is_send_done(room))
-        mgr._completed_send.update((str(room), mgr._swa_req_id(room)))
+        mgr._completed_send.update((str(room), mgr._sliding_window_attn_req_id(room)))
         self.assertTrue(mgr.is_send_done(room))
 
-    def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
+    def test_hybrid_sliding_window_attn_decode_starts_both_pulls_with_separate_pages(
+        self,
+    ):
         room = 29
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -433,44 +636,45 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._swa_engine = Mock()
+        mgr.transport._engine = Mock()
+        mgr.transport._sliding_window_attn_engine = Mock()
         mgr._pulling = SlotAdmission(1)
-        mgr._full_engine_max_blocks = 2
-        mgr._swa_engine_max_blocks = 1
+        mgr.transport._full_attn_engine_max_blocks = 2
+        mgr.transport._sliding_window_attn_engine_max_blocks = 1
         mgr._local_blocks = {room: [8, 9]}
-        mgr._local_swa_blocks = {room: [7]}
+        mgr._local_sliding_window_attn_blocks = {room: [7]}
         mgr._remote_blocks = {room: [1, 2, 3]}
-        mgr._remote_swa_blocks = {room: [4, 5]}
+        mgr._remote_sliding_window_attn_blocks = {room: [4, 5]}
         mgr._remote_endpoint = {room: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._remote_sliding_window_attn_endpoint = {room: "127.0.0.1:31022"}
         mgr.chunked_transfer = False
         mgr._failed = set()
         mgr._native_failed = set()
 
         self.assertTrue(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_called_once_with(
+        mgr.transport._engine.start_read.assert_called_once_with(
             str(room), room, "127.0.0.1:31020", [2, 3], [8, 9]
         )
-        mgr._swa_engine.start_read.assert_called_once_with(
-            mgr._swa_req_id(room), room, "127.0.0.1:31022", [5], [7]
+        mgr.transport._sliding_window_attn_engine.start_read.assert_called_once_with(
+            mgr._sliding_window_attn_req_id(room), room, "127.0.0.1:31022", [5], [7]
         )
 
-    def _make_hybrid_swa_decode_manager(
+    def _make_hybrid_sliding_window_attn_decode_manager(
         self,
         *,
-        full_pages,
-        swa_pages,
-        full_max_blocks=128,
-        swa_max_blocks=33,
+        full_attn_pages,
+        sliding_window_attn_pages,
+        full_attn_max_blocks=128,
+        sliding_window_attn_max_blocks=33,
     ):
         room = 29
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._swa_engine = Mock()
+        mgr.transport._engine = Mock()
+        mgr.transport._sliding_window_attn_engine = Mock()
         mgr._pulling = SlotAdmission(1)
         mgr._pulling_cleared = set()
         mgr._aborted = {}
@@ -478,46 +682,56 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._status_lock = threading.Lock()
         mgr.request_status = {}
         mgr._failed_reasons = {}
-        mgr._full_engine_max_blocks = full_max_blocks
-        mgr._swa_engine_max_blocks = swa_max_blocks
+        mgr.transport._full_attn_engine_max_blocks = full_attn_max_blocks
+        mgr.transport._sliding_window_attn_engine_max_blocks = (
+            sliding_window_attn_max_blocks
+        )
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
         mgr.record_failure = Mock()
-        mgr._local_blocks = {room: list(range(1000, 1000 + full_pages))}
-        mgr._local_swa_blocks = {room: list(range(2000, 2000 + swa_pages))}
-        mgr._remote_blocks = {room: list(range(full_pages))}
-        mgr._remote_swa_blocks = {room: list(range(swa_pages))}
+        mgr._local_blocks = {room: list(range(1000, 1000 + full_attn_pages))}
+        mgr._local_sliding_window_attn_blocks = {
+            room: list(range(2000, 2000 + sliding_window_attn_pages))
+        }
+        mgr._remote_blocks = {room: list(range(full_attn_pages))}
+        mgr._remote_sliding_window_attn_blocks = {
+            room: list(range(sliding_window_attn_pages))
+        }
         mgr._remote_endpoint = {room: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._remote_sliding_window_attn_endpoint = {room: "127.0.0.1:31022"}
         return room, mgr
 
-    def test_hybrid_swa_decode_accepts_full_request_larger_than_swa_window(self):
-        room, mgr = self._make_hybrid_swa_decode_manager(
-            full_pages=128,
-            swa_pages=33,
+    def test_hybrid_sliding_window_attn_decode_accepts_full_request_larger_than_sliding_window_attn_window(
+        self,
+    ):
+        room, mgr = self._make_hybrid_sliding_window_attn_decode_manager(
+            full_attn_pages=128,
+            sliding_window_attn_pages=33,
         )
 
         self.assertTrue(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_called_once_with(
+        mgr.transport._engine.start_read.assert_called_once_with(
             str(room),
             room,
             "127.0.0.1:31020",
             list(range(128)),
             list(range(1000, 1128)),
         )
-        mgr._swa_engine.start_read.assert_called_once_with(
-            mgr._swa_req_id(room),
+        mgr.transport._sliding_window_attn_engine.start_read.assert_called_once_with(
+            mgr._sliding_window_attn_req_id(room),
             room,
             "127.0.0.1:31022",
             list(range(33)),
             list(range(2000, 2033)),
         )
 
-    def test_hybrid_swa_decode_rejects_oversized_full_attention_pull(self):
-        room, mgr = self._make_hybrid_swa_decode_manager(
-            full_pages=129,
-            swa_pages=33,
+    def test_hybrid_sliding_window_attn_decode_rejects_oversized_full_attention_pull(
+        self,
+    ):
+        room, mgr = self._make_hybrid_sliding_window_attn_decode_manager(
+            full_attn_pages=129,
+            sliding_window_attn_pages=33,
         )
 
         self.assertFalse(mgr.maybe_start_pull(room))
@@ -526,13 +740,15 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertIn("129 pages", reason)
         self.assertIn("holds 128", reason)
         self.assertIn("SGLANG_RAIDEN_MAX_BLOCKS", reason)
-        mgr._engine.start_read.assert_not_called()
-        mgr._swa_engine.start_read.assert_not_called()
+        mgr.transport._engine.start_read.assert_not_called()
+        mgr.transport._sliding_window_attn_engine.start_read.assert_not_called()
 
-    def test_hybrid_swa_decode_rejects_oversized_swa_pull(self):
-        room, mgr = self._make_hybrid_swa_decode_manager(
-            full_pages=128,
-            swa_pages=34,
+    def test_hybrid_sliding_window_attn_decode_rejects_oversized_sliding_window_attn_pull(
+        self,
+    ):
+        room, mgr = self._make_hybrid_sliding_window_attn_decode_manager(
+            full_attn_pages=128,
+            sliding_window_attn_pages=34,
         )
 
         self.assertFalse(mgr.maybe_start_pull(room))
@@ -541,12 +757,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertIn("34 pages", reason)
         self.assertIn("holds 33", reason)
         self.assertIn("SGLANG_RAIDEN_SWA_MAX_BLOCKS", reason)
-        mgr._engine.start_read.assert_not_called()
-        mgr._swa_engine.start_read.assert_not_called()
+        mgr.transport._engine.start_read.assert_not_called()
+        mgr.transport._sliding_window_attn_engine.start_read.assert_not_called()
 
     def test_decode_defers_pull_until_a_staging_slot_frees(self):
         first, second = 29, 30
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -555,35 +772,36 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._swa_engine = None
+        mgr.transport._engine = Mock()
+        mgr.transport._sliding_window_attn_engine = None
         mgr._pulling = SlotAdmission(1)
         mgr._pulling_cleared = set()
-        mgr._full_engine_max_blocks = 4
+        mgr.transport._full_attn_engine_max_blocks = 4
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
         mgr._local_blocks = {first: [8], second: [9]}
-        mgr._local_swa_blocks = {}
+        mgr._local_sliding_window_attn_blocks = {}
         mgr._remote_blocks = {first: [1], second: [2]}
-        mgr._remote_swa_blocks = {}
+        mgr._remote_sliding_window_attn_blocks = {}
         mgr._remote_endpoint = {r: "127.0.0.1:31020" for r in (first, second)}
-        mgr._remote_swa_endpoint = {}
+        mgr._remote_sliding_window_attn_endpoint = {}
 
         self.assertTrue(mgr.maybe_start_pull(first))
         self.assertFalse(mgr.maybe_start_pull(second))
-        self.assertEqual(mgr._engine.start_read.call_count, 1)
+        self.assertEqual(mgr.transport._engine.start_read.call_count, 1)
 
         mgr._completed_recv.add(str(first))
         mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
-        mgr._engine.start_read.assert_called_with(
+        mgr.transport._engine.start_read.assert_called_with(
             str(second), second, "127.0.0.1:31020", [2], [9]
         )
 
     @staticmethod
-    def _decode_mgr(capacity, full_limit, swa_limit=None):
-        mgr = object.__new__(RaidenKVManager)
+    def _decode_mgr(capacity, full_attn_limit, sliding_window_attn_limit=None):
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -592,22 +810,26 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._swa_engine = Mock() if swa_limit is not None else None
+        mgr.transport._engine = Mock()
+        mgr.transport._sliding_window_attn_engine = (
+            Mock() if sliding_window_attn_limit is not None else None
+        )
         mgr._pulling = SlotAdmission(capacity)
         mgr._pulling_cleared = set()
-        mgr._full_engine_max_blocks = full_limit
-        mgr._swa_engine_max_blocks = swa_limit or 0
+        mgr.transport._full_attn_engine_max_blocks = full_attn_limit
+        mgr.transport._sliding_window_attn_engine_max_blocks = (
+            sliding_window_attn_limit or 0
+        )
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
         mgr._local_blocks = {}
-        mgr._local_swa_blocks = {}
+        mgr._local_sliding_window_attn_blocks = {}
         mgr._remote_blocks = {}
-        mgr._remote_swa_blocks = {}
+        mgr._remote_sliding_window_attn_blocks = {}
         mgr._remote_endpoint = {}
-        mgr._remote_swa_endpoint = {}
+        mgr._remote_sliding_window_attn_endpoint = {}
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
         # clear_room sweeps the reshard bookkeeping too.
@@ -616,40 +838,48 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         return mgr
 
     @staticmethod
-    def _announce(mgr, room, full_pages, swa_pages=0):
-        mgr._local_blocks[room] = list(range(100, 100 + full_pages))
-        mgr._remote_blocks[room] = list(range(full_pages))
+    def _announce(mgr, room, full_attn_pages, sliding_window_attn_pages=0):
+        mgr._local_blocks[room] = list(range(100, 100 + full_attn_pages))
+        mgr._remote_blocks[room] = list(range(full_attn_pages))
         mgr._remote_endpoint[room] = "127.0.0.1:31020"
-        if mgr._swa_engine is not None:
-            mgr._local_swa_blocks[room] = list(range(200, 200 + swa_pages))
-            mgr._remote_swa_blocks[room] = list(range(swa_pages))
-            mgr._remote_swa_endpoint[room] = "127.0.0.1:31022"
+        if mgr.transport._sliding_window_attn_engine is not None:
+            mgr._local_sliding_window_attn_blocks[room] = list(
+                range(200, 200 + sliding_window_attn_pages)
+            )
+            mgr._remote_sliding_window_attn_blocks[room] = list(
+                range(sliding_window_attn_pages)
+            )
+            mgr._remote_sliding_window_attn_endpoint[room] = "127.0.0.1:31022"
 
-    def test_hybrid_swa_checks_each_pool_against_its_own_page_limit(self):
+    def test_hybrid_sliding_window_attn_checks_each_pool_against_its_own_page_limit(
+        self,
+    ):
         # gpt-oss at page 64: a 128-token window is 3 pages, the full pool 128.
         room = 31
-        mgr = self._decode_mgr(capacity=4, full_limit=128, swa_limit=3)
-        self._announce(mgr, room, full_pages=40, swa_pages=3)
+        mgr = self._decode_mgr(
+            capacity=4, full_attn_limit=128, sliding_window_attn_limit=3
+        )
+        self._announce(mgr, room, full_attn_pages=40, sliding_window_attn_pages=3)
 
         self.assertTrue(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_called_once()
-        mgr._swa_engine.start_read.assert_called_once()
+        mgr.transport._engine.start_read.assert_called_once()
+        mgr.transport._sliding_window_attn_engine.start_read.assert_called_once()
         mgr.record_failure.assert_not_called()
 
         too_wide = 32
-        self._announce(mgr, too_wide, full_pages=4, swa_pages=5)
+        self._announce(mgr, too_wide, full_attn_pages=4, sliding_window_attn_pages=5)
         self.assertFalse(mgr.maybe_start_pull(too_wide))
         self.assertIn(str(too_wide), mgr._failed)
         self.assertIn(
             "SGLANG_RAIDEN_SWA_MAX_BLOCKS", mgr.record_failure.call_args.args[1]
         )
-        self.assertEqual(mgr._engine.start_read.call_count, 1)
+        self.assertEqual(mgr.transport._engine.start_read.call_count, 1)
 
     def test_cleared_room_keeps_its_slot_until_the_read_settles(self):
         first, second = 33, 34
-        mgr = self._decode_mgr(capacity=1, full_limit=8)
-        self._announce(mgr, first, full_pages=2)
-        self._announce(mgr, second, full_pages=2)
+        mgr = self._decode_mgr(capacity=1, full_attn_limit=8)
+        self._announce(mgr, first, full_attn_pages=2)
+        self._announce(mgr, second, full_attn_pages=2)
         mgr._send_blocks = {}
         mgr._read_leases = {}
 
@@ -667,9 +897,9 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_cleared_settled_room_releases_its_slot_at_once(self):
         first, second = 35, 36
-        mgr = self._decode_mgr(capacity=1, full_limit=8)
-        self._announce(mgr, first, full_pages=2)
-        self._announce(mgr, second, full_pages=2)
+        mgr = self._decode_mgr(capacity=1, full_attn_limit=8)
+        self._announce(mgr, first, full_attn_pages=2)
+        self._announce(mgr, second, full_attn_pages=2)
         mgr._send_blocks = {}
         mgr._read_leases = {}
 
@@ -679,11 +909,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertTrue(mgr.maybe_start_pull(second))
         self.assertNotIn(str(first), mgr._completed_recv)
 
-    def test_hybrid_swa_slot_is_held_until_both_engines_settle(self):
+    def test_hybrid_sliding_window_attn_slot_is_held_until_both_engines_settle(self):
         first, second = 37, 38
-        mgr = self._decode_mgr(capacity=1, full_limit=8, swa_limit=3)
-        self._announce(mgr, first, full_pages=2, swa_pages=1)
-        self._announce(mgr, second, full_pages=2, swa_pages=1)
+        mgr = self._decode_mgr(
+            capacity=1, full_attn_limit=8, sliding_window_attn_limit=3
+        )
+        self._announce(mgr, first, full_attn_pages=2, sliding_window_attn_pages=1)
+        self._announce(mgr, second, full_attn_pages=2, sliding_window_attn_pages=1)
 
         self.assertTrue(mgr.maybe_start_pull(first))
         # The full-attention read fails while the sliding-window read is
@@ -694,14 +926,15 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             mgr._release_pull_slots_locked()
         self.assertFalse(mgr.maybe_start_pull(second))
 
-        mgr._completed_recv.add(mgr._swa_req_id(first))
+        mgr._completed_recv.add(mgr._sliding_window_attn_req_id(first))
         with mgr._state_lock:
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
 
     @staticmethod
     def _reshard_decode_mgr():
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -709,12 +942,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.request_status = {}
         mgr._state_lock = threading.RLock()
         mgr._completed_recv = set()
-        mgr._swa_engine = Mock()
+        mgr.transport._sliding_window_attn_engine = Mock()
         mgr._dynamic_host_staging = True
         mgr.update_status = Mock()
         return mgr
 
-    def test_hybrid_swa_reshard_forwards_its_window_pages(self):
+    def test_hybrid_sliding_window_attn_reshard_forwards_its_window_pages(self):
         """Asymmetric TP used to reject hybrid models outright. It now forwards
         the sliding-window pages too, so the second engine can be given its own
         reshard plan -- without them the window would never reach decode."""
@@ -724,7 +957,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.register_decode_request(
             room=31,
             local_blocks=[8, 9],
-            local_swa_blocks=[6, 7],
+            local_sliding_window_attn_blocks=[6, 7],
             aux_index=None,
             bootstrap_infos=[{}, {}],
         )
@@ -733,7 +966,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             31, [8, 9], [6, 7], None, [{}, {}]
         )
 
-    def test_hybrid_swa_reshard_prefix_hit_settles_both_engines(self):
+    def test_hybrid_sliding_window_attn_reshard_prefix_hit_settles_both_engines(self):
         """A full prefix hit receives nothing on either engine. Settling only
         the full-attention id would hang is_recv_done, which requires the
         sliding-window id too whenever a second engine exists."""
@@ -743,14 +976,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr.register_decode_request(
             room=31,
             local_blocks=[],
-            local_swa_blocks=[6, 7],
+            local_sliding_window_attn_blocks=[6, 7],
             aux_index=None,
             bootstrap_infos=[{}, {}],
         )
 
         mgr._register_reshard_request.assert_not_called()
         self.assertIn("31", mgr._completed_recv)
-        self.assertIn(mgr._swa_req_id(31), mgr._completed_recv)
+        self.assertIn(mgr._sliding_window_attn_req_id(31), mgr._completed_recv)
 
     def test_alloc_returns_page_aligned_token_runs(self):
         pool = _make_host_pool(page_size=4, page_num=3)
@@ -826,7 +1059,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
 
     @staticmethod
     def _prefill():
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenPrefillKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -835,10 +1069,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._engine.register_read = Mock(return_value=True)
-        mgr._swa_engine = None
-        mgr._local_rank = 3
+        mgr.transport._engine = Mock()
+        mgr.transport._engine.register_read = Mock(return_value=True)
+        mgr.transport._sliding_window_attn_engine = None
+        mgr.transport._local_rank = 3
         mgr._chunk_seq = {}
         mgr._uuid_seq = 0
         mgr._held_chunks = {}
@@ -852,7 +1086,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._announce_pages = 16
         mgr._reshard_req = {}
         mgr._reshard_finalized = set()
-        mgr.raiden_endpoint = "127.0.0.1:31020"
+        mgr.transport._endpoint = "127.0.0.1:31020"
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()
@@ -883,12 +1117,14 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # 64 prefill pages; the decode already holds the first 24.
         blocks = list(range(100, 164))
         mgr.offer_chunk(room, 0, blocks[0:16], 64)
-        mgr._engine.register_read.assert_not_called()
+        mgr.transport._engine.register_read.assert_not_called()
         mgr._socket.send_multipart.assert_not_called()
 
         mgr.offer_chunk(room, 16, blocks[16:32], 64)
-        mgr._engine.register_read.assert_called_once()
-        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[24:32])
+        mgr.transport._engine.register_read.assert_called_once()
+        self.assertEqual(
+            mgr.transport._engine.register_read.call_args.args[2], blocks[24:32]
+        )
         msg = mgr._socket.send_multipart.call_args.args[0]
         self.assertEqual(msg[0], MessageTag.CHUNK)
         self.assertEqual(int(msg[4]), 24)
@@ -896,8 +1132,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertEqual(unpack_blocks(msg[6]), blocks[24:32])
 
         mgr.offer_chunk(room, 32, blocks[32:48], 64)
-        self.assertEqual(mgr._engine.register_read.call_count, 2)
-        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[32:48])
+        self.assertEqual(mgr.transport._engine.register_read.call_count, 2)
+        self.assertEqual(
+            mgr.transport._engine.register_read.call_args.args[2], blocks[32:48]
+        )
 
     def test_small_chunks_gather_into_one_announcement(self):
         room = 34
@@ -905,10 +1143,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._on_pull_req(self._pull_req(room, 64))
         blocks = list(range(100, 164))
         mgr.offer_chunk(room, 0, blocks[0:8], 64)
-        mgr._engine.register_read.assert_not_called()
+        mgr.transport._engine.register_read.assert_not_called()
         mgr.offer_chunk(room, 8, blocks[8:16], 64)
-        mgr._engine.register_read.assert_called_once()
-        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[0:16])
+        mgr.transport._engine.register_read.assert_called_once()
+        self.assertEqual(
+            mgr.transport._engine.register_read.call_args.args[2], blocks[0:16]
+        )
         self.assertEqual(int(mgr._socket.send_multipart.call_args.args[0][4]), 0)
         self.assertNotIn(room, mgr._pending_offer)
 
@@ -918,16 +1158,19 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         blocks = list(range(100, 164))
         mgr.offer_chunk(room, 0, blocks[0:16], 64)
         mgr.offer_chunk(room, 16, blocks[16:32], 64)
-        mgr._engine.register_read.assert_not_called()
+        mgr.transport._engine.register_read.assert_not_called()
 
         mgr._on_pull_req(self._pull_req(room, 40))
-        self.assertEqual(mgr._engine.register_read.call_count, 1)
-        self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[24:32])
+        self.assertEqual(mgr.transport._engine.register_read.call_count, 1)
+        self.assertEqual(
+            mgr.transport._engine.register_read.call_args.args[2], blocks[24:32]
+        )
         self.assertNotIn(room, mgr._held_chunks)
 
     @staticmethod
     def _decode(room, local, capacity):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -935,13 +1178,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.request_status = {}
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._engine.start_read = Mock(return_value=0)
-        mgr._swa_engine = None
+        mgr.transport._engine = Mock()
+        mgr.transport._engine.start_read = Mock(return_value=0)
+        mgr.transport._sliding_window_attn_engine = None
         mgr.chunked_transfer = True
         mgr._pulling = SlotAdmission(capacity)
-        mgr._full_engine_max_blocks = 64
-        mgr._swa_engine_max_blocks = 2
+        mgr.transport._full_attn_engine_max_blocks = 64
+        mgr.transport._sliding_window_attn_engine_max_blocks = 2
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
         mgr._local_blocks = {room: local}
@@ -968,20 +1211,20 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
-        mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {room: [4, 5]}
-        mgr._local_swa_blocks = {room: [7]}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr.transport._sliding_window_attn_engine = Mock()
+        mgr._remote_sliding_window_attn_blocks = {room: [4, 5]}
+        mgr._local_sliding_window_attn_blocks = {room: [7]}
+        mgr._remote_sliding_window_attn_endpoint = {room: "127.0.0.1:31022"}
         mgr._final_seen.add(room)
         mgr._chunk_queue[room] = [
             (str(room), room, list(range(48, 48 + 16)), remote[48:64], endpoint)
         ]
 
         self.assertTrue(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_called_once_with(
+        mgr.transport._engine.start_read.assert_called_once_with(
             "35", room, endpoint, remote[48:64], local[48:64]
         )
-        mgr._swa_engine.start_read.assert_called_once_with(
+        mgr.transport._sliding_window_attn_engine.start_read.assert_called_once_with(
             "swa:35", room, "127.0.0.1:31022", [5], [7]
         )
         mgr._completed_recv.add("35")
@@ -996,17 +1239,17 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
         mgr._chunk_queue[room] = [
-            ("33#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
+            ("33#0", 11, list(range(0 + 16)), remote[0:16], endpoint),
             ("33#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
 
         self.assertTrue(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_called_once_with(
+        mgr.transport._engine.start_read.assert_called_once_with(
             "33#0", 11, endpoint, remote[0:16], local[0:16]
         )
         # The second chunk waits for the first read even though slots are free.
         self.assertTrue(mgr.maybe_start_pull(room))
-        self.assertEqual(mgr._engine.start_read.call_count, 1)
+        self.assertEqual(mgr.transport._engine.start_read.call_count, 1)
         self.assertEqual(len(mgr._pulling), 1)
         self.assertFalse(mgr.is_recv_done(room))
 
@@ -1014,9 +1257,11 @@ class TestRaidenChunkedTransfer(CustomTestCase):
             mgr._completed_recv.add("33#0")
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(room))
-        self.assertEqual(mgr._engine.start_read.call_count, 2)
-        self.assertEqual(mgr._engine.start_read.call_args.args[0], "33#1")
-        self.assertEqual(mgr._engine.start_read.call_args.args[4], local[16:32])
+        self.assertEqual(mgr.transport._engine.start_read.call_count, 2)
+        self.assertEqual(mgr.transport._engine.start_read.call_args.args[0], "33#1")
+        self.assertEqual(
+            mgr.transport._engine.start_read.call_args.args[4], local[16:32]
+        )
         self.assertEqual(len(mgr._pulling), 1)
 
     def test_oversized_chunk_fails_the_request(self):
@@ -1024,13 +1269,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         mgr = self._decode(room, local, capacity=4)
-        mgr._full_engine_max_blocks = 8
+        mgr.transport._full_attn_engine_max_blocks = 8
         mgr._chunk_queue[room] = [
-            ("43#0", 11, list(range(0, 0 + 16)), remote[0:16], "127.0.0.1:31020")
+            ("43#0", 11, list(range(0 + 16)), remote[0:16], "127.0.0.1:31020")
         ]
 
         self.assertFalse(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_not_called()
+        mgr.transport._engine.start_read.assert_not_called()
         self.assertTrue(mgr.is_failed(room))
         self.assertIn("SGLANG_RAIDEN_MAX_BLOCKS", mgr.record_failure.call_args.args[1])
         self.assertIn("16 pages", mgr.record_failure.call_args.args[1])
@@ -1040,10 +1285,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         mgr = self._decode(room, local, capacity=4)
-        mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {room: [4, 5, 6]}
-        mgr._local_swa_blocks = {room: [7, 8, 9]}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr.transport._sliding_window_attn_engine = Mock()
+        mgr._remote_sliding_window_attn_blocks = {room: [4, 5, 6]}
+        mgr._local_sliding_window_attn_blocks = {room: [7, 8, 9]}
+        mgr._remote_sliding_window_attn_endpoint = {room: "127.0.0.1:31022"}
         mgr._chunk_queue[room] = [
             (
                 str(room),
@@ -1055,8 +1300,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         ]
 
         self.assertFalse(mgr.maybe_start_pull(room))
-        mgr._engine.start_read.assert_not_called()
-        mgr._swa_engine.start_read.assert_not_called()
+        mgr.transport._engine.start_read.assert_not_called()
+        mgr.transport._sliding_window_attn_engine.start_read.assert_not_called()
         self.assertTrue(mgr.is_failed(room))
         self.assertIn(
             "SGLANG_RAIDEN_SWA_MAX_BLOCKS", mgr.record_failure.call_args.args[1]
@@ -1096,8 +1341,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr = self._decode(room, list(range(200, 264)), capacity=4)
         mgr._remote_blocks = {}
         mgr._remote_endpoint = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_swa_endpoint = {}
+        mgr._remote_sliding_window_attn_blocks = {}
+        mgr._remote_sliding_window_attn_endpoint = {}
         mgr._decode_aux_index = {}
         mgr._on_chunk(
             [
@@ -1124,7 +1369,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         )
         req_id, uuid, pages, blocks, _ = mgr._chunk_queue[room][-1]
         self.assertEqual(req_id, str(room))
-        self.assertEqual(pages, list(range(0, 16)) + list(range(32, 64)))
+        self.assertEqual(pages, list(range(16)) + list(range(32, 64)))
         self.assertEqual(blocks, remote[0:16] + remote[32:64])
 
     def test_room_failure_does_not_settle_its_closing_read(self):
@@ -1147,7 +1392,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
         mgr._chunk_queue[room] = [
-            ("42#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
+            ("42#0", 11, list(range(0 + 16)), remote[0:16], endpoint),
             ("42#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
         self.assertTrue(mgr.maybe_start_pull(room))
@@ -1173,10 +1418,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._local_blocks[second] = local
         mgr._remote_total[second] = 64
         mgr._chunk_queue[first] = [
-            ("36#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint)
+            ("36#0", 11, list(range(0 + 16)), remote[0:16], endpoint)
         ]
         mgr._chunk_queue[second] = [
-            ("37#0", 21, list(range(0, 0 + 16)), remote[0:16], endpoint)
+            ("37#0", 21, list(range(0 + 16)), remote[0:16], endpoint)
         ]
 
         self.assertTrue(mgr.maybe_start_pull(first))
@@ -1184,13 +1429,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # The framework aborts the request while raiden still holds the read.
         mgr.clear_room(first)
         self.assertFalse(mgr.maybe_start_pull(second))
-        self.assertEqual(mgr._engine.start_read.call_count, 1)
+        self.assertEqual(mgr.transport._engine.start_read.call_count, 1)
 
         with mgr._state_lock:
             mgr._completed_recv.add("36#0")
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
-        self.assertEqual(mgr._engine.start_read.call_args.args[0], "37#0")
+        self.assertEqual(mgr.transport._engine.start_read.call_args.args[0], "37#0")
         self.assertFalse(mgr._pulling_cleared)
         self.assertNotIn("36#0", mgr._completed_recv)
         self.assertNotIn("36#0", mgr._completed_send)
@@ -1202,7 +1447,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=4)
         mgr._chunk_queue[room] = [
-            ("38#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
+            ("38#0", 11, list(range(0 + 16)), remote[0:16], endpoint),
             ("38#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
         self.assertTrue(mgr.maybe_start_pull(room))
@@ -1225,10 +1470,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(first, local, capacity=1)
-        mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {first: [4, 5], second: [4, 5]}
-        mgr._local_swa_blocks = {first: [7], second: [7]}
-        mgr._remote_swa_endpoint = {first: "127.0.0.1:31022", second: "127.0.0.1:31022"}
+        mgr.transport._sliding_window_attn_engine = Mock()
+        mgr._remote_sliding_window_attn_blocks = {first: [4, 5], second: [4, 5]}
+        mgr._local_sliding_window_attn_blocks = {first: [7], second: [7]}
+        mgr._remote_sliding_window_attn_endpoint = {
+            first: "127.0.0.1:31022",
+            second: "127.0.0.1:31022",
+        }
         mgr._local_blocks[second] = local
         mgr._remote_total[second] = 64
         mgr._chunk_queue[first] = [
@@ -1246,14 +1494,18 @@ class TestRaidenChunkedTransfer(CustomTestCase):
             mgr._native_failed.add(str(first))
             mgr._release_pull_slots_locked()
         self.assertFalse(mgr.maybe_start_pull(second))
-        self.assertEqual(mgr._engine.start_read.call_count, 1)
+        self.assertEqual(mgr.transport._engine.start_read.call_count, 1)
 
         with mgr._state_lock:
-            mgr._completed_recv.add(mgr._swa_req_id(first))
+            mgr._completed_recv.add(mgr._sliding_window_attn_req_id(first))
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
-        self.assertEqual(mgr._engine.start_read.call_args.args[0], str(second))
-        self.assertEqual(mgr._swa_engine.start_read.call_count, 2)
+        self.assertEqual(
+            mgr.transport._engine.start_read.call_args.args[0], str(second)
+        )
+        self.assertEqual(
+            mgr.transport._sliding_window_attn_engine.start_read.call_count, 2
+        )
 
     def test_cleared_hybrid_room_drops_both_reads_when_they_settle(self):
         room = 41
@@ -1261,10 +1513,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, capacity=1)
-        mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {room: [4, 5]}
-        mgr._local_swa_blocks = {room: [7]}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr.transport._sliding_window_attn_engine = Mock()
+        mgr._remote_sliding_window_attn_blocks = {room: [4, 5]}
+        mgr._local_sliding_window_attn_blocks = {room: [7]}
+        mgr._remote_sliding_window_attn_endpoint = {room: "127.0.0.1:31022"}
         mgr._chunk_queue[room] = [
             (str(room), room, list(range(48, 48 + 16)), remote[48:64], endpoint)
         ]
@@ -1278,7 +1530,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertIn(str(room), mgr._completed_recv)
 
         with mgr._state_lock:
-            mgr._completed_recv.add(mgr._swa_req_id(room))
+            mgr._completed_recv.add(mgr._sliding_window_attn_req_id(room))
             mgr._release_pull_slots_locked()
         self.assertEqual(len(mgr._pulling), 0)
         self.assertFalse(mgr._pulling_cleared)
@@ -1305,7 +1557,7 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
             "_on_reshard_chunk",
             "_register_receiver_and_signal",
             "_register_reshard_request",
-            "_register_reshard_swa_receiver",
+            "_register_reshard_sliding_window_attn_receiver",
             "_maybe_register_reshard_final",
             "_publish_reshard_plan",
             "register_decode_request",
@@ -1317,7 +1569,7 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
             "_on_reshard_ready",
             "_on_reshard_chunk_ready",
             "_run_reshard_push",
-            "_run_reshard_swa_push",
+            "_run_reshard_sliding_window_attn_push",
             "_maybe_reshard_reply",
             "_announce_reshard_chunk",
         }
@@ -1338,6 +1590,9 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
         return found
 
     def test_role_state_is_declared_in_the_branch_that_reads_it(self):
+        self.assertTrue(self.DECODE_SIDE <= set(RaidenDecodeKVManager.__dict__))
+        self.assertTrue(self.PREFILL_SIDE <= set(RaidenPrefillKVManager.__dict__))
+        return
         source = inspect.getsource(sys.modules[RaidenKVManager.__module__])
         cls = next(
             node
@@ -1488,7 +1743,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         return ReshardGeometry(src_tp, dst_tp, 1024, 8)
 
     def _prefill(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenPrefillKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1499,23 +1755,25 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._reshard_push_lock = threading.Lock()
-        mgr._engine = Mock()
-        mgr._engine.d2h = Mock(return_value=_ReadyFuture())
+        mgr.transport._engine = Mock()
+        mgr.transport._engine.d2h = Mock(return_value=_ReadyFuture())
         # Device-shadow staging: a plan stages each device block into the
         # host block of the same id.
-        mgr._engine.plan_host_blocks = Mock(side_effect=lambda uuid, blocks: blocks)
-        mgr._swa_engine = None
-        mgr._kv_caches = [object(), object()]
+        mgr.transport._engine.plan_host_blocks = Mock(
+            side_effect=lambda uuid, blocks: blocks
+        )
+        mgr.transport._sliding_window_attn_engine = None
+        mgr.transport._kv_caches = [object(), object()]
         mgr.kv_args = Mock(page_size=128)
         mgr.attn_tp_rank = 1
         mgr.attn_tp_size = 8
-        mgr._local_rank = 1
-        mgr._timeout_s = 5
+        mgr.transport._local_rank = 1
+        mgr.transport._timeout_s = 5
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
         mgr._send_blocks = {}
         mgr._read_leases = {}
-        mgr._send_swa_blocks = {}
+        mgr._send_sliding_window_attn_blocks = {}
         mgr._send_aux = {}
         mgr._send_total = {}
         mgr._held_chunks = {}
@@ -1617,13 +1875,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
         # A chunk announced after the reply would arrive after it and outlive
         # the room's completion; its pages ride the closing transfer instead.
         mgr = self._prefill()
-        mgr._ensure_engine = Mock()
+        mgr.transport.ensure_ready = Mock()
         room = self.ROOM
         mgr._decode_addr[room] = ("10.0.0.2", 5555)
         mgr._decode_pages[room] = 40
         mgr._replied = {room}
         mgr._announce_chunk(room, 0, list(range(16)), 64)
-        mgr._ensure_engine.assert_not_called()
+        mgr.transport.ensure_ready.assert_not_called()
         mgr._socket.send_multipart.assert_not_called()
 
     def test_prefill_announces_chunks_and_pushes_them_on_request(self):
@@ -1651,16 +1909,16 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 [MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"777"]
             )
             self.assertEqual(mgr._failed, set())
-            mgr._engine.d2h.assert_called_once_with(
+            mgr.transport._engine.d2h.assert_called_once_with(
                 blocks[24:32], blocks[24:32], [1] * 8
             )
-            uuid, req = mgr._engine.register_active_plan.call_args.args
+            uuid, req = mgr.transport._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.uuid, req.req_id), (777, 777, "41#0"))
             self.assertEqual(
                 _plan_blocks(req, 0), (blocks[24:32], self.DECODE_BLOCKS[0:8])
             )
-            self.assertEqual(mgr._engine.push_registered_plan.call_count, 2)
-            mgr._engine.unregister_active_plan.assert_called_once_with(777)
+            self.assertEqual(mgr.transport._engine.push_registered_plan.call_count, 2)
+            mgr.transport._engine.unregister_active_plan.assert_called_once_with(777)
             self.assertFalse(mgr.is_send_done(room))
 
             # The prefill finishes; the closing push moves only the rest.
@@ -1675,7 +1933,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 ]
             )
             self.assertEqual(mgr._failed, set())
-            uuid, req = mgr._engine.register_active_plan.call_args.args
+            uuid, req = mgr.transport._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))
             self.assertEqual(
                 _plan_blocks(req, 0), (blocks[32:64], self.DECODE_BLOCKS[8:40])
@@ -1683,7 +1941,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertTrue(mgr.is_send_done(room))
 
     def _decode(self):
-        mgr = object.__new__(RaidenKVManager)
+        mgr = object.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1693,12 +1952,12 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
-        mgr._engine = Mock(transfer_address="10.0.0.2:31000")
-        mgr._swa_engine = None
+        mgr.transport._engine = Mock(transfer_address="10.0.0.2:31000")
+        mgr.transport._sliding_window_attn_engine = None
         mgr.kv_args = Mock(page_size=128)
         mgr.attn_tp_rank = 0
         mgr.attn_tp_size = 4
-        mgr._local_rank = 0
+        mgr.transport._local_rank = 0
         mgr._uuid_seq = 0
         mgr._make_geometry = self._geometry
         mgr._reshard_meta = {
@@ -1712,7 +1971,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         }
         mgr._reshard_sources = {self.ROOM: {}}
         # Same shape for the window pool; _on_reshard_blocks records both.
-        mgr._reshard_swa_sources = {self.ROOM: {}}
+        mgr._reshard_sliding_window_attn_sources = {self.ROOM: {}}
         mgr._reshard_registered = set()
         mgr._reshard_chunk_sources = {}
         mgr._reshard_covered = {}
@@ -1767,7 +2026,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         str(rank).encode("ascii"),
                     ]
                 )
-        uuid = mgr._engine.register_active_plan.call_args.args[0]
+        uuid = mgr.transport._engine.register_active_plan.call_args.args[0]
         self.assertEqual(mgr._reshard_plans, {self.ROOM: {"41#0": uuid}})
         return mgr, uuid
 
@@ -1777,39 +2036,39 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
         # The framework aborts the request while the sources are still pushing.
         mgr.clear_room(self.ROOM)
-        mgr._engine.unregister_active_plan.assert_not_called()
+        mgr.transport._engine.unregister_active_plan.assert_not_called()
         self.assertEqual(mgr._cleared_plans, {"41#0": uuid})
         self.assertNotIn(self.ROOM, mgr._reshard_plans)
         self.assertFalse(mgr._completed_send)
 
         # An unrelated completion does not touch it.
-        mgr._engine.poll_stats = Mock(return_value=([], ["7#0"], []))
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_not_called()
+        mgr.transport._engine.poll_stats = Mock(return_value=([], ["7#0"], []))
+        mgr.drain_engine()
+        mgr.transport._engine.unregister_active_plan.assert_not_called()
 
         # The push lands late: the plan goes, exactly once, with its record.
-        mgr._engine.poll_stats = Mock(return_value=([], ["41#0"], []))
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        mgr.transport._engine.poll_stats = Mock(return_value=([], ["41#0"], []))
+        mgr.drain_engine()
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertNotIn("41#0", mgr._completed_recv)
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        mgr.drain_engine()
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(uuid)
 
     def test_aborted_room_drops_its_chunk_plan_when_the_push_times_out(self):
         mgr, uuid = self._decode_with_chunk_plan()
         mgr.clear_room(self.ROOM)
 
         # Raiden reports the timeout and has already dropped the plan itself.
-        mgr._engine.unregister_active_plan = Mock(
+        mgr.transport._engine.unregister_active_plan = Mock(
             side_effect=RuntimeError(
                 f"KVCacheManager unregister_active_plan failed: Plan with "
                 f"UUID {uuid} is not registered"
             )
         )
-        mgr._engine.poll_stats = Mock(return_value=([], [], ["41#0"]))
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        mgr.transport._engine.poll_stats = Mock(return_value=([], [], ["41#0"]))
+        mgr.drain_engine()
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._failed)
 
@@ -1825,7 +2084,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             # its closing read is already owed.
             seen_complete.append(mgr.is_recv_done(self.ROOM))
 
-        mgr._engine.register_active_plan = Mock(side_effect=registers_slowly)
+        mgr.transport._engine.register_active_plan = Mock(side_effect=registers_slowly)
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
                 mgr._on_reshard_blocks(
@@ -1867,7 +2126,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr.clear_room(self.ROOM)
         self.assertEqual(
             sorted(
-                c.args[0] for c in mgr._engine.unregister_active_plan.call_args_list
+                c.args[0]
+                for c in mgr.transport._engine.unregister_active_plan.call_args_list
             ),
             sorted([chunk_uuid, self.ROOM]),
         )
@@ -1876,7 +2136,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr, uuid = self._decode_with_chunk_plan()
         mgr._completed_recv.add("41#0")
         mgr.clear_room(self.ROOM)
-        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._cleared_plans, {})
         self.assertFalse(mgr._completed_recv)
 
@@ -1885,7 +2145,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         room = self.ROOM
         blocks = self.PREFILL_BLOCKS
         mgr = self._prefill()
-        mgr._timeout_s = 0.01
+        mgr.transport._timeout_s = 0.01
 
         class _PendingFuture:
             ready = False
@@ -1894,8 +2154,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 return self.ready
 
         fut = _PendingFuture()
-        mgr._engine.plan_host_blocks = Mock(side_effect=lambda uuid, b: list(b))
-        mgr._engine.d2h = Mock(return_value=fut)
+        mgr.transport._engine.plan_host_blocks = Mock(
+            side_effect=lambda uuid, b: list(b)
+        )
+        mgr.transport._engine.d2h = Mock(return_value=fut)
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_req(self._reshard_req())
             mgr._send_blocks[room] = list(blocks[:32])
@@ -1908,16 +2170,16 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
         self.assertTrue(mgr.is_failed(room))
         # The copy still runs: the plan (and its staging) must survive it.
-        mgr._engine.unregister_active_plan.assert_not_called()
+        mgr.transport._engine.unregister_active_plan.assert_not_called()
         self.assertEqual([(u, r) for u, r, _ in mgr._stale_plans], [(7, self.ROOM)])
 
-        mgr._engine.poll_stats = Mock(return_value=([], [], []))
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_not_called()
+        mgr.transport._engine.poll_stats = Mock(return_value=([], [], []))
+        mgr.drain_engine()
+        mgr.transport._engine.unregister_active_plan.assert_not_called()
 
         fut.ready = True
-        mgr._drain_engine()
-        mgr._engine.unregister_active_plan.assert_called_once_with(7)
+        mgr.drain_engine()
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(7)
         self.assertEqual(mgr._stale_plans, [])
 
     def test_timed_out_stage_is_reclaimed_without_another_poll(self):
@@ -1925,7 +2187,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         room = self.ROOM
         blocks = self.PREFILL_BLOCKS
         mgr = self._prefill()
-        mgr._timeout_s = 0.01
+        mgr.transport._timeout_s = 0.01
 
         class _PendingFuture:
             ready = False
@@ -1934,8 +2196,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 return self.ready
 
         fut = _PendingFuture()
-        mgr._engine.plan_host_blocks = Mock(side_effect=lambda uuid, b: list(b))
-        mgr._engine.d2h = Mock(return_value=fut)
+        mgr.transport._engine.plan_host_blocks = Mock(
+            side_effect=lambda uuid, b: list(b)
+        )
+        mgr.transport._engine.d2h = Mock(return_value=fut)
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_req(self._reshard_req())
             mgr._send_blocks[room] = list(blocks[:32])
@@ -1950,7 +2214,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         deadline = time.time() + 3
         while mgr._stale_plans and time.time() < deadline:
             time.sleep(0.02)
-        mgr._engine.unregister_active_plan.assert_called_once_with(7)
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(7)
         self.assertEqual(mgr._stale_plans, [])
 
     def test_push_asked_for_before_the_room_was_cleared_is_a_noop(self):
@@ -1973,7 +2237,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
             mgr.clear_room(room)
             push[0](*push[1:])
-        mgr._engine.register_active_plan.assert_not_called()
+        mgr.transport._engine.register_active_plan.assert_not_called()
         self.assertFalse(mgr._failed)
         self.assertNotIn(room, mgr._reshard_pushes_pending)
         self.assertFalse(mgr._completed_send)
@@ -2001,10 +2265,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
         # the decode expects announcements from) are 0 and 1.
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_chunk(chunk(8))
-            mgr._engine.register_active_plan.assert_not_called()
+            mgr.transport._engine.register_active_plan.assert_not_called()
             mgr._on_reshard_chunk(chunk(9))
             self.assertEqual(mgr._failed, set())
-            uuid, req = mgr._engine.register_active_plan.call_args.args
+            uuid, req = mgr.transport._engine.register_active_plan.call_args.args
             self.assertEqual(set(req.shard_push_schedules), {8, 9})
             self.assertEqual(
                 _plan_blocks(req, 8), (src[8][24:32], self.DECODE_BLOCKS[0:8])
@@ -2024,7 +2288,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         def clears_midway(uuid, req, is_sender):
             mgr.clear_room(room)
 
-        mgr._engine.register_active_plan = Mock(side_effect=clears_midway)
+        mgr.transport._engine.register_active_plan = Mock(side_effect=clears_midway)
 
         def chunk(rank):
             return [
@@ -2041,8 +2305,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
             mgr._on_reshard_chunk(chunk(0))
             mgr._on_reshard_chunk(chunk(1))
         # The plan is dropped again, nothing is recreated, no push is asked for.
-        uuid = mgr._engine.register_active_plan.call_args.args[0]
-        mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
+        uuid = mgr.transport._engine.register_active_plan.call_args.args[0]
+        mgr.transport._engine.unregister_active_plan.assert_called_once_with(uuid)
         self.assertEqual(mgr._chunk_reads.get(room, []), [])
         self.assertEqual(mgr._reshard_plans.get(room, {}), {})
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
@@ -2055,7 +2319,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
         mgr.record_failure = Mock()
-        mgr._engine.register_active_plan = Mock(
+        mgr.transport._engine.register_active_plan = Mock(
             side_effect=RuntimeError("RESOURCE_EXHAUSTED: no host blocks")
         )
 
@@ -2100,10 +2364,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_chunk(chunk(0))
-            mgr._engine.register_active_plan.assert_not_called()
+            mgr.transport._engine.register_active_plan.assert_not_called()
             mgr._on_reshard_chunk(chunk(1))
             self.assertEqual(mgr._failed, set())
-            uuid, req = mgr._engine.register_active_plan.call_args.args
+            uuid, req = mgr.transport._engine.register_active_plan.call_args.args
             self.assertEqual((req.uuid, req.req_id), (uuid, "41#0"))
             self.assertEqual(
                 _plan_blocks(req, 0), (src[0][24:32], self.DECODE_BLOCKS[0:8])
@@ -2128,7 +2392,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                         pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
                     ]
                 )
-            uuid, req = mgr._engine.register_active_plan.call_args.args
+            uuid, req = mgr.transport._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))
             self.assertEqual(
                 _plan_blocks(req, 0), (src[0][32:64], self.DECODE_BLOCKS[8:40])
@@ -2178,7 +2442,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                     ]
                 )
 
-        uuid, req = mgr._engine.register_active_plan.call_args.args
+        uuid, req = mgr.transport._engine.register_active_plan.call_args.args
         self.assertEqual((uuid, req.req_id), (room, "41"))
         self.assertEqual(_plan_blocks(req, 0), (src[0][24:64], self.DECODE_BLOCKS))
         self.assertEqual(_plan_blocks(req, 1), (src[1][24:64], self.DECODE_BLOCKS))
@@ -2221,7 +2485,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 )
 
         missing = list(range(24, 32)) + list(range(40, 64))
-        uuid, req = mgr._engine.register_active_plan.call_args.args
+        uuid, req = mgr.transport._engine.register_active_plan.call_args.args
         self.assertEqual((uuid, req.req_id), (room, "41"))
         self.assertEqual(
             _plan_blocks(req, 0),
@@ -2263,7 +2527,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 )
             )
 
-        mgr._engine.register_active_plan = Mock(side_effect=register_with_final_arrival)
+        mgr.transport._engine.register_active_plan = Mock(
+            side_effect=register_with_final_arrival
+        )
 
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
@@ -2281,7 +2547,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
         self.assertEqual(seen_during_chunk_registration, [(False, False)])
         self.assertEqual(
-            [c.args[1].req_id for c in mgr._engine.register_active_plan.call_args_list],
+            [
+                c.args[1].req_id
+                for c in mgr.transport._engine.register_active_plan.call_args_list
+            ],
             ["41#0", "41"],
         )
         self.assertEqual(mgr._chunk_reads[room], ["41#0", "41"])

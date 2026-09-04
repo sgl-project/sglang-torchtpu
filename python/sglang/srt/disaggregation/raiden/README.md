@@ -51,25 +51,25 @@ ports via `base + 4*node_worker_rank`, where the node worker rank counts the
 attention-TP ranks of every context-parallel, attention-DP, and system-DP
 replica on the node (reduces to `base + 4*attn_tp_rank` for a single replica);
 each rank owns 4 ports —
-full-engine control/data, then SWA-engine control/data.
+full-attention engine control/data, then SWA-engine control/data.
 
 ## Hybrid sliding-window models
 
-Hybrid-SWA models (e.g. gpt-oss) keep two KV pools with distinct page-id
-spaces: full-attention layers in a full-size pool, sliding-window layers in a
+Hybrid sliding-window-attention models (e.g. gpt-oss) keep two KV pools with distinct page-id
+spaces: full-attention layers in a full_attn-size pool, sliding-window layers in a
 smaller pool that only retains the attention window. One raiden transfer
 applies a single block-id list to every tensor it wraps, so each rank runs a
-second engine over the SWA sub-pool's layers. The full engine pulls the whole
-sequence's pages; the SWA engine pulls just the window's pages, using the
-per-side SWA page ids both schedulers already derive for `StateType.SWA`
-(`_swa_payload` in prefill.py/decode.py). The extra block list and endpoint
+second engine over the sliding-window-attention sub-pool's layers. The full-attention engine pulls the whole
+sequence's pages; the sliding-window-attention engine pulls just the window's pages, using the
+per-side sliding-window-attention page ids both schedulers already derive for `StateType.SWA`
+(`_sliding_window_attn_payload` in prefill.py/decode.py). The extra block list and endpoint
 ride in the existing `BLOCKS` reply.
 
 Push-resharding runs the same two-engine split. `RESHARD_REQ` carries the
-decode's SWA pages and its SWA transfer address alongside the full ones, and
+decode's sliding-window-attention pages and its sliding-window-attention transfer address alongside the full-attention ones, and
 `RESHARD_BLOCKS` carries the prefill's; each side then builds a second plan
-over the SWA sub-pool with `_make_geometry(..., swa=True)`, which takes the
-head-pair granule from the SWA tensor so the two pools may differ in dtype or
+over the sliding-window-attention sub-pool with `_make_geometry(..., sliding_window_attn=True)`, which takes the
+head-pair granule from the sliding-window-attention tensor so the two pools may differ in dtype or
 head_dim. The window is **never chunked** — it is settled only when the prefill
 ends — so it always travels on the closing push, even when chunks already cover
 every full-attention page. Completion is unchanged: `is_send_done` /
@@ -89,10 +89,10 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
+| `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, sliding-window-attention engine control/data = `+2`/`+3`) |
 | `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; the pool holds as many in-flight transfers as fit it, at most the running batch. Startup fails with the required and available sizes when not even one transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
-| `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
+| `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | sliding-window-attention max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
 | `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden allocates host staging per transfer from the pool; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots and rejects asymmetric resharding, which needs per-transfer staging |

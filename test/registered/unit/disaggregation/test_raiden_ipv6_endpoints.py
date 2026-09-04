@@ -15,16 +15,20 @@ and the send path opts the socket into IPv6 for them.
 """
 
 import socket
-import sys
 import threading
-import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, _tcp_endpoint
+from sglang.srt.disaggregation.raiden.conn import (
+    RaidenKVCacheGroups,
+    _tcp_endpoint,
+    build_engine_configs,
+)
+from sglang.srt.disaggregation.raiden.decode import RaidenDecodeKVManager
+from sglang.srt.disaggregation.raiden.prefill import RaidenPrefillKVManager
 from sglang.srt.disaggregation.raiden.serde import MessageTag
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,9 +41,9 @@ V6_DECODE = "2a03:83e4:4021:302:0:15:0:13"
 V6_PREFILL = "2a03:83e4:4021:302:0:13:0:12"
 
 
-def _bare_manager(mode):
-    """A RaidenKVManager with only the state the tested paths touch."""
-    mgr = RaidenKVManager.__new__(RaidenKVManager)
+def _bare_manager(manager_cls, mode):
+    """A role manager with only the state the tested paths touch."""
+    mgr = manager_cls.__new__(manager_cls)
     mgr.disaggregation_mode = mode
     mgr.attn_tp_rank = 0
     mgr.request_status = {}
@@ -48,25 +52,23 @@ def _bare_manager(mode):
     mgr._state_lock = threading.Lock()
     mgr._status_lock = threading.Lock()
     mgr._announce_lock = threading.Lock()
-    mgr._engine_lock = threading.Lock()
     mgr._completed_send = set()
     mgr._completed_recv = set()
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._aborted = {}
-    mgr._engine = Mock()
-    mgr._swa_engine = None
+    mgr._full_attn_engine = Mock()
+    mgr._sliding_window_attn_engine = None
     mgr._send_reads = {}
     mgr.chunked_transfer = False
     return mgr
 
 
 def _prefill_manager():
-    mgr = _bare_manager(DisaggregationMode.PREFILL)
-    mgr.raiden_endpoint = f"[{V6_PREFILL}]:31000"
-    mgr.swa_raiden_endpoint = None
+    mgr = _bare_manager(RaidenPrefillKVManager, DisaggregationMode.PREFILL)
+    mgr._full_attn_engine.endpoint = f"[{V6_PREFILL}]:31000"
     mgr._send_blocks = {}
-    mgr._send_swa_blocks = {}
+    mgr._send_sliding_window_attn_blocks = {}
     mgr._send_aux = {}
     mgr._decode_addr = {}
     mgr._replied = set()
@@ -81,12 +83,12 @@ def _prefill_manager():
 
 
 def _decode_manager():
-    mgr = _bare_manager(DisaggregationMode.DECODE)
+    mgr = _bare_manager(RaidenDecodeKVManager, DisaggregationMode.DECODE)
     mgr.local_ip = V6_DECODE
     mgr.rank_port = 7000
     mgr._dynamic_host_staging = True
     mgr._local_blocks = {}
-    mgr._local_swa_blocks = {}
+    mgr._local_sliding_window_attn_blocks = {}
     mgr._decode_aux_index = {}
     return mgr
 
@@ -209,40 +211,40 @@ class TestHandshakeEndpoints(CustomTestCase):
 class TestEngineEndpoint(CustomTestCase):
     """The endpoint the native engine is advertised under brackets IPv6."""
 
-    def _build(self, local_ip, swa):
-        mgr = _bare_manager(DisaggregationMode.PREFILL)
-        mgr._engine = None
-        mgr.swa_raiden_endpoint = None
-        mgr.local_ip = local_ip
-        mgr._control_port = 31000
-        mgr._timeout_s = 120.0
-        mgr._local_rank = 0
-        mgr._kv_caches = [object()]
-        mgr._swa_kv_caches = [object()] if swa else None
-        mgr._max_request_blocks = lambda: 8
-        mgr._swa_max_request_blocks = lambda: 2
-        mgr._num_slots = lambda *a, **k: 3
-        fake_api = types.ModuleType("tpu_sync.api.torch.kv_cache_manager")
-        fake_api.KVCacheManager = Mock()
-        modules = {
-            "tpu_sync": types.ModuleType("tpu_sync"),
-            "tpu_sync.api": types.ModuleType("tpu_sync.api"),
-            "tpu_sync.api.torch": types.ModuleType("tpu_sync.api.torch"),
-            "tpu_sync.api.torch.kv_cache_manager": fake_api,
-        }
-        with patch.dict(sys.modules, modules):
-            mgr._build_engine()
-        return mgr
+    def _build(self, local_ip, sliding_window_attn):
+        cache = Mock(shape=(8, 4))
+        cache.element_size.return_value = 4
+        groups = RaidenKVCacheGroups(
+            full_attn=[cache],
+            sliding_window_attn=[cache] if sliding_window_attn else [],
+        )
+        return build_engine_configs(
+            groups,
+            local_ip=local_ip,
+            local_rank=0,
+            control_port=31000,
+            timeout_s=120.0,
+            context_length=32,
+            page_size=4,
+            sliding_window_size=8,
+            slot_ceiling=3,
+            local_ranks=1,
+            rank=0,
+        )
 
     def test_ipv6_engine_endpoints_are_bracketed(self):
-        mgr = self._build(V6_PREFILL, swa=True)
-        self.assertEqual(mgr.raiden_endpoint, f"[{V6_PREFILL}]:31000")
-        self.assertEqual(mgr.swa_raiden_endpoint, f"[{V6_PREFILL}]:31002")
+        full_attn, sliding_window_attn = self._build(
+            V6_PREFILL, sliding_window_attn=True
+        )
+        self.assertEqual(full_attn.endpoint, f"[{V6_PREFILL}]:31000")
+        self.assertEqual(sliding_window_attn.endpoint, f"[{V6_PREFILL}]:31002")
 
     def test_ipv4_engine_endpoint_is_unchanged(self):
-        mgr = self._build("10.0.0.2", swa=False)
-        self.assertEqual(mgr.raiden_endpoint, "10.0.0.2:31000")
-        self.assertIsNone(mgr.swa_raiden_endpoint)
+        full_attn, sliding_window_attn = self._build(
+            "10.0.0.2", sliding_window_attn=False
+        )
+        self.assertEqual(full_attn.endpoint, "10.0.0.2:31000")
+        self.assertIsNone(sliding_window_attn)
 
 
 def _ipv6_loopback_available():

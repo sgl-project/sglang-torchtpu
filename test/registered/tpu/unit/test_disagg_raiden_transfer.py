@@ -33,7 +33,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.raiden import create_raiden_kv_manager
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+from sglang.srt.disaggregation.raiden.engine import RaidenEngine, RaidenEngineConfig
 from sglang.srt.disaggregation.raiden.serde import MessageTag, unpack_blocks
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.test_utils import CustomTestCase
@@ -116,6 +118,21 @@ class _FakeRaidenEngine:
         return stats
 
 
+def _engine(native):
+    config = RaidenEngineConfig(
+        kv_caches=[],
+        node_id=0,
+        local_control_port=0,
+        endpoint="",
+        max_blocks=0,
+        num_slots=0,
+        timeout_s=120.0,
+        label="test",
+        rank=0,
+    )
+    return RaidenEngine(native, config=config)
+
+
 class _AuxBuffers:
     """Host-resident aux slots, addressed the way KVArgs exposes them."""
 
@@ -190,19 +207,19 @@ class RaidenRendezvousTestCase(CustomTestCase):
         )
         server_args = SimpleNamespace(context_length=1024)
 
-        # _listen is stubbed to a no-op: its daemon thread would otherwise race
+        # The rendezvous listener is stubbed to a no-op: its daemon thread would otherwise race
         # the tests for the inbox. Handlers are driven directly instead. The
         # decode heartbeat checker is stubbed the same way -- the stubbed
         # common init carries none of the fields its thread reads.
         with patch.object(CommonKVManager, "__init__", _fake_common_init), patch.object(
-            RaidenKVManager, "_listen", lambda self: None
+            RaidenKVManager, "_start_listener", lambda self: None
         ), patch.object(
             CommonKVManager, "_start_heartbeat_checker_thread", lambda self: None
         ):
-            m = RaidenKVManager(kv_args, mode, server_args)
+            m = create_raiden_kv_manager(kv_args, mode, server_args)
 
-        m._engine = _FakeRaidenEngine()
-        m.raiden_endpoint = f"raiden://127.0.0.1:{port + 1000}"
+        m._full_attn_engine = _engine(_FakeRaidenEngine())
+        m.full_attn_engine.endpoint = f"raiden://127.0.0.1:{port + 1000}"
         m.aux = aux
         m.endpoint = endpoint
         self.addCleanup(self._release, m)
@@ -314,7 +331,7 @@ class TestRaidenPullHandshake(RaidenRendezvousTestCase):
         self.assertEqual(len(frames), BLOCKS_FRAMES)
         self.assertEqual(int(frames[1]), room)
         self.assertEqual(unpack_blocks(frames[2]), [11, 12, 13])
-        self.assertEqual(frames[3].decode(), prefill.raiden_endpoint)
+        self.assertEqual(frames[3].decode(), prefill.full_attn_engine.endpoint)
 
     def test_reply_registers_exactly_the_blocks_it_announced(self):
         """Raiden blocks the consumer's read until a matching producer
@@ -327,7 +344,9 @@ class TestRaidenPullHandshake(RaidenRendezvousTestCase):
         prefill.finalize_send(room, aux_index=None)
 
         frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
-        self.assertEqual(prefill._engine.reads, [(str(room), room, blocks)])
+        self.assertEqual(
+            prefill.full_attn_engine._engine.reads, [(str(room), room, blocks)]
+        )
         self.assertEqual(unpack_blocks(frames[2]), blocks)
 
     def test_malformed_pull_req_is_rejected_before_it_is_indexed(self):
@@ -411,9 +430,9 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         """Decode must process engine completions without prefill-only state."""
         decode = self._decode()
         room = 7200
-        decode._engine._stats = ([], [str(room)], [])
+        decode.full_attn_engine._engine._stats = ([], [str(room)], [])
 
-        decode._drain_engine()
+        decode.drain_engine()
 
         self.assertTrue(decode.is_recv_done(room))
 
@@ -437,7 +456,9 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         decode._on_blocks(self.inboxes[decode.endpoint].take(MessageTag.BLOCKS))
 
         self.assertEqual(decode._remote_blocks[room], blocks)
-        self.assertEqual(decode._remote_endpoint[room], prefill.raiden_endpoint)
+        self.assertEqual(
+            decode._remote_endpoint[room], prefill.full_attn_engine.endpoint
+        )
 
     def test_decode_records_its_own_pages_for_the_pull(self):
         prefill, decode = self._prefill(), self._decode()

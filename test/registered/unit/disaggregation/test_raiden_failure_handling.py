@@ -11,10 +11,15 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
-from sglang.srt.disaggregation.raiden.conn import (
-    RaidenKVManager,
+from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
+from sglang.srt.disaggregation.raiden.decode import (
+    RaidenDecodeKVManager,
     RaidenKVReceiver,
+)
+from sglang.srt.disaggregation.raiden.engine import RaidenEngine, RaidenEngineConfig
+from sglang.srt.disaggregation.raiden.prefill import (
     RaidenKVSender,
+    RaidenPrefillKVManager,
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -26,13 +31,163 @@ ROOM = 7
 OTHER_ROOM = 8
 
 
+def _engine(native=None):
+    config = RaidenEngineConfig(
+        kv_caches=[],
+        node_id=0,
+        local_control_port=0,
+        endpoint="",
+        max_blocks=0,
+        num_slots=0,
+        timeout_s=120.0,
+        label="test",
+        rank=0,
+    )
+    return RaidenEngine(native or Mock(), config=config)
+
+
+class _TransportView:
+    """Fixture adapter for tests written against the former facade."""
+
+    def __init__(self, manager):
+        object.__setattr__(self, "_manager", manager)
+        manager._full_attn_engine = _engine()
+        manager._sliding_window_attn_engine = None
+        manager._local_rank = 0
+        manager._timeout_s = 120.0
+        for name in (
+            "_held_chunks",
+            "_send_total",
+            "_decode_pages",
+            "_reshard_chunks",
+            "_reshard_covered",
+            "_reshard_ready_pages",
+            "_reshard_pushes_pending",
+            "_pending_offer",
+            "_chunk_seq",
+            "_reshard_chunk_acked",
+            "_send_blocks",
+            "_send_sliding_window_attn_blocks",
+            "_send_aux",
+            "_decode_addr",
+            "_reshard_req",
+            "_reshard_replied_at",
+            "_chunk_queue",
+            "_remote_total",
+            "_announced_spans",
+            "_chunk_reads",
+            "_reshard_chunk_sources",
+            "_reshard_chunk_registering",
+            "_reshard_plans",
+            "_reshard_sources",
+            "_reshard_sliding_window_attn_sources",
+            "_reshard_meta",
+            "_local_blocks",
+            "_local_sliding_window_attn_blocks",
+            "_decode_aux_index",
+            "_remote_blocks",
+            "_remote_sliding_window_attn_blocks",
+            "_remote_endpoint",
+            "_remote_sliding_window_attn_endpoint",
+            "_cleared_plans",
+        ):
+            if not hasattr(manager, name):
+                setattr(manager, name, {})
+        for name in (
+            "_replied",
+            "_reshard_final_pushed",
+            "_reshard_finalized",
+            "_reshard_replied",
+            "_reshard_ready",
+            "_reshard_pushed",
+            "_final_seen",
+            "_reshard_registered",
+            "_pulling_cleared",
+        ):
+            if not hasattr(manager, name):
+                setattr(manager, name, set())
+
+    def __getattr__(self, name):
+        manager = self._manager
+        owner, attr = {
+            "_engine": ("_full_attn_engine", "_engine"),
+            "_sliding_window_attn_engine": ("_sliding_window_attn_engine", "_engine"),
+            "_kv_caches": ("_full_attn_engine", "_kv_caches"),
+            "_endpoint": ("_full_attn_engine", "endpoint"),
+            "_sliding_window_attn_endpoint": (
+                "_sliding_window_attn_engine",
+                "endpoint",
+            ),
+            "_full_attn_engine_max_blocks": ("_full_attn_engine", "max_blocks"),
+            "_sliding_window_attn_engine_max_blocks": (
+                "_sliding_window_attn_engine",
+                "max_blocks",
+            ),
+            "_local_rank": (None, "_local_rank"),
+            "_timeout_s": (None, "_timeout_s"),
+        }[name]
+        target = manager if owner is None else getattr(manager, owner)
+        return None if target is None else getattr(target, attr)
+
+    def __setattr__(self, name, value):
+        if name not in {
+            "_engine",
+            "_sliding_window_attn_engine",
+            "_kv_caches",
+            "_endpoint",
+            "_sliding_window_attn_endpoint",
+            "_full_attn_engine_max_blocks",
+            "_sliding_window_attn_engine_max_blocks",
+            "_local_rank",
+            "_timeout_s",
+        }:
+            object.__setattr__(self, name, value)
+            return
+        manager = self._manager
+        if name == "_sliding_window_attn_engine":
+            manager._sliding_window_attn_engine = (
+                None if value is None else _engine(value)
+            )
+            return
+        owner, attr = {
+            "_engine": ("_full_attn_engine", "_engine"),
+            "_kv_caches": ("_full_attn_engine", "_kv_caches"),
+            "_endpoint": ("_full_attn_engine", "endpoint"),
+            "_sliding_window_attn_endpoint": (
+                "_sliding_window_attn_engine",
+                "endpoint",
+            ),
+            "_full_attn_engine_max_blocks": ("_full_attn_engine", "max_blocks"),
+            "_sliding_window_attn_engine_max_blocks": (
+                "_sliding_window_attn_engine",
+                "max_blocks",
+            ),
+            "_local_rank": (None, "_local_rank"),
+            "_timeout_s": (None, "_timeout_s"),
+        }[name]
+        target = manager if owner is None else getattr(manager, owner)
+        if target is not None:
+            setattr(target, attr, value)
+
+    def ensure_ready(self):
+        return None
+
+    def send(self, endpoint, parts):
+        return self._manager._send_multipart_locked(endpoint, parts)
+
+
+def _transport(manager):
+    return _TransportView(manager)
+
+
 def _abort_frame(room):
     return [MessageTag.ABORT, str(room).encode("ascii"), b"10.0.0.2", b"5555"]
 
 
 def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
-    mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr = RaidenPrefillKVManager.__new__(RaidenPrefillKVManager)
+    mgr.transport = _transport(mgr)
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
     mgr.request_status = {}
     mgr.failure_records = {}
@@ -44,9 +199,9 @@ def _prefill_manager():
     mgr._completed_recv = set()
     mgr._failed = set()
     mgr._native_failed = set()
-    mgr._swa_engine = None
+    mgr.transport._sliding_window_attn_engine = None
     mgr._send_blocks = {}
-    mgr._send_swa_blocks = {}
+    mgr._send_sliding_window_attn_blocks = {}
     mgr._send_aux = {}
     mgr._decode_addr = {}
     mgr._replied = set()
@@ -59,17 +214,13 @@ def _prefill_manager():
     mgr._reshard_slot_rooms = [None]
     mgr._reshard_slot_of = {}
     mgr._aborted = {}
-    mgr._pulling = None
-    # Settle-aware cleanup state shared by every manager mode.
-    mgr._pulling_cleared = set()
-    mgr._cleared_plans = {}
     mgr._stale_plans = []
     mgr.chunked_transfer = False
-    # Chunked-transfer send state swept by _drop_room_state.
+    # Chunked-transfer send state swept by drop_room_state.
     mgr._held_chunks = {}
     mgr._send_total = {}
     mgr._send_reads = {}
-    mgr._timeout_s = 120.0
+    mgr.transport._timeout_s = 120.0
     mgr._decode_pages = {}
     mgr._reshard_chunks = {}
     mgr._reshard_covered = {}
@@ -82,9 +233,10 @@ def _prefill_manager():
 
 
 def _populate_send_state(mgr, room):
+    """Populate producer-side room state on a composed prefill manager."""
     mgr.request_status[room] = KVPoll.Transferring
     mgr._send_blocks[room] = [1, 2, 3]
-    mgr._send_swa_blocks[room] = [4]
+    mgr._send_sliding_window_attn_blocks[room] = [4]
     mgr._send_aux[room] = b"aux"
     mgr._decode_addr[room] = ("10.0.0.2", 5555)
     mgr._replied.add(room)
@@ -103,7 +255,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
         self.assertIn(ROOM, mgr.failure_records)
         for table in (
             mgr._send_blocks,
-            mgr._send_swa_blocks,
+            mgr._send_sliding_window_attn_blocks,
             mgr._send_aux,
             mgr._decode_addr,
             mgr._replied,
@@ -165,7 +317,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
     def test_abort_propagates_to_sender_poll_and_clear(self):
         mgr = _prefill_manager()
         _populate_send_state(mgr, ROOM)
-        mgr._drain_engine = lambda: None
+        mgr.drain_engine = lambda: None
         mgr.is_dummy_cp_rank = False
         mgr.bootstrap_timeout = 300
         sender = RaidenKVSender.__new__(RaidenKVSender)
@@ -189,7 +341,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
     def test_abort_is_terminal_for_a_prefill_still_computing(self):
         """A send that lands after the abort must not revive the room."""
         mgr = _prefill_manager()
-        mgr._ensure_engine = lambda: None
+        mgr.transport.ensure_ready = lambda: None
         mgr.is_dummy_cp_rank = False
         mgr.request_status[ROOM] = KVPoll.WaitingForInput
         mgr._decode_addr[ROOM] = ("10.0.0.2", 5555)
@@ -213,7 +365,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
 
 def _decode_manager_stub(**overrides):
     fields = dict(
-        _drain_engine=lambda: None,
+        drain_engine=lambda: None,
         is_failed=lambda room: False,
         is_recv_done=lambda room: False,
         maybe_start_pull=lambda room: False,
@@ -233,6 +385,7 @@ def _decode_manager_stub(**overrides):
         RaidenKVManager._mark_aborted_locked, mgr
     )
     mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
+    mgr.fail_room = types.MethodType(RaidenKVManager.fail_room, mgr)
     mgr.check_status = lambda room: mgr.request_status[room]
     mgr.record_failure = lambda room, reason: mgr.failure_records.__setitem__(
         room, reason
@@ -278,7 +431,8 @@ class TestReceiverFailurePaths(unittest.TestCase):
             self.assertTrue(resume.wait(5))
 
         engine.start_read.side_effect = blocking_start
-        mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr = RaidenDecodeKVManager.__new__(RaidenDecodeKVManager)
+        mgr.transport = _transport(mgr)
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
@@ -290,16 +444,16 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr._remote_blocks = {ROOM: [11, 12]}
         mgr._remote_endpoint = {ROOM: "peer"}
         mgr._local_blocks = {ROOM: [21, 22]}
-        mgr._local_swa_blocks = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_swa_endpoint = {}
-        mgr._swa_engine = None
+        mgr._local_sliding_window_attn_blocks = {}
+        mgr._remote_sliding_window_attn_blocks = {}
+        mgr._remote_sliding_window_attn_endpoint = {}
+        mgr.transport._sliding_window_attn_engine = None
         mgr.chunked_transfer = False
-        mgr._full_engine_max_blocks = 4
-        mgr._swa_engine_max_blocks = 0
+        mgr.transport._full_attn_engine_max_blocks = 4
+        mgr.transport._sliding_window_attn_engine_max_blocks = 0
         mgr._pulling = SlotAdmission(1)
-        mgr._ensure_engine = lambda: engine
-        mgr._drain_engine = lambda: None
+        mgr.transport._engine = engine
+        mgr.drain_engine = lambda: None
         mgr.is_failed = lambda room: False
         mgr.is_recv_done = lambda room: False
         mgr.room_has_active_io = lambda room: str(room) in mgr._pulling
@@ -366,7 +520,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
 class TestSenderBootstrapTimeout(unittest.TestCase):
     def _sender(self, has_decode_request, bootstrap_timeout, age):
         mgr = SimpleNamespace(
-            _drain_engine=lambda: None,
+            drain_engine=lambda: None,
             is_dummy_cp_rank=False,
             is_failed=lambda room: False,
             is_send_done=lambda room: False,
@@ -387,7 +541,7 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
         )
         mgr._fail_room_locked = types.MethodType(RaidenKVManager._fail_room_locked, mgr)
         mgr.fail_decode_silence = types.MethodType(
-            RaidenKVManager.fail_decode_silence, mgr
+            RaidenPrefillKVManager.fail_decode_silence, mgr
         )
         mgr._mark_aborted_locked = types.MethodType(
             RaidenKVManager._mark_aborted_locked, mgr
@@ -429,33 +583,33 @@ class TestReshardHandshakeWindow(unittest.TestCase):
     def test_window_spans_request_to_ready(self):
         mgr = _prefill_manager()
         start = 1000.0
-        self.assertEqual(mgr.awaiting_decode_since(ROOM, start), start)
+        self.assertEqual(mgr._awaiting_decode_since(ROOM, start), start)
 
         # The decode asked for the room; until the prefill announces its
         # blocks the wait is on local compute, which has no deadline here.
         mgr._reshard_req[ROOM] = {}
-        self.assertIsNone(mgr.awaiting_decode_since(ROOM, start))
+        self.assertIsNone(mgr._awaiting_decode_since(ROOM, start))
 
         # Blocks announced: the decode now owes RESHARD_READY, timed from here.
         mgr._reshard_replied.add(ROOM)
         mgr._reshard_replied_at[ROOM] = 1500.0
-        self.assertEqual(mgr.awaiting_decode_since(ROOM, start), 1500.0)
+        self.assertEqual(mgr._awaiting_decode_since(ROOM, start), 1500.0)
 
         mgr._reshard_ready.add(ROOM)
-        self.assertIsNone(mgr.awaiting_decode_since(ROOM, start))
+        self.assertIsNone(mgr._awaiting_decode_since(ROOM, start))
 
     def test_pull_request_closes_the_window(self):
         mgr = _prefill_manager()
         mgr._decode_addr[ROOM] = ("10.0.0.2", 5555)
-        self.assertIsNone(mgr.awaiting_decode_since(ROOM, 1000.0))
+        self.assertIsNone(mgr._awaiting_decode_since(ROOM, 1000.0))
 
 
 class TestAbortIsTerminal(unittest.TestCase):
     def _mgr(self):
         mgr = _prefill_manager()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
-        mgr._ensure_engine = Mock()
-        mgr._send_multipart_locked = Mock()
+        mgr.transport.ensure_ready = Mock()
+        mgr.transport.send = Mock()
         return mgr
 
     def test_abort_after_finalize_stays_failed(self):
@@ -478,8 +632,8 @@ class TestAbortIsTerminal(unittest.TestCase):
         mgr._decode_addr[ROOM] = ("10.0.0.2", 5555)
         mgr._dispatch(_abort_frame(ROOM))
         mgr._maybe_reply(ROOM)
-        mgr._ensure_engine.assert_not_called()
-        mgr._send_multipart_locked.assert_not_called()
+        mgr.transport.ensure_ready.assert_not_called()
+        mgr.transport.send.assert_not_called()
 
     def test_decode_silence_failure_drops_a_racing_pull_request(self):
         mgr = self._mgr()
@@ -490,7 +644,7 @@ class TestAbortIsTerminal(unittest.TestCase):
             [MessageTag.PULL_REQ, str(ROOM).encode(), b"10.0.0.2", b"5555", b"4"]
         )
         self.assertNotIn(ROOM, mgr._decode_addr)
-        mgr._ensure_engine.assert_not_called()
+        mgr.transport.ensure_ready.assert_not_called()
 
     def test_frames_after_clear_do_not_rebuild_the_room(self):
         mgr = self._mgr()
@@ -508,7 +662,7 @@ class TestAbortIsTerminal(unittest.TestCase):
                 b"10.0.0.2:31000",
                 b"",
                 b"4",
-                # SWA pages + SWA push endpoint: empty for a non-hybrid model,
+                # sliding-window-attention pages + sliding-window-attention push endpoint: empty for a non-hybrid model,
                 # but the frames are part of RESHARD_REQ either way.
                 b"",
                 b"",
@@ -516,13 +670,13 @@ class TestAbortIsTerminal(unittest.TestCase):
         )
         self.assertNotIn(ROOM, mgr._decode_addr)
         self.assertNotIn(ROOM, mgr._reshard_req)
-        mgr._send_multipart_locked.assert_not_called()
+        mgr.transport.send.assert_not_called()
 
 
 class TestSenderTerminalPrecedence(unittest.TestCase):
     def _sender(self, **overrides):
         fields = dict(
-            _drain_engine=lambda: None,
+            drain_engine=lambda: None,
             is_dummy_cp_rank=False,
             is_failed=lambda room: False,
             is_send_done=lambda room: False,
@@ -567,11 +721,11 @@ class TestOffersRespectTheTombstone(unittest.TestCase):
         # The room fails between the offer's snapshot and the announcement.
         mgr = _prefill_manager()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
-        mgr._send_multipart_locked = Mock()
+        mgr.transport.send = Mock()
         mgr._dispatch(_abort_frame(ROOM))
         mgr._announce_chunk(ROOM, 0, [1, 2, 3], 8)
         mgr._announce_reshard_chunk(ROOM, 0, [1, 2, 3], 8)
-        mgr._send_multipart_locked.assert_not_called()
+        mgr.transport.send.assert_not_called()
 
 
 class TestExplicitAbortQuiesces(unittest.TestCase):
@@ -657,9 +811,12 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce_attn_cp_tp_group([poller], cp_group, tp_group)
@@ -697,12 +854,16 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
-        ), patch(
-            "sglang.srt.disaggregation.utils._apply_metadata_gate",
-            side_effect=lambda *args: events.append("metadata"),
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
+            patch(
+                "sglang.srt.disaggregation.utils._apply_metadata_gate",
+                side_effect=lambda *args: events.append("metadata"),
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce(
@@ -776,33 +937,42 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
     def test_a_tombstoned_room_cannot_admit_a_read(self):
         from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
 
-        mgr = _prefill_manager()  # provides locks and the tombstone dict
+        mgr = RaidenDecodeKVManager.__new__(RaidenDecodeKVManager)
+        mgr._state_lock = threading.RLock()
+        mgr._status_lock = threading.RLock()
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
+        mgr.failure_records = {}
+        mgr._aborted = {}
+        mgr._failed = set()
+        mgr._native_failed = set()
         mgr.chunked_transfer = False
-        mgr._engine = Mock()
-        mgr._swa_engine = None
+        mgr.transport = _transport(mgr)
+        mgr.transport._engine = Mock()
+        mgr.transport._sliding_window_attn_engine = None
         mgr._pulling = SlotAdmission(4)
-        mgr._full_engine_max_blocks = 8
-        mgr._swa_engine_max_blocks = 0
+        mgr.transport._full_attn_engine_max_blocks = 8
+        mgr.transport._sliding_window_attn_engine_max_blocks = 0
         mgr._local_blocks = {ROOM: [8]}
-        mgr._local_swa_blocks = {}
+        mgr._local_sliding_window_attn_blocks = {}
         mgr._remote_blocks = {ROOM: [1]}
-        mgr._remote_swa_blocks = {}
+        mgr._remote_sliding_window_attn_blocks = {}
         mgr._remote_endpoint = {ROOM: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {}
+        mgr._remote_sliding_window_attn_endpoint = {}
         with mgr._state_lock:
             mgr._mark_aborted_locked(ROOM)
         self.assertFalse(mgr.maybe_start_pull(ROOM))
-        mgr._engine.start_read.assert_not_called()
+        mgr.transport._engine.start_read.assert_not_called()
         self.assertEqual(len(mgr._pulling), 0)
 
 
 class TestSenderLeases(unittest.TestCase):
     def test_registered_read_holds_room_until_poll_stats_settles_it(self):
         mgr = _prefill_manager()
-        mgr._engine = Mock()
-        mgr._engine.register_read.return_value = True
+        mgr.transport._engine = Mock()
+        mgr.transport._engine.register_read.return_value = True
 
-        mgr._register_sender_read(ROOM, mgr._engine, "7#0", 17, [1, 2])
+        mgr._register_sender_read(ROOM, "7#0", 17, [1, 2])
         self.assertTrue(mgr.sender_has_active_io(ROOM))
 
         with mgr._state_lock:
@@ -813,11 +983,13 @@ class TestSenderLeases(unittest.TestCase):
     def test_register_read_exception_terminalizes_the_room(self):
         mgr = _prefill_manager()
         mgr.request_status[ROOM] = KVPoll.Transferring
-        mgr._engine = Mock()
-        mgr._engine.register_read.side_effect = RuntimeError("registration broke")
+        mgr.transport._engine = Mock()
+        mgr.transport._engine.register_read.side_effect = RuntimeError(
+            "registration broke"
+        )
 
         with self.assertRaisesRegex(RuntimeError, "registration broke"):
-            mgr._register_sender_read(ROOM, mgr._engine, str(ROOM), ROOM, [1, 2])
+            mgr._register_sender_read(ROOM, str(ROOM), ROOM, [1, 2])
 
         self.assertIn(ROOM, mgr._aborted)
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
@@ -828,14 +1000,14 @@ class TestSenderLeases(unittest.TestCase):
     def test_registered_read_lease_survives_room_cleanup(self):
         mgr = _prefill_manager()
         mgr._send_reads[ROOM] = {"7#0"}
-        mgr._drop_room_state(ROOM)
+        mgr.drop_room_state(ROOM)
         self.assertEqual(set(mgr._send_reads[ROOM]), {"7#0"})
         self.assertTrue(mgr.sender_has_active_io(ROOM))
 
     def test_drop_keeps_the_push_lease_until_the_worker_returns_it(self):
         mgr = _prefill_manager()
         mgr._reshard_pushes_pending[ROOM] = 1
-        mgr._drop_room_state(ROOM)
+        mgr.drop_room_state(ROOM)
         self.assertTrue(mgr.sender_has_active_io(ROOM))
         # The worker's own unwind hands the lease back.
         with mgr._state_lock:
@@ -872,7 +1044,7 @@ class TestSenderLeaseSettlement(unittest.TestCase):
         # deadline; no local timer may drop the lease while the read could
         # still pull the room's pages.
         mgr = _prefill_manager()
-        mgr._timeout_s = 0.0
+        mgr.transport._timeout_s = 0.0
         mgr._send_reads[ROOM] = {str(ROOM)}
         self.assertTrue(mgr.sender_has_active_io(ROOM))
         # raiden reports the read settled: the lease is released.
@@ -889,19 +1061,24 @@ class TestFailureWaitsForActiveIo(unittest.TestCase):
         from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
 
         mgr = _decode_manager_stub(is_failed=lambda room: True)
-        mgr._swa_engine = None
+        mgr._sliding_window_attn_engine = None
+        mgr.has_sliding_window_attn = False
+        mgr._reshard_plans = {}
+        mgr._cleared_plans = {}
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
         mgr._pulling = SlotAdmission(4)
         mgr._pulling.admit(str(ROOM))
-        mgr._swa_req_id = lambda room: f"swa:{room}"
+        mgr._sliding_window_attn_req_id = lambda room: f"swa:{room}"
         mgr._pull_settled_locked = types.MethodType(
-            RaidenKVManager._pull_settled_locked, mgr
+            RaidenDecodeKVManager._pull_settled_locked, mgr
         )
-        mgr._paired_swa_read = types.MethodType(RaidenKVManager._paired_swa_read, mgr)
+        mgr._paired_sliding_window_attn_read = types.MethodType(
+            RaidenDecodeKVManager._paired_sliding_window_attn_read, mgr
+        )
         mgr.room_has_active_io = types.MethodType(
-            RaidenKVManager.room_has_active_io, mgr
+            RaidenDecodeKVManager.room_has_active_io, mgr
         )
         recv = _receiver(mgr)
         with patch.object(RaidenKVReceiver, "_send_abort_notification") as send_abort:
@@ -924,6 +1101,7 @@ class TestReceiverFailureRecords(unittest.TestCase):
         mgr.record_failure(ROOM, "first request's reason")
         receiver = SimpleNamespace(
             kv_mgr=mgr,
+            decode=mgr,
             bootstrap_room=ROOM,
             failure_exception=RaidenKVReceiver.failure_exception,
         )
@@ -957,6 +1135,7 @@ class TestSendRevalidatesTheSocket(unittest.TestCase):
     def test_sender_that_lost_the_eviction_race_uses_a_fresh_socket(self):
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr._socket_lock = threading.Lock()
         old_sock, new_sock = Mock(), Mock()
         mgr._socket_cache = {endpoint: old_sock}
@@ -979,7 +1158,7 @@ class TestSendRevalidatesTheSocket(unittest.TestCase):
                 return False
 
         mgr._socket_send_locks = {endpoint: EvictOnFirstAcquire()}
-        mgr._send_multipart_locked(endpoint, [b"PING"])
+        mgr.transport.send(endpoint, [b"PING"])
 
         old_sock.send_multipart.assert_not_called()
         old_sock.close.assert_called_once()
@@ -1005,6 +1184,7 @@ class TestConnectDefersStaleSocketClose(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr._socket_lock = threading.Lock()
         stale, monitor = FakeSocket(), FakeMonitor()
         mgr._socket_cache = {endpoint: stale}
@@ -1035,6 +1215,7 @@ class TestHeartbeatPrunesRoomTracker(unittest.TestCase):
         a prefill dies; without the heartbeat prune it grows for the process
         lifetime."""
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr.addr_to_rooms_tracker = {"10.0.0.1:8998": {ROOM, OTHER_ROOM}}
         mgr.request_status = {ROOM: KVPoll.Transferring}
 
@@ -1082,6 +1263,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
         endpoint = "tcp://10.0.0.1:4444"
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
@@ -1122,6 +1304,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
 
     def test_heartbeat_failure_serializes_with_native_progress_publication(self):
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
@@ -1176,6 +1359,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 return value
 
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr._status_lock = threading.Lock()
         mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
 
@@ -1216,6 +1400,7 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
                 return value
 
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr.transport = _transport(mgr)
         mgr._status_lock = threading.Lock()
         mgr.request_status = PausingStatus({ROOM: KVPoll.Bootstrapping})
 

@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric
-from sglang.srt.disaggregation.raiden.conn import RaidenKVSender
+from sglang.srt.disaggregation.raiden.prefill import RaidenKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -19,7 +19,7 @@ class TestRaidenKVTransferMetrics(CustomTestCase):
         manager.kv_item_lens_sum = 1 << 30
         manager.state_item_lens_sum = 0
         manager.get_kv_replica_factor.return_value = 1
-        manager._swa_blocks_from_state_indices.return_value = []
+        manager.swa_blocks_from_state_indices.return_value = []
         manager.append_send_blocks.side_effect = [0, 1]
         manager.is_aborted.return_value = False
         manager.is_failed.return_value = False
@@ -45,7 +45,7 @@ class TestRaidenKVTransferMetrics(CustomTestCase):
 
         sender.should_send_kv_chunk(1, last_chunk=False)
         with patch(
-            "sglang.srt.disaggregation.raiden.conn.time.perf_counter",
+            "sglang.srt.disaggregation.raiden.prefill.time.perf_counter",
             return_value=10.0,
         ):
             sender.send([3])
@@ -53,7 +53,7 @@ class TestRaidenKVTransferMetrics(CustomTestCase):
         sender.should_send_kv_chunk(1, last_chunk=True)
         sender.send([4])
         with patch(
-            "sglang.srt.disaggregation.raiden.conn.time.perf_counter",
+            "sglang.srt.disaggregation.raiden.prefill.time.perf_counter",
             return_value=14.0,
         ):
             self.assertEqual(sender.poll(), KVPoll.Success)
@@ -73,7 +73,7 @@ class TestRaidenKVTransferMetrics(CustomTestCase):
         sender.kv_mgr.check_status.return_value = KVPoll.Success
 
         with patch(
-            "sglang.srt.disaggregation.raiden.conn.time.perf_counter",
+            "sglang.srt.disaggregation.raiden.prefill.time.perf_counter",
             return_value=14.0,
         ):
             self.assertEqual(sender.poll(), KVPoll.Success)
@@ -85,13 +85,13 @@ class TestRaidenKVTransferMetrics(CustomTestCase):
         sender._transfer_start_time = 10.0
 
         with patch(
-            "sglang.srt.disaggregation.raiden.conn.time.perf_counter",
+            "sglang.srt.disaggregation.raiden.prefill.time.perf_counter",
             return_value=14.0,
         ):
             self.assertEqual(sender.poll(), KVPoll.Success)
 
         with patch(
-            "sglang.srt.disaggregation.raiden.conn.time.perf_counter"
+            "sglang.srt.disaggregation.raiden.prefill.time.perf_counter"
         ) as perf_counter:
             self.assertEqual(sender.poll(), KVPoll.Success)
             perf_counter.assert_not_called()

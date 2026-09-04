@@ -735,14 +735,14 @@ def get_kv_class(
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.raiden import (
             RaidenKVBootstrapServer,
-            RaidenKVManager,
             RaidenKVReceiver,
             RaidenKVSender,
+            create_raiden_kv_manager,
         )
 
         class_mapping = {
             KVClassType.KVARGS: KVArgs,
-            KVClassType.MANAGER: RaidenKVManager,
+            KVClassType.MANAGER: create_raiden_kv_manager,
             KVClassType.SENDER: RaidenKVSender,
             KVClassType.RECEIVER: (RaidenKVReceiver),
             KVClassType.BOOTSTRAP_SERVER: RaidenKVBootstrapServer,
