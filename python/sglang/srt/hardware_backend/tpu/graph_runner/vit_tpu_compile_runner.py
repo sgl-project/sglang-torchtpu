@@ -27,14 +27,22 @@ logger = logging.getLogger(__name__)
 # without warming a huge grid.
 _DEFAULT_MAX_PATCHES = 4900
 
-# The env cap only bounds the ladder; the real ceiling is the largest square under
-# it (4900 = 70^2 by default), so batching callers must read the warmed value.
-_warmed_patch_budget: int | None = None
+_precompiled_max_patch_count: int | None = None
 
 
-def warmed_patch_budget() -> int | None:
-    """Largest ViT patch count warmed by precompile, or None if none ran."""
-    return _warmed_patch_budget
+def precompiled_max_patch_count() -> int:
+    """Largest ViT patch count that has a precompiled graph.
+
+    The env vars only bound the ladder -- its real ceiling is the largest square
+    under the cap (4900 = 70^2 by default) -- so the warmed value wins and the
+    envs are a fallback for before precompile runs.
+    """
+    if _precompiled_max_patch_count is not None:
+        return _precompiled_max_patch_count
+    explicit_sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()
+    if explicit_sizes:
+        return max(int(size) for size in explicit_sizes)
+    return envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
 
 
 def _compute_patch_counts(
@@ -230,8 +238,8 @@ class VisionTpuCompilePolicy(CompilePolicy):
             )
             return
 
-        global _warmed_patch_budget
-        _warmed_patch_budget = max(patch_counts)
+        global _precompiled_max_patch_count
+        _precompiled_max_patch_count = max(patch_counts)
 
         logger.info(
             "VisionTpuCompilePolicy.precompile: warming %d patch counts %s.",
@@ -439,7 +447,8 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
                 logger.warning(
                     "ViTTpuCompileRunner: patch count %d exceeds the largest "
                     "precompiled bucket %s; this image triggers a one-time ViT "
-                    "recompile. Raise SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
+                    "recompile. Raise SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES, or "
+                    "lower max_pixels via --mm-process-config.",
                     seq_len,
                     buckets[-1] if buckets else None,
                 )

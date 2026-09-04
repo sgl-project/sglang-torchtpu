@@ -5,7 +5,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
@@ -284,23 +283,13 @@ class PerImageRequestInfo:
     )
 
 
-def _tpu_vit_patch_budget() -> int:
-    """Patch count of the top ViT bucket the server actually warmed.
-
-    The env vars only bound the ladder, so they are a fallback for before
-    precompile runs.
-    """
+def _tpu_vision_encoder_patch_budget() -> int:
+    """Patches one vision-encoder call may carry on TPU. Callers gate on _is_tpu."""
     from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
-        warmed_patch_budget,
+        precompiled_max_patch_count,
     )
 
-    warmed = warmed_patch_budget()
-    if warmed is not None:
-        return warmed
-    explicit_sizes = envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.get()
-    if explicit_sizes:
-        return max(int(size) for size in explicit_sizes)
-    return envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get()
+    return precompiled_max_patch_count()
 
 
 def _item_patch_count(item: MultimodalDataItem) -> int:
@@ -311,7 +300,7 @@ def _item_patch_count(item: MultimodalDataItem) -> int:
 def _split_items_by_patch_budget(
     items: List[MultimodalDataItem], budget: int
 ) -> List[List[MultimodalDataItem]]:
-    """Greedily pack items into groups whose total patch count fits one bucket."""
+    """Greedily pack items into groups whose total patch count fits the budget."""
     groups: List[List[MultimodalDataItem]] = []
     current: List[MultimodalDataItem] = []
     current_patches = 0
@@ -331,33 +320,23 @@ def _encode_vision_items(
     data_embedding_func: DataEmbeddingFunc,
     items: List[MultimodalDataItem],
 ) -> torch.Tensor | list:
-    """Encode items, splitting the call on TPU to stay inside a precompiled bucket.
+    """Encode items, splitting the call to stay within the encoder patch budget.
 
-    Every image in the batch is concatenated into one ViT call; a patch total
-    above the top bucket gets no padding and recompiles, which is fatal once
-    fail_on_recompile is armed.
+    A batch is concatenated into one encoder call. TPU precompiles that call for
+    a bounded set of patch counts, so a batch above the largest one falls off the
+    set and recompiles; other backends take no budget and keep the single call.
     """
     if not _is_tpu or not items:
         return data_embedding_func(items)
 
-    budget = _tpu_vit_patch_budget()
+    budget = _tpu_vision_encoder_patch_budget()
     groups = _split_items_by_patch_budget(items, budget)
-    largest_item = max(_item_patch_count(item) for item in items)
-    if largest_item > budget:
-        logger.warning(
-            "[tpu] One image needs %d patches, above the top precompiled ViT "
-            "bucket (%d); it will recompile. Lower max_pixels via "
-            "--mm-process-config, or raise "
-            "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
-            largest_item,
-            budget,
-        )
     if len(groups) == 1:
         return data_embedding_func(items)
 
     logger.info(
-        "[tpu] Splitting ViT batch: %d images / %d patches exceed the top "
-        "precompiled bucket (%d), so it runs as %d calls of %s patches.",
+        "Splitting the vision batch: %d items / %d patches exceed the encoder "
+        "patch budget (%d), so it runs as %d calls of %s patches.",
         len(items),
         sum(_item_patch_count(item) for item in items),
         budget,

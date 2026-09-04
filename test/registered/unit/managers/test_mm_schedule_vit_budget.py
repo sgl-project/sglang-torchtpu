@@ -1,8 +1,8 @@
-"""Unit tests for TPU ViT patch-budget batching in mm_schedule.
+"""Unit tests for vision-encoder patch-budget batching in mm_schedule.
 
-Every image in a prefill batch is concatenated into one vision-encoder call,
-but TPU precompiles that call as graphs bucketed by patch count. A batch above
-the top bucket gets no padding and recompiles, which is fatal once the
+Every image in a prefill batch is concatenated into one vision-encoder call.
+Backends that precompile that call for a bounded set of patch counts recompile
+once the batch total exceeds the largest one, which is fatal on TPU where the
 scheduler arms fail_on_recompile.
 
 The budget is injected here; resolving it against the live policy is covered in
@@ -64,7 +64,7 @@ class TestSplitItemsByPatchBudget(CustomTestCase):
         self.assertEqual(totals, [4000, 3000])
 
     def test_an_item_larger_than_the_budget_still_forms_one_group(self):
-        # Packing cannot help; the caller warns instead of silently dropping it.
+        # Packing cannot help; the item must still be encoded, not dropped.
         groups = mm_schedule._split_items_by_patch_budget([_image(14372)], 4900)
         self.assertEqual([len(group) for group in groups], [1])
 
@@ -78,7 +78,7 @@ class TestSplitItemsByPatchBudget(CustomTestCase):
 class TestEncodeVisionItems(CustomTestCase):
     def _encode(self, items, embedder, budget=4900, is_tpu=True):
         with patch.object(mm_schedule, "_is_tpu", is_tpu), patch.object(
-            mm_schedule, "_tpu_vit_patch_budget", return_value=budget
+            mm_schedule, "_tpu_vision_encoder_patch_budget", return_value=budget
         ):
             return mm_schedule._encode_vision_items(embedder, items)
 
@@ -116,17 +116,11 @@ class TestEncodeVisionItems(CustomTestCase):
             [int(tensor[0, 0].item()) for tensor in out], [4752, 4836, 4784]
         )
 
-    def test_an_image_above_the_budget_warns_that_it_will_recompile(self):
+    def test_an_item_above_the_budget_is_still_encoded_in_one_call(self):
+        # Nothing to split; the backend pads/recompiles and warns for itself.
         embedder = _RecordingEmbedder()
-        with self.assertLogs(mm_schedule.logger, level="WARNING") as captured:
-            self._encode([_image(14372)], embedder)
-        self.assertIn("above the top precompiled ViT", "".join(captured.output))
-
-    def test_a_batch_that_fits_does_not_warn(self):
-        embedder = _RecordingEmbedder()
-        with patch.object(mm_schedule.logger, "warning") as warn:
-            self._encode([_image(2000), _image(2000)], embedder)
-        warn.assert_not_called()
+        self._encode([_image(14372)], embedder)
+        self.assertEqual(embedder.calls, [14372])
 
 
 if __name__ == "__main__":
