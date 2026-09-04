@@ -284,7 +284,7 @@ class PerImageRequestInfo:
 
 
 def _tpu_vision_encoder_patch_budget() -> int:
-    """Patches one vision-encoder call may carry on TPU. Callers gate on _is_tpu."""
+    """Patches one vision-encoder call may carry on TPU."""
     from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
         precompiled_max_patch_count,
     )
@@ -316,19 +316,16 @@ def _split_items_by_patch_budget(
     return groups
 
 
-def _encode_vision_items(
+def _encode_vision_items_tpu(
     data_embedding_func: DataEmbeddingFunc,
     items: List[MultimodalDataItem],
 ) -> torch.Tensor | list:
-    """Encode items, splitting the call to stay within the encoder patch budget.
+    """Encode items as several calls that each fit the precompiled patch budget.
 
-    A batch is concatenated into one encoder call. TPU precompiles that call for
-    a bounded set of patch counts, so a batch above the largest one falls off the
-    set and recompiles; other backends take no budget and keep the single call.
+    A batch is concatenated into one encoder call, and TPU precompiles that call
+    for a bounded set of patch counts, so a batch above the largest one falls off
+    the set and recompiles.
     """
-    if not _is_tpu or not items:
-        return data_embedding_func(items)
-
     budget = _tpu_vision_encoder_patch_budget()
     groups = _split_items_by_patch_budget(items, budget)
     if len(groups) == 1:
@@ -349,6 +346,16 @@ def _encode_vision_items(
     return torch.concat(
         [output.reshape(-1, output.shape[-1]) for output in outputs], dim=0
     )
+
+
+def _encode_vision_items(
+    data_embedding_func: DataEmbeddingFunc,
+    items: List[MultimodalDataItem],
+) -> torch.Tensor | list:
+    """Encode a batch of vision items, one encoder call unless a backend caps it."""
+    if _is_tpu:
+        return _encode_vision_items_tpu(data_embedding_func, items)
+    return data_embedding_func(items)
 
 
 def _batch_encode_per_image_misses(
