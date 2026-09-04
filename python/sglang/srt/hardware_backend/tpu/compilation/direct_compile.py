@@ -347,7 +347,10 @@ class CompiledFunction:
         # Clone mutated KV inputs; XLA will optimize these away.
         # The strategy for these is that during runtime, we will copy_ the
         # updated values back into the original Tensors. copy_ doesn't launch a
-        # kernel, it just swizzles some metadata around.
+        # kernel, it just swizzles some metadata around -- provided the target
+        # is a contiguous base tensor whose dtype matches its storage. A dtype
+        # view (uint8 storage viewed as fp8) makes torch_tpu materialize the
+        # write-back into a fresh buffer instead (see kv_pool._zeros_kv_buffer).
         for input_index in range(kv_pool_input_start, kv_pool_input_stop):
             trace_inputs[input_index] = graph_inputs[input_index].clone()
         kv_pool_trace_inputs = trace_inputs[kv_pool_input_start:kv_pool_input_stop]
