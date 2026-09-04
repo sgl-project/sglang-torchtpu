@@ -60,6 +60,7 @@ def _prefill_manager():
     mgr._reshard_slot_of = {}
     mgr._aborted = {}
     mgr._pulling = None
+    mgr._announced_at = {}
     # Settle-aware cleanup state shared by every manager mode.
     mgr._pulling_cleared = set()
     mgr._cleared_plans = {}
@@ -299,6 +300,8 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr._swa_engine_max_blocks = 0
         mgr._dynamic_host_staging = True
         mgr._pulling = StagingAdmission(4)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._ensure_engine = lambda: engine
         mgr._drain_engine = lambda: None
         mgr.is_failed = lambda room: False

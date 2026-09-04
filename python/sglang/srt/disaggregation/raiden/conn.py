@@ -309,6 +309,11 @@ class RaidenKVManager(CommonKVManager):
             self._remote_swa_blocks: Dict[int, List[int]] = {}
             self._remote_endpoint: Dict[int, str] = {}
             self._remote_swa_endpoint: Dict[int, str] = {}
+            # When each of a room's reads was announced, by read id. The
+            # prefill keeps a read registered for the transfer deadline and
+            # then releases its pages, so a read that waited longer than
+            # that for a staging slot is failed instead of issued.
+            self._announced_at: Dict[str, float] = {}
             # Chunk announcements waiting for a staging slot, and the reads
             # already issued for a room.
             self._chunk_queue: Dict[int, List[tuple]] = {}
@@ -844,6 +849,7 @@ class RaidenKVManager(CommonKVManager):
         with self._state_lock:
             if room in self._aborted:
                 return
+            self._announced_at[req_id] = self._monotonic()
             self._remote_total[room] = total_pages
             self._announced_spans.setdefault(room, []).append(
                 (start, start + len(blocks))
@@ -921,6 +927,7 @@ class RaidenKVManager(CommonKVManager):
             self._remote_endpoint[room] = endpoint
             self._remote_swa_blocks[room] = remote_swa_blocks
             self._remote_swa_endpoint[room] = swa_endpoint
+            self._announced_at[str(room)] = self._monotonic()
             aux_index = self._decode_aux_index.get(room)
             if self.chunked_transfer:
                 spans = self._announced_spans.get(room, [])
@@ -1458,6 +1465,32 @@ class RaidenKVManager(CommonKVManager):
             self._failed.add(str(room))
         logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
 
+    def _announcement_expired_locked(self, room: int, req_id: str) -> bool:
+        """Fails ``room`` when its read ``req_id`` waited for a staging slot
+        longer than the transfer deadline.
+
+        The prefill registers a read for that long and then releases its
+        pages, so a pull issued afterwards can only find nothing there.
+        Called under ``_state_lock``.
+        """
+        announced = self._announced_at.get(req_id)
+        if announced is None:
+            return False
+        waited = self._monotonic() - announced
+        if waited < self._timeout_s:
+            return False
+        self._fail_room_locked(
+            room,
+            f"Request {room} waited {waited:.0f}s for a host staging slot, "
+            f"past the {self._timeout_s:.0f}s transfer deadline after which "
+            "the prefill releases its KV",
+        )
+        # The read will not ask again, so it must not hold the head of the
+        # line for the other rooms.
+        if self._pulling is not None:
+            self._pulling.forget(req_id)
+        return True
+
     def maybe_start_pull(self, room: int) -> bool:
         """Issue whatever of this room's pull is announced and affordable.
 
@@ -1535,6 +1568,8 @@ class RaidenKVManager(CommonKVManager):
                     )
                 if room in self._aborted:
                     # The room failed; its pages are no longer this read's.
+                    return started
+                if self._announcement_expired_locked(room, req_id):
                     return started
                 if not self._pulling.admit(req_id, cost, swa_cost):
                     return started
@@ -1621,9 +1656,11 @@ class RaidenKVManager(CommonKVManager):
             # own key; a chunked read's key is its chunk id.
             if str(room) in self._pulling:
                 return True
-            if room in self._aborted or not self._pulling.admit(
-                str(room), cost, swa_cost
+            if room in self._aborted or self._announcement_expired_locked(
+                room, str(room)
             ):
+                return False
+            if not self._pulling.admit(str(room), cost, swa_cost):
                 return False
             # Status moves with the admission, under the same lock an abort
             # takes: a Transferring write can never follow the abort's Failed.
@@ -2748,6 +2785,10 @@ class RaidenKVManager(CommonKVManager):
             )
             for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
+            announced = getattr(self, "_announced_at", None)
+            if announced is not None:
+                for key in [k for k in announced if belongs(k)]:
+                    del announced[key]
             for d in (
                 getattr(self, "_chunk_queue", None),
                 getattr(self, "_remote_total", None),
