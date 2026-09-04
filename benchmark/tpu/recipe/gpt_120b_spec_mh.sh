@@ -51,6 +51,5 @@ exec env \
   ENABLE_TORCH_COMPILE=1 \
   ENABLE_METRICS=1 \
   SGLANG_TPU_FUSED_MOE_SC_GATHER=0 \
-  SGLANG_TPU_ALLOW_SPEC_RECOMPILE=1 \
   EXTRA_ARGS="${spec_args[*]}${EXTRA_ARGS:+ $EXTRA_ARGS}" \
   bash launch_server.sh "$@"

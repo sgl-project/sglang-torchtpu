@@ -61,8 +61,6 @@ LAUNCH_ENV = {
     # Include cache-hit details in OpenAI API responses.
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
-    # TODO(tpu): remove after distributed top-k precompiles the 2048-token bucket.
-    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "

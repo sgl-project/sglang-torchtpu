@@ -50,7 +50,6 @@ LAUNCH_ENV = {
     "HICACHE_WRITE_POLICY": "write_through",
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
-    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "

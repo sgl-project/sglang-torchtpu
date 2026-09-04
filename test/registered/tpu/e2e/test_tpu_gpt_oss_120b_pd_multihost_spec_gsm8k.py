@@ -98,7 +98,6 @@ EXTRA_LAUNCH_ENV: Dict[str, str] = {
     "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
     "TPU_COMPILE_BS": "1 2 4 16",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "SGLANG_RAIDEN_RESHARD": "0",
 }
 
@@ -547,7 +546,6 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             self.assertNotIn("--disable-radix-cache", env["EXTRA_ARGS"])
             # Bounded verify-graph compile grid guards against the host-RAM OOM.
             self.assertEqual(env["TPU_COMPILE_BS"], "1 2 4 16")
-            self.assertEqual(env["SGLANG_TPU_ALLOW_SPEC_RECOMPILE"], "1")
 
     def test_decode_omits_raiden_hicache_retraction(self) -> None:
         # Spec decode does not offload draft KV, so no host-pool retraction flags.

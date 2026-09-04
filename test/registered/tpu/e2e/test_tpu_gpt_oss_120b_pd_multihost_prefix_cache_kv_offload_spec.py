@@ -107,7 +107,6 @@ EXTRA_LAUNCH_ENV: Dict[str, str] = {
     "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
     "TPU_COMPILE_BS": "1 2 4 16",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "SGLANG_RAIDEN_RESHARD": "0",
 }
 
@@ -687,7 +686,6 @@ class TestPdGptOss120bConfiguration(unittest.TestCase):
             self.assertNotIn("--disable-radix-cache", env["EXTRA_ARGS"])
             # Bounded verify-graph compile grid guards against the host-RAM OOM.
             self.assertEqual(env["TPU_COMPILE_BS"], "1 2 4 16")
-            self.assertEqual(env["SGLANG_TPU_ALLOW_SPEC_RECOMPILE"], "1")
         prefill_args = build_prefill_env(2, env={})["EXTRA_ARGS"]
         self.assertIn("--enable-hierarchical-cache", prefill_args)
         self.assertIn("--hicache-io-backend raiden", prefill_args)

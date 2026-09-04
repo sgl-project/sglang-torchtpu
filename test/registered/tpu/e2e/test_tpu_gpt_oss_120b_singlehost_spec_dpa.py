@@ -34,9 +34,6 @@ LAUNCH_ENV = {
     "MAX_TOTAL_TOKENS": "8192",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "DP_SIZE": "4",
-    # Keep speculative recompilation enabled until distributed top-k precompiles
-    # the same token buckets as the decoder.
-    "SGLANG_TPU_ALLOW_SPEC_RECOMPILE": "1",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "
