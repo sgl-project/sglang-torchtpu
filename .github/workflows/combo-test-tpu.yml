@@ -27,13 +27,11 @@ jobs:
 
   pd-mh-gpt-120b-pc-offload-spec:
     needs: build
-    name: pd-mh-gpt-120b-pc-offload-spec
+    name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
-      # Last segment of the check name; the job name above holds the tag.
-      display_name: test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec
       lane: nightly
       hosts: 2
       pd_prefill_hosts: 2

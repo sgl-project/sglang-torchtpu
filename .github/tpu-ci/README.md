@@ -189,12 +189,16 @@ The nightly single-host jobs are ONE JOB PER TEST FILE (`discover_tests.py` rend
 matrix), so a red job names its test directly — the dashboard contract. Kueue queues
 them against the nightly lane's single-host quota, and they all reuse one image build.
 
-**Two names per job.** GitHub renders a called job as `<caller> / <callee>`, so a stage
-job carries the compact stage tag (`single-host`, `accuracy`, `pd-sh-gpt-120b`, …) and
-passes its test to `_tpu-test.yml` as `display_name` — a check ENDS with the test:
-`feature-validation / single-host / test_diffusion_wan22_ti2v_5b`. `run_name` is a
-different name, for Kubernetes only (pods are `tpu-ci-<run_name>-<rand>-slice-<idx>`, 63
-chars max). Neither is a dashboard key: series identity is the metric `id`.
+**Two names per leg.** GitHub renders a called job as two lines, `<caller job> / <called
+job>`, and appends every matrix value in parentheses to a matrix job whose `name` does not
+reference the matrix. So a stage job's `name` is the test or suite it runs, taken from the
+matrix (`${{ matrix.test.name }}`, `${{ matrix.suite }}`), and `_tpu-test.yml` names its
+own job by where it ran (`nightly lane, 1 host`, `nightly lane, 2P+2D`) — the pair never
+repeats itself. `run_name` is the other name, for Kubernetes only: JobSet validates the
+POD name `tpu-ci-<run_name>-<5 rand>-<role>-<job idx>-<pod idx>-<5 rand>` against 63
+chars, which leaves `run_name` 34 chars on a slice and 32 on a P/D role (the accuracy
+legs' `accuracy-<model>-<eval>` is 29). Neither is a dashboard key: series identity is the
+metric `id`.
 
 **Adding a nightly test.** Single-host: `register_tpu_ci(est_time=…, suite=…, nightly=True)`
 plus the suite in `run_suite.py`. Multi-host: drop a file with a `MULTIHOST_LAUNCH` dict

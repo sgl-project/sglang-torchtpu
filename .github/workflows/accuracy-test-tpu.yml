@@ -79,24 +79,25 @@ jobs:
       fail-fast: false
       matrix:
         # One suite (= one file, one job, one slice) per benchmark, each paired
-        # with the shorter name its pods get (tpu-ci-<run_name>-<rand>-slice-<idx>
-        # against a 63-char cap; the suite spends four of those on a "tpu" the
-        # prefix already carries). Suites stay spelled out -- the pr-gate lint
-        # greps this file for each nightly-accuracy registration's literal suite.
-        # The next model adds its legs here and a choice above; selection stays in
-        # the job-level `if` while a single model is the only single-host entrant.
+        # with the name its Kubernetes objects get. JobSet validates the POD name,
+        # tpu-ci-<run_name>-<5 rand>-slice-0-0-<5 rand>, against 63 chars, which
+        # leaves run_name 34; the suite itself (38-41) is rejected at admission.
+        # Suites stay spelled out: the pr-gate lint greps this file for each
+        # nightly-accuracy registration's literal suite. The next model adds its
+        # legs here and a choice above; selection stays in the job-level `if`
+        # while a single model is the only single-host entrant.
         include:
           - suite: nightly-tpu-accuracy-gpt-oss-120b-aime
-            run_name: nightly-accuracy-gpt-oss-120b-aime
+            run_name: accuracy-gpt-oss-120b-aime
           - suite: nightly-tpu-accuracy-gpt-oss-120b-gpqa
-            run_name: nightly-accuracy-gpt-oss-120b-gpqa
+            run_name: accuracy-gpt-oss-120b-gpqa
           - suite: nightly-tpu-accuracy-gpt-oss-120b-gsm8k
-            run_name: nightly-accuracy-gpt-oss-120b-gsm8k
+            run_name: accuracy-gpt-oss-120b-gsm8k
           - suite: nightly-tpu-accuracy-gpt-oss-120b-mmlupro
-            run_name: nightly-accuracy-gpt-oss-120b-mmlupro
-    # Stage tag here, suite in display_name, so a red check ends with the eval
-    # that failed (see README, "Two names per job").
-    name: accuracy
+            run_name: accuracy-gpt-oss-120b-mmlupro
+    # From the matrix: a static name here makes GitHub append every matrix value
+    # in parentheses (README, "Two names per leg").
+    name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -104,7 +105,6 @@ jobs:
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}
-      display_name: ${{ matrix.suite }}
       run_name: ${{ matrix.run_name }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights.
@@ -155,12 +155,11 @@ jobs:
       fail-fast: false
       matrix:
         group: ${{ fromJSON(needs.discover-multihost.outputs.groups) }}
-    name: accuracy-multihost
+    name: ${{ matrix.group.name }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
-      display_name: ${{ matrix.group.name }}
       lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}
@@ -168,10 +167,9 @@ jobs:
       hosts: ${{ matrix.group.hosts }}
       weights_pvc: ${{ matrix.group.weights_pvc }}
       timeout_per_file: ${{ matrix.group.timeout_per_file }}
-      # The group's COMPACT name (discovery hashes the path): the file stem here
-      # would push `tpu-ci-<run_name>-<rand>-slice-0` past k8s's 63 chars for
-      # deepseek-r1-0528. The test stays legible in display_name and in the
-      # job's own "== test files: ... ==" line.
+      # The group's COMPACT name (discovery hashes the path): the file stem would
+      # push the pod name past 63 chars for deepseek-r1-0528. The test stays
+      # legible in the job name and in the job's own "== test files: ==" line.
       run_name: ${{ matrix.group.run_name }}
     permissions:
       contents: read

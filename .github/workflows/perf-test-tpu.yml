@@ -76,9 +76,9 @@ jobs:
         # next one adds a choice above and a branch here.
         suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-perf-gpt-oss-120b"]'))
                 || fromJSON('["nightly-tpu-perf-gpt-oss-120b"]') }}
-    # Stage tag here, suite in display_name, so the check ends with the gate that
-    # ran (see README, "Two names per job").
-    name: perf
+    # From the matrix: a static name here makes GitHub append every matrix value
+    # in parentheses (README, "Two names per leg").
+    name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -86,7 +86,6 @@ jobs:
       lane: nightly
       hosts: 1
       suite: ${{ matrix.suite }}
-      display_name: ${{ matrix.suite }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights; harmless for the
       # model that pulls from HF instead.
