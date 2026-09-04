@@ -1499,6 +1499,7 @@ class RaidenKVManager(CommonKVManager):
                 ]
                 if not pairs:
                     queue.pop(0)
+                    self._pulling.forget(req_id)
                     continue
                 full_pages = len({local_block for _, local_block in pairs})
                 if full_pages > self._full_engine_max_blocks:
