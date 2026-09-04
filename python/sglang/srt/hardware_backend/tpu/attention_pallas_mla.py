@@ -43,6 +43,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    _quantize_kv_to_fp8,
+)
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
 )
@@ -51,7 +54,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,8 @@ def _build_pallas_mla_kernel_op():
         cu_kv_lens: jax.Array,
         distribution: jax.Array,
         sm_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> tuple[jax.Array, jax.Array]:
         return _jax_mla(
             ql_nope,
@@ -106,13 +110,15 @@ def _build_pallas_mla_kernel_op():
             cu_kv_lens,
             distribution,
             sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
             decode_batch_size=_MLA_DECODE_BATCH_SIZE,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        static_argnums=(10,),
+        static_argnums=(10, 11, 12),
         donate_argnums=(4,),
         input_output_aliases={4: 1},
         warn_deprecated=False,
@@ -135,6 +141,8 @@ def _build_pallas_mla_kernel_op():
         cu_kv_lens: torch.Tensor,
         distribution: torch.Tensor,
         sm_scale: float = 1.0,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> torch.Tensor:
         # JAX is CPU-only here, so Mosaic needs the TPU generation patched in.
         # Inside the custom op like the RPA base: Dynamo can't trace the patch's lock.
@@ -151,6 +159,8 @@ def _build_pallas_mla_kernel_op():
                 cu_kv_lens,
                 distribution,
                 sm_scale,
+                k_scale,
+                v_scale,
             )
         return output
 
@@ -175,16 +185,6 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
     MLA kernel consumes the identical layout — and overrides only the op
     registration and the per-layer forward.
     """
-
-    def __init__(
-        self, model_runner: "ModelRunner", speculative_step_id: int = 0
-    ) -> None:
-        super().__init__(model_runner, speculative_step_id=speculative_step_id)
-        if self.kv_cache_quant_dtype is not None:
-            raise NotImplementedError(
-                "fp8 KV cache is not supported by the pallas_tpu_mla backend "
-                "yet; run with --kv-cache-dtype auto (bf16)."
-            )
 
     def _build_kernel_op(self):
         # Hook called by ``super().__init__()`` to populate ``self._op``. Both
@@ -280,6 +280,21 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
         new_kv_c = k.reshape(num_tokens, kv_lora_rank).contiguous()
         new_k_pe = k_rope.reshape(num_tokens, rope_dim).contiguous()
 
+        # fp8 KV cache: the kernel writes new_kv_c / new_k_pe into the cache
+        # itself and requires them in the cache dtype. Quantize per-tensor with
+        # the layer's k_scale (1.0 when the checkpoint has none) and pass the
+        # same scale for K and V: MLA's V is the same latent tensor, so it
+        # must be dequantized with the scale it was quantized with. Q stays
+        # bf16 (the combination upstream tests).
+        if self.kv_cache_quant_dtype is not None:
+            k_scale = layer.k_scale_float if layer.k_scale_float is not None else 1.0
+            v_scale = k_scale
+            new_kv_c = _quantize_kv_to_fp8(new_kv_c, k_scale, self.kv_cache_quant_dtype)
+            new_k_pe = _quantize_kv_to_fp8(new_k_pe, k_scale, self.kv_cache_quant_dtype)
+        else:
+            k_scale = None
+            v_scale = None
+
         # Backend-cached pool: upstream moved token_to_kv_pool off ForwardBatch.
         kv_cache = self.token_to_kv_pool.get_fused_kv_buffer(layer.layer_id)
 
@@ -295,6 +310,8 @@ class TpuPallasMlaAttnBackend(TpuPallasRpaV3AttnBackend):
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
             float(layer.scaling),
+            k_scale,
+            v_scale,
         )
 
         # o_latent [T, H, kv_lora_rank] -> [T, H * kv_lora_rank]; the model

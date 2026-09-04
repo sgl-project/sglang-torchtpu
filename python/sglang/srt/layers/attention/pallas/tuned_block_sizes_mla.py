@@ -145,6 +145,11 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 2048): (8, 128),
+        # 4096/8192-token chunks (tp=8 single-host serving): copies of the 2048
+        # entry, not tuned. The alternative is the (1, 16) fallback, measured at
+        # 14.8 ms/layer for a 4096-token chunk (bq=16 x 1 page grid).
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 4096): (8, 128),
+        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 8192): (8, 128),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 1): (32, 1, 8),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 2): (32, 1, 8),
         ("decode", "bfloat16", "bfloat16", 8, 512, 64, 64, 4): (32, 1, 8),

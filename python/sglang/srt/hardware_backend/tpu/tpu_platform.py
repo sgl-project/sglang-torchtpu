@@ -136,9 +136,9 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     KV, not by arithmetic. "auto" (model dtype) is the generic SGLang default
     and gives up both.
 
-    Only those backends: ``pallas_tpu_mla`` rejects an fp8 KV cache outright,
-    and ``pallas_tpu_flash`` has no dequantization scale, so defaulting either
-    to fp8 breaks or silently degrades it.
+    Only those backends: ``pallas_tpu_mla`` accepts fp8 KV but stays opt-in
+    until its accuracy is validated, and ``pallas_tpu_flash`` has no
+    dequantization scale, so defaulting it to fp8 silently degrades it.
     """
     from sglang.srt.arg_groups.overrides import (
         declare_late_resolution,
