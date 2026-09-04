@@ -19,6 +19,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import Bucketer
 from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -109,6 +110,17 @@ class _DFlashLayerAttn(nn.Module):
         self.head_dim = head_dim
         self.device = device or torch.device("tpu")
         self.attn = SimpleNamespace(k_scale=None, v_scale=None)
+        # The fused KV write gathers cos/sin off rotary_emb instead of calling
+        # apply_k_rope, and asserts a neox table over head_dim.
+        self.rotary_emb = get_rope(
+            head_dim,
+            rotary_dim=head_dim,
+            max_position=4096,
+            base=10000,
+            is_neox_style=True,
+            dtype=torch.float32,
+        )
+        self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(self.device)
 
     def kv_proj_only(self, layer_ctx_hidden: torch.Tensor):
         num_tokens = layer_ctx_hidden.shape[0]
