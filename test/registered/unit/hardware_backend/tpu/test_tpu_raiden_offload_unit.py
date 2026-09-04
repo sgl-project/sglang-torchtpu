@@ -36,7 +36,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVSender,
     get_raiden_kv_caches,
 )
-from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 from sglang.srt.disaggregation.raiden.serde import MessageTag, pack_ints, unpack_blocks
 from sglang.srt.disaggregation.utils import KVClassType, TransferBackend
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
@@ -435,7 +435,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
-        mgr._pulling = SlotAdmission(1)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(2, 1)
         mgr._full_engine_max_blocks = 2
         mgr._swa_engine_max_blocks = 1
         mgr._local_blocks = {room: [8, 9]}
@@ -471,7 +472,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._state_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
-        mgr._pulling = SlotAdmission(1)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(full_max_blocks, swa_max_blocks)
         mgr._pulling_cleared = set()
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -544,7 +546,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._engine.start_read.assert_not_called()
         mgr._swa_engine.start_read.assert_not_called()
 
-    def test_decode_defers_pull_until_a_staging_slot_frees(self):
+    def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
@@ -557,7 +559,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = None
-        mgr._pulling = SlotAdmission(1)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(1)
         mgr._pulling_cleared = set()
         mgr._full_engine_max_blocks = 4
         mgr._completed_recv = set()
@@ -582,7 +585,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
 
     @staticmethod
-    def _decode_mgr(capacity, full_limit, swa_limit=None):
+    def _decode_mgr(pool_pages, full_limit, swa_limit=None, swa_pool_pages=None):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -594,7 +597,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._status_lock = threading.Lock()
         mgr._engine = Mock()
         mgr._swa_engine = Mock() if swa_limit is not None else None
-        mgr._pulling = SlotAdmission(capacity)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(pool_pages, swa_pool_pages)
         mgr._pulling_cleared = set()
         mgr._full_engine_max_blocks = full_limit
         mgr._swa_engine_max_blocks = swa_limit or 0
@@ -628,7 +632,9 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_checks_each_pool_against_its_own_page_limit(self):
         # gpt-oss at page 64: a 128-token window is 3 pages, the full pool 128.
         room = 31
-        mgr = self._decode_mgr(capacity=4, full_limit=128, swa_limit=3)
+        mgr = self._decode_mgr(
+            pool_pages=512, full_limit=128, swa_limit=3, swa_pool_pages=12
+        )
         self._announce(mgr, room, full_pages=40, swa_pages=3)
 
         self.assertTrue(mgr.maybe_start_pull(room))
@@ -645,9 +651,9 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         )
         self.assertEqual(mgr._engine.start_read.call_count, 1)
 
-    def test_cleared_room_keeps_its_slot_until_the_read_settles(self):
+    def test_cleared_room_keeps_its_staging_until_the_read_settles(self):
         first, second = 33, 34
-        mgr = self._decode_mgr(capacity=1, full_limit=8)
+        mgr = self._decode_mgr(pool_pages=2, full_limit=8)
         self._announce(mgr, first, full_pages=2)
         self._announce(mgr, second, full_pages=2)
         mgr._send_blocks = {}
@@ -665,9 +671,9 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertNotIn(str(first), mgr._completed_recv)
         self.assertFalse(mgr._pulling_cleared)
 
-    def test_cleared_settled_room_releases_its_slot_at_once(self):
+    def test_cleared_settled_room_releases_its_staging_at_once(self):
         first, second = 35, 36
-        mgr = self._decode_mgr(capacity=1, full_limit=8)
+        mgr = self._decode_mgr(pool_pages=2, full_limit=8)
         self._announce(mgr, first, full_pages=2)
         self._announce(mgr, second, full_pages=2)
         mgr._send_blocks = {}
@@ -679,9 +685,11 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         self.assertTrue(mgr.maybe_start_pull(second))
         self.assertNotIn(str(first), mgr._completed_recv)
 
-    def test_hybrid_swa_slot_is_held_until_both_engines_settle(self):
+    def test_hybrid_swa_staging_is_held_until_both_engines_settle(self):
         first, second = 37, 38
-        mgr = self._decode_mgr(capacity=1, full_limit=8, swa_limit=3)
+        mgr = self._decode_mgr(
+            pool_pages=2, full_limit=8, swa_limit=3, swa_pool_pages=1
+        )
         self._announce(mgr, first, full_pages=2, swa_pages=1)
         self._announce(mgr, second, full_pages=2, swa_pages=1)
 
@@ -698,6 +706,66 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         with mgr._state_lock:
             mgr._release_pull_slots_locked()
         self.assertTrue(mgr.maybe_start_pull(second))
+
+    def test_pool_seats_reads_by_their_pages(self):
+        # Four 2-page reads fit a pool sized for one 8-page read; a fifth
+        # waits for pages to free.
+        rooms = [50, 51, 52, 53, 54]
+        mgr = self._decode_mgr(pool_pages=8, full_limit=8)
+        for room in rooms:
+            self._announce(mgr, room, full_pages=2)
+
+        self.assertTrue(all(mgr.maybe_start_pull(room) for room in rooms[:4]))
+        self.assertFalse(mgr.maybe_start_pull(rooms[4]))
+        self.assertEqual(mgr._engine.start_read.call_count, 4)
+
+        mgr._completed_recv.add(str(rooms[0]))
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(rooms[4]))
+
+    def test_fixed_slots_seat_one_read_per_slot(self):
+        first, second = 55, 56
+        mgr = self._decode_mgr(pool_pages=8, full_limit=8)
+        mgr._dynamic_host_staging = False
+        self._announce(mgr, first, full_pages=2)
+        self._announce(mgr, second, full_pages=2)
+
+        self.assertTrue(mgr.maybe_start_pull(first))
+        self.assertFalse(mgr.maybe_start_pull(second))
+
+    def test_a_waiting_read_is_not_starved_by_smaller_ones(self):
+        holder, big, small = 57, 58, 59
+        mgr = self._decode_mgr(pool_pages=8, full_limit=8)
+        self._announce(mgr, holder, full_pages=6)
+        self._announce(mgr, big, full_pages=4)
+        self._announce(mgr, small, full_pages=2)
+
+        self.assertTrue(mgr.maybe_start_pull(holder))
+        self.assertFalse(mgr.maybe_start_pull(big))
+        # Two pages are free, but the smaller read waits behind the larger.
+        self.assertFalse(mgr.maybe_start_pull(small))
+
+        mgr._completed_recv.add(str(holder))
+        with mgr._state_lock:
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(big))
+        self.assertTrue(mgr.maybe_start_pull(small))
+
+    def test_clearing_a_waiting_room_frees_the_line(self):
+        holder, big, small = 60, 61, 62
+        mgr = self._decode_mgr(pool_pages=8, full_limit=8)
+        mgr._send_blocks = {}
+        mgr._read_leases = {}
+        self._announce(mgr, holder, full_pages=6)
+        self._announce(mgr, big, full_pages=4)
+        self._announce(mgr, small, full_pages=2)
+
+        self.assertTrue(mgr.maybe_start_pull(holder))
+        self.assertFalse(mgr.maybe_start_pull(big))
+        # The framework drops the waiting request; the smaller read may go.
+        mgr.clear_room(big)
+        self.assertTrue(mgr.maybe_start_pull(small))
 
     @staticmethod
     def _reshard_decode_mgr():
@@ -926,7 +994,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertNotIn(room, mgr._held_chunks)
 
     @staticmethod
-    def _decode(room, local, capacity):
+    def _decode(room, local, pool_pages, swa_pool_pages=8):
         mgr = object.__new__(RaidenKVManager)
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -939,7 +1007,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._engine.start_read = Mock(return_value=0)
         mgr._swa_engine = None
         mgr.chunked_transfer = True
-        mgr._pulling = SlotAdmission(capacity)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(pool_pages, swa_pool_pages)
         mgr._full_engine_max_blocks = 64
         mgr._swa_engine_max_blocks = 2
         mgr.attn_tp_rank = 0
@@ -967,7 +1036,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(room, local, capacity=4)
+        mgr = self._decode(room, local, pool_pages=256)
         mgr._swa_engine = Mock()
         mgr._remote_swa_blocks = {room: [4, 5]}
         mgr._local_swa_blocks = {room: [7]}
@@ -994,7 +1063,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(room, local, capacity=4)
+        mgr = self._decode(room, local, pool_pages=256)
         mgr._chunk_queue[room] = [
             ("33#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
             ("33#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
@@ -1023,7 +1092,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         room = 43
         local = list(range(200, 264))
         remote = list(range(100, 164))
-        mgr = self._decode(room, local, capacity=4)
+        mgr = self._decode(room, local, pool_pages=256)
         mgr._full_engine_max_blocks = 8
         mgr._chunk_queue[room] = [
             ("43#0", 11, list(range(0, 0 + 16)), remote[0:16], "127.0.0.1:31020")
@@ -1039,7 +1108,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         room = 44
         local = list(range(200, 264))
         remote = list(range(100, 164))
-        mgr = self._decode(room, local, capacity=4)
+        mgr = self._decode(room, local, pool_pages=256)
         mgr._swa_engine = Mock()
         mgr._remote_swa_blocks = {room: [4, 5, 6]}
         mgr._local_swa_blocks = {room: [7, 8, 9]}
@@ -1067,7 +1136,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
 
         room = 45
         remote = list(range(100, 164))
-        mgr = self._decode(room, list(range(200, 264)), capacity=4)
+        mgr = self._decode(room, list(range(200, 264)), pool_pages=256)
 
         def chunk(req_id, start, blocks):
             return [
@@ -1093,7 +1162,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # closing read must pull 0:16 and 32:64, not just the tail.
         room = 46
         remote = list(range(100, 164))
-        mgr = self._decode(room, list(range(200, 264)), capacity=4)
+        mgr = self._decode(room, list(range(200, 264)), pool_pages=256)
         mgr._remote_blocks = {}
         mgr._remote_endpoint = {}
         mgr._remote_swa_blocks = {}
@@ -1131,8 +1200,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # An abort shares its id with the closing read; only the engine's own
         # report may release the pages the read still writes.
         room = 47
-        mgr = self._decode(room, list(range(200, 264)), capacity=4)
-        mgr._pulling.admit(str(room))
+        mgr = self._decode(room, list(range(200, 264)), pool_pages=256)
+        mgr._pulling.admit(str(room), 16)
         with mgr._state_lock:
             mgr._fail_room_locked(room, "aborted mid-read")
         self.assertTrue(mgr.room_has_active_io(room))
@@ -1140,12 +1209,37 @@ class TestRaidenChunkedTransfer(CustomTestCase):
             mgr._native_failed.add(str(room))
         self.assertFalse(mgr.room_has_active_io(room))
 
+    def test_chunks_of_several_requests_share_the_pool_by_pages(self):
+        rooms = [60, 61, 62]
+        local = list(range(200, 264))
+        remote = list(range(100, 164))
+        endpoint = "127.0.0.1:31020"
+        mgr = self._decode(rooms[0], local, pool_pages=32)
+        for room in rooms:
+            mgr._local_blocks[room] = local
+            mgr._remote_total[room] = 64
+            mgr._chunk_queue[room] = [
+                (f"{room}#0", room, list(range(0, 16)), remote[0:16], endpoint)
+            ]
+
+        # A 32-page pool seats two 16-page chunks; the third request waits.
+        self.assertTrue(mgr.maybe_start_pull(rooms[0]))
+        self.assertTrue(mgr.maybe_start_pull(rooms[1]))
+        self.assertFalse(mgr.maybe_start_pull(rooms[2]))
+        self.assertEqual(mgr._engine.start_read.call_count, 2)
+
+        with mgr._state_lock:
+            mgr._completed_recv.add(f"{rooms[0]}#0")
+            mgr._release_pull_slots_locked()
+        self.assertTrue(mgr.maybe_start_pull(rooms[2]))
+        self.assertEqual(mgr._engine.start_read.call_count, 3)
+
     def test_failed_chunk_read_fails_the_request(self):
         room = 42
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(room, local, capacity=4)
+        mgr = self._decode(room, local, pool_pages=256)
         mgr._chunk_queue[room] = [
             ("42#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
             ("42#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
@@ -1164,12 +1258,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.clear_room(room)
         self.assertFalse(mgr._failed)
 
-    def test_cleared_room_keeps_its_slot_until_the_chunk_read_settles(self):
+    def test_cleared_room_keeps_its_staging_until_the_chunk_read_settles(self):
         first, second = 36, 37
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(first, local, capacity=1)
+        mgr = self._decode(first, local, pool_pages=16)
         mgr._local_blocks[second] = local
         mgr._remote_total[second] = 64
         mgr._chunk_queue[first] = [
@@ -1200,7 +1294,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(room, local, capacity=4)
+        mgr = self._decode(room, local, pool_pages=256)
         mgr._chunk_queue[room] = [
             ("38#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
             ("38#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
@@ -1219,12 +1313,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # Only the cleared room's ids go; room 380 shares the prefix digits.
         self.assertEqual(mgr._completed_recv, {"380#0"})
 
-    def test_hybrid_closing_read_holds_its_slot_until_both_engines_settle(self):
+    def test_hybrid_closing_read_holds_its_staging_until_both_engines_settle(self):
         first, second = 39, 40
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(first, local, capacity=1)
+        mgr = self._decode(first, local, pool_pages=64, swa_pool_pages=1)
         mgr._swa_engine = Mock()
         mgr._remote_swa_blocks = {first: [4, 5], second: [4, 5]}
         mgr._local_swa_blocks = {first: [7], second: [7]}
@@ -1260,7 +1354,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         local = list(range(200, 264))
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
-        mgr = self._decode(room, local, capacity=1)
+        mgr = self._decode(room, local, pool_pages=64, swa_pool_pages=1)
         mgr._swa_engine = Mock()
         mgr._remote_swa_blocks = {room: [4, 5]}
         mgr._local_swa_blocks = {room: [7]}

@@ -267,7 +267,7 @@ class TestReceiverFailurePaths(unittest.TestCase):
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
 
     def test_abort_while_start_read_blocks_cannot_be_overwritten(self):
-        from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 
         started = threading.Event()
         resume = threading.Event()
@@ -297,7 +297,8 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr.chunked_transfer = False
         mgr._full_engine_max_blocks = 4
         mgr._swa_engine_max_blocks = 0
-        mgr._pulling = SlotAdmission(1)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(4)
         mgr._ensure_engine = lambda: engine
         mgr._drain_engine = lambda: None
         mgr.is_failed = lambda room: False
@@ -774,13 +775,14 @@ class TestGroupFailureQuiescesRaiden(unittest.TestCase):
 
 class TestAdmissionRespectsTheTombstone(unittest.TestCase):
     def test_a_tombstoned_room_cannot_admit_a_read(self):
-        from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 
         mgr = _prefill_manager()  # provides locks and the tombstone dict
         mgr.chunked_transfer = False
         mgr._engine = Mock()
         mgr._swa_engine = None
-        mgr._pulling = SlotAdmission(4)
+        mgr._dynamic_host_staging = True
+        mgr._pulling = StagingAdmission(32)
         mgr._full_engine_max_blocks = 8
         mgr._swa_engine_max_blocks = 0
         mgr._local_blocks = {ROOM: [8]}
@@ -886,15 +888,15 @@ class TestSenderLeaseSettlement(unittest.TestCase):
 
 class TestFailureWaitsForActiveIo(unittest.TestCase):
     def test_failed_room_is_not_concluded_while_its_read_is_in_flight(self):
-        from sglang.srt.disaggregation.raiden.host_pool import SlotAdmission
+        from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 
         mgr = _decode_manager_stub(is_failed=lambda room: True)
         mgr._swa_engine = None
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
-        mgr._pulling = SlotAdmission(4)
-        mgr._pulling.admit(str(ROOM))
+        mgr._pulling = StagingAdmission(4)
+        mgr._pulling.admit(str(ROOM), 1)
         mgr._swa_req_id = lambda room: f"swa:{room}"
         mgr._pull_settled_locked = types.MethodType(
             RaidenKVManager._pull_settled_locked, mgr

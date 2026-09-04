@@ -44,7 +44,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang.srt.disaggregation.raiden.host_pool import (
-    SlotAdmission,
+    StagingAdmission,
     node_worker_rank,
     ranks_per_node,
     slot_host_bytes,
@@ -227,11 +227,12 @@ class RaidenKVManager(CommonKVManager):
         # served or failed, and ages out after the transfer deadline for a
         # read the decode never comes for.
         self._send_reads: Dict[int, Set[str]] = {}
-        # Rooms whose pull is issued and not yet settled. Raiden borrows one
-        # host staging slot per in-flight transfer and rejects a read it cannot
-        # seat, so the decode side admits at most one pull per slot and leaves
-        # the rest in the transfer queue.
-        self._pulling: Optional[SlotAdmission] = None
+        # Reads issued and not yet settled, with the host staging pages each
+        # holds. Raiden seats a read in pages of the pool it allocated at
+        # startup and rejects a read it cannot seat, so the decode side admits
+        # a read only while the pool has room for it and leaves the rest in
+        # the transfer queue.
+        self._pulling: Optional[StagingAdmission] = None
         # Reads of rooms the framework dropped while they were still in
         # flight. Raiden cannot cancel a read, so the read keeps its admission
         # until the engine reports it settled.
@@ -455,15 +456,17 @@ class RaidenKVManager(CommonKVManager):
             num_slots=num_slots,
             timeout_s=self._timeout_s,
         )
-        self._pulling = SlotAdmission(num_slots)
         self._full_engine_max_blocks = max_blocks
+        pool_pages = num_slots * max_blocks
+        swa_pool_pages = None
         logger.info(
             "RaidenKVManager rank%d engine up | endpoint=%s max_blocks=%d "
-            "num_slots=%d chunked=%d",
+            "num_slots=%d pool_pages=%d chunked=%d",
             self.attn_tp_rank,
             self.raiden_endpoint,
             max_blocks,
             num_slots,
+            pool_pages,
             int(self.chunked_transfer),
         )
         if self._swa_kv_caches:
@@ -480,17 +483,28 @@ class RaidenKVManager(CommonKVManager):
                 num_slots=swa_num_slots,
                 timeout_s=self._timeout_s,
             )
-            # A room occupies a slot in both engines; the tighter pool binds.
-            self._pulling.capacity = min(self._pulling.capacity, swa_num_slots)
             self._swa_engine_max_blocks = swa_max_blocks
+            swa_pool_pages = swa_num_slots * swa_max_blocks
             logger.info(
                 "RaidenKVManager rank%d SWA engine up | endpoint=%s "
-                "max_blocks=%d num_slots=%d",
+                "max_blocks=%d num_slots=%d pool_pages=%d",
                 self.attn_tp_rank,
                 self.swa_raiden_endpoint,
                 swa_max_blocks,
                 swa_num_slots,
+                swa_pool_pages,
             )
+        # Each engine's pool is handed out read by read, so the pages the
+        # decode may hold in flight are the pages raiden reserved.
+        self._pulling = StagingAdmission(pool_pages, swa_pool_pages)
+
+    def _staging_cost(self, pages: int, max_blocks: int) -> int:
+        """Host pages a read of ``pages`` pages takes from its engine's pool.
+
+        Per-transfer staging seats exactly the read's pages; fixed slots seat
+        every read in a whole slot of ``max_blocks`` pages.
+        """
+        return pages if self._dynamic_host_staging else max_blocks
 
     def _max_request_blocks(self) -> int:
         override = int(os.environ.get("SGLANG_RAIDEN_MAX_BLOCKS", "0"))
@@ -515,13 +529,13 @@ class RaidenKVManager(CommonKVManager):
         return max(1, math.ceil(max_tokens / self.kv_args.page_size))
 
     def _slot_ceiling(self) -> int:
-        """Slots that can ever be claimed at once.
+        """Slots the pool is sized for, at most.
 
-        A transfer holds one slot from the moment it is issued until its H2D
-        lands. The decode admits a request into the transfer queue before it
-        joins the running batch, so the reach is the batch plus the extra
-        in-transfer slots reserved alongside it; past that, slots are
-        unclaimable.
+        A read holds its pages from the moment it is issued until its H2D
+        lands, and a request keeps one read in flight. The decode admits a
+        request into the transfer queue before it joins the running batch, so
+        the reach is the batch plus the extra in-transfer slots reserved
+        alongside it; a larger pool could never be claimed.
         """
         batch = int(self.server_args.max_running_requests or 64)
         in_transfer = int(
@@ -537,9 +551,8 @@ class RaidenKVManager(CommonKVManager):
         The per-node budget is split across the ranks resident on this host
         and across the engines this rank builds, then divided by what one slot
         costs. Deriving the count keeps a large context length from turning
-        into a host allocation that fails at startup -- it lowers the transfer
-        concurrency instead, and refuses to start when not even one slot fits
-        the budget.
+        into a host allocation that fails at startup -- it shrinks the pool
+        instead, and refuses to start when not even one slot fits the budget.
         """
         budget = float(os.environ.get("SGLANG_RAIDEN_HOST_POOL_GB", "128")) * 1024**3
         local_ranks = ranks_per_node(
@@ -1410,7 +1423,7 @@ class RaidenKVManager(CommonKVManager):
         self._unregister_plan(uuid)
 
     def _release_pull_slots_locked(self) -> None:
-        """Hand back the slots of reads that have settled."""
+        """Hand back the staging of reads that have settled."""
         if self._pulling is None:
             return
         for key in self._pulling.rooms():
@@ -1456,12 +1469,11 @@ class RaidenKVManager(CommonKVManager):
         return self._start_whole_pull(room)
 
     def _start_chunked_pull(self, room: int) -> bool:
-        """Issue the next announced chunk once a staging slot can be found.
+        """Issue the next announced chunk once the pool can seat it.
 
-        A request keeps at most one chunk read in flight, so it occupies one
-        staging slot at a time exactly as a single-shot pull does; the next
-        chunk is issued when the previous read has settled. Chunks are taken
-        in prefill order.
+        A request keeps at most one chunk read in flight, so it holds the
+        staging of one chunk at a time; the next chunk is issued when the
+        previous read has settled. Chunks are taken in prefill order.
         """
         engine = self._ensure_engine()
         while True:
@@ -1488,14 +1500,17 @@ class RaidenKVManager(CommonKVManager):
                 if not pairs:
                     queue.pop(0)
                     continue
-                if len(pairs) > self._full_engine_max_blocks:
+                full_pages = len({local_block for _, local_block in pairs})
+                if full_pages > self._full_engine_max_blocks:
                     oversized = (
-                        len(pairs),
+                        full_pages,
                         self._full_engine_max_blocks,
                         "full-attention",
                         "SGLANG_RAIDEN_MAX_BLOCKS",
                     )
                     break
+                cost = self._staging_cost(full_pages, self._full_engine_max_blocks)
+                swa_cost = 0
                 # The closing read also carries the sliding-window pages, on
                 # the engine that stages them against its own limit.
                 closing = req_id == str(room) and self._swa_engine is not None
@@ -1514,10 +1529,13 @@ class RaidenKVManager(CommonKVManager):
                             "SGLANG_RAIDEN_SWA_MAX_BLOCKS",
                         )
                         break
+                    swa_cost = self._staging_cost(
+                        swa_pages, self._swa_engine_max_blocks
+                    )
                 if room in self._aborted:
                     # The room failed; its pages are no longer this read's.
                     return started
-                if not self._pulling.admit(req_id):
+                if not self._pulling.admit(req_id, cost, swa_cost):
                     return started
                 # Status moves with the admission, under the same lock an
                 # abort takes: a Transferring write can never follow the
@@ -1577,6 +1595,8 @@ class RaidenKVManager(CommonKVManager):
                 "SGLANG_RAIDEN_MAX_BLOCKS",
             )
             return False
+        cost = self._staging_cost(full_pages, self._full_engine_max_blocks)
+        swa_cost = 0
         if self._swa_engine is not None:
             remote_swa, local_swa = self._pair_blocks(remote_swa, local_swa)
             swa_pages = len(set(local_swa))
@@ -1589,6 +1609,7 @@ class RaidenKVManager(CommonKVManager):
                     "SGLANG_RAIDEN_SWA_MAX_BLOCKS",
                 )
                 return False
+            swa_cost = self._staging_cost(swa_pages, self._swa_engine_max_blocks)
         with self._state_lock:
             # The receiver polls every scheduler pass; a room whose read is
             # already in flight must not issue again -- a second start_read
@@ -1599,7 +1620,9 @@ class RaidenKVManager(CommonKVManager):
             # own key; a chunked read's key is its chunk id.
             if str(room) in self._pulling:
                 return True
-            if room in self._aborted or not self._pulling.admit(str(room)):
+            if room in self._aborted or not self._pulling.admit(
+                str(room), cost, swa_cost
+            ):
                 return False
             # Status moves with the admission, under the same lock an abort
             # takes: a Transferring write can never follow the abort's Failed.
@@ -2706,6 +2729,11 @@ class RaidenKVManager(CommonKVManager):
                         continue
                     self._pulling_cleared.add(key)
                     held.update((key, self._paired_swa_read(key) or key))
+                # A read of the room still waiting for staging will not ask
+                # again; it must not hold the line for the other rooms.
+                waiting = self._pulling.waiting
+                if waiting is not None and belongs(waiting):
+                    self._pulling.forget(waiting)
             settled_plans = []
             plans = (getattr(self, "_reshard_plans", None) or {}).pop(room, {})
             for req_id, uuid in plans.items():

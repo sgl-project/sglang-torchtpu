@@ -1,29 +1,39 @@
 """Sizing and admission control for raiden's host staging pool.
 
 A raiden engine reserves ``num_slots * max_blocks`` pages of pinned host memory
-at startup and borrows one slot per in-flight transfer. Deriving the slot count
-from a memory budget keeps a large context length from turning into a host
-allocation that fails at startup; admission keeps a consumer from issuing more
-concurrent pulls than the pool holds.
+at startup and seats each in-flight transfer in as many of those pages as the
+transfer needs (in a whole slot when fixed slots are configured). Deriving the
+slot count from a memory budget keeps a large context length from turning into
+a host allocation that fails at startup; admission keeps a consumer from
+issuing pulls the pool cannot seat.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 
-class SlotAdmission:
-    """Admission control over raiden's host staging slots.
+class StagingAdmission:
+    """Admission control over raiden's host staging, in pages.
 
-    Raiden borrows one slot per in-flight transfer and rejects a read it cannot
-    seat, so a consumer must not issue more concurrent reads than the pool
-    holds. Reads that are not admitted stay pending and are retried. Keys are
-    whatever identifies one read -- a room, or a room's chunk.
+    Raiden seats each in-flight read in host pages of the pool it allocated at
+    startup and rejects a read it cannot seat, so a consumer must not issue
+    reads that together need more pages than the pool holds. Reads that are
+    not admitted stay pending and are retried. A hybrid model's sliding-window
+    pages are seated by a second engine with its own pool, so a read that
+    carries them is charged against both pools. Keys are whatever identifies
+    one read -- a room, or a room's chunk.
+
+    Reads are admitted in the order they ask: a read that did not fit holds
+    the head of the line until it is admitted or forgotten, so a stream of
+    smaller reads cannot keep a larger one waiting indefinitely.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, swa_capacity: Optional[int] = None):
         self.capacity = max(1, int(capacity))
-        self._in_flight: Set[Any] = set()
+        self.swa_capacity = None if swa_capacity is None else max(1, int(swa_capacity))
+        self._in_flight: Dict[Any, Tuple[int, int]] = {}
+        self._waiting: Optional[Any] = None
 
     def __len__(self) -> int:
         return len(self._in_flight)
@@ -31,17 +41,50 @@ class SlotAdmission:
     def __contains__(self, key: Any) -> bool:
         return key in self._in_flight
 
-    def admit(self, key: Any) -> bool:
-        """Reserves a slot for ``key``. False means try again later."""
+    @property
+    def waiting(self) -> Optional[Any]:
+        """The read holding the head of the line, if any."""
+        return self._waiting
+
+    def pages(self) -> int:
+        return sum(pages for pages, _ in self._in_flight.values())
+
+    def swa_pages(self) -> int:
+        return sum(swa_pages for _, swa_pages in self._in_flight.values())
+
+    def admit(self, key: Any, pages: int, swa_pages: int = 0) -> bool:
+        """Reserves ``pages`` of the pool (and ``swa_pages`` of the
+        sliding-window pool) for ``key``. False means try again later."""
         if key in self._in_flight:
             return True
-        if len(self._in_flight) >= self.capacity:
+        pages, swa_pages = int(pages), int(swa_pages)
+        if pages > self.capacity or (
+            swa_pages > 0
+            and (self.swa_capacity is None or swa_pages > self.swa_capacity)
+        ):
+            raise ValueError(
+                f"read {key!r} needs {pages} pages and {swa_pages} sliding-window "
+                f"pages, more than the pool holds ({self.capacity} and "
+                f"{self.swa_capacity})"
+            )
+        if self._waiting is not None and self._waiting != key:
             return False
-        self._in_flight.add(key)
+        if self.pages() + pages > self.capacity or (
+            swa_pages > 0 and self.swa_pages() + swa_pages > self.swa_capacity
+        ):
+            self._waiting = key
+            return False
+        self._waiting = None
+        self._in_flight[key] = (pages, swa_pages)
         return True
 
     def release(self, key: Any) -> None:
-        self._in_flight.discard(key)
+        self._in_flight.pop(key, None)
+
+    def forget(self, key: Any) -> None:
+        """Gives up ``key``'s place in line: its read will not ask again."""
+        if self._waiting == key:
+            self._waiting = None
 
     def rooms(self) -> List[Any]:
         return list(self._in_flight)

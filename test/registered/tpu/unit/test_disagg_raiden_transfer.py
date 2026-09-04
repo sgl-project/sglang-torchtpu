@@ -16,7 +16,7 @@ frames only carry block ids.
 Deliberately not duplicated here, because they already have dedicated tests:
 reshard geometry and placement (``test/manual/kv_transfer/test_reshard_schedule``),
 the byte-level wire helpers (``test_raiden_serde``), and host staging admission
-(``test_raiden_slot_admission``).
+(``test_raiden_staging_admission``).
 """
 
 from __future__ import annotations

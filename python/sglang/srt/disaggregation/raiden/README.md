@@ -23,8 +23,8 @@ Page ids come from `kv_to_page_indices` in token order and are raiden block ids
 directly.
 
 KV moves chunk by chunk: as each chunked-prefill step commits its pages the
-prefill announces them, and the decode pulls each piece as soon as a staging
-slot is free, so only the last chunk's transfer is left after the prefill. The
+prefill announces them, and the decode pulls each piece as soon as the host
+staging pool can seat it, so only the last chunk's transfer is left after the prefill. The
 closing message carries the aux blob and the remaining pages. A request keeps
 one chunk in flight at a time, and pages the decode already holds from its own
 prefix cache are never announced. A hybrid model's sliding-window pages ride on
@@ -90,14 +90,14 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `SGLANG_RAIDEN_KV_PORT` | `31000` | base control port, kept clear of the default serving ports; local rank uses `base + 4*node_worker_rank` over every CP/DP replica's TP ranks (data = `+1`, SWA engine control/data = `+2`/`+3`) |
-| `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; the pool holds as many in-flight transfers as fit it, at most the running batch. Startup fails with the required and available sizes when not even one transfer fits |
+| `SGLANG_RAIDEN_HOST_POOL_GB` | `128` | host staging ceiling per node, split across local ranks and engines; each rank's pool is sized for at most one max-length transfer per running request and seats in-flight transfers page by page. Startup fails with the required and available sizes when not even one max-length transfer fits |
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
 | `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
-| `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden allocates host staging per transfer from the pool; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots and rejects asymmetric resharding, which needs per-transfer staging |
+| `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden seats each transfer in its own pages of the pool pinned at startup; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots, where every transfer takes a whole max-length slot, and rejects asymmetric resharding, which needs per-transfer staging |
 
-A decode rank issues at most one pull per host staging slot; requests past that stay in the transfer queue and are retried as slots free, so the batch size does not have to fit the slot count.
+A decode rank issues a pull only while its host staging pool has the pages for it; requests past that stay in the transfer queue, in order, and are retried as pages free, so the pool does not have to hold a max-length transfer per running request. A pull that does not fit waits at the head of the queue, so smaller pulls cannot starve it.
 
 ## Launch (one host each, equal TP)
 
