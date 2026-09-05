@@ -170,6 +170,24 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 2048): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 4096): (16, 128),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 64, 8192): (16, 128),
+        # ===== fp8 KV rows (tuned 2026-09-05 on a v7x core with the vendored
+        # kernel, bf16 Q, 2k-token KV; profiles/kimi-k26/opt/tune_mla_fp8.py).
+        # Kimi-K2.6 tp=16 (64 heads / 16 = 4, page 128): decode -20..27% vs the
+        # borrowed 16-head rows at 2k KV, ~-2% at 8k; mixed 8192 -28% (3.66 vs
+        # 5.10 ms per layer at 16k KV). =====
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 16): (8, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 64): (8, 1, 4),
+        ("decode", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 128): (16, 1, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8192): (16, 256),
+        # DeepSeek-R1 tp=8 (16 heads, page 128): decode -8% / -15% at bs 64 / 128
+        # vs (32,1,2); mixed 4096 -5% vs (8,128).
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 64): (16, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 128): (16, 1, 8),
+        ("mixed", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 4096): (32, 128),
+        # DeepSeek-R1 tp=16 (8 heads, page 64): decode 64 -5% vs (32,1,8); mixed
+        # 8192 -19% vs (16,128) (5.34 vs 6.60 ms per layer at 16k KV).
+        ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 64): (32, 1, 16),
+        ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 8192): (64, 256),
         # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
         # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
         ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 1): (16, 1, 4),
