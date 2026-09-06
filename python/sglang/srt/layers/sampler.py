@@ -919,14 +919,20 @@ def sampling_from_probs_torch(
     """
     if sampling_seed is not None:
         # Deterministic sampling takes precedence over the unseeded callback.
-        sampling_fn = lambda x: multinomial_with_seed(
-            torch.log(x), sampling_seed, positions
+        sampled_index = multinomial_with_seed(
+            torch.log(probs), sampling_seed, positions
         )
-    elif unseeded_sampling_fn is None:
-        sampling_fn = lambda x: torch.multinomial(x, num_samples=1)
+    elif unseeded_sampling_fn is not None:
+        sampled_index = unseeded_sampling_fn(probs)
+    elif envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.get():
+        # Gumbel-max trick: distributionally equivalent to torch.multinomial,
+        # but avoids multinomial's CPU-side philox offset bookkeeping and
+        # distribution-validity assert that stall the decode critical path.
+        q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+        q.clamp_min_(torch.finfo(torch.float32).tiny)
+        sampled_index = (probs.float() / q).argmax(dim=-1, keepdim=True)
     else:
-        sampling_fn = unseeded_sampling_fn
-    sampled_index = sampling_fn(probs)
+        sampled_index = torch.multinomial(probs, num_samples=1)
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
     return batch_next_token_ids
 
