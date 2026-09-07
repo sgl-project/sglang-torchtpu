@@ -81,7 +81,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import is_npu
@@ -200,12 +199,6 @@ class PrefillBootstrapQueue:
                 # Staging writer accounting has no pp dimension.
                 raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
-                )
-            if get_parallel().enable_prefill_context_parallel:
-                # CP rewrites index_slice per rank, breaking the chunk grid.
-                raise RuntimeError(
-                    "SGLANG_DISAGG_STAGING_BUFFER does not support "
-                    "prefill context parallelism."
                 )
         self.kv_manager = self._init_kv_manager()
 

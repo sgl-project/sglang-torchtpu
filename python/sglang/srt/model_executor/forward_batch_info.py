@@ -1351,10 +1351,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
-        # Local imports: module-level CP helper imports here are circular (#27014).
-        from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-        from sglang.srt.layers.cp.utils import enable_cp_v2
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -1362,9 +1358,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_num_tokens = list(self.global_num_tokens_cpu)
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
-        # Zigzag CP performs its own padding. Other CP modes expose the
-        # alignment required by the platform-neutral compile policy.
-        cp_align_size = 1 if enable_cp_v2() else get_cp_padding_align_size()
+        # Every remaining CP strategy performs its own padding.
         (
             global_num_tokens,
             self.global_num_tokens_for_logprob_cpu,
@@ -1374,7 +1368,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_num_tokens,
             self.global_num_tokens_for_logprob_cpu,
             attn_tp_size=attn_tp_size,
-            cp_align_size=cp_align_size,
+            cp_align_size=1,
         )
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
