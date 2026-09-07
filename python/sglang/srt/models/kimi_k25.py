@@ -826,6 +826,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
     # where image embeddings are spliced. The TPU decoder compile policy reads
     # this to warm the input_ids decode / verify variants.
     decode_embeds_in_language_model: bool = _is_tpu
+    # Text-only prefill (no image anywhere in the batch) takes the same direct
+    # path. The routine would embed eagerly and call the decoder with
+    # input_embeds sized by the real token count, which under DP attention
+    # disagrees with the padded bucket the compile policy set the DP gather
+    # slots for (rank-divergent metadata, watchdog abort on the first request).
+    # The policy warms the input_ids extend variant, so nothing recompiles.
+    text_prefill_in_language_model: bool = _is_tpu
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
@@ -886,27 +893,55 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-        # TPU: annotate the inner DeepSeek-V3 decoder (mirrors Qwen3-VL) so the
-        # data-dependent multimodal merge and logits stay out of the graph.
-        # Inert unless --enable-torch-compile.
+        # TPU compile boundary. Inert unless --enable-torch-compile.
         if _is_tpu and self.language_model is not None:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
-            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-                Qwen3VLDecoderTpuCompilePolicy,
-            )
+            from sglang.srt.server_args import get_global_server_args
 
-            support_torch_compile(
-                self.language_model.model,
-                policy=Qwen3VLDecoderTpuCompilePolicy,
-            )
+            if get_global_server_args().enable_multimodal is False:
+                # Text-only serving (--no-enable-multimodal): compile this
+                # wrapper's forward, which forward() routes straight into the
+                # language model, logits processor included -- the same
+                # boundary a text model gets. The alternative below leaves the
+                # logits processor eager, and under DP attention its DP gather
+                # and attention-TP all-gather then run as eager torch_tpu
+                # collectives, which CHECK-fail (attn_tp=1, lowering_util.cc)
+                # or deadlock (attn_tp>1) on the first request.
+                from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                    DecoderTpuCompilePolicy,
+                )
+
+                support_torch_compile(self, policy=DecoderTpuCompilePolicy)
+            else:
+                # Multimodal serving: annotate the inner DeepSeek-V3 decoder
+                # (mirrors Qwen3-VL) so the data-dependent multimodal merge and
+                # the logits stay out of the graph.
+                from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                    Qwen3VLDecoderTpuCompilePolicy,
+                )
+
+                support_torch_compile(
+                    self.language_model.model,
+                    policy=Qwen3VLDecoderTpuCompilePolicy,
+                )
 
     @property
     def model(self):
         # Alias .model to .language_model so this class satisfies the piecewise
         # CUDA graph gate, which checks `hasattr(model, "model")`.
         return self.language_model
+
+    @property
+    def logits_processor(self):
+        # The TPU decoder compile policy reads the compiled model's logits
+        # processor (input-logprob flag, distributed top-k width) when this
+        # wrapper is the compile boundary (text-only serving).
+        return getattr(self.language_model, "logits_processor", None)
+
+    def get_output_embeddings(self):
+        return getattr(self.language_model, "lm_head", None)
 
     def __setattr__(self, name, value):
         # Skip redundant self.model.model assignment in runner to avoid duplicate
@@ -1046,8 +1081,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if self.decode_embeds_in_language_model and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
+            or (
+                self.text_prefill_in_language_model
+                and not forward_batch.contains_mm_inputs()
+            )
         ):
-            # Sampled or drafted text tokens, never an image: embed in-graph.
+            # Decode / verify (sampled or drafted text tokens) and text-only
+            # prefill: let the language model embed inside its compiled graph.
             return self.language_model(
                 input_ids=input_ids,
                 positions=positions,
