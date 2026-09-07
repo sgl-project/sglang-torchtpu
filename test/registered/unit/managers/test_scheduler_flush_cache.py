@@ -14,7 +14,7 @@ from sglang.srt.managers.scheduler_components.flush_wrapper import (
 )
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
