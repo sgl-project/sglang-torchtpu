@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_tpu,
+    is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import (
@@ -4838,6 +4839,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 assert self.page_size == 1, (
                     f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
                 )
+        elif is_xpu():
+            assert self.page_size in (
+                64,
+                128,
+            ), f"XPU DSA requires page_size 64 or 128, got {self.page_size}"
         else:
             assert self.page_size == 64
         self.index_key_cache = self._create_index_key_cache()
