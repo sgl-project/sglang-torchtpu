@@ -20,7 +20,8 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -90,6 +91,12 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_prealloc_waiting_row_still_enters_tp_cp_vote(self, reduce):
         tp_group, cp_group = object(), object()

@@ -42,6 +42,8 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_model,
+    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -247,7 +249,7 @@ def capture_cuda_graphs(
     # batch.
     eager_runner = EagerRunner(model_runner)
 
-    post_graph_hook_specs = model_runner.server_args.forward_hooks or []
+    post_graph_hook_specs = get_observability().forward_hooks or []
     if (
         post_graph_hook_specs
         and model_runner.device == "tpu"
@@ -572,7 +574,7 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture
-    if model_runner.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+    if get_model().model_impl.lower() == ModelImpl.MINDSPORE:
         return no_capture
     # TPU uses this hook only to install torch.compile via TpuGraphRunner (PJRT
     # handles compilation caching, so there is no CUDA-style capture/replay).
