@@ -67,9 +67,8 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_exec,
     get_spec,
-    mamba_extra_buffer_enabled,
-    mamba_extra_buffer_lazy_enabled,
     mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
@@ -1582,10 +1581,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     # spec_utils import cycle.
     from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 
-    if not mamba_extra_buffer_enabled():
+    if not get_exec().mamba.enable_mamba_extra_buffer:
         return
     track_positions = None
-    if mamba_extra_buffer_lazy_enabled():
+    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
         assert track_positions is not None and len(track_positions) == len(
             batch.reqs
@@ -1870,7 +1869,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if mamba_extra_buffer_lazy_enabled():
+    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),
