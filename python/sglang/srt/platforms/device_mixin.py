@@ -27,6 +27,10 @@ Method status annotations:
 
 import enum
 import random
+<<<<<<< HEAD
+=======
+from collections.abc import Iterator
+>>>>>>> upstream/main
 from contextlib import contextmanager
 from typing import NamedTuple, Optional
 
@@ -191,6 +195,11 @@ class DeviceMixin:
     def is_pin_memory_available(self, device=None) -> bool:
         """[Active] Whether pinned host memory is available for a target device."""
         return False
+
+    @contextmanager
+    def reindex_device_id(self, device_id: int) -> Iterator[int]:
+        """[Active] Temporarily remap a physical device to logical device 0."""
+        yield device_id
 
     # ------------------------------------------------------------------
     # Planned methods — reserved interface.  Core still uses hardcoded

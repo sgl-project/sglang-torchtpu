@@ -478,6 +478,7 @@ def run_eagle_verify(
     metadata_ready_pre_pad: bool,
     finalize_tree_path: bool,
     grammar_barrier=None,
+    uno_target_max_top_k: Optional[int] = None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -505,6 +506,10 @@ def run_eagle_verify(
     # Batch 1: Target verify
     # Prepare for target verify in a separate stream
     with plan_stream_ctx:
+        if plan_stream is not None:
+            # Verify prep copies draft-produced tree metadata on the plan stream,
+            # so it must not start before the draft frontier.
+            plan_stream.wait_stream(fwd_stream)
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             req_to_token_pool,
@@ -593,6 +598,7 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+<<<<<<< HEAD
     # Match scheduler inputs to any padded target logits.
     verify_padding = target_compile_policy.prepare_spec_verify(
         batch, verify_input, logits_output.next_token_logits
@@ -622,6 +628,20 @@ def run_eagle_verify(
             )
     predict, accept_lens, accept_index = verify_result
     new_seq_lens, bonus_tokens = verify_bookkeeping_result
+=======
+    (
+        predict,
+        accept_lens,
+        accept_index,
+    ) = eagle_sample(
+        verify_input,
+        batch,
+        logits_output,
+        grammar_mask,
+        uno_target_max_top_k=uno_target_max_top_k,
+    )
+    new_seq_lens = batch.seq_lens + accept_lens
+>>>>>>> upstream/main
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

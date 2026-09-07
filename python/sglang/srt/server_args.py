@@ -11,105 +11,76 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The arguments of the server."""
+"""Server argument declarations, resolution, and CLI registration.
+
+Keep this file in the following top-level order:
+
+1. Imports and the module logger.
+2. Public extension-point choice lists, with each legacy ``add_*`` alias
+   immediately below the choice list it extends.
+3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
+   aliases. A choice list used by only one field belongs inline in that field.
+4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
+   registration and small query helpers. New resolution steps are appended at
+   the end of ``arg_groups.pipeline.run_resolution_pipeline``, immediately
+   marked complete, unless an earlier dependency is documented explicitly.
+5. Module-level ``ServerArgs`` construction/runtime shims.
+6. Networking constants and ``PortArgs``.
+
+Model- or vendor-specific utilities belong in ``sglang.srt.arg_groups`` (or
+their owning subsystem), not before ``ServerArgs`` in this module.
+"""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
-import glob
-import importlib
-import importlib.util
-import json
+import functools
 import logging
-import math
-import os
-import random
-import socket
 import tempfile
 import uuid
-from functools import cached_property
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from contextlib import contextmanager
+from typing import Any
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
+from sglang.srt.arg_groups.arg_utils import (
+    add_cli_args_from_dataclass,
+)
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
     DeprecatedStoreConstAction,
     DeprecatedStoreTrueAction,
-    LoRAPathAction,
 )
+from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
-    attention_backends_of,
-    mamba_extra_buffer_lazy_of,
-    mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
-    resolved_view,
-)
-from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
-from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
-from sglang.srt.connector import ConnectorType
-from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-    parse_ib_device_config,
+    resolution_projection,
+    resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.model_executor.cuda_graph_config import (
-    ALLOWED_BACKENDS_PER_PHASE,
-    Backend,
-    CudaGraphConfig,
-    Phase,
-    default_cuda_graph_config,
-    parse_cuda_graph_config_arg,
-)
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.platforms import current_platform
-from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
-from sglang.srt.utils.common import (
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-    configure_media_url_security,
-    get_device,
-    get_device_memory_capacity,
-    get_device_sm,
-    get_quantization_config,
-    human_readable_int,
-    is_blackwell_supported,
-    is_cpu,
-    is_cuda,
-    is_flashinfer_available,
-    is_hip,
-    is_hopper_with_cuda_12_3,
-    is_host_cpu_arm64,
-    is_mnnvl_fabric_device,
-    is_mps,
-    is_musa,
-    is_no_spec_infer_or_topk_one,
-    is_npu,
-    is_remote_url,
-    is_sm90_supported,
-    is_sm100_or_sm110_supported,
-    is_sm100_supported,
-    is_sm120_supported,
-    is_xpu,
-    json_list_type,
-    nullable_str,
-    parse_connector_type,
-    torch_release,
+from sglang.srt.runtime_context import (
+    get_context,
+    get_platform,
+    publish,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
-from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.srt.utils.tensor_bridge import use_mlx
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
-# Define constants
-DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+# Re-exported. These were importable from this module while the field
+# declarations that used them lived here; the declarations moved to
+# `arg_groups/fields/` but out-of-tree code -- and `tokenizer_control_mixin`
+# for `LoRARef` -- still reaches them through `sglang.srt.server_args`.
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
+from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 
+<<<<<<< HEAD
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "tpu"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
     SAMPLING_BACKEND_CHOICES.add("token_oracle")
@@ -336,124 +307,106 @@ ENCODER_TRANSFER_BACKEND_CHOICES = [
     "zmq_to_tokenizer",
     "mooncake",
 ]
+=======
+# Re-exported for out-of-tree plugins, which have always reached these
+# through `sglang.srt.server_args`. The lists and their adders moved to
+# `arg_groups/choices.py` with the field declarations that name them.
+from sglang.srt.arg_groups.choices import (  # noqa: F401
+    ATTENTION_BACKEND_CHOICES,
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
+    DISAGG_TRANSFER_BACKEND_CHOICES,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+    FP4_GEMM_RUNNER_BACKEND_CHOICES,
+    FP8_GEMM_RUNNER_BACKEND_CHOICES,
+    GRAMMAR_BACKEND_CHOICES,
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+    LOAD_FORMAT_CHOICES,
+    MOE_RUNNER_BACKEND_CHOICES,
+    MXFP8_MOE_RUNNER_BACKEND_CHOICES,
+    QUANTIZATION_CHOICES,
+    RADIX_EVICTION_POLICY_CHOICES,
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
+    RL_ON_POLICY_TARGET_CHOICES,
+    SAMPLING_BACKEND_CHOICES,
+    add_attention_backend_choices,
+    add_chunked_prefix_cache_attention_backend,
+    add_deterministic_attention_backend_choices,
+    add_disagg_transfer_backend_choices,
+    add_draft_attention_backend_choices,
+    add_fp4_gemm_runner_backend_choices,
+    add_fp8_gemm_runner_backend_choices,
+    add_grammar_backend_choices,
+    add_linear_attn_kernel_backend_choices,
+    add_load_format_choices,
+    add_moe_runner_backend_choices,
+    add_mxfp8_moe_runner_backend_choices,
+    add_quantization_method_choices,
+    add_radix_eviction_policy_choices,
+    add_radix_supported_deterministic_attention_backend_choices,
+    add_rl_on_policy_target_choices,
+)
+from sglang.srt.arg_groups.fields import collect_input_fields
+from sglang.srt.arg_groups.fields.device import (
+    Device,
+)
+from sglang.srt.arg_groups.fields.disagg import (
+    Disagg,
+)
+from sglang.srt.arg_groups.fields.exec_ import (
+    ExecComm,
+    ExecDeterministic,
+    ExecDllm,
+    ExecFeatures,
+    ExecGraph,
+    ExecKernel,
+    ExecMamba,
+    ExecMoe,
+    ExecOffload,
+    ExecOverlap,
+)
+from sglang.srt.arg_groups.fields.lora import (
+    Lora,
+)
+from sglang.srt.arg_groups.fields.memory import (
+    Memory,
+)
+from sglang.srt.arg_groups.fields.mm import (
+    Mm,
+)
+from sglang.srt.arg_groups.fields.model import (
+    Model,
+)
+from sglang.srt.arg_groups.fields.observability import (
+    Observability,
+)
+from sglang.srt.arg_groups.fields.parallel import (
+    Parallel,
+)
+from sglang.srt.arg_groups.fields.schedule import (
+    Schedule,
+)
+from sglang.srt.arg_groups.fields.serving import (
+    Serving,
+)
+from sglang.srt.arg_groups.fields.spec import (
+    Spec,
+)
+from sglang.srt.lora.lora_registry import LoRARef  # noqa: F401
+from sglang.srt.model_executor.cuda_graph_config import (  # noqa: F401
+    CudaGraphConfig,
+    parse_cuda_graph_config_arg,
+)
+from sglang.srt.utils.common import (  # noqa: F401
+    LORA_TARGET_ALL_MODULES,
+    SUPPORTED_LORA_TARGET_MODULES,
+    human_readable_int,
+    json_list_type,
+    nullable_str,
+)
+>>>>>>> upstream/main
 
 
-def resolve_encoder_transfer_backend(
-    backend: str, model_arch: str, tp_size: int
-) -> str:
-    if backend != "auto":
-        return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
-        return "zmq_to_tokenizer"
-    return "zmq_to_scheduler"
-
-
-DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
-NSA_PREFILL_CP_SPLIT_CHOICES = DSA_PREFILL_CP_SPLIT_CHOICES  # deprecated alias
-
-PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
-
-DEFAULT_LORA_EVICTION_POLICY = "lru"
-
-DSA_CHOICES = [
-    "flashmla_sparse",
-    "flashmla_sparse_q8",
-    "flashmla_kv",
-    "flashmla_auto",
-    "flashinfer_sparse_mla",
-    "fa3",
-    "tilelang",
-    "aiter",
-    "trtllm",
-]
-NSA_CHOICES = DSA_CHOICES  # deprecated alias
-
-DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
-
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
-
-MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
-    "auto",
-    "no_buffer",
-    "extra_buffer",
-    "extra_buffer_lazy",
-]
-
-MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
-    "triton",
-    "cutedsl",
-    "flashinfer",
-    "flashkda",
-    "nvidia_kda",
-    "ptx_kda",
-    "helion",
-]
-
-
-# Allow external code to add more choices
-def add_load_format_choices(choices):
-    LOAD_FORMAT_CHOICES.extend(choices)
-
-
-def add_quantization_method_choices(choices):
-    QUANTIZATION_CHOICES.extend(choices)
-
-
-def add_attention_backend_choices(choices):
-    ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_chunked_prefix_cache_attention_backend(backend_name):
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append(backend_name)
-
-
-def add_deterministic_attention_backend_choices(choices):
-    DETERMINISTIC_ATTENTION_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_supported_deterministic_attention_backend_choices(choices):
-    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND.extend(choices)
-
-
-def add_disagg_transfer_backend_choices(choices):
-    DISAGG_TRANSFER_BACKEND_CHOICES.extend(choices)
-
-
-def add_grammar_backend_choices(choices):
-    GRAMMAR_BACKEND_CHOICES.extend(choices)
-
-
-def add_moe_runner_backend_choices(choices):
-    MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_mxfp8_moe_runner_backend_choices(choices):
-    MXFP8_MOE_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp8_gemm_runner_backend_choices(choices):
-    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_fp4_gemm_runner_backend_choices(choices):
-    FP4_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
-
-
-def add_radix_eviction_policy_choices(choices):
-    RADIX_EVICTION_POLICY_CHOICES.extend(choices)
-
-
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
-
-
-def add_linear_attn_kernel_backend_choices(choices):
-    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
-
-
-@dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
 
@@ -493,8 +446,15 @@ class ServerArgs:
        - The ``--config`` meta-argument (not a dataclass field).
 
        Everything else should use the ``A[T, ...]`` annotation.
+
+    The fields live in ``arg_groups/fields/`` -- one class per config
+    namespace, assembled here rather than inherited, so what the record holds
+    is one readable call and not a property of a base-class list. The order
+    they appear in is ``POSITIONAL_FIELD_ORDER``, not the order the namespaces
+    are listed in: field order *is* the positional constructor signature.
     """
 
+<<<<<<< HEAD
     # -------------------------------------------------------------------------
     # Model and tokenizer
     # -------------------------------------------------------------------------
@@ -3636,45 +3596,33 @@ class ServerArgs:
     torch_tpu_slicebuilder_addresses: A[Optional[str], NS("parallel")] = None
     torch_tpu_topology: A[Optional[str], NS("parallel")] = None
 
+=======
+>>>>>>> upstream/main
     def __post_init__(self):
-        self._run_resolution_pipeline()
+        """Construction leaves the record at what the caller asked for.
 
-    def _run_resolution_pipeline(self):
-        """
-        Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
-
-        Dispatcher style principles:
-        1. Keep this method as an ordered dispatcher. Each step should be a
-           named self._handle_* call; put imports, conditionals, mutations, and
-           raises inside helpers instead of inline here.
-        2. Keep the dummy-model boundary as early as correctness allows. Only
-           model-independent bootstrap, API/network/protocol validation, and
-           errors that should fire for dummy models should run before it.
-        3. Order handlers by dependency domains, not by historical insertion:
-           internal/bootstrap, API/network/protocol, model source/path
-           resolution, hardware/platform, model-specific adjustment,
-           parallelism, kernel/attention backend, cuda graph, memory/cache,
-           and advanced/debug features.
-        4. Hide narrow integrations behind general handler names. The
-           dispatcher should say what phase is being handled, not expose a
-           vendor-, hook-, or feature-specific implementation detail.
-        5. Give each handler one clear contract: what state it expects, what it
-           may mutate, and whether it validates only. Long ordering comments
-           belong in the helper or signal that the helper should be split.
+        Resolution is a separate act, entered through ``resolve_once``: the
+        launcher runs it once per engine, and every publishing process asks the
+        gate on the way in. A record that is only constructed -- a fixture, a
+        config being inspected, one being handed to a subprocess that will
+        resolve it itself -- stays raw.
         """
 
-        # Declaration stash for the override/post-process passes. Set before any
-        # short-circuit (none/dummy model paths) so run_post_process_pass and
-        # direct handler invocations can rely on it even when
-        # _handle_model_specific_adjustments never runs.
-        self._resolved_overrides = []
+    def resolve_once(self) -> None:
+        """Run the resolution pipeline, unless this record has been through it.
 
-        self._handle_moe_runner_backend_alias()
-        self._handle_return_hidden_states_mode()
-        self._handle_media_url_security()
-        self._handle_hicache_ratio_default()
-        if self.model_path.lower() in ["none", "dummy"]:
+        Resolution is a deterministic function of the raw inputs -- two records
+        built from the same arguments declare the same things -- but the
+        handlers do not survive a second pass over their own output: DP
+        attention halves ``chunked_prefill_size`` again on every re-entry.
+
+        The publishing entry of every process calls this. In a child the record
+        arrived by pickle and brought its declarations along, so the child has
+        nothing left to derive and projects what the parent decided.
+        """
+        if getattr(self, "_resolution_finished", False):
             return
+<<<<<<< HEAD
 
         self._handle_model_source_paths()
 
@@ -3853,84 +3801,57 @@ class ServerArgs:
                 "--moe-a2a-backend megamoe; overriding "
                 "--moe-a2a-backend %s.",
                 self.moe_a2a_backend,
+=======
+        if getattr(self, "_resolution_failed", False):
+            raise RuntimeError(
+                "resolution already failed on this ServerArgs; the handlers that "
+                "ran left their writes on the record, and a second pass would "
+                "read that partial output as fresh input. Build a new record "
+                "from the corrected arguments."
+>>>>>>> upstream/main
             )
-        self.moe_runner_backend = "auto"
-        self.moe_a2a_backend = "megamoe"
+        from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
-    def _handle_return_hidden_states_mode(self):
-        if self.return_hidden_states_mode not in (None, "last", "full"):
-            raise ValueError(
-                "return_hidden_states_mode must be one of: None, 'last', or 'full'."
-            )
-        if self.return_hidden_states_mode is None:
-            if self.enable_return_hidden_states:
-                self.return_hidden_states_mode = "full"
-        else:
-            self.enable_return_hidden_states = True
+        # Sealed for the duration, not just afterwards: everything below this
+        # line reads the input and declares against it, and the one channel
+        # that still writes the record (`declare_direct_writes`, for
+        # out-of-tree platform plugins) asks for the seal to be lifted by name.
+        self._input_frozen = True
+        try:
+            run_resolution_pipeline(self)
+        except BaseException:
+            # The handlers that ran already declared, and they are not
+            # idempotent over their own output.
+            self._resolution_failed = True
+            raise
+        finally:
+            self._input_frozen = False
+        # Set here too, because the dummy/absent-model path returns before the
+        # end of the pipeline that normally sets it: the gate is about whether
+        # the handlers ran, not how far they got.
+        self._resolution_finished = True
 
-    def _handle_model_capability_adjustments(self):
-        if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
-            return
-        from sglang.srt.arg_groups.overrides import (
-            _hrm_text_attention_force,
-            run_post_process_pass,
-        )
+    @property
+    def launch_command(self) -> str | None:
+        """How this record was created, verbatim.
 
-        model_config = self.get_model_config()
-        hf_config = model_config.hf_config
+        `resolved_dict` answers with what resolution decided; this answers with
+        what the operator asked for, which is a different question and the one
+        "why is this server configured like this?" usually means. The two are
+        not derivable from each other: a field the operator never set reads the
+        same as one they set to the value resolution would have picked anyway.
 
-        # HRM-Text needs bidirectional prompt attention (prefill), which only
-        # the Triton backend honors at the kernel level. Radix/prefix reuse is
-        # also unsafe: the recurrent forward writes direction-dependent KV
-        # across many slots.
-        is_hrm_text = getattr(
-            hf_config, "model_type", None
-        ) == "hrm_text" or "HrmTextForCausalLM" in getattr(
-            hf_config, "architectures", []
-        )
-        # prefix_lm defaults to True upstream; defaulting False would skip the
-        # bidirectional-attention forcing and silently produce junk output.
-        if is_hrm_text and getattr(hf_config, "prefix_lm", True):
-            run_post_process_pass(self, _hrm_text_attention_force)
-            self.chunked_prefill_size = -1
-            self.disable_radix_cache = True
-            self.disable_cuda_graph = True
-            # cuda_graph_config was already parsed from the legacy boolean, so
-            # flipping the boolean alone would not stop graph capture.
-            self.cuda_graph_config.decode.backend = Backend.DISABLED
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            logger.warning(
-                "HRM-Text (prefix_lm) detected: forcing --attention-backend "
-                "triton, --chunked-prefill-size -1, --disable-radix-cache, and "
-                "--disable-cuda-graph for correctness of the bidirectional "
-                "prompt attention."
-            )
+        The launcher stores the arguments it parsed; the in-process `Engine`
+        stores the call that built the record, since there was no command line.
+        `None` on a record built directly (a fixture, a subprocess copy that
+        predates this, a config being inspected).
+        """
+        return getattr(self, "_launch_command", None)
 
-        # EmbeddingGemma is a Gemma3TextModel with bidirectional prompt
-        # attention. Prefix reuse and split prefills would reuse K/V states
-        # whose values depend on later prompt tokens, so both are invalid.
-        # Breakable CUDA Graph captures one complete prefill and is the graph
-        # mode validated for this encoder-style attention.
-        # Native encoder architectures declare a pooling-only task and do not
-        # need the legacy --is-embedding intent flag. Decoder checkpoints still
-        # require that explicit opt-in because their architecture alone does
-        # not distinguish embedding from generation serving.
-        #
-        # ``_handle_model_capability_adjustments`` is also exercised directly
-        # by a few focused tests that use a small ModelConfig stand-in. Keep
-        # the old predicate as a compatibility fallback while production
-        # ModelConfig instances use the central capability contract.
-        embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
-        if (
-            embedding_model_spec is not None
-            and embedding_model_spec.auto_enable_embedding
-            and not self.is_embedding
-        ):
-            self.is_embedding = True
-            logger.info(
-                "Embedding architecture detected: enabling embedding mode automatically."
-            )
+    def resolved_dict(self) -> dict[str, Any]:
+        """This configuration as a plain dict of resolved field values.
 
+<<<<<<< HEAD
         is_embedding_gemma = (
             embedding_model_spec is not None
             and embedding_model_spec.bcg_prefill_policy == BCGPrefillPolicy.FULL_ENCODER
@@ -4401,146 +4322,82 @@ class ServerArgs:
         because its value uses repo_id/filename semantics rather than a
         plain repo ID.  That resolution lives in
         :func:`sglang.srt.speculative.spec_utils.load_token_map`.
+=======
+        What the whole-object readbacks report (`/server_info` and its gRPC and
+        in-process twins). `dataclasses.asdict(self)` reads the fields, which
+        carry the raw input; this reads the declarations, so it answers with what
+        resolution decided. Nested dataclass fields are expanded
+        the way `asdict` expands them; the private resolution bookkeeping and the
+        `model_config` memo are not fields and do not appear.
+>>>>>>> upstream/main
         """
 
-        ms_root = None
-        ms_snapshot_download = None
+        return resolution_projection(self)
 
-        def _resolve_or_download(
-            path: Optional[str],
-            ignore_patterns: Optional[list] = None,
-            revision: Optional[str] = None,
-        ) -> Optional[str]:
-            nonlocal ms_root, ms_snapshot_download
-            if path is None:
-                return None
-            if not path or os.path.exists(path):
-                return path
+    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
+        """A copy of this record that stays resolved, and says what it changed.
 
-            if ms_snapshot_download is None:
-                from modelscope.hub.snapshot_download import (
-                    snapshot_download as _ms_snapshot_download,
-                )
-                from modelscope.utils.file_utils import get_model_cache_root
+        `dataclasses.replace` builds a new instance, so the copy carries none of
+        what makes a record resolved: no raw snapshot, no declarations, no
+        finished flag. The next publish therefore resolves it again, which
+        drops every decision the stash held -- the late ones (the auto-detected
+        parsers) and the direct ones alike -- and re-runs the device probes in
+        whatever process opened the copy. The Ray paths replace
+        `dist_init_addr` on a resolved record, which is how they reach this.
 
-                ms_snapshot_download = _ms_snapshot_download
-                ms_root = get_model_cache_root()
+        The change is appended to the stash rather than left on the field: the
+        projection reads the raw snapshot plus the declarations, so a field the
+        copy set on its own would publish the parent's raw value instead.
 
-            # Check ModelScope default cache
-            cached = os.path.join(ms_root, path)
-            if os.path.exists(cached):
-                return cached
-            # Check user-specified download dir
-            if self.download_dir:
-                alt = os.path.join(self.download_dir, path)
-                if os.path.exists(alt):
-                    return alt
+        The carry is shallow. The containers are copied so the copy's own
+        declaration does not travel back into the parent, but everything inside
+        them -- the stash entries, the raw-input values, the memoized
+        `ModelConfig` -- is shared. That is fine for what this is for: a copy
+        that immediately crosses a process boundary (Ray actors, the gateway's
+        workers), where pickling severs the sharing. A caller that mutates the
+        copy's deep structure in-process mutates the parent's too.
+        """
+        replacement = dataclasses.replace(self, **changes)
+        # Provenance, not resolution state: a copy was still launched by
+        # whatever launched its parent, resolved or not.
+        object.__setattr__(replacement, "_launch_command", self.launch_command)
+        if not getattr(self, "_resolution_finished", False):
+            # Not resolved yet: the copy goes through the gate itself.
+            return replacement
 
-            # Cache miss — download from ModelScope hub
-            return ms_snapshot_download(
-                path,
-                cache_dir=self.download_dir,
-                revision=revision,
-                **({"ignore_patterns": ignore_patterns} if ignore_patterns else {}),
-            )
-
-        self.model_path = _resolve_or_download(self.model_path, revision=self.revision)
-        self.tokenizer_path = _resolve_or_download(
-            self.tokenizer_path,
-            ignore_patterns=["*.bin", "*.safetensors"],
-            revision=self.revision,
-        )
-        if self.speculative_draft_model_path:
-            self.speculative_draft_model_path = _resolve_or_download(
-                self.speculative_draft_model_path,
-                revision=self.speculative_draft_model_revision or "main",
-            )
-
-    def _handle_hpu_backends(self):
-        if self.device == "hpu":
-            self.attention_backend = "torch_native"
-            self.sampling_backend = "pytorch"
-
-    def _handle_cpu_backends(self):
-        if self.device == "cpu":
-            if self.attention_backend is None:
-                self.attention_backend = (
-                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
-                )
-            self.sampling_backend = "pytorch"
-
-    def _handle_npu_backends(self):
-        if self.device == "npu":
-            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
-
-            set_default_server_args(self)
-
-            current = self.cuda_graph_config.prefill.tc_compiler
-            if current is not None and current != "eager":
-                logger.warning(
-                    "At this moment Ascend platform only support prefill graph compilation with "
-                    "cuda_graph_config[prefill].tc_compiler='eager'."
-                )
-                self.cuda_graph_config.prefill.tc_compiler = "eager"
-
-    def _handle_mps_backends(self):
-        if self.device == "mps":
-            if not use_mlx():
-                self.disable_overlap_schedule = True
-
-    def _handle_xpu_backends(self):
-        if self.device == "xpu":
-            # Decode graph is opt-in on XPU: unless the user explicitly set
-            # --cuda-graph-backend-decode (or --cuda-graph-config), keep it
-            # disabled so the default startup doesn't require graph capture.
-            if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-            elif self.cuda_graph_config.decode.backend not in (
-                Backend.DISABLED,
-                Backend.FULL,
-            ):
-                logger.warning(
-                    "XPU platform only supports decode backend 'full'; "
-                    "disabling unsupported decode backend '%s'.",
-                    self.cuda_graph_config.decode.backend,
-                )
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
+        # Everything outside the fields, enumerated from the instance: the raw
+        # snapshot, the stash, and what resolution memoized -- including the
+        # model-configuration memo, which the copy carries over rather than
+        # rebuild.
+        field_names = {field.name for field in dataclasses.fields(self)}
+        for name, value in vars(self).items():
+            if name in field_names or name == "_resolution_finished":
+                continue
+            if isinstance(value, (dict, list, set)):
+                value = copy.copy(value)
+            object.__setattr__(replacement, name, value)
+        stash = getattr(replacement, "_resolved_overrides", None)
+        if stash is None:
+            stash = []
+            object.__setattr__(replacement, "_resolved_overrides", stash)
+        if changes:
+            stash.append((source, dict(changes)))
+        object.__setattr__(replacement, "_resolution_finished", True)
+        return replacement
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
-    def _apply_inkling_prefill_cuda_graph_default(self):
-        """Inkling opts into full-graph prefill CUDA-graph capture. Must run
-        before _handle_cuda_graph_config: the generic breakable default is
-        auto-disabled for this multimodal arch, and declarative model overrides
-        materialize too late to steer cuda-graph resolution. Honors an explicit
-        --cuda-graph-backend-prefill / --disable-prefill-cuda-graph."""
-        if (
-            self.cuda_graph_backend_prefill is not None
-            or self.disable_prefill_cuda_graph
-            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
-        ):
-            return
-        arch = self.get_model_config().hf_config.architectures[0]
-        if arch in (
-            "InklingForConditionalGeneration",
-            "InklingForConditionalGenerationMTP",
-        ):
-            self.cuda_graph_backend_prefill = Backend.FULL
 
-    def _apply_muse_glimmer_prefill_cuda_graph_max_bs_default(self):
-        if (
-            self.cuda_graph_max_bs_prefill is not None
-            or parse_connector_type(self.model_path) == ConnectorType.INSTANCE
-        ):
-            return
-        arch = self.get_model_config().hf_config.architectures[0]
-        if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
-            self.cuda_graph_max_bs_prefill = 512
+    # ===== END TO BE REFACTORED ====
 
-    def _handle_cuda_graph_config(self):
-        from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Cosmos3ForConditionalGeneration",
+        "Cosmos3EdgeForConditionalGeneration",
+    )
 
+<<<<<<< HEAD
         self._parse_cuda_graph_config()
         # Reads the resolved per-phase backends; must precede the compat rules
         # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
@@ -8820,6 +8677,12 @@ class ServerArgs:
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
+=======
+    # The attention-backend allow-list is enforced via
+    # --enable-page-major-kv-layout (implied by the unified pool in
+    # _handle_page_major_kv_layout); the model-family gate is enforced at pool
+    # construction in model_runner_kv_cache_mixin._init_pools.
+>>>>>>> upstream/main
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -8828,6 +8691,17 @@ class ServerArgs:
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
+        sampling_backend_choices = set(SAMPLING_BACKEND_CHOICES)
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            sampling_backend_choices.add("token_oracle")
+        parser.add_argument(
+            "--sampling-backend",
+            type=str,
+            choices=sampling_backend_choices,
+            default=ServerArgs.sampling_backend,
+            help="Choose the kernels for sampling layers.",
+        )
+
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
@@ -8906,7 +8780,17 @@ class ServerArgs:
             new_flag="--dsa-prefill-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             help="[Deprecated] Use --dsa-prefill-backend instead.",
         )
         parser.add_argument(
@@ -8916,7 +8800,17 @@ class ServerArgs:
             new_flag="--dsa-decode-backend",
             default=argparse.SUPPRESS,
             type=str,
-            choices=DSA_CHOICES,
+            choices=[
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+                "fa3",
+                "tilelang",
+                "aiter",
+                "trtllm",
+            ],
             help="[Deprecated] Use --dsa-decode-backend instead.",
         )
         parser.add_argument(
@@ -9012,13 +8906,6 @@ class ServerArgs:
             help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
-            "--enable-dsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
             "--enable-nsa-prefill-context-parallel",
             dest="enable_dsa_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
@@ -9040,41 +8927,14 @@ class ServerArgs:
             help="[Deprecated] Use --enable-prefill-cp instead.",
         )
         parser.add_argument(
-            "--dsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.dsa_prefill_cp_mode,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
-                "'interleave'."
-            ),
-        )
-        parser.add_argument(
             "--nsa-prefill-cp-mode",
             dest="dsa_prefill_cp_mode",
             action=DeprecatedAliasStoreAction,
             new_flag="--cp-strategy",
             type=str,
             default=argparse.SUPPRESS,
-            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            choices=["in-seq-split", "round-robin-split"],
             help="[Deprecated] Use --cp-strategy instead.",
-        )
-        parser.add_argument(
-            "--prefill-cp-mode",
-            dest="prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.prefill_cp_mode,
-            choices=PREFILL_CP_SPLIT_CHOICES,
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'."
-            ),
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -9145,7 +9005,7 @@ class ServerArgs:
 
         return TokenizerWorker
 
-    def url(self, port: Optional[int] = None):
+    def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -9161,192 +9021,33 @@ class ServerArgs:
     def engine_info_bootstrap_url(self):
         return self.url(port=self.engine_info_bootstrap_port)
 
-    @property
-    def is_ep_joiner(self) -> bool:
-        """True for processes launched as elastic-EP joiners."""
-        return self.ep_join_mode in ("scale", "recover")
-
-    @property
-    def is_ep_scale_joiner(self) -> bool:
-        return self.ep_join_mode == "scale"
-
-    @property
-    def is_startup_weight_load_overlap(self) -> bool:
-        return self.startup_weight_load_mode == "overlap"
-
-    def ssl_verify(self):
-        """Return the value for the requests library's verify= parameter.
-
-        When SSL is configured:
-          - If a CA certificate file is provided, return its path so requests
-            validates the server certificate against that CA.
-          - Otherwise, return False to disable certificate verification
-            (suitable for self-signed certificates in development/testing).
-            A warning is logged once when this happens.
-        When SSL is not configured, return True to use the system's default
-        CA bundle.
-        """
-        if self.ssl_ca_certs:
-            return self.ssl_ca_certs
-        if self.ssl_certfile:
-            if not getattr(self, "_ssl_verify_warned", False):
-                logger.warning(
-                    "SSL is enabled but --ssl-ca-certs was not provided. "
-                    "Certificate verification is DISABLED for internal "
-                    "health checks. For production deployments, provide "
-                    "--ssl-ca-certs or use CA-signed certificates."
-                )
-                self._ssl_verify_warned = True
-            return False
-        return True
-
-    def get_model_config(self):
-        # Lazy init to avoid circular import
-        from sglang.srt.configs.model_config import ModelConfig
-
-        if hasattr(self, "model_config"):
-            return self.model_config
-        self.model_config = ModelConfig.from_server_args(self)
-        if self.model_config.is_hybrid_swa:
-            logger.info(
-                "Hybrid SWA model detected. architectures=%s",
-                self.model_config.hf_config.architectures,
-            )
-        return self.model_config
-
-    def _resolved(self):
-        """Read-only view of the resolving configuration: declared fields
-        resolve from the declaration stash."""
-
-        return resolved_view(self)
-
-    def _late_resolution(self, source: str, **fields) -> None:
-        """Resolve fields at the launcher's validation stage (pre-publish).
-
-        See ``arg_groups.overrides.declare_late_resolution``: in place, because
-        every holder of this instance must see the resolved value, and refused
-        outright once the config is published.
-        """
-        from sglang.srt.arg_groups.overrides import declare_late_resolution
-
-        declare_late_resolution(self, source, **fields)
-
     def __setattr__(self, name, value):
-        # After materialization the fields are the resolved startup
-        # configuration -- the pristine, READ-ONLY record that the config bags
-        # were projected from. Resolved config changes go to the bags via
-        # get_context().override(source, ...); a value one runner or worker
-        # owns travels as a constructor argument to it.
-        if (
-            not name.startswith("_")
-            and getattr(self, "_declarations_materialized", False)
-            and not getattr(self, "_internal_write", False)
-        ):
-            raise AttributeError(
-                f"server_args.{name} assigned after resolution; server_args is "
-                "read-only -- use get_context().override(source, ...) to change "
-                "resolved config; a value one runner owns travels as a "
-                "constructor argument."
-            )
+        # The record holds the operator's input. It is writable while the
+        # caller is still assembling it and sealed from the moment resolution
+        # starts: a resolver that writes a field would overwrite the very thing
+        # the record exists to remember, and the decision it meant to record
+        # belongs in the stash, where it carries a source and does not destroy
+        # the input it was derived from.
+        if not name.startswith("_") or name in _underscore_field_names():
+            if getattr(self, "_input_frozen", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned during resolution; the record "
+                    "is the operator's input and resolution does not write it -- "
+                    "declare the decision with declare_resolution(server_args, "
+                    "source, **fields) so it carries a source and leaves the "
+                    "input intact."
+                )
+            if getattr(self, "_resolution_finished", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; server_args is "
+                    "read-only -- use get_context().override(source, ...) to change "
+                    "resolved config; a value one runner owns travels as a "
+                    "constructor argument."
+                )
         object.__setattr__(self, name, value)
 
-    def _resolved_attention_backends(self):
-        """Mid-resolution (prefill, decode) backends: reads through the pass
-        view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-        )
-
-        return attention_backends_of(resolved_view(self))
-
-    def get_attention_backends(self):
-        return attention_backends_of(self)
-
-    def use_mla_backend(self):
-        from sglang.srt.configs.model_config import AttentionArch
-
-        model_config = self.get_model_config()
-        return model_config.attention_arch == AttentionArch.MLA
-
-    def is_attention_backend_not_set(self):
-        return (
-            self.attention_backend is None
-            and self.prefill_attention_backend is None
-            and self.decode_attention_backend is None
-        )
-
-    def enable_mamba_extra_buffer(self) -> bool:
-        return mamba_extra_buffer_of(self)
-
-    def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return mamba_extra_buffer_lazy_of(self)
-
-    @cached_property
-    def max_speculative_num_draft_tokens(self) -> Optional[int]:
-        """Return the maximum draft-token count speculative decoding may use."""
-        if self.speculative_num_draft_tokens is None:
-            return None
-        if not self.speculative_adaptive:
-            return self.speculative_num_draft_tokens
-
-        from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps_from_config,
-        )
-
-        candidate_steps = resolve_candidate_steps_from_config(
-            cfg_path=self.speculative_adaptive_config,
-        )
-        # TODO: adaptive spec currently requires topk=1, so each runtime state
-        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
-        return max(candidate_steps) + 1
-
-    @property
-    def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
-        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
-        # It is used to determine the caching point in a sequence during prefill.
-        if not hasattr(self, "_mamba_cache_chunk_size"):
-
-            try:
-                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-                    CHUNK_SIZE as FLA_CHUNK_SIZE,
-                )
-            except ImportError:
-                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
-                FLA_CHUNK_SIZE = 64
-
-            hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
-            page_size = resolved_view(self).page_size
-            assert (
-                max(chunk_size, page_size) % min(chunk_size, page_size) == 0
-            ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"
-            self._mamba_cache_chunk_size = max(chunk_size, page_size)
-        return self._mamba_cache_chunk_size
-
-    def _check_two_batch_overlap(self):
-        # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
-        # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
-        # the other ubatch's compute), which requires DP attention. Enabling it
-        # there needs no extra opt-in env flag.
-        cp_tbo = (
-            is_hip()
-            and self.enable_dsa_prefill_context_parallel
-            and self.dsa_prefill_cp_mode == "round-robin-split"
-        )
-        if (
-            self.enable_two_batch_overlap
-            and self.moe_a2a_backend == "none"
-            and not self.enable_dp_attention
-            and not cp_tbo
-        ):
-            raise ValueError(
-                "When enabling two batch overlap without an EP a2a backend "
-                "(moe_a2a_backend='none'), --enable-dp-attention is required "
-                "(DeepSeek-V4 non-EP DP TBO path)."
-            )
-
     def check_server_args(self):
+<<<<<<< HEAD
         # Check parallel size constraints. nnodes=0 is the Ray auto-detect
         # sentinel (TPU only): the real count is resolved from the live cluster
         # at scheduler launch, so defer the divisibility check until then.
@@ -9357,570 +9058,88 @@ class ServerArgs:
             assert (
                 self.nnodes == 0 or (self.tp_size * self.pp_size) % self.nnodes == 0
             ), "tp_size must be divisible by number of nodes"
+=======
+        from sglang.srt.arg_groups.validation_hook import check_server_args
+>>>>>>> upstream/main
 
-        assert (
-            self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
-        ), (
-            "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
-            f"Got: {self.pp_max_micro_batch_size}"
-        )
-
-        assert not (self.disable_cuda_graph_padding and self.enable_torch_compile), (
-            "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
-            "With padding disabled, every distinct batch size gets its own torch.compile + "
-            "Triton autotune cycle (O(max_batch_size) compilations) instead of the small fixed "
-            "set of padded bucket sizes, causing engine initialisation to stall for many minutes. "
-            "Remove --disable-cuda-graph-padding or --enable-torch-compile."
-        )
-
-        if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            assert self.min_free_slots_delay is None, (
-                "--min-free-slots-delay is not supported with pipeline "
-                "parallelism: allocatable slots per microbatch are bounded by "
-                "pp-max-micro-batch-size, so the threshold may never be reached"
-            )
-
-        assert not (
-            self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
-        ), "multi-node data parallel is not supported unless dp attention!"
-
-        assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
-
-        assert self.moe_dense_tp_size in (
-            None,
-            1,
-            self.tp_size,
-        ), "moe_dense_tp_size only supports None, 1, or tp_size currently"
-
-        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        if not is_runai_obj_uri(self.served_model_name):
-            assert ":" not in self.served_model_name, (
-                "served_model_name cannot contain a colon (':') character. "
-                "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-                f"Invalid value: '{self.served_model_name}'"
-            )
-
-        # Check LoRA
-        self.check_lora_server_args()
-
-        # Check speculative decoding
-        if self.speculative_algorithm is not None:
-            assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
-
-        # Check chunked prefill
-        # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-        # Skip validation if disaggregation mode is decode.
-        if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
-
-        # Check pdmux
-        if self.enable_pdmux:
-            assert (
-                self.pp_size == 1
-            ), "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-            assert (
-                self.chunked_prefill_size == -1
-            ), "PD-Multiplexing is not compatible with chunked prefill."
-            assert (
-                self.disaggregation_mode == "null"
-            ), "PD-Multiplexing is not compatible with disaggregation mode."
-            assert (
-                self.disable_overlap_schedule
-            ), "PD-Multiplexing is not compatible with overlap schedule."
-
-            # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
-            import torch
-
-            if torch_release >= (2, 7):
-                logger.warning(
-                    "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
-                    f"  Current torch version is {torch.__version__}.\n"
-                    "  Please manually install torch 2.6.x."
-                )
-
-        assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
-        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
-        assert (
-            self.mm_processor_worker_num >= 0
-        ), "Multimodal processor worker num must >= 0"
-        assert self.mm_io_worker_num >= 0, "Multimodal I/O worker num must >= 0"
-        self.validate_buckets_rule(
-            "--prompt-tokens-buckets", self.prompt_tokens_buckets
-        )
-        self.validate_buckets_rule(
-            "--generation-tokens-buckets", self.generation_tokens_buckets
-        )
-
-        # Check scheduling policy
-        if self.enable_priority_scheduling:
-            assert self.schedule_policy in [
-                "fcfs",
-                "lof",
-            ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
-            if self.default_priority_value is None:
-                logger.warning(
-                    "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
-                    "Requests without explicit priority will have priority=None, "
-                    "resulting in priority='None' string labels in Prometheus metrics."
-                )
-        else:
-            if self.disable_priority_preemption:
-                logger.warning(
-                    "--disable-priority-preemption has no effect without --enable-priority-scheduling"
-                )
-            if self.default_priority_value is not None:
-                logger.warning(
-                    "--default-priority-value has no effect without --enable-priority-scheduling"
-                )
-        if self.retraction_policy == "priority" and not self.enable_priority_scheduling:
-            raise ValueError(
-                "--retraction-policy priority requires --enable-priority-scheduling"
-            )
-
-        # Check hisparse
-        # Moved to the resolution pipeline (arg_groups/overrides.py:
-        # _hisparse_validation), invoked here at its legacy slot.
-        from sglang.srt.arg_groups.overrides import (
-            _hisparse_validation,
-            run_post_process_pass,
-        )
-
-        run_post_process_pass(self, _hisparse_validation)
-
-        assert (
-            self.schedule_conservativeness >= 0
-        ), "schedule_conservativeness must be non-negative"
-
-        if self.model_impl == "mindspore":
-            assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
-
-        # Check metrics labels
-        if (
-            not self.tokenizer_metrics_custom_labels_header
-            and self.tokenizer_metrics_allowed_custom_labels
-        ):
-            raise ValueError(
-                "Please set --tokenizer-metrics-custom-labels-header when setting --tokenizer-metrics-allowed-custom-labels."
-            )
-
-        # Check metrics exporters
-        if self.export_metrics_to_file and self.export_metrics_to_file_dir is None:
-            raise ValueError(
-                "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
-            )
-
-        # Check two batch overlap backend requirement.
-        self._check_two_batch_overlap()
-
-        # Check communications compression
-        if self.enable_quant_communications and self.tp_size == 1:
-            raise ValueError(
-                "Communications quantization is only used with tp_size != 1"
-            )
-
-        if self.enable_quant_communications and self.device != "npu":
-            raise ValueError(
-                "Communications quantization is only supported for NPU device"
-            )
-
-        # grpc_port is None for HTTP-only launches, so the == comparison is
-        # already False there; no explicit None check needed.
-        if not (self.smg_grpc_mode or self.grpc_mode) and self.grpc_port == self.port:
-            raise ValueError(
-                f"--grpc-port ({self.grpc_port}) must differ from --port ({self.port})"
-            )
-
-        # TODO: Also validate grpc_port != metrics_http_port and grpc_port != nccl_port
-        # to avoid opaque bind errors at runtime. Deferred because metrics_http_port
-        # and nccl_port have dynamic defaults that may not be resolved yet here.
-
-        if self.gc_threshold:
-            if not (1 <= len(self.gc_threshold) <= 3):
-                raise ValueError(
-                    "When setting gc_threshold, it must contain 1 to 3 integers."
-                )
-
-        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
-            raise ValueError(
-                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
-            )
-
-    def check_lora_server_args(self):
-        assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
-
-        # Enable LoRA if any LoRA paths are provided for backward compatibility.
-        if self.lora_paths:
-            if self.enable_lora is None:
-                self._late_resolution("check_lora_server_args", enable_lora=True)
-                logger.warning(
-                    "--enable-lora is set to True because --lora-paths is provided."
-                )
-            elif self.enable_lora is False:
-                logger.warning(
-                    "--enable-lora is set to False, any provided lora_paths will be ignored."
-                )
-
-        if self.enable_lora:
-            if self.enable_lora_overlap_loading is None:
-                self._late_resolution(
-                    "check_lora_server_args", enable_lora_overlap_loading=False
-                )
-
-            if self.enable_lora_overlap_loading:
-                # TODO (glenliu21): use some sort of buffer with eviction instead of enforcing a limit
-                max_loaded_loras_limit = self.max_loras_per_batch * 2
-                assert (
-                    self.max_loaded_loras is not None
-                    and self.max_loaded_loras <= max_loaded_loras_limit
-                ), (
-                    "Enabling LoRA overlap loading requires pinning LoRA adapter weights in CPU memory, "
-                    f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
-                )
-
-            # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
-                raise ValueError(
-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
-                )
-
-            # Parse lora_paths
-            if isinstance(self.lora_paths, list):
-                parsed_lora_paths = []
-                for lora_path in self.lora_paths:
-                    if isinstance(lora_path, str):
-                        if "=" in lora_path:
-                            name, path = lora_path.split("=", 1)
-                            lora_ref = LoRARef(
-                                lora_id=LoRARef.deterministic_id(name, path),
-                                lora_name=name,
-                                lora_path=path,
-                                pinned=False,
-                            )
-                        else:
-                            lora_ref = LoRARef(
-                                lora_id=LoRARef.deterministic_id(lora_path, lora_path),
-                                lora_name=lora_path,
-                                lora_path=lora_path,
-                                pinned=False,
-                            )
-                    elif isinstance(lora_path, dict):
-                        assert (
-                            "lora_name" in lora_path and "lora_path" in lora_path
-                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
-                        lora_ref = LoRARef(
-                            lora_id=LoRARef.deterministic_id(
-                                lora_path["lora_name"], lora_path["lora_path"]
-                            ),
-                            lora_name=lora_path["lora_name"],
-                            lora_path=lora_path["lora_path"],
-                            pinned=lora_path.get("pinned", False),
-                        )
-                    else:
-                        raise ValueError(
-                            f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
-                            "Expected a string or a dictionary."
-                        )
-                    parsed_lora_paths.append(lora_ref)
-                self._late_resolution(
-                    "check_lora_server_args", lora_paths=parsed_lora_paths
-                )
-            elif isinstance(self.lora_paths, dict):
-                self._late_resolution(
-                    "check_lora_server_args",
-                    lora_paths=[
-                        LoRARef(
-                            lora_id=LoRARef.deterministic_id(k, v),
-                            lora_name=k,
-                            lora_path=v,
-                            pinned=False,
-                        )
-                        for k, v in self.lora_paths.items()
-                    ],
-                )
-            elif self.lora_paths is None:
-                self._late_resolution("check_lora_server_args", lora_paths=[])
-            else:
-                raise ValueError(
-                    f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
-                    "Expected a list or a dictionary."
-                )
-
-            # Normalize target modules to a set; keep {"all"} as a sentinel
-            # that gets resolved model-awarely in lora_manager.init_lora_shapes().
-            if self.lora_target_modules:
-                self._late_resolution(
-                    "check_lora_server_args",
-                    lora_target_modules=set(self.lora_target_modules),
-                )
-                if "all" in self.lora_target_modules:
-                    assert (
-                        len(self.lora_target_modules) == 1
-                    ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
-
-            # Ensure sufficient information is provided for LoRA initialization.
-            assert self.lora_paths or (
-                self.max_lora_rank and self.lora_target_modules
-            ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
-
-            # Validate max_loaded_loras
-            if self.max_loaded_loras is not None:
-                assert self.max_loaded_loras >= self.max_loras_per_batch, (
-                    "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
-                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
-                )
-                assert len(self.lora_paths) <= self.max_loaded_loras, (
-                    "The number of LoRA paths should not exceed max_loaded_loras. "
-                    f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
-                )
-
-            if self.max_lora_chunk_size is not None:
-                assert (
-                    16 <= self.max_lora_chunk_size <= 128
-                    and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
-                ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
-
-            if self.lora_use_virtual_experts:
-                logger.info("Virtual expert computation enabled.")
-
-            assert (
-                self.lora_drain_wait_threshold >= 0.0
-            ), "--lora-drain-wait-threshold must be non-negative."
-
-    def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
-        if not buckets_rule:
-            return
-
-        assert len(buckets_rule) > 0, f"{arg_name} cannot be empty list"
-        rule = buckets_rule[0]
-        assert rule in [
-            "tse",
-            "default",
-            "custom",
-        ], f"Unsupported {arg_name} rule type: '{rule}'. Must be one of: 'tse', 'default', 'custom'"
-
-        if rule == "tse":
-            assert (
-                len(buckets_rule) == 4
-            ), f"{arg_name} TSE rule requires exactly 4 parameters: ['tse', middle, base, count], got {len(buckets_rule)}"
-            try:
-                middle = float(buckets_rule[1])
-                base = float(buckets_rule[2])
-                count = int(buckets_rule[3])
-            except (ValueError, IndexError):
-                assert (
-                    False
-                ), f"{arg_name} TSE rule parameters must be: ['tse', <float:middle>, <float:base>, <int:count>]"
-            assert base > 1, f"{arg_name} TSE base must be larger than 1, got: {base}"
-            assert count > 0, f"{arg_name} TSE count must be positive, got: {count}"
-            assert middle > 0, f"{arg_name} TSE middle must be positive, got: {middle}"
-
-        elif rule == "default":
-            assert (
-                len(buckets_rule) == 1
-            ), f"{arg_name} default rule should only have one parameter: ['default'], got {len(buckets_rule)}"
-
-        elif rule == "custom":
-            assert (
-                len(buckets_rule) >= 2
-            ), f"{arg_name} custom rule requires at least one bucket value: ['custom', value1, ...]"
-            try:
-                bucket_values = [float(x) for x in buckets_rule[1:]]
-            except ValueError:
-                assert False, f"{arg_name} custom rule bucket values must be numeric"
-            assert len(set(bucket_values)) == len(
-                bucket_values
-            ), f"{arg_name} custom rule bucket values should not contain duplicates"
-            assert all(
-                val >= 0 for val in bucket_values
-            ), f"{arg_name} custom rule bucket values should be non-negative"
-
-    def adjust_mem_fraction_for_vlm(self, model_config):
-        vision_config = getattr(model_config.hf_config, "vision_config", None)
-        if vision_config is None:
-            return
-
-        # roughly reduce the mem_fraction_static base on params of Vit
-        original_server_arg_mem_fraction = self.mem_fraction_static
-        # a base mem_fraction_static factor for regular Vit
-        base_mem_fraction_reduction_ratio = 0.95
-
-        vit_num_layers = getattr(vision_config, "num_hidden_layers", 24)
-        vit_hidden_size = getattr(vision_config, "hidden_size", 1024)
-
-        # baseline ViT params (ViT-L/14)
-        baseline_vit_layers = 24
-        baseline_vit_hidden_size = 1024
-
-        # weight params count
-        current_complexity_score = vit_num_layers * (vit_hidden_size**2)
-        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
-        complexity_ratio = (
-            current_complexity_score / baseline_complexity_score
-            if baseline_complexity_score > 0
-            else 1.0
-        )
-
-        # every time the complexity grows 100%, adjust final factor for 10%
-        sensitivity_scale = 0.1
-        dynamic_adjustment_factor = 1.0 - sensitivity_scale * (complexity_ratio - 1.0)
-        dynamic_adjustment_factor = max(0.8, min(1.05, dynamic_adjustment_factor))
-
-        final_overall_factor = (
-            base_mem_fraction_reduction_ratio * dynamic_adjustment_factor
-        )
-        self.mem_fraction_static = (
-            original_server_arg_mem_fraction * final_overall_factor
-        )
-
-    def validate_transfer_engine(self):
-        try:
-            mooncake_available = importlib.util.find_spec("mooncake.engine") is not None
-        except (ModuleNotFoundError, ValueError):
-            mooncake_available = False
-        if not mooncake_available:
-            logger.warning(
-                "Failed to import mooncake.engine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            return False
-        elif self.enable_memory_saver:
-            logger.warning(
-                "Memory saver is enabled, which is not compatible with TransferEngine. Does not support using TransferEngine as remote instance weight loader backend."
-            )
-            return False
-        else:
-            return True
-
-    @property
-    def _parsed_modelexpress_config(self) -> dict:
-        cache = getattr(self, "_mx_config_cache", None)
-        if cache is not None:
-            return cache
-        if self.modelexpress_config is None:
-            result = {}
-        elif isinstance(self.modelexpress_config, str):
-            result = json.loads(self.modelexpress_config)
-        else:
-            result = self.modelexpress_config
-        object.__setattr__(self, "_mx_config_cache", result)
-        return result
-
-    @property
-    def modelexpress_url(self) -> Optional[str]:
-        return self._parsed_modelexpress_config.get("url")
-
-    @property
-    def modelexpress_transport(self) -> str:
-        """Transport backend for modelexpress."""
-        return self._parsed_modelexpress_config.get("transport", "nixl")
+        check_server_args(self)
 
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
-        return remote_instance_transfer_engine_of(self, load_format)
+        return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
-    def describe_kv_events_publisher(self) -> Optional[dict]:
-        """Return a structured description of this server's KV-event
-        publisher, or `None` if publishing is disabled / misconfigured.
 
-        This is the wire contract surfaced under the `kv_events` key on
-        `/server_info` so KV-aware routers (e.g. the SGLang model
-        gateway) can subscribe per-worker without operator-supplied port
-        coordination. The router constructs the per-DP-rank SUB endpoint
-        as tcp://<worker_host>:<endpoint_port_base + dp_rank> for
-        every rank reported in dp_size.
+# The namespaces whose *input* fields make up the record. A namespace declares
+# its input and derived fields side by side; only the input half is collected,
+# which is why this is a call and not a base-class list.
+#
+# A set, not an order: `collect_input_fields` orders by `field_order.py`, which
+# is what keeps the positional constructor stable.
 
-        Returned descriptor shape:
 
-            {
-                "publisher": "zmq",
-                "endpoint_host": "*",             # may be a ZMQ wildcard
-                                                  # ("*", "0.0.0.0", "::");
-                                                  # subscribers MUST substitute
-                                                  # the worker URL's host when
-                                                  # dialing
-                "endpoint_port_base": 5557,       # base TCP port; per-rank
-                                                  # port = base + dp_rank
-                "topic": "",                      # ZMQ topic prefix on the
-                                                  # SUB filter (empty =
-                                                  # subscribe-all)
-                "block_size": <page_size>,        # subscribers MUST hash
-                                                  # prompts at this size
-                "dp_size": <dp_size>,             # number of SUB sockets
-                                                  # to open
-            }
+_INPUT_NAMESPACES = [
+    Model,
+    ExecDeterministic,
+    ExecDllm,
+    ExecOffload,
+    ExecOverlap,
+    Lora,
+    Disagg,
+    Spec,
+    ExecMoe,
+    ExecComm,
+    ExecGraph,
+    ExecMamba,
+    ExecKernel,
+    Observability,
+    Device,
+    Parallel,
+    Memory,
+    Schedule,
+    ExecFeatures,
+    Mm,
+    Serving,
+]
 
-        Returns None (i.e. "no publisher to describe") when any of:
+_annotations, _defaults, _namespaces = collect_input_fields(_INPUT_NAMESPACES)
+ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
+# The assembled record has no base classes, so it carries the map the classes
+# used to answer through their `_NS_PATH`.
+ServerArgs._NS_BY_FIELD = _namespaces
+# The classes themselves, so the bag projection can find the declarations
+# that are not fields -- the derived half of each namespace.
+ServerArgs._NAMESPACES = _INPUT_NAMESPACES
+for _name, _value in _defaults.items():
+    setattr(ServerArgs, _name, _value)
+ServerArgs = dataclasses.dataclass(ServerArgs)
 
-        * --kv-events-config is unset / empty / malformed JSON,
-        * the configured publisher is "null",
-        * page_size is missing or non-positive (a placeholder
-          block_size would cause silent KV-cache misses by hashing
-          prompts at the wrong granularity on the router side),
-        * the endpoint is not a routable TCP address (inproc:// /
-          ipc://, missing port, non-integer port, or port outside
-          1..65535).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
-        """
-        # Lazy import so loading server_args doesn't pull in
-        # disaggregation / msgspec / zmq at module top level.
-        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+# --------------------------------------------------------------------------
+# Module-level ServerArgs helpers and runtime shims.
+# --------------------------------------------------------------------------
 
-        raw = self.kv_events_config
-        page_size = self.page_size
-        if not raw or page_size is None or page_size <= 0:
-            return None
-        try:
-            cfg = KVEventsConfig.from_cli(raw)
-        except Exception:
-            # Malformed JSON / schema mismatch. The publisher would
-            # have failed at server startup; /server_info must
-            # keep working, so just report "no publisher" to consumers.
-            return None
-        if cfg.publisher == "null" or not cfg.endpoint:
-            return None
-        if not cfg.endpoint.startswith("tcp://"):
-            return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
-            return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
 
-        return {
-            "publisher": cfg.publisher,
-            "endpoint_host": host,
-            "endpoint_port_base": port,
-            "topic": cfg.topic,
-            "block_size": page_size,
-            "dp_size": self.dp_size,
-        }
+def resolve_encoder_transfer_backend(
+    backend: str, model_arch: str, tp_size: int
+) -> str:
+    if backend != "auto":
+        return backend
+    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+        return "zmq_to_tokenizer"
+    return "zmq_to_scheduler"
 
-    def should_report_expert_balancedness(self) -> bool:
-        return self.expert_balancedness_report_mode != "off"
 
-    def should_log_expert_balancedness_to_server_log(self) -> bool:
-        return self.expert_balancedness_report_mode in ("server_log", "both")
+def compute_world_size(
+    *, enable_dp_attention: bool, dp_size: int, tp_size: int, pp_size: int
+) -> int:
+    """Total GPU count across all data-parallel replicas.
 
-    def should_export_expert_balancedness_to_prometheus(self) -> bool:
-        return self.expert_balancedness_report_mode in ("prometheus", "both")
+    Takes the values rather than a config object: the two sizes are the widths
+    the launch asked for, which the Ray driver needs before any process group
+    exists, and passing a context would hand it the live groups instead.
+    """
+    return (1 if enable_dp_attention else dp_size) * tp_size * pp_size
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
@@ -9935,12 +9154,11 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     bf16 q) without having to move off trtllm_mha.
     """
     from sglang.srt.environ import envs
-    from sglang.srt.utils.common import is_sm100_supported
 
     return (
         args.kv_cache_dtype == "fp8_e4m3"
         and args.attention_backend == "trtllm_mha"
-        and is_sm100_supported()
+        and get_platform().is_sm100
         and not envs.SGLANG_DISABLE_M3_FP8_ATTN_GEMM.get()
     )
 
@@ -9948,13 +9166,28 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 # NOTE: The process-wide ServerArgs is owned by the runtime context
 # (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
 # for the existing call-sites; they publish/read the same live object by
-# reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
+# reference. Do not add new call-sites.
 # Imports are in-function so the two modules stay cycle-free at import time.
+@functools.lru_cache(maxsize=1)
+def _underscore_field_names() -> frozenset:
+    """Real dataclass fields whose names start with an underscore.
+
+    The read-only guard exempts underscore names because they are the record's
+    own bookkeeping (the stash, the flags, the cache keys). A *field* that
+    happens to start with an underscore is still resolved configuration --
+    `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
+    by spelling would leave exactly one leaf writable on a read-only record.
+    """
+    return frozenset(
+        field.name
+        for field in dataclasses.fields(ServerArgs)
+        if field.name.startswith("_")
+    )
+
+
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""
-    from sglang.srt.runtime_context import publish
 
     publish(server_args, role="scheduler")
 
@@ -9962,7 +9195,6 @@ def set_global_server_args_for_scheduler(server_args: ServerArgs):
 def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     """Legacy publish shim (role=tokenizer). Not aliased to the scheduler shim:
     the process role differs."""
-    from sglang.srt.runtime_context import publish
 
     publish(server_args, role="tokenizer")
 
@@ -9970,12 +9202,32 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
 def get_global_server_args() -> ServerArgs:
     """Legacy accessor shim — prefer ``get_server_args()`` from
     ``sglang.srt.runtime_context`` in new code."""
-    from sglang.srt.runtime_context import get_context
 
     return get_context().server_args
 
 
-def prepare_server_args(argv: List[str]) -> ServerArgs:
+@contextmanager
+def record_writable(server_args: Any):
+    """Lift the input seal for a resolver that genuinely writes the record.
+
+    There is exactly one: `declare_direct_writes`, which hands the record to an
+    out-of-tree platform plugin that sets fields on it. Those implementations
+    live outside this tree and cannot be converted by editing a resolver here,
+    so the write stays and is captured into the stash afterwards. Naming the
+    exception is the point -- an in-tree resolver that reaches for this is
+    doing something it should be declaring instead.
+    """
+    frozen = getattr(server_args, "_input_frozen", False)
+    if frozen:
+        object.__setattr__(server_args, "_input_frozen", False)
+    try:
+        yield
+    finally:
+        if frozen:
+            object.__setattr__(server_args, "_input_frozen", True)
+
+
+def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
 
@@ -9992,7 +9244,7 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
     # Check for config file and merge arguments if present
     if "--config" in argv:
         # Import here to avoid circular imports
-        from sglang.srt.server_args_config_parser import ConfigArgumentMerger
+        from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 
         # Extract boolean actions from the parser to handle them correctly
         config_merger = ConfigArgumentMerger(parser)
@@ -10009,7 +9261,17 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    # Not a field: the record's fields are the configuration, and this is how
+    # the configuration was asked for. It rides along on the record so a
+    # subprocess copy can answer the same question the launcher can.
+    object.__setattr__(server_args, "_launch_command", " ".join(argv))
+    return server_args
+
+
+# --------------------------------------------------------------------------
+# Networking constants and PortArgs.
+# --------------------------------------------------------------------------
 
 
 ZMQ_TCP_PORT_DELTA = 233
@@ -10035,10 +9297,10 @@ class PortArgs:
     metrics_ipc_name: str
 
     # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
-    tokenizer_worker_ipc_name: Optional[str]
+    tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler
-    decoupled_spec_ipc_config: Optional[DecoupledSpecIpcConfig]
+    decoupled_spec_ipc_config: DecoupledSpecIpcConfig | None
 
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
@@ -10051,9 +9313,10 @@ class PortArgs:
     @staticmethod
     def init_new(
         server_args: ServerArgs,
-        dp_rank: Optional[int] = None,
-        worker_ports: Optional[List[int]] = None,
+        dp_rank: int | None = None,
+        worker_ports: list[int] | None = None,
     ) -> PortArgs:
+        cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
             nccl_port = get_free_port()
         else:
@@ -10086,7 +9349,7 @@ class PortArgs:
                 rank=int(server_args.decoupled_spec_rank),
             )
 
-        if not server_args.enable_dp_attention:
+        if not cfg.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -10117,8 +9380,8 @@ class PortArgs:
             # every init_new call agrees, decrementing below dist_init_port on
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
-            if server_args.is_ep_scale_joiner:
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
+            if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -10142,7 +9405,7 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = server_args.is_ep_joiner
+            is_joiner = ep_joiner_of(resolving_view(server_args))
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so

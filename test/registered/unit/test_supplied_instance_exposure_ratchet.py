@@ -56,7 +56,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=23, suite="base-a-test-cpu")
 # Also on a CUDA runner: the written set is derived by resolving on the running
 # host, and `is_cuda()` / capability gates only open on real hardware. The pin
 # is split by host so both registrations stay exact: `_EXPOSED` is asserted
@@ -68,7 +68,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 # shift the exact sets in ways none of the pinning hosts can verify; the ROCm
 # resolution surface is covered by `test_resolution_is_reproducible.py`
 # instead, whose assertion is device-agnostic.)
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 _PACKAGE_ROOT = Path(next(iter(sglang.__path__))) / "srt"
 
@@ -118,6 +118,12 @@ _LATE_RESOLUTION_DYNAMIC_SITES = {
     "parser/template_detection.py": frozenset({"reasoning_parser", "tool_call_parser"}),
 }
 
+# `get_context().override(...)` declares through the same seam, but the fields
+# are the caller's -- a test names them one call at a time. There is no static
+# set to collect, and nothing resolution decides: whatever a caller overrides
+# there is exposure only through that caller's own reads.
+_CALLER_SUPPLIED_LATE_SITES = frozenset({"runtime_context.py"})
+
 # Resolution also branches on ambient environment; those shapes are explicit
 # entries so the written set is the same on every host. `SGLANG_IS_IN_CI`
 # makes resolution fill `soft_watchdog_timeout`.
@@ -128,6 +134,7 @@ _ENV_MATRIX = (({}, {"SGLANG_IS_IN_CI": "true"}),)
 # are step-12 exposure like any other pair.
 _PASSED = frozenset({"model_path", "device", "random_seed"})
 
+<<<<<<< HEAD
 _EXPOSED = {
     ("entrypoints/sidecar.py", "grpc_port"),
     ("configs/embedding_model_spec.py", "chunked_prefill_size"),
@@ -383,6 +390,14 @@ _EXPOSED = {
     ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
     ("utils/patch_torch.py", "device"),
 }
+=======
+# Empty. A pair belongs here when a reader has no bag to read -- it runs before
+# its process publishes -- and cannot use `resolving_view` either. The launcher's
+# pre-publish reads (`_set_envs_and_config`, the auto-parser gate) and the
+# late-resolution detection it calls all read the declarations now, so nothing
+# qualifies. A new entry needs that kind of reason next to it.
+_EXPOSED: frozenset = frozenset()
+>>>>>>> upstream/main
 
 # Pairs whose resolution write only happens on a CUDA host (capability or
 # `is_cuda()` gated): asserted on the CUDA registration, invisible to the CPU
@@ -395,6 +410,7 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # Axis two: (file, field) pairs where a supplied-instance read names a field that
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
+<<<<<<< HEAD
 _OVERRIDDEN_AND_READ = {
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
@@ -455,6 +471,9 @@ _OVERRIDDEN_AND_READ = {
     ("hardware_backend/tpu/tpu_platform.py", "model_path"),
     ("speculative/eagle_worker_v2.py", "disable_cuda_graph"),
 }
+=======
+_OVERRIDDEN_AND_READ: frozenset = frozenset()
+>>>>>>> upstream/main
 
 
 def _expanded_override_keys(rel, tree, call, kw) -> set:
@@ -508,17 +527,17 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
         return values
 
     def dict_keys(node) -> set:
-        assert isinstance(
-            node, ast.Dict
-        ), f"non-literal dict in override expansion at {rel}:{call.lineno}"
+        assert isinstance(node, ast.Dict), (
+            f"non-literal dict in override expansion at {rel}:{call.lineno}"
+        )
         keys = set()
         for key in node.keys:
             if isinstance(key, ast.Constant):
                 keys.add(key.value)
                 continue
-            assert isinstance(
-                key, ast.Name
-            ), f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            assert isinstance(key, ast.Name), (
+                f"non-literal dict key in override expansion at {rel}:{call.lineno}"
+            )
             bound = loop_variable_values(key.id)
             assert bound, (
                 f"dict key {key.id!r} at {rel}:{call.lineno} is not bound by a "
@@ -541,9 +560,9 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
                     f"unresolvable override expansion at {rel}:{call.lineno}"
                 )
         return keys
-    assert isinstance(
-        kw.value, ast.Name
-    ), f"unresolvable override expansion at {rel}:{call.lineno}"
+    assert isinstance(kw.value, ast.Name), (
+        f"unresolvable override expansion at {rel}:{call.lineno}"
+    )
     name = kw.value.id
     enclosing = None
     for fn in ast.walk(tree):
@@ -555,9 +574,9 @@ def _expanded_override_keys(rel, tree, call, kw) -> set:
             ):
                 if enclosing is None or fn.lineno > enclosing.lineno:
                     enclosing = fn
-    assert (
-        enclosing is not None
-    ), f"override expansion outside any function at {rel}:{call.lineno}"
+    assert enclosing is not None, (
+        f"override expansion outside any function at {rel}:{call.lineno}"
+    )
     keys = set()
     found = False
     for node in ast.walk(enclosing):
@@ -660,6 +679,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 resolved = ServerArgs(
                     model_path=model_path, device="cuda", random_seed=42, **extra
                 )
+                resolved.resolve_once()
             except Exception as exc:
                 self.fail(
                     f"the matrix entry {extra} (env={env}) did not resolve in "
@@ -698,14 +718,22 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         `speculative_draft_attention_backend`, and no entry ran it) showed
         that a family nobody listed leaves its readers unpinned. The hook
         modules under `arg_groups/` are the resolution pipeline's extension
-        points, and their assignment surface (`server_args.field = ...`) is
-        the may-write set, family-blind by construction. Collected like the
+        points -- along with the NPU default helper, which the pipeline calls
+        the same way -- and their write surface is the may-write set,
+        family-blind by
+        construction. A hook writes two ways: `server_args.field = ...`, and
+        `declare_resolution(server_args, source, field=...)`, which records
+        the write in the declaration stash on its way to the field. Counting
+        only the assignment would read a hook's conversion to a declaration as
+        the field having stopped being written. Collected like the
         late-resolution keywords: statically, failing loudly on an
         unparsable module. Underscore-prefixed targets are pipeline
         bookkeeping, not config leaves.
         """
         targets = set()
-        for path in sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py")):
+        modules = sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py"))
+        modules.append(_PACKAGE_ROOT / "hardware_backend/npu/utils.py")
+        for path in modules:
             try:
                 tree = ast.parse(path.read_text(encoding="utf-8-sig"))
             except SyntaxError:
@@ -715,6 +743,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     tgts = node.targets
                 elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                     tgts = [node.target]
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "declare_resolution"
+                ):
+                    targets |= {
+                        kw.arg
+                        for kw in node.keywords
+                        if kw.arg and not kw.arg.startswith("_")
+                    }
+                    continue
                 else:
                     continue
                 for tgt in tgts:
@@ -737,6 +776,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         A write site that can never fire is a dead branch to delete upstream,
         not a census exemption. Only names that are declared dataclass fields
         count; underscore bookkeeping does not.
+
+        Two spellings write: an assignment, and ``self._declare(source,
+        field=value)``, which records the write in the declaration stash on
+        its way to the field. Counting only assignments would read a handler's
+        conversion to a declaration as the field having stopped being written,
+        which would quietly retire every pinned pair that reads it.
         """
         tree = ast.parse(
             (_PACKAGE_ROOT / "server_args.py").read_text(encoding="utf-8-sig")
@@ -757,6 +802,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = node.targets
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                 tgts = [node.target]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_resolution"
+            ):
+                targets |= {
+                    kw.arg
+                    for kw in node.keywords
+                    if kw.arg in declared and not kw.arg.startswith("_")
+                }
+                continue
             else:
                 continue
             for tgt in tgts:
@@ -768,27 +824,40 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     and not tgt.attr.startswith("_")
                 ):
                     targets.add(tgt.attr)
-        # The deprecated-alias normalization loop writes through a *name
-        # tuple* (`for attr in (...): setattr(self, attr, "dsv4")`), which no
-        # assignment scan sees; its field set is pinned here with a drift
-        # guard on the tuple itself.
+        # The deprecated-alias normalization declares through `**renamed`, so
+        # the keyword scan sees no names; its field set is pinned here.
         alias_fields = {
             "attention_backend",
             "decode_attention_backend",
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         }
+
+        # The handler lives in `arg_groups/serving_hook.py`, reached either as a
+        # record method or as a bare-name call, so look the loop up by both.
+        def _deprecated_alias_handler():
+            for node in ast.walk(sa_class):
+                if (
+                    isinstance(node, ast.FunctionDef)
+                    and node.name == "_handle_deprecated_args"
+                    and any(isinstance(n, ast.For) for n in ast.walk(node))
+                ):
+                    return node
+            for path in sorted((_PACKAGE_ROOT / "arg_groups").glob("*.py")):
+                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                for node in tree.body:
+                    if (
+                        isinstance(node, ast.FunctionDef)
+                        and node.name == "handle_deprecated_args"
+                    ):
+                        return node
+            raise AssertionError("the deprecated-alias handler was not found")
+
+        deprecated = _deprecated_alias_handler()
         found_tuples = [
             {elt.value for elt in node.iter.elts if isinstance(elt, ast.Constant)}
-            for node in ast.walk(sa_class)
-            if isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Tuple)
-            and any(
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "setattr"
-                for inner in ast.walk(node)
-            )
+            for node in ast.walk(deprecated)
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
         ]
         self.assertIn(
             alias_fields,
@@ -803,9 +872,9 @@ class TestSuppliedInstanceExposure(CustomTestCase):
 
         ``MODEL_OVERRIDES`` maps arch -> {field: value}, and the
         ``@register_model_override``(-``_predicate``) providers return (or
-        build by subscript) {field: value} dicts; ``materialize_declarations``
-        applies them all via setattr, so no assignment scan sees these writes
-        and a llama-only matrix never triggers them. Keys must be
+        build by subscript) {field: value} dicts, which go straight into the
+        declaration stash, so no assignment scan sees these writes and a
+        llama-only matrix never triggers them. Keys must be
         string literals; anything else fails loudly.
         """
         tree = ast.parse(
@@ -873,8 +942,11 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         root = _PACKAGE_ROOT
         for path in sorted(root.rglob("*.py")):
             rel = path.relative_to(root).as_posix()
+            source = path.read_text(encoding="utf-8-sig")
+            if "declare_late_resolution" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 self.fail(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):
@@ -905,6 +977,8 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     if kw.arg and kw.arg != "source":
                         written.add(kw.arg)
                     elif kw.arg is None:
+                        if rel in _CALLER_SUPPLIED_LATE_SITES:
+                            continue
                         dynamic = _LATE_RESOLUTION_DYNAMIC_SITES.get(rel)
                         if dynamic is not None:
                             constants = {
@@ -923,24 +997,32 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                             written |= _expanded_override_keys(rel, tree, node, kw)
         return written
 
+    _READS_CACHE = None
+
     def _supplied_instance_reads(self) -> set:
         """Three spellings of the same read: ``server_args.field`` off the
         parameter, ``getattr(server_args, "field", default)`` with a literal
         name, and the *parked* form -- ``self.x = server_args`` in a method
         that takes the parameter, read as ``self.x.field`` anywhere in the
         class. Parking under a different object, a container, or a computed
-        name stays invisible, like in every census of this family -- the
-        loudest known boundary is the *chain* spelling,
-        ``model_runner.server_args.field`` off some other parameter, which
-        this census does not count (~150 reads tree-wide; extending the pin
-        to that spelling is its own step, not a by-product of this one)."""
+        name stays invisible, like in every census of this family. The
+        loudest boundary *was* the *chain* spelling,
+        ``model_runner.server_args.field`` off some other object, which this
+        census still does not count -- but those reads are gone for every
+        resolution-written field and ``test_chain_read_ratchet.py`` holds them
+        at zero, so the gap is no longer where the risk is."""
+        if TestSuppliedInstanceExposure._READS_CACHE is not None:
+            return TestSuppliedInstanceExposure._READS_CACHE
         pairs = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
             if rel.startswith(_OWNERS):
                 continue
+            source = path.read_text(encoding="utf-8-sig")
+            if "server_args" not in source:
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 # A silently dropped module shrinks `found` and reads as
                 # intentional surface shrinkage under the bidirectional pin.
@@ -1006,6 +1088,7 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                         and node.value.value.id == "self"
                     ):
                         pairs.add((rel, node.attr))
+        TestSuppliedInstanceExposure._READS_CACHE = pairs
         return pairs
 
     @staticmethod
@@ -1014,8 +1097,13 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         written = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
+            source = path.read_text(encoding="utf-8-sig")
+            if "record_config_updates" not in source and not (
+                "get_context" in source and "override" in source
+            ):
+                continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+                tree = ast.parse(source)
             except SyntaxError:
                 raise AssertionError(f"unparsable module in the census: {rel}")
             for node in ast.walk(tree):

@@ -46,6 +46,7 @@ class AccuracyTestParams:
     # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
     # of letting _run_sgl_eval infer it from the model name.
     sgl_eval_thinking: Optional[bool] = None
+<<<<<<< HEAD
     # Optional secondary gate read from /server_info after the evaluation. The
     # primary score remains dataset accuracy. Every scheduler state must meet it.
     spec_accept_length_threshold: Optional[float] = None
@@ -76,6 +77,9 @@ class AccuracyTestParams:
         if self.baseline_accuracy is None:
             return None
         return self.baseline_accuracy - self.atol
+=======
+    num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
+>>>>>>> upstream/main
 
 
 @dataclass
@@ -192,6 +196,7 @@ def _run_simple_eval(
     dataset: str,
     num_examples: Optional[int] = None,
     num_threads: Optional[int] = None,
+    num_shots: Optional[int] = None,
     max_tokens: Optional[int] = None,
     return_latency: bool = False,
     thinking_mode: Optional[str] = None,
@@ -217,6 +222,9 @@ def _run_simple_eval(
             num_examples=num_examples,
             num_threads=num_threads or 1024,
         )
+
+        if num_shots is not None:
+            args.num_shots = num_shots
 
         if api is not None:
             args.api = api
@@ -617,8 +625,9 @@ def run_accuracy_test(
     """
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running ACCURACY test for {model.model_path}")
+<<<<<<< HEAD
     print(f"  Eval: {params.name}")
     if params.floor is not None:
         print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
@@ -637,6 +646,30 @@ def run_accuracy_test(
                 spec_accept_lengths = _get_avg_spec_accept_lengths(base_url)
             except (TypeError, ValueError, requests.RequestException) as exc:
                 spec_accept_length_error = str(exc)
+=======
+    print(f"  Dataset: {params.dataset}")
+    print(f"  Baseline: {params.baseline_accuracy}")
+    print(f"{'=' * 60}\n")
+
+    success, error, metrics = _run_simple_eval(
+        model=model,
+        base_url=base_url,
+        dataset=params.dataset,
+        num_examples=params.num_examples,
+        num_threads=params.num_threads,
+        num_shots=params.num_shots,
+        max_tokens=params.max_tokens,
+        return_latency=params.return_latency,
+        thinking_mode=params.thinking_mode,
+        temperature=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        repeat=params.repeat,
+        api=params.api,
+        seed=params.seed,
+        sgl_eval_thinking=params.sgl_eval_thinking,
+    )
+>>>>>>> upstream/main
 
     if not success:
         print(f"✗ Accuracy test failed for {model.model_path}: {error}")

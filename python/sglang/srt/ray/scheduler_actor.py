@@ -47,8 +47,6 @@ class SchedulerActor:
         dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
     ):
-        import dataclasses
-
         from sglang.srt.environ import envs
         from sglang.srt.utils.numa_utils import (
             get_numa_node_if_available,
@@ -56,10 +54,11 @@ class SchedulerActor:
         )
         from sglang.srt.utils.patch_torch import initialize_torch_tpu_worker
 
-        # Override dist_init_addr if provided (for multi-node)
+        # Override dist_init_addr if provided (for multi-node), through
+        # `replace_resolved` so the copy keeps the parent's resolution.
         if dist_init_addr:
-            server_args = dataclasses.replace(
-                server_args, dist_init_addr=dist_init_addr
+            server_args = server_args.replace_resolved(
+                "ray.scheduler_actor", dist_init_addr=dist_init_addr
             )
 
         # The Ray-discovered, physically-ordered TPU host list is injected into

@@ -214,7 +214,11 @@ def resolve_current_platform_cls_qualname() -> str:
             "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
             "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
             "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+<<<<<<< HEAD
             "tpu": "sglang.multimodal_gen.runtime.platforms.tpu.TpuPlatform",
+=======
+            "xpu": "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform",
+>>>>>>> upstream/main
         }
         qualname = forced_map.get(forced_platform.lower())
         if qualname is None:
@@ -266,7 +270,7 @@ def resolve_current_platform_cls_qualname() -> str:
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 
-    raise RuntimeError("No platform plugin found. Please check your " "installation.")
+    raise RuntimeError("No platform plugin found. Please check your installation.")
 
 
 _current_platform: Platform | None = None

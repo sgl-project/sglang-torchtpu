@@ -9,7 +9,8 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import attention_backends, get_spec
+from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
@@ -22,6 +23,7 @@ from sglang.srt.utils import is_tpu
 
 logger = logging.getLogger(__name__)
 
+<<<<<<< HEAD
 # trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
 # earlier, at arg resolution (speculative_hook.py) -- its draft path needs
 # per-layer DFlash attention -- so it never reaches this gate with it.
@@ -39,6 +41,8 @@ _SUPPORTED_DRAFT_BACKENDS = (
     "torch_native",
 )
 
+=======
+>>>>>>> upstream/main
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_worker: TpModelWorker
@@ -47,13 +51,18 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
-def _resolve_draft_attention_backend_fallback(
-    *, server_args: ServerArgs, algo_label: str
-) -> str:
-    draft_backend = server_args.speculative_draft_attention_backend
+def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
+    """The draft's attention backend, from the published leaves.
+
+    `spec.speculative_draft_attention_backend` when the operator named one,
+    otherwise the process's prefill backend. Both are resolution's answers, so
+    they come from the bags.
+    """
+    draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
-        draft_backend, _ = server_args.get_attention_backends()
+        draft_backend, _ = attention_backends()
     if draft_backend is None:
+<<<<<<< HEAD
         return (
             "pallas_tpu_rpa_v3"
             if is_tpu()
@@ -65,11 +74,16 @@ def _resolve_draft_attention_backend_fallback(
             if is_tpu()
             else ("triton" if torch.version.hip else "flashinfer")
         )
+=======
+        return "triton" if torch.version.hip else "flashinfer"
+    if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
+        fallback = "triton" if torch.version.hip else "flashinfer"
+>>>>>>> upstream/main
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
             algo_label,
-            _SUPPORTED_DRAFT_BACKENDS,
+            DRAFT_ATTENTION_BACKEND_CHOICES,
             draft_backend,
             fallback,
         )
@@ -86,14 +100,13 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    draft_worker_cls: type[TpModelWorker] = TpModelWorker,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
     # supported-backend fallback below.
     draft_backend = attention_backend_override or (
-        _resolve_draft_attention_backend_fallback(
-            server_args=server_args, algo_label=algo_label
-        )
+        _resolve_draft_attention_backend_fallback(algo_label=algo_label)
     )
     from sglang.srt.layers.moe.utils import draft_model_build_scope
 
@@ -103,7 +116,7 @@ def build_draft_tp_worker(
     # workers run the draft outside speculative_moe_backend_context, so a
     # construction-only swap would build and execute under different backends.
     with draft_model_build_scope():
-        draft_worker = TpModelWorker(
+        draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
             ps=ps,
