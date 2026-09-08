@@ -675,7 +675,6 @@ class FutureMap:
             indices,
             payload.bonus_tokens.to(self.output_tokens_buf.dtype),
         )
-
         if self.need_topk:
             self._store(
                 self.topk_p_buf, indices, payload.topk_p.to(self.topk_p_buf.dtype)
