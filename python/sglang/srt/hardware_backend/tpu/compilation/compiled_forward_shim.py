@@ -26,6 +26,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -36,7 +37,14 @@ logger = get_logger(__name__)
 DEFAULT_TPU_COMPILE_MAX_BS = 64
 
 # Fields whose token dim gets padded to the token bucket.
-_TOKEN_FIELDS = ("input_ids", "positions", "out_cache_loc", "input_embeds")
+_TOKEN_FIELDS = (
+    "input_ids",
+    "positions",
+    "out_cache_loc",
+    "input_embeds",
+    # Draft extend inherits the target's real-length embeds, so re-pad them.
+    "mm_input_embeds",
+)
 
 # Fields whose batch dim gets padded to the bs bucket.
 _BS_FIELDS = (
@@ -711,9 +719,22 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
-        input_embeds = getattr(forward_batch, "input_embeds", None)
-        if input_embeds is not None:
-            kwargs["input_embeds"] = input_embeds
+        # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
+        # which is_extend() excludes.
+        if (
+            forward_batch.mm_input_embeds is not None
+            and isinstance(forward_batch.spec_info, EagleDraftExtendInput)
+            and forward_batch.forward_mode.is_extend()
+        ):
+            from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
+                fold_last_token_embeds,
+            )
+
+            forward_batch.input_embeds = fold_last_token_embeds(
+                forward_batch, self.policy.model_runner.model.get_input_embeddings()
+            )
+        if forward_batch.input_embeds is not None:
+            kwargs["input_embeds"] = forward_batch.input_embeds
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across

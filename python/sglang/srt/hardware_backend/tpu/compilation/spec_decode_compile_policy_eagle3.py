@@ -149,6 +149,29 @@ def _pad_eagle_draft_input(draft_input: EagleDraftInput, request_rows: int) -> i
     return current_rows
 
 
+def fold_last_token_embeds(
+    forward_batch: ForwardBatch, embed_tokens: torch.nn.Embedding
+) -> torch.Tensor:
+    """Return the target's multimodal embeds with each appended next token embedded.
+
+    Feeding the result back as input_embeds is what keeps the draft from
+    assembling it inside its graph, where reading forward_batch.mm_inputs makes
+    Dynamo guard on each request slot's emptiness. Those guards track how the
+    scheduler packs the batch, so no precompiled variant covers them.
+
+    Returns:
+        [num_tokens, hidden_size] embeds, already padded to the token bucket.
+    """
+    # Padding zero-fills the ghost request slots, whose last index would be -1.
+    real_b = getattr(forward_batch, _REAL_B_KEY, None)
+    last_indices = (forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1)[
+        :real_b
+    ].long()
+    embeds = forward_batch.mm_input_embeds
+    embeds[last_indices] = embed_tokens(forward_batch.input_ids[last_indices])
+    return embeds
+
+
 class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     """Add EAGLE3 warmup and batch shaping to a decoder compile policy."""
 
@@ -681,25 +704,35 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
-        valid_shapes = [(t, bs) for t in self.t_bucketer.buckets if t >= bs]
+        # A multimodal prefill hands the draft the target's embeds, which the
+        # draft reads instead of calling embed_tokens -- a separate graph.
+        variants = ("plain", "mm_embeds")
+        valid_shapes = [
+            (t, bs, variant)
+            for t in self.t_bucketer.buckets
+            if t >= bs
+            for variant in variants
+        ]
         logger.info(
             "[spec compile policy] DRAFT EXTEND(LAST): %d shapes "
-            "(bs=%d, token_buckets=%s)",
+            "(bs=%d, token_buckets=%s, variants=%s)",
             len(valid_shapes),
             bs,
             list(self.t_bucketer.buckets),
+            list(variants),
         )
 
-        def run(shape: tuple[int, int]) -> str:
-            num_tokens, bs = shape
+        def run(shape: tuple[int, int, str]) -> str:
+            num_tokens, bs, variant = shape
             self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.EXTEND,
+                variant=variant,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
                 spec_info=self._make_draft_prefill_spec_info(),
             )
-            return f"tokens={num_tokens}, bs={bs}"
+            return f"tokens={num_tokens}, bs={bs}, variant={variant}"
 
         self._precompile_shapes("DRAFT EXTEND(LAST)", valid_shapes, run)
 
@@ -937,6 +970,34 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
     def _dummy_mm_inputs(self, bs: int) -> list[None]:
         return [None] * bs
+
+    def _make_warmup_inputs(
+        self,
+        *,
+        num_tokens: int,
+        bs: int,
+        mode: ForwardMode,
+        variant: str = "plain",
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        spec_info: SpecInput | None = None,
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        args, kwargs = super()._make_warmup_inputs(
+            num_tokens=num_tokens,
+            bs=bs,
+            mode=mode,
+            variant=variant,
+            capture_hidden_mode=capture_hidden_mode,
+            spec_info=spec_info,
+        )
+        if variant == "mm_embeds":
+            forward_batch = kwargs.get("forward_batch", args[2])
+            embed_tokens = self.model_runner.model.get_input_embeddings()
+            forward_batch.mm_input_embeds = torch.zeros(
+                (num_tokens, embed_tokens.embedding_dim),
+                dtype=embed_tokens.weight.dtype,
+                device=self.model_runner.device,
+            )
+        return args, kwargs
 
     def _dummy_out_cache_loc_dtype(self, mode: ForwardMode) -> torch.dtype:
         if (

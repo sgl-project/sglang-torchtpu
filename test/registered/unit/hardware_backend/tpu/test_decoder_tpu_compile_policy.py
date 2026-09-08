@@ -137,12 +137,16 @@ def _model_runner(device="cpu"):
 
     ``prepare_forward_batch`` is included because ``_run_one`` calls it
     before ``init_forward_metadata`` (mirrors the runtime chain installed
-    by ``DecoderTpuCompilePolicy.install()``)."""
+    by ``DecoderTpuCompilePolicy.install()``).
+
+    get_input_embeddings sizes the EAGLE3 draft's mm_embeds warmup variant."""
+    embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,
         model=SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
+            get_input_embeddings=lambda: embed_tokens,
         ),
         attn_backend=_FakeAttnBackend(),
         req_to_token_pool=SimpleNamespace(),
@@ -1340,12 +1344,16 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
 
 
 def _spec_model_runner(device="cpu", is_draft_worker=False):
-    """ModelRunner stand-in; the spec config comes from get_spec(), not from here."""
+    """ModelRunner stand-in; the spec config comes from get_spec(), not from here.
+
+    get_input_embeddings sizes the EAGLE3 draft's mm_embeds warmup variant."""
+    embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,
         model=SimpleNamespace(
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
+            get_input_embeddings=lambda: embed_tokens,
         ),
         attn_backend=_FakeAttnBackend(),
         # _run_one seeds req_to_token rows; needs a real indexable tensor
@@ -1451,7 +1459,10 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy._precompile_draft_prefill_extend()
 
-        self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
+        self.assertEqual(
+            mr.attn_backend.calls,
+            [(1024, 16), (1024, 16), (4096, 16), (4096, 16)],
+        )
 
     def test_infers_eagle_aux_hidden_width_from_config(self):
         mr = _spec_model_runner(is_draft_worker=True)
@@ -1542,14 +1553,16 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_backend, draft_extend_backend)
 
-        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
+        # Each prefill token bucket is compiled twice: with and without the
+        # target's multimodal embeds.
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (8, 4), (64, 4), (64, 4)])
         self.assertEqual(decode_backends[0].calls, [(1, 1), (4, 4)])
         self.assertEqual(decode_backends[1].calls, [(1, 1), (4, 4)])
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
         modes = [call.args[2].forward_mode for call in mr.model.forward.call_args_list]
         self.assertEqual(
             modes,
-            [ForwardMode.EXTEND] * 2
+            [ForwardMode.EXTEND] * 4
             + [ForwardMode.DECODE] * 4
             + [ForwardMode.DRAFT_EXTEND_V2] * 2,
         )
@@ -1558,7 +1571,7 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         ]
         self.assertEqual(
             capture_modes,
-            [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
+            [CaptureHiddenMode.LAST] * 8 + [CaptureHiddenMode.FULL] * 2,
         )
 
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
@@ -2832,16 +2845,16 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
 
-        # EXTEND(LAST) 2 token buckets at the bs cap + DECODE 2 bs x 3 steps
-        # + DRAFT_EXTEND_V2 2 bs buckets.
-        self.assertEqual(mr.model.forward.call_count, 2 + 6 + 2)
+        # EXTEND(LAST) 2 token buckets x 2 mm variants at the bs cap
+        # + DECODE 2 bs x 3 steps + DRAFT_EXTEND_V2 2 bs buckets.
+        self.assertEqual(mr.model.forward.call_count, 4 + 6 + 2)
         # Draft decode warms each step's own backend, not the runner's.
         self.assertEqual([len(b.calls) for b in step_backends], [2, 2, 2])
         self.assertEqual(step_backends[0].calls, [(1, 1), (4, 4)])
         # DRAFT_EXTEND_V2: bs * draft_token_num tokens per shape.
         self.assertEqual(draft_extend_attn_backend.calls, [(4, 1), (16, 4)])
         # Only the draft-prefill EXTEND shapes go to the runner's own backend.
-        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (8, 4), (64, 4), (64, 4)])
 
     def test_target_worker_skips_draft_precompile(self):
         mr = _spec_model_runner(is_draft_worker=False)

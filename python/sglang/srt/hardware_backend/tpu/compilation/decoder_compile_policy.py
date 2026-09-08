@@ -805,6 +805,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             time.perf_counter() - overall,
         )
 
+    def _extend_input_variants(self) -> tuple[str, ...]:
+        """Input signatures an extend graph must be compiled for."""
+        return ("plain",)
+
     def _precompile_extend(self) -> None:
         """Compile extend at each token bucket and the fixed batch cap."""
         assert self.t_bucketer is not None
@@ -1233,6 +1237,14 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         is_multimodal = hasattr(outer, "get_image_feature")
         return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
 
+    def _extend_input_variants(self) -> tuple[str, ...]:
+        """Split text from deepstack: deepstack adds a Dynamo-guarded kwarg."""
+        if not self._uses_input_embeds(self.owner):
+            return super()._extend_input_variants()
+        if self._num_deepstack > 0:
+            return ("deepstack", "text_only")
+        return ("text_only",)
+
     def _direct_compile_specialization_key(
         self,
         _attention_metadata: Any,
@@ -1332,9 +1344,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
-        variants = ["text_only"]
-        if self._num_deepstack > 0:
-            variants = ["deepstack", "text_only"]
+        variants = self._extend_input_variants()
 
         compile_items = [
             (num_tokens, bs, mode, variant, logits_output_mode)

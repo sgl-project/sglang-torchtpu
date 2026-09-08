@@ -514,6 +514,8 @@ class TestCompiledForwardShim(CustomTestCase):
     def _forward_batch(**kwargs):
         defaults = {
             "is_prefill_only": False,
+            "mm_input_embeds": None,
+            "input_embeds": None,
             "seq_lens": torch.zeros(4, dtype=torch.int32),
             "spec_info": None,
             # The logprob pin reads these on every call, and a real
@@ -1018,6 +1020,8 @@ class TestHiCacheReloadGate(CustomTestCase):
         shim = self._shim(counter)
         fb = SimpleNamespace(
             is_prefill_only=False,
+            mm_input_embeds=None,
+            input_embeds=None,
             spec_info=None,
             forward_mode=_ForwardModeMock("decode"),
             return_logprob=False,
@@ -1033,6 +1037,8 @@ class TestHiCacheReloadGate(CustomTestCase):
         shim = self._shim(None)
         fb = SimpleNamespace(
             is_prefill_only=False,
+            mm_input_embeds=None,
+            input_embeds=None,
             spec_info=None,
             forward_mode=_ForwardModeMock("decode"),
             return_logprob=False,
@@ -1047,6 +1053,8 @@ class TestHiCacheReloadGate(CustomTestCase):
         shim = self._shim(counter)
         fb = SimpleNamespace(
             is_prefill_only=False,
+            mm_input_embeds=None,
+            input_embeds=None,
             spec_info=None,
             forward_mode=_ForwardModeMock("decode"),
             return_logprob=False,
@@ -1179,6 +1187,8 @@ class TestShimInputLogprobPath(CustomTestCase):
     def _fb(mode="extend", return_logprob=True, starts=(0, 0)):
         return SimpleNamespace(
             is_prefill_only=False,
+            mm_input_embeds=None,
+            input_embeds=None,
             spec_info=None,
             seq_lens=torch.zeros(2, dtype=torch.int32),
             forward_mode=_ForwardModeMock(mode),

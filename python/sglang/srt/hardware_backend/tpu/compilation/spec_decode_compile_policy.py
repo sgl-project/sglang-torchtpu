@@ -129,17 +129,21 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
+        variants = self._extend_input_variants()
         valid_shapes = [
-            (t, bs, has_spec_info)
+            (t, bs, has_spec_info, variant)
             for t in self.t_bucketer.buckets
             if t >= bs
             for has_spec_info in (False, True)
+            for variant in variants
         ]
         logger.info(
-            "[spec compile policy] EXTEND(FULL): %d shapes (bs=%d, token_buckets=%s)",
+            "[spec compile policy] EXTEND(FULL): %d shapes (bs=%d, token_buckets=%s, "
+            "variants=%s)",
             len(valid_shapes),
             bs,
             list(self.t_bucketer.buckets),
+            list(variants),
         )
         compile_range = (
             tqdm.tqdm(
@@ -150,13 +154,14 @@ class BaseSpecDecodeCompilePolicyMixin:
             if get_parallel().tp_rank == 0
             else valid_shapes
         )
-        for num_tokens, bs, has_spec_info in compile_range:
+        for num_tokens, bs, has_spec_info, variant in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.EXTEND,
+                variant=variant,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_null_spec_info() if has_spec_info else None,
             )
@@ -166,6 +171,7 @@ class BaseSpecDecodeCompilePolicyMixin:
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
                     f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
+                    f"variant={variant}, "
                     f"spec_info={'set' if has_spec_info else 'none'})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
