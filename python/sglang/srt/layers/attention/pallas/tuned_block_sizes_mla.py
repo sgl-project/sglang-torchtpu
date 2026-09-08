@@ -181,13 +181,123 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "float8_e4m3fn", 4, 512, 64, 128, 8192): (16, 256),
         # DeepSeek-R1 tp=8 (16 heads, page 128): decode -8% / -15% at bs 64 / 128
         # vs (32,1,2); mixed 4096 -5% vs (8,128).
-        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 64): (16, 1, 8),
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 64): (
+            32,
+            1,
+            8,
+        ),  # 1.375 ms vs fallback 1.934
         ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 128): (16, 1, 8),
-        ("mixed", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 4096): (32, 128),
+        ("mixed", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 4096): (
+            8,
+            256,
+        ),  # 4.470 ms vs fallback 29.314
         # DeepSeek-R1 tp=16 (8 heads, page 64): decode 64 -5% vs (32,1,8); mixed
         # 8192 -19% vs (16,128) (5.34 vs 6.60 ms per layer at 16k KV).
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 64): (32, 1, 16),
         ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 8192): (64, 256),
+        # ===== fp8 KV rows for DP attention (dp=16: every rank owns all 64 heads, page 128), tuned 2026-09-05 with tune_mla_fp8.py; decode rows from the 16k-KV pass (GPQA chains run 20k-98k), bs=1 from 2k; mixed 1024 = per-rank prefill chunk (4.0 vs 10.9 ms fallback) =====
+        ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 1): (
+            128,
+            1,
+            1,
+        ),  # 0.352 ms vs fallback 0.468
+        ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 8): (
+            32,
+            1,
+            2,
+        ),  # 0.425 ms vs fallback 0.509
+        ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 16): (
+            32,
+            1,
+            4,
+        ),  # 0.587 ms vs fallback 0.724
+        ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 32): (
+            16,
+            1,
+            8,
+        ),  # 0.870 ms vs fallback 1.156
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 1024): (
+            32,
+            32,
+        ),  # 4.018 ms vs fallback 10.889
+        # ===== fp8 KV rows for DP attention dp=4 / attn_tp=4 (16 heads per core, page 128), tuned 2026-09-06; decode rows from the 16k-KV pass, bs=1 from 2k; mixed 4096 = per-rank prefill chunk =====
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 1): (
+            16,
+            1,
+            1,
+        ),  # 0.305 ms vs fallback 0.326
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 16): (
+            32,
+            1,
+            8,
+        ),  # 0.565 ms vs fallback 0.708
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 32): (
+            64,
+            1,
+            4,
+        ),  # 0.830 ms vs fallback 1.140
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 8): (
+            64,
+            1,
+            2,
+        ),  # 0.831 ms vs fallback 1.124
+        # ===== fp8 KV rows for the eval TAIL regime (bs 1-4 per rank at 64k/96k KV) for the 64-head (dp=16) and 16-head (dp=4) layouts, decode + 4-query verify; and 64-head verify shapes mnt 4..128 at 16k KV; tuned 2026-09-06 =====
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 4): (
+            32,
+            4,
+        ),  # 0.419 ms vs fallback 0.950
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 8): (
+            32,
+            8,
+        ),  # 0.444 ms vs fallback 0.940
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 16): (
+            64,
+            16,
+        ),  # 0.551 ms vs fallback 0.953
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 32): (
+            64,
+            8,
+        ),  # 0.438 ms vs fallback 0.648
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 64): (
+            8,
+            16,
+        ),  # 0.538 ms vs fallback 0.961
+        ("mixed", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 128): (
+            64,
+            16,
+        ),  # 0.739 ms vs fallback 1.559
+        ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 2): (
+            128,
+            1,
+            1,
+        ),  # 0.427 ms vs fallback 0.514
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 2): (
+            32,
+            1,
+            2,
+        ),  # 0.430 ms vs fallback 0.539
+        ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 4): (
+            64,
+            1,
+            4,
+        ),  # 0.575 ms vs fallback 0.720
+        ("decode", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 4): (
+            128,
+            1,
+            2,
+        ),  # 0.577 ms vs fallback 0.725
+        ("mixed", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 4): (
+            64,
+            4,
+        ),  # 0.339 ms vs fallback 0.398
+        ("mixed", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 8): (
+            8,
+            8,
+        ),  # 0.322 ms vs fallback 0.410
+        ("mixed", "bfloat16", "float8_e4m3fn", 16, 512, 64, 128, 16): (
+            4,
+            16,
+        ),  # 0.337 ms vs fallback 0.414
         # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
         # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
         ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 1): (16, 1, 4),
