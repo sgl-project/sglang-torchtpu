@@ -371,6 +371,21 @@ class PackedTopKOutput(NamedTuple):
         return TopKOutputFormat.PACKED
 
 
+def _balanced_routing_num_ranks(num_experts: int) -> int:
+    """EP ranks to deal the balanced assignment across, or 1 when dealing cannot help.
+
+    Rank-first dealing needs equal contiguous blocks. When the EP size does not
+    divide ``num_experts`` the ranks own unequal blocks, no exact per-rank balance
+    exists, and dealing would leave the tail experts unreachable. The override is
+    also driven from standalone benchmark scripts with no distributed launch,
+    where the EP group does not exist and ``get_parallel()`` would assert.
+    """
+    if not torch.distributed.is_initialized():
+        return 1
+    num_ranks = get_parallel().moe_ep_size
+    return num_ranks if num_ranks > 0 and num_experts % num_ranks == 0 else 1
+
+
 def _make_round_robin_expert_ids(
     num_tokens: int,
     topk: int,
@@ -380,14 +395,27 @@ def _make_round_robin_expert_ids(
     dtype: torch.dtype,
     layer_id: Optional[int] = None,
 ) -> torch.Tensor:
+    """Deterministic balanced expert assignment, dealt rank-first.
+
+    Number the ``(token, slot)`` assignments and deal ordinal ``a`` to EP rank
+    ``a % num_ranks``, so consecutive slots land on consecutive ranks. Spacing a
+    token's slots by ``num_experts // topk`` instead leaves every rank whose
+    expert block is narrower than that spacing with zero tokens: at
+    ``num_experts=256, topk=8`` (spacing 32) and EP16 (blocks of 16) every odd
+    rank drew nothing for any batch under 32 tokens.
+    """
     if topk == 0:
         return torch.empty((num_tokens, 0), device=device, dtype=dtype)
 
-    step = max(num_experts // topk, 1)
     layer_offset = 0 if layer_id is None else layer_id
-    offsets = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(1)
-    steps = torch.arange(topk, device=device, dtype=dtype).unsqueeze(0) * step
-    return (offsets + layer_offset + steps) % num_experts
+    num_ranks = _balanced_routing_num_ranks(num_experts)
+    experts_per_rank = max(num_experts // num_ranks, 1)
+    tokens = torch.arange(num_tokens, device=device, dtype=dtype).unsqueeze(1)
+    slots = torch.arange(topk, device=device, dtype=dtype).unsqueeze(0)
+    deal = tokens * topk + slots + layer_offset
+    return (deal % num_ranks) * experts_per_rank + (
+        deal // num_ranks
+    ) % experts_per_rank
 
 
 # -------------------------------- TopK ---------------------------------------
