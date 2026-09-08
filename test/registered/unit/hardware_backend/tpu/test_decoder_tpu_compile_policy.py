@@ -135,11 +135,10 @@ class _SpecPolicyTestCase(_PolicyTestCase):
 def _model_runner(device="cpu"):
     """Minimal ModelRunner stand-in for unit tests.
 
-    ``prepare_forward_batch`` is included because ``_run_one`` calls it
-    before ``init_forward_metadata`` (mirrors the runtime chain installed
-    by ``DecoderTpuCompilePolicy.install()``).
-
-    get_input_embeddings sizes the EAGLE3 draft's mm_embeds warmup variant."""
+    prepare_forward_batch is included because _run_one calls it before
+    init_forward_metadata (mirrors the runtime chain installed by
+    DecoderTpuCompilePolicy.install()). get_input_embeddings sizes the EAGLE3
+    draft's mm_embeds warmup variant."""
     embed_tokens = torch.nn.Embedding(8, 4)
     return SimpleNamespace(
         device=device,

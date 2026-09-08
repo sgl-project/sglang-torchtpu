@@ -726,12 +726,14 @@ class CompiledForwardShim:
             and isinstance(forward_batch.spec_info, EagleDraftExtendInput)
             and forward_batch.forward_mode.is_extend()
         ):
+            # Local import: the eagle3 policy imports this module.
             from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
                 fold_last_token_embeds,
             )
 
             forward_batch.input_embeds = fold_last_token_embeds(
-                forward_batch, self.policy.model_runner.model.get_input_embeddings()
+                forward_batch=forward_batch,
+                embed_tokens=self.policy.model_runner.model.get_input_embeddings(),
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds

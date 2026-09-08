@@ -150,7 +150,7 @@ def _pad_eagle_draft_input(draft_input: EagleDraftInput, request_rows: int) -> i
 
 
 def fold_last_token_embeds(
-    forward_batch: ForwardBatch, embed_tokens: torch.nn.Embedding
+    *, forward_batch: ForwardBatch, embed_tokens: torch.nn.Embedding
 ) -> torch.Tensor:
     """Return the target's multimodal embeds with each appended next token embedded.
 
@@ -160,7 +160,7 @@ def fold_last_token_embeds(
     scheduler packs the batch, so no precompiled variant covers them.
 
     Returns:
-        [num_tokens, hidden_size] embeds, already padded to the token bucket.
+      [num_tokens, hidden_size] embeds, already padded to the token bucket.
     """
     # Padding zero-fills the ghost request slots, whose last index would be -1.
     real_b = getattr(forward_batch, _REAL_B_KEY, None)
@@ -981,6 +981,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: SpecInput | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        """Attach the target embeds a multimodal draft extend arrives with."""
         args, kwargs = super()._make_warmup_inputs(
             num_tokens=num_tokens,
             bs=bs,
