@@ -1941,6 +1941,8 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+# TPU hybrid DP x attention-TP: ranks with the same attention-TP index across DP groups.
+_ATTN_DP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -1971,6 +1973,12 @@ def get_attn_tp_group() -> GroupCoordinator:
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
     return _ATTN_TP
+
+
+def get_attn_dp_group() -> Optional[GroupCoordinator]:
+    """Cross-DP group of the ranks sharing this rank's attention-TP index (TPU
+    hybrid layouts only); None when not created."""
+    return _ATTN_DP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -2595,6 +2603,31 @@ def initialize_model_parallel(
             rank_offset=rank_offset,
             max_world_size=max_world_size,
         )
+    global _ATTN_DP
+    assert _ATTN_DP is None, "attention data parallel group is already initialized"
+    if _is_tpu and attn_dp_size > 1 and attn_tp_size > 1 and attn_cp_size == 1:
+        # One group per attention-TP index: its members hold the same shard of
+        # every DP group, so the DP MLP gather is an all-gather over dp_size
+        # ranks (slot order == dp order) instead of an all-reduce over all of TP.
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            for attn_tp_idx in range(attn_tp_size):
+                base = tp_group_idx * tensor_model_parallel_size + attn_tp_idx
+                group_ranks.append(
+                    [base + dp_idx * attn_tp_size for dp_idx in range(attn_dp_size)]
+                )
+        _ATTN_DP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
+            group_name="attention_dp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
 
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
@@ -2978,6 +3011,11 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
+
+    global _ATTN_DP
+    if _ATTN_DP:
+        _ATTN_DP.destroy()
+    _ATTN_DP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]

@@ -15,6 +15,7 @@ from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
     get_attn_cp_overlap_group,
+    get_attn_dp_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -528,6 +529,17 @@ def _dp_gather_tpu_all_reduce(
             f"dp gather: local contribution has {local_tokens.shape[0]} rows "
             f"but the global buffer slot holds {expected_rows}."
         )
+
+    col_group = get_attn_dp_group()
+    if col_group is not None:
+        # Hybrid DP x attention-TP: partial sums are reduced inside the attention
+        # group, then the dp_size slots are gathered across groups; each rank moves
+        # 1/dp of the buffer instead of all-reducing the whole buffer over all of TP.
+        contrib = (
+            get_attn_tp_group().all_reduce(local_tokens) if is_partial else local_tokens
+        )
+        col_group.all_gather_into_tensor(global_tokens, contrib.contiguous())
+        return
 
     idx = _dp_rank_slot_rows(num_rows=expected_rows, device=local_tokens.device)
     contrib = torch.zeros_like(global_tokens)
