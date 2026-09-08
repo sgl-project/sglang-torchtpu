@@ -38,3 +38,11 @@ def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
     if resources.graph_memory_pool is None:
         resources.graph_memory_pool = device_module.graph_pool_handle()
     return resources.graph_memory_pool
+
+
+def get_or_create_global_graph_capture_stream(device_module: Any) -> Any:
+    """Return the stream paired with the shared graph memory pool."""
+    resources = get_resources()
+    if resources.graph_capture_stream is None:
+        resources.graph_capture_stream = device_module.Stream()
+    return resources.graph_capture_stream

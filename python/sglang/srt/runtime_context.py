@@ -436,9 +436,10 @@ class Resources(_FlagGroupBase):
     semantics kept in the owning modules' accessors (which are thin shims
     over these slots)."""
 
-    # CUDA graph memory pool shared across the prefill and decode graph
-    # backends (created lazily by model_executor.runner_utils.pool).
+    # CUDA graph memory pool and capture stream shared across the prefill and
+    # decode graph backends (created lazily by model_executor.runner_utils.pool).
     graph_memory_pool: Any = None
+    graph_capture_stream: Any = None
     # EPLB: per-process recorder and the publish-once location metadata
     # (owning accessors live in sglang.srt.eplb).
     expert_distribution_recorder: Any = None

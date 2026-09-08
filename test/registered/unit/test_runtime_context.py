@@ -515,19 +515,25 @@ class TestResources(_IsolatedServerArgs):
     """ctx.resources: named slots for process-level resource handles with one
     reset lifecycle; owning accessors keep their creation/publish semantics."""
 
-    def test_graph_pool_lazy_create_and_reuse(self):
+    def test_graph_pool_resources_lazy_create_and_reuse(self):
         from types import SimpleNamespace
 
         from sglang.srt.model_executor.runner_utils.pool import (
             get_global_graph_memory_pool,
+            get_or_create_global_graph_capture_stream,
             get_or_create_global_graph_memory_pool,
         )
 
         reset_context()
         self.assertIsNone(get_global_graph_memory_pool())
-        dev = SimpleNamespace(graph_pool_handle=lambda: object())
+        dev = SimpleNamespace(
+            graph_pool_handle=lambda: object(),
+            Stream=lambda: object(),
+        )
         handle = get_or_create_global_graph_memory_pool(dev)
         self.assertIs(get_or_create_global_graph_memory_pool(dev), handle)
+        stream = get_or_create_global_graph_capture_stream(dev)
+        self.assertIs(get_or_create_global_graph_capture_stream(dev), stream)
 
     def test_expert_recorder_noop_default_and_injection(self):
         from sglang.srt.eplb.expert_distribution import (
