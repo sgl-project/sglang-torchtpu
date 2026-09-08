@@ -866,10 +866,16 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
+        # Under DP attention on TPU only the group that owns an image launches
+        # the encoder program, and a TPU program with a collective must be
+        # launched by every chip. Build the tower replicated (attention
+        # tp_size=1, no all-reduce) and let each rank of the group encode the
+        # group's images itself (no cross-rank image sharding either).
+        self.replicate_vision_tower = _is_tpu and is_dp_attention_enabled()
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
             config.vision_config,
-            use_data_parallel=self.use_data_parallel,
+            use_data_parallel=self.use_data_parallel or self.replicate_vision_tower,
             quant_config=(
                 quant_config if isinstance(quant_config, ModelSlimConfig) else None
             ),
@@ -926,8 +932,14 @@ class KimiK25ForConditionalGeneration(nn.Module):
                     Qwen3VLDecoderTpuCompilePolicy,
                 )
 
+                # Boundary = the language model INCLUDING its logits processor:
+                # under DP attention the eager logits collectives CHECK-fail or
+                # deadlock (see the text-only branch). The vision encoder and the
+                # embed merge stay eager in front; the VL policy warms both the
+                # positional input_ids convention (text prefill, decode) and the
+                # input_embeds keyword convention general_mm_embed_routine uses.
                 support_torch_compile(
-                    self.language_model.model,
+                    self.language_model,
                     policy=Qwen3VLDecoderTpuCompilePolicy,
                 )
 
@@ -1000,7 +1012,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 features, device=device, dtype=target_dtype
             )
 
-        if self.use_data_parallel:
+        if self.use_data_parallel and not self.replicate_vision_tower:
             image_embeds = run_dp_sharded_mrope_vision_model(
                 self.vision_tower,
                 None,
@@ -1087,17 +1099,32 @@ class KimiK25ForConditionalGeneration(nn.Module):
             or (
                 self.text_prefill_in_language_model
                 and not forward_batch.contains_mm_inputs()
+                # Under DP attention every rank must launch the same compiled
+                # program: a text-only or idle rank takes the input_embeds path
+                # whenever another rank's extend carries an image.
+                and not forward_batch.is_mm_extend_in_batch
             )
         ):
             # Decode (one new token per sequence, never an image) and text-only
             # prefill: let the language model embed inside its compiled graph.
+            # Positional: the compiled language model's text variants are warmed
+            # with (input_ids, positions, forward_batch); Dynamo guards on the
+            # call shape, so a keyword call here would miss every warmed graph.
             return self.language_model(
-                input_ids=input_ids,
-                positions=positions,
-                forward_batch=forward_batch,
+                input_ids,
+                positions,
+                forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
+        # The routine forwards extra kwargs to the (compiled) language model;
+        # an explicit pp_proxy_tensors=None is a different Dynamo call shape
+        # from the warmed one, so only pass it when set.
+        extra = (
+            {"pp_proxy_tensors": pp_proxy_tensors}
+            if pp_proxy_tensors is not None
+            else {}
+        )
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1106,7 +1133,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 Modality.IMAGE: self.get_image_feature,
             },
             positions=positions,
-            pp_proxy_tensors=pp_proxy_tensors,
+            **extra,
         )
 
         return hidden_states

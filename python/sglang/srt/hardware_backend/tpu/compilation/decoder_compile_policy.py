@@ -617,7 +617,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
 
-        return self.owner is self.model_runner.model and not bool(
+        runner_model = self.model_runner.model
+        # A multimodal wrapper compiles its language model (which owns the
+        # logits processor) rather than itself, so that owner counts too.
+        owns_logits = self.owner is runner_model or (
+            self.owner is getattr(runner_model, "language_model", None)
+        )
+        return owns_logits and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
 
@@ -1217,16 +1223,18 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         outer = getattr(self.model_runner, "model", None)
         is_multimodal = hasattr(outer, "get_image_feature")
         if is_multimodal and is_dp_attention_enabled():
-            # --no-enable-multimodal rejects image inputs upstream, so only the
-            # text calling convention (which the plain policy's DP support
-            # covers) can reach the decoder; the VL input_embeds path stays
-            # unreachable and unwarmed (see _uses_input_embeds).
             if not self._mm_serving_disabled():
-                raise NotImplementedError(
-                    "Qwen3-VL TPU decoder compilation does not support DP "
-                    "attention with multimodal serving enabled; relaunch with "
-                    "--no-enable-multimodal for text-only DP serving, or "
-                    "disable --enable-torch-compile."
+                # Image prefills embed eagerly and enter the compiled language
+                # model through the input_embeds convention. Every rank must
+                # launch the same compiled program, so on a step where any rank's
+                # extend carries an image (ScheduleBatch.is_mm_extend_in_batch,
+                # gathered in the MLP sync) the text-only and idle ranks take the
+                # input_embeds variant too; the shim pads it to the DP-agreed
+                # bucket like the positional variant.
+                logger.info(
+                    "[decoder compile policy] DP attention with multimodal "
+                    "serving: image steps use the padded input_embeds variant "
+                    "on every rank."
                 )
         return super().install()
 

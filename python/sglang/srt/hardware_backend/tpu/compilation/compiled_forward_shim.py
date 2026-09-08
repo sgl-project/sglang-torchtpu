@@ -731,6 +731,19 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        if not self._prompt_logprob_enabled:
+            # Per-request logprob start offsets only feed the eager input-logprob
+            # gather; left in place the graph guards on them (None for /generate,
+            # a list for chat requests) and a chat prefill recompiles at serve time.
+            saved.update(
+                _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
+            )
+        # Multimodal embeds ride LogitsMetadata -> LogitsProcessorOutput untouched;
+        # keep the tensor out of the graph's guards and re-attach it below.
+        mm_embeds = forward_batch.mm_input_embeds
+        if mm_embeds is not None:
+            saved["mm_input_embeds"] = mm_embeds
+            forward_batch.mm_input_embeds = None
         try:
             out = self.fn(input_ids, positions, forward_batch, *args, **kwargs)
             spec_info = forward_batch.spec_info
@@ -739,6 +752,13 @@ class CompiledForwardShim:
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+        if mm_embeds is not None:
+            real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+            if real_q is not None and mm_embeds.shape[0] > real_q:
+                mm_embeds = mm_embeds[:real_q]
+            forward_batch.mm_input_embeds = mm_embeds
+            if out.mm_input_embeds is None:
+                out.mm_input_embeds = mm_embeds
 
         # After the restore: LogitsMetadata.from_forward_batch branches on
         # capture_hidden_mode, so the gather must see the caller's value.

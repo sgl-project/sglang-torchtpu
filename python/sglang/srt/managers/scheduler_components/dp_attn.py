@@ -89,6 +89,7 @@ class MLPSyncBatchInfo:
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
     is_extend_in_batch: bool
+    is_mm_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
 
@@ -110,6 +111,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                int(self.is_mm_extend_in_batch),
             ],
             device=device,
             dtype=dtype,
@@ -125,6 +127,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # is_mm_extend_in_batch
             ],
             device=device,
             dtype=dtype,
@@ -196,6 +199,7 @@ class MLPSyncBatchInfo:
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.is_mm_extend_in_batch = bool(tp0_info_cpu[:, 7].max())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -219,12 +223,26 @@ def _update_gather_batch(
         )
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+        batch.is_mm_extend_in_batch = mlp_sync_info.is_mm_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+
+
+def _batch_has_mm_inputs(batch: ScheduleBatch) -> bool:
+    """Same predicate as ForwardBatch.contains_mm_inputs, on the schedule batch."""
+    return any(
+        mm is not None
+        and (
+            mm.contains_image_inputs()
+            or mm.contains_video_inputs()
+            or mm.contains_audio_inputs()
+        )
+        for mm in (batch.multimodal_inputs or ())
+    )
 
 
 def prepare_mlp_sync_batch_raw(
@@ -302,8 +320,12 @@ def prepare_mlp_sync_batch_raw(
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    # An extend carrying multimodal inputs takes the model's input_embeds path;
+    # gathered so every DP rank can take that same path (and compiled program).
+    is_mm_extend_in_batch = is_extend_in_batch and _batch_has_mm_inputs(local_batch)
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
+        local_batch.is_mm_extend_in_batch = is_mm_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
@@ -345,6 +367,7 @@ def prepare_mlp_sync_batch_raw(
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
         is_extend_in_batch=is_extend_in_batch,
+        is_mm_extend_in_batch=is_mm_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
     )
