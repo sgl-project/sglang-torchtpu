@@ -1007,7 +1007,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
         if not _is_tpu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -1080,6 +1080,13 @@ def eagle_sample(
             top_p_renorm_prob = top_p_renorm_prob_func
             tree_speculative_sampling_target_only = (
                 tree_speculative_sampling_target_only_func
+            )
+        elif _is_npu:
+            from sgl_kernel_npu.sample import (
+                chain_speculative_sampling_triton,
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
             )
         else:
             from sgl_kernel import (
