@@ -767,7 +767,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if pp_group is not None and not pp_group.is_last_rank:
             # Only the final pipeline stage runs the logits processor.
             return False
-        return self.owner is self.model_runner.model and not bool(
+        runner_model = self.model_runner.model
+        # A multimodal wrapper compiles its language model (which owns the
+        # logits processor) rather than itself, so that owner counts too.
+        owns_logits = self.owner is runner_model or (
+            self.owner is getattr(runner_model, "language_model", None)
+        )
+        return owns_logits and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
 
@@ -1467,18 +1473,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
     def install(self) -> bool:
-        # This policy is attached to the shared backbone (`Qwen3_5ForCausalLM`),
-        # not to a wrapper, so the TEXT-ONLY entry (`Qwen3_5TextForCausalLM`)
-        # gets it too. It only diverges from the plain decoder policy on the VL
-        # input_embeds path, so the DP restriction -- which is a property of that
-        # path -- must be gated the same way. Raising unconditionally blocked DP
-        # attention for text-only serving, where none of the VL machinery runs.
         outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        if is_multimodal and is_dp_attention_enabled():
-            raise NotImplementedError(
-                "Qwen3-VL TPU decoder compilation does not support DP attention; "
-                "disable --enable-torch-compile for this configuration."
+        if hasattr(outer, "get_image_feature") and is_dp_attention_enabled():
+            # Under DP attention every rank launches the same program: on a
+            # step where any rank's extend carries an image, all ranks take
+            # the padded input_embeds variant (ScheduleBatch.is_tpu_mm_extend_in_batch).
+            logger.info(
+                "[decoder compile policy] DP attention with multimodal "
+                "serving: image steps use the padded input_embeds variant "
+                "on every rank."
             )
         return super().install()
 

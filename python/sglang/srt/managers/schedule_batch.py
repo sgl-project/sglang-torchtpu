@@ -2470,6 +2470,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For DP attention
     is_extend_in_batch: bool = False
+    # Some DP rank's extend carries multimodal inputs (gathered in the MLP sync).
+    is_tpu_mm_extend_in_batch: bool = False
     can_run_decode_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
@@ -3842,6 +3844,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
             is_extend_in_batch=self.is_extend_in_batch,
+            is_tpu_mm_extend_in_batch=self.is_tpu_mm_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

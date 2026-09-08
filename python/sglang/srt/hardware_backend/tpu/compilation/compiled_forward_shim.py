@@ -974,6 +974,19 @@ class CompiledForwardShim:
                 forward_batch.seq_lens.shape[0]
             )
         saved.update(_pin_fields(forward_batch, _PINNED_LOGPROB_FIELDS))
+        if not self._prompt_logprob_enabled and hasattr(
+            forward_batch, "extend_logprob_start_lens_cpu"
+        ):
+            # Only the eager input-logprob gather reads these; left in place the
+            # graph guards on them (None vs a list) and a chat prefill recompiles.
+            saved.update(
+                _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
+            )
+        # Keep the multimodal embeds out of the graph's guards; re-attached below.
+        mm_embeds = getattr(forward_batch, "mm_input_embeds", None)
+        if mm_embeds is not None:
+            saved["mm_input_embeds"] = mm_embeds
+            forward_batch.mm_input_embeds = None
         try:
             out = fn(input_ids, positions, forward_batch, *args, **kwargs)
             if isinstance(out, PendingCall):
@@ -993,13 +1006,21 @@ class CompiledForwardShim:
         finally:
             forward_batch.is_prefill_only = orig_prefill_only
             _restore_fields(forward_batch, saved)
+        if mm_embeds is not None:
+            real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+            if real_q is not None and mm_embeds.shape[0] > real_q:
+                mm_embeds = mm_embeds[:real_q]
+            forward_batch.mm_input_embeds = mm_embeds
+
+        def finish(result: Any) -> Any:
+            # Re-attach the embeds the graph did not see; the async path lands here too.
+            if mm_embeds is not None and result.mm_input_embeds is None:
+                result.mm_input_embeds = mm_embeds
+            return self._finish_forward(result, forward_batch, wants_input_logprob)
+
         if isinstance(out, PendingCall):
-            return out.then(
-                lambda result: self._finish_forward(
-                    result, forward_batch, wants_input_logprob
-                )
-            )
-        return self._finish_forward(out, forward_batch, wants_input_logprob)
+            return out.then(finish)
+        return finish(out)
 
     def _finalize_forward(self, out: Any, forward_batch: Any) -> Any:
         spec_info = forward_batch.spec_info
