@@ -27,6 +27,7 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
 )
 from sglang_tpu.disaggregation.raiden.pipeline_final_chunks import FinalChunks
 from sglang_tpu.disaggregation.raiden.pp_common import (
+    _BLOCK_MAJOR_KV_RANK,
     _HEAD_MAJOR_KV_RANK,
     _kv_rank,
     _new_transfer_state,
@@ -58,7 +59,11 @@ _EARLY_COMPLETION = "Only an empty producer registration may complete before"
 
 
 def pool_manifest(groups: Any) -> list[dict]:
-    """Name each local full-attention or sliding-window tensor by model layer."""
+    """Name each local full-attention or sliding-window tensor by model layer.
+
+    A block-major bundle is one pool whose block is the whole row,
+    ``<kind>.l<first>+<count>``; it pairs only with a bundle of the same layers.
+    """
     pools = []
     for kind, tensors, layer_ids, num_draft in (
         ("fa", groups.full, groups.full_layer_ids, groups.num_draft_full),
@@ -70,11 +75,13 @@ def pool_manifest(groups: Any) -> list[dict]:
         for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
             # Draft layer IDs restart at 0, so they need their own namespace.
             tag_kind = kind if index < num_target else f"draft.{kind}"
-            _kv_rank(tensor)
+            tag = f"{tag_kind}.l{int(layer)}"
+            if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+                tag += f"+{int(tensor.shape[1])}"
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
             pools.append(
                 dict(
-                    tag=f"{tag_kind}.l{int(layer)}",
+                    tag=tag,
                     storage_index=len(pools),
                     base_offset_bytes=0,
                     block_stride_bytes=size,
@@ -133,6 +140,10 @@ def layout_fingerprint(pools: Sequence[dict], tensors: Sequence[Any], getter) ->
             # Axis 1, the per-rank 2 * kv_heads, is left out.
             schema = "sglang-rpa-seq-kv-v1"
             page_shape = [int(tensor.shape[2]), int(tensor.shape[3])]
+        elif _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+            # Axis 1, the layer count, differs between stages; the tag carries it.
+            schema = "sglang-block-major-kv-v1"
+            page_shape = [int(n) for n in tensor.shape[2:]]
         else:
             page_shape = [
                 int(tensor.shape[1]),
@@ -1207,7 +1218,8 @@ class PipelineTransfer:
                 return
             if mgr.pp_size > 1 and set(meta["pool_tags"]) != set(self._pool_tags()):
                 raise ValueError(
-                    "Matching pipelines must own the same layers per stage"
+                    "Matching pipelines must own the same layers per stage, "
+                    "in the same KV layout (SGLANG_TPU_USE_BLOCK_MAJOR_KV)"
                 )
             if meta.get("part") is None:
                 pp_swa.check_agreement(self, meta)

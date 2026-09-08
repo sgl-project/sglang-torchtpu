@@ -19,15 +19,19 @@ from sglang_tpu.disaggregation.raiden.reshard_schedule import (
 #   rank 4, the RPA-seq pool: [num_blocks, 2 * kv_heads, head_dim_lanes, page_size]
 # The rank-4 pool keeps each head's K and V rows adjacent and puts the token
 # index on the lane axis, so one kv-head is a single contiguous run of a page.
+# A block-major bundle (rank 6) holds every layer of a page in one row:
+#   [num_blocks, layer_num, page_size, kv_heads_packed, kv_packing, head_dim]
 _FUSED_KV_RANK = 5
 _HEAD_MAJOR_KV_RANK = 4
+_BLOCK_MAJOR_KV_RANK = 6
 
 
 def _kv_rank(tensor) -> int:
     rank = len(tensor.shape)
-    if rank not in (_FUSED_KV_RANK, _HEAD_MAJOR_KV_RANK):
+    if rank not in (_FUSED_KV_RANK, _HEAD_MAJOR_KV_RANK, _BLOCK_MAJOR_KV_RANK):
         raise ValueError(
-            "Raiden pipeline transfer requires rank-5 fused or rank-4 RPA-seq KV"
+            "Raiden pipeline transfer requires rank-5 fused or rank-4 RPA-seq KV, "
+            "or a rank-6 block-major bundle"
         )
     return rank
 
@@ -84,6 +88,11 @@ def head_slice_spans(
     result = []
     for pool, tensor in zip(pools, tensors):
         blocks = swa if is_swa_pool(pool["tag"]) else full
+        if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
+            raise ValueError(
+                "A block-major KV bundle moves whole page rows; a "
+                "tensor-parallel consumer needs per-layer KV pools"
+            )
         if _kv_rank(tensor) == _HEAD_MAJOR_KV_RANK:
             result.append(
                 _head_major_slice_spans(

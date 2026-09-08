@@ -632,6 +632,73 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         blocks_frames = self.inboxes[decode.endpoint].take(MessageTag.BLOCKS)
         return prefill, decode, chunk_frames, blocks_frames
 
+    def _assert_layout_refused(self, decode, room):
+        self.assertIn(room, decode._aborted)
+        self.assertEqual(decode.request_status[room], KVPoll.Failed)
+        reason = decode.failure_records[room]
+        for text in ("SGLANG_TPU_USE_BLOCK_MAJOR_KV", "block-major", "per-layer"):
+            self.assertIn(text, reason)
+
+    def test_blocks_from_a_peer_in_the_other_kv_layout_fail_the_room(self):
+        """Peers in different KV layouts register rows of different sizes, so
+        the decode refuses the prefill's blocks instead of reading them; peers
+        in the same layout proceed."""
+        for prefill_layout, decode_layout, refused in (
+            ("block-major", "per-layer", True),
+            ("block-major", "block-major", False),
+        ):
+            with self.subTest(prefill=prefill_layout, decode=decode_layout):
+                prefill, decode = self._prefill(), self._decode()
+                prefill.kv_layout, decode.kv_layout = prefill_layout, decode_layout
+                room = 7210
+                decode.request_status[room] = KVPoll.WaitingForInput
+                decode.register_decode_request(
+                    room,
+                    [1, 2, 3],
+                    [],
+                    aux_index=None,
+                    bootstrap_infos=self._bootstrap_info(prefill),
+                )
+                prefill._on_pull_req(
+                    self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ)
+                )
+                prefill.append_send_blocks(room, [31, 32, 33])
+                prefill.finalize_send(room, aux_index=None)
+
+                decode._on_blocks(self.inboxes[decode.endpoint].take(MessageTag.BLOCKS))
+
+                if refused:
+                    self._assert_layout_refused(decode, room)
+                    self.assertNotIn(room, decode._decode.remote_blocks)
+                else:
+                    self.assertEqual(decode._decode.remote_blocks[room], [31, 32, 33])
+                    self.assertNotIn(room, decode._aborted)
+
+    def test_chunk_from_a_peer_in_the_other_kv_layout_starts_no_read(self):
+        """A chunked transfer announces pages before BLOCKS, so the layout is
+        checked on the first CHUNK, before any read is queued."""
+        room = 7211
+        prefill, decode = self._prefill(), self._decode()
+        prefill.kv_layout = "block-major"
+        decode.chunked_transfer = True
+        decode.request_status[room] = KVPoll.WaitingForInput
+        decode.register_decode_request(
+            room,
+            [101, 102, 103, 104],
+            [],
+            aux_index=None,
+            bootstrap_infos=self._bootstrap_info(prefill),
+        )
+        prefill._on_pull_req(self.inboxes[prefill.endpoint].take(MessageTag.PULL_REQ))
+        prefill.append_send_blocks(room, [11, 12])
+        prefill._announce_chunk(room, 0, [11, 12], total_pages=4)
+
+        decode._dispatch(self.inboxes[decode.endpoint].take(MessageTag.CHUNK))
+
+        self._assert_layout_refused(decode, room)
+        self.assertEqual(decode._decode.chunk_queue.get(room, []), [])
+        self.assertEqual(decode._engine.started, [])
+
     def test_duplicate_chunk_is_queued_once(self):
         """A CHUNK delivered twice must queue one read, not a second pull of
         the same pages."""
@@ -959,6 +1026,70 @@ class TestRaidenStateEngine(RaidenRendezvousTestCase):
         self.assertEqual(m.raiden_endpoint, "127.0.0.1:32006")
         self.assertEqual(m.swa_raiden_endpoint, "127.0.0.1:32008")
         self.assertEqual(m.state_raiden_endpoint, "127.0.0.1:32010")
+
+
+class TestRaidenBlockMajorEngine(RaidenRendezvousTestCase):
+    """A block-major pool hands each engine one bundle, staged at the per-layer price."""
+
+    @staticmethod
+    def _pool(pool_cls):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        return SWAKVPool(
+            size=32,
+            size_swa=16,
+            page_size=4,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=128,
+            swa_attention_layer_ids=[0, 2, 4],
+            full_attention_layer_ids=[1, 3, 5],
+            device="cpu",
+            token_to_kv_pool_class=pool_cls,
+        )
+
+    def test_each_engine_registers_one_bundle(self):
+        from sglang_tpu.disaggregation.raiden.host_pool import slot_host_bytes
+        from sglang_tpu.kv_pool import (
+            TpuBlockMajorMHATokenToKVPool,
+            TpuFusedMHATokenToKVPool,
+        )
+
+        pool = self._pool(TpuBlockMajorMHATokenToKVPool)
+        bundles = get_raiden_kv_caches(pool)
+        layers = get_raiden_kv_caches(self._pool(TpuFusedMHATokenToKVPool))
+        m = self._prefill()
+        built = []
+
+        class Engine:
+            def __init__(self, **kwargs):
+                built.append(kwargs)
+
+        m._engine = None
+        m._max_request_blocks = lambda: 8
+        m._swa_max_request_blocks = lambda: 2
+        m._num_slots = lambda kv_caches, max_blocks, engines=1, **_: 10
+        with (
+            patch.dict(sys.modules, _fake_tpu_sync(Engine)),
+            self.assertLogs("sglang_tpu.disaggregation.raiden.conn", "INFO") as logs,
+        ):
+            m.set_kv_caches(bundles)
+
+        self.assertTrue(m.chunked_transfer)
+        engine_lines = [line for line in logs.output if "engine up" in line]
+        self.assertEqual(len(engine_lines), 2)
+        self.assertTrue(all("kv_tensors=1 " in line for line in engine_lines))
+        self.assertEqual([len(kw["kv_caches"]) for kw in built], [1, 1])
+        self.assertIs(built[0]["kv_caches"][0], pool.full_kv_pool.kv_bundle)
+        self.assertIs(built[1]["kv_caches"][0], pool.swa_kv_pool.kv_bundle)
+        for bundle, per_layer, max_blocks in (
+            (bundles.full, layers.full, 8),
+            (bundles.swa, layers.swa, 2),
+        ):
+            self.assertEqual(
+                slot_host_bytes(bundle, max_blocks),
+                slot_host_bytes(per_layer, max_blocks),
+            )
 
 
 class TestRaidenStateGroups(CustomTestCase):
