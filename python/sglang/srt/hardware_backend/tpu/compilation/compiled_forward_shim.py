@@ -542,9 +542,9 @@ def _restore_forward_batch_inputs(forward_batch: Any, real_q: int, real_b: int) 
 
     for field in _BS_CPU_LIST_FIELDS:
         value = getattr(forward_batch, field, None)
-        if isinstance(value, torch.Tensor) and value.shape[0] > real_b:
-            setattr(forward_batch, field, value[:real_b])
-        elif isinstance(value, list) and len(value) > real_b:
+        if (isinstance(value, torch.Tensor) and value.shape[0] > real_b) or (
+            isinstance(value, list) and len(value) > real_b
+        ):
             setattr(forward_batch, field, value[:real_b])
 
     mm_inputs = getattr(forward_batch, "mm_inputs", None)
