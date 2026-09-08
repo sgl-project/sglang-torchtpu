@@ -533,7 +533,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         worker.server_args = _fake_server_args()
         worker.draft_runner = SimpleNamespace(
-            attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            compile_policy=NoopCompilePolicy(),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -557,7 +559,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
         worker.draft_runner = SimpleNamespace(
-            attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+            compile_policy=NoopCompilePolicy(),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
