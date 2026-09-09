@@ -8,7 +8,10 @@ Run: python -m pytest test/manual/kv_transfer/test_raiden_chunk_plan.py
 
 import unittest
 
-from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
+from sglang.srt.disaggregation.raiden.chunk_plan import (
+    chunk_pull_window,
+    whole_pull_registration,
+)
 
 
 def _pair(chunks, total, local_pages):
@@ -88,6 +91,34 @@ class TestEquivalenceWithSingleShot(unittest.TestCase):
     def test_matches_for_a_single_chunk(self):
         self._check([64], 64, 64)
         self._check([64], 64, 40)
+
+
+class TestWholePullRegistration(unittest.TestCase):
+    """Verifies that producer registration matches the tail pages read by decode."""
+
+    BLOCKS = list(range(1000, 1064))
+
+    def test_no_hit_registers_everything(self):
+        self.assertEqual(whole_pull_registration(self.BLOCKS, 64), self.BLOCKS)
+
+    def test_reserved_decode_page_registers_everything(self):
+        self.assertEqual(whole_pull_registration(self.BLOCKS, 65), self.BLOCKS)
+
+    def test_decode_prefix_hit_registers_the_tail(self):
+        self.assertEqual(whole_pull_registration(self.BLOCKS, 40), self.BLOCKS[-40:])
+
+    def test_full_prefix_hit_registers_nothing(self):
+        self.assertEqual(whole_pull_registration(self.BLOCKS, 0), [])
+        self.assertEqual(whole_pull_registration([], 0), [])
+
+    def test_matches_the_single_shot_pairing(self):
+        for local_pages in (0, 1, 40, 63, 64, 65):
+            remote, _ = _whole(len(self.BLOCKS), local_pages)
+            self.assertEqual(
+                whole_pull_registration(self.BLOCKS, local_pages),
+                remote,
+                f"local_pages={local_pages}",
+            )
 
 
 if __name__ == "__main__":

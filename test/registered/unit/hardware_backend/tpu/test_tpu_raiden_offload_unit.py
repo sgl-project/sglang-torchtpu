@@ -27,6 +27,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+import zmq
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
@@ -355,6 +356,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr._send_reads = {}
                 mgr._send_aux = {}
                 mgr._decode_addr = {}
+                mgr._decode_pages = {room: len(blocks)}
+                mgr._decode_swa_pages = {room: 0}
                 mgr._replied = set()
                 mgr._reshard_req = {}
                 mgr._reshard_finalized = set()
@@ -413,6 +416,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._send_swa_blocks = {}
         mgr._send_aux = {}
         mgr._decode_addr = {}
+        mgr._decode_pages = {room: len(full_blocks)}
+        mgr._decode_swa_pages = {room: len(swa_blocks)}
         mgr._replied = set()
         mgr._reshard_req = {}
         mgr._reshard_finalized = set()
@@ -951,6 +956,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._send_total = {}
         mgr._decode_addr = {}
         mgr._decode_pages = {}
+        mgr._decode_swa_pages = {}
         mgr._send_blocks = {}
         mgr._read_leases = {}
         mgr._replied = set()
@@ -1657,6 +1663,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._held_chunks = {}
         mgr._decode_addr = {}
         mgr._decode_pages = {}
+        mgr._decode_swa_pages = {}
         mgr._chunk_seq = {}
         mgr._uuid_seq = 0
         mgr._reshard_req = {}
@@ -2358,6 +2365,213 @@ class TestCombinedFutureEvent(CustomTestCase):
         self.assertFalse(ev.query())
         self.assertTrue(ev.query())
         ev.synchronize()  # must not block once all are ready
+
+
+class TestDecodeRadixPullRegistration(CustomTestCase):
+    """Tests trimmed producer registration and zero-read completion on full hits."""
+
+    ROOM = 41
+    BLOCKS = [3, 9, 12, 20]
+    SWA_BLOCKS = [5, 6, 7]
+
+    def _make_producer(self, decode_pages):
+        mgr = object.__new__(RaidenKVManager)
+        mgr.attn_tp_rank = 0
+        mgr._state_lock = threading.Lock()
+        mgr._announce_lock = threading.Lock()
+        mgr._aborted = {}
+        mgr._send_reads = {}
+        mgr._send_blocks = {self.ROOM: list(self.BLOCKS)}
+        mgr._send_swa_blocks = {}
+        mgr._send_aux = {self.ROOM: b"aux"}
+        mgr._decode_addr = {self.ROOM: ("127.0.0.1", 31002)}
+        mgr._decode_pages = {self.ROOM: decode_pages}
+        mgr._decode_swa_pages = {self.ROOM: 0}
+        mgr._replied = set()
+        mgr._reshard_req = {}
+        mgr._reshard_finalized = {self.ROOM}
+        mgr._completed_send = set()
+        mgr._failed = set()
+        mgr.record_failure = Mock()
+        mgr.update_status = Mock()
+        mgr._engine = Mock()
+        mgr._swa_engine = None
+        mgr._swa_kv_caches = []
+        mgr.raiden_endpoint = "127.0.0.1:31020"
+        mgr.swa_raiden_endpoint = None
+        socket = Mock()
+        mgr._socket_send_locks = defaultdict(threading.Lock)
+        mgr._socket_lock = threading.Lock()
+        mgr._socket_cache = {}
+        mgr._connect = Mock(
+            side_effect=lambda ep, is_ipv6=False: mgr._socket_cache.setdefault(
+                ep, socket
+            )
+        )
+        return mgr, socket
+
+    def _make_receiver(self, local_blocks):
+        mgr = object.__new__(RaidenKVManager)
+        mgr.chunked_transfer = False
+        mgr._state_lock = threading.Lock()
+        mgr._status_lock = threading.Lock()
+        mgr._aborted = {}
+        mgr._send_reads = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.request_status = {}
+        mgr._engine = Mock()
+        mgr._swa_engine = None
+        mgr._pulling = StagingAdmission(128, 8)
+        mgr._pulling_cleared = set()
+        mgr._dynamic_host_staging = True
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
+        mgr._full_engine_max_blocks = 128
+        mgr._completed_recv = set()
+        mgr._failed = set()
+        mgr._native_failed = set()
+        mgr._local_blocks = {self.ROOM: list(local_blocks)}
+        mgr._local_swa_blocks = {}
+        mgr._remote_blocks = {self.ROOM: list(self.BLOCKS)}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_endpoint = {self.ROOM: "127.0.0.1:31020"}
+        mgr._remote_swa_endpoint = {}
+        return mgr
+
+    def test_partial_hit_registers_the_tail_but_announces_everything(self):
+        mgr, socket = self._make_producer(decode_pages=2)
+        mgr._maybe_reply(self.ROOM)
+        mgr._engine.register_read.assert_called_once_with(
+            str(self.ROOM), self.ROOM, self.BLOCKS[-2:]
+        )
+        payload = socket.send_multipart.call_args.args[0]
+        self.assertEqual(Blocks.from_frames(payload).blocks, self.BLOCKS)
+        # Ensure send does not complete while a read is pending an engine ACK.
+        self.assertFalse(mgr.is_send_done(self.ROOM))
+
+    def test_full_hit_sends_blocks_and_completes_without_a_registration(self):
+        mgr, socket = self._make_producer(decode_pages=0)
+        mgr._maybe_reply(self.ROOM)
+        mgr._engine.register_read.assert_not_called()
+        reply = Blocks.from_frames(socket.send_multipart.call_args.args[0])
+        self.assertEqual(reply.blocks, self.BLOCKS)
+        self.assertEqual(reply.aux_blob, b"aux")
+        self.assertTrue(mgr.is_send_done(self.ROOM))
+        self.assertFalse(mgr.is_failed(self.ROOM))
+
+    def test_full_hit_send_failure_fails_the_room_instead_of_completing(self):
+        mgr, socket = self._make_producer(decode_pages=0)
+        socket.send_multipart.side_effect = zmq.ZMQError(zmq.EHOSTUNREACH)
+        mgr._maybe_reply(self.ROOM)
+        self.assertFalse(mgr.is_send_done(self.ROOM))
+        self.assertTrue(mgr.is_failed(self.ROOM))
+
+    def test_blocks_send_failure_fails_the_room(self):
+        mgr, socket = self._make_producer(decode_pages=len(self.BLOCKS))
+        socket.send_multipart.side_effect = zmq.ZMQError(zmq.EHOSTUNREACH)
+        mgr._maybe_reply(self.ROOM)
+        self.assertFalse(mgr.is_send_done(self.ROOM))
+        self.assertTrue(mgr.is_failed(self.ROOM))
+
+    def test_receiver_full_hit_completes_without_a_read(self):
+        mgr = self._make_receiver(local_blocks=[])
+        self.assertTrue(mgr.maybe_start_pull(self.ROOM))
+        mgr._engine.start_read.assert_not_called()
+        self.assertTrue(mgr.is_recv_done(self.ROOM))
+        self.assertFalse(mgr.is_failed(self.ROOM))
+
+    def test_receiver_partial_hit_still_reads_the_tail(self):
+        mgr = self._make_receiver(local_blocks=[8, 9])
+        self.assertTrue(mgr.maybe_start_pull(self.ROOM))
+        mgr._engine.start_read.assert_called_once_with(
+            str(self.ROOM), self.ROOM, "127.0.0.1:31020", self.BLOCKS[-2:], [8, 9]
+        )
+        self.assertFalse(mgr.is_recv_done(self.ROOM))
+
+    def _add_swa_producer(self, mgr):
+        mgr._swa_engine = Mock()
+        mgr._send_swa_blocks = {self.ROOM: list(self.SWA_BLOCKS)}
+        mgr._decode_swa_pages = {self.ROOM: len(self.SWA_BLOCKS)}
+        mgr.swa_raiden_endpoint = "127.0.0.1:31022"
+
+    def test_swa_partial_hit_trims_the_window_registration(self):
+        mgr, _ = self._make_producer(decode_pages=2)
+        self._add_swa_producer(mgr)
+        mgr._decode_swa_pages = {self.ROOM: 1}
+        mgr._maybe_reply(self.ROOM)
+        mgr._engine.register_read.assert_called_once_with(
+            str(self.ROOM), self.ROOM, self.BLOCKS[-2:]
+        )
+        mgr._swa_engine.register_read.assert_called_once_with(
+            f"swa:{self.ROOM}", self.ROOM, self.SWA_BLOCKS[-1:]
+        )
+        self.assertFalse(mgr.is_send_done(self.ROOM))
+
+    def test_swa_full_hit_completes_both_engines_without_registration(self):
+        mgr, socket = self._make_producer(decode_pages=0)
+        self._add_swa_producer(mgr)
+        mgr._decode_swa_pages = {self.ROOM: 0}
+        mgr._maybe_reply(self.ROOM)
+        mgr._engine.register_read.assert_not_called()
+        mgr._swa_engine.register_read.assert_not_called()
+        reply = Blocks.from_frames(socket.send_multipart.call_args.args[0])
+        self.assertEqual(reply.swa_blocks, self.SWA_BLOCKS)
+        self.assertTrue(mgr.is_send_done(self.ROOM))
+        self.assertFalse(mgr.is_failed(self.ROOM))
+
+    def test_full_hit_skips_the_window_registration_even_untrimmed(self):
+        # Full-attention full hits issue no network reads. Suppress window
+        # registrations regardless of window page counts to avoid orphaned leases.
+        mgr, _ = self._make_producer(decode_pages=0)
+        self._add_swa_producer(mgr)
+        mgr._decode_swa_pages = {self.ROOM: len(self.SWA_BLOCKS)}
+        mgr._maybe_reply(self.ROOM)
+        mgr._swa_engine.register_read.assert_not_called()
+        self.assertTrue(mgr.is_send_done(self.ROOM))
+
+    def test_pull_req_carries_the_window_page_count(self):
+        # A PULL_REQ without the window count is a decode without a window
+        # pool; the sender then registers no window blocks.
+        mgr, _ = self._make_producer(decode_pages=len(self.BLOCKS))
+        mgr._held_chunks = {}
+        mgr._send_total = {}
+        mgr._on_pull_req(PullReq(self.ROOM, "127.0.0.1", 31002, 2).to_frames())
+        self.assertEqual(mgr._decode_pages[self.ROOM], 2)
+        self.assertEqual(mgr._decode_swa_pages[self.ROOM], 0)
+        mgr._replied = set()
+        mgr._on_pull_req(
+            PullReq(self.ROOM, "127.0.0.1", 31002, 2, decode_swa_pages=1).to_frames()
+        )
+        self.assertEqual(mgr._decode_swa_pages[self.ROOM], 1)
+
+    def _add_swa_receiver(self, mgr):
+        mgr._swa_engine = Mock()
+        mgr._swa_engine_max_blocks = 8
+        mgr._local_swa_blocks = {self.ROOM: []}
+        mgr._remote_swa_blocks = {self.ROOM: list(self.SWA_BLOCKS)}
+        mgr._remote_swa_endpoint = {self.ROOM: "127.0.0.1:31022"}
+
+    def test_receiver_swa_full_hit_settles_the_window_key_too(self):
+        mgr = self._make_receiver(local_blocks=[])
+        self._add_swa_receiver(mgr)
+        self.assertTrue(mgr.maybe_start_pull(self.ROOM))
+        mgr._engine.start_read.assert_not_called()
+        mgr._swa_engine.start_read.assert_not_called()
+        self.assertTrue(mgr.is_recv_done(self.ROOM))
+
+    def test_receiver_swa_partial_hit_reads_both_tails(self):
+        mgr = self._make_receiver(local_blocks=[8, 9])
+        self._add_swa_receiver(mgr)
+        mgr._local_swa_blocks = {self.ROOM: [2]}
+        self.assertTrue(mgr.maybe_start_pull(self.ROOM))
+        mgr._engine.start_read.assert_called_once_with(
+            str(self.ROOM), self.ROOM, "127.0.0.1:31020", self.BLOCKS[-2:], [8, 9]
+        )
+        mgr._swa_engine.start_read.assert_called_once_with(
+            f"swa:{self.ROOM}", self.ROOM, "127.0.0.1:31022", self.SWA_BLOCKS[-1:], [2]
+        )
+        self.assertFalse(mgr.is_recv_done(self.ROOM))
 
 
 if __name__ == "__main__":

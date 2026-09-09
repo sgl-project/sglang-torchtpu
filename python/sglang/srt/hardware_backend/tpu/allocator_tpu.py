@@ -211,3 +211,12 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             free_index = free_index.cpu()
         free_index = free_index.to(dtype=torch.int32)
         super().free(free_index)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
+        # Radix-cache node values are int64. Normalize to host-resident int32 so
+        # torch.cat does not promote the release pool, keeping the free pages
+        # int32 for subsequent decode assignments.
+        if free_index.device.type != "cpu":
+            free_index = free_index.cpu()
+        free_index = free_index.to(dtype=torch.int32)
+        super().free_segment(free_index, start_pos=start_pos)

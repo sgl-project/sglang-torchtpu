@@ -77,6 +77,7 @@ def _prefill_manager():
     mgr._reshard_finalized = set()
     mgr._reshard_req = {}
     mgr._decode_pages = {}
+    mgr._decode_swa_pages = {}
     mgr._send_total = {}
     mgr._chunk_seq = {}
     mgr._uuid_seq = 0
@@ -156,8 +157,10 @@ class TestHandshakeEndpoints(CustomTestCase):
         mgr._send_blocks[ROOM] = [1, 2, 3]
         mgr._send_aux[ROOM] = b""
         mgr._reshard_finalized.add(ROOM)
-        # As stored by _on_pull_req from the PULL_REQ ip/port frames.
+        # As stored by _on_pull_req from the PULL_REQ frames.
         mgr._decode_addr[ROOM] = (V6_DECODE, 5555)
+        mgr._decode_pages[ROOM] = 3
+        mgr._decode_swa_pages[ROOM] = 0
         mgr.request_status[ROOM] = KVPoll.Transferring
         mgr._register_sender_read = Mock()
         mgr._send_multipart_locked = Mock()

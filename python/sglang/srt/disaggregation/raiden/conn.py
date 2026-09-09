@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -42,7 +43,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
-from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
+from sglang.srt.disaggregation.raiden.chunk_plan import (
+    chunk_pull_window,
+    whole_pull_registration,
+)
 from sglang.srt.disaggregation.raiden.host_pool import (
     StagingAdmission,
     node_worker_rank,
@@ -297,6 +301,9 @@ class RaidenKVManager(CommonKVManager):
             # Pages the decode allocated for the room, so a chunk it already
             # holds is never registered or announced.
             self._decode_pages: Dict[int, int] = {}
+            # Window pages allocated by the decode node, used to restrict
+            # sender registrations.
+            self._decode_swa_pages: Dict[int, int] = {}
             # Chunks announced to a resharding decode, by chunk index, until it
             # asks for their push; how far its announcements reach; and the
             # pushes still running, so the room counts as sent only after the
@@ -820,11 +827,13 @@ class RaidenKVManager(CommonKVManager):
         decode_ip = req.decode_ip
         decode_port = req.decode_port
         decode_pages = req.decode_pages
+        decode_swa_pages = req.decode_swa_pages
         with self._state_lock:
             if room in self._aborted:
                 return
             self._decode_addr[room] = (decode_ip, decode_port)
             self._decode_pages[room] = decode_pages
+            self._decode_swa_pages[room] = decode_swa_pages
             held = self._held_chunks.pop(room, [])
             total_pages = self._send_total.get(room, 0)
         for start, block_ids in held:
@@ -1269,15 +1278,30 @@ class RaidenKVManager(CommonKVManager):
             blocks = list(self._send_blocks[room])
             addr = self._decode_addr[room]
             aux_blob = self._send_aux.get(room, b"")
+            decode_pages = self._decode_pages[room]
+            decode_swa_pages = self._decode_swa_pages[room]
             self._replied.add(room)
+        # Register only the suffix requested by the decode node to prevent
+        # unread blocks from leaking leases until deadline timeout.
+        read_blocks = whole_pull_registration(blocks, decode_pages)
+        swa_read_blocks = whole_pull_registration(swa_blocks, decode_swa_pages)
+        # Decode reads both engines concurrently or neither; suppress window
+        # registrations on full hits to prevent orphaned leases.
+        if not read_blocks:
+            swa_read_blocks = []
         with self._announce_lock:
-            if self._swa_engine is not None:
+            if self._swa_engine is not None and swa_read_blocks:
                 self._register_sender_read(
-                    room, self._swa_engine, self._swa_req_id(room), room, swa_blocks
+                    room,
+                    self._swa_engine,
+                    self._swa_req_id(room),
+                    room,
+                    swa_read_blocks,
                 )
-            self._register_sender_read(
-                room, self._ensure_engine(), str(room), room, blocks
-            )
+            if read_blocks:
+                self._register_sender_read(
+                    room, self._ensure_engine(), str(room), room, read_blocks
+                )
             with self._state_lock:
                 # The room can fail while its reads register; the decode is
                 # gone and its own handlers drop frames for the room.
@@ -1292,7 +1316,28 @@ class RaidenKVManager(CommonKVManager):
                 swa_endpoint=self.swa_raiden_endpoint or "",
                 aux_blob=aux_blob,
             ).to_frames()
-            self._send_multipart_locked(endpoint, payload)
+            try:
+                self._send_multipart_locked(endpoint, payload)
+            except zmq.ZMQError as exc:
+                # The decode is waiting on BLOCKS; fail the room now rather
+                # than letting it sit until the endpoint deadline.
+                with self._state_lock:
+                    if room not in self._aborted:
+                        self._mark_aborted_locked(room)
+                        self._fail_room_locked(
+                            room, f"BLOCKS reply to {endpoint} failed: {exc}"
+                        )
+                        self.update_status(room, KVPoll.Failed)
+                return
+        with self._state_lock:
+            if room in self._aborted:
+                return
+            if not read_blocks:
+                # Full prefix hit: no read follows, so BLOCKS on the wire
+                # completes the send.
+                self._completed_send.add(str(room))
+            if self._swa_engine is not None and not swa_read_blocks:
+                self._completed_send.add(self._swa_req_id(room))
 
     # ----- decode side -------------------------------------------------------
 
@@ -1342,6 +1387,7 @@ class RaidenKVManager(CommonKVManager):
             decode_ip=self.local_ip,
             decode_port=self.rank_port,
             decode_pages=len(local_blocks),
+            decode_swa_pages=len(local_swa_blocks),
         ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
@@ -1627,6 +1673,16 @@ class RaidenKVManager(CommonKVManager):
         # Empty local => full prefix hit; pull nothing (and avoid remote[-0:],
         # which would select the whole list).
         remote, local = self._pair_blocks(remote, local)
+        if not local:
+            # Full prefix hit: all pages reside in local radix cache.
+            # Mark reception complete for both engines upon receiving BLOCKS metadata.
+            with self._state_lock:
+                if room in self._aborted:
+                    return False
+                self._completed_recv.add(str(room))
+                if self._swa_engine is not None:
+                    self._completed_recv.add(self._swa_req_id(room))
+            return True
         engine = self._ensure_engine()
         full_pages = len(set(local))
         if full_pages > self._full_engine_max_blocks:
@@ -2785,6 +2841,7 @@ class RaidenKVManager(CommonKVManager):
                 getattr(self, "_held_chunks", None),
                 getattr(self, "_send_total", None),
                 getattr(self, "_decode_pages", None),
+                getattr(self, "_decode_swa_pages", None),
                 getattr(self, "_chunk_seq", None),
                 getattr(self, "_reshard_chunks", None),
                 getattr(self, "_pending_offer", None),

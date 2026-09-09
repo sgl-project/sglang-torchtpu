@@ -231,13 +231,14 @@ class RaidenRendezvousTestCase(CustomTestCase):
         return [{"rank_ip": "127.0.0.1", "rank_port": prefill.rank_port}]
 
     @staticmethod
-    def _pull_req_frames(decode, room, pages):
+    def _pull_req_frames(decode, room, pages, swa_pages=0):
         """Build the typed PULL_REQ frames sent by a decode rank."""
         return PullReq(
             room=room,
             decode_ip=decode.local_ip,
             decode_port=decode.rank_port,
             decode_pages=pages,
+            decode_swa_pages=swa_pages,
         ).to_frames()
 
 
@@ -459,12 +460,13 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
         """_maybe_reply gates on both, and the page count sizes the pull
         window for chunked transfers."""
         prefill, decode = self._prefill(), self._decode()
-        room, pages = 7203, 5
+        room, pages, swa_pages = 7203, 5, 2
 
-        prefill._on_pull_req(self._pull_req_frames(decode, room, pages))
+        prefill._on_pull_req(self._pull_req_frames(decode, room, pages, swa_pages))
 
         self.assertEqual(prefill._decode_addr[room], ("127.0.0.1", decode.rank_port))
         self.assertEqual(prefill._decode_pages[room], pages)
+        self.assertEqual(prefill._decode_swa_pages[room], swa_pages)
 
 
 class TestRaidenMessageValidation(CustomTestCase):

@@ -47,3 +47,16 @@ def chunk_pull_window(
     if hi <= lo:
         return EMPTY_WINDOW
     return PullWindow(lo - start_page, lo - skip, hi - lo)
+
+
+def whole_pull_registration(blocks: list[int], local_pages: int) -> list[int]:
+    """Returns the producer KV blocks that the decode consumer will read.
+
+    The decode pairs announced blocks from the tail against its local allocation,
+    so leading pages already resident in its prefix cache are not requested.
+    Returns an empty list on a full prefix hit, where no read is issued.
+    """
+    window = chunk_pull_window(0, len(blocks), len(blocks), local_pages)
+    if not window:
+        return []
+    return blocks[window.chunk_offset : window.chunk_offset + window.length]

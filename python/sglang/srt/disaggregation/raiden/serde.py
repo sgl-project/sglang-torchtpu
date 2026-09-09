@@ -56,10 +56,14 @@ class PullReq(WireMessage):
     decode_ip: str
     decode_port: int
     decode_pages: int
+    # Window pages the decode allocated for the room; the sender registers
+    # only the window blocks it will read.
+    decode_swa_pages: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.decode_pages, "decode_pages")
+        require_non_negative(self.decode_swa_pages, "decode_swa_pages")
         _require_port(self.decode_port)
 
 

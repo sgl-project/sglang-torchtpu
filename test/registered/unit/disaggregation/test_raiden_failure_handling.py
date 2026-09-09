@@ -72,6 +72,7 @@ def _prefill_manager():
     mgr._send_reads = {}
     mgr._timeout_s = 120.0
     mgr._decode_pages = {}
+    mgr._decode_swa_pages = {}
     mgr._reshard_chunks = {}
     mgr._reshard_covered = {}
     mgr._reshard_ready_pages = {}
