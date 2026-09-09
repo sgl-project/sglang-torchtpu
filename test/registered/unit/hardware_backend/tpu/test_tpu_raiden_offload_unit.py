@@ -37,7 +37,17 @@ from sglang.srt.disaggregation.raiden.conn import (
     get_raiden_kv_caches,
 )
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
-from sglang.srt.disaggregation.raiden.serde import MessageTag, pack_ints, unpack_blocks
+from sglang.srt.disaggregation.raiden.serde import (
+    Blocks,
+    Chunk,
+    MessageTag,
+    PullReq,
+    ReshardBlocks,
+    ReshardChunk,
+    ReshardChunkReady,
+    ReshardReady,
+    ReshardReq,
+)
 from sglang.srt.disaggregation.utils import KVClassType, TransferBackend
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
@@ -50,6 +60,14 @@ from sglang.srt.hardware_backend.tpu.raiden_transfer import (
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
+
+
+def _reshard_chunk_frames(room, index, start, total_pages, blocks, src_rank):
+    return ReshardChunk(room, index, start, total_pages, blocks, src_rank).to_frames()
+
+
+def _reshard_blocks_frames(room, blocks, src_rank):
+    return ReshardBlocks(room, blocks, src_rank, b"", []).to_frames()
 
 
 class _FakeTransfer:
@@ -424,8 +442,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
             mgr._swa_req_id(room), room, swa_blocks
         )
         payload = socket.send_multipart.call_args.args[0]
-        self.assertEqual(len(payload), 7)
-        self.assertEqual(payload[5], b"127.0.0.1:31022")
+        response = Blocks.from_frames(payload)
+        self.assertEqual(response.swa_endpoint, "127.0.0.1:31022")
 
         self.assertFalse(mgr.is_send_done(room))
         mgr._completed_send.update((str(room), mgr._swa_req_id(room)))
@@ -954,13 +972,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
 
     @staticmethod
     def _pull_req(room, decode_pages):
-        return [
-            MessageTag.PULL_REQ,
-            str(room).encode("ascii"),
-            b"10.0.0.2",
-            b"31002",
-            str(decode_pages).encode("ascii"),
-        ]
+        return PullReq(room, "10.0.0.2", 31002, decode_pages).to_frames()
 
     def test_prefill_announces_only_the_pages_the_decode_will_pull(self):
         room = 31
@@ -978,10 +990,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._engine.register_read.assert_called_once()
         self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[24:32])
         msg = mgr._socket.send_multipart.call_args.args[0]
-        self.assertEqual(msg[0], MessageTag.CHUNK)
-        self.assertEqual(int(msg[4]), 24)
-        self.assertEqual(int(msg[5]), 64)
-        self.assertEqual(unpack_blocks(msg[6]), blocks[24:32])
+        chunk = Chunk.from_frames(msg)
+        self.assertEqual(chunk.start, 24)
+        self.assertEqual(chunk.total_pages, 64)
+        self.assertEqual(chunk.blocks, blocks[24:32])
 
         mgr.offer_chunk(room, 32, blocks[32:48], 64)
         self.assertEqual(mgr._engine.register_read.call_count, 2)
@@ -997,7 +1009,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.offer_chunk(room, 8, blocks[8:16], 64)
         mgr._engine.register_read.assert_called_once()
         self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[0:16])
-        self.assertEqual(int(mgr._socket.send_multipart.call_args.args[0][4]), 0)
+        msg = mgr._socket.send_multipart.call_args.args[0]
+        self.assertEqual(Chunk.from_frames(msg).start, 0)
         self.assertNotIn(room, mgr._pending_offer)
 
     def test_chunks_offered_before_the_pull_request_are_held_then_filtered(self):
@@ -1154,23 +1167,14 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         )
 
     def test_announced_reach_is_the_furthest_chunk_end(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_blocks
-
         room = 45
         remote = list(range(100, 164))
         mgr = self._decode(room, list(range(200, 264)), pool_pages=256)
 
         def chunk(req_id, start, blocks):
-            return [
-                MessageTag.CHUNK,
-                str(room).encode("ascii"),
-                req_id.encode("ascii"),
-                b"11",
-                str(start).encode("ascii"),
-                b"64",
-                pack_blocks(blocks),
-                b"127.0.0.1:31020",
-            ]
+            return Chunk(
+                room, req_id, 11, start, 64, blocks, "127.0.0.1:31020"
+            ).to_frames()
 
         # The second chunk overtakes the first on the wire.
         mgr._on_chunk(chunk("45#1", 16, remote[16:32]))
@@ -1178,8 +1182,6 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertEqual(sorted(mgr._announced_spans[room]), [(0, 16), (16, 32)])
 
     def test_closing_read_covers_a_chunk_lost_mid_range(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_blocks
-
         # Chunk 0:16 lost its announcement race while 16:32 got through; the
         # closing read must pull 0:16 and 32:64, not just the tail.
         room = 46
@@ -1191,36 +1193,17 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._remote_swa_endpoint = {}
         mgr._decode_aux_index = {}
         mgr._on_chunk(
-            [
-                MessageTag.CHUNK,
-                str(room).encode("ascii"),
-                b"46#1",
-                b"11",
-                b"16",
-                b"64",
-                pack_blocks(remote[16:32]),
-                b"127.0.0.1:31020",
-            ]
+            Chunk(
+                room, "46#1", 11, 16, 64, remote[16:32], "127.0.0.1:31020"
+            ).to_frames()
         )
-        mgr._on_blocks(
-            [
-                MessageTag.BLOCKS,
-                str(room).encode("ascii"),
-                pack_blocks(remote),
-                b"127.0.0.1:31020",
-                pack_blocks([]),
-                b"",
-                b"",
-            ]
-        )
+        mgr._on_blocks(Blocks(room, remote, "127.0.0.1:31020", [], "", b"").to_frames())
         req_id, uuid, pages, blocks, _ = mgr._chunk_queue[room][-1]
         self.assertEqual(req_id, str(room))
         self.assertEqual(pages, list(range(0, 16)) + list(range(32, 64)))
         self.assertEqual(blocks, remote[0:16] + remote[32:64])
 
     def test_discarded_waiter_does_not_block_closing_read(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_blocks
-
         room = 48
         mgr = self._decode(room, list(range(200, 208)), pool_pages=8)
         mgr._remote_blocks = {}
@@ -1233,16 +1216,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # head-of-line waiter.
         self.assertTrue(mgr._pulling.admit("holder", 6))
         mgr._on_chunk(
-            [
-                MessageTag.CHUNK,
-                str(room).encode("ascii"),
-                b"48#0",
-                b"48",
-                b"0",
-                b"8",
-                pack_blocks(list(range(4))),
-                b"127.0.0.1:31020",
-            ]
+            Chunk(room, "48#0", 48, 0, 8, list(range(4)), "127.0.0.1:31020").to_frames()
         )
         self.assertFalse(mgr.maybe_start_pull(room))
         self.assertEqual(mgr._pulling.waiting, "48#0")
@@ -1251,15 +1225,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # chunk and queues a replacement closing read. BLOCKS itself does not
         # release staging capacity: the holder still owns its six pages.
         mgr._on_blocks(
-            [
-                MessageTag.BLOCKS,
-                str(room).encode("ascii"),
-                pack_blocks(list(range(20))),
-                b"127.0.0.1:31020",
-                pack_blocks([]),
-                b"",
-                b"",
-            ]
+            Blocks(room, list(range(20)), "127.0.0.1:31020", [], "", b"").to_frames()
         )
         self.assertEqual(mgr._pulling.pages(), 6)
         self.assertFalse(mgr.maybe_start_pull(room))
@@ -1732,20 +1698,16 @@ class TestRaidenChunkedResharding(CustomTestCase):
         return mgr
 
     def _reshard_req(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
-        return [
-            MessageTag.RESHARD_REQ,
-            str(self.ROOM).encode("ascii"),
-            b"10.0.0.2",
-            b"31002",
-            b"10.0.0.2:31000",
-            pack_ints(self.DECODE_BLOCKS),
-            b"4",
-            # SWA pages + SWA push endpoint; empty here (no window engine).
-            b"",
-            b"",
-        ]
+        return ReshardReq(
+            self.ROOM,
+            "10.0.0.2",
+            31002,
+            "10.0.0.2:31000",
+            self.DECODE_BLOCKS,
+            4,
+            [],
+            "",
+        ).to_frames()
 
     def _sent(self, mgr, tag):
         return [
@@ -1765,9 +1727,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         )
         mgr._reshard_chunks[room] = {0: (0, list(range(16))), 1: (16, list(range(16)))}
         mgr._push_executor = Mock()  # hold the push; only the accounting matters
-        mgr._on_reshard_chunk_ready([MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"7"])
+        mgr._on_reshard_chunk_ready(ReshardChunkReady(41, 0, 7).to_frames())
         self.assertEqual(mgr._reshard_chunk_acked[room], {0})
-        mgr._on_reshard_chunk_ready([MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"7"])
+        mgr._on_reshard_chunk_ready(ReshardChunkReady(41, 0, 7).to_frames())
         self.assertEqual(mgr._reshard_chunk_acked[room], {0})
         self.assertEqual(mgr._reshard_pushes_pending[room], 1)
         self.assertEqual(mgr._push_executor.submit.call_count, 1)
@@ -1797,8 +1759,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._socket.send_multipart.assert_not_called()
 
     def test_prefill_announces_chunks_and_pushes_them_on_request(self):
-        from sglang.srt.disaggregation.raiden.serde import unpack_ints
-
         room, blocks = self.ROOM, self.PREFILL_BLOCKS
         mgr = self._prefill()
         # Two chunks commit before the decode has asked for the room.
@@ -1812,14 +1772,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
         # chunk 1 is trimmed to pages 24..32.
         chunks = self._sent(mgr, MessageTag.RESHARD_CHUNK)
         self.assertEqual(len(chunks), 1)
-        self.assertEqual(int(chunks[0][2]), 0)  # first announced chunk index
-        self.assertEqual(int(chunks[0][3]), 24)
-        self.assertEqual(unpack_ints(chunks[0][5]), blocks[24:32])
+        chunk = ReshardChunk.from_frames(chunks[0])
+        self.assertEqual(chunk.index, 0)
+        self.assertEqual(chunk.start, 24)
+        self.assertEqual(chunk.blocks, blocks[24:32])
 
         with patch.dict(sys.modules, _pb2_modules()):
-            mgr._on_reshard_chunk_ready(
-                [MessageTag.RESHARD_CHUNK_READY, b"41", b"0", b"777"]
-            )
+            mgr._on_reshard_chunk_ready(ReshardChunkReady(41, 0, 777).to_frames())
             self.assertEqual(mgr._failed, set())
             mgr._engine.d2h.assert_called_once_with(
                 blocks[24:32], blocks[24:32], [1] * 8
@@ -1837,13 +1796,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             mgr.append_send_blocks(room, blocks[32:64])
             mgr.finalize_send(room, None)
             self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_BLOCKS)), 1)
-            mgr._on_reshard_ready(
-                [
-                    MessageTag.RESHARD_READY,
-                    b"41",
-                    pack_ints(list(range(32, 64))),
-                ]
-            )
+            mgr._on_reshard_ready(ReshardReady(41, list(range(32, 64))).to_frames())
             self.assertEqual(mgr._failed, set())
             uuid, req = mgr._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))
@@ -1925,21 +1878,11 @@ class TestRaidenChunkedResharding(CustomTestCase):
     def _decode_with_chunk_plan(self):
         """A decode whose sources have both announced chunk 0 of ROOM, so its
         receive plan is registered and the push is in flight."""
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         mgr = self._decode()
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
                 mgr._on_reshard_chunk(
-                    [
-                        MessageTag.RESHARD_CHUNK,
-                        b"41",
-                        b"0",
-                        b"24",
-                        b"64",
-                        pack_ints(list(range(124, 132))),
-                        str(rank).encode("ascii"),
-                    ]
+                    _reshard_chunk_frames(41, 0, 24, 64, list(range(124, 132)), rank)
                 )
         uuid = mgr._engine.register_active_plan.call_args.args[0]
         self.assertEqual(mgr._reshard_plans, {self.ROOM: {"41#0": uuid}})
@@ -1988,8 +1931,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertFalse(mgr._failed)
 
     def test_room_is_not_complete_while_closing_registration_is_pending(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         mgr, _ = self._decode_with_chunk_plan()
         mgr._completed_recv.add("41#0")
         seen_complete = []
@@ -2003,14 +1944,11 @@ class TestRaidenChunkedResharding(CustomTestCase):
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
                 mgr._on_reshard_blocks(
-                    [
-                        MessageTag.RESHARD_BLOCKS,
-                        b"41",
-                        pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
-                        str(rank).encode("ascii"),
-                        b"",
-                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
-                    ]
+                    _reshard_blocks_frames(
+                        41,
+                        list(range(100 + 200 * rank, 164 + 200 * rank)),
+                        rank,
+                    )
                 )
         self.assertEqual(seen_complete, [False])
         self.assertFalse(mgr.is_recv_done(self.ROOM))
@@ -2018,20 +1956,15 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertTrue(mgr.is_recv_done(self.ROOM))
 
     def test_closing_plan_is_dropped_once_its_push_settles(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         mgr, chunk_uuid = self._decode_with_chunk_plan()
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
                 mgr._on_reshard_blocks(
-                    [
-                        MessageTag.RESHARD_BLOCKS,
-                        b"41",
-                        pack_ints(list(range(100 + 200 * rank, 164 + 200 * rank))),
-                        str(rank).encode("ascii"),
-                        b"",
-                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
-                    ]
+                    _reshard_blocks_frames(
+                        41,
+                        list(range(100 + 200 * rank, 164 + 200 * rank)),
+                        rank,
+                    )
                 )
         self.assertEqual(
             mgr._reshard_plans[self.ROOM], {"41#0": chunk_uuid, "41": self.ROOM}
@@ -2077,8 +2010,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
             chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
             # The push's D2H stage never becomes ready and times out.
+            chunk = ReshardChunk.from_frames(chunk_msg)
             mgr._on_reshard_chunk_ready(
-                [MessageTag.RESHARD_CHUNK_READY, b"41", chunk_msg[2], b"7"]
+                ReshardChunkReady(41, chunk.index, 7).to_frames()
             )
         self.assertTrue(mgr.is_failed(room))
         # The copy still runs: the plan (and its staging) must survive it.
@@ -2116,8 +2050,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
             for start in (0, 16):
                 mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
             chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
+            chunk = ReshardChunk.from_frames(chunk_msg)
             mgr._on_reshard_chunk_ready(
-                [MessageTag.RESHARD_CHUNK_READY, b"41", chunk_msg[2], b"7"]
+                ReshardChunkReady(41, chunk.index, 7).to_frames()
             )
         # The copy settles later with nobody polling; the plan still goes.
         fut.ready = True
@@ -2139,8 +2074,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
             for start in (0, 16):
                 mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
             chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
+            chunk = ReshardChunk.from_frames(chunk_msg)
             mgr._on_reshard_chunk_ready(
-                [MessageTag.RESHARD_CHUNK_READY, b"41", chunk_msg[2], b"7"]
+                ReshardChunkReady(41, chunk.index, 7).to_frames()
             )
             self.assertEqual(mgr._reshard_pushes_pending[room], 1)
             push = mgr._push_executor.submit.call_args.args
@@ -2153,22 +2089,14 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertFalse(mgr._completed_send)
 
     def test_schedules_are_keyed_by_the_sender_engine_id(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         room = self.ROOM
         src = {8: list(range(100, 164)), 9: list(range(300, 364))}
         mgr = self._decode()
 
         def chunk(sender_id):
-            return [
-                MessageTag.RESHARD_CHUNK,
-                b"41",
-                b"0",
-                b"24",
-                b"64",
-                pack_ints(src[sender_id][24:32]),
-                str(sender_id).encode("ascii"),
-            ]
+            return _reshard_chunk_frames(
+                41, 0, 24, 64, src[sender_id][24:32], sender_id
+            )
 
         # The sources sit on the prefill's second attention-DP replica, so
         # their engine ids are 8 and 9 while their attention-TP ranks (what
@@ -2188,8 +2116,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
 
     def test_room_cleared_during_plan_registration_is_not_resurrected(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         room = self.ROOM
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
@@ -2201,15 +2127,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.register_active_plan = Mock(side_effect=clears_midway)
 
         def chunk(rank):
-            return [
-                MessageTag.RESHARD_CHUNK,
-                b"41",
-                b"0",
-                b"24",
-                b"64",
-                pack_ints(src[rank][24:32]),
-                str(rank).encode("ascii"),
-            ]
+            return _reshard_chunk_frames(41, 0, 24, 64, src[rank][24:32], rank)
 
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_chunk(chunk(0))
@@ -2223,8 +2141,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertFalse(mgr.is_failed(room))
 
     def test_failed_plan_registration_fails_the_room(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         room = self.ROOM
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
@@ -2234,15 +2150,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         )
 
         def chunk(rank):
-            return [
-                MessageTag.RESHARD_CHUNK,
-                b"41",
-                b"0",
-                b"24",
-                b"64",
-                pack_ints(src[rank][24:32]),
-                str(rank).encode("ascii"),
-            ]
+            return _reshard_chunk_frames(41, 0, 24, 64, src[rank][24:32], rank)
 
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_chunk(chunk(0))
@@ -2255,22 +2163,12 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
 
     def test_decode_registers_a_plan_per_chunk_once_every_source_announced(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         room = self.ROOM
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
 
         def chunk(rank):
-            return [
-                MessageTag.RESHARD_CHUNK,
-                b"41",
-                b"0",
-                b"24",
-                b"64",
-                pack_ints(src[rank][24:32]),
-                str(rank).encode("ascii"),
-            ]
+            return _reshard_chunk_frames(41, 0, 24, 64, src[rank][24:32], rank)
 
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_chunk(chunk(0))
@@ -2287,21 +2185,13 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
             ready = self._sent(mgr, MessageTag.RESHARD_CHUNK_READY)
             self.assertEqual(len(ready), 2)
-            self.assertEqual([int(ready[0][2]), int(ready[0][3])], [0, uuid])
+            message = ReshardChunkReady.from_frames(ready[0])
+            self.assertEqual([message.index, message.uuid], [0, uuid])
             self.assertFalse(mgr.is_recv_done(room))
 
             # Both sources finish: the closing plan covers only the tail.
             for rank in (0, 1):
-                mgr._on_reshard_blocks(
-                    [
-                        MessageTag.RESHARD_BLOCKS,
-                        b"41",
-                        pack_ints(src[rank]),
-                        str(rank).encode("ascii"),
-                        b"",
-                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
-                    ]
-                )
+                mgr._on_reshard_blocks(_reshard_blocks_frames(41, src[rank], rank))
             uuid, req = mgr._engine.register_active_plan.call_args.args
             self.assertEqual((uuid, req.req_id), (room, "41"))
             self.assertEqual(
@@ -2320,37 +2210,18 @@ class TestRaidenChunkedResharding(CustomTestCase):
     def test_partial_source_chunk_is_folded_into_the_closing_plan(self):
         """A source that loses its chunk/final race sends no chunk.  The other
         source's unacknowledged announcement must not leave a hole."""
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         room = self.ROOM
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
 
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_chunk(
-                [
-                    MessageTag.RESHARD_CHUNK,
-                    b"41",
-                    b"0",
-                    b"24",
-                    b"64",
-                    pack_ints(src[0][24:32]),
-                    b"0",
-                ]
+                _reshard_chunk_frames(41, 0, 24, 64, src[0][24:32], 0)
             )
             self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
 
             for rank in (0, 1):
-                mgr._on_reshard_blocks(
-                    [
-                        MessageTag.RESHARD_BLOCKS,
-                        b"41",
-                        pack_ints(src[rank]),
-                        str(rank).encode("ascii"),
-                        b"",
-                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
-                    ]
-                )
+                mgr._on_reshard_blocks(_reshard_blocks_frames(41, src[rank], rank))
 
         uuid, req = mgr._engine.register_active_plan.call_args.args
         self.assertEqual((uuid, req.req_id), (room, "41"))
@@ -2360,8 +2231,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertEqual(mgr._chunk_reads[room], ["41"])
 
     def test_closing_plan_covers_a_reshard_chunk_lost_mid_range(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints, unpack_ints
-
         # Chunk 0 (pages 24:32) lost its race; chunk 1 (pages 32:40) was
         # registered by both sources. The closing plan and the READY must
         # cover 24:32 and 40:64, not just the tail past the furthest chunk.
@@ -2372,27 +2241,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
                 mgr._on_reshard_chunk(
-                    [
-                        MessageTag.RESHARD_CHUNK,
-                        b"41",
-                        b"1",
-                        b"32",
-                        b"64",
-                        pack_ints(src[rank][32:40]),
-                        str(rank).encode("ascii"),
-                    ]
+                    _reshard_chunk_frames(41, 1, 32, 64, src[rank][32:40], rank)
                 )
             for rank in (0, 1):
-                mgr._on_reshard_blocks(
-                    [
-                        MessageTag.RESHARD_BLOCKS,
-                        b"41",
-                        pack_ints(src[rank]),
-                        str(rank).encode("ascii"),
-                        b"",
-                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
-                    ]
-                )
+                mgr._on_reshard_blocks(_reshard_blocks_frames(41, src[rank], rank))
 
         missing = list(range(24, 32)) + list(range(40, 64))
         uuid, req = mgr._engine.register_active_plan.call_args.args
@@ -2406,11 +2258,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         )
         readies = self._sent(mgr, MessageTag.RESHARD_READY)
         self.assertTrue(readies)
-        self.assertEqual(unpack_ints(readies[-1][2]), missing)
+        self.assertEqual(ReshardReady.from_frames(readies[-1]).pages, missing)
 
     def test_closing_plan_waits_for_chunk_registration_to_publish(self):
-        from sglang.srt.disaggregation.raiden.serde import pack_ints
-
         room = self.ROOM
         src = {0: list(range(100, 164)), 1: list(range(300, 364))}
         mgr = self._decode()
@@ -2420,16 +2270,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             if req.req_id != "41#0":
                 return
             for rank in (0, 1):
-                mgr._on_reshard_blocks(
-                    [
-                        MessageTag.RESHARD_BLOCKS,
-                        b"41",
-                        pack_ints(src[rank]),
-                        str(rank).encode("ascii"),
-                        b"",
-                        pack_ints([]),  # prefill SWA pages (none: not a hybrid model)
-                    ]
-                )
+                mgr._on_reshard_blocks(_reshard_blocks_frames(41, src[rank], rank))
             seen_during_chunk_registration.append(
                 (
                     room in mgr._reshard_registered,
@@ -2442,15 +2283,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         with patch.dict(sys.modules, _pb2_modules()):
             for rank in (0, 1):
                 mgr._on_reshard_chunk(
-                    [
-                        MessageTag.RESHARD_CHUNK,
-                        b"41",
-                        b"0",
-                        b"24",
-                        b"64",
-                        pack_ints(src[rank][24:32]),
-                        str(rank).encode("ascii"),
-                    ]
+                    _reshard_chunk_frames(41, 0, 24, 64, src[rank][24:32], rank)
                 )
 
         self.assertEqual(seen_during_chunk_registration, [(False, False)])

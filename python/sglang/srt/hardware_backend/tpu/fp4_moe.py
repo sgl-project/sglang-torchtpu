@@ -36,11 +36,11 @@ TPU_NVFP4_GROUP_SIZE = 512
 TPU_NVFP4_SUPPORTED_GROUP_SIZES = (128, 256, TPU_NVFP4_GROUP_SIZE)
 PACKING = 2  # two FP4 codes per uint8 byte
 
-# Load-bearing, not a tuning knob: a single fused-RS invocation over a full
-# 4096-token prefill reproducibly triggered RuntimeUnexpectedCoreHalt during the
-# EXTEND4096 precompile on tpu7x. Chunking the call at 1024 tokens avoids it, so
-# do not raise this without re-validating that precompile shape on device.
-_FUSED_RS_MAX_TOKENS_PER_CALL = 1024
+# Keep a bounded fallback above the largest configured serving bucket. The 8K
+# bucket uses one fused-RS invocation; smaller 1K invocations reload expert
+# weights and repeat kernel setup inside the same compiled graph. Calls above
+# 8K remain deterministically chunked.
+_FUSED_RS_MAX_TOKENS_PER_CALL = 8192
 
 
 def _transpose_packed_fp4(matrix: torch.Tensor) -> torch.Tensor:

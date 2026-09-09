@@ -54,6 +54,10 @@ from sglang.srt.disaggregation.tpu.conn import (
     _KvStats,
     _tcp_endpoint,
 )
+from sglang.srt.disaggregation.tpu.serde import (
+    KVDataChannelHeader,
+    Transfer,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Range
@@ -585,21 +589,19 @@ class TestTpuKVManagerProtocol(CustomTestCase):
 
     def test_trsfr_marks_waiting_for_input(self):
         prefill, decode, *_ = self._make_pair()
-        prefill._serve(MessageTag.TRSFR, prefill._handle_transfer)
+        prefill._serve(MessageTag.TRANSFER, prefill._handle_transfer)
         room = 4242
         prefill.server_socket.deliver(
-            [
-                MessageTag.TRSFR,
-                str(room).encode(),
-                b"127.0.0.1",
-                str(decode.rank_port).encode(),
-                b"1",  # aux present
-                b"3",  # num pages
-                b"1",  # required_dst_info_num
-                b"0",  # decode_prefix_len
-                b"0",  # dst_tp_rank
-                b"1",  # decode_attn_tp_size
-            ]
+            Transfer(
+                room=room,
+                decode_ip="127.0.0.1",
+                decode_port=decode.rank_port,
+                num_pages=3,
+                required_dst_info_num=1,
+                decode_prefix_len=0,
+                dst_tp_rank=0,
+                decode_attn_tp_size=1,
+            ).to_frames()
         )
         deadline = time.time() + 5
         while time.time() < deadline:
@@ -779,7 +781,7 @@ class TestTpuKVManagerProtocol(CustomTestCase):
         # bg recv -> stashes host bytes only (inlined _init_decode recv loop).
         decode._serve_router(
             {
-                MessageTag.KVDATA_CH: decode._handle_kvdata_ch,
+                MessageTag.KV_DATA_CHANNEL: decode._handle_kvdata_ch,
             },
             copy=False,
         )
@@ -1169,7 +1171,7 @@ class TestTpuReshardingProtocol(CustomTestCase):
 @_TPU_CONNECTOR_RETIRED
 class TestTpuReshardTransferTimeFailure(CustomTestCase):
     """An unsupported fp8 reshard is NOT pre-flighted at handshake — a Failed set
-    on the TRSFR recv thread would be clobbered by the sender's later
+    on the TRANSFER receive thread would be clobbered by the sender's later
     WaitingForInput/Transferring (update_status uses max() and KVPoll.Failed == 0).
     It instead fails cleanly at transfer time in ``gather_and_push`` — the state
     machine's last step, where Failed sticks — mirroring how mooncake fails a
@@ -2054,6 +2056,108 @@ class TestFanInOddHeadReassembleLayout(CustomTestCase):
         )
         print(out)
         np.testing.assert_array_equal(out, exp)
+
+
+class TestKVDataChannelMessageValidation(CustomTestCase):
+    @staticmethod
+    def _message(num_pages: int = 2) -> list[bytes]:
+        info = PrefillTransferInfo(
+            room=7,
+            decode_endpoint="tcp://127.0.0.1:1234",
+            num_pages=2,
+            kv_packing=2,
+            src_tp_rank=0,
+            dst_tp_rank=0,
+            src_attn_tp_size=1,
+            dst_attn_tp_size=1,
+            total_num_head=1,
+            n_layers=2,
+            page_size=1,
+        )
+        header = KVDataChannelHeader(
+            info=info,
+            index_start=0,
+            num_pages=num_pages,
+            channel=0,
+            num_channels=1,
+            layer_start=0,
+            num_layers=2,
+            num_aux=0,
+        )
+        return header.to_frames([], [b"layer-0", b"layer-1"])
+
+    def test_parse_valid_message(self):
+        header, aux_frames, layer_frames = KVDataChannelHeader.from_frames(
+            self._message()
+        )
+
+        self.assertEqual(header.info.room, 7)
+        self.assertEqual(header.num_pages, 2)
+        self.assertEqual(aux_frames, [])
+        self.assertEqual(layer_frames, [b"layer-0", b"layer-1"])
+
+    def test_allows_empty_final_chunk(self):
+        header, aux_frames, layer_frames = KVDataChannelHeader.from_frames(
+            self._message(num_pages=0)
+        )
+
+        self.assertEqual(header.num_pages, 0)
+        self.assertEqual(aux_frames, [])
+        self.assertEqual(layer_frames, [b"layer-0", b"layer-1"])
+
+    def test_rejects_truncated_payload(self):
+        with self.assertRaisesRegex(ValueError, "expected 4 frames, got 3"):
+            KVDataChannelHeader.from_frames(self._message()[:-1])
+
+    def test_rejects_invalid_json_header(self):
+        msg = self._message()
+        msg[1] = b"not-json"
+        with self.assertRaisesRegex(ValueError, "malformed KV_DATA_CHANNEL header"):
+            KVDataChannelHeader.from_frames(msg)
+
+    def test_rejects_out_of_range_channel(self):
+        info = PrefillTransferInfo(
+            room=7,
+            decode_endpoint="",
+            num_pages=1,
+            kv_packing=2,
+            src_tp_rank=0,
+            dst_tp_rank=0,
+            src_attn_tp_size=1,
+            dst_attn_tp_size=1,
+            total_num_head=1,
+            n_layers=2,
+            page_size=1,
+        )
+        with self.assertRaisesRegex(ValueError, "invalid channel"):
+            KVDataChannelHeader(
+                info=info,
+                index_start=0,
+                num_pages=1,
+                channel=1,
+                num_channels=1,
+                layer_start=0,
+                num_layers=2,
+                num_aux=0,
+            )
+
+    def test_transfer_round_trip(self):
+        message = Transfer(7, "127.0.0.1", 1234, 2, 1, 0, 0, 1)
+        self.assertEqual(Transfer.from_frames(message.to_frames()), message)
+
+    def test_transfer_rejects_wrong_tag(self):
+        message = Transfer(7, "127.0.0.1", 1234, 2, 1, 0, 0, 1)
+        with self.assertRaisesRegex(ValueError, "expected tag"):
+            Transfer.from_frames([MessageTag.KV_DATA_CHANNEL, message.to_frames()[1]])
+
+    def test_transfer_validates_range_during_decode(self):
+        payload = (
+            b'{"room":7,"decode_ip":"127.0.0.1","decode_port":70000,'
+            b'"num_pages":2,"required_dst_info_num":1,"decode_prefix_len":0,'
+            b'"dst_tp_rank":0,"decode_attn_tp_size":1}'
+        )
+        with self.assertRaisesRegex(ValueError, "malformed Transfer payload"):
+            Transfer.from_frames([MessageTag.TRANSFER, payload])
 
 
 if __name__ == "__main__":

@@ -725,23 +725,19 @@ def popen_launch_server(
     host = host[2:]
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
-    if pd_separated or use_mixed_pd_engine:
-        command = [
-            "python3",
-            "-m",
-            "sglang.launch_pd_server",
-            "--model-path",
-            model,
-            *[str(x) for x in other_args],
-        ]
-    else:
-        command = [
-            "sglang",
-            "serve",
-            "--model-path",
-            model,
-            *[str(x) for x in other_args],
-        ]
+    server_module = (
+        "sglang.launch_pd_server"
+        if pd_separated or use_mixed_pd_engine
+        else "sglang.launch_server"
+    )
+    command = [
+        sys.executable,
+        "-m",
+        server_module,
+        "--model-path",
+        model,
+        *[str(x) for x in other_args],
+    ]
 
     if pd_separated or use_mixed_pd_engine:
         command.extend(["--lb-host", host, "--lb-port", port])

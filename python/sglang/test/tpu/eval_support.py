@@ -124,6 +124,9 @@ class RecipeLauncher:
 
             env = os.environ.copy()
             env.update(self.env)
+            # Default shell recipes to this interpreter; explicit PYTHON wins.
+            if sys.executable:
+                env.setdefault("PYTHON", sys.executable)
             # The whole invocation, env included: this line is what a reader reproduces
             # a red nightly with.
             overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))

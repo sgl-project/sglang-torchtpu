@@ -25,7 +25,11 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, _tcp_endpoint
-from sglang.srt.disaggregation.raiden.serde import MessageTag
+from sglang.srt.disaggregation.raiden.serde import (
+    Blocks,
+    Chunk,
+    PullReq,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -162,9 +166,9 @@ class TestHandshakeEndpoints(CustomTestCase):
 
         (endpoint, payload), _ = mgr._send_multipart_locked.call_args
         self.assertEqual(endpoint, f"tcp://[{V6_DECODE}]:5555")
-        self.assertEqual(payload[0], MessageTag.BLOCKS)
+        Blocks.from_frames(payload)
         # The native engine endpoint rides along bracketed as well.
-        self.assertEqual(payload[3], f"[{V6_PREFILL}]:31000".encode("ascii"))
+        self.assertEqual(Blocks.from_frames(payload).endpoint, f"[{V6_PREFILL}]:31000")
 
     def test_chunk_announcement_targets_bracketed_decode_endpoint(self):
         mgr = _prefill_manager()
@@ -178,7 +182,7 @@ class TestHandshakeEndpoints(CustomTestCase):
 
         (endpoint, payload), _ = mgr._send_multipart_locked.call_args
         self.assertEqual(endpoint, f"tcp://[{V6_DECODE}]:5555")
-        self.assertEqual(payload[0], MessageTag.CHUNK)
+        Chunk.from_frames(payload)
 
     def test_decode_pull_request_targets_bracketed_prefill_endpoint(self):
         mgr = _decode_manager()
@@ -189,9 +193,9 @@ class TestHandshakeEndpoints(CustomTestCase):
 
         (endpoint, payload), _ = mgr._send_multipart_locked.call_args
         self.assertEqual(endpoint, f"tcp://[{V6_PREFILL}]:6000")
-        self.assertEqual(payload[0], MessageTag.PULL_REQ)
+        PullReq.from_frames(payload)
         # The reply address is the bare ip; the prefill brackets it itself.
-        self.assertEqual(payload[2], V6_DECODE.encode("ascii"))
+        self.assertEqual(PullReq.from_frames(payload).decode_ip, V6_DECODE)
 
     def test_ipv4_peers_are_addressed_as_before(self):
         mgr = _decode_manager()

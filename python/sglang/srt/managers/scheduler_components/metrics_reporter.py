@@ -614,6 +614,7 @@ class SchedulerMetricsReporter:
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"{self._cached_token_tier_msg(prefill_stats)}"
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
@@ -1078,6 +1079,32 @@ class SchedulerMetricsReporter:
         """Shut down the FPM publisher thread."""
         if self.scheduler.enable_fpm:
             self.scheduler._fpm_publisher.shutdown()
+
+    def _cached_token_tier_msg(self, prefill_stats: PrefillStats) -> str:
+        """Break #cached-token down by the tier that served it.
+
+        #cached-token alone cannot answer "did the host pool do any work?" --
+        an HBM hit and a page reloaded from host DRAM are both just a longer
+        prefix match. Emitted only under hierarchical cache, so a plain run's
+        log line is unchanged; emitted even when the host/storage counts are
+        zero, since "hicache on and everything stayed in HBM" is exactly the
+        case that needs to be distinguishable from "hicache off".
+
+        These are the SCHEDULER's view, taken from the prefix match. A page
+        counted here as a host hit is one the match found on the host tier; if
+        load_back later declines it (below load_back_threshold) or fails, it is
+        recomputed instead, and req.host_hit_length is not walked back. For
+        tokens actually moved by DMA, read sglang:load_back_tokens_total.
+        """
+        if not self.scheduler.enable_hierarchical_cache:
+            return ""
+        msg = (
+            f"#hbm-hit-token: {prefill_stats.log_device_hit_tokens}, "
+            f"#host-hit-token: {prefill_stats.log_host_hit_tokens}, "
+        )
+        if prefill_stats.log_storage_hit_tokens:
+            msg += f"#storage-hit-token: {prefill_stats.log_storage_hit_tokens}, "
+        return msg
 
     def _log_hicache_stats(self):
         """Populate HiCache host-tier stats on self.stats.

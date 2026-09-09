@@ -158,6 +158,7 @@ jobs:
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: ${{ matrix.group.name }}
       lane: nightly
       nightly: true
       launch_script: ${{ matrix.group.launch_script }}

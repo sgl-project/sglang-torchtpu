@@ -46,7 +46,6 @@ What a new backend implements (the seam)
 from __future__ import annotations
 
 import abc
-import enum
 import logging
 import threading
 import time
@@ -66,6 +65,7 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.tpu import transfer as tpu_transfer
 from sglang.srt.disaggregation.tpu.host_staging import StageBuf
+from sglang.srt.disaggregation.tpu.serde import Transfer
 from sglang.srt.disaggregation.tpu.transfer import (
     DecodeTransferState,
     PendingChunk,
@@ -76,13 +76,6 @@ from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
-
-
-class MessageTag(bytes, enum.Enum):
-    """ZMQ message tags for TPU P/D disaggregation control & data plane."""
-
-    TRSFR = b"TRSFR"
-    KVDATA_CH = b"KVDATAC"
 
 
 class KVTransferError(Exception):
@@ -279,22 +272,15 @@ class TpuKVManagerBase(CommonKVManager):
         decode's control endpoint and advance to WaitingForInput once every
         expected decode rank has reported. Shared across backends; subclasses
         choose what value to stash per endpoint via ``_record_decode_endpoint``."""
-        # [TAG, room, decode_ip, decode_port, aux_present, num_pages,
-        #  required_dst_info_num, decode_prefix_len,
-        #  dst_tp_rank, decode_attn_tp_size]
-        if len(msg) != 10:
-            raise ValueError(
-                f"Malformed {MessageTag.TRSFR.decode()} message. "
-                f"Expected 10 frames, got {len(msg)}."
-            )
-        room = int(msg[1].decode())
-        decode_ip = msg[2].decode()
-        decode_port = int(msg[3].decode())
-        num_pages = int(msg[5].decode())
-        required = int(msg[6].decode())
-        prefix_len = int(msg[7].decode())
-        dst_tp_rank = int(msg[8].decode())
-        decode_attn_tp_size = int(msg[9].decode())
+        req = Transfer.from_frames(msg)
+        room = req.room
+        decode_ip = req.decode_ip
+        decode_port = req.decode_port
+        num_pages = req.num_pages
+        required = req.required_dst_info_num
+        prefix_len = req.decode_prefix_len
+        dst_tp_rank = req.dst_tp_rank
+        decode_attn_tp_size = req.decode_attn_tp_size
 
         logger.info(
             "[pd_kv_resharding] _handle_transfer room=%s endpoint=%s:%s num_pages=%d "
@@ -383,7 +369,7 @@ class TpuKVManagerBase(CommonKVManager):
         with self.decode_states_lock:
             state = self.decode_states.get(room)
         if state is None:
-            logger.warning("decode KVDATA for unknown room %s, dropping", room)
+            logger.warning("decode KV data for unknown room %s, dropping", room)
             return
 
         self._assert_layer_page_buffers()
@@ -637,18 +623,16 @@ class TpuKVReceiverBase(CommonKVReceiver):
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
-                    [
-                        MessageTag.TRSFR,
-                        str(self.bootstrap_room).encode(),
-                        self.kv_mgr.local_ip.encode(),
-                        str(self.kv_mgr.rank_port).encode(),
-                        b"1" if aux_index is not None else b"0",
-                        str(num_pages).encode(),
-                        str(self.required_dst_info_num).encode(),
-                        str(decode_prefix_len or 0).encode(),
-                        str(dst_tp_rank).encode(),
-                        str(dst_attn_tp_size).encode(),
-                    ]
+                    Transfer(
+                        room=self.bootstrap_room,
+                        decode_ip=self.kv_mgr.local_ip,
+                        decode_port=self.kv_mgr.rank_port,
+                        num_pages=num_pages,
+                        required_dst_info_num=self.required_dst_info_num,
+                        decode_prefix_len=decode_prefix_len or 0,
+                        dst_tp_rank=dst_tp_rank,
+                        decode_attn_tp_size=dst_attn_tp_size,
+                    ).to_frames()
                 )
         self.init_time = time.time()
 

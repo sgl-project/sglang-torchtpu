@@ -16,7 +16,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVReceiver,
     RaidenKVSender,
 )
-from sglang.srt.disaggregation.raiden.serde import MessageTag
+from sglang.srt.disaggregation.raiden.serde import MessageTag, PullReq, ReshardReq
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -79,6 +79,9 @@ def _prefill_manager():
     mgr._reshard_final_pushed = set()
     mgr._pending_offer = {}
     mgr._chunk_seq = {}
+    mgr._message_handlers = {
+        PullReq.TAG: mgr._on_pull_req,
+    }
     return mgr
 
 
@@ -93,6 +96,17 @@ def _populate_send_state(mgr, room):
 
 
 class TestPrefillAbortHandling(unittest.TestCase):
+    def test_dispatch_rejects_missing_or_invalid_tags(self):
+        mgr = _prefill_manager()
+
+        with patch("sglang.srt.disaggregation.raiden.conn.logger.error") as log_error:
+            mgr._dispatch([])
+            mgr._dispatch([b""])
+            mgr._dispatch([None])
+            mgr._dispatch([b"UNKNOWN"])
+
+        self.assertEqual(log_error.call_count, 4)
+
     def test_abort_marks_room_failed_and_drops_send_state(self):
         mgr = _prefill_manager()
         _populate_send_state(mgr, ROOM)
@@ -139,17 +153,18 @@ class TestPrefillAbortHandling(unittest.TestCase):
         self.assertTrue(mgr.is_aborted(ROOM))
 
         # The delayed pull request finds the tombstone and is dropped.
-        mgr._dispatch(
-            [MessageTag.PULL_REQ, str(ROOM).encode(), b"10.0.0.2", b"5555", b"4"]
-        )
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
         self.assertNotIn(ROOM, mgr._decode_addr)
 
     def test_malformed_abort_is_ignored(self):
         mgr = _prefill_manager()
         _populate_send_state(mgr, ROOM)
 
-        mgr._dispatch([MessageTag.ABORT, b"not-a-room", b"10.0.0.2", b"5555"])
-        mgr._dispatch([MessageTag.ABORT])
+        with patch("sglang.srt.disaggregation.raiden.conn.logger.error") as log_error:
+            mgr._dispatch([MessageTag.ABORT, b"not-a-room", b"10.0.0.2", b"5555"])
+            mgr._dispatch([MessageTag.ABORT])
+
+        self.assertEqual(log_error.call_count, 2)
 
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Transferring)
         self.assertIn(ROOM, mgr._send_blocks)
@@ -494,9 +509,7 @@ class TestAbortIsTerminal(unittest.TestCase):
         self.assertTrue(mgr.fail_decode_silence(ROOM, time.time() - 10, 1))
         self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
         # The pull request that raced the deadline finds the tombstone.
-        mgr._dispatch(
-            [MessageTag.PULL_REQ, str(ROOM).encode(), b"10.0.0.2", b"5555", b"4"]
-        )
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
         self.assertNotIn(ROOM, mgr._decode_addr)
         mgr._ensure_engine.assert_not_called()
 
@@ -504,23 +517,11 @@ class TestAbortIsTerminal(unittest.TestCase):
         mgr = self._mgr()
         mgr._dispatch(_abort_frame(ROOM))
         mgr.clear_room(ROOM)
+        mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
         mgr._dispatch(
-            [MessageTag.PULL_REQ, str(ROOM).encode(), b"10.0.0.2", b"5555", b"4"]
-        )
-        mgr._dispatch(
-            [
-                MessageTag.RESHARD_REQ,
-                str(ROOM).encode(),
-                b"10.0.0.2",
-                b"5555",
-                b"10.0.0.2:31000",
-                b"",
-                b"4",
-                # SWA pages + SWA push endpoint: empty for a non-hybrid model,
-                # but the frames are part of RESHARD_REQ either way.
-                b"",
-                b"",
-            ]
+            ReshardReq(
+                ROOM, "10.0.0.2", 5555, "10.0.0.2:31000", [], 4, [], ""
+            ).to_frames()
         )
         self.assertNotIn(ROOM, mgr._decode_addr)
         self.assertNotIn(ROOM, mgr._reshard_req)

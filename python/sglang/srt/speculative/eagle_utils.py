@@ -612,14 +612,14 @@ def fused_verify_bookkeeping(
     bs = accept_lens.shape[0]
     accept_width = accept_index.shape[1]
     idx = accept_width * torch.arange(bs, device=accept_lens.device) + accept_lens - 1
-    bonus_tokens = accept_tokens.reshape(-1)[idx].to(torch.int32)
+    bonus_tokens = accept_tokens.reshape(-1)[idx].to(torch.int64)
     return new_seq_lens, bonus_tokens
 
 
 def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
     if seq_lens.numel() == 0:
         return seq_lens + accept_lens, torch.empty(
-            (0,), device=seq_lens.device, dtype=torch.int32
+            (0,), device=seq_lens.device, dtype=torch.int64
         )
     if _use_torch_native:
         return fused_verify_bookkeeping(seq_lens, accept_lens, predict, accept_index)

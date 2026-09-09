@@ -51,12 +51,17 @@ from sglang.srt.disaggregation.raiden.host_pool import (
     slots_within_budget,
 )
 from sglang.srt.disaggregation.raiden.serde import (
+    Blocks,
+    Chunk,
     MessageTag,
-    pack_blocks,
-    pack_ints,
+    PullReq,
+    ReshardBlocks,
+    ReshardChunk,
+    ReshardChunkReady,
+    ReshardReady,
+    ReshardReq,
+    decode_text,
     read_aux_blob,
-    unpack_blocks,
-    unpack_ints,
     write_aux_blob,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -173,6 +178,17 @@ class RaidenKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+
+        self._message_handlers = {
+            PullReq.TAG: self._on_pull_req,
+            Blocks.TAG: self._on_blocks,
+            ReshardReq.TAG: self._on_reshard_req,
+            ReshardBlocks.TAG: self._on_reshard_blocks,
+            ReshardReady.TAG: self._on_reshard_ready,
+            Chunk.TAG: self._on_chunk,
+            ReshardChunk.TAG: self._on_reshard_chunk,
+            ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
+        }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None
@@ -775,42 +791,35 @@ class RaidenKVManager(CommonKVManager):
 
     def _dispatch(self, msg: List[bytes]) -> None:
         """Route one multipart message from the per-rank PULL socket by its tag."""
-        if msg and msg[0] == MessageTag.ABORT:
+        if not msg:
+            logger.error("RaidenKVManager received an empty message")
+            return
+        tag_frame = msg[0]
+        if not isinstance(tag_frame, (bytes, bytearray, memoryview)):
+            logger.error(
+                "RaidenKVManager received a non-bytes message tag: %r", tag_frame
+            )
+            return
+        tag = bytes(tag_frame)
+        if not tag:
+            logger.error("RaidenKVManager received an empty message tag")
+            return
+        # CommonKVReceiver still emits ABORT as a positional message.
+        if tag == MessageTag.ABORT:
             self._on_abort(msg)
             return
-        if msg[0] == MessageTag.PULL_REQ:
-            self._on_pull_req(msg)
-        elif msg[0] == MessageTag.BLOCKS:
-            self._on_blocks(msg)
-        elif msg[0] == MessageTag.RESHARD_REQ:
-            self._on_reshard_req(msg)
-        elif msg[0] == MessageTag.RESHARD_BLOCKS:
-            self._on_reshard_blocks(msg)
-        elif msg[0] == MessageTag.RESHARD_READY:
-            self._on_reshard_ready(msg)
-        elif msg[0] == MessageTag.CHUNK:
-            self._on_chunk(msg)
-        elif msg[0] == MessageTag.RESHARD_CHUNK:
-            self._on_reshard_chunk(msg)
-        elif msg[0] == MessageTag.RESHARD_CHUNK_READY:
-            self._on_reshard_chunk_ready(msg)
-        else:
-            logger.warning("RaidenKVManager unknown header: %s", msg[0])
-
-    @staticmethod
-    def _require_frames(msg: List[bytes], tag: MessageTag, n: int) -> None:
-        """Reject a malformed header before it is indexed past its length."""
-        if len(msg) != n:
-            raise ValueError(
-                f"malformed {tag.name} message: expected {n} frames, got {len(msg)}"
-            )
+        handler = self._message_handlers.get(tag)
+        if handler is None:
+            logger.error("RaidenKVManager unknown message tag: %s", tag)
+            return
+        handler(msg)
 
     def _on_pull_req(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.PULL_REQ, 5)
-        room = int(msg[1].decode("ascii"))
-        decode_ip = msg[2].decode("ascii")
-        decode_port = int(msg[3].decode("ascii"))
-        decode_pages = int(msg[4].decode("ascii"))
+        req = PullReq.from_frames(msg)
+        room = req.room
+        decode_ip = req.decode_ip
+        decode_port = req.decode_port
+        decode_pages = req.decode_pages
         with self._state_lock:
             if room in self._aborted:
                 return
@@ -837,14 +846,14 @@ class RaidenKVManager(CommonKVManager):
         return [pg for pg in range(total) if not covered[pg]]
 
     def _on_chunk(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.CHUNK, 8)
-        room = int(msg[1].decode("ascii"))
-        req_id = msg[2].decode("ascii")
-        uuid = int(msg[3].decode("ascii"))
-        start = int(msg[4].decode("ascii"))
-        total_pages = int(msg[5].decode("ascii"))
-        blocks = unpack_blocks(msg[6])
-        endpoint = msg[7].decode("ascii")
+        req = Chunk.from_frames(msg)
+        room = req.room
+        req_id = req.req_id
+        uuid = req.uuid
+        start = req.start
+        total_pages = req.total_pages
+        blocks = req.blocks
+        endpoint = req.endpoint
         with self._state_lock:
             if room in self._aborted:
                 return
@@ -864,7 +873,7 @@ class RaidenKVManager(CommonKVManager):
             )
 
     def _on_abort(self, msg: List[bytes]) -> None:
-        """Fail a room the decode gave up on: ``[ABORT, room, decode ip, port]``.
+        """Fail a room that decode abandoned through the common ABORT message.
 
         The room's send state is dropped and later send calls for it are
         ignored, so a prefill still computing the request cannot register a
@@ -874,9 +883,10 @@ class RaidenKVManager(CommonKVManager):
         sockets) or the sender's creation still wins.
         """
         try:
-            room = int(msg[1].decode("ascii"))
-        except (IndexError, ValueError) as e:
-            logger.debug("RaidenKVManager ignoring malformed abort: %s", e)
+            _, room_frame, *_ = msg
+            room = int(decode_text(room_frame, "room"))
+        except (IndexError, ValueError) as error:
+            logger.error("RaidenKVManager received malformed ABORT: %s", error)
             return
         with self._state_lock:
             # The status check, the tombstone, the failure record, and the
@@ -911,13 +921,14 @@ class RaidenKVManager(CommonKVManager):
             return room in self._aborted
 
     def _on_blocks(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.BLOCKS, 7)
-        room = int(msg[1].decode("ascii"))
-        remote_blocks = unpack_blocks(msg[2])
-        endpoint = msg[3].decode("ascii")
-        remote_swa_blocks = unpack_blocks(msg[4])
-        swa_endpoint = msg[5].decode("ascii")
-        aux_blob = msg[6]
+        req = Blocks.from_frames(msg)
+        room = req.room
+        remote_blocks = req.blocks
+        endpoint = req.endpoint
+        remote_swa_blocks = req.swa_blocks
+        swa_endpoint = req.swa_endpoint
+        aux_blob = req.aux_blob
+
         aux_index = None
         with self._state_lock:
             if room in self._aborted:
@@ -1088,16 +1099,15 @@ class RaidenKVManager(CommonKVManager):
                 # tombstone is visible.
                 if room in self._aborted:
                     return
-            payload = [
-                MessageTag.CHUNK,
-                str(room).encode("ascii"),
-                req_id.encode("ascii"),
-                str(uuid).encode("ascii"),
-                str(start).encode("ascii"),
-                str(total_pages).encode("ascii"),
-                pack_blocks(block_ids),
-                (self.raiden_endpoint or "").encode("ascii"),
-            ]
+            payload = Chunk(
+                room=room,
+                req_id=req_id,
+                uuid=uuid,
+                start=start,
+                total_pages=total_pages,
+                blocks=block_ids,
+                endpoint=self.raiden_endpoint or "",
+            ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             self._send_multipart_locked(endpoint, payload)
 
@@ -1274,15 +1284,14 @@ class RaidenKVManager(CommonKVManager):
                 if room in self._aborted:
                     return
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
-            payload = [
-                MessageTag.BLOCKS,
-                str(room).encode("ascii"),
-                pack_blocks(blocks),
-                (self.raiden_endpoint or "").encode("ascii"),
-                pack_blocks(swa_blocks),
-                (self.swa_raiden_endpoint or "").encode("ascii"),
-                aux_blob,
-            ]
+            payload = Blocks(
+                room=room,
+                blocks=blocks,
+                endpoint=self.raiden_endpoint or "",
+                swa_blocks=swa_blocks,
+                swa_endpoint=self.swa_raiden_endpoint or "",
+                aux_blob=aux_blob,
+            ).to_frames()
             self._send_multipart_locked(endpoint, payload)
 
     # ----- decode side -------------------------------------------------------
@@ -1328,13 +1337,12 @@ class RaidenKVManager(CommonKVManager):
             self._local_swa_blocks[room] = local_swa_blocks
             if aux_index is not None:
                 self._decode_aux_index[room] = aux_index
-        payload = [
-            MessageTag.PULL_REQ,
-            str(room).encode("ascii"),
-            self.local_ip.encode("ascii"),
-            str(self.rank_port).encode("ascii"),
-            str(len(local_blocks)).encode("ascii"),
-        ]
+        payload = PullReq(
+            room=room,
+            decode_ip=self.local_ip,
+            decode_port=self.rank_port,
+            decode_pages=len(local_blocks),
+        ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
@@ -1720,31 +1728,30 @@ class RaidenKVManager(CommonKVManager):
             self._reshard_swa_sources[room] = {}
             if aux_index is not None:
                 self._decode_aux_index[room] = aux_index
-        payload = [
-            MessageTag.RESHARD_REQ,
-            str(room).encode("ascii"),
-            self.local_ip.encode("ascii"),
-            str(self.rank_port).encode("ascii"),
-            push_endpoint.encode("ascii"),
-            pack_ints(list(local_blocks)),
-            str(self.attn_tp_size).encode("ascii"),
-            pack_ints(list(local_swa_blocks or [])),
-            swa_push_endpoint.encode("ascii"),
-        ]
+        payload = ReshardReq(
+            room=room,
+            decode_ip=self.local_ip,
+            decode_port=self.rank_port,
+            push_endpoint=push_endpoint,
+            decode_blocks=list(local_blocks),
+            dst_attn_tp=self.attn_tp_size,
+            decode_swa_blocks=list(local_swa_blocks or []),
+            swa_push_endpoint=swa_push_endpoint,
+        ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])
             self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_req(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_REQ, 9)
-        room = int(msg[1].decode("ascii"))
-        decode_ip = msg[2].decode("ascii")
-        decode_port = int(msg[3].decode("ascii"))
-        push_endpoint = msg[4].decode("ascii")
-        decode_blocks = unpack_ints(msg[5])
-        dst_attn_tp = int(msg[6].decode("ascii"))
-        decode_swa_blocks = unpack_ints(msg[7])
-        swa_push_endpoint = msg[8].decode("ascii")
+        req = ReshardReq.from_frames(msg)
+        room = req.room
+        decode_ip = req.decode_ip
+        decode_port = req.decode_port
+        push_endpoint = req.push_endpoint
+        decode_blocks = req.decode_blocks
+        dst_attn_tp = req.dst_attn_tp
+        decode_swa_blocks = req.decode_swa_blocks
+        swa_push_endpoint = req.swa_push_endpoint
         with self._state_lock:
             if room in self._aborted:
                 return
@@ -1795,23 +1802,22 @@ class RaidenKVManager(CommonKVManager):
                 self._chunk_seq[room] = index + 1
                 self._reshard_chunks.setdefault(room, {})[index] = (start, block_ids)
                 addr = req["reply_addr"]
-            payload = [
-                MessageTag.RESHARD_CHUNK,
-                str(room).encode("ascii"),
-                str(index).encode("ascii"),
-                str(start).encode("ascii"),
-                str(total_pages).encode("ascii"),
-                pack_ints(block_ids),
-                str(self._local_rank).encode("ascii"),
-            ]
+            payload = ReshardChunk(
+                room=room,
+                index=index,
+                start=start,
+                total_pages=total_pages,
+                blocks=block_ids,
+                src_rank=self._local_rank,
+            ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_chunk_ready(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_CHUNK_READY, 4)
-        room = int(msg[1].decode("ascii"))
-        index = int(msg[2].decode("ascii"))
-        uuid = int(msg[3].decode("ascii"))
+        req = ReshardChunkReady.from_frames(msg)
+        room = req.room
+        index = req.index
+        uuid = req.uuid
         with self._state_lock:
             if room in self._aborted:
                 return
@@ -1859,24 +1865,23 @@ class RaidenKVManager(CommonKVManager):
                 self._reshard_replied.add(room)
                 self._reshard_replied_at[room] = time.time()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
-            payload = [
-                MessageTag.RESHARD_BLOCKS,
-                str(room).encode("ascii"),
-                pack_ints(blocks),
-                str(self._local_rank).encode("ascii"),
-                aux_blob,
-                pack_ints(swa_blocks),
-            ]
+            payload = ReshardBlocks(
+                room=room,
+                prefill_blocks=blocks,
+                src_rank=self._local_rank,
+                aux_blob=aux_blob,
+                prefill_swa_blocks=swa_blocks,
+            ).to_frames()
             self._send_multipart_locked(endpoint, payload)
 
     def _on_reshard_chunk(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_CHUNK, 7)
-        room = int(msg[1].decode("ascii"))
-        index = int(msg[2].decode("ascii"))
-        start = int(msg[3].decode("ascii"))
-        total_pages = int(msg[4].decode("ascii"))
-        blocks = unpack_ints(msg[5])
-        src_rank = int(msg[6].decode("ascii"))
+        req = ReshardChunk.from_frames(msg)
+        room = req.room
+        index = req.index
+        start = req.start
+        total_pages = req.total_pages
+        blocks = req.blocks
+        src_rank = req.src_rank
         with self._state_lock:
             if room not in self._reshard_meta or room in self._aborted:
                 return
@@ -1976,12 +1981,7 @@ class RaidenKVManager(CommonKVManager):
             dst_block_ids=dst,
             live_tokens=[self.kv_args.page_size] * window.length,
         )
-        payload = [
-            MessageTag.RESHARD_CHUNK_READY,
-            str(room).encode("ascii"),
-            str(index).encode("ascii"),
-            str(uuid).encode("ascii"),
-        ]
+        payload = ReshardChunkReady(room=room, index=index, uuid=uuid).to_frames()
         if not self._publish_reshard_plan(
             room, req_id, uuid, req, payload, ready_endpoints
         ):
@@ -1989,12 +1989,12 @@ class RaidenKVManager(CommonKVManager):
         return (start, start + length)
 
     def _on_reshard_blocks(self, msg: List[bytes]) -> None:
-        self._require_frames(msg, MessageTag.RESHARD_BLOCKS, 6)
-        room = int(msg[1].decode("ascii"))
-        prefill_blocks = unpack_ints(msg[2])
-        src_rank = int(msg[3].decode("ascii"))
-        aux_blob = msg[4]
-        prefill_swa_blocks = unpack_ints(msg[5])
+        req = ReshardBlocks.from_frames(msg)
+        room = req.room
+        prefill_blocks = req.prefill_blocks
+        src_rank = req.src_rank
+        aux_blob = req.aux_blob
+        prefill_swa_blocks = req.prefill_swa_blocks
         ready = False
         aux_index = None
         with self._state_lock:
@@ -2254,14 +2254,9 @@ class RaidenKVManager(CommonKVManager):
                 if missing:
                     self._chunk_reads.setdefault(room, []).append(str(room))
                 self._final_seen.add(room)
-            payload_pages = pack_ints(missing)
             if not missing:
                 for endpoint in ready_endpoints:
-                    payload = [
-                        MessageTag.RESHARD_READY,
-                        str(room).encode("ascii"),
-                        payload_pages,
-                    ]
+                    payload = ReshardReady(room=room).to_frames()
                     self._send_multipart_locked(endpoint, payload)
                 return
             sources = [
@@ -2307,9 +2302,9 @@ class RaidenKVManager(CommonKVManager):
                 len(local_blocks),
                 local_blocks[:4],
             )
-        ready_payload = [MessageTag.RESHARD_READY, str(room).encode("ascii")]
-        if self.chunked_transfer:
-            ready_payload.append(pack_ints(missing))
+        ready_payload = ReshardReady(
+            room=room, pages=missing if self.chunked_transfer else []
+        ).to_frames()
         self._publish_reshard_plan(
             room,
             str(room),
@@ -2321,15 +2316,9 @@ class RaidenKVManager(CommonKVManager):
         )
 
     def _on_reshard_ready(self, msg: List[bytes]) -> None:
-        # Two frames from a plain reshard; a chunked one appends the pages
-        # its closing plan covers.
-        if len(msg) not in (2, 3):
-            raise ValueError(
-                f"malformed RESHARD_READY message: expected 2 or 3 frames, "
-                f"got {len(msg)}"
-            )
-        room = int(msg[1].decode("ascii"))
-        pages = unpack_ints(msg[2]) if len(msg) > 2 else []
+        req = ReshardReady.from_frames(msg)
+        room = req.room
+        pages = req.pages
         with self._state_lock:
             if room in self._aborted:
                 return

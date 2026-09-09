@@ -428,12 +428,15 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-4096_n-8192_g-32_lhs_quant_rhs_bs-256"
                 "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-256"
             ): _h4096_i4096_fp4_q512_size_dependent(),
-            # H4096-I4096 multi-host: H=4096, I=4096, E=256, EP=16 → g=16.
-            # Reuse the EP=8 (g=32) rhs_bs=256 table — same tiles.
+            # Start from the matching block-scaled table, with the validated
+            # schedule for the largest supported routed-token bucket.
             (
                 "k-4096_n-8192_g-16_lhs_quant_rhs_bs-256"
                 "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-256"
-            ): _h4096_i4096_fp4_q512_size_dependent(),
+            ): {
+                **_h4096_i4096_fp4_q512_size_dependent(),
+                "65536_silu": _H4096_I4096_FP4_Q512_W4A8_SMALL,
+            },
             # H4096-I4096 subchannel FP4 (block_size=512), EP=8 → g=32.
             # rhs_bs=512 matches the LHS online-quant block, so this uses the
             # W4A8-tuned table.

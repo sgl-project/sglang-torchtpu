@@ -64,7 +64,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    RUNAI_STREAMER_TENSOR_ATTR,
+    default_weight_loader,
+)
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -958,20 +961,22 @@ class GptOssForCausalLM(nn.Module):
             )
 
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
-        mxfp4_weights = []
         normal_weights = []
 
-        for name, weight in weights:
-            if (
-                ".experts" in name
-                and self.quant_config is not None
-                and self.quant_config.get_name() == "mxfp4"
-            ):
-                mxfp4_weights.append((name, weight))
-            else:
-                normal_weights.append((name, weight))
+        def expert_weights():
+            # Expert tensors are consumed as they arrive; the non-expert set
+            # is held for the sorted pass below.
+            for name, weight in weights:
+                if (
+                    ".experts" in name
+                    and self.quant_config is not None
+                    and self.quant_config.get_name() == "mxfp4"
+                ):
+                    yield name, weight
+                else:
+                    normal_weights.append((name, _materialize_streamed(weight)))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(expert_weights())
         self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
@@ -1383,6 +1388,13 @@ class GptOssForCausalLM(nn.Module):
 
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
+
+
+def _materialize_streamed(tensor: torch.Tensor) -> torch.Tensor:
+    """Copies a runai-streamed tensor out of the streamer's reused buffer."""
+    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
+        return tensor.clone().detach()
+    return tensor
 
 
 def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]):

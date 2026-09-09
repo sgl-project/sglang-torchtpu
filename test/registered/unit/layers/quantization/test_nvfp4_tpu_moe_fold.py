@@ -571,29 +571,113 @@ class TestNvfp4Block512Contract(CustomTestCase):
         self.assertEqual(call["topk_weights"][1, 1].item(), 0)
         self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
 
-    def test_fused_apply_chunks_large_prefills(self):
+    def test_fused_apply_runs_8k_once_and_chunks_only_above_8k(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe
 
-        num_tokens = 2050
-        hidden_states = torch.randn(num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16)
-        topk_weights = torch.rand(num_tokens, 2, dtype=torch.bfloat16)
+        for num_tokens, expected_call_rows in (
+            (8192, [8192]),
+            (8193, [8192, 1]),
+        ):
+            with self.subTest(num_tokens=num_tokens):
+                hidden_states = torch.randn(
+                    num_tokens, HIDDEN_SIZE, dtype=torch.bfloat16
+                )
+                topk_weights = torch.rand(num_tokens, 2, dtype=torch.bfloat16)
+                topk_ids = torch.zeros(num_tokens, 2, dtype=torch.int64)
+                dispatch_output = types.SimpleNamespace(
+                    hidden_states=hidden_states,
+                    topk_output=(topk_weights, topk_ids, None),
+                )
+                layer = _make_block512_layer(include_unused_params=False)
+                layer._tpu_fused_rs_has_post_expert_norm = False
+                layer._tpu_fused_rs_group_offset = torch.tensor(
+                    [0, 0], dtype=torch.int32
+                )
+                layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
+                    [0], dtype=torch.int32
+                )
+                fused_moe_rs_gather = mock.Mock(
+                    side_effect=lambda **kwargs: kwargs["hidden_states"]
+                )
+                fused_rs_module = types.SimpleNamespace(
+                    fused_moe_rs_gather=fused_moe_rs_gather
+                )
+
+                with mock.patch.dict(
+                    sys.modules,
+                    {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+                ):
+                    result = fp4_moe.apply_tpu_nvfp4_moe(
+                        layer=layer,
+                        dispatch_output=dispatch_output,
+                        activation="silu",
+                        apply_router_weight_on_input=False,
+                        use_fused_rs=True,
+                    )
+
+                self.assertEqual(
+                    fused_moe_rs_gather.call_count, len(expected_call_rows)
+                )
+                self.assertEqual(
+                    [
+                        call.kwargs["hidden_states"].shape[0]
+                        for call in fused_moe_rs_gather.call_args_list
+                    ],
+                    expected_call_rows,
+                )
+                # The shared backend owns collective-ID reuse; the adapter only
+                # issues the same deterministic chunk sequence on every rank.
+                self.assertTrue(
+                    all(
+                        "collective_id" not in call.kwargs
+                        for call in fused_moe_rs_gather.call_args_list
+                    )
+                )
+                torch.testing.assert_close(result.hidden_states, hidden_states)
+
+    def test_fused_apply_chunks_sequence_parallel_inputs_by_local_row(self):
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+
+        rows_per_partition = 4097
+        partition_count = 2
+        num_tokens = rows_per_partition * partition_count
+        # BF16 exactly represents these small repeating IDs, which makes the
+        # partition/chunk order observable without relying on large integers.
+        row_ids = (torch.arange(num_tokens, dtype=torch.int32) % 251).to(torch.bfloat16)
+        hidden_states = row_ids[:, None].expand(-1, HIDDEN_SIZE).contiguous()
+        topk_weights = torch.ones(num_tokens, 2, dtype=torch.bfloat16)
         topk_ids = torch.zeros(num_tokens, 2, dtype=torch.int64)
         dispatch_output = types.SimpleNamespace(
             hidden_states=hidden_states,
             topk_output=(topk_weights, topk_ids, None),
         )
+        prepared_input = types.SimpleNamespace(
+            dispatch_output=dispatch_output,
+            plan=types.SimpleNamespace(keep_output_shard=True),
+            output_token_count=rows_per_partition,
+        )
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
         layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
-        layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor([0], dtype=torch.int32)
+        layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
+            [0, 1], dtype=torch.int32
+        )
+
+        # Model rank 0's output is the first partition of each kernel result.
         fused_moe_rs_gather = mock.Mock(
             side_effect=lambda **kwargs: kwargs["hidden_states"]
         )
         fused_rs_module = types.SimpleNamespace(fused_moe_rs_gather=fused_moe_rs_gather)
-
-        with mock.patch.dict(
-            sys.modules,
-            {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.srt.layers.moe.pallas.fused_moe_rs_op": fused_rs_module},
+            ),
+            mock.patch.object(
+                fp4_moe,
+                "prepare_fused_moe_sequence_parallel_input",
+                return_value=prepared_input,
+            ),
         ):
             result = fp4_moe.apply_tpu_nvfp4_moe(
                 layer=layer,
@@ -603,23 +687,35 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 use_fused_rs=True,
             )
 
-        self.assertEqual(fused_moe_rs_gather.call_count, 3)
         self.assertEqual(
             [
                 call.kwargs["hidden_states"].shape[0]
                 for call in fused_moe_rs_gather.call_args_list
             ],
-            [1024, 1024, 2],
+            [8192, 2],
         )
-        # The shared backend owns collective-ID reuse; the adapter only issues
-        # the same deterministic chunk sequence on every rank.
-        self.assertTrue(
-            all(
-                "collective_id" not in call.kwargs
-                for call in fused_moe_rs_gather.call_args_list
-            )
+        first_call_rows = fused_moe_rs_gather.call_args_list[0].kwargs["hidden_states"][
+            :, 0
+        ]
+        torch.testing.assert_close(
+            first_call_rows,
+            torch.cat(
+                (
+                    row_ids[:4096],
+                    row_ids[rows_per_partition : rows_per_partition + 4096],
+                )
+            ),
         )
-        torch.testing.assert_close(result.hidden_states, hidden_states)
+        second_call_rows = fused_moe_rs_gather.call_args_list[1].kwargs[
+            "hidden_states"
+        ][:, 0]
+        torch.testing.assert_close(
+            second_call_rows,
+            torch.stack((row_ids[4096], row_ids[8193])),
+        )
+        torch.testing.assert_close(
+            result.hidden_states[:, 0], row_ids[:rows_per_partition]
+        )
 
     def test_fused_backend_caches_declared_post_expert_norm_weight(self):
         from sglang.srt.hardware_backend.tpu import fp4_moe

@@ -189,6 +189,13 @@ The nightly single-host jobs are ONE JOB PER TEST FILE (`discover_tests.py` rend
 matrix), so a red job names its test directly — the dashboard contract. Kueue queues
 them against the nightly lane's single-host quota, and they all reuse one image build.
 
+**The leaf job is named after the test.** The nightly nests two reusable workflows deep
+(`nightly-test-tpu.yml` → stage → `_tpu-test.yml`), and the Actions sidebar of a nightly
+run shows only the innermost job's name per leg — the stage job's name is elided. So
+`_tpu-test.yml` names its job from `display_name` (falling back to the suite), and every
+caller passes the test it runs. The stage job keeps the same name, taken from the matrix:
+a static name on a matrix job makes GitHub append every matrix value in parentheses.
+
 **`run_name` has a budget.** It prefixes every Kubernetes object a leg creates, and JobSet
 validates the POD name — `tpu-ci-<run_name>-<5 rand>-<role>-<job idx>-<pod idx>-<5 rand>` —
 against the 63-char DNS-label cap at admission. That leaves `run_name` 34 chars on a slice
