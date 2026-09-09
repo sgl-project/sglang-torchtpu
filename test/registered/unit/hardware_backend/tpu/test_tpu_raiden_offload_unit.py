@@ -295,8 +295,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -312,8 +310,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -340,8 +336,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
-                mgr._announced_at = {}
-                mgr._timeout_s = 120.0
                 mgr._aborted = {}
                 mgr._send_reads = {}
                 mgr.failure_records = {}
@@ -398,8 +392,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -457,8 +449,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -500,8 +490,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     ):
         room = 29
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
@@ -584,8 +572,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -636,8 +622,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = Mock() if swa_limit is not None else None
         mgr._dynamic_host_staging = True
         mgr._pulling = StagingAdmission(pool_pages, swa_pool_pages)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._pulling_cleared = set()
         mgr._full_engine_max_blocks = full_limit
         mgr._swa_engine_max_blocks = swa_limit or 0
@@ -809,8 +793,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -936,8 +918,6 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1057,8 +1037,6 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._chunk_queue = {}
         mgr._chunk_reads = {}
         mgr._announced_spans = {}
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._final_seen = set()
         mgr._completed_send = set()
         mgr._completed_recv = set()
@@ -1630,7 +1608,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1814,8 +1791,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _decode(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1861,8 +1836,6 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._chunk_queue = {}
         mgr._final_seen = set()
         mgr._announced_spans = {}
-        mgr._announced_at = {}
-        mgr._timeout_s = 120.0
         mgr._remote_total = {}
         mgr._completed_send = set()
         mgr._completed_recv = set()
