@@ -129,20 +129,35 @@ def test_weight_blocks_are_packed_in_physical_destination_order():
 
 
 @pytest.mark.parametrize(
-    ("tokens", "plan_type", "name"),
+    ("tokens", "plan_type", "name", "collective_id"),
     (
-        (1024, HybridGatherAllToAllPlan, "gather-8-sources"),
-        (2048, HybridGatherAllToAllPlan, "gather-2-sources"),
-        (4096, AllToAllPlan, "all-to-all"),
-        (8192, AllToAllPlan, "all-to-all"),
-        (16384, AllToAllPlan, "all-to-all-grid"),
+        (1024, HybridGatherAllToAllPlan, "gather-8-sources", 100),
+        (2048, HybridGatherAllToAllPlan, "gather-2-sources", 101),
+        (4096, AllToAllPlan, "all-to-all", 102),
+        (8192, AllToAllPlan, "all-to-all", 102),
+        (16384, AllToAllPlan, "all-to-all-grid", 103),
     ),
 )
-def test_tuned_token_schedule(tokens, plan_type, name):
+def test_tuned_token_schedule(tokens, plan_type, name, collective_id):
     assert supports_token_count(tokens)
     plan = make_schedule_plan(tokens // 16)
     assert isinstance(plan, plan_type)
     assert plan.name == name
+    assert plan.collective_id == collective_id
+
+
+def test_schedule_owned_collective_ids_have_finite_cardinality():
+    ids = {
+        make_schedule_plan(tokens // 16).collective_id
+        for tokens in range(4096, 16385, 1024)
+    }
+    ids.update(
+        {
+            make_schedule_plan(1024 // 16).collective_id,
+            make_schedule_plan(2048 // 16).collective_id,
+        }
+    )
+    assert ids == {100, 101, 102, 103}
 
 
 def test_inlined_ici_schedule_keeps_the_tuned_hypercube_routes():
@@ -180,6 +195,64 @@ def test_runtime_contract_accepts_only_tuned_bf16_shapes():
         gain,
         metadata,
     )
+
+
+def test_layer_collective_id_is_not_forwarded_to_exported_op(monkeypatch):
+    hidden = torch.empty((64, 8192), dtype=torch.bfloat16, device="meta")
+    weight = torch.empty((8192, 16 * 1152), dtype=torch.bfloat16, device="meta")
+    gain = torch.empty((8192,), dtype=torch.bfloat16, device="meta")
+    cos = torch.empty((64, 64), dtype=torch.float32, device="meta")
+    sin = torch.empty((64, 64), dtype=torch.float32, device="meta")
+    metadata = torch.empty((18,), dtype=torch.int32, device="meta")
+    calls = []
+    sentinel = (object(), object(), object(), object())
+
+    def exported_op(*args):
+        calls.append(args)
+        return sentinel
+
+    monkeypatch.setattr(qkvog, "_FUSED_QKVOG_OP", exported_op)
+    kwargs = {
+        "eps": 1e-5,
+        "eps_qk": 1e-5,
+        "scale_query_by": 1.0,
+        "use_qk_norm": True,
+        "use_rope": True,
+    }
+    for layer_collective_id in (100, 161):
+        assert (
+            qkvog.tpu_sp_fused_qkvog(
+                hidden,
+                weight,
+                gain,
+                cos,
+                sin,
+                metadata,
+                collective_id=layer_collective_id,
+                **kwargs,
+            )
+            is sentinel
+        )
+
+    assert len(calls) == 2
+    for args in calls:
+        assert len(args) == 11
+        assert all(
+            actual is expected
+            for actual, expected in zip(
+                args[:6],
+                (
+                    hidden,
+                    weight,
+                    gain,
+                    cos,
+                    sin,
+                    metadata,
+                ),
+                strict=True,
+            )
+        )
+        assert args[6:] == (1e-5, 1e-5, 1.0, True, True)
 
 
 if __name__ == "__main__":

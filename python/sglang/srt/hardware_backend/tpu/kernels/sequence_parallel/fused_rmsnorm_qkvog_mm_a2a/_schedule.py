@@ -42,6 +42,7 @@ class AllToAllPlan:
     """Project local rows for every destination and exchange completed tiles."""
 
     name: str
+    collective_id: int
     local_rows: int
     row_block_rows: int
     destination_orders: tuple[tuple[int, ...], ...]
@@ -65,6 +66,7 @@ class HybridGatherAllToAllPlan:
     """Gather source rows before projecting and exchanging destination tiles."""
 
     name: str  # Human-readable schedule name used in benchmark output.
+    collective_id: int  # Stable barrier channel shared by equivalent invocations.
     local_rows: int  # Token rows initially owned by each rank.
     destinations_per_rank: int  # Output destinations projected by each rank.
     # Gather waves. Each entry identifies the peer link and source slot to
@@ -86,6 +88,15 @@ class HybridGatherAllToAllPlan:
 
 
 SchedulePlan = AllToAllPlan | HybridGatherAllToAllPlan
+
+# Mosaic embeds the barrier channel in the compiled custom-call body. Keep this
+# namespace finite and schedule-owned: a layer-owned ID would turn every layer
+# into a separate TorchTPU/Pallas specialization. Different synchronization
+# patterns retain different IDs, as required by Pallas collective semantics.
+_GATHER_8_SOURCES_COLLECTIVE_ID = 100
+_GATHER_2_SOURCES_COLLECTIVE_ID = 101
+_ALL_TO_ALL_COLLECTIVE_ID = 102
+_ALL_TO_ALL_GRID_COLLECTIVE_ID = 103
 
 
 def supports_token_count(global_tokens: int) -> bool:
@@ -131,6 +142,7 @@ def make_schedule_plan(local_rows: int) -> SchedulePlan:
     if local_rows == 64:
         return HybridGatherAllToAllPlan(
             name="gather-8-sources",
+            collective_id=_GATHER_8_SOURCES_COLLECTIVE_ID,
             local_rows=local_rows,
             destinations_per_rank=2,
             routing_steps=_eight_source_gather_steps(),
@@ -144,6 +156,7 @@ def make_schedule_plan(local_rows: int) -> SchedulePlan:
     if local_rows == 128:
         return HybridGatherAllToAllPlan(
             name="gather-2-sources",
+            collective_id=_GATHER_2_SOURCES_COLLECTIVE_ID,
             local_rows=local_rows,
             destinations_per_rank=8,
             routing_steps=(((1, 0),),),
@@ -160,6 +173,11 @@ def make_schedule_plan(local_rows: int) -> SchedulePlan:
         )
     return AllToAllPlan(
         name="all-to-all-grid" if local_rows > 512 else "all-to-all",
+        collective_id=(
+            _ALL_TO_ALL_GRID_COLLECTIVE_ID
+            if local_rows > 512
+            else _ALL_TO_ALL_COLLECTIVE_ID
+        ),
         local_rows=local_rows,
         row_block_rows=min(local_rows, 512),
         destination_orders=_ALL_TO_ALL_DESTINATION_ORDERS,

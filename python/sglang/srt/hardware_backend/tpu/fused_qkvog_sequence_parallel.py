@@ -305,7 +305,6 @@ def _build_fused_qkvog_op() -> Callable:
             scale_query_by: float,
             use_qk_norm: bool,
             use_rope: bool,
-            collective_id: int,
         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
             return fused_rmsnorm_qkvog_mm_a2a(
                 hidden_states,
@@ -322,7 +321,6 @@ def _build_fused_qkvog_op() -> Callable:
                 use_qk_norm=use_qk_norm,
                 use_rope=use_rope,
                 kv_dtype=jnp.bfloat16,
-                collective_id=collective_id,
             )
 
         # ``from __future__ import annotations`` stringizes the inline types,
@@ -340,7 +338,6 @@ def _build_fused_qkvog_op() -> Callable:
             "scale_query_by": float,
             "use_qk_norm": bool,
             "use_rope": bool,
-            "collective_id": int,
             "return": tuple[jax.Array, jax.Array, jax.Array, jax.Array],
         }
 
@@ -355,7 +352,6 @@ def _build_fused_qkvog_op() -> Callable:
                 P("model", None),
                 P("model", None),
                 P("model"),
-                None,
                 None,
                 None,
                 None,
@@ -423,9 +419,15 @@ def tpu_sp_fused_qkvog(
     scale_query_by: float,
     use_qk_norm: bool,
     use_rope: bool,
-    collective_id: int,
+    collective_id: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A."""
+    """Run fused RMSNorm, QKVOG projection, Q/K epilogue, and token/head A2A.
+
+    ``collective_id`` remains accepted for compatibility with serving callers,
+    but is intentionally not forwarded to the exported custom op. The Pallas
+    implementation owns a finite channel namespace by schedule so layer IDs do
+    not create otherwise-identical compiler specializations.
+    """
     if not can_use_tpu_sp_fused_qkvog(
         hidden_states,
         packed_weight,
@@ -451,7 +453,6 @@ def tpu_sp_fused_qkvog(
         scale_query_by,
         use_qk_norm,
         use_rope,
-        collective_id,
     )
 
 

@@ -264,6 +264,40 @@ def test_matches_jax_reference_and_is_deterministic(
         _assert_addressable_shards_close(actual_part, expected_part)
 
 
+@pytest.mark.parametrize("tokens", (1024, 4096))
+def test_schedule_owned_collective_channel_is_reuse_safe(
+    tp16_mesh,
+    weight_and_gain,
+    tokens,
+):
+    """Reuse one hybrid/direct executable enough times to expose rank runahead."""
+    weight, gain = weight_and_gain
+    x, cos, sin = _make_inputs(tp16_mesh, tokens)
+    kwargs = {
+        "mesh": tp16_mesh,
+        "axis_name": "tp",
+        "eps": _EPS,
+        "eps_qk": _EPS_QK,
+        "scale_query_by": _QUERY_SCALE,
+        "use_qk_norm": True,
+        "use_rope": True,
+        "kv_dtype": jnp.bfloat16,
+    }
+    candidate_fn = jax.jit(functools.partial(fused_rmsnorm_qkvog_mm_a2a, **kwargs))
+    reference_fn = jax.jit(functools.partial(jax_rmsnorm_qkvog_mm_a2a, **kwargs))
+    expected = reference_fn(x, weight, gain, cos, sin)
+    jax.block_until_ready(expected)
+
+    # Eight sequential launches match the established distributed-kernel reuse
+    # regression pattern. The first launch compiles; every later launch reuses
+    # both the executable and its schedule-owned global barrier channel.
+    for _ in range(8):
+        actual = candidate_fn(x, weight, gain, cos, sin)
+        jax.block_until_ready(actual)
+        for actual_part, expected_part in zip(actual, expected, strict=True):
+            _assert_addressable_shards_close(actual_part, expected_part)
+
+
 def test_fp32_input_norm_matches_jax_reference(tp16_mesh, weight_and_gain):
     """Preserve FP32 input math until the BF16 projection boundary."""
     tokens = 1024

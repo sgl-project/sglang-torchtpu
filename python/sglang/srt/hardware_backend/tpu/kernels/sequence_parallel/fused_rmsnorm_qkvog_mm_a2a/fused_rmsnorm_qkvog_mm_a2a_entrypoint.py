@@ -169,7 +169,7 @@ def fused_rmsnorm_qkvog_mm_a2a(
     use_qk_norm: bool = True,
     use_rope: bool = True,
     kv_dtype: Any = jnp.bfloat16,
-    collective_id: int = 0,
+    collective_id: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Run the tuned TP16 fused SP attention-entry operation.
 
@@ -185,7 +185,9 @@ def fused_rmsnorm_qkvog_mm_a2a(
         rank_metadata: Token-sharded ``[16 * 18]`` int32 metadata. Each local
             row is ``[physical_id, logical_id, *physical_to_logical]``. ``None``
             selects identity placement for native JAX callers.
-        collective_id: Pallas collective channel identifier.
+        collective_id: Optional Pallas collective channel override. The default
+            uses the schedule's stable channel so equivalent layer invocations
+            share one compiled kernel safely.
 
     Returns:
         Attention-ready ``(q, k, v, og)`` with global shapes
@@ -246,6 +248,8 @@ def fused_rmsnorm_qkvog_mm_a2a(
 
     local_rows = x.shape[0] // TP_SIZE
     plan = make_schedule_plan(local_rows)
+    if collective_id is None:
+        collective_id = plan.collective_id
     local_operation = functools.partial(
         _run_local_schedule,
         axis_name=axis_name,

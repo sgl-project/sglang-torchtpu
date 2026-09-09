@@ -52,6 +52,24 @@ def _signal_all_peers(axis_name: str) -> None:
         )
 
 
+def _wait_for_all_peers_reuse_safe(axis_name: str) -> None:
+    """Finish the global barrier without leaking signals across invocations."""
+    pltpu.semaphore_wait(pltpu.get_barrier_semaphore(), TP_SIZE)
+
+    # A fast rank must not re-enter the next invocation and signal the global
+    # barrier before every peer consumed this invocation's signals. Rendezvous
+    # once more on a fresh scoped semaphore before any rank can leave setup.
+    @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
+    def _(second_barrier):
+        for peer in range(TP_SIZE):
+            pltpu.semaphore_signal(
+                second_barrier,
+                device_id={axis_name: jnp.int32(peer)},
+                device_id_type=pltpu.DeviceIdType.MESH,
+            )
+        pltpu.semaphore_wait(second_barrier, TP_SIZE)
+
+
 def _kernel_a2a(
     rank_metadata_ref,
     x_hbm_ref,
@@ -448,7 +466,7 @@ def _kernel_a2a(
             # Projection is independent of remote output buffers, so wait for
             # the setup barrier only immediately before the first send.
             if destination_round == 0:
-                pltpu.semaphore_wait(pltpu.get_barrier_semaphore(), TP_SIZE)
+                _wait_for_all_peers_reuse_safe(axis_name)
 
             # This is the all-to-all itself: send this source rank's fixed row
             # interval to the physical rank that owns these Q/K/V/OG columns.

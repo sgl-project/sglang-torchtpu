@@ -256,6 +256,20 @@ def _kernel_hybrid_gather_a2a(
             ).astype(gathered_x.dtype)
         pl.semaphore_wait(barrier, len(neighbor_masks))
 
+        # Do not let a fast neighbor's next invocation satisfy a slow rank's
+        # current global wait. A fresh scoped semaphore keeps this second phase
+        # independent while ensuring every peer consumed the global signals.
+        @functools.partial(pl.run_scoped, second_barrier=pltpu.SemaphoreType.REGULAR)
+        def _(second_barrier):
+            for mask in neighbor_masks:
+                pl.semaphore_signal(
+                    second_barrier,
+                    inc=1,
+                    device_id=peer(lax.bitwise_xor(my_id, jnp.int32(mask))),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            pl.semaphore_wait(second_barrier, len(neighbor_masks))
+
         def gather_copy(step_index, entry_index, semaphore_index, *, rope=False):
             link_mask, slot_xor = plan.routing_steps[step_index][entry_index]
             if destination_count == 8:

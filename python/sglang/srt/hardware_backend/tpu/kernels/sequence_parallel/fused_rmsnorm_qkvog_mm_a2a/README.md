@@ -55,17 +55,37 @@ equivalent all-gather then QKVOG path selected by the caller.
 
 ## Static schedules
 
-| Global tokens | Local rows | Schedule | Work per rank |
-| ---: | ---: | --- | --- |
-| 1024 | 64 | `gather-8-sources` | Gather eight source shards and project two physical destinations. |
-| 2048 | 128 | `gather-2-sources` | Gather the sibling core and project eight destinations. |
-| 4096 | 256 | `all-to-all` | Project local rows for all destinations and push completed tiles. |
-| 8192 | 512 | `all-to-all` | Same direct output pipeline with taller local matmuls. |
-| 16384 | 1024 | `all-to-all-grid` | Run the direct schedule in bounded 512-row blocks. |
+| Global tokens | Local rows | Schedule | Collective ID | Work per rank |
+| ---: | ---: | --- | ---: | --- |
+| 1024 | 64 | `gather-8-sources` | 100 | Gather eight source shards and project two physical destinations. |
+| 2048 | 128 | `gather-2-sources` | 101 | Gather the sibling core and project eight destinations. |
+| 4096 | 256 | `all-to-all` | 102 | Project local rows for all destinations and push completed tiles. |
+| 8192 | 512 | `all-to-all` | 102 | Same direct output pipeline with taller local matmuls. |
+| 16384 | 1024 | `all-to-all-grid` | 103 | Run the direct schedule in bounded 512-row blocks. |
 
 All schedules overlap asynchronous remote copies with useful work. The 1K and
 2K variants gather just enough rows to keep the MXU efficient; larger shapes
 avoid activation movement and exchange only completed projection tiles.
+
+## Collective channel reuse
+
+The schedule, rather than the model layer, owns the Pallas collective ID.
+Mosaic serializes this ID into the custom-call body, so a layer-specific value
+would create one TorchTPU/Pallas specialization per layer even when tensor
+shapes and kernel behavior are identical. The finite IDs in the table preserve
+separate channels for different synchronization patterns without multiplying
+specializations by model depth.
+
+Equivalent invocations safely reuse a channel through a two-phase setup
+barrier. After every rank consumes the global barrier signals, all peers meet
+again on a fresh scoped regular semaphore. This prevents a fast rank from
+entering the next invocation and contributing a signal to a slower rank's
+previous invocation. Both the hybrid and direct schedules use this protocol.
+
+The lower-level JAX entrypoint accepts an explicit collective-ID override for
+specialized callers. The Torch adapter intentionally uses the schedule-owned
+default; its legacy `collective_id` keyword remains source-compatible but does
+not enter the exported custom-op signature or compilation key.
 
 ## Source layout
 
@@ -78,6 +98,3 @@ avoid activation movement and exchange only completed projection tiles.
 - `_kernel_a2a.py` implements the 4K--16K direct-output pipeline.
 - `_epilogue.py` centralizes QKVOG splitting, Q/K normalization, scaling,
   RoPE, and output dtype semantics.
-
-Callers must assign distinct collective IDs to concurrently live layer
-programs.
