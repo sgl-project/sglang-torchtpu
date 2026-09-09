@@ -973,6 +973,10 @@ def _is_rank2_grid(value):
 
 def _slice_value(value, start, end):
     if isinstance(value, torch.Tensor):
+        if _is_tpu:
+            # Materialize per-item tensors so pickling a slice does not serialize
+            # its entire parent storage.
+            return value[start:end].clone()
         return value[start:end]
     if isinstance(value, np.ndarray):
         return value[start:end]

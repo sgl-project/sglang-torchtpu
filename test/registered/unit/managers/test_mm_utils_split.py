@@ -11,7 +11,9 @@ recognize both keys, fall back cleanly when no usable grid is present, and not
 mis-split a degenerate flat grid. No server / GPU / weight loading involved.
 """
 
+import pickle
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -139,6 +141,49 @@ class TestGetNewExpandedMMItems(CustomTestCase):
 
         self.assertEqual(len(out), 1)
         self.assertIs(out[0], item)
+
+    @patch("sglang.srt.managers.mm_utils._is_tpu", True)
+    def test_split_tensors_own_storage(self):
+        # Large tensors keep pickle metadata overhead negligible.
+        hidden_size = 1536
+        cases = [
+            (Modality.IMAGE, "image_grid_thw", count, 1) for count in (2, 8, 16)
+        ] + [(Modality.VIDEO, "video_grid_thw", 2, 2)]
+
+        for modality, grid_key, count, frames in cases:
+            for field in ("feature", "precomputed_embeddings"):
+                with self.subTest(modality=modality, count=count, field=field):
+                    rows = frames * 256
+                    parent = torch.arange(
+                        count * rows * hidden_size, dtype=torch.float32
+                    ).reshape(count * rows, hidden_size)
+                    item = MultimodalDataItem(
+                        modality=modality,
+                        offsets=[(i, i + 1) for i in range(count * frames)],
+                        model_specific_data={grid_key: [[frames, 16, 16]] * count},
+                        **{field: parent},
+                    )
+                    items = get_new_expanded_mm_items([item])
+                    logical_bytes = parent.numel() * parent.element_size()
+
+                    # Check both IPC protocols and receiver-side storage.
+                    variants = [items]
+                    for protocol in (pickle.DEFAULT_PROTOCOL, pickle.HIGHEST_PROTOCOL):
+                        payload = pickle.dumps(items, protocol=protocol)
+                        self.assertLess(len(payload), logical_bytes * 1.2)
+                        variants.append(pickle.loads(payload))
+
+                    for split_items in variants:
+                        self.assertEqual(len(split_items), count)
+                        for split_item, expected in zip(
+                            split_items, parent.split(rows)
+                        ):
+                            tensor = getattr(split_item, field)
+                            self.assertTrue(torch.equal(tensor, expected))
+                            self.assertEqual(
+                                tensor.untyped_storage().nbytes(),
+                                tensor.numel() * tensor.element_size(),
+                            )
 
 
 if __name__ == "__main__":
