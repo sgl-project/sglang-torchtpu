@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from ._contract import COLUMNS_PER_DESTINATION, HEAD_DIM, HIDDEN_SIZE, TP_SIZE
@@ -228,7 +228,7 @@ def fused_rmsnorm_qkvog_mm_a2a(
     cos, sin = _validate_rope_inputs(x, cos, sin, use_rope=use_rope)
     if rank_metadata is None:
         logical_ranks = np.arange(TP_SIZE, dtype=np.int32)
-        rank_metadata = jnp.asarray(
+        rank_metadata = jax.device_put(
             np.concatenate(
                 (
                     logical_ranks[:, None],
@@ -236,7 +236,8 @@ def fused_rmsnorm_qkvog_mm_a2a(
                     np.broadcast_to(logical_ranks, (TP_SIZE, TP_SIZE)),
                 ),
                 axis=1,
-            ).reshape(-1)
+            ).reshape(-1),
+            NamedSharding(mesh, P(axis_name)),
         )
     if rank_metadata.shape != (TP_SIZE * (TP_SIZE + 2),):
         raise ValueError(
