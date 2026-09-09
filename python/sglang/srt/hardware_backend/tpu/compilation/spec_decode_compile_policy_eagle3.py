@@ -35,7 +35,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec, process_model_config
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -202,6 +202,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             if self.is_draft_worker
             else 0
         )
+        # Only a multimodal target ever hands the draft input embeds, and the
+        # draft's own model_config is the text-only EAGLE3 checkpoint, so read
+        # the target's.
+        self.target_is_multimodal = process_model_config().is_multimodal
 
     def prepare_spec_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket a draft forward before constructing attention metadata."""
@@ -705,8 +709,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         assert self.b_bucketer is not None
         bs = self._extend_compile_cap()
         # A multimodal prefill hands the draft the target's embeds, which the
-        # draft reads instead of calling embed_tokens -- a separate graph.
-        variants = ("plain", "mm_embeds")
+        # draft reads instead of calling embed_tokens -- a separate graph. A
+        # multimodal target still serves text-only requests, so both stay live.
+        variants = ("plain", "mm_embeds") if self.target_is_multimodal else ("plain",)
         valid_shapes = [
             (t, bs, variant)
             for t in self.t_bucketer.buckets

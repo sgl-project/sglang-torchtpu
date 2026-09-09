@@ -1378,17 +1378,35 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
     )
 
 
+@contextlib.contextmanager
+def _target_model_config(is_multimodal=False):
+    """Stand in for the target ModelConfig a spec policy reads at construction.
+
+    The published test config points at a dummy model path, so the real
+    accessor would go looking for an HF config that does not exist."""
+    with patch(
+        _SPEC_POLICY + "process_model_config",
+        return_value=SimpleNamespace(is_multimodal=is_multimodal),
+    ):
+        yield
+
+
 def _make_spec_policy(
-    model_runner=None, token_buckets=(8, 64), bs_buckets=(1, 4), **mr_kwargs
+    model_runner=None,
+    token_buckets=(8, 64),
+    bs_buckets=(1, 4),
+    target_is_multimodal=False,
+    **mr_kwargs,
 ):
     if model_runner is None:
         model_runner = _spec_model_runner(**mr_kwargs)
-    policy = SpecDecoderTpuCompilePolicy(
-        model_runner=model_runner,
-        t_bucketer=Bucketer(name="Token", buckets=list(token_buckets)),
-        b_bucketer=Bucketer(name="Bs", buckets=list(bs_buckets)),
-        owner=model_runner.model,
-    )
+    with _target_model_config(target_is_multimodal):
+        policy = SpecDecoderTpuCompilePolicy(
+            model_runner=model_runner,
+            t_bucketer=Bucketer(name="Token", buckets=list(token_buckets)),
+            b_bucketer=Bucketer(name="Bs", buckets=list(bs_buckets)),
+            owner=model_runner.model,
+        )
     # install() normally creates this; these tests construct the policy directly.
     policy.compiled_forward_shim = CompiledForwardShim(
         model_runner.model.forward, policy=policy
@@ -1458,10 +1476,28 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy._precompile_draft_prefill_extend()
 
-        self.assertEqual(
-            mr.attn_backend.calls,
-            [(1024, 16), (1024, 16), (4096, 16), (4096, 16)],
-        )
+        self.assertEqual(mr.attn_backend.calls, [(1024, 16), (4096, 16)])
+
+    def test_draft_prefill_adds_embeds_variant_only_for_a_multimodal_target(self):
+        """Only a multimodal target hands the draft input embeds.
+
+        A text-only target never takes that path, so compiling it would double
+        the draft EXTEND warmup for every text-only deployment."""
+        seen = []
+        for target_is_multimodal in (False, True):
+            mr = _spec_model_runner(is_draft_worker=True)
+            policy = _make_spec_policy(
+                mr,
+                token_buckets=(1024,),
+                bs_buckets=(16,),
+                target_is_multimodal=target_is_multimodal,
+            )
+            policy.extend_bs = 16
+            with get_parallel().override(tp_rank=1):
+                policy._precompile_draft_prefill_extend()
+            seen.append(len(mr.attn_backend.calls))
+
+        self.assertEqual(seen, [1, 2])
 
     def test_infers_eagle_aux_hidden_width_from_config(self):
         mr = _spec_model_runner(is_draft_worker=True)
@@ -1552,16 +1588,14 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_backend, draft_extend_backend)
 
-        # Each prefill token bucket is compiled twice: with and without the
-        # target's multimodal embeds.
-        self.assertEqual(mr.attn_backend.calls, [(8, 4), (8, 4), (64, 4), (64, 4)])
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
         self.assertEqual(decode_backends[0].calls, [(1, 1), (4, 4)])
         self.assertEqual(decode_backends[1].calls, [(1, 1), (4, 4)])
         self.assertEqual(draft_extend_backend.calls, [(4, 1), (16, 4)])
         modes = [call.args[2].forward_mode for call in mr.model.forward.call_args_list]
         self.assertEqual(
             modes,
-            [ForwardMode.EXTEND] * 4
+            [ForwardMode.EXTEND] * 2
             + [ForwardMode.DECODE] * 4
             + [ForwardMode.DRAFT_EXTEND_V2] * 2,
         )
@@ -1570,7 +1604,7 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         ]
         self.assertEqual(
             capture_modes,
-            [CaptureHiddenMode.LAST] * 8 + [CaptureHiddenMode.FULL] * 2,
+            [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
         )
 
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
@@ -2844,16 +2878,16 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         with get_parallel().override(tp_rank=1):
             policy.precompile_draft(draft_attn_backend, draft_extend_attn_backend)
 
-        # EXTEND(LAST) 2 token buckets x 2 mm variants at the bs cap
-        # + DECODE 2 bs x 3 steps + DRAFT_EXTEND_V2 2 bs buckets.
-        self.assertEqual(mr.model.forward.call_count, 4 + 6 + 2)
+        # EXTEND(LAST) 2 token buckets at the bs cap (text-only target, so no
+        # embeds variant) + DECODE 2 bs x 3 steps + DRAFT_EXTEND_V2 2 bs buckets.
+        self.assertEqual(mr.model.forward.call_count, 2 + 6 + 2)
         # Draft decode warms each step's own backend, not the runner's.
         self.assertEqual([len(b.calls) for b in step_backends], [2, 2, 2])
         self.assertEqual(step_backends[0].calls, [(1, 1), (4, 4)])
         # DRAFT_EXTEND_V2: bs * draft_token_num tokens per shape.
         self.assertEqual(draft_extend_attn_backend.calls, [(4, 1), (16, 4)])
         # Only the draft-prefill EXTEND shapes go to the runner's own backend.
-        self.assertEqual(mr.attn_backend.calls, [(8, 4), (8, 4), (64, 4), (64, 4)])
+        self.assertEqual(mr.attn_backend.calls, [(8, 4), (64, 4)])
 
     def test_target_worker_skips_draft_precompile(self):
         mr = _spec_model_runner(is_draft_worker=False)
@@ -2918,12 +2952,13 @@ def _policy():
         is_draft_worker=False,
         model_config=SimpleNamespace(hidden_size=16, model_is_mrope=False),
     )
-    return SpecDecoderTpuCompilePolicy(
-        model_runner=model_runner,
-        t_bucketer=Bucketer(name="Token", buckets=[PADDED_TOKENS]),
-        b_bucketer=Bucketer(name="Bs", buckets=[1, BUCKET_BS]),
-        owner=model_runner.model,
-    )
+    with _target_model_config():
+        return SpecDecoderTpuCompilePolicy(
+            model_runner=model_runner,
+            t_bucketer=Bucketer(name="Token", buckets=[PADDED_TOKENS]),
+            b_bucketer=Bucketer(name="Bs", buckets=[1, BUCKET_BS]),
+            owner=model_runner.model,
+        )
 
 
 @contextlib.contextmanager
