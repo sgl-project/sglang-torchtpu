@@ -877,12 +877,19 @@ def _dp_gather_via_all_gatherv(
     get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
+def _note_dp_gather_in_prefill_graph() -> None:
+    dp = get_flags().dp
+    if dp.capturing_prefill_graph:
+        dp.prefill_graph_has_dp_gather = True
+
+
 def _dp_gather(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    _note_dp_gather_in_prefill_graph()
     # NOTE: compare against DpPaddingMode.MAX_LEN directly rather than calling
     # dp_padding_mode.is_max_len() — this runs inside a compiled forward, where
     # the enum's bound method can cause tracing errors under full compilation
@@ -946,6 +953,7 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
 ):
+    _note_dp_gather_in_prefill_graph()
     if _is_tpu:
         # TPU supports MAX_LEN only (SUM_LEN is ragged and not supported by TPU)
         assert forward_batch.dp_padding_mode == DpPaddingMode.MAX_LEN, (
@@ -991,6 +999,7 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    _note_dp_gather_in_prefill_graph()
     if is_dp_gatherv_active():
         # Variable-length combine matching all_gatherv dispatch: scatter the
         # global (sum_len) tensor back to per-rank token counts. Fall through to
