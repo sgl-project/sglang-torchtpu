@@ -13,6 +13,16 @@ def build_topk1_verify_chain_torch(
     The fused TPU draft loop calls this before returning so tree construction
     stays in the same compiled program. The ordinary path also uses it as its
     torch-native fallback.
+
+    Args:
+        bonus_tokens: Bonus token IDs with shape ``[bs]``.
+        draft_tokens: Draft token IDs with shape ``[bs, num_draft_tokens]``.
+        seq_lens: Prefix lengths with shape ``[bs]``.
+
+    Returns:
+        An empty tree mask with shape ``[0]``, followed by positions, retrieve
+        indices, next-token indices, next-sibling indices, and verification
+        tokens, each with shape ``[bs, num_draft_tokens + 1]``.
     """
     bs = seq_lens.shape[0]
     num_verify_tokens = draft_tokens.shape[1] + 1
