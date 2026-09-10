@@ -941,7 +941,19 @@ class RaidenKVManager(CommonKVManager):
             self._remote_swa_blocks[room] = remote_swa_blocks
             self._remote_swa_endpoint[room] = swa_endpoint
             aux_index = self._decode_aux_index.get(room)
+            # Written under the lock: a room failing concurrently frees its
+            # metadata slot, and the write must never land in a reused one.
+            if aux_index is not None and aux_blob and room not in self._aborted:
+                write_aux_blob(
+                    self.kv_args.aux_data_ptrs,
+                    self.kv_args.aux_item_lens,
+                    aux_index,
+                    aux_blob,
+                )
             if self.chunked_transfer:
+                holds_nothing = (
+                    room in self._local_blocks and not self._local_blocks[room]
+                )
                 spans = self._announced_spans.get(room, [])
                 total = len(remote_blocks)
                 if self._remote_total.get(room, total) != total:
@@ -955,10 +967,16 @@ class RaidenKVManager(CommonKVManager):
                     )
                 self._remote_total[room] = total
                 missing = self._uncovered_pages(total, spans)
-                if missing:
+                if holds_nothing:
+                    # Full prefix hit: BLOCKS and its aux blob complete
+                    # reception on both engines without a closing read.
+                    self._completed_recv.add(str(room))
+                    if self._swa_engine is not None:
+                        self._completed_recv.add(self._swa_req_id(room))
+                elif missing:
                     self._chunk_queue.setdefault(room, []).append(
                         (
-                            str(room),
+                            str(room),  # Request ID; the integer below is the UUID.
                             room,
                             missing,
                             [remote_blocks[p] for p in missing],
@@ -966,15 +984,6 @@ class RaidenKVManager(CommonKVManager):
                         )
                     )
                 self._final_seen.add(room)
-            # Written under the lock: a room failing concurrently frees its
-            # metadata slot, and the write must never land in a reused one.
-            if aux_index is not None and aux_blob and room not in self._aborted:
-                write_aux_blob(
-                    self.kv_args.aux_data_ptrs,
-                    self.kv_args.aux_item_lens,
-                    aux_index,
-                    aux_blob,
-                )
 
     # ----- prefill side ------------------------------------------------------
 

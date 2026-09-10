@@ -27,8 +27,9 @@ prefill announces them, and the decode pulls each piece as soon as the host
 staging pool can seat it, so only the last chunk's transfer is left after the prefill. The
 closing message carries the aux blob and the remaining pages. A request keeps
 one chunk in flight at a time, and pages the decode already holds from its own
-prefix cache are never announced. A hybrid model's sliding-window pages ride on
-the closing read, since the window is only settled when the prefill ends.
+prefix cache are never announced; a decode that already holds every page settles
+the request on the closing message alone. A hybrid model's sliding-window pages
+ride on the closing read, since the window is only settled when the prefill ends.
 
 ## Asymmetric attention TP (strided push-resharding)
 
