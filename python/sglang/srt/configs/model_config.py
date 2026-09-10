@@ -1660,7 +1660,6 @@ class ModelConfig:
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
-            "gptq",
             "fp8",
             "compressed_tensors",
             "compressed-tensors",
