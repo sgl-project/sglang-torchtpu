@@ -23,8 +23,18 @@ def _patch_budget() -> int:
     return precompiled_max_patch_count()
 
 
+def _item_patch_grid(item: MultimodalDataItem) -> object | None:
+    if item.is_video():
+        return item.model_specific_data.get("video_grid_thw")
+    if item.is_image():
+        return item.model_specific_data.get("image_grid_thw")
+    return None
+
+
 def _item_patch_count(item: MultimodalDataItem) -> int:
-    grid = item.video_grid_thw if item.is_video() else item.image_grid_thw
+    grid = _item_patch_grid(item)
+    if grid is None:
+        raise ValueError("multimodal item does not expose a vision patch grid")
     return int(torch.as_tensor(grid).prod().item())
 
 
@@ -57,6 +67,12 @@ def encode_vision_items(
     for a bounded set of patch counts, so a batch above the largest one falls off
     the set and recompiles.
     """
+    # Some external processors derive patch geometry from feature tensors and
+    # own their batching. Apply this generic split only when every item exposes
+    # the grid metadata it requires.
+    if any(_item_patch_grid(item) is None for item in items):
+        return data_embedding_func(items)
+
     budget = _patch_budget()
     groups = _split_items_by_patch_budget(items, budget)
     if len(groups) == 1:

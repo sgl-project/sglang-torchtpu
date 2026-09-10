@@ -11,7 +11,7 @@ involved.
 """
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -115,6 +115,28 @@ class TestEncodeVisionItems(CustomTestCase):
         embedder = _RecordingEmbedder()
         self._encode([_image(14372)], embedder)
         self.assertEqual(embedder.calls, [14372])
+
+    def test_items_without_patch_grids_use_model_owned_batching(self):
+        cases = (
+            (Modality.IMAGE, torch.zeros(3, 28, 28)),
+            (Modality.VIDEO, torch.zeros(2, 3, 28, 28)),
+        )
+        for modality, feature in cases:
+            with self.subTest(modality=modality):
+                items = [
+                    MultimodalDataItem(
+                        modality=modality,
+                        feature=feature,
+                        offsets=[(0, 1)],
+                    )
+                ]
+                expected = torch.ones(2, 3)
+                embedder = Mock(return_value=expected)
+
+                result = self._encode(items, embedder, budget=1)
+
+                self.assertIs(result, expected)
+                embedder.assert_called_once_with(items)
 
 
 class TestSharedDispatch(CustomTestCase):
