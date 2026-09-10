@@ -12,9 +12,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_common import (
-    _select_verify_bookkeeping_seq_lens,
-)
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -126,28 +123,6 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
                 self.assertEqual(fast_index.dtype, torch.long)
                 self.assertTrue(fast_parent.is_contiguous())
                 self.assertTrue(fast_index.is_contiguous())
-
-    def test_idle_dp_rank_uses_logical_seq_lens_for_verify_bookkeeping(self):
-        physical_seq_lens = torch.tensor([8])
-        logical_seq_lens = torch.empty(0, dtype=torch.int64)
-        batch = SimpleNamespace(seq_lens=physical_seq_lens)
-        idle_padding = SimpleNamespace(
-            state=SimpleNamespace(logical_batch_size=0),
-            seq_lens=logical_seq_lens,
-        )
-        active_padding = SimpleNamespace(
-            state=SimpleNamespace(logical_batch_size=1),
-            seq_lens=logical_seq_lens,
-        )
-
-        self.assertIs(
-            _select_verify_bookkeeping_seq_lens(batch, idle_padding),
-            logical_seq_lens,
-        )
-        self.assertIs(
-            _select_verify_bookkeeping_seq_lens(batch, active_padding),
-            physical_seq_lens,
-        )
 
     def test_assert_on_inconsistent_steps_and_draft_tokens(self):
         # num_draft_tokens must equal num_steps + 1 for topk=1.

@@ -53,23 +53,6 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 
 
-def _select_verify_bookkeeping_seq_lens(
-    batch: Any, verify_padding: Any
-) -> torch.Tensor:
-    """Use the scheduler-logical empty tensor for a padded idle DP rank.
-
-    TPU hybrid-DP verification temporarily widens an idle rank to its peer's
-    physical request width so sampling sees the padded target logits. Sampling
-    itself intentionally returns empty tensors on that logical idle rank. Keep
-    bookkeeping on the original empty ``seq_lens`` tensor; otherwise the fused
-    bookkeeping op sees a padded sequence row paired with an empty prediction
-    tensor and attempts an un-warmed zero-width recompile.
-    """
-    if verify_padding is not None and verify_padding.state.logical_batch_size == 0:
-        return verify_padding.seq_lens
-    return batch.seq_lens
-
-
 def duplicate_prefix_tail_to_draft_branches(
     token_to_kv_pool,
     rows: torch.Tensor,
@@ -631,8 +614,10 @@ def run_eagle_verify(
     try:
         verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
         post_predict, post_accept_lens, post_accept_index = verify_result
+        # Sampling and bookkeeping must use the same physical rows, including
+        # padded idle DP peers. finalize_spec_verify restores the logical batch.
         verify_bookkeeping_result = verify_bookkeeping_func(
-            _select_verify_bookkeeping_seq_lens(batch, verify_padding),
+            batch.seq_lens,
             post_accept_lens,
             post_predict,
             post_accept_index,

@@ -59,6 +59,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyInput,
 )
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.eagle_worker_common import run_eagle_verify
 from sglang.srt.speculative.spec_info import SpecInputType, SpeculativeAlgorithm
 from sglang.test.test_utils import CustomTestCase
 
@@ -3172,6 +3173,91 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
             )
         )
         self.assertFalse(verify_input.keep_outputs_padded)
+
+    def test_idle_peer_verify_keeps_bookkeeping_padded_until_finalize(self):
+        """An idle DP peer must drain verification without mixing empty and padded rows."""
+        for physical_bs in (1, 2, 4):
+            with self.subTest(physical_bs=physical_bs):
+                batch = _make_batch(temperature=0.0)
+                batch.forward_mode = ForwardMode.IDLE
+                batch.global_num_tokens_cpu = [physical_bs * DRAFT_TOKEN_NUM, 0]
+                batch.seq_lens = batch.seq_lens[:0]
+                logical_seq_lens = batch.seq_lens
+                batch.input_ids = torch.empty(0, dtype=torch.int64)
+                batch.out_cache_loc = torch.empty(0, dtype=torch.int64)
+                batch.sampling_info.temperatures = batch.sampling_info.temperatures[:0]
+                batch.sampling_info.top_ks = batch.sampling_info.top_ks[:0]
+                batch.sampling_info.top_ps = batch.sampling_info.top_ps[:0]
+                verify_input = EagleVerifyInput.create_idle_input(
+                    topk=1,
+                    spec_steps=DRAFT_TOKEN_NUM - 1,
+                    num_verify_tokens=DRAFT_TOKEN_NUM,
+                    device="cpu",
+                )
+                verify_input.record_padding(
+                    logical_batch_size=0,
+                    physical_batch_size=physical_bs,
+                    logical_num_tokens=0,
+                    physical_num_tokens=physical_bs * DRAFT_TOKEN_NUM,
+                )
+                batch.spec_info = verify_input
+                policy = _policy()
+                logits_output = LogitsProcessorOutput(
+                    next_token_logits=torch.zeros(
+                        (physical_bs * DRAFT_TOKEN_NUM, VOCAB_SIZE)
+                    )
+                )
+                target_worker = SimpleNamespace(
+                    model_runner=SimpleNamespace(compile_policy=policy),
+                    forward_batch_generation=MagicMock(
+                        return_value=SimpleNamespace(
+                            logits_output=logits_output,
+                            routed_experts_output=None,
+                            indexer_topk_output=None,
+                        )
+                    ),
+                )
+                forward_batch = SimpleNamespace(spec_info=verify_input)
+                module = "sglang.srt.speculative.eagle_worker_common"
+                with (
+                    _serving_stubs(),
+                    _dp_attention(True),
+                    patch(f"{module}.record_stream_for_v2_verify"),
+                    patch(f"{module}.record_stream_each"),
+                    patch(
+                        f"{module}.eagle_prepare_for_verify",
+                        return_value=(forward_batch, False),
+                    ),
+                    patch(f"{module}.commit_mamba_states_after_verify"),
+                    patch.object(
+                        policy, "finalize_forward_batch", return_value=logits_output
+                    ),
+                ):
+                    result = run_eagle_verify(
+                        batch,
+                        target_worker=target_worker,
+                        req_to_token_pool=None,
+                        token_to_kv_pool_allocator=SimpleNamespace(
+                            get_kvcache=lambda: SimpleNamespace()
+                        ),
+                        plan_stream=None,
+                        plan_stream_ctx=contextlib.nullcontext(),
+                        topk=1,
+                        num_draft_tokens=DRAFT_TOKEN_NUM,
+                        device="cpu",
+                        metadata_ready_pre_pad=False,
+                        finalize_tree_path=False,
+                    )
+                self.assertEqual(batch.forward_mode, ForwardMode.IDLE)
+                self.assertIs(batch.seq_lens, logical_seq_lens)
+                self.assertEqual(verify_input.draft_token.numel(), 0)
+                for tensor in (
+                    result.next_token_ids,
+                    result.accept_lens,
+                    result.new_seq_lens,
+                    result.next_draft_input.bonus_tokens,
+                ):
+                    self.assertEqual(tensor.numel(), 0)
 
     def test_widens_every_per_request_input(self):
         batch = _make_batch(temperature=0.7)
