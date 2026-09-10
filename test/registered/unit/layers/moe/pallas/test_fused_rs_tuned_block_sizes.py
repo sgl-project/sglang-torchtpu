@@ -25,7 +25,7 @@ FUSED_RS_TUNED_BLOCK_SIZES = _TABLE_MODULE.FUSED_RS_TUNED_BLOCK_SIZES
 
 
 class TestFusedRsTunedBlockSizes(unittest.TestCase):
-    def test_large_routed_bucket_uses_established_schedule(self):
+    def test_ep16_w4a8_uses_half_n_schedule_through_8k_tokens(self):
         dtype_table = FUSED_RS_TUNED_BLOCK_SIZES["TPU7x"][
             "lhs_bfloat16_rhs_float4_e2m1fn"
         ]
@@ -33,7 +33,26 @@ class TestFusedRsTunedBlockSizes(unittest.TestCase):
             "k-4096_n-8192_g-16_lhs_quant_rhs_bs-256"
             "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-256"
         ]
-        self.assertEqual(shape_table["65536_silu"], shape_table["8192_silu"])
+        expected = (64, 4096, 2048, 4096, 2048, 2, 2)
+        for token_count in (1024, 2048, 4096, 8192):
+            with self.subTest(token_count=token_count):
+                routed_tokens = token_count * 8
+                self.assertEqual(shape_table[f"{routed_tokens}_silu"], expected)
+
+        # Do not retune buckets above the bounded 8K-token serving call.
+        self.assertEqual(
+            shape_table["131072_silu"],
+            (128, 4096, 4096, 4096, 4096, 2, 1),
+        )
+
+        ep8_shape_table = dtype_table[
+            "k-4096_n-8192_g-32_lhs_quant_rhs_bs-256"
+            "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-256"
+        ]
+        self.assertEqual(
+            ep8_shape_table["16384_silu"],
+            (128, 4096, 4096, 4096, 4096, 2, 1),
+        )
 
 
 if __name__ == "__main__":

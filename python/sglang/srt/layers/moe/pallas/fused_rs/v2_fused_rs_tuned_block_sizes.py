@@ -229,6 +229,24 @@ def _h4096_i4096_fp4_q512_size_dependent():
     return out
 
 
+def _h4096_i4096_fp4_q512_ep16_size_dependent():
+    """H4096-I4096 W4A8 schedule for TP16/EP16 (g=16).
+
+    Extending a fused-RS call from 1K to 8K tokens makes M=16384 and M=32768
+    reachable without chunking.  On EP16, the half-N cached tm64 schedule is
+    faster at every routed-token bucket reachable by an 8K call.  In a TP16
+    sweep it took 0.988/1.605/2.836 ms at M=16384/32768/65536, versus
+    1.437/2.099/3.610 ms for the full-N cached tm128 schedule.
+
+    Keep the inherited behavior above M=65536; the serving path bounds each
+    fused-RS call to 8K tokens, so those table entries are not reached here.
+    """
+    out = _h4096_i4096_fp4_q512_size_dependent()
+    for m_val in (16384, 32768, 65536):
+        out[f"{m_val}_silu"] = _H4096_I4096_FP4_Q512_W4A8_SMALL
+    return out
+
+
 def _h4096_i4096_fp8_q512_size_dependent():
     """H4096-I4096 fp8 with rhs_bs=512."""
     out = {}
@@ -428,15 +446,13 @@ FUSED_RS_TUNED_BLOCK_SIZES = {
                 "k-4096_n-8192_g-32_lhs_quant_rhs_bs-256"
                 "+k-4096_n-4096_g-32_lhs_quant_rhs_bs-256"
             ): _h4096_i4096_fp4_q512_size_dependent(),
-            # Start from the matching block-scaled table, with the validated
-            # schedule for the largest supported routed-token bucket.
+            # TP16/EP16 has a different crossover from EP8: keep the
+            # half-N cached schedule for every routed-token bucket reachable
+            # by the bounded 8K-token fused call.
             (
                 "k-4096_n-8192_g-16_lhs_quant_rhs_bs-256"
                 "+k-4096_n-4096_g-16_lhs_quant_rhs_bs-256"
-            ): {
-                **_h4096_i4096_fp4_q512_size_dependent(),
-                "65536_silu": _H4096_I4096_FP4_Q512_W4A8_SMALL,
-            },
+            ): _h4096_i4096_fp4_q512_ep16_size_dependent(),
             # H4096-I4096 subchannel FP4 (block_size=512), EP=8 → g=32.
             # rhs_bs=512 matches the LHS online-quant block, so this uses the
             # W4A8-tuned table.
