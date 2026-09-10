@@ -40,6 +40,7 @@ on:
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
+          - pd-sh-gpt-120b-decode-radix
           - sh
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
@@ -92,6 +93,7 @@ jobs:
       pd_tp_reshard: ${{ steps.tests.outputs.pd_tp_reshard }}
       pd_singlehost: ${{ steps.tests.outputs.pd_singlehost }}
       pd_singlehost_spec: ${{ steps.tests.outputs.pd_singlehost_spec }}
+      pd_singlehost_decode_radix: ${{ steps.tests.outputs.pd_singlehost_decode_radix }}
       pd_multihost: ${{ steps.tests.outputs.pd_multihost }}
       diffusion_mh_collectives: ${{ steps.tests.outputs.diffusion_mh_collectives }}
     steps:
@@ -107,6 +109,7 @@ jobs:
           echo "pd_tp_reshard=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py)" >> "$GITHUB_OUTPUT"
           echo "pd_singlehost_spec=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py)" >> "$GITHUB_OUTPUT"
+          echo "pd_singlehost_decode_radix=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py)" >> "$GITHUB_OUTPUT"
           echo "pd_multihost=$($discover_files --entry test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py)" >> "$GITHUB_OUTPUT"
           echo "diffusion_mh_collectives=$($discover_files --entry test/registered/tpu/e2e/test_diffusion_tpu_multihost_collectives.py)" >> "$GITHUB_OUTPUT"
 
@@ -248,6 +251,31 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
       weights_pvc: model-weights-rox
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
+    permissions:
+      contents: read
+      id-token: write
+
+  # Decode-side radix cache on the raiden P/D pair: a returning turn reuses
+  # the response KV the decode engine holds, so only the suffix crosses the wire.
+  pd-sh-gpt-120b-decode-radix:
+    needs: [build, discover-tests]
+    if: >-
+      ${{ !cancelled() && needs.discover-tests.result == 'success'
+          && contains(fromJSON('["all","pd-sh-gpt-120b-decode-radix"]'), inputs.only || 'all') }}
+    name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].name }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_gpt_oss_120b_pd_singlehost_decode_radix
+      lane: nightly
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
+      weights_pvc: model-weights-rox
+      run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].run_name }}
     permissions:
       contents: read
       id-token: write

@@ -50,6 +50,7 @@ on:
           - pd-mh-gpt-120b-tp-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
+          - pd-sh-gpt-120b-decode-radix
           - sh
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
