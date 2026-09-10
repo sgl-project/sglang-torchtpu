@@ -123,6 +123,7 @@ class StandardDispatcher(BaseDispatcher):
         #   (mask_tpu_moe_non_local_experts); keeping the mapping out of the
         #   dispatcher also keeps lazily-created module state out of the
         #   compiled graph, whose guards precompiled TPU programs depend on
+        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
@@ -130,6 +131,7 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or backend.is_hpc_ops()
+            or backend.is_flashinfer_megamoe()
             or self.enable_flashinfer_mxfp4_moe
             or _is_tpu
         )

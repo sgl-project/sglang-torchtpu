@@ -2471,6 +2471,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 quantization=None,
                 moe_runner_backend="auto",
                 speculative_algorithm=None,
+                moe_a2a_backend="none",
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
