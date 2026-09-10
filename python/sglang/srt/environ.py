@@ -1667,6 +1667,11 @@ class Envs:
     # TPU slice by assigning half the chips to prefill and half to decode.
     # This is intended primarily for development and is not for production use.
     SGLANG_TPU_PD_COLOCATED = EnvBool(False)
+    # Hack to workaround libtpu bug in 0.0.46 and 0.0.47 causing performance
+    # regression in fused MoE with reduce scatter.
+    # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
+    # (likely 0.0.48).
+    SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = EnvBool(True)
 
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)

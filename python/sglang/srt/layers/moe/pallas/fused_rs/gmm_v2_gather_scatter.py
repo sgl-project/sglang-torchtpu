@@ -10,7 +10,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.pallas.gmm_v2 import TileSizes, recover_quant_block_size
+
+# Hack to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
+# online-quantized LHS to be recomputed per use.
+# TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
+# (likely 0.0.48).
+_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE = (
+    envs.SGLANG_TPU_LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE.get()
+)
 
 
 def get_maybe_quantize_lhs(
@@ -323,6 +332,18 @@ def inner_kernel(
             amax_safe = jnp.where(amax == 0, jnp.ones_like(amax), amax)
             block_q = (block_f32 / amax_safe * dtype_max).astype(quant_dtype)
             block_scale = amax / dtype_max
+
+            if _LIBTPU_WORKAROUND_FOR_ONLINE_QUANT_SCALE:
+                # This is a noop to workaround libtpu bug in 0.0.46 and 0.0.47 that causes
+                # "block_scale = amax / dtype_max" to be recomputed per use, which
+                # leads to performance regression. The hack is to route the block scale
+                # through a select, which breaks the pattern to prevent XLA from
+                # rematerializing.
+                # TODO: Remove once the issue gets resolved in libtpu version > 0.0.47
+                # (likely 0.0.48).
+                block_scale = jnp.where(
+                    amax == 0, jnp.zeros_like(block_scale), block_scale
+                )
             return block_q, block_scale
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
