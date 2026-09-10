@@ -351,7 +351,7 @@ def build_kv_only_stack(
         override_kv_cache_dim=override_kv_cache_dim,
         mtp_draft_device_pools=params.mtp_draft_device_pools,
     )
-    cache_controller = HybridCacheController(
+    cache_controller = HybridCacheController.create_for_backend(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         params.page_size,

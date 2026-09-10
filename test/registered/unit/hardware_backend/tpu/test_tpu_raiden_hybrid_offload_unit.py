@@ -24,8 +24,9 @@ import torch
 from sglang.srt.hardware_backend.tpu.raiden_hybrid_cache_controller import (
     TpuRaidenHybridCacheController,
 )
-from sglang.srt.managers.cache_controller import BatchDoneCounter
+from sglang.srt.managers.cache_controller import BatchDoneCounter, LayerDoneCounter
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     CacheOperation,
     HybridCacheController,
@@ -116,6 +117,41 @@ def _op(n_kv: int = 8, n_swa: int = 4) -> CacheOperation:
             )
         ],
     )
+
+
+class TestPlainKvController(CustomTestCase):
+    def test_raiden_plain_kv_supports_forward_reload_wait(self):
+        """Plain KV offload must provide the whole-batch forward reload gate."""
+        device_pool = MagicMock()
+
+        def init_base(controller, *args, **kwargs):
+            controller.mem_pool_device = device_pool
+            controller.layer_done_counter = object.__new__(LayerDoneCounter)
+
+        with (
+            patch.object(HybridCacheController, "__init__", init_base),
+            patch.object(hybrid_pool_assembler, "build_kv_only_group"),
+            patch.object(hybrid_pool_assembler, "get_memory") as memory,
+        ):
+            memory.return_value.hicache_io_backend = "raiden"
+            _, controller = hybrid_pool_assembler.build_kv_only_stack(
+                params=MagicMock(),
+                kv_pool=device_pool,
+                full_layer_mapping={0: 0},
+                load_cache_event=None,
+                storage_backend=None,
+                use_mla=False,
+            )
+
+        counter = controller.layer_done_counter
+        counter.wait()
+        event = _FakeFuture()
+        slot = counter.update_producer()
+        counter.set_event(slot, event)
+        counter.set_consumer(slot)
+        counter.wait()
+        self.assertTrue(event.synchronized)
+        device_pool.register_layer_transfer_counter.assert_called_once_with(counter)
 
 
 class TestHybridWrite(CustomTestCase):
