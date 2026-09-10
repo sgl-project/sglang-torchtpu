@@ -140,7 +140,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_tpu
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -160,6 +160,7 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
+_is_tpu = is_tpu()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -2924,7 +2925,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
+        reserve = get_alloc_reserve_per_decode() + int(
+            _is_tpu
+            and self.enable_overlap
+            and not self.spec_algorithm.is_dflash_family()
+        )
         total = 0
         for r in requests:
             x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)

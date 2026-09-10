@@ -16,6 +16,12 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
 
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        resolve_device_accept_seq_lens_tpu,
+        resolve_spec_extras_tpu,
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -431,6 +437,8 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        if _is_tpu and resolve_spec_extras_tpu(self, batch):
+            return
         if self.spec_algo.is_ngram():
             draft_input = batch.spec_info
             if draft_input is None or draft_input.future_indices is None:
@@ -531,6 +539,8 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
+        if _is_tpu and resolve_device_accept_seq_lens_tpu(self, batch):
+            return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:

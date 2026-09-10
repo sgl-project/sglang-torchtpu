@@ -11,6 +11,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -28,7 +29,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_tpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -38,6 +39,13 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        device_accept_verify_cache_locs_tpu,
+        prepare_draft_cache_locs_tpu,
+    )
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
@@ -226,7 +234,17 @@ def prepare_for_draft(
 
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
-        if page_size == 1 or topk == 1:
+        if _is_tpu and prepare_draft_cache_locs_tpu(
+            batch,
+            draft_input,
+            bs=bs,
+            topk=topk,
+            num_steps=num_steps,
+            num_verify_tokens=get_spec().speculative_num_draft_tokens,
+            host_resident=req_to_token_pool.host_resident,
+        ):
+            pass
+        elif page_size == 1 or topk == 1:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
@@ -403,7 +421,7 @@ def build_eagle_verify_input(
             fill_prefix_mask=fill_mask,
         )
 
-    return EagleVerifyInput(
+    verify_input = EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,
         positions=position,
@@ -419,6 +437,14 @@ def build_eagle_verify_input(
         seq_lens_cpu=None,
         draft_probs=draft_probs,
     )
+
+    if _is_tpu:
+        verify_input.device_accept_cache_locs = device_accept_verify_cache_locs_tpu(
+            draft_input,
+            bs=batch.seq_lens.shape[0],
+            num_verify_tokens=num_draft_tokens,
+        )
+    return verify_input
 
 
 def _finalize_accept_tree_path(
@@ -676,6 +702,8 @@ def run_eagle_verify(
         )
 
     next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    if _is_tpu:
+        next_draft_input.accept_lens_device = accept_lens
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent

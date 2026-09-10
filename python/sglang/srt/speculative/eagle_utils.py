@@ -54,12 +54,14 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
-_use_torch_native = is_tpu()
+_is_tpu = is_tpu()
 _is_cpu = is_cpu()
 
-if _use_torch_native:
+if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_tree_tpu,
+        prepare_device_accept_tpu,
+        prepare_verify_cache_locs_tpu,
     )
 
 logger = logging.getLogger(__name__)
@@ -210,7 +212,7 @@ def build_tree_kernel_efficient(
     fill_prefix_mask: bool = True,
 ):
     if (
-        _use_torch_native
+        _is_tpu
         and topk == 1
         and tree_mask_mode == TreeMaskMode.FULL_MASK
         and tree_mask_buf is None
@@ -256,7 +258,7 @@ def build_tree_kernel_efficient(
             dtype=packed_dtypes[packed_dtype_idx],
             device=device,
         )
-    elif tree_mask_mode == TreeMaskMode.FULL_MASK and _use_torch_native:
+    elif tree_mask_mode == TreeMaskMode.FULL_MASK and _is_tpu:
         # TPU causal attention does not use the dense mask.
         tree_mask = torch.empty((0,), dtype=torch.bool, device=device)
     elif tree_mask_mode == TreeMaskMode.FULL_MASK:
@@ -283,7 +285,7 @@ def build_tree_kernel_efficient(
     # then, positions = [7, 8, 8, 9]
     positions = torch.empty((bs * num_verify_tokens,), device=device, dtype=torch.long)
 
-    if _use_torch_native:
+    if _is_tpu:
         _build_tree_kernel_efficient_torch(
             topk,
             tree_mask_mode,
@@ -591,7 +593,7 @@ def verify_tree_greedy_func(
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
         )
-    elif _use_torch_native:
+    elif _is_tpu:
         assert next_token_logits is not None
         out_predicts, out_accept_index, out_accept_token_num = (
             _verify_tree_greedy_torch(next_token_logits, candidates, retrieve_index)
@@ -636,7 +638,7 @@ def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
         return seq_lens + accept_lens, torch.empty(
             (0,), device=seq_lens.device, dtype=torch.int64
         )
-    if _use_torch_native:
+    if _is_tpu:
         return fused_verify_bookkeeping(seq_lens, accept_lens, predict, accept_index)
     new_seq_lens = seq_lens + accept_lens
     accept_tokens = predict[accept_index]
@@ -741,7 +743,6 @@ def eagle_prepare_for_verify(
         ForwardMode,
     )
     from sglang.srt.speculative.spec_utils import (
-        assign_extend_cache_locs_func,
         prepare_mamba_track_for_verify,
     )
 
@@ -756,18 +757,9 @@ def eagle_prepare_for_verify(
             "v2 prepare_for_verify input_ids",
         )
         device = batch.device
-        if _use_torch_native:
-            # TPU: torch-native gather routed through the host mirrors.
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + verify_input.draft_token_num,
-                batch_size=bs,
-                draft_token_num=verify_input.draft_token_num,
-                device=device,
-                host_req_pool_indices=batch.req_pool_indices_cpu,
-                host_seq_lens=batch.seq_lens_cpu,
+        if _is_tpu:
+            batch.out_cache_loc = prepare_verify_cache_locs_tpu(
+                verify_input, req_to_token_pool, batch
             )
         else:
             # Uniform variant: end offsets (= start + draft_token_num) are computed
@@ -978,7 +970,7 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
-        if not _use_torch_native:
+        if not _is_tpu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -1009,7 +1001,7 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        if _use_torch_native:
+        if _is_tpu:
             top_k_renorm_prob = top_k_renorm_prob_func
             top_p_renorm_prob = top_p_renorm_prob_func
             tree_speculative_sampling_target_only = (
@@ -1028,7 +1020,7 @@ def eagle_sample(
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
-        if _use_torch_native:
+        if _is_tpu:
             sampling_fn = tree_speculative_sampling_target_only
         else:
             sampling_fn = (
@@ -1187,10 +1179,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
+    # In overlap mode req.seqlen is one pending accepted bonus ahead of honest
+    # kv_committed_len while the following batch is prepared. Include that slot
+    # in the page-aligned allocation used by device-resident accept routing.
+    tpu_overlap = _is_tpu and batch.enable_overlap
+    allocation_reserve = double_alloc + int(tpu_overlap)
 
     cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
         batch.reqs,
-        reserve=double_alloc,
+        reserve=allocation_reserve,
         page_size=page_size,
     )
     for r in batch.reqs:
@@ -1213,7 +1210,7 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
         )
 
-    if _use_torch_native and batch.req_to_token_pool.host_resident:
+    if _is_tpu and batch.req_to_token_pool.host_resident:
         # TPU: req_to_token lives on the host, so allocate and write the page
         # table through the host mirrors instead of the device alloc path.
         allocate_and_assign_decode_cache(
@@ -1250,6 +1247,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             batch=batch,
         )
 
+    if _is_tpu:
+        prepare_device_accept_tpu(batch, bs=bs, double_alloc=double_alloc)
+
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
     """Keep the top-k probabilities per row and renormalize (torch fallback)."""
@@ -1280,7 +1280,7 @@ def top_k_renorm_prob_func(
     top_ks: torch.Tensor,
     need_top_k_sampling: bool = True,
 ) -> torch.Tensor:
-    if _use_torch_native:
+    if _is_tpu:
         if not need_top_k_sampling:
             return probs
         return _top_k_renorm_prob_torch(probs, top_ks)
@@ -1290,7 +1290,7 @@ def top_k_renorm_prob_func(
 
 
 def top_p_renorm_prob_func(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
-    if _use_torch_native:
+    if _is_tpu:
         return _top_p_renorm_prob_torch(probs, top_ps)
     from sgl_kernel import top_p_renorm_prob
 
@@ -1406,7 +1406,7 @@ def tree_speculative_sampling_target_only_func(
     topk: int = 1,
 ):
     """Dispatch to the torch port (TPU, topk=1) or the sgl_kernel op."""
-    if _use_torch_native:
+    if _is_tpu:
         _tree_speculative_sampling_target_only_torch(
             predicts=predicts,
             accept_index=accept_index,

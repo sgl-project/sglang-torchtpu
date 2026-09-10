@@ -3143,7 +3143,7 @@ def _serving_stubs():
             "apply_scaling_penalties",
             eager_scaling_penalties,
         ),
-        patch("sglang.srt.speculative.eagle_utils._use_torch_native", True),
+        patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
         patch(
             "sglang.srt.distributed.get_tp_group",
             return_value=SimpleNamespace(world_size=1),
