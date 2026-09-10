@@ -243,7 +243,7 @@ class _MoeMockRunner:
         # Single-rank EP: no distributed process group in a unit test.
         with patch(
             "sglang.srt.layers.quantization.unquant.get_parallel",
-            lambda: SimpleNamespace(moe_ep_rank=0),
+            lambda: SimpleNamespace(moe_ep_rank=0, moe_ep_size=1),
         ):
             return self.method.forward_tpu(layer, d_out)
 
@@ -255,7 +255,7 @@ class _MoeMockRunner:
         """
         with patch(
             "sglang.srt.layers.quantization.unquant.get_parallel",
-            lambda: SimpleNamespace(moe_ep_rank=0),
+            lambda: SimpleNamespace(moe_ep_rank=0, moe_ep_size=1),
         ):
             return self.method.forward(layer, d_out)
 
