@@ -5,6 +5,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     attention_backends_of,
@@ -15,6 +16,7 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -216,10 +218,13 @@ def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
     if not (
-        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "tpu"
+        cfg.device.startswith("cuda")
+        or cfg.device == "npu"
+        or cfg.device == "tpu"
+        or cfg.device == "xpu"
     ):
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA, NPU, and TPU devices."
+            "DFLASH speculative decoding only supports CUDA, NPU, TPU, and XPU devices."
         )
 
     if resolved_view(server_args).enable_dp_attention:
@@ -739,23 +744,20 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    from sglang.srt.utils import is_hip, is_tpu
+    from sglang.srt.utils import is_tpu
 
     cfg = resolving_view(server_args)
 
-    supported_draft_backends = (
-        "flashinfer",
-        "fa3",
-        "fa4",
-        "triton",
-        "trtllm_mha",
-        "ascend",
-        "pallas_tpu_rpa_v3",
-        "torch_native",
-    )
-    # Use triton on ROCm (no FlashInfer), flashinfer on CUDA, pallas on TPU.
+    supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
+    # Use Triton on ROCm/XPU, FlashInfer on CUDA, and Pallas on TPU.
     fallback_backend = (
-        "pallas_tpu_rpa_v3" if is_tpu() else ("triton" if is_hip() else "flashinfer")
+        "pallas_tpu_rpa_v3"
+        if is_tpu()
+        else (
+            "triton"
+            if (get_platform().is_xpu or get_platform().is_hip)
+            else "flashinfer"
+        )
     )
 
     draft_backend = cfg.speculative_draft_attention_backend
