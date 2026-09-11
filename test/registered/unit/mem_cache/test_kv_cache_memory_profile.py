@@ -1,4 +1,5 @@
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +12,9 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestKVCacheMemoryProfile(unittest.TestCase):
     def setUp(self):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+
         self.configurator = kv_cache_configurator.KVCacheConfigurator.__new__(
             kv_cache_configurator.KVCacheConfigurator
         )
@@ -19,25 +23,25 @@ class TestKVCacheMemoryProfile(unittest.TestCase):
         self.configurator.mambaish_config = None
         self.configurator.model_config = SimpleNamespace(is_multimodal=False)
 
-        self.enterContext(
+        stack.enter_context(
             get_context().override_server_args(
                 mem_fraction_static=0.75, mm_feature_transport=None
             )
         )
-        self.platform = self.enterContext(
+        self.platform = stack.enter_context(
             patch.object(kv_cache_configurator, "current_platform")
         )
         self.platform.is_tpu.return_value = True
-        self.collect = self.enterContext(
+        self.collect = stack.enter_context(
             patch.object(kv_cache_configurator.gc, "collect")
         )
-        self.available_memory = self.enterContext(
+        self.available_memory = stack.enter_context(
             patch.object(
                 kv_cache_configurator, "get_available_gpu_memory", return_value=60
             )
         )
         self.world_group = SimpleNamespace(world_size=16, cpu_group=object())
-        self.enterContext(
+        stack.enter_context(
             patch.object(
                 kv_cache_configurator, "get_world_group", return_value=self.world_group
             )
