@@ -45,6 +45,10 @@ LAUNCH_ENV = {
     "MAX_TOTAL_TOKENS": "8192",
     "MEM_FRACTION_STATIC": os.environ.get("MEM_FRACTION_STATIC", "0.6"),
     "ENABLE_PROFILER_ENDPOINT": "0",
+    # Broadcast only the sites that can genuinely differ across ranks -- memory
+    # init and the RNG draws. The deterministic ones (greedy accept) compute the
+    # same answer everywhere, so syncing them costs a collective per step.
+    "SGLANG_SPEC_TP_SYNC": "rng",
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "

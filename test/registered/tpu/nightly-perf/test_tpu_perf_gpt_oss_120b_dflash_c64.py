@@ -66,6 +66,10 @@ MODEL_CONFIG = {
             "TPU_COMPILE_BS": str(CONCUR),
             "ENABLE_PROFILER_ENDPOINT": "0",
             "SGLANG_SIMULATE_ACC_LEN": str(SIMULATE_ACC_LEN),
+            # Match the DFlash accuracy gates, so this measures the configuration
+            # they validate. Only the sites that can differ across ranks are
+            # broadcast; the deterministic ones would cost a collective per step.
+            "SGLANG_SPEC_TP_SYNC": "rng",
             "EXTRA_ARGS": (
                 f"--served-model-name {MODEL} "
                 "--speculative-algorithm DFLASH "
