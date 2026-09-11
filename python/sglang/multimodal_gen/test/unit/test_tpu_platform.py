@@ -36,8 +36,8 @@ class TestTpuPlatformSurface(unittest.TestCase):
         self.assertTrue(TpuPlatform.get_device_name().lower().startswith("tpu"))
         self.assertTrue(TpuPlatform().is_tpu())
 
-    def test_float64_unsupported(self):
-        self.assertFalse(TpuPlatform.is_float64_supported())
+    def test_float64_supported(self):
+        self.assertTrue(TpuPlatform.is_float64_supported())
 
     def test_inference_mode_is_no_grad(self):
         self.assertIsInstance(TpuPlatform.inference_mode(), torch.no_grad)
@@ -64,6 +64,68 @@ class TestTpuPlatformSurface(unittest.TestCase):
             self.assertEqual(
                 TpuPlatform().get_torch_distributed_backend_str(), "tpu_dist"
             )
+
+    def test_p2p_is_unsupported(self):
+        self.assertFalse(TpuPlatform.supports_distributed_p2p())
+
+    def test_spatial_shard_decode_is_refused_without_p2p(self):
+        from sglang.multimodal_gen.configs.models.vaes import base as vae_base
+        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+
+        platform = MagicMock()
+        platform.supports_distributed_p2p.return_value = False
+        with patch.object(vae_base, "current_platform", platform):
+            self.assertFalse(
+                vae_base.should_use_spatial_shard_parallel_decode(
+                    WanVAEConfig(), world_size=2
+                )
+            )
+
+    def test_spatial_shard_decode_survives_where_p2p_works(self):
+        from sglang.multimodal_gen.configs.models.vaes import base as vae_base
+        from sglang.multimodal_gen.configs.models.vaes.wanvae import WanVAEConfig
+
+        platform = MagicMock()
+        platform.supports_distributed_p2p.return_value = True
+        with patch.object(vae_base, "current_platform", platform):
+            self.assertTrue(
+                vae_base.should_use_spatial_shard_parallel_decode(
+                    WanVAEConfig(), world_size=2
+                )
+            )
+
+    def test_platform_defaults_leave_other_backends_alone(self):
+        from sglang.multimodal_gen.runtime.platforms.interface import Platform
+
+        self.assertTrue(Platform.supports_distributed_p2p())
+        self.assertTrue(Platform.supports_device_tensor_pickle())
+
+    def test_device_tensor_pickle_is_unsupported(self):
+        self.assertFalse(TpuPlatform.supports_device_tensor_pickle())
+
+    def test_supporting_platforms_get_plain_pickle(self):
+        import pickle
+
+        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+
+        platform = MagicMock()
+        platform.supports_device_tensor_pickle.return_value = True
+        payload = [torch.arange(4, dtype=torch.float32), {"k": 1}]
+        with patch.object(dist_utils, "current_platform", platform):
+            self.assertEqual(dist_utils._dumps(payload), pickle.dumps(payload))
+
+    def test_cpu_tensors_are_pickled_untouched(self):
+        import pickle
+
+        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+
+        platform = MagicMock()
+        platform.supports_device_tensor_pickle.return_value = False
+        payload = [torch.arange(6, dtype=torch.float32), "text", 7]
+        with patch.object(dist_utils, "current_platform", platform):
+            restored = pickle.loads(dist_utils._dumps(payload))
+        self.assertTrue(torch.equal(restored[0], payload[0]))
+        self.assertEqual(restored[1:], ["text", 7])
 
     def test_layerwise_offload_disabled(self):
         self.assertFalse(TpuPlatform.enable_dit_layerwise_offload_by_default())

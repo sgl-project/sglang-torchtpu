@@ -36,6 +36,65 @@ class TestWorkerBootstrap(CustomTestCase):
         self.assertGreater(TpuPlatform.get_device_total_memory(), 0)
         self.assertGreater(TpuPlatform.get_current_memory_usage(), 0.0)
 
+    def test_device_tensors_survive_a_pickle_round_trip(self):
+        import pickle
+
+        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        contiguous = torch.arange(12, dtype=torch.float32, device="tpu") * 2.0
+        strided = contiguous.view(3, 4).transpose(0, 1)
+        for original in (contiguous, strided):
+            restored = pickle.loads(dist_utils._dumps([original]))[0]
+            self.assertEqual(restored.device.type, "tpu")
+            self.assertEqual(restored.shape, original.shape)
+            self.assertEqual(restored.stride(), original.stride())
+            self.assertEqual(restored.is_contiguous(), original.is_contiguous())
+            self.assertTrue(torch.equal(restored.cpu(), original.cpu()))
+
+    def test_requires_grad_survives_the_round_trip(self):
+        import pickle
+
+        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        for requires_grad in (False, True):
+            original = torch.ones(4, dtype=torch.float32, device="tpu")
+            original.requires_grad_(requires_grad)
+            restored = pickle.loads(dist_utils._dumps([original]))[0]
+            self.assertEqual(restored.requires_grad, requires_grad)
+
+
+class TestFloat64IsRealOnDevice(CustomTestCase):
+    """The measurements behind `TpuPlatform.is_float64_supported() -> True`."""
+
+    def test_elementwise_float64_matches_the_host(self):
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        self.assertTrue(TpuPlatform.is_float64_supported())
+        inv = 1.0 / (
+            10000.0 ** (torch.arange(0, 64, 2, dtype=torch.float64, device="tpu") / 64)
+        )
+        pos = torch.arange(128, dtype=torch.float64, device="tpu")
+        got = torch.outer(pos, inv).cos().cpu()
+
+        ref_inv = 1.0 / (10000.0 ** (torch.arange(0, 64, 2, dtype=torch.float64) / 64))
+        ref = torch.outer(torch.arange(128, dtype=torch.float64), ref_inv).cos()
+        self.assertEqual(got.dtype, torch.float64)
+        self.assertLess((got - ref).abs().max().item(), 1e-12)
+
+    def test_float64_matmul_still_downcasts(self):
+        TpuPlatform.set_device(TpuPlatform.get_local_torch_device())
+        a = torch.linspace(0, 1, 64, device="tpu").double().reshape(8, 8)
+        got = (a @ a.t()).cpu()
+        ref_a = torch.linspace(0, 1, 64).double().reshape(8, 8)
+        err = (got - ref_a @ ref_a.t()).abs().max().item()
+        self.assertGreater(
+            err,
+            1e-12,
+            "float64 matmul now matches the host: widen "
+            "TpuPlatform.is_float64_supported's comment and re-check minimax_h3",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

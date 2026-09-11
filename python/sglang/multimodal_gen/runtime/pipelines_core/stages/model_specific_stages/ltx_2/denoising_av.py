@@ -2,10 +2,6 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
-from sglang.multimodal_gen.runtime.distributed import (
-    get_decode_parallel_world_size,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -15,6 +11,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    decode_uses_every_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.denoising import (
     LTX2DenoisingStage,
@@ -152,12 +151,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         # Stage 2 is distilled and always runs with CFG disabled, so non-main
         # CFG ranks only need the result when the decoder will use all ranks.
         if self.server_args.enable_cfg_parallel:
-            if (
-                model_parallel_is_initialized()
-                and get_decode_parallel_world_size() > 1
-                and self.vae is not None
-                and self.vae.use_parallel_decode
-            ):
+            if decode_uses_every_rank(self.vae):
                 return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
             return StageParallelismType.MAIN_RANK_ONLY
         return StageParallelismType.REPLICATED

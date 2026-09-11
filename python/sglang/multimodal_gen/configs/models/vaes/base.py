@@ -10,7 +10,11 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import StoreBoolean
+
+logger = init_logger(__name__)
 
 AUTO_PARALLEL_DECODE_MODE = "auto"
 SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
@@ -43,6 +47,17 @@ def _should_use_auto_spatial_shard_parallel_decode(
 def should_use_spatial_shard_parallel_decode(
     config: Any, z: torch.Tensor | None = None, world_size: int = 1
 ) -> bool:
+    # Height shards exchange conv halos with isend/irecv.
+    if not current_platform.supports_distributed_p2p():
+        if is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode):
+            logger.warning_once(
+                f"parallel_decode_mode={config.parallel_decode_mode!r} shards the "
+                f"height axis, which needs isend/irecv; {current_platform.device_type} "
+                "has collectives only, so the VAE decodes on one rank. "
+                "'tiled' and 'patch' still use every rank."
+            )
+        return False
+
     if not config.use_parallel_decode:
         return False
 
