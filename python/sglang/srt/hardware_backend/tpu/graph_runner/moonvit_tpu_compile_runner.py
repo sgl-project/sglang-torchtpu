@@ -146,9 +146,67 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
         **kwargs: Any,
     ) -> None:
         super().__init__(encoder, name=name, **kwargs)
+        self._warned_oversize: set[int] = set()
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
         return getattr(runner, "supports_segment_ids", False)
+
+    def run(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """One compiled call per image, each padded to its own bucket.
+
+        The packed multi-image sequence is unbounded and misses every bucket;
+        attention never crosses image boundaries, so the split is exact.
+        Slices are cloned: torch_tpu passes a view's backing buffer to the
+        compiled fn, which fails on an exact bucket hit (no pad copy).
+        """
+        bounds = cu_seqlens.tolist()
+        if len(bounds) <= 2:
+            return self._run_one(x, cos, sin, cu_seqlens)
+        outs = []
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            single = torch.tensor([0, end - start], dtype=torch.int32)
+            outs.append(
+                self._run_one(
+                    x[start:end].clone(),
+                    cos[start:end].clone(),
+                    sin[start:end].clone(),
+                    single,
+                )
+            )
+        # Outputs are [1, S_i, D]; the patch axis is second to last.
+        return torch.cat(outs, dim=outs[0].ndim - 2)
+
+    def _run_one(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = x.shape[0]
+        if self._bucket_for(seq_len) is None and self.eager_fn is not None:
+            # Past the ladder: run eagerly; fail_on_recompile is armed after warmup.
+            if seq_len not in self._warned_oversize:
+                self._warned_oversize.add(seq_len)
+                buckets = self.resolve_patch_buckets()
+                logger.warning(
+                    "MoonVitTpuCompilePolicy: patch count %d exceeds largest "
+                    "precompiled bucket %s; running this image eagerly. Add a "
+                    "bucket to SGLANG_TPU_VIT_PRECOMPILE_SIZES or raise "
+                    "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
+                    seq_len,
+                    buckets[-1] if buckets else None,
+                )
+            segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x.device)
+            with torch.no_grad():
+                return self.eager_fn(x, cos, sin, segment_ids)
+        return super().run(x, cos, sin, cu_seqlens)
 
     def _install_run_adapter(self, runner: Any) -> None:
         def _run(
@@ -218,16 +276,7 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
             )
             segment_ids = torch.cat([segment_ids, pad_segment], dim=1)
         else:
-            if bucket_len is None and seq_len not in self._warned_oversize:
-                self._warned_oversize.add(seq_len)
-                buckets = self.resolve_patch_buckets()
-                logger.warning(
-                    "MoonVitTpuCompilePolicy: patch count %d exceeds largest "
-                    "precompiled bucket %s; one-time recompile. Raise "
-                    "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
-                    seq_len,
-                    buckets[-1] if buckets else None,
-                )
+            # Exact bucket hit (oversize never gets here: _run_one runs it eagerly).
             segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x.device)
 
         ctx = VisionPaddingContext(
