@@ -72,26 +72,32 @@ jobs:
       fail-fast: false
       matrix:
         # matrix context is unavailable in job-level `if`, so selection shapes the
-        # matrix instead -- same trick as combo-test-tpu.yml. One model today; the
-        # next one adds a choice above and a branch here.
-        suite: ${{ (inputs.model == 'gpt-oss-120b' && fromJSON('["nightly-tpu-perf-gpt-oss-120b"]'))
-                || fromJSON('["nightly-tpu-perf-gpt-oss-120b"]') }}
-    name: ${{ matrix.suite }}
+        # matrix instead -- same trick as combo-test-tpu.yml. Every suite here is
+        # gpt-oss-120b, so `model` cannot narrow it yet; the next model adds a
+        # choice above and turns this into a ternary again.
+        # Each entry carries its own budget: one bring-up (weight load + per-shape
+        # compile) plus one sweep leg, with slack for a cold compile cache. c64
+        # compiles a wider decode bucket than c16, and the speculative legs also
+        # load and compile a draft model.
+        entry: >-
+          ${{ fromJSON('[
+          {"suite": "nightly-tpu-perf-gpt-oss-120b", "timeout": 1800},
+          {"suite": "nightly-tpu-perf-gpt-oss-120b-c64", "timeout": 2400},
+          {"suite": "nightly-tpu-perf-gpt-oss-120b-eagle3-c64", "timeout": 3000},
+          {"suite": "nightly-tpu-perf-gpt-oss-120b-dflash-c64", "timeout": 3000}]') }}
+    name: ${{ matrix.entry.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ inputs.image || needs.build.outputs.digest }}
       lane: nightly
       hosts: 1
-      suite: ${{ matrix.suite }}
+      suite: ${{ matrix.entry.suite }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights; harmless for the
       # model that pulls from HF instead.
       weights_pvc: model-weights-rox
-      # One bring-up (weight load + per-shape compile) plus one sweep leg. The
-      # two-model file needed 3000s; a single model needs about half that, and the
-      # slack is what absorbs a cold compile cache.
-      timeout_per_file: 1800
+      timeout_per_file: ${{ matrix.entry.timeout }}
     permissions:
       contents: read
       id-token: write

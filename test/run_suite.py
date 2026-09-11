@@ -198,6 +198,9 @@ NIGHTLY_SUITES = {
         # One suite per perf model, so the nightly can fan them out as separate
         # jobs on separate slices instead of one sequential single-host job.
         "nightly-tpu-perf-gpt-oss-120b",
+        "nightly-tpu-perf-gpt-oss-120b-c64",
+        "nightly-tpu-perf-gpt-oss-120b-eagle3-c64",
+        "nightly-tpu-perf-gpt-oss-120b-dflash-c64",
         "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
