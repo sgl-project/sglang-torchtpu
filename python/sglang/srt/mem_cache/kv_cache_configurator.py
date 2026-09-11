@@ -1934,6 +1934,12 @@ class KVCacheConfigurator:
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        if current_platform.is_tpu():
+            # Dummy initialization and weight postprocessing can still be deferred.
+            # Drain after target/draft post-load barriers: synchronizing inside a
+            # loader can deadlock distributed draft initialization.
+            current_platform.synchronize()
+
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
