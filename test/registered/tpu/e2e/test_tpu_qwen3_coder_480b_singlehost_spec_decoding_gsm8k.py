@@ -1,7 +1,8 @@
-"""Qwen3-Coder-480B EAGLE3 single-host GSM8K quality gate.
+"""Qwen3-Coder-480B EAGLE3 + fused-RS single-host GSM8K quality gate.
 
 The quality lane launches the same speculative-decoding configuration as the
-functional integration test, then scores 200 GSM8K examples through run_eval.
+functional integration test, explicitly exercising the fused reduce-scatter
+MoE path from issue #501, then scores 200 GSM8K examples through run_eval.
 """
 
 import os
@@ -12,8 +13,7 @@ from sglang.test.tpu import model_config_main
 register_tpu_ci(
     est_time=3600,
     suite="stage-b-test-tpu-4-v7",
-    disabled="Removed from CI",
-    labels=["singlehost", "qwen3-coder-480b", "spec"],
+    labels=["singlehost", "qwen3-coder-480b", "spec", "fused-rs"],
 )
 
 SERVED_MODEL_NAME = "qwen3-coder-480b"
@@ -48,14 +48,16 @@ LAUNCH_ENV = {
         "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI "
         "--speculative-num-steps 3 "
         "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4"
+        "--speculative-num-draft-tokens 4 "
+        "--moe-runner-backend pallas_tpu_fused_rs "
+        "--tpu-compile-tracer dynamo"
     ),
 }
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "qwen3-coder-480b-spec-decoding-gsm8k",
-    "variant": "TP8+EP8+EAGLE3",
+    "variant": "TP8+EP8+EAGLE3+fused-RS",
     "launch": {
         "recipe": "recipe/qwen3_coder_480b/server.sh",
         "env": LAUNCH_ENV,
