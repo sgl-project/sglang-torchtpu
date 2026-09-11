@@ -194,6 +194,9 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # DeepSeek-R1 tp=16 (8 heads, page 64): decode 64 -5% vs (32,1,8); mixed
         # 8192 -19% vs (16,128) (5.34 vs 6.60 ms per layer at 16k KV).
         ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 64): (32, 1, 16),
+        # TP8 Kimi bs1, long-context FP8 KV: 64 pages improves the ~64k
+        # kernel versus 16; 128 is similar there but worse at short context.
+        ("decode", "bfloat16", "float8_e4m3fn", 8, 512, 64, 128, 1): (64, 1, 1),
         ("mixed", "bfloat16", "float8_e4m3fn", 8, 512, 64, 64, 8192): (64, 256),
         # ===== fp8 KV rows for DP attention (dp=16: every rank owns all 64 heads, page 128), tuned 2026-09-05 with tune_mla_fp8.py; decode rows from the 16k-KV pass (GPQA chains run 20k-98k), bs=1 from 2k; mixed 1024 = per-rank prefill chunk (4.0 vs 10.9 ms fallback) =====
         ("decode", "bfloat16", "float8_e4m3fn", 64, 512, 64, 128, 1): (
