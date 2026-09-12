@@ -976,9 +976,12 @@ class GptOssForCausalLM(nn.Module):
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         normal_weights = []
 
-        def expert_weights():
-            # Expert tensors are consumed as they arrive; the non-expert set
-            # is held for the sorted pass below.
+        def experts(weights):
+            # The RunAI streamer reuses one staging buffer across tensors, so a
+            # tensor read after later ones arrive can be read back as garbage.
+            # Expert weights are copied into their parameter as they are
+            # yielded; the rest are held until afterwards and need their own
+            # memory.
             for name, weight in weights:
                 if (
                     ".experts" in name
@@ -987,9 +990,9 @@ class GptOssForCausalLM(nn.Module):
                 ):
                     yield name, weight
                 else:
-                    normal_weights.append((name, _materialize_streamed(weight)))
+                    normal_weights.append((name, _own_if_runai_streamed(weight)))
 
-        mxfp4_loaded_params = self._load_mxfp4_experts_weights(expert_weights())
+        mxfp4_loaded_params = self._load_mxfp4_experts_weights(experts(weights))
         self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
@@ -1402,10 +1405,15 @@ class GptOssForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
 
-def _materialize_streamed(tensor: torch.Tensor) -> torch.Tensor:
-    """Copies a runai-streamed tensor out of the streamer's reused buffer."""
+def _own_if_runai_streamed(tensor: torch.Tensor) -> torch.Tensor:
+    """Take a copy the streamer cannot overwrite.
+
+    The copy lands on the host: distributed streaming yields device tensors,
+    and these are held until the whole checkpoint has streamed, so cloning
+    them in place would add their own GiB to peak GPU usage.
+    """
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
-        return tensor.clone().detach()
+        return tensor.detach().to("cpu", copy=True)
     return tensor
 
 
