@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
     _build_tpu_segment_ids,
 )
+from sglang.srt.multimodal.embedding import PaddedEmbedding
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=10, suite="stage-a-test-tpu-unit")
@@ -200,11 +201,15 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             spatial_merge_size=2,
             patch_embed=patch_embed,
             dtype=torch.float32,
-            forward_with_tpu_graph=MagicMock(return_value=torch.zeros(1)),
+            forward_with_tpu_graph=MagicMock(
+                return_value=PaddedEmbedding.from_tensor(torch.zeros(81, 4))
+            ),
         )
         policy = Qwen3VLVisionTpuCompilePolicy(vit)
 
-        policy.warmup_once(324)
+        with patch.object(vit_runner, "tpu_sync") as sync:
+            policy.warmup_once(324)
+        self.assertTrue(sync.call_args.kwargs["wait"])
 
         (x, grid_thw), _ = vit.forward_with_tpu_graph.call_args
         # 3 channels * 2 temporal * 16 * 16 == 1536 features per patch.
@@ -235,58 +240,19 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1024)
 
-    def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):
+    def test_qwen3_vl_unpad_keeps_bucket_and_selects_rows_in_metadata(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
-        padded = torch.arange(8).float()
-        # 12 real patches in a 16 bucket, 2x2 merge => 3 real output rows.
+        padded = torch.arange(16).reshape(4, 4).float()
         padding = VisionPaddingContext(
             real_seq_len=12, bucket_len=16, padded=True, merge_sq=4
         )
-
-        trimmed = policy.unpad_outputs(
-            padded, _Qwen3VLRunContext(padding=padding, output_indices=None)
-        )
-        self.assertEqual(trimmed.tolist(), [0.0, 1.0, 2.0])
-
-        selected = policy.unpad_outputs(
-            padded,
-            _Qwen3VLRunContext(padding=padding, output_indices=torch.tensor([2, 0])),
-        )
-        self.assertEqual(selected.tolist(), [2.0, 0.0])
-
-    def test_qwen3_vl_unpad_moves_to_host_before_trimming(self):
-        """The D2H must happen while the shape is still the static bucket.
-
-        Everything downstream of unpad (per-image split, embedding cache, chunk
-        assembly) is variable-length; leaving it on device recompiles once per
-        length. Asserting the device of the result cannot catch a regression
-        here because unit-test tensors are already on CPU, so spy on the shape
-        at which .to() is called instead: it must be the bucket, not the trim.
-        """
-
-        class _HostMoveSpy:
-            """Stands in for the compiled ViT output; records .to() calls."""
-
-            def __init__(self, tensor):
-                self._tensor = tensor
-                self.to_calls = []
-
-            def to(self, device):
-                self.to_calls.append((device, tuple(self._tensor.shape)))
-                return self._tensor
-
-        policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
-        spy = _HostMoveSpy(torch.arange(8).float())
-        padding = VisionPaddingContext(
-            real_seq_len=12, bucket_len=16, padded=True, merge_sq=4
-        )
-
-        trimmed = policy.unpad_outputs(
-            spy, _Qwen3VLRunContext(padding=padding, output_indices=None)
-        )
-
-        self.assertEqual(spy.to_calls, [("cpu", (8,))])
-        self.assertEqual(trimmed.tolist(), [0.0, 1.0, 2.0])
+        for indices, expected in ((None, [0, 1, 2]), (torch.tensor([2, 0]), [2, 0])):
+            result = policy.unpad_outputs(
+                padded, _Qwen3VLRunContext(padding=padding, output_indices=indices)
+            )
+            self.assertIs(result.parts[0].data, padded)
+            self.assertEqual(result.parts[0].indices.tolist(), expected)
+            self.assertEqual(result.num_tokens, len(expected))
 
     def test_qwen3_vl_prepare_call_consumes_host_padded_inputs(self):
         """prepare_call reads the real length off cu_seqlens, not off x_3d.
@@ -482,7 +448,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
             rotary_pos_emb_sin=rotary,
         )
 
-        self.assertEqual(tuple(result.shape), (5, 1, 4))
+        self.assertEqual(tuple(result.parts[0].data.shape), (5, 4))
+        self.assertEqual(result.num_tokens, 5)
         self.assertEqual(block.graph_cu_seqlens.tolist(), [0, 5])
         self.assertEqual(block.segment_ids.tolist(), [[0, 0, 1, 1, 1]])
 

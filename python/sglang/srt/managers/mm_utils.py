@@ -501,9 +501,9 @@ def embed_mm_inputs(
 
     # 4. scatter embeddings into input embedding
     if _is_tpu:
-        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_host
+        from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_tpu
 
-        input_embeds, input_deepstack_embeds = embed_mm_on_host(
+        input_embeds, input_deepstack_embeds = embed_mm_on_tpu(
             input_embeds=input_embeds,
             deepstack_shape=deepstack_embedding_shape if use_deepstack else None,
             modalities=modalities,

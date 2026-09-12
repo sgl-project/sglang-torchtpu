@@ -1489,6 +1489,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
+        from sglang.srt.multimodal.embedding import PaddedEmbedding
+
+        if isinstance(embedding, PaddedEmbedding):
+            return embedding.split_columns(self.config.hidden_size)
+
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
         ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"

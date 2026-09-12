@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.managers.mm_schedule import DataEmbeddingFunc
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.multimodal.embedding import Embedding, concat_embeddings
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def _split_items_by_patch_budget(
 def encode_vision_items(
     data_embedding_func: DataEmbeddingFunc,
     items: List[MultimodalDataItem],
-) -> torch.Tensor | List[torch.Tensor] | EVSEmbeddingResult:
+) -> Embedding | List[Embedding] | EVSEmbeddingResult:
     """Encode items as several calls that each fit the precompiled patch budget.
 
     A batch is concatenated into one encoder call, and TPU precompiles that call
@@ -90,6 +91,4 @@ def encode_vision_items(
     outputs = [data_embedding_func(group) for group in groups]
     if isinstance(outputs[0], list):
         return [embedding for output in outputs for embedding in output]
-    return torch.concat(
-        [output.reshape(-1, output.shape[-1]) for output in outputs], dim=0
-    )
+    return concat_embeddings(outputs)

@@ -51,6 +51,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model as load_model
+from sglang.srt.multimodal.embedding import PaddedEmbedding
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
@@ -844,6 +845,8 @@ class MMEncoder:
         forward_start = time.perf_counter()
         with torch.inference_mode():
             new_embeddings = get_feature_fn(mm_items)
+            if isinstance(new_embeddings, PaddedEmbedding):
+                new_embeddings = new_embeddings.to_cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
         if encoder_metrics_collector is not None:
@@ -1390,7 +1393,9 @@ class MMEncoder:
             if mm_embedding is None:
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
+                    mm_embedding = ctx.get_feature_fn(mm_items)
+                    if isinstance(mm_embedding, PaddedEmbedding):
+                        mm_embedding = mm_embedding.to_cpu()
                     if not keep_on_gpu:
                         mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:

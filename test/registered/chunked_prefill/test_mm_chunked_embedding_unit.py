@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.multimodal.embedding import PaddedEmbedding
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -137,6 +138,10 @@ def _assert_chunks_equal(chunks_a, chunks_b):
         if a is None or b is None:
             assert a is None and b is None
             continue
+        if isinstance(a, PaddedEmbedding):
+            a = torch.cat([p.data[p.indices.long()] for p in a.parts])
+        if isinstance(b, PaddedEmbedding):
+            b = torch.cat([p.data[p.indices.long()] for p in b.parts])
         assert a.shape == b.shape
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
@@ -289,3 +294,58 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def _encoder_padded(items):
+    valid = _encoder_tensor(items)
+    bucket = torch.full((32, HIDDEN), float("nan"))
+    bucket[: valid.shape[0]] = valid
+    return PaddedEmbedding.from_tensor(bucket, valid.shape[0])
+
+
+def test_padded_chunks_match_tensor_and_pin_whole_bucket():
+    _assert_chunks_equal(
+        _run_by_item_chunks(_encoder_padded), _run_by_item_chunks(_encoder_tensor)
+    )
+    _assert_chunks_equal(
+        _run_full_chunks(_encoder_padded), _run_full_chunks(_encoder_tensor)
+    )
+    _run_by_item_chunks(_encoder_padded)
+    for item in _make_items():
+        cached = mm_schedule.embedding_cache.get_single(item.hash).embedding
+        assert cached.num_tokens == _num_tokens(item)
+        assert sum(cached.storage_sizes.values()) == 32 * HIDDEN * 4
+
+
+def test_padded_batched_requests_reuse_cache_across_chunks():
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()
+    encoder = Mock(side_effect=_encoder_padded)
+
+    def run(prefixes, lengths):
+        chunk, _ = mm_schedule._get_chunked_prefill_embedding(
+            encoder,
+            items,
+            [0, 2, 3],
+            prefixes,
+            lengths,
+            [ITEM_OFFSETS[:2], ITEM_OFFSETS[2:]],
+            torch.zeros(sum(lengths), dtype=torch.long),
+        )
+        return torch.cat([part.data[part.indices.long()] for part in chunk.parts])
+
+    first = run([3, 21], [12, 4])
+    expected = torch.cat(
+        [
+            _item_embedding(items[0])[1:],
+            _item_embedding(items[1]),
+            _item_embedding(items[2])[1:],
+        ]
+    )
+    assert torch.equal(first, expected)
+    second = run([4, 22], [3, 2])
+    expected = torch.cat(
+        [_item_embedding(items[0])[2:], _item_embedding(items[2])[2:4]]
+    )
+    assert torch.equal(second, expected)
+    assert encoder.call_count == 1

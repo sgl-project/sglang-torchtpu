@@ -17,6 +17,7 @@ from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
+from sglang.srt.multimodal.embedding import PaddedEmbedding
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +247,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
             patch_counts,
         )
 
+        embedding_outputs = []
         init_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.float32)
         try:
@@ -258,13 +260,37 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         len(patch_counts),
                         patch_count,
                     )
-                    self.warmup_once(patch_count)
+                    output = self.warmup_once(patch_count)
+                    if isinstance(output, PaddedEmbedding):
+                        embedding_outputs.append(output)
         finally:
             torch.set_default_dtype(init_dtype)
 
+        if embedding_outputs:
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                DecoderTpuCompilePolicy,
+            )
+            from sglang.srt.hardware_backend.tpu.mm_embed_tpu import (
+                warmup_device_mm_embeds,
+            )
+
+            decoder = self.model_runner.compile_policy
+            if (
+                isinstance(decoder, DecoderTpuCompilePolicy)
+                and decoder.t_bucketer is not None
+            ):
+                embed_tokens = decoder.owner.get_input_embeddings()
+                warmup_device_mm_embeds(
+                    embedding_outputs,
+                    list(decoder.t_bucketer.buckets),
+                    embed_tokens.embedding_dim,
+                    embed_tokens.weight.dtype,
+                    self.model_runner.device,
+                )
+
         logger.info("VisionTpuCompilePolicy.precompile: done.")
 
-    def run(self, *raw: Any) -> torch.Tensor:
+    def run(self, *raw: Any) -> Any:
         if self.compiled_fn is None:
             raise RuntimeError("VisionTpuCompilePolicy.run called before install().")
 
@@ -294,11 +320,12 @@ class VisionTpuCompilePolicy(CompilePolicy):
         precompile.
         """
 
-    def warmup_once(self, patch_count: int) -> None:
+    def warmup_once(self, patch_count: int) -> PaddedEmbedding | None:
         """Warm one patch count, blocking until it lands.
 
         Defaults to the compiled region. Override when the encoder has an
         eager prologue or epilogue that is shape-static per bucket too.
+        Return a PaddedEmbedding to also warm its placement into prefill buckets.
         """
         result = self.compiled_fn(*self.make_warmup_inputs(patch_count))
         tpu_sync([result], wait=True)
@@ -326,8 +353,8 @@ class VisionTpuCompilePolicy(CompilePolicy):
     def unpad_outputs(self, result: Any, ctx: Any) -> Any:
         """Turn the padded compiled output into what the caller expects.
 
-        Slices the real token count back out of the bucket, plus any
-        encoder-specific output adaptation.
+        Return PaddedEmbedding to preserve device buckets through caching and
+        chunking, or adapt the output for an existing tensor consumer.
         """
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
@@ -404,7 +431,7 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             max_patches=envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.get(),
         )
 
-    def warmup_once(self, patch_count: int) -> None:
+    def warmup_once(self, patch_count: int) -> PaddedEmbedding:
         # A square grid lands exactly on the bucket, so the eager prologue and
         # epilogue warm at the shapes a real image of this bucket will use.
         vit = self.vit
@@ -415,10 +442,12 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
             * patch_embed.patch_size**2
         )
         grid = int(math.isqrt(patch_count))
-        vit.forward_with_tpu_graph(
+        result = vit.forward_with_tpu_graph(
             torch.zeros(patch_count, in_features, dtype=vit.dtype),
             torch.tensor([[1, grid, grid]], dtype=torch.int32),
         )
+        tpu_sync([part.data for part in result.parts], wait=True)
+        return result
 
     def prepare_call(
         self,
@@ -470,17 +499,12 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
 
     def unpad_outputs(
         self, result: torch.Tensor, ctx: _Qwen3VLRunContext
-    ) -> torch.Tensor:
-        padding = ctx.padding
-        # Land on the host while the shape is still the bucket: every consumer
-        # from here on is variable-length and would recompile per length.
-        result = result.to("cpu")
-        if padding.padded:
-            result = result[: padding.real_seq_len // padding.merge_sq]
-        # Qwen3-VL's caller asks for a subset of the merged output rows.
-        if ctx.output_indices is not None:
-            result = result.index_select(0, ctx.output_indices.to("cpu"))
-        return result
+    ) -> PaddedEmbedding:
+        return PaddedEmbedding.from_tensor(
+            result,
+            num_tokens=ctx.padding.real_seq_len // ctx.padding.merge_sq,
+            row_indices=ctx.output_indices,
+        )
 
 
 class ViTTpuCompileRunner:
@@ -669,9 +693,8 @@ class ViTTpuCompileRunner:
             result = self._blocks_and_merger_fallback(
                 x_3d, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
-        # Same host contract as the installed policy's unpad_outputs, so the
-        # embedding cache never mixes devices across the two modes.
-        result = result.to("cpu")
-        if output_indices is not None:
-            result = result.index_select(0, output_indices.to("cpu"))
-        return result
+        return PaddedEmbedding.from_tensor(
+            result.reshape(-1, result.shape[-1]),
+            num_tokens=int(cu_seqlens[-1]) // self.vit.spatial_merge_size**2,
+            row_indices=output_indices,
+        )
