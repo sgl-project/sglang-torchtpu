@@ -1602,6 +1602,9 @@ class Envs:
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # TPU
+    # Restore device MM scatter instead of host placement.
+    # https://github.com/sgl-project/sglang-torchtpu/issues/741
+    SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it

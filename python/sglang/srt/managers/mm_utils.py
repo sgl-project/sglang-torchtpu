@@ -374,6 +374,9 @@ def _scatter_mm_embedding(
 ) -> None:
     # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
     src = src.to(dest.device, dest.dtype)
+    if dest.device.type == "tpu":
+        dest.masked_scatter_(mask.to(dest.device).expand_as(dest), src)
+        return
     num_src_rows = src.size(0)
     flat_mask = mask.view(-1)
     ranks = torch.cumsum(flat_mask, dim=0) - 1
@@ -500,7 +503,7 @@ def embed_mm_inputs(
         )
 
     # 4. scatter embeddings into input embedding
-    if _is_tpu:
+    if _is_tpu and not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
         from sglang.srt.hardware_backend.tpu.mm_embed_tpu import embed_mm_on_host
 
         input_embeds, input_deepstack_embeds = embed_mm_on_host(
