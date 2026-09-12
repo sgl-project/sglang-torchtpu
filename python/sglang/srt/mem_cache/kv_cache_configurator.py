@@ -2079,12 +2079,10 @@ class KVCacheConfigurator:
                 **self._mxint8_pool_kwargs(),
             )
         from sglang.srt.layers.attention.qsa.config import (
-            QSA_VARIANT_TOKENWISE,
             parse_qsa_profile,
         )
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
-            QwenDSATokenToKVPool,
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_config)
@@ -2092,13 +2090,6 @@ class KVCacheConfigurator:
             pool_class = HybridLinearKVPool
             extra_args["use_mla"] = self.use_mla_backend
             extra_args["full_kv_pool"] = full_kv_pool
-        elif qsa_profile.variant == QSA_VARIANT_TOKENWISE:
-            pool_class = QwenDSATokenToKVPool
-            extra_args.update(
-                qsa_index_kv_heads=qsa_profile.kv_heads,
-                qsa_index_head_dim=qsa_profile.head_dim,
-                qsa_token_budget=qsa_profile.budget,
-            )
         else:
             pool_class = QSATokenToKVPool
             extra_args.update(
