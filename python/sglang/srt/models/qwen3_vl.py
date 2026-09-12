@@ -73,6 +73,12 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
+    CudaIpcTensorTransportProxy,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
@@ -1558,16 +1564,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # Assemble on the host at bucket length so the encoder prologue sees
             # a static shape; forward_with_tpu_graph does the single transfer.
             total_patches = int(grid_thw.prod(dim=1).sum())
-            pixel_values = self._materialize_visual_items(
+            pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
                 items,
                 range(len(items)),
                 device=torch.device("cpu"),
                 pad_to=self.visual.graph_runners.bucket_for_patches(total_patches),
+                preserve_for_reprefill=True,
             )
         else:
-            pixel_values = self._materialize_visual_items(items, range(len(items)))
+            pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
+                items, range(len(items)), preserve_for_reprefill=True
+            )
         assert pixel_values.dim() == 2, pixel_values.dim()
-        return self.visual(pixel_values, grid_thw=grid_thw)
+        visual_features = self.visual(pixel_values, grid_thw=grid_thw)
+        if borrowed_items:
+            self._offload_packed_visual_inputs(
+                pixel_values, borrowed_items, packed_ready
+            )
+        return visual_features
 
     def _materialize_visual_items(
         self,
@@ -1576,8 +1590,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         *,
         device: torch.device | None = None,
         pad_to: int | None = None,
-    ) -> torch.Tensor:
+        preserve_for_reprefill: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         visual_device = self.visual.device
+        target_device = visual_device if device is None else device
         device_index = visual_device.index
         if visual_device.type == "cuda" and device_index is None:
             device_index = torch.cuda.current_device()
@@ -1586,17 +1602,117 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             consumer_count = max(parallel.tp_size, 1)
 
         features = []
+        borrowed_items = []
+        feature_offset = 0
         for index in indices:
             item = items[index]
             if visual_device.type == "cuda":
-                item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+                proxy = item.feature
+                model_specific_data = getattr(item, "model_specific_data", {})
+                pending_copy = model_specific_data.pop(
+                    CUDA_IPC_FEATURE_COPY_EVENT_KEY, None
+                )
+                if pending_copy is not None:
+                    torch.cuda.current_stream(device_index).wait_event(pending_copy)
+                borrow_requested = model_specific_data.pop(
+                    BORROW_CUDA_IPC_FEATURE_KEY, False
+                )
+                can_borrow = (
+                    preserve_for_reprefill
+                    and consumer_count == 1
+                    and isinstance(proxy, CudaIpcTensorTransportProxy)
+                    and borrow_requested
+                )
+                borrowed = (
+                    proxy.borrow_on_target_device(device_index) if can_borrow else None
+                )
+                if borrowed is not None:
+                    item.feature = borrowed
+                    model_specific_data[RETAINED_CUDA_IPC_FEATURE_PROXY_KEY] = proxy
+                    borrowed_items.append(
+                        (item, proxy, feature_offset, borrowed.shape[0])
+                    )
+                elif RETAINED_CUDA_IPC_FEATURE_PROXY_KEY not in model_specific_data:
+                    item.reconstruct(device_index, ipc_consumer_count=consumer_count)
             features.append(item.feature)
-        return materialize_multimodal_features(
-            features,
-            device=visual_device if device is None else device,
-            dtype=self.visual.dtype,
-            pad_to=pad_to,
-        )
+            feature_offset += item.feature.shape[0]
+        try:
+            materialized = materialize_multimodal_features(
+                features,
+                device=target_device,
+                dtype=self.visual.dtype,
+                pad_to=pad_to,
+            )
+        except Exception:
+            for item, proxy, _, _ in borrowed_items:
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a borrowed CUDA IPC feature after "
+                        "materialization failed",
+                        exc_info=True,
+                    )
+                item.feature = None
+            raise
+        packed_ready = None
+        if borrowed_items:
+            source_stream = torch.cuda.current_stream(device_index)
+            packed_ready = torch.cuda.Event()
+            packed_ready.record(source_stream)
+            for item, proxy, offset, length in borrowed_items:
+                item.feature = materialized.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = packed_ready
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a copied CUDA IPC feature; retaining "
+                        "its lease until request cleanup",
+                        exc_info=True,
+                    )
+        if preserve_for_reprefill:
+            return materialized, borrowed_items, packed_ready
+        return materialized
+
+    def _offload_packed_visual_inputs(
+        self, materialized: torch.Tensor, borrowed_items: list, packed_ready
+    ) -> None:
+        """Preserve inputs for re-prefill without delaying the ViT launch."""
+        try:
+            host_features = torch.empty(
+                materialized.shape,
+                dtype=materialized.dtype,
+                device="cpu",
+                pin_memory=torch.cuda.is_available(),
+            )
+            copy_stream = getattr(self, "_mm_feature_copy_stream", None)
+            if copy_stream is None:
+                copy_stream = torch.cuda.Stream(device=self.visual.device)
+                self._mm_feature_copy_stream = copy_stream
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(packed_ready)
+                host_features.copy_(materialized, non_blocking=True)
+                host_ready = torch.cuda.Event()
+                host_ready.record(copy_stream)
+            if materialized.is_cuda:
+                materialized.record_stream(copy_stream)
+            for item, _, offset, length in borrowed_items:
+                item.feature = host_features.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = host_ready
+        except Exception:
+            # The generic multimodal path will offload the owned CUDA slices.
+            logger.warning(
+                "Failed to preserve CUDA IPC features on the copy stream; "
+                "falling back to the generic offload path",
+                exc_info=True,
+            )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
