@@ -32,11 +32,19 @@ COPY . /workspace/sglang
 # version
 # 2. Copy pyproject_tpu.toml to pyproject.toml
 # 3. Install sglang tpu dependencies and sglang itself
-RUN cd /workspace/sglang/python && \
+RUN --mount=type=secret,id=gcp_token,required=false \
+    cd /workspace/sglang/python && \
     sed -i 's/"torch-tpu==[^"]*"/"torch-tpu"/' pyproject_tpu.toml && \
     sed -i '/\[tool.uv\]/,$d' pyproject_tpu.toml && \
     cp pyproject_tpu.toml pyproject.toml && \
-    uv pip install --system .[all_tpu,ray,runai]
+    TOKEN="$(cat /run/secrets/gcp_token 2>/dev/null || true)" && \
+    if [ -n "$TOKEN" ]; then \
+      uv pip install --system \
+        --extra-index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
+        .[all_tpu,ray,runai]; \
+    else \
+      uv pip install --system .[all_tpu,ray,runai]; \
+    fi
 
 # Default command
 CMD ["/bin/bash"]
