@@ -34,7 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_tpu, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -208,6 +208,10 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
+        and not (
+            _hf_arch(config) == "GlmMoeDsaForCausalLM"
+            and _hf_attr(config, "tpu_dense_dsa_max_context") is not None
+        )
     )
 
 
@@ -1185,6 +1189,13 @@ class ModelConfig:
 
         # Unify the config keys for hf_text_config
         self.head_dim = getattr(self.hf_text_config, "head_dim", None)
+        if (
+            is_tpu()
+            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        ):
+            # The TPU reference path expands MLA to ordinary per-head K/V.
+            self.head_dim = self.hf_text_config.qk_nope_head_dim
+            self.hf_text_config.head_dim = self.head_dim
         if self.head_dim is None:
             if is_pure_ssm:
                 self.head_dim = 0

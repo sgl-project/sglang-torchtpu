@@ -121,6 +121,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     log_info_on_rank0,
+    is_tpu,
     make_pp_layers,
     set_weight_attrs,
 )
@@ -1875,4 +1876,5 @@ class Glm5NextForConditionalGeneration(nn.Module):
         )
 
 
-EntryClass = [Glm5NextForConditionalGeneration]
+# TPU registers its text-only implementation from glm5_next_tpu.
+EntryClass = [] if is_tpu() else [Glm5NextForConditionalGeneration]

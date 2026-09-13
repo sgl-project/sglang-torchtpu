@@ -69,6 +69,10 @@ def poll_and_all_reduce_pp(
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
     """Return the model-defined PD seed width, independent of local spec mode."""
+    # A checkpoint may retain indexer settings while using a dense attention
+    # path (e.g. the bounded-context GLM TPU recipes), which produces no seeds.
+    if not is_deepseek_dsa(hf_config):
+        return 0
     if not getattr(hf_config, "index_share_for_mtp_iteration", False):
         return 0
     # QSA models reuse the same flag for their draft-side index sharing but

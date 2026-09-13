@@ -386,11 +386,11 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     is irrelevant here (state is always updated).
     """
 
-    def __init__(self, model_runner: "ModelRunner"):
+    def __init__(self, model_runner: "ModelRunner", *, op_builder=None):
         super().__init__(model_runner)
         # Build (and JAX-export) the custom op eagerly at construction time so
         # the heavyweight export does not happen inside a torch.compile trace.
-        self._op = build_gdn_pallas_op()
+        self._op = (op_builder or build_gdn_pallas_op)()
         self._extra_buffer_enabled = get_exec().mamba.enable_mamba_extra_buffer
         if self._extra_buffer_enabled:
             self.req_to_token_pool.mamba_pool.warmup_state_copy(

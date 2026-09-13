@@ -120,6 +120,21 @@ class TestTpuMambaPool(CustomTestCase):
             "HybridReqToTokenPool.alloc will raise AttributeError.",
         )
 
+    def test_kda_conv_layout_is_already_time_major(self):
+        shape = KimiLinearStateShape.create(
+            tp_world_size=2, num_heads=8, head_dim=16, conv_kernel_size=4
+        )
+        params = KimiLinearCacheParams(shape=shape, layers=[0, 1])
+        pool = TpuMambaPool(
+            size=3,
+            spec_state_size=0,
+            cache_params=params,
+            mamba_layer_ids=[0, 1],
+            device="cpu",
+        )
+        self.assertEqual(pool.mamba_cache.conv[0][0].shape, (4, 3, 192))
+        self.assertEqual(pool.mamba_cache.temporal[0].shape, (4, 4, 16, 16))
+
     def test_kernel_native_buffer_layout(self):
         pool = self._pool()
         num_layers = len(self.LAYERS)

@@ -223,3 +223,15 @@ sglang_tpu_e2e_test(
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )
+
+sglang_tpu_e2e_test(
+    name = "test_tpu_glm_5_3_flash_singlehost",
+    srcs = ["test_tpu_glm_5_3_flash_singlehost.py"],
+    data = ["//benchmark/tpu:runtime"],
+    main = "test_tpu_glm_5_3_flash_singlehost.py",
+    tags = ["requires-tpu-v7x"],
+    deps = [
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
