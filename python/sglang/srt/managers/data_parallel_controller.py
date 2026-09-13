@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+    DPC_WORKER_PORT_DELTA,
     PortArgs,
     ServerArgs,
 )
@@ -576,10 +577,20 @@ class DataParallelController:
                 if server_args.elastic_ep_backend is not None
                 else get_parallel().dp_size
             )
+            is_single_host = server_args.node_rank == 0 and server_args.nnodes == 1
             for slot in range(bind_count):
-                worker_port, worker_socket = get_zmq_socket_on_host(
-                    self.context, zmq.PUSH, host=bind_host
-                )
+                if is_single_host:
+                    worker_port = server_args.port + DPC_WORKER_PORT_DELTA + slot
+                    worker_socket = get_zmq_socket(
+                        self.context,
+                        zmq.PUSH,
+                        f"tcp://127.0.0.1:{worker_port}",
+                        True,
+                    )
+                else:
+                    worker_port, worker_socket = get_zmq_socket_on_host(
+                        self.context, zmq.PUSH, host=bind_host
+                    )
                 worker_ports.append(worker_port)
                 self.workers[slot] = worker_socket
                 logger.debug(

@@ -4381,6 +4381,10 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
+NCCL_DEFAULT_PORT_DELTA = 240
+DPC_WORKER_PORT_DELTA = 241
+TPU_HANDSHAKE_PORT_DELTA = 280
+TPU_SLICEBUILDER_PORT_DELTA = 300
 
 
 @dataclasses.dataclass
@@ -4423,7 +4427,10 @@ class PortArgs:
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
-            nccl_port = get_free_port()
+            if getattr(server_args, "port", None) is not None and server_args.port > 0:
+                nccl_port = server_args.port + NCCL_DEFAULT_PORT_DELTA
+            else:
+                nccl_port = get_free_port()
         else:
             nccl_port = server_args.nccl_port
 

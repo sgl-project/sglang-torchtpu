@@ -14,6 +14,11 @@ import os
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.server_args import (
+    TPU_HANDSHAKE_PORT_DELTA,
+    TPU_SLICEBUILDER_PORT_DELTA,
+    ServerArgs,
+)
 
 logger = get_logger(__name__)
 
@@ -36,6 +41,7 @@ _dynamic_compile_unwrapped = False
 # multi-process / multi-host init issues are diagnosable from a single line.
 _IMPORTANT_TPU_ENV_VARS = (
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_INTERNAL_HANDSHAKE_PORT",
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_BASE_PORT",
     "TORCH_TPU_DEVICES_PER_HOST",
@@ -144,13 +150,14 @@ def _set_torch_tpu_topology_env_multihost(
     os.environ.setdefault("TORCH_TPU_TOPOLOGY", ",".join(str(d) for d in chip_dims))
 
 
-def compute_single_host_tpu_env(world_size: int) -> dict:
+def compute_single_host_tpu_env(world_size: int, base_port: int | None = None) -> dict:
     """Compute parent-safe single-host slicebuilder env without mutating
     ``os.environ`` or importing TorchTPU.
 
-    Picks ``world_size`` free localhost ports for the per-rank slicebuilder
-    endpoints. The trivial single-rank topology is known without hardware
-    discovery; multi-rank topology is resolved later inside each worker.
+    Derives slicebuilder and handshake ports deterministically from
+    ``base_port`` (or ``PORT`` env var, default 30000). The trivial
+    single-rank topology is known without hardware discovery; multi-rank
+    topology is resolved later inside each worker.
 
     Returning the values (rather than writing them) lets the Ray driver compute
     the shared port list once and inject it into every same-host actor via
@@ -158,26 +165,18 @@ def compute_single_host_tpu_env(world_size: int) -> dict:
     mutations to actors, so each actor computing this independently would pick a
     different port list and the slicebuilder would never rendezvous.
     """
-    try:
-        import portpicker
+    if base_port is None:
+        base_port = int(os.environ.get("PORT", "30000"))
 
-        sb_ports = [portpicker.pick_unused_port() for _ in range(world_size)]
-    except ImportError:
-        import socket
-
-        # Hold sockets open until the ports are read so the OS doesn't reassign.
-        _held = [
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM) for _ in range(world_size)
-        ]
-        for s in _held:
-            s.bind(("", 0))
-        sb_ports = [s.getsockname()[1] for s in _held]
-        for s in _held:
-            s.close()
-
+    sb_ports = [base_port + TPU_SLICEBUILDER_PORT_DELTA + i for i in range(world_size)]
     env = {
         "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(f"localhost:{p}" for p in sb_ports)
     }
+
+    if "TORCH_TPU_INTERNAL_HANDSHAKE_PORT" not in os.environ:
+        env["TORCH_TPU_INTERNAL_HANDSHAKE_PORT"] = str(
+            base_port + TPU_HANDSHAKE_PORT_DELTA
+        )
 
     if world_size == 1:
         env["TORCH_TPU_TOPOLOGY"] = "1,1,1"
@@ -192,17 +191,24 @@ def _resolve_single_host_tpu_topology(world_size: int) -> str | None:
     return hardware.get_tpu_topology(world_size)
 
 
-def _set_torch_tpu_topology_env_single(world_size: int) -> None:
+def _set_torch_tpu_topology_env_single(
+    world_size: int, base_port: int | None = None
+) -> None:
     """Set the slicebuilder + topology env for a single-host process group.
 
     Thin wrapper over ``compute_single_host_tpu_env`` for the non-Ray / in-process
     path. Addresses are always written; the trivial single-rank topology is
     filled when unset. Multi-rank topology requires worker-side resolution.
     """
-    env = compute_single_host_tpu_env(world_size)
+    env = compute_single_host_tpu_env(world_size, base_port=base_port)
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = env[
         "TORCH_TPU_SLICEBUILDER_ADDRESSES"
     ]
+    if "TORCH_TPU_INTERNAL_HANDSHAKE_PORT" in env:
+        os.environ.setdefault(
+            "TORCH_TPU_INTERNAL_HANDSHAKE_PORT",
+            env["TORCH_TPU_INTERNAL_HANDSHAKE_PORT"],
+        )
     if "TORCH_TPU_TOPOLOGY" in env:
         os.environ.setdefault("TORCH_TPU_TOPOLOGY", env["TORCH_TPU_TOPOLOGY"])
 
@@ -211,6 +217,8 @@ def _prepare_tpu_env(
     world_size: int | None = None,
     setup_slicebuilder: bool = True,
     resolve_single_host_topology: bool = False,
+    server_args: ServerArgs | None = None,
+    base_port: int | None = None,
 ) -> None:
     """Set TORCH_TPU_* env vars needed by PjRt for multi-process init.
 
@@ -245,6 +253,16 @@ def _prepare_tpu_env(
     # torch implementation instead.
     os.environ.setdefault("SGLANG_NATIVE_MOVE_KV_CACHE", "1")
 
+    if base_port is None and server_args is not None:
+        base_port = getattr(server_args, "port", None)
+    if base_port is None:
+        base_port = int(os.environ.get("PORT", "30000"))
+
+    if "TORCH_TPU_INTERNAL_HANDSHAKE_PORT" not in os.environ:
+        os.environ["TORCH_TPU_INTERNAL_HANDSHAKE_PORT"] = str(
+            base_port + TPU_HANDSHAKE_PORT_DELTA
+        )
+
     if not setup_slicebuilder:
         return
 
@@ -269,9 +287,9 @@ def _prepare_tpu_env(
             tpu_topology=os.environ.get("TPU_TOPOLOGY", ""),
         )
     elif "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ:
-        # Single-host picks random free ports, so it must be computed once and
+        # Single-host picks deterministic ports, so it must be computed once and
         # inherited by child ranks -- don't clobber an already-set value.
-        _set_torch_tpu_topology_env_single(world_size)
+        _set_torch_tpu_topology_env_single(world_size, base_port=base_port)
 
     if (
         len(hosts) <= 1
