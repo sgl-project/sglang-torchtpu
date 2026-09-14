@@ -141,7 +141,9 @@ def _to_tpu_fp8_moe_scale_layout(
     """Convert per-expert FP8 MoE scales to gmm_v2's RHS scale layout."""
     # TODO(torch_tpu): gmm_v2 has historically stored TPU MoE scales in bf16.
     # Check fp32 scale storage/compute for accuracy before changing this layout.
-    scale = scale.to(torch.bfloat16)
+    scale = scale.to(
+        torch.float32 if envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get() else torch.bfloat16
+    )
     if scale.dim() == 1:
         scale = scale[:, None].expand(-1, out_size)
     elif scale.dim() == 2:
@@ -179,7 +181,9 @@ def _to_tpu_fp8_moe_block_scale_layout(
     scale_tile_stride = 128
     # TODO(torch_tpu): gmm_v2 has historically stored TPU MoE scales in bf16.
     # Check fp32 scale storage/compute for accuracy before changing this layout.
-    scale = scale.to(torch.bfloat16)
+    scale = scale.to(
+        torch.float32 if envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get() else torch.bfloat16
+    )
     if scale.dim() == 4:
         if scale.shape[2] != 1:
             raise ValueError(

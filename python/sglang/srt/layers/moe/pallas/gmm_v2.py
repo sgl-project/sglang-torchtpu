@@ -30,6 +30,20 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sglang.srt.environ import envs
+
+_FP32_MOE_SCALES = envs.SGLANG_TPU_FP8_MOE_FP32_SCALES.get()
+
+
+def _scale_quantized_partial(partial, lhs_scale, rhs_scale, *, fp32_scales):
+    """Apply scales without changing dot-result rounding or accumulator dtype."""
+    dtype = jnp.float32 if fp32_scales else partial.dtype
+    scaled = partial.astype(dtype) * lhs_scale.astype(dtype)
+    if rhs_scale is not None:
+        scaled = scaled * rhs_scale.astype(dtype)
+    return scaled.astype(partial.dtype)
+
+
 # Util.
 
 
@@ -551,19 +565,18 @@ def inner_kernel(
                         preferred_element_type=preferred_element_type,
                     ).astype(acc_ref.dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
-
+                    rhs_scale = None
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.has_scale:
                         b_id = start_k // cfgs.rhs_cfgs.quant_block_size
                         rhs_scale_slice = tiled_rhs_ref.get_scale(
                             b_id, cfgs.rhs_cfgs.scale_block_n
                         )
-                        block_acc *= rhs_scale_slice[..., start_n:end_n].astype(
-                            acc_ref.dtype
-                        )
+                        rhs_scale = rhs_scale_slice[..., start_n:end_n]
 
-                    acc_n += block_acc
+                    acc_n += _scale_quantized_partial(
+                        block_acc, block_scale, rhs_scale, fp32_scales=_FP32_MOE_SCALES
+                    )
                 acc_list.append(acc_n)
             acc = jnp.concatenate(acc_list, axis=1)
 
@@ -1343,6 +1356,11 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
+    if _FP32_MOE_SCALES and lhs_cfgs.quant_dtype is not None:
+        # FP32 scale temporaries are absent from the BF16 accumulator cost model.
+        # R1 prefill otherwise needs 77.82 MiB against 63.94 MiB available VMEM.
+        # Bound M while preserving K groups and each output's accumulation order.
+        tiles = dataclasses.replace(tiles, tile_m=min(tiles.tile_m, 16))
     if dims.size_n % tiles.tile_n != 0:
         # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
         # partial final N tile would read/write past the RHS/output buffers, so
