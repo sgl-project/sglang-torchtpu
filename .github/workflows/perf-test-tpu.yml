@@ -79,12 +79,15 @@ jobs:
         # compile) plus one sweep leg, with slack for a cold compile cache. c64
         # compiles a wider decode bucket than c16, and the speculative legs also
         # load and compile a draft model.
+        # run_name names the Kubernetes objects. JobSet validates the pod name,
+        # tpu-ci-<run_name>-<5 rand>-slice-0-0-<5 rand>, against 63 chars, leaving
+        # run_name 34; the suites themselves (29-40) are rejected at admission.
         entry: >-
           ${{ fromJSON('[
-          {"suite": "nightly-tpu-perf-gpt-oss-120b", "timeout": 1800},
-          {"suite": "nightly-tpu-perf-gpt-oss-120b-c64", "timeout": 2400},
-          {"suite": "nightly-tpu-perf-gpt-oss-120b-eagle3-c64", "timeout": 3000},
-          {"suite": "nightly-tpu-perf-gpt-oss-120b-dflash-c64", "timeout": 3000}]') }}
+          {"suite": "nightly-tpu-perf-gpt-oss-120b", "run_name": "perf-gpt-oss-120b", "timeout": 1800},
+          {"suite": "nightly-tpu-perf-gpt-oss-120b-c64", "run_name": "perf-gpt-oss-120b-c64", "timeout": 2400},
+          {"suite": "nightly-tpu-perf-gpt-oss-120b-eagle3-c64", "run_name": "perf-gpt-oss-120b-eagle3-c64", "timeout": 3000},
+          {"suite": "nightly-tpu-perf-gpt-oss-120b-dflash-c64", "run_name": "perf-gpt-oss-120b-dflash-c64", "timeout": 3000}]') }}
     name: ${{ matrix.entry.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -93,6 +96,7 @@ jobs:
       lane: nightly
       hosts: 1
       suite: ${{ matrix.entry.suite }}
+      run_name: ${{ matrix.entry.run_name }}
       nightly: true
       # gpt-oss-120b serves from the shared ROX disk at /weights; harmless for the
       # model that pulls from HF instead.
