@@ -433,8 +433,15 @@ class CompiledFunction:
             len(inserted_callbacks),
         )
         with dynamo_timed("direct_compile_traverse_and_compile"):
+            # Placeholders do not retain the physical layout of their buffers.
+            argument_layouts = []
+            for tensor in flat_inputs:
+                layout = None
+                if tensor.device.type == "tpu":
+                    layout = tpu_torch_compile.get_device_layout_if_materialized(tensor)
+                argument_layouts.append(layout[0] if layout is not None else [])
             compile_result = tpu_torch_compile.traverse_and_compile(
-                result_tensors, graph_inputs
+                result_tensors, graph_inputs, argument_layouts=argument_layouts
             )
         logger.info("[direct_compile] compilation finished")
         return _CompiledArtifact(

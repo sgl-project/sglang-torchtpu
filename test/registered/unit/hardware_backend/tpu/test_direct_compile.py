@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from jax import tree_util
+from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
 from sglang.srt.speculative.eagle_info import (
@@ -145,6 +146,61 @@ class TestDirectCompile(CustomTestCase):
         self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
         self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
         self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+
+    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    def test_preserves_model_and_argument_layouts(self):
+        """Compile against live buffer layouts, not placeholder defaults."""
+        cache_cpu = torch.arange(256 * 64, dtype=torch.float32).reshape(256, 64)
+        values_cpu = cache_cpu * 2
+        compiler = direct_compile.tpu_torch_compile
+        execute = compiler.execute
+
+        def execute_with_layout_check(executable, inputs):
+            input_layouts = [
+                compiler.get_device_layout_if_materialized(tensor) for tensor in inputs
+            ]
+            self.assertTrue(all(layout is not None for layout in input_layouts))
+            # Inspect the real executable before launching it: a silently ignored
+            # layout must fail even if execution would relayout the inputs.
+            self.assertEqual(
+                executable.get_parameter_layouts(),
+                input_layouts,
+            )
+            return execute(executable, inputs)
+
+        # Swap the layouts without changing the graph. An unconstrained compiler
+        # cannot accidentally choose the required layouts for both cases.
+        for cache_order, values_order in (([1, 0], [0, 1]), ([0, 1], [1, 0])):
+            with self.subTest(cache_order=cache_order, values_order=values_order):
+                with LayoutContext(TpuLayout(minor_to_major=cache_order)):
+                    cache = cache_cpu.to("tpu")
+                with LayoutContext(TpuLayout(minor_to_major=values_order)):
+                    values = values_cpu.to("tpu")
+                for tensor, order in ((cache, cache_order), (values, values_order)):
+                    layout = compiler.get_device_layout_if_materialized(tensor)
+                    self.assertIsNotNone(layout)
+                    self.assertEqual(layout[0], order)
+                model = torch.nn.Module()
+                model.register_buffer("cache", cache)
+
+                def fn(positions, values):
+                    cache_rows = model.cache.index_select(0, positions)
+                    return cache_rows + values.index_select(0, positions)
+
+                compiled = direct_compile.direct_compile(
+                    fn, model=model, specialization_key=lambda positions, values: ()
+                )
+                with patch.object(
+                    compiler, "execute", side_effect=execute_with_layout_check
+                ):
+                    for indices in ([0, 127, 128, 255], [255, 128, 0, 255]):
+                        positions = torch.tensor(indices)
+                        expected = (cache_cpu + values_cpu).index_select(0, positions)
+                        actual = compiled(positions.to("tpu"), values)
+                        torch.testing.assert_close(
+                            actual.cpu(), expected, rtol=0, atol=0
+                        )
+                self.assertEqual(len(compiled.cache), 1)
 
     def test_model_extra_tensor_attrs_trace_user_object_state_and_aliases(self):
         model = _ModelWithObjectTensorState()
