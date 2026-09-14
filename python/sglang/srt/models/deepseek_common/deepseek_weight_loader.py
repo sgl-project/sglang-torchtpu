@@ -566,7 +566,6 @@ class DeepseekV2WeightLoaderMixin:
             # This may affect the accuracy of fp8 model.
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
-            tpu_mla_bf16 = _is_tpu and envs.SGLANG_TPU_MLA_BF16_WEIGHTS.get()
 
             if w.dtype in (
                 torch.float8_e4m3fn,
@@ -617,12 +616,12 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        (_is_cuda or _is_musa or _is_xpu or tpu_mla_bf16)
+                        (_is_cuda or _is_musa or _is_xpu or _is_tpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
                         if (
-                            not tpu_mla_bf16
+                            not _is_tpu
                             and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                             and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
                             and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
@@ -636,7 +635,7 @@ class DeepseekV2WeightLoaderMixin:
                                 weight_block_size,
                                 torch.bfloat16,
                             )
-                            if tpu_mla_bf16:
+                            if _is_tpu:
                                 # Reloads may leave a scale from the legacy FP8 path.
                                 self_attn.w_scale = None
                     else:

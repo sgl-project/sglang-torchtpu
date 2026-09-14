@@ -69,13 +69,9 @@ class TestMlaBf16Weights(unittest.TestCase):
         scales = torch.logspace(-4, -1, 32).reshape(8, 4)
         results = {}
         for mode, cuda in [
-            ("production", False),
             ("mla_bf16", False),
             ("cuda_reference", True),
         ]:
-            g["envs"] = NS(
-                SGLANG_TPU_MLA_BF16_WEIGHTS=NS(get=lambda: mode == "mla_bf16")
-            )
             g["_is_cuda"], g["_is_tpu"] = cuda, not cuda
             attention = NS(
                 kv_b_proj=NS(weight=w.clone(), weight_scale_inv=scales.clone()),
@@ -107,9 +103,6 @@ class TestMlaBf16Weights(unittest.TestCase):
         assert torch.equal(treatment.w_vc, v.transpose(1, 2))
         assert torch.equal(treatment.w_kc, results["cuda_reference"].w_kc)
         assert torch.equal(treatment.w_vc, results["cuda_reference"].w_vc)
-        legacy = results["production"]
-        assert legacy.w_kc.dtype == torch.float8_e4m3fn
-        assert not torch.equal(legacy.w_kc.bfloat16() * legacy.w_scale, treatment.w_kc)
 
 
 if __name__ == "__main__":
