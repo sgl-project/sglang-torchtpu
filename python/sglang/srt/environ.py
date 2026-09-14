@@ -1622,6 +1622,8 @@ class Envs:
     # structural, so the VL wrappers undo the slice in _restore_full_rope_cache
     # (the config cannot tell -- the text checkpoint carries mrope_section too).
     SGLANG_TPU_ENABLE_ROPE_CACHE_SLICE = EnvBool(False)
+    # Reconstruct block-FP8 absorbed MLA weights directly in BF16 on TPU.
+    SGLANG_TPU_MLA_BF16_WEIGHTS = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
