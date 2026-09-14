@@ -356,6 +356,14 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
         self.tracer = tracer
+        if (
+            envs.SGLANG_TPU_EAGLE_TARGET_DIRECT.get()
+            and model_runner is not None
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_eagle3()
+        ):
+            self.tracer = "direct"
+            logger.info("EAGLE target uses direct compilation; draft tracer unchanged")
         self.extend_bs: int | None = None
         self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
