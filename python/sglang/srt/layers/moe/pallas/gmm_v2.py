@@ -1356,11 +1356,6 @@ def make_gmm_configs(
         tiles = tile_info
     else:
         tiles = tile_info(dims, lhs_cfgs, rhs_cfgs, vmem_limit_bytes, fuse_act)
-    if _FP32_MOE_SCALES and lhs_cfgs.quant_dtype is not None:
-        # FP32 scale temporaries are absent from the BF16 accumulator cost model.
-        # R1 prefill otherwise needs 77.82 MiB against 63.94 MiB available VMEM.
-        # Bound M while preserving K groups and each output's accumulation order.
-        tiles = dataclasses.replace(tiles, tile_m=min(tiles.tile_m, 16))
     if dims.size_n % tiles.tile_n != 0:
         # The kernel uses fixed-size BlockSpecs and disables bounds checks. A
         # partial final N tile would read/write past the RHS/output buffers, so
