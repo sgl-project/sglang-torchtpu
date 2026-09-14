@@ -5,6 +5,7 @@ run-name: ${{ (inputs.target_stage || inputs.target_stage_select) && (inputs.pr_
 
 on:
   schedule:
+<<<<<<< HEAD
     - cron: '0 */12 * * *' # Run every 12 hours (UTC)
   # Disabled in sglang-torchtpu: TPU PRs should not spawn AMD checks.
   # AMD CI remains available via schedule, workflow_dispatch, and workflow_call.
@@ -16,6 +17,14 @@ on:
   #     - "python/sglang/kernels/aot/**"
   #     - ".github/workflows/pr-test-amd.yml"
   #     - "docker/rocm.Dockerfile"
+=======
+    # ROCm 7.0 rollback shadow. pr-test-amd-rocm720.yml is the PR gate; this
+    # workflow now only proves ROCm 7.0 still works, so it fires every two days
+    # alongside nightly-test-amd.yml and chases coverage rather than latency:
+    # no matrix parallelism caps, no stage fast-fail (the `schedule` escape in
+    # each job's `if`), and continue-on-error via check-changes.
+    - cron: '30 17 */2 * *'
+>>>>>>> upstream/main
   workflow_dispatch:
     inputs:
       target_stage_select:

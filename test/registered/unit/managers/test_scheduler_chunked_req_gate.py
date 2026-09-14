@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -19,7 +20,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import Range
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req(
@@ -42,7 +43,7 @@ def _make_req(
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
     req.last_node = None
-    req.swa_uuid_for_lock = None
+    req.lock_receipt = DecLockRefParams()
     req.session = None
     req.return_logprob = False
     req.logprob_start_len = -1
@@ -77,8 +78,7 @@ def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
 
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
-    s._abort_on_waiting_timeout = MagicMock()
-    s._abort_on_running_timeout = MagicMock()
+    s.scheduler_stage_metrics = None
     s.dllm_config = None
     s.dllm_manager = None
     s.enable_hisparse = False

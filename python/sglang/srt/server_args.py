@@ -37,50 +37,141 @@ import argparse
 import copy
 import dataclasses
 import functools
-import json
 import logging
 import tempfile
 import uuid
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, NoReturn
+
+import msgspec
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
-from sglang.srt.arg_groups.argparse_actions import (
-    DeprecatedAction,
-    DeprecatedAliasStoreAction,
-    DeprecatedStoreConstAction,
-    DeprecatedStoreTrueAction,
-    LoRAPathAction,
+from sglang.srt.arg_groups.arg_utils import (
+    add_cli_args_from_dataclass,
+    is_record,
+    record_fields,
 )
+from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedStoreTrueAction,
+)
+from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
 from sglang.srt.arg_groups.overrides import (
-    mamba_extra_buffer_lazy_of,
-    mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
-    resolution_projection,
+    resolution_result,
     resolving_view,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
+from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.runtime_context import get_platform, publish
+from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
+from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
+
+logger = logging.getLogger(__name__)
+
+# Re-exported. These were importable from this module while the field
+# declarations that used them lived here; the declarations moved to
+# `arg_groups/fields/` but out-of-tree code -- and `tokenizer_control_mixin`
+# for `LoRARef` -- still reaches them through `sglang.srt.server_args`.
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
+from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
+
+# Re-exported for out-of-tree plugins, which have always reached these
+# through `sglang.srt.server_args`. The lists and their adders moved to
+# `arg_groups/choices.py` with the field declarations that name them.
+from sglang.srt.arg_groups.choices import (  # noqa: F401
+    ATTENTION_BACKEND_CHOICES,
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+    DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
+    DISAGG_TRANSFER_BACKEND_CHOICES,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+    FP4_GEMM_RUNNER_BACKEND_CHOICES,
+    FP8_GEMM_RUNNER_BACKEND_CHOICES,
+    GRAMMAR_BACKEND_CHOICES,
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+    LOAD_FORMAT_CHOICES,
+    MOE_RUNNER_BACKEND_CHOICES,
+    MXFP8_MOE_RUNNER_BACKEND_CHOICES,
+    QUANTIZATION_CHOICES,
+    RADIX_EVICTION_POLICY_CHOICES,
+    RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
+    RL_ON_POLICY_TARGET_CHOICES,
+    SAMPLING_BACKEND_CHOICES,
+    add_attention_backend_choices,
+    add_chunked_prefix_cache_attention_backend,
+    add_deterministic_attention_backend_choices,
+    add_disagg_transfer_backend_choices,
+    add_draft_attention_backend_choices,
+    add_fp4_gemm_runner_backend_choices,
+    add_fp8_gemm_runner_backend_choices,
+    add_grammar_backend_choices,
+    add_linear_attn_kernel_backend_choices,
+    add_load_format_choices,
+    add_moe_runner_backend_choices,
+    add_mxfp8_moe_runner_backend_choices,
+    add_quantization_method_choices,
+    add_radix_eviction_policy_choices,
+    add_radix_supported_deterministic_attention_backend_choices,
+    add_rl_on_policy_target_choices,
+)
+from sglang.srt.arg_groups.fields import collect_input_fields
+from sglang.srt.arg_groups.fields.device import (
+    Device,
+)
+from sglang.srt.arg_groups.fields.disagg import (
+    Disagg,
+)
+from sglang.srt.arg_groups.fields.exec_ import (
+    ExecComm,
+    ExecDeterministic,
+    ExecDllm,
+    ExecFeatures,
+    ExecGraph,
+    ExecKernel,
+    ExecMamba,
+    ExecMoe,
+    ExecOffload,
+    ExecOverlap,
+)
+from sglang.srt.arg_groups.fields.lora import (
+    Lora,
+)
+from sglang.srt.arg_groups.fields.memory import (
+    Memory,
+)
+from sglang.srt.arg_groups.fields.mm import (
+    Mm,
+)
+from sglang.srt.arg_groups.fields.model import (
+    Model,
+)
+from sglang.srt.arg_groups.fields.observability import (
+    Observability,
+)
+from sglang.srt.arg_groups.fields.parallel import (
+    Parallel,
+)
+from sglang.srt.arg_groups.fields.schedule import (
+    Schedule,
+)
+from sglang.srt.arg_groups.fields.serving import (
+    Serving,
+)
+from sglang.srt.arg_groups.fields.spec import (
+    Spec,
+)
+from sglang.srt.lora.lora_registry import LoRARef  # noqa: F401
+from sglang.srt.model_executor.cuda_graph_config import (  # noqa: F401
     CudaGraphConfig,
     parse_cuda_graph_config_arg,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import (
-    get_context,
-    get_platform,
-    publish,
-)
-from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
-from sglang.srt.utils.common import (
+from sglang.srt.utils.common import (  # noqa: F401
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
     human_readable_int,
     json_list_type,
     nullable_str,
 )
+<<<<<<< HEAD
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
 logger = logging.getLogger(__name__)
@@ -360,9 +451,29 @@ add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.exte
 # choice list is inlined into its field by default; hoisting one here makes
 # it public API for out-of-tree code and is a deliberate decision.
 # --------------------------------------------------------------------------
+=======
+>>>>>>> upstream/main
 
 
-@dataclasses.dataclass
+def _plain(value: Any) -> Any:
+    """``asdict``'s conversion, applied to one value: a record -- Struct or
+    dataclass, since nested config values are both -- becomes a dict, containers
+    recurse, everything else is deep-copied (a caller mutating the dump must not
+    reach the live configuration)."""
+    if not isinstance(value, type) and is_record(value):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in record_fields(type(value))
+        }
+    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        return type(value)(*(_plain(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
+    return copy.deepcopy(value)
+
+
 class ServerArgs:
     """Server-wide configuration for SGLang.
 
@@ -395,15 +506,23 @@ class ServerArgs:
        A few arguments cannot use the annotation style and must be
        registered manually in ``add_cli_args``:
 
-       - **Deprecated flags** that redirect to another field via
-         ``DeprecatedAction`` / ``DeprecatedAliasStoreAction`` / etc.
+       - **Deprecated flags** that redirect to another field via one of the
+         ``Deprecated*Action`` classes in ``arg_groups/argparse_actions.py``
+         (that module's header says which shape fits which migration).
        - **Dynamic choices** computed at runtime (e.g. ``reasoning_parser``
          whose choices come from a plugin registry).
        - The ``--config`` meta-argument (not a dataclass field).
 
        Everything else should use the ``A[T, ...]`` annotation.
+
+    The fields live in ``arg_groups/fields/`` -- one class per config
+    namespace, assembled here rather than inherited, so what the record holds
+    is one readable call and not a property of a base-class list. The order
+    they appear in is ``POSITIONAL_FIELD_ORDER``, not the order the namespaces
+    are listed in: field order *is* the positional constructor signature.
     """
 
+<<<<<<< HEAD
     # -------------------------------------------------------------------------
     # Model and tokenizer
     # -------------------------------------------------------------------------
@@ -3703,6 +3822,8 @@ class ServerArgs:
     torch_tpu_slicebuilder_addresses: A[Optional[str], NS("parallel")] = None
     torch_tpu_topology: A[Optional[str], NS("parallel")] = None
 
+=======
+>>>>>>> upstream/main
     def __post_init__(self):
         """Construction leaves the record at what the caller asked for.
 
@@ -3736,6 +3857,10 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
+        # Sealed for the duration, not just afterwards: everything below this
+        # line reads the input and declares against it. No exceptions -- even a
+        # resolver from outside this tree assigns onto a stand-in, not here.
+        self._input_frozen = True
         try:
             run_resolution_pipeline(self)
         except BaseException:
@@ -3743,71 +3868,45 @@ class ServerArgs:
             # idempotent over their own output.
             self._resolution_failed = True
             raise
+        finally:
+            self._input_frozen = False
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
         # the handlers ran, not how far they got.
         self._resolution_finished = True
 
-    def resolved_dict(self) -> Dict[str, Any]:
+    @property
+    def launch_command(self) -> str | None:
+        """How this record was created, verbatim.
+
+        `resolved_dict` answers with what resolution decided; this answers with
+        what the operator asked for, which is a different question and the one
+        "why is this server configured like this?" usually means. The two are
+        not derivable from each other: a field the operator never set reads the
+        same as one they set to the value resolution would have picked anyway.
+
+        The launcher stores the arguments it parsed; the in-process `Engine`
+        stores the call that built the record, since there was no command line.
+        `None` on a record built directly (a fixture, a subprocess copy that
+        predates this, a config being inspected).
+        """
+        return getattr(self, "_launch_command", None)
+
+    def resolved_dict(self) -> dict[str, Any]:
         """This configuration as a plain dict of resolved field values.
 
         What the whole-object readbacks report (`/server_info` and its gRPC and
-        in-process twins). `dataclasses.asdict(self)` reads the fields, which
+        in-process twins). A plain `asdict` reads the fields, which
         carry the raw input; this reads the declarations, so it answers with what
         resolution decided. Nested dataclass fields are expanded
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
         """
 
-        return resolution_projection(self)
-
-    def replace_resolved(self, source: str, **changes: Any) -> ServerArgs:
-        """A copy of this record that stays resolved, and says what it changed.
-
-        `dataclasses.replace` builds a new instance, so the copy carries none of
-        what makes a record resolved: no raw snapshot, no declarations, no
-        finished flag. The next publish therefore resolves it again, which
-        drops every decision the stash held -- the late ones (the auto-detected
-        parsers) and the direct ones alike -- and re-runs the device probes in
-        whatever process opened the copy. The Ray paths replace
-        `dist_init_addr` on a resolved record, which is how they reach this.
-
-        The change is appended to the stash rather than left on the field: the
-        projection reads the raw snapshot plus the declarations, so a field the
-        copy set on its own would publish the parent's raw value instead.
-
-        The carry is shallow. The containers are copied so the copy's own
-        declaration does not travel back into the parent, but everything inside
-        them -- the stash entries, the raw-input values, the memoized
-        `ModelConfig` -- is shared. That is fine for what this is for: a copy
-        that immediately crosses a process boundary (Ray actors, the gateway's
-        workers), where pickling severs the sharing. A caller that mutates the
-        copy's deep structure in-process mutates the parent's too.
-        """
-        replacement = dataclasses.replace(self, **changes)
-        if not getattr(self, "_resolution_finished", False):
-            # Not resolved yet: the copy goes through the gate itself.
-            return replacement
-
-        # Everything outside the fields, enumerated from the instance: the raw
-        # snapshot, the stash, and what resolution memoized -- including the
-        # model-configuration memo, which the copy carries over rather than
-        # rebuild.
-        field_names = {field.name for field in dataclasses.fields(self)}
-        for name, value in vars(self).items():
-            if name in field_names or name == "_resolution_finished":
-                continue
-            if isinstance(value, (dict, list, set)):
-                value = copy.copy(value)
-            object.__setattr__(replacement, name, value)
-        stash = getattr(replacement, "_resolved_overrides", None)
-        if stash is None:
-            stash = []
-            object.__setattr__(replacement, "_resolved_overrides", stash)
-        if changes:
-            stash.append((source, dict(changes)))
-        object.__setattr__(replacement, "_resolution_finished", True)
-        return replacement
+        return {
+            field.name: _plain(resolution_result(self, field.name))
+            for field in record_fields(type(self))
+        }
 
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
@@ -3815,7 +3914,11 @@ class ServerArgs:
 
     # ===== END TO BE REFACTORED ====
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Cosmos3ForConditionalGeneration",
+        "Cosmos3EdgeForConditionalGeneration",
+    )
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
@@ -3836,7 +3939,7 @@ class ServerArgs:
             "--sampling-backend",
             type=str,
             choices=sampling_backend_choices,
-            default=ServerArgs.sampling_backend,
+            default=_declared_default("sampling_backend"),
             help="Choose the kernels for sampling layers.",
         )
 
@@ -3845,7 +3948,7 @@ class ServerArgs:
             "--reasoning-parser",
             type=str,
             choices=["auto"] + reasoning_parser_choices,
-            default=ServerArgs.reasoning_parser,
+            default=_declared_default("reasoning_parser"),
             help=f"Specify the parser for reasoning models. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
@@ -3855,7 +3958,7 @@ class ServerArgs:
             "--tool-call-parser",
             type=str,
             choices=["auto"] + tool_call_parser_choices,
-            default=ServerArgs.tool_call_parser,
+            default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
             f"Use 'auto' to detect from chat template. "
             f"Options include: {tool_call_parser_choices}.",
@@ -3863,7 +3966,7 @@ class ServerArgs:
         parser.add_argument(
             "--kv-canary-real-data",
             type=str,
-            default=ServerArgs.kv_canary_real_data,
+            default=_declared_default("kv_canary_real_data"),
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Check the real KV-cache in the canary. "
@@ -3881,232 +3984,13 @@ class ServerArgs:
         )
 
         # --- Deprecated argument registrations ---
-        parser.add_argument(
-            "--enable-expert-distribution-metrics",
-            action=DeprecatedAction,
-            error_message=(
-                "--enable-expert-distribution-metrics is no longer supported. Use "
-                "--expert-balancedness-report-mode with one of: off, server_log, "
-                "prometheus, both."
-            ),
-            help=(
-                "Removed. Use --expert-balancedness-report-mode with one of: "
-                "off, server_log, prometheus, both."
-            ),
-        )
-        parser.add_argument(
-            "--stream-output",
-            action=DeprecatedStoreTrueAction,
-            dest="incremental_streaming_output",
-            new_flag="--incremental-streaming-output",
-            help="[Deprecated] Use --incremental-streaming-output instead.",
-        )
-        parser.add_argument(
-            "--prefill-round-robin-balance",
-            action=DeprecatedAction,
-            help="Note: --prefill-round-robin-balance is deprecated now.",
-        )
-        parser.add_argument(
-            "--collect-tokens-histogram",
-            action=DeprecatedAction,
-            help="Deprecated. Token histograms are now automatically collected when --enable-metrics is set.",
-        )
-        parser.add_argument(
-            "--nsa-prefill-backend",
-            dest="dsa_prefill_backend",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--dsa-prefill-backend",
-            default=argparse.SUPPRESS,
-            type=str,
-            choices=[
-                "flashmla_sparse",
-                "flashmla_sparse_q8",
-                "flashmla_kv",
-                "flashmla_auto",
-                "flashinfer_sparse_mla",
-                "fa3",
-                "tilelang",
-                "aiter",
-                "trtllm",
-            ],
-            help="[Deprecated] Use --dsa-prefill-backend instead.",
-        )
-        parser.add_argument(
-            "--nsa-decode-backend",
-            dest="dsa_decode_backend",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--dsa-decode-backend",
-            default=argparse.SUPPRESS,
-            type=str,
-            choices=[
-                "flashmla_sparse",
-                "flashmla_sparse_q8",
-                "flashmla_kv",
-                "flashmla_auto",
-                "flashinfer_sparse_mla",
-                "fa3",
-                "tilelang",
-                "aiter",
-                "trtllm",
-            ],
-            help="[Deprecated] Use --dsa-decode-backend instead.",
-        )
-        parser.add_argument(
-            "--speculative-dflash-draft-window-size",
-            type=int,
-            dest="speculative_draft_window_size",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--speculative-draft-window-size",
-            help=argparse.SUPPRESS,
-        )
-        parser.add_argument(
-            "--mamba-scheduler-strategy",
-            dest="mamba_radix_cache_strategy",
-            type=str,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--mamba-radix-cache-strategy",
-            default=ServerArgs.mamba_radix_cache_strategy,
-            help="Deprecated alias for --mamba-radix-cache-strategy.",
-        )
-        parser.add_argument(
-            "--cuda-graph-max-bs",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-decode",
-            dest="cuda_graph_max_bs_decode",
-            help="Deprecated alias for --cuda-graph-max-bs-decode.",
-        )
-        parser.add_argument(
-            "--cuda-graph-bs",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-decode",
-            dest="cuda_graph_bs_decode",
-            help="Deprecated alias for --cuda-graph-bs-decode.",
-        )
+        # `disable_cuda_graph` is `no_cli=True`, so this deprecated spelling is
+        # its only command-line entry point.
         parser.add_argument(
             "--disable-cuda-graph",
             action=DeprecatedStoreTrueAction,
             new_flag="--cuda-graph-backend-{decode,prefill}=disabled",
             help="Deprecated. Use --cuda-graph-backend-{decode,prefill}=disabled instead.",
-        )
-        parser.add_argument(
-            "--enable-breakable-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.BREAKABLE,
-            new_flag="--cuda-graph-backend-prefill=breakable",
-            help="Deprecated alias for --cuda-graph-backend-prefill=breakable.",
-        )
-        parser.add_argument(
-            "--disable-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.DISABLED,
-            new_flag="--cuda-graph-backend-prefill=disabled",
-            help="Deprecated alias for --cuda-graph-backend-prefill=disabled.",
-        )
-        parser.add_argument(
-            "--enforce-piecewise-cuda-graph",
-            action=DeprecatedStoreConstAction,
-            dest="cuda_graph_backend_prefill",
-            const_value=Backend.TC_PIECEWISE,
-            new_flag="--cuda-graph-backend-prefill=tc_piecewise",
-            help="Deprecated alias for --cuda-graph-backend-prefill=tc_piecewise. "
-            "Explicitly setting the prefill backend now skips the auto-disable "
-            "cascade automatically.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-tokens",
-            type=int,
-            nargs="+",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-bs-prefill",
-            dest="cuda_graph_bs_prefill",
-            help="Deprecated alias for --cuda-graph-bs-prefill.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-compiler",
-            type=str,
-            choices=["eager", "inductor"],
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-tc-compiler",
-            dest="cuda_graph_tc_compiler",
-            help="Deprecated alias for --cuda-graph-tc-compiler.",
-        )
-        parser.add_argument(
-            "--piecewise-cuda-graph-max-tokens",
-            type=int,
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-bs-prefill",
-            dest="cuda_graph_max_bs_prefill",
-            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
-        )
-        parser.add_argument(
-            "--enable-dsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--enable-nsa-prefill-context-parallel",
-            dest="enable_dsa_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--enable-gdn-replayssm-spec",
-            dest="enable_linear_replayssm_spec",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-linear-replayssm-spec",
-            help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
-        )
-        parser.add_argument(
-            "--enable-prefill-context-parallel",
-            dest="enable_prefill_context_parallel",
-            action=DeprecatedStoreTrueAction,
-            new_flag="--enable-prefill-cp",
-            help="[Deprecated] Use --enable-prefill-cp instead.",
-        )
-        parser.add_argument(
-            "--dsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.dsa_prefill_cp_mode,
-            choices=["in-seq-split", "round-robin-split"],
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'; 'round-robin-split' maps to "
-                "'interleave'."
-            ),
-        )
-        parser.add_argument(
-            "--nsa-prefill-cp-mode",
-            dest="dsa_prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=argparse.SUPPRESS,
-            choices=["in-seq-split", "round-robin-split"],
-            help="[Deprecated] Use --cp-strategy instead.",
-        )
-        parser.add_argument(
-            "--prefill-cp-mode",
-            dest="prefill_cp_mode",
-            action=DeprecatedAliasStoreAction,
-            new_flag="--cp-strategy",
-            type=str,
-            default=ServerArgs.prefill_cp_mode,
-            choices=["in-seq-split"],
-            help=(
-                "[Deprecated] Use --cp-strategy {zigzag,interleave} instead. "
-                "'in-seq-split' maps to 'zigzag'."
-            ),
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -4167,9 +4051,7 @@ class ServerArgs:
         # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
         # surface and won't appear on the argparse Namespace. Skip them so the
         # dataclass default applies.
-        attrs = [
-            attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
-        ]
+        attrs = [attr.name for attr in record_fields(cls) if hasattr(args, attr.name)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
@@ -4177,7 +4059,7 @@ class ServerArgs:
 
         return TokenizerWorker
 
-    def url(self, port: Optional[int] = None):
+    def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
         # When binding to all interfaces, use loopback for internal requests.
         host = self.host
@@ -4193,46 +4075,54 @@ class ServerArgs:
     def engine_info_bootstrap_url(self):
         return self.url(port=self.engine_info_bootstrap_port)
 
-    @property
-    def is_ep_joiner(self) -> bool:
-        """True for processes launched as elastic-EP joiners."""
-        cfg = resolving_view(self)
-
-        return cfg.ep_join_mode in ("scale", "recover")
-
-    @property
-    def is_ep_scale_joiner(self) -> bool:
-        cfg = resolving_view(self)
-
-        return cfg.ep_join_mode == "scale"
-
-    @property
-    def is_startup_weight_load_overlap(self) -> bool:
-        cfg = resolving_view(self)
-
-        return cfg.startup_weight_load_mode == "overlap"
-
     def __setattr__(self, name, value):
-        # Once resolution has finished the record is the READ-ONLY raw input
-        # the config bags were projected from. Resolved config changes go to the bags via
-        # get_context().override(source, ...); a value one runner or worker
-        # owns travels as a constructor argument to it.
-        if getattr(self, "_resolution_finished", False) and (
-            not name.startswith("_") or name in _underscore_field_names()
-        ):
-            raise AttributeError(
-                f"server_args.{name} assigned after resolution; server_args is "
-                "read-only -- use get_context().override(source, ...) to change "
-                "resolved config; a value one runner owns travels as a "
-                "constructor argument."
-            )
-        object.__setattr__(self, name, value)
+        # The record holds the operator's input. It is writable while the
+        # caller is still assembling it and sealed from the moment resolution
+        # starts: a resolver that writes a field would overwrite the very thing
+        # the record exists to remember, and the decision it meant to record
+        # belongs in the stash, where it carries a source and does not destroy
+        # the input it was derived from.
+        # Underscore names are mostly the record's own bookkeeping --
+        # `_input_frozen`, `_raw_input`, `_resolved_overrides`, the memo slots
+        # -- which resolution writes on purpose. A *field* spelled that way is
+        # still configuration, so the test cannot be on spelling alone or that
+        # one leaf stays writable on a read-only record.
+        if not name.startswith("_") or name in _underscore_field_names():
+            if getattr(self, "_input_frozen", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned during resolution; the record "
+                    "is the operator's input and resolution does not write it -- "
+                    "declare the decision with declare_resolution(server_args, "
+                    "source, **fields) so it carries a source and leaves the "
+                    "input intact."
+                )
+            if getattr(self, "_resolution_finished", False):
+                raise AttributeError(
+                    f"server_args.{name} assigned after resolution; server_args is "
+                    "read-only -- use get_context().override(source, ...) to change "
+                    "resolved config; a value one runner owns travels as a "
+                    "constructor argument."
+                )
+        # The Struct's own setter, spelled explicitly: this method is copied
+        # into the class `defstruct` builds, so a zero-argument `super()` would
+        # still close over the class it was written in. `object.__setattr__`
+        # does not reach a Struct's fields at all.
+        msgspec.Struct.__setattr__(self, name, value)
 
-    def enable_mamba_extra_buffer(self) -> bool:
-        return mamba_extra_buffer_of(resolving_view(self))
+    def __reduce__(self):
+        """Pickle the record *and* what resolution left on it.
 
-    def enable_mamba_extra_buffer_lazy(self) -> bool:
-        return mamba_extra_buffer_lazy_of(resolving_view(self))
+        A Struct pickles its fields; everything else lives in the `dict=True`
+        namespace and would be dropped, which for this record means the input
+        snapshot, the declaration stash and the resolution flags -- the whole
+        reason a child can publish what its parent decided without resolving
+        again. Reconstruction restores the fields first and the bookkeeping
+        after, so the seal is re-armed only once the fields are in place.
+        """
+        return (
+            _rebuild_server_args,
+            (type(self), msgspec.structs.asdict(self), dict(self.__dict__)),
+        )
 
     def check_server_args(self):
         from sglang.srt.arg_groups.validation_hook import check_server_args
@@ -4243,6 +4133,65 @@ class ServerArgs:
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
+
+
+# The namespaces whose *input* fields make up the record. A namespace declares
+# its input and derived fields side by side; only the input half is collected,
+# which is why this is a call and not a base-class list.
+#
+# A set, not an order: `collect_input_fields` orders by `field_order.py`, which
+# is what keeps the positional constructor stable.
+
+
+_INPUT_NAMESPACES = [
+    Model,
+    ExecDeterministic,
+    ExecDllm,
+    ExecOffload,
+    ExecOverlap,
+    Lora,
+    Disagg,
+    Spec,
+    ExecMoe,
+    ExecComm,
+    ExecGraph,
+    ExecMamba,
+    ExecKernel,
+    Observability,
+    Device,
+    Parallel,
+    Memory,
+    Schedule,
+    ExecFeatures,
+    Mm,
+    Serving,
+]
+
+_annotations, _defaults, _namespaces = collect_input_fields(_INPUT_NAMESPACES)
+ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
+# The assembled record has no base classes, so it carries the map the classes
+# used to answer through their `_NS_PATH`.
+ServerArgs._NS_BY_FIELD = _namespaces
+# The classes themselves, so the bag projection can find the declarations
+# that are not fields -- the derived half of each namespace.
+ServerArgs._NAMESPACES = _INPUT_NAMESPACES
+# `dict=True` so the record can carry what is not configuration -- the input
+# snapshot, the declaration stash, the resolution flags, the memo slots. A
+# Struct has no `__dict__` without it, and those are exactly the underscore
+# names `_underscore_field_names()` is careful *not* to include.
+ServerArgs = msgspec.defstruct(
+    "ServerArgs",
+    [
+        (_name, _ann, _defaults[_name]) if _name in _defaults else (_name, _ann)
+        for _name, _ann in ServerArgs.__annotations__.items()
+    ],
+    namespace={
+        _k: _v
+        for _k, _v in vars(ServerArgs).items()
+        if _k not in ("__dict__", "__weakref__", "__annotations__")
+    },
+    dict=True,
+)
 
 
 # --------------------------------------------------------------------------
@@ -4293,12 +4242,6 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     )
 
 
-# NOTE: The process-wide ServerArgs is owned by the runtime context
-# (sglang.srt.runtime_context). The two functions below are LEGACY shims kept
-# for the existing call-sites; they publish/read the same live object by
-# reference. Do not add new call-sites — the counts are ratcheted
-# (decrease-only) by test/registered/unit/test_legacy_global_ratchet.py.
-# Imports are in-function so the two modules stay cycle-free at import time.
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:
     """Real dataclass fields whose names start with an underscore.
@@ -4310,12 +4253,16 @@ def _underscore_field_names() -> frozenset:
     by spelling would leave exactly one leaf writable on a read-only record.
     """
     return frozenset(
-        field.name
-        for field in dataclasses.fields(ServerArgs)
-        if field.name.startswith("_")
+        field.name for field in record_fields(ServerArgs) if field.name.startswith("_")
     )
 
 
+# NOTE: The process-wide ServerArgs is owned by the runtime context
+# (sglang.srt.runtime_context). The two publish functions below are LEGACY
+# shims kept for the existing call-sites; they hand over the same live object
+# by reference. Do not add new call-sites. The third function is retired and
+# only raises.
+# Imports are in-function so the two modules stay cycle-free at import time.
 def set_global_server_args_for_scheduler(server_args: ServerArgs):
     """Legacy publish shim (role=scheduler) — prefer
     ``runtime_context.publish(server_args, role=...)`` in new code."""
@@ -4330,14 +4277,48 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
     publish(server_args, role="tokenizer")
 
 
-def get_global_server_args() -> ServerArgs:
-    """Legacy accessor shim — prefer ``get_server_args()`` from
-    ``sglang.srt.runtime_context`` in new code."""
+def get_global_server_args() -> NoReturn:
+    """Retired. It raises, because what it used to return is the problem: the
+    record answers with the operator's *input*, so a caller reading a field
+    resolution decided got a stale value and no error.
 
-    return get_context().server_args
+    The name survives so that a caller importing it from this module lands on
+    a message instead of an ImportError. Annotated ``NoReturn`` so a type
+    checker rejects the call rather than accepting the attribute access after
+    it. The message lives once, in the exception.
+    """
+    raise RuntimeError(
+        "get_global_server_args() is retired. Read the value that is in effect "
+        "from its namespace bag -- `get_exec().kernel.attention_backend`, "
+        "`get_schedule().max_running_requests`, and so on "
+        "(sglang.srt.runtime_context). For the operator's raw input, which is a "
+        "different question, `get_server_args()` still answers it."
+    )
 
 
-def prepare_server_args(argv: List[str]) -> ServerArgs:
+def _rebuild_server_args(cls, fields, bookkeeping):
+    """Rebuild a pickled record: fields through the constructor, the rest after."""
+    record = cls(**fields)
+    record.__dict__.update(bookkeeping)
+    return record
+
+
+def _declared_default(name: str):
+    """The declared default of a field, for a manual `add_argument`.
+
+    `ServerArgs.<field>` used to answer with it. The record is a Struct now, so
+    that expression returns the slot descriptor instead -- which argparse
+    happily stores as the default, and the first reader gets a
+    `member_descriptor` where it expected a string.
+    """
+    return next(
+        field.default
+        for field in msgspec.structs.fields(ServerArgs)
+        if field.name == name
+    )
+
+
+def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
 
@@ -4360,7 +4341,15 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
+    radix_eviction_policy_explicitly_set = any(
+        arg == "--radix-eviction-policy" or arg.startswith("--radix-eviction-policy=")
+        for arg in argv
+    )
+
     raw_args = parser.parse_args(argv)
+    raw_args._radix_eviction_policy_explicitly_set = (
+        radix_eviction_policy_explicitly_set
+    )
 
     # Set up basic logging before ServerArgs.__post_init__ so that
     # logger.info / logger.warning calls there are properly formatted.
@@ -4371,7 +4360,12 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+    # Not a field: the record's fields are the configuration, and this is how
+    # the configuration was asked for. It rides along on the record so a
+    # subprocess copy can answer the same question the launcher can.
+    server_args._launch_command = " ".join(argv)
+    return server_args
 
 
 # --------------------------------------------------------------------------
@@ -4402,10 +4396,10 @@ class PortArgs:
     metrics_ipc_name: str
 
     # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
-    tokenizer_worker_ipc_name: Optional[str]
+    tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler
-    decoupled_spec_ipc_config: Optional[DecoupledSpecIpcConfig]
+    decoupled_spec_ipc_config: DecoupledSpecIpcConfig | None
 
     # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
     # empty when IPC mode derives the address from instance_id).
@@ -4418,8 +4412,8 @@ class PortArgs:
     @staticmethod
     def init_new(
         server_args: ServerArgs,
-        dp_rank: Optional[int] = None,
-        worker_ports: Optional[List[int]] = None,
+        dp_rank: int | None = None,
+        worker_ports: list[int] | None = None,
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
@@ -4486,7 +4480,7 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + cfg.dp_size
-            if server_args.is_ep_scale_joiner:
+            if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -4510,7 +4504,7 @@ class PortArgs:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
-            is_joiner = server_args.is_ep_joiner
+            is_joiner = ep_joiner_of(resolving_view(server_args))
             # Under SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE, SGLang never binds
             # dist_init_port / nccl_port (rendezvous uses the externally-managed
             # store; see distributed/bootstrap.py:_resolve_dist_init_method), so

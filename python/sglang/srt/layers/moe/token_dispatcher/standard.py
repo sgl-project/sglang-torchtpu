@@ -119,10 +119,14 @@ class StandardDispatcher(BaseDispatcher):
         # - cutlass / cutedsl / trtllm_routed handle EP internally
         # - mxfp4 dispatcher mapping is already global
         # - hpc_ops consumes global ids together with rank_ep / num_expert_total
+<<<<<<< HEAD
         # - the TPU runner takes global IDs and translates/masks them itself
         #   (mask_tpu_moe_non_local_experts); keeping the mapping out of the
         #   dispatcher also keeps lazily-created module state out of the
         #   compiled graph, whose guards precompiled TPU programs depend on
+=======
+        # - flashinfer_megamoe routes by global expert ID inside the mega kernel
+>>>>>>> upstream/main
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
@@ -130,6 +134,7 @@ class StandardDispatcher(BaseDispatcher):
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
             or backend.is_hpc_ops()
+            or backend.is_flashinfer_megamoe()
             or self.enable_flashinfer_mxfp4_moe
             or _is_tpu
         )
@@ -206,8 +211,9 @@ class StandardDispatcher(BaseDispatcher):
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
                 self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
+                    self.moe_ep_rank * self.num_local_routed_experts : (
+                        self.moe_ep_rank + 1
+                    )
                     * self.num_local_routed_experts
                 ] = torch.arange(
                     0, self.num_local_routed_experts, dtype=torch.int32, device=device
