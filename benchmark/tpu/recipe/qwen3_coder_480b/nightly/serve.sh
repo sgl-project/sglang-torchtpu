@@ -4,7 +4,7 @@
 # contract in config.sh into that script's env interface, so there is exactly
 # one place where server flags are decided.
 #
-#   ROLE=colocated ./serve.sh      # tp=16 dp=4 (attn_tp=4), one engine
+#   ROLE=colocated ./serve.sh      # tp=16 dp=2 (attn_tp=8), one engine
 #   ROLE=prefill   ./serve.sh      # tp=8  dp=2 (attn_tp=4), P/D prefill
 #   ROLE=decode    ./serve.sh      # tp=8  dp=2 (attn_tp=4), P/D decode
 #
@@ -131,7 +131,9 @@ if [[ "$ROLE" != "colocated" ]]; then
     export SGLANG_HOST_IP=${SGLANG_HOST_IP:-$(hostname -i | awk '{print $1}')}
 fi
 
-export EXTRA_ARGS="$ROLE_ARGS $SPEC_ARGS ${EXTRA_ARGS:-}"
+# Release checkpoint pages before allocating HiCache and compiler state in both
+# baseline and EAGLE runs; otherwise host memory can run out despite free HBM.
+export EXTRA_ARGS="$ROLE_ARGS $SPEC_ARGS --weight-loader-drop-cache-after-load ${EXTRA_ARGS:-}"
 
 log_config "$ROLE"
 

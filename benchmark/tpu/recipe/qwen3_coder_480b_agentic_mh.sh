@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Multi-host CI recipe: Qwen3-Coder-480B-A35B-Instruct-FP8 colocated agentic
-# benchmark server -- tp=16, ep=16, dp=4 -> attention_tp = 16/4 = 4, across 2 hosts.
+# benchmark server -- tp=16, ep=16, dp=2 -> attention_tp = 16/2 = 8, across 2 hosts.
 #
 # Declared by test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_multihost_agentic.py via
 # MULTIHOST_LAUNCH; the TPU CI JobSet runs this on EVERY host (one global TP group)
