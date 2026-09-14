@@ -3,7 +3,7 @@
 Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_offload_unit.py for the host-only logic). Run with:
 
-    PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-raiden \
+    PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-sync \
         python3 test/manual/tpu/test_tpu_raiden_roundtrip_ondevice.py
 
 IMPORTANT — why this test never writes the KV buffer with eager ops:

@@ -1,4 +1,4 @@
-"""TPU prefill/decode disaggregation backend backed by tpu-raiden.
+"""TPU prefill/decode disaggregation backend backed by tpu-sync.
 
 Raiden moves KV pages directly between TPU hosts (D2H -> network -> H2D) and
 tracks transfer completion itself. SGLang only provides rendezvous: the decode

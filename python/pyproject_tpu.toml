@@ -71,7 +71,7 @@ dependencies = [
   # - torch and torchvision must be ABI compatible.
   # - torch-tpu and libtpu must be validated together.
   # - jax and jaxlib must be compatible with libtpu.
-  # - tpu-raiden-torch's native extension links torch-tpu's per-torch-version
+  # - tpu-sync-torch's native extension links torch-tpu's per-torch-version
   #   glue library, so it must be upgraded and validated with torch-tpu.
   # torch-tpu wheels come from a private package server (see the
   # [[tool.uv.index]] block below); installing them requires registry
@@ -80,7 +80,8 @@ dependencies = [
   # PJRT raw-transfer / KV-cache DMA engine backing the raiden disaggregation
   # connector (sglang/srt/disaggregation/raiden/) and the raiden HiCache
   # transfer backend (sglang/srt/hardware_backend/tpu/raiden_transfer.py).
-  "tpu-raiden-torch==0.0.1.dev20260906031043",
+  # Published to PyPI as nightly .dev pre-releases (see [tool.uv.sources]).
+  "tpu-sync-torch==0.0.1.dev20260923040928",
   "libtpu==0.0.47",
   "torch==2.11.0",
   "torchvision==0.26.0",
@@ -209,3 +210,11 @@ name = "torch-tpu-registry"
 # torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
 # and the PyPI index. It prioritizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
 url = "https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+explicit = true
+
+[tool.uv.sources]
+tpu-sync-torch = { index = "pypi" }

@@ -129,7 +129,7 @@ sglang_tpu_e2e_test(
     ],
 )
 
-# Requires a raiden-enabled runtime; tpu-raiden-torch is currently excluded
+# Requires a raiden-enabled runtime; tpu-sync-torch is currently excluded
 # from the Bazel pip hub.
 
 sglang_tpu_e2e_test(

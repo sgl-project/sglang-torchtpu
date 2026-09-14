@@ -420,7 +420,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.runtime_context import get_memory
 
-        # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the
+        # raiden offloads through tpu-sync's DMA-pinned host pool instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
         if get_memory().hicache_io_backend == "raiden":
             from sglang.srt.hardware_backend.tpu.kv_pool_host import (
