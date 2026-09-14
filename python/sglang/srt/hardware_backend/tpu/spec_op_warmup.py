@@ -7,6 +7,8 @@ from typing import Any
 
 import torch
 
+from sglang.srt.environ import envs
+
 
 @dataclass(frozen=True)
 class SpecOpWarmupContext:
@@ -58,7 +60,7 @@ def make_verify_bookkeeping_args(
 
 def make_draft_extend_select_args(
     context: SpecOpWarmupContext,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor | int, ...]:
     num_verify_rows = context.physical_bs * context.num_verify_tokens
     select_index = (
         torch.arange(context.physical_bs, dtype=torch.int64, device=context.device)
@@ -66,7 +68,7 @@ def make_draft_extend_select_args(
         + context.num_verify_tokens
         - 1
     )
-    return (
+    args = (
         torch.zeros(
             (num_verify_rows, context.draft_vocab_size),
             dtype=torch.float32,
@@ -79,6 +81,16 @@ def make_draft_extend_select_args(
         ),
         select_index,
     )
+
+    if envs.SGLANG_TPU_EAGLE_FUSED_REFRESH_INDICES.get():
+        counts = torch.full(
+            (context.physical_bs,),
+            context.num_verify_tokens,
+            dtype=torch.int32,
+            device=context.device,
+        )
+        return (*args[:2], counts, context.num_verify_tokens)
+    return args
 
 
 def make_dflash_verify_argmax_args(

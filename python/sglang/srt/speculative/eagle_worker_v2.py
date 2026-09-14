@@ -1336,16 +1336,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+        select_index = None
+        if not (
+            _is_tpu
+            and envs.SGLANG_TPU_EAGLE_FUSED_REFRESH_INDICES.get()
+            and not self.seed_dsa_topk_from_draft_extend
+        ):
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
-        )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
@@ -1423,7 +1429,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         if current_platform.is_tpu():
-            execution_select_index = forward_batch.spec_info.last_accepted_indices()
+            if envs.SGLANG_TPU_EAGLE_FUSED_REFRESH_INDICES.get():
+                selection_args = (
+                    forward_batch.spec_info.num_accept_tokens,
+                    forward_batch.spec_info.num_tokens_per_req,
+                )
+            else:
+                selection_args = (forward_batch.spec_info.last_accepted_indices(),)
             (
                 draft_logits_output.next_token_logits,
                 draft_logits_output.hidden_states,
@@ -1433,7 +1445,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 outputs=fused_draft_extend_select_argmax_func(
                     draft_logits_output.next_token_logits,
                     draft_logits_output.hidden_states,
-                    execution_select_index,
+                    *selection_args,
                 ),
                 forward_batch=forward_batch,
             )
