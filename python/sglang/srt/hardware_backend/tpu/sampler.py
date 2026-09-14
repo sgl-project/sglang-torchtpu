@@ -319,7 +319,9 @@ def sample_from_global_top_k_logits(
             positions.unsqueeze(0) >= top_ks.unsqueeze(1), -torch.inf
         )
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
-    return sampling_from_probs_torch(global_top_k_probs)
+    return sampling_from_probs_torch(
+        global_top_k_probs, sampling_fn=sample_exponential_race
+    )
 
 
 def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
@@ -388,12 +390,11 @@ class TpuSampler(Sampler):
         This avoids a full sort when pre-gather reduction is not selected."""
 
         if simple_sampling_case:
-            if sampling_info.sampling_seed is None:
-                return sample_exponential_race(probs)
             return sampling_from_probs_torch(
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
+                sampling_fn=sample_exponential_race,
             )
         top_k = sampling_info.uniform_top_k
         needs_top_p_or_min_p = (
@@ -415,7 +416,9 @@ class TpuSampler(Sampler):
                 global_top_k_probs = _filter_gathered_top_k_probs(
                     global_top_k_probs, sampling_info
                 )
-            sampled_top_k_position = sampling_from_probs_torch(global_top_k_probs)
+            sampled_top_k_position = sampling_from_probs_torch(
+                global_top_k_probs, sampling_fn=sample_exponential_race
+            )
             return torch.gather(
                 global_top_k_token_ids,
                 dim=1,

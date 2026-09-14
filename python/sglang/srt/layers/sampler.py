@@ -773,14 +773,23 @@ def sampling_from_probs_torch(
     probs: torch.Tensor,
     sampling_seed: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
+    sampling_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ):
     """A sampling implementation with native pytorch operations, without
     top-k, top-p, or min-p filtering.
 
+    ``sampling_fn`` replaces ``torch.multinomial`` for the unseeded draw. It
+    receives the (n, vocab) probs and returns one index per row. Backends
+    whose multinomial falls out of the compiled graph pass their own draw here;
+    the seeded path is unaffected so determinism keeps a single owner.
+
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
     if sampling_seed is None:
-        sampled_index = torch.multinomial(probs, num_samples=1)
+        if sampling_fn is None:
+            sampled_index = torch.multinomial(probs, num_samples=1)
+        else:
+            sampled_index = sampling_fn(probs)
     else:
         # Deterministic sampling: convert probs to logprobs and use gumbel trick
         sampled_index = multinomial_with_seed(
