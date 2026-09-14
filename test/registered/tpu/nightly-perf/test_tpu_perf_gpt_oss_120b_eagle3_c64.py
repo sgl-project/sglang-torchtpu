@@ -34,17 +34,19 @@ MODEL = "openai/gpt-oss-120b"
 WEIGHTS = "/weights/gpt-oss-120b"
 DRAFT_MODEL = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 
-# Six drafts per verify, matching the DFlash sibling's block size so the two
+# Three drafts per verify, matching the DFlash sibling's block size so the two
 # legs propose the same amount of work. topk=1 makes this a chain, and the arg
-# hook then resolves num_draft_tokens to num_steps + 1 (6 drafts + 1 bonus).
-NUM_STEPS, EAGLE_TOPK = 6, 1
+# hook then resolves num_draft_tokens to num_steps + 1 (3 drafts + 1 bonus).
+NUM_STEPS, EAGLE_TOPK = 3, 1
 
 # The sweep drives random-ids prompts, which have no structure for a drafter to
 # predict: real acceptance would collapse toward 1 and the throughput would not
 # describe any served workload. Pin it instead, near what GSM8K actually
 # measures, so the number is representative and comparable across drafters.
+# Fractional: the default match-expected method commits 2 or 3 per verify so the
+# mean lands on 2.5.
 # Output text is meaningless under this knob -- never set it on an accuracy gate.
-SIMULATE_ACC_LEN = 3
+SIMULATE_ACC_LEN = 2.5
 
 
 MODEL_CONFIG = {

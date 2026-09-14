@@ -34,14 +34,16 @@ DRAFT_MODEL = "z-lab/gpt-oss-120b-DFlash"
 
 # Fixed by the z-lab DFlash checkpoint; the arg hook pins num_steps and
 # eagle_topk to 1, so block size is the only speculative knob that applies.
-DFLASH_BLOCK_SIZE = 6
+DFLASH_BLOCK_SIZE = 3
 
 # The sweep drives random-ids prompts, which have no structure for a drafter to
 # predict: real acceptance would collapse toward 1 and the throughput would not
 # describe any served workload. Pin it instead, near what GSM8K actually
 # measures, so the number is representative and comparable across drafters.
+# Fractional: the default match-expected method commits 2 or 3 per verify so the
+# mean lands on 2.5.
 # Output text is meaningless under this knob -- never set it on an accuracy gate.
-SIMULATE_ACC_LEN = 3
+SIMULATE_ACC_LEN = 2.5
 
 
 MODEL_CONFIG = {
