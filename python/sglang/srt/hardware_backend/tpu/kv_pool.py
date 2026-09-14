@@ -50,24 +50,18 @@ def _torch_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 
 def _zeros_kv_buffer(shape, dtype: torch.dtype, device) -> torch.Tensor:
-    """A zeroed KV buffer whose tensor dtype equals its storage dtype.
+    """Preallocate one layer's KV buffer as a genuine ``dtype`` base tensor.
 
-    torch_tpu hands the compiled graph the real device buffer only when the
-    tensor's element type matches the storage's (tensor_to_buffer.cc GetBuffer);
-    otherwise it gets a deferred bitcast view. A ``uint8`` buffer ``.view(fp8)``
-    fails that check, so the attention kernel's KV donation is silently dropped
-    and the write-back materializes a second copy of every layer's buffer:
-    measured ``Compiled EXTEND HBM: +6637 MB`` for a 6.4 GB fp8 pool (bf16:
-    +90 MB for 29 GB) and an OOM at tp=16. Allocate fp8 directly; current
-    torch_tpu zero-fills fp8. On a wheel that cannot, materialize a real fp8
-    base from the zeroed bytes with ``clone`` (all-zero bytes are +0.0).
+    Called once per layer at pool construction; nothing allocates later. The
+    buffer must not be a dtype view (``uint8`` storage ``.view(fp8)``):
+    torch_tpu passes a compiled graph the real device buffer only when the
+    tensor dtype equals the storage dtype, otherwise the attention kernel's
+    KV donation is dropped and every extend materializes a second copy of the
+    pool (+6.6 GB for a 6.4 GB fp8 pool, OOM at tp=16).
     """
-    try:
-        return torch.zeros(shape, dtype=dtype, device=device)
-    except RuntimeError:
-        if dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-            raise
-        return torch.zeros(shape, dtype=torch.uint8, device=device).view(dtype).clone()
+    buf = torch.zeros(shape, dtype=dtype, device=device)
+    assert buf._base is None and buf.dtype == dtype
+    return buf
 
 
 def _cdiv(a: int, b: int) -> int:

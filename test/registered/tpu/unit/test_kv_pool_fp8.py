@@ -78,6 +78,9 @@ class TestTpuFusedKVPoolFp8(CustomTestCase):
         for layer_id in range(self.LAYER_NUM):
             buf = pool.get_fused_kv_buffer(layer_id)
             self.assertEqual(buf.dtype, dtype)
+            # A genuine fp8 base tensor, not a uint8 storage viewed as fp8:
+            # a dtype view loses the kernel's KV donation on torch_tpu.
+            self.assertIsNone(buf._base)
             # num_kv_heads_x2 = 2*2 = 4; packed by 4 -> 1 along the packed axis.
             self.assertEqual(buf.shape[2], 4 // 4)
             self.assertEqual(buf.shape[3], 4)
@@ -93,6 +96,27 @@ class TestTpuFusedKVPoolFp8(CustomTestCase):
         import torch
 
         self._check_fp8(torch.float8_e5m2)
+
+    def test_mla_pool_layers_are_fp8_bases(self):
+        import torch
+
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMLATokenToKVPool
+
+        pool = TpuFusedMLATokenToKVPool(
+            size=self.SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=torch.float8_e4m3fn,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=self.LAYER_NUM,
+            device="tpu",
+            enable_memory_saver=False,
+        )
+        for layer_id in range(self.LAYER_NUM):
+            buf = pool.get_fused_kv_buffer(layer_id)
+            self.assertEqual(buf.dtype, torch.float8_e4m3fn)
+            self.assertIsNone(buf._base)
+            self.assertEqual(float(buf.to(torch.float32).abs().sum().item()), 0.0)
 
     def test_logical_kv_views_are_fp8(self):
         """``get_key_buffer`` / ``get_value_buffer`` (used by radix/HiCache)
