@@ -78,6 +78,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         seed: int = 0,
         num_q_heads: Optional[int] = None,
         num_kv_heads: Optional[int] = None,
+        noncontiguous_pages=False,
         kv_dtype=None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -190,6 +191,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
         page_indices_2d = np.arange(
             num_seqs * self.PAGES_PER_SEQ, dtype=np.int32
         ).reshape(num_seqs, self.PAGES_PER_SEQ)
+
+        if noncontiguous_pages:
+            page_indices_2d = (page_indices_2d * 5 + 3) % self.TOTAL_NUM_PAGES
 
         ref_kpages = k_pages
         ref_vpages = v_pages
@@ -304,7 +308,7 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             **scale_kwargs,
         )
 
-        kernel_out, _ = ragged_paged_attention(
+        kernel_out, updated_cache = ragged_paged_attention(
             inputs["q"],
             inputs["new_k"],
             inputs["new_v"],
@@ -320,6 +324,31 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
             **kernel_kwargs,
             **scale_kwargs,
         )
+        if "chunk_prefill_size" in kernel_kwargs:
+            # Independently check live K/V against the reference page updates.
+            cache = (
+                np.asarray(updated_cache)
+                .reshape(
+                    self.TOTAL_NUM_PAGES,
+                    self.PAGE_SIZE,
+                    inputs["num_kv_heads"],
+                    2,
+                    self.HEAD_DIM,
+                )
+                .astype(np.float32)
+            )
+            for row, length in enumerate(np.asarray(inputs["kv_lens"])):
+                for token in range(int(length)):
+                    page = int(inputs["ref_page_indices"][row, token // self.PAGE_SIZE])
+                    slot = token % self.PAGE_SIZE
+                    np.testing.assert_array_equal(
+                        cache[page, slot, :, 0],
+                        np.asarray(inputs["ref_kpages"][page, slot]).astype(np.float32),
+                    )
+                    np.testing.assert_array_equal(
+                        cache[page, slot, :, 1],
+                        np.asarray(inputs["ref_vpages"][page, slot]).astype(np.float32),
+                    )
         kernel_out = kernel_out[: inputs["total_q_tokens"]]
 
         diff = jnp.abs(
@@ -334,6 +363,106 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # Original two cases — kept (single seq), now via the multi-seq helper.
     # ------------------------------------------------------------------ #
+
+    def test_static_verification_reference(self):
+        """Static causal rows must match the reference across physical pages."""
+        import jax.numpy as jnp
+
+        for width in (1, 3, 4, 5):
+            for kv_dtype in (jnp.bfloat16, jnp.float8_e4m3fn):
+                with self.subTest(width=width, kv_dtype=kv_dtype):
+                    inputs = self._build_inputs(
+                        [(16 + width, width), (31 + width, width)],
+                        num_kv_heads=2,
+                        noncontiguous_pages=True,
+                        kv_dtype=kv_dtype,
+                        k_scale=0.5,
+                        v_scale=0.25,
+                    )
+                    self._run_and_compare(
+                        inputs, distribution=(0, 2, 2), chunk_prefill_size=width
+                    )
+
+    def test_static_verification_partial_compute_tile(self):
+        """Width three cannot be subdivided into complete two-row tiles."""
+        inputs = self._build_inputs([(18, 3)], noncontiguous_pages=True)
+        self._run_and_compare(
+            inputs,
+            distribution=(0, 1, 1),
+            chunk_prefill_size=3,
+            p_block_sizes=(4, 32, 2, 16),
+        )
+
+    def test_static_verification_nonuniform_fallback(self):
+        """A mismatched static promise must process every ragged query row."""
+        inputs = self._build_inputs([(19, 3), (37, 5)], noncontiguous_pages=True)
+        self._run_and_compare(inputs, distribution=(0, 2, 2), chunk_prefill_size=4)
+
+    def test_static_verification_features_and_causality(self):
+        """Static scheduling preserves masks, live cache, and inactive rows."""
+        import jax.numpy as jnp
+
+        from sglang.srt.layers.attention.pallas.ragged_paged_attention_v3 import (
+            ragged_paged_attention,
+        )
+
+        inputs = self._build_inputs([(19, 4), (36, 4)], noncontiguous_pages=True)
+        # Extra metadata row is inactive; its width must not disable static
+        # specialization or cause its pages to be written.
+        kv_lens = jnp.append(inputs["kv_lens"], 0).astype(jnp.int32)
+        cu_q = jnp.append(inputs["cu_q_lens"], 8).astype(jnp.int32)
+        cu_kv = jnp.append(inputs["cu_kv_lens"], 192).astype(jnp.int32)
+        pages = jnp.concatenate([inputs["page_indices_flat"], jnp.arange(4)])
+
+        def run(width, new_v, **kwargs):
+            return ragged_paged_attention(
+                inputs["q"].copy(),
+                inputs["new_k"].copy(),
+                new_v.copy(),
+                inputs["kv_fused"].copy(),
+                kv_lens,
+                pages,
+                cu_q,
+                cu_kv,
+                jnp.array([0, 2, 2], jnp.int32),
+                kwargs.pop("custom_mask", None),
+                kwargs.pop("attention_sink", None),
+                sm_scale=1.0 / np.sqrt(self.HEAD_DIM),
+                chunk_prefill_size=width,
+                **kwargs,
+            )
+
+        for features in (
+            {},
+            {"sliding_window": 7},
+            {"soft_cap": 2.0},
+            {"attention_sink": jnp.zeros((self.NUM_Q_HEADS,), jnp.float32)},
+            {"causal": 0, "custom_mask": jnp.ones((4 * (19 + 36),), jnp.int32)},
+        ):
+            with self.subTest(features=tuple(features)):
+                dynamic, dynamic_cache = run(None, inputs["new_v"], **features)
+                static, static_cache = run(4, inputs["new_v"], **features)
+                np.testing.assert_allclose(
+                    static[:8], dynamic[:8], atol=0.05, rtol=0.05
+                )
+                # Compare live cache prefixes; complete-page tail writes may
+                # contain intentionally unspecified values.
+                cache = np.asarray(static_cache).reshape(16, 16, 2, 128)
+                baseline = np.asarray(dynamic_cache).reshape(16, 16, 2, 128)
+                live_pages = set()
+                for row, length in enumerate((19, 36)):
+                    for token in range(length):
+                        page = int(inputs["ref_page_indices"][row, token // 16])
+                        live_pages.add(page)
+                        np.testing.assert_array_equal(
+                            cache[page, token % 16], baseline[page, token % 16]
+                        )
+                original = np.asarray(inputs["kv_fused"]).reshape(16, 16, 2, 128)
+                for page in set(range(16)) - live_pages:
+                    np.testing.assert_array_equal(cache[page], original[page])
+                if "custom_mask" not in features:
+                    changed, _ = run(4, inputs["new_v"].at[3].set(100), **features)
+                    np.testing.assert_array_equal(changed[:3], static[:3])
 
     def test_decode_single_seq(self):
         """q_len = 1, distribution = (1, 1, 1) -> DECODE-only path."""

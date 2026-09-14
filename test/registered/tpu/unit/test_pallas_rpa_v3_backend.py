@@ -36,6 +36,7 @@ import torch
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     PallasForwardMetadata,
     TpuPallasRpaV3AttnBackend,
+    _invoke_v3_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -123,7 +124,9 @@ def _build_meta(backend, fb) -> PallasForwardMetadata:
 class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
     """The shared adapter translates SGLang window spans for RPA kernels."""
 
-    def _forward_with_window(self, sliding_window_size):
+    def _forward_with_window(
+        self, sliding_window_size, mode=ForwardMode.DECODE, width=None
+    ):
         backend = _BackendUnderTest(
             page_size=16,
             req_to_token=_build_req_to_token(num_reqs=1, max_context_len=16),
@@ -159,8 +162,37 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             soft_cap,
             k_scale,
             v_scale,
+            verify_query_size=None,
         ):
             captured["sliding_window"] = sliding_window
+            captured["widths"] = verify_query_size
+
+            def kernel(*args, **kwargs):
+                captured["kernel_kwargs"] = kwargs
+
+            _invoke_v3_kernel(
+                kernel,
+                queries=q,
+                keys=k,
+                values=v,
+                kv_cache_fused=kv_cache,
+                kv_lens=kv_lens,
+                page_indices=page_indices,
+                cu_q_lens=cu_q_lens,
+                cu_kv_lens=cu_kv_lens,
+                distribution=distribution,
+                attention_sink=sinks,
+                sm_scale=scaling,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                verify_query_size=verify_query_size,
+            )
+            self.assertEqual(
+                captured["kernel_kwargs"]["chunk_prefill_size"], verify_query_size
+            )
+            self.assertEqual(captured["kernel_kwargs"]["causal"], 1)
             return torch.zeros_like(q)
 
         backend._op = recording_op
@@ -176,7 +208,8 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             scaling=1.0,
         )
         forward_batch = types.SimpleNamespace(
-            spec_info=None,
+            spec_info=types.SimpleNamespace(num_tokens_per_req=width),
+            forward_mode=mode,
             capture_hidden_mode=None,
         )
 
@@ -187,7 +220,26 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             layer=layer,
             forward_batch=forward_batch,
         )
+        if width is not None:
+            return captured["widths"]
         return captured["sliding_window"]
+
+    def test_static_width_only_reaches_target_verification(self):
+        # A width on spec_info is also present during draft/prefill. Passing it
+        # there would impose incorrect loop bounds on ragged query lengths.
+        for mode in (
+            ForwardMode.DECODE,
+            ForwardMode.EXTEND,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(self._forward_with_window(7, mode, 4), None)
+        for width in (1, 3, 4, 5):
+            with self.subTest(width=width):
+                self.assertEqual(
+                    self._forward_with_window(7, ForwardMode.TARGET_VERIFY, width),
+                    width,
+                )
 
     def test_positive_window_is_converted_to_total_token_count(self):
         self.assertEqual(self._forward_with_window(7), 8)

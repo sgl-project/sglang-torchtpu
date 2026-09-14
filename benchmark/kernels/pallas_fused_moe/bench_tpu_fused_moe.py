@@ -28,13 +28,12 @@ Defaults model the Qwen3-30B-A3B MoE block (H=2048, I=768, E=128, top_k=8).
 """
 
 import argparse
-import statistics
 import time
 
 import jax
 import jax.numpy as jnp
 
-from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2
+from sglang.srt.layers.moe.pallas.gmm_v2 import gmm_v2, swigluoai
 
 # gmm_v2 requires the LHS row dim to be a multiple of the sublane tiling; the
 # bridge pads to 32 (a multiple of 16 for bf16 and 8 for f32/i32). Mirror that.
@@ -46,6 +45,8 @@ def _act(gate, up, name):
         return jax.nn.silu(gate) * up
     if name == "gelu":
         return jax.nn.gelu(gate) * up
+    if name == "swigluoai":
+        return swigluoai(gate, up)
     raise ValueError(f"unsupported activation {name!r}")
 
 
@@ -120,16 +121,21 @@ def _make_full_moe(act_name, out_dtype):
 
 
 def _bench(fn, args, iters):
+    """Mean device ms per call.
+
+    Enqueues every call before blocking once at the end. Blocking per call
+    measures the host round-trip instead, and dispatch (~0.25 ms) is the same
+    order as these kernels -- which compresses the fused/unfused ratio.
+    """
     out = fn(*args)
     jax.block_until_ready(out)  # compile
     for _ in range(3):
         jax.block_until_ready(fn(*args))  # warm
-    samples = []
+    t = time.perf_counter()
     for _ in range(iters):
-        t = time.perf_counter()
-        jax.block_until_ready(fn(*args))
-        samples.append((time.perf_counter() - t) * 1e3)  # ms
-    return statistics.median(samples)
+        out = fn(*args)
+    jax.block_until_ready(out)
+    return (time.perf_counter() - t) * 1e3 / iters
 
 
 def _max_abs_diff(a, b):
@@ -149,7 +155,9 @@ def main():
     p.add_argument("--intermediate", type=int, default=768)
     p.add_argument("--num-experts", type=int, default=128)
     p.add_argument("--top-k", type=int, default=8)
-    p.add_argument("--activation", default="silu", choices=["silu", "gelu"])
+    p.add_argument(
+        "--activation", default="silu", choices=["silu", "gelu", "swigluoai"]
+    )
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     p.add_argument("--iters", type=int, default=50)
     args = p.parse_args()

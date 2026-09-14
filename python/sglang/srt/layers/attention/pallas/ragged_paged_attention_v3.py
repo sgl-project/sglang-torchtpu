@@ -26,6 +26,7 @@ sglang-jax specific features:
 import functools
 import inspect as _inspect
 import logging
+import math
 from enum import Enum
 
 import jax
@@ -875,7 +876,8 @@ def _ragged_paged_attention_kernel_loop(
             actual_bq_sz = min(bq_sz, static_q_len)
             num_bq = cdiv(static_q_len, actual_bq_sz)
 
-        actual_bq_csz = min(bq_csz, actual_bq_sz)
+        # A short static width may not divide the configured compute tile.
+        actual_bq_csz = math.gcd(min(bq_csz, actual_bq_sz), actual_bq_sz)
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -1371,8 +1373,7 @@ def static_validate_inputs(
 
     if actual_num_q_heads % actual_num_kv_heads != 0:
         raise ValueError(
-            f"Expected {actual_num_q_heads=} to be divisible by"
-            f" {actual_num_kv_heads=}."
+            f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
         )
 
     if kv_cache_fused is not None:
@@ -1527,6 +1528,7 @@ def get_default_block_sizes(
     vmem_limit_bytes: int | None = None,
     use_custom_mask: bool = False,
     sliding_window: int | None = None,
+    static_q_len: int | None = None,
 ):
     """Get (bq_sz, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas."""
     tpu_version = get_tpu_version()
@@ -1585,6 +1587,17 @@ def get_default_block_sizes(
                 )
         case _:
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
+
+    # A static width caps the rows any block can carry, so size to it rather
+    # than to the batch-wide token count: the surplus would be padding. With the
+    # tile that short the kv sub-split only multiplies the per-step rescale --
+    # cost is the trip count, kv_len / bkv_csz -- so drop it the way DECODE
+    # does. The VMEM loop below still shrinks both if the wider block does not
+    # fit. Measured on a gpt-oss-120b verify layer (bs 64 x 4 draft tokens,
+    # kv 8192, v7x): 0.446 ms with the split, 0.274 ms without.
+    if static_q_len is not None and case != RpaCase.DECODE:
+        bq_sz = min(bq_sz, static_q_len)
+        bkv_csz = bkv_sz
 
     bkv_alignment = max(page_size, kv_packing)
     bq_sz = max(1, bq_sz)
@@ -2022,7 +2035,7 @@ def ragged_paged_attention(
 
         return run(scalar_prefetches, q, kv, kv_cache)
 
-    def _prepare_block_sizes(block_sizes, case):
+    def _prepare_block_sizes(block_sizes, case, static_q_len=None):
         if block_sizes is None:
             return get_default_block_sizes(
                 q.dtype,
@@ -2038,6 +2051,7 @@ def ragged_paged_attention(
                 vmem_limit_bytes=vmem_limit_bytes,
                 use_custom_mask=not use_causal_mask,
                 sliding_window=sliding_window,
+                static_q_len=static_q_len,
             )
 
         return {
@@ -2051,6 +2065,17 @@ def ragged_paged_attention(
     # Remap prefill sequences to MIXED so they are still processed.
     if chunk_prefill_size is None:
         distribution = distribution.at[1].set(distribution[0])
+
+    else:
+        # Static loop bounds are valid only for uniform active PREFILL rows.
+        # Ignore inactive/padded rows and retain MIXED as the device-side
+        # fallback without a host sync or a shape-dependent compilation.
+        seq_ids = jnp.arange(max_num_seqs)
+        is_prefill = (seq_ids >= distribution[0]) & (seq_ids < distribution[1])
+        uniform = jnp.all(~is_prefill | (jnp.diff(cu_q_lens) == chunk_prefill_size))
+        distribution = distribution.at[1].set(
+            jnp.where(uniform, distribution[1], distribution[0])
+        )
 
     # Decode-only
     q, kv_cache_fused_processed = run_rpa_kernel(
@@ -2066,7 +2091,9 @@ def ragged_paged_attention(
         q, kv_cache_fused_processed = run_rpa_kernel(
             q,
             kv_cache_fused_processed,
-            **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
+            **_prepare_block_sizes(
+                p_block_sizes, RpaCase.PREFILL, static_q_len=chunk_prefill_size
+            ),
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
         )

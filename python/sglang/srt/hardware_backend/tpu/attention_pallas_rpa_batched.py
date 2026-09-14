@@ -82,12 +82,13 @@ def _invoke_batched_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    verify_query_size=None,
 ):
     # cu_kv_lens and attention_sink are not consumed by the batched kernel.
     # It builds its schedule inline and has no per-mode dispatch to skip, so
     # the two arguments the shared shell passes for kernels that do are
     # discarded here.
-    del cu_kv_lens, attention_sink
+    del cu_kv_lens, attention_sink, verify_query_size
     return jax_rpa(
         queries,
         keys,

@@ -146,6 +146,7 @@ class InvokeKernelFn(Protocol):
         soft_cap,
         k_scale,
         v_scale,
+        verify_query_size: int | None = None,
     ) -> tuple: ...
 
 
@@ -180,6 +181,8 @@ class RpaKernelSpec:
     # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
     # the TPU platform's page-size defaulting, not by this module.
     min_page_size: int | None = None
+    # Static causal PREFILL specialization for target verification.
+    supports_verify_prefill: bool = False
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend
@@ -241,6 +244,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        verify_query_size: int | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -265,14 +269,16 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             soft_cap=soft_cap,
             k_scale=k_scale,
             v_scale=v_scale,
+            verify_query_size=verify_query_size,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         # Static (non-traced) args by _wrapped position: 10=sm_scale,
-        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale.
-        static_argnums=(10, 11, 12, 13, 14),
+        # 11=sliding_window, 12=soft_cap, 13=k_scale, 14=v_scale,
+        # 15=verify_query_size.
+        static_argnums=(10, 11, 12, 13, 14, 15),
         donate_argnums=(3,),
         input_output_aliases={3: 1},
         warn_deprecated=False,
@@ -299,6 +305,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         soft_cap: float | None = None,
         k_scale: float | None = None,
         v_scale: float | None = None,
+        verify_query_size: int | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -317,6 +324,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 soft_cap,
                 k_scale,
                 v_scale,
+                verify_query_size,
             )
         return output
 
@@ -915,6 +923,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             soft_cap,
             k_scale,
             v_scale,
+            (
+                forward_batch.spec_info.num_tokens_per_req
+                if self.kernel_spec.supports_verify_prefill
+                and forward_batch.forward_mode.is_target_verify()
+                else None
+            ),
         )
 
         capture_mode = getattr(forward_batch, "capture_hidden_mode", None)
