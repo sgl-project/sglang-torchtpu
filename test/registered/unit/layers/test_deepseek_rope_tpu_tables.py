@@ -1,3 +1,4 @@
+import itertools
 import unittest
 from unittest.mock import patch
 
@@ -28,45 +29,62 @@ def _make(rotary_dim, head_size, neox, dtype):
         )
 
 
+def _reference(rope, positions, q, k, offsets):
+    """The native rope math, written out for both styles.
+
+    gptj uses the real ``forward_native``. Upstream's neox branch there does
+    ``cos.repeat(1, 1, 2)`` on the 2-D ``[T, rd/2]`` slice (it assumes 2-D
+    positions), which DeepSeek/Kimi never hit since both are gptj style; spell
+    out the same formula with a correct broadcast instead.
+    """
+    if not rope.is_neox_style:
+        with patch.object(rope_variant, "_is_tpu", False):
+            return rope.forward_native(positions, q, k, offsets)
+    rd = rope.rotary_dim
+    idx = positions + offsets if offsets is not None else positions
+    cos, sin = rope.cos_sin_cache[idx].chunk(2, dim=-1)
+    cos = cos.repeat(1, 2).unsqueeze(-2)
+    sin = sin.repeat(1, 2).unsqueeze(-2)
+
+    def apply(x):
+        x_rot = x[..., :rd]
+        x_rot = x_rot * cos + rope_variant.rotate_neox(x_rot) * sin
+        return torch.cat((x_rot, x[..., rd:]), dim=-1).to(x.dtype)
+
+    return apply(q), apply(k)
+
+
 class TestDeepseekRopeTpuTables(CustomTestCase):
+    CASES = tuple(
+        itertools.product(
+            (torch.float32, torch.bfloat16),  # dtype
+            (False, True),  # neox style
+            ((64, 64), (64, 192)),  # (rotary_dim, head_size)
+            (False, True),  # offsets
+        )
+    )
+
     def test_tpu_path_is_bit_identical_to_native(self):
         torch.manual_seed(0)
-        for dtype in (torch.float32, torch.bfloat16):
-            for neox in (False, True):
-                for rotary_dim, head_size in ((64, 64), (64, 192)):
-                    for use_offsets in (False, True):
-                        with self.subTest(
-                            dtype=dtype,
-                            neox=neox,
-                            rotary_dim=rotary_dim,
-                            head_size=head_size,
-                            offsets=use_offsets,
-                        ):
-                            if neox and rotary_dim < head_size:
-                                # forward_native's neox branch cannot run
-                                # this shape (its cos repeat adds a dim).
-                                continue
-                            rope = _make(rotary_dim, head_size, neox, dtype)
-                            t = 7
-                            positions = torch.randint(0, 900, (t,))
-                            offsets = (
-                                torch.randint(0, 100, (t,)) if use_offsets else None
-                            )
-                            q = torch.randn(t, 16, head_size, dtype=dtype)
-                            k = torch.randn(t, 1, head_size, dtype=dtype)
-                            with patch.object(rope_variant, "_is_tpu", False):
-                                q_ref, k_ref = rope.forward_native(
-                                    positions, q, k, offsets
-                                )
-                            # The native neox branch returns a leading dim of 1.
-                            q_ref, k_ref = q_ref.reshape(q.shape), k_ref.reshape(
-                                k.shape
-                            )
-                            q_tpu, k_tpu = rope._forward_tpu(positions, q, k, offsets)
-                            self.assertEqual(tuple(q_tpu.shape), tuple(q.shape))
-                            self.assertEqual(q_tpu.dtype, dtype)
-                            torch.testing.assert_close(q_tpu, q_ref, atol=0, rtol=0)
-                            torch.testing.assert_close(k_tpu, k_ref, atol=0, rtol=0)
+        for dtype, neox, (rotary_dim, head_size), use_offsets in self.CASES:
+            with self.subTest(
+                dtype=dtype,
+                neox=neox,
+                rotary_dim=rotary_dim,
+                head_size=head_size,
+                offsets=use_offsets,
+            ):
+                rope = _make(rotary_dim, head_size, neox, dtype)
+                t = 7
+                positions = torch.randint(0, 900, (t,))
+                offsets = torch.randint(0, 100, (t,)) if use_offsets else None
+                q = torch.randn(t, 16, head_size, dtype=dtype)
+                k = torch.randn(t, 1, head_size, dtype=dtype)
+                q_ref, k_ref = _reference(rope, positions, q, k, offsets)
+                q_tpu, k_tpu = rope._forward_tpu(positions, q, k, offsets)
+                self.assertEqual(q_tpu.dtype, dtype)
+                torch.testing.assert_close(q_tpu, q_ref, atol=0, rtol=0)
+                torch.testing.assert_close(k_tpu, k_ref, atol=0, rtol=0)
 
     def test_tables_are_non_persistent_buffers(self):
         rope = _make(64, 64, True, torch.bfloat16)
