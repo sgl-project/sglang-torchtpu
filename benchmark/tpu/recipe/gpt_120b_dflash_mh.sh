@@ -3,8 +3,13 @@
 #
 # The JobSet runs this identical command on both hosts. launch_server.sh reads
 # GKE-owned TPU_WORKER_ID / TPU_WORKER_HOSTNAMES and builds one no-Ray global
-# process group: tp=16, ep=16, dp=4 (attention tp=4) on a 2x2x2 v7x slice.
-# The GSM8K client drives 64 concurrent requests, or 16 per DP rank.
+# process group: tp=16, ep=16 on a 2x2x2 v7x slice. The GSM8K client drives 64
+# concurrent requests.
+#
+# DP_SIZE is pinned empty, not left overridable: _handle_dflash rejects
+# enable_dp_attention outright, so any DP_SIZE > 1 dies in prepare_server_args.
+# MAX_TOTAL_TOKENS caps one attention worker's pool, so collapsing dp=4 into a
+# single tp=16 worker needs 4x the old 32768 to keep the per-chip KV footprint.
 #
 # Keep this recipe focused on speculative decoding. Prefix-cache, HiCache, and
 # P/D combinations have separate tests and should not obscure this gate.
@@ -29,7 +34,7 @@ exec env \
   MODEL="$model" \
   TP_SIZE="${TP_SIZE:-16}" \
   EP_SIZE="${EP_SIZE:-16}" \
-  DP_SIZE="${DP_SIZE:-4}" \
+  DP_SIZE= \
   ISL="${ISL:-4096}" \
   OSL="${OSL:-512}" \
   CONC="${CONC:-64}" \
@@ -37,7 +42,7 @@ exec env \
   CONTEXT_LEN="${CONTEXT_LEN:-8192}" \
   CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-4096}" \
   MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-4096}" \
-  MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-32768}" \
+  MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-131072}" \
   TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-512 1024 2048 4096}" \
   TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 2 4 8 16}" \
   PAGE_SIZE="${PAGE_SIZE:-64}" \

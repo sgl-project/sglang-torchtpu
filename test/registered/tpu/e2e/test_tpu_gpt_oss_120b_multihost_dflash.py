@@ -32,7 +32,7 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-multihost-dflash-gsm8k",
-    "variant": "2host-TP16+EP16+DP4+DFLASH-c64",
+    "variant": "2host-TP16+EP16+DFLASH-c64",
     "launch": {
         "external": True,
         "health_timeout": HEALTH_TIMEOUT,
