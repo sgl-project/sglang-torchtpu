@@ -794,6 +794,30 @@ class TopK(BaseFusedOp):
 # ------------------------------- TopK implementation -------------------------------------
 
 
+def _stable_topk(values: torch.Tensor, topk: int):
+    """Top-k over the last dim with deterministic, lowest-index-wins ties.
+
+    ``torch.topk`` makes no guarantee about which index is returned when two
+    values compare equal, and the result is permitted to depend on the shape of
+    the input.  On backends that select via a bitonic comparator network the
+    tie-break genuinely does change with the size of the batch being reduced.
+
+    That is fatal for MoE routing under speculative decoding: the same token is
+    routed once in a small decode step and again in a much larger verify step,
+    and if the two disagree on a tied expert the verify logits no longer match
+    what the draft proposed, so every speculated token is rejected.
+
+    ``torch.sort(..., stable=True)`` pins ties to the lowest index regardless of
+    shape.  It is only affordable because the reduced dimension here is the
+    expert count (8-256), not the vocabulary -- do not reuse this for vocab-wide
+    selection such as the EAGLE draft top-k.
+    """
+    sorted_values, sorted_indices = torch.sort(
+        values, dim=-1, descending=True, stable=True
+    )
+    return sorted_values[..., :topk], sorted_indices[..., :topk]
+
+
 def fused_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -824,13 +848,8 @@ def fused_topk_torch_native(
         assert (
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
-        M, _ = hidden_states.shape
-        topk_weights = torch.empty(
-            M, topk, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
         topk_weights = scoring_func_impl(gating_output.float())
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        topk_weights, topk_ids = _stable_topk(topk_weights, topk)
 
     if renormalize:
         # fp32 like the reference gate (the epsilon is not representable in

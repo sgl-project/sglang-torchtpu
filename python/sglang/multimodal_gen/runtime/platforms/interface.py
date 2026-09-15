@@ -223,6 +223,18 @@ class Platform:
     @classmethod
     @lru_cache(maxsize=1)
     def is_float64_supported(cls) -> bool:
+        """Whether the device computes float64 elementwise.
+
+        Says nothing about matmul, which an accelerator may downcast anyway.
+        """
+        return True
+
+    @classmethod
+    def supports_distributed_p2p(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_device_tensor_pickle(cls) -> bool:
         return True
 
     @classmethod

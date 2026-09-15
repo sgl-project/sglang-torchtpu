@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import io
 import pickle
 from typing import Any, List, Optional
 
@@ -8,6 +9,40 @@ import torch
 import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
+
+
+def _rebuild_on_local_device(
+    tensor: torch.Tensor, requires_grad: bool = False
+) -> torch.Tensor:
+    tensor = tensor.to(current_platform.get_local_torch_device())
+    if requires_grad:
+        tensor.requires_grad_(True)
+    return tensor
+
+
+class _CpuTransportPickler(pickle.Pickler):
+    """Serialize accelerator tensors through CPU.
+
+    torch_tpu aborts in tensor_to_buffer.cc when pickle reduces a PrivateUse1
+    storage. `detach()` is what makes the hop safe, so `requires_grad` is
+    carried across by hand rather than lost with the graph.
+    """
+
+    def reducer_override(self, obj: Any):
+        if isinstance(obj, torch.Tensor) and obj.device.type not in ("cpu", "meta"):
+            return (
+                _rebuild_on_local_device,
+                (obj.detach().cpu(), obj.requires_grad),
+            )
+        return NotImplemented
+
+
+def _dumps(data: Any) -> bytes:
+    if current_platform.supports_device_tensor_pickle():
+        return pickle.dumps(data)
+    buf = io.BytesIO()
+    _CpuTransportPickler(buf).dump(data)
+    return buf.getvalue()
 
 
 def broadcast_pyobj(
@@ -31,7 +66,7 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
-            serialized_data = pickle.dumps(data)
+            serialized_data = _dumps(data)
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(

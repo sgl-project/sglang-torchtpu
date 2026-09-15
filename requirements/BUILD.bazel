@@ -1,0 +1,29 @@
+load(":uv_lock.bzl", "uv_lock")
+
+exports_files([
+    "requirements_lock_3_12.txt",
+    "tpu_stack_excludes.txt",
+])
+
+# Regenerate requirements_lock_3_12.txt from python/pyproject_tpu.toml and
+# torch_tpu's pyproject.toml in ONE resolution with the hermetic uv pinned in
+# requirements/uv.lock.json -- same binary on every machine, nothing required
+# on PATH:
+#
+#   bazel run //requirements:regenerate_lock
+#
+# Resolving both pyprojects together makes this single lock the mediated
+# resolution for the whole module graph: sglang's deps (including its test
+# extra), torch_tpu's runtime deps (without its own test extra), and
+# the TPU stack pins in pyproject_tpu.toml (which satisfy torch_tpu's looser
+# bounds). MODULE.bazel then points torch_tpu's pip hub at this one hub via
+# override_repo, so there is no second lock for the TPU stack.
+uv_lock(
+    name = "regenerate_lock",
+    pyprojects = [
+        "//python:pyproject_tpu.toml",
+        "@torch_tpu//:pyproject",
+    ],
+    excludes = "tpu_stack_excludes.txt",
+    out = "requirements/requirements_lock_3_12.txt",
+)

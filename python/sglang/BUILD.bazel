@@ -1,0 +1,23 @@
+# Handwritten. Two filegroups for the whole sglang package, consumed by
+# //python:sglang. sglang's directories are too import-coupled (its own scan:
+# 254 of 415 dirs in cycles through top-level __init__ re-export chains) for
+# fine-grained per-directory targets to be acyclic, so the package ships as a
+# single unit and this is the only BUILD file under python/sglang/.
+#
+# .py sources go in srcs; everything else (kernels/jit's include/ and csrc/
+# trees, resolved from the filesystem at import time) goes in data, because a
+# py_library only propagates non-source files to runfiles through data.
+filegroup(
+    name = "py_files",
+    srcs = glob(["**/*.py"]),
+    visibility = ["//python:__pkg__"],
+)
+
+filegroup(
+    name = "data_files",
+    srcs = glob(
+        ["**"],
+        exclude = ["**/*.py"],
+    ),
+    visibility = ["//python:__pkg__"],
+)

@@ -126,6 +126,18 @@ class TpuPlatform(Platform):
 
     @classmethod
     def is_float64_supported(cls) -> bool:
+        # tpu7x: elementwise matches a host reference to ~1e-13, matmul
+        # downcasts to ~1e-7.
+        return True
+
+    @classmethod
+    def supports_distributed_p2p(cls) -> bool:
+        # tpu_dist implements collectives only; send/recv raise.
+        return False
+
+    @classmethod
+    def supports_device_tensor_pickle(cls) -> bool:
+        # Reducing a PrivateUse1 storage aborts in tensor_to_buffer.cc.
         return False
 
     @classmethod

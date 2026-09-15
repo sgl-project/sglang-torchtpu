@@ -474,12 +474,13 @@ class Qwen3VLVisionTpuCompilePolicy(VisionTpuCompilePolicy):
         padding = ctx.padding
         # Land on the host while the shape is still the bucket: every consumer
         # from here on is variable-length and would recompile per length.
-        result = result.to("cpu")
+        if not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+            result = result.to("cpu")
         if padding.padded:
             result = result[: padding.real_seq_len // padding.merge_sq]
         # Qwen3-VL's caller asks for a subset of the merged output rows.
         if ctx.output_indices is not None:
-            result = result.index_select(0, ctx.output_indices.to("cpu"))
+            result = result.index_select(0, ctx.output_indices.to(result.device))
         return result
 
 
@@ -671,7 +672,8 @@ class ViTTpuCompileRunner:
             )
         # Same host contract as the installed policy's unpad_outputs, so the
         # embedding cache never mixes devices across the two modes.
-        result = result.to("cpu")
+        if not envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
+            result = result.to("cpu")
         if output_indices is not None:
-            result = result.index_select(0, output_indices.to("cpu"))
+            result = result.index_select(0, output_indices.to(result.device))
         return result

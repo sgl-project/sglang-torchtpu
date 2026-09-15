@@ -41,7 +41,7 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagl
     Eagle3SpecDecodeCompilePolicyMixin,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -165,6 +165,58 @@ class TestZeroPadDim0(CustomTestCase):
 
 class TestPadForwardBatchInputs(CustomTestCase):
     """Pads ForwardBatch fields to bucket size before init_forward_metadata."""
+
+    def test_speculative_padding_roundtrip_preserves_rows_and_metadata(self):
+        for mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND_V2):
+            for width in (1, 4):
+                with self.subTest(mode=mode, width=width):
+                    real_b, real_q = 3, 3 * width
+                    # Retain extend lists in both modes to check their restoration.
+                    fb = _forward_batch(real_q, real_b, mode="draft_extend_v2")
+                    fb.forward_mode = mode
+                    fb.input_embeds = torch.arange(real_q * 2).reshape(real_q, 2)
+                    fb.mm_input_embeds = fb.input_embeds.clone()
+                    fb.mrope_positions = torch.arange(3 * real_q).reshape(3, real_q)
+                    fb.mm_inputs = [object(), None, object()]
+                    fb.spec_info = SimpleNamespace(
+                        num_tokens_per_req=width,
+                        hidden_states=torch.arange(real_q * 5).reshape(real_q, 5),
+                    )
+                    original = (
+                        fb.input_ids.clone(),
+                        fb.out_cache_loc.clone(),
+                        fb.input_embeds.clone(),
+                        fb.mrope_positions.clone(),
+                        fb.spec_info.hidden_states.clone(),
+                    )
+                    mm_inputs = list(fb.mm_inputs)
+                    # Reuse the same batch: a second pad must not retain ghost rows.
+                    for _ in range(2):
+                        q, b = _pad_forward_batch_inputs(
+                            fb, _bucketer("Token", [8, 16]), _bucketer("Bs", [1, 4])
+                        )
+                        self.assertEqual((q, b), (real_q, real_b))
+                        self.assertEqual(
+                            fb.spec_info.hidden_states.shape, (4 * width, 5)
+                        )
+                        self.assertEqual(fb.mrope_positions.shape, (3, 4 * width))
+                        self.assertEqual(
+                            fb.out_cache_loc[real_q:].tolist(), [0] * width
+                        )
+                        self.assertEqual(fb.mm_inputs, mm_inputs + [None])
+                        _restore_forward_batch_inputs(fb, q, b)
+                        restored = (
+                            fb.input_ids,
+                            fb.out_cache_loc,
+                            fb.input_embeds,
+                            fb.mrope_positions,
+                            fb.spec_info.hidden_states,
+                        )
+                        for before, after in zip(original, restored):
+                            self.assertTrue(torch.equal(before, after))
+                        self.assertEqual(fb.batch_size, real_b)
+                        self.assertEqual(fb.mm_inputs, mm_inputs)
+                        self.assertEqual(fb.extend_seq_lens_cpu, [width] * real_b)
 
     def test_extend_single_req(self):
         # tokens=4 -> max(tokens, bs_cap=4) -> bucket 8.
@@ -1264,14 +1316,16 @@ class TestShimInputLogprobPath(CustomTestCase):
                 MagicMock(side_effect=RuntimeError("boom")),
                 policy=_policy(_StubModel()),
             )
-        fb = self._fb(starts=(1, 1))
-
-        with self.assertRaises(RuntimeError):
-            shim(None, None, fb)
-
-        self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
-        self.assertTrue(fb.return_logprob)
-        self.assertEqual(fb.extend_logprob_start_lens_cpu, [1, 1])
+        for prefill_only in (False, True):
+            with self.subTest(prefill_only=prefill_only):
+                fb = self._fb(starts=(1, 1))
+                fb.is_prefill_only = prefill_only
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    shim(None, None, fb)
+                self.assertIs(fb.is_prefill_only, prefill_only)
+                self.assertIs(fb.capture_hidden_mode, CaptureHiddenMode.NULL)
+                self.assertTrue(fb.return_logprob)
+                self.assertEqual(fb.extend_logprob_start_lens_cpu, [1, 1])
 
     def test_input_logprobs_are_attached(self):
         model = _StubModel()

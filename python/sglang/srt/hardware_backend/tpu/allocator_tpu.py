@@ -32,11 +32,91 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.mem_cache.allocator import (
-    PagedTokenToKVPoolAllocator,
-    alloc_extend_naive,
-)
+from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
+
+
+def alloc_extend_vectorized_cpu(
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_pages: torch.Tensor,
+    out_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Fill ``out_indices`` like ``alloc_extend_naive`` without a per-request loop.
+
+    Each request contributes three contiguous runs of token slots: the rest of
+    its current partial page (continuing from ``last_loc``), whole new pages,
+    and a trailing partial page. All inputs are CPU tensors.
+
+    Example with page_size=4, prefix_lens=[3, 0, 5], seq_lens=[9, 2, 8],
+    last_loc=[22, -1, 48], and free_pages=[10, 27, 35, 42]:
+      prefix_page_end = [4, 0, 8]
+      num1 = [1, 0, 3]  # Continue the current page.
+      num2 = [4, 0, 0]  # Fill whole new pages.
+      num3 = [1, 2, 0]  # Fill a final partial new page.
+    Request 0 gets [23, 40, 41, 42, 43, 108], request 1 gets [140, 141],
+    and request 2 gets [49, 50, 51]. Free page 42 is unused.
+    """
+    prefix_lens = prefix_lens.to(torch.int64)
+    seq_lens = seq_lens.to(torch.int64)
+    last_loc = last_loc.to(torch.int64)
+    free_pages = free_pages.to(torch.int64)
+
+    extend_lens = seq_lens - prefix_lens
+    total = int(extend_lens.sum())
+    if total == 0:
+        return
+
+    prefix_page_end = (prefix_lens + page_size - 1) // page_size * page_size
+    num1 = torch.minimum(seq_lens, prefix_page_end) - prefix_lens
+    remaining = extend_lens - num1
+    num2 = remaining // page_size * page_size
+    num3 = remaining - num2
+    num_new_pages = num2 // page_size + (num3 > 0).to(torch.int64)
+    page_start = torch.cumsum(num_new_pages, 0) - num_new_pages
+
+    # Segment k of request i (k = 0: partial current page, 1: full new pages,
+    # 2: partial last page) covers ``seg_len[i, k]`` slots. Segments 0 and 2
+    # each continue one page from a base slot; segment 1 spans several pages
+    # that need not be contiguous, so its slots look their page up directly.
+    seg_len = torch.stack([num1, num2, num3], dim=1)
+    zeros = torch.zeros_like(num3)
+    if free_pages.numel() > 0:
+        last_page_idx = (page_start + num_new_pages - 1).clamp(
+            min=0, max=free_pages.numel() - 1
+        )
+        last_page_base = torch.where(
+            num3 > 0, free_pages[last_page_idx] * page_size, zeros
+        )
+    else:
+        last_page_base = zeros
+    seg_base = torch.stack([last_loc + 1, zeros, last_page_base], dim=1)
+
+    seg_len_flat = seg_len.reshape(-1)
+    seg_base_flat = seg_base.reshape(-1)
+    seg_start = torch.cumsum(seg_len_flat, 0) - seg_len_flat
+    within = torch.arange(total, dtype=torch.int64) - torch.repeat_interleave(
+        seg_start, seg_len_flat, output_size=total
+    )
+    values = (
+        torch.repeat_interleave(seg_base_flat, seg_len_flat, output_size=total) + within
+    )
+    seg_id = torch.repeat_interleave(
+        torch.arange(seg_len_flat.numel(), dtype=torch.int64),
+        seg_len_flat,
+        output_size=total,
+    )
+    is_full_seg = seg_id % 3 == 1
+    if bool(is_full_seg.any()):
+        req_of_slot = seg_id // 3
+        page_idx = (page_start[req_of_slot] + within // page_size).clamp(
+            max=free_pages.numel() - 1
+        )
+        full_value = free_pages[page_idx] * page_size + within % page_size
+        values = torch.where(is_full_seg, full_value, values)
+    out_indices[:total] = values.to(out_indices.dtype)
 
 
 class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -107,15 +187,10 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         # Compute the per-token page indices entirely on host, then do a
-        # single H2D copy. The shared ``alloc_extend_naive`` iterates over
-        # ``range(len(prefix_lens))`` and reads scalar elements off its
-        # tensor inputs each iteration — if those tensors live on the TPU,
-        # the XLA backend lowers each scalar ``//`` to its own one-element
-        # HLO module per iteration (~64 tiny compiles per extend) and every
-        # scalar read forces a device→host sync. Running the loop on CPU
-        # avoids both. ``prefix_lens_cpu`` / ``seq_lens_cpu`` are already
-        # mirrors of the device tensors, so the only extra D2H is the tiny
-        # ``last_loc`` vector (one int32 per sequence).
+        # single H2D copy. Batch-wide tensor operations avoid the per-request
+        # Python loop in ``alloc_extend_naive``. ``prefix_lens_cpu`` and
+        # ``seq_lens_cpu`` are already mirrors of the device tensors, so only
+        # ``last_loc`` needs a D2H copy when it is not already on the host.
         if num_new_pages_item > 0:
             free_pages_cpu = self.free_pages[:num_new_pages_item]
         else:
@@ -127,14 +202,13 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 dtype=torch.int32,
                 device="cpu",
             )
-        alloc_extend_naive(
+        alloc_extend_vectorized_cpu(
             prefix_lens_cpu,
             seq_lens_cpu,
             last_loc.cpu(),
             free_pages_cpu,
             out_indices_cpu,
             self.page_size,
-            "cpu",
         )
         out_indices = out_indices_cpu.to(self.device, non_blocking=True)
 

@@ -10,6 +10,10 @@ import weakref
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen.configs.models.vaes.base import (
+    is_auto_parallel_decode_mode,
+    is_spatial_shard_parallel_decode_mode,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_local_torch_device,
@@ -47,6 +51,23 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
 )
 
 logger = init_logger(__name__)
+
+
+def decode_uses_every_rank(vae) -> bool:
+    """Whether the decoder spreads one sample across the decode group.
+
+    False means the other ranks would only repeat rank 0's work.
+    """
+    if vae is None or not vae.use_parallel_decode:
+        return False
+    mode = vae.parallel_decode_mode
+    # Only height shards trade conv halos over p2p; auto may resolve to one.
+    needs_p2p = is_auto_parallel_decode_mode(mode) or (
+        is_spatial_shard_parallel_decode_mode(mode)
+    )
+    if needs_p2p and not current_platform.supports_distributed_p2p():
+        return False
+    return model_parallel_is_initialized() and get_decode_parallel_world_size() > 1
 
 
 def scale_and_shift_latents(latents: torch.Tensor, server_args, vae) -> torch.Tensor:
@@ -141,11 +162,7 @@ class DecodingStage(PipelineStage):
         return StageParallelismType.REPLICATED
 
     def _can_use_parallel_decode(self) -> bool:
-        return (
-            model_parallel_is_initialized()
-            and get_decode_parallel_world_size() > 1
-            and self.vae.use_parallel_decode
-        )
+        return decode_uses_every_rank(self.vae)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify decoding stage inputs."""

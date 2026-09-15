@@ -294,3 +294,8 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Bazel output symlinks, generated module lock, and local user configuration.
+/bazel-*
+/MODULE.bazel.lock
+/user.bazelrc

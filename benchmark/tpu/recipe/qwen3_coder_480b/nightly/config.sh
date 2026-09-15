@@ -237,6 +237,9 @@ HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-raiden}
 # time, hence the cap. Formerly named NORMAL_REPLAYS, which wrongly suggested
 # re-sending the same session (each is distinct -- no artificial prefix-cache
 # hits); the old env names still work.
+# In CI, auto also supplies at least three sessions per normal slot when
+# concurrency > 1 (subject to the cap), to replace sessions that finish early.
+# This increases measured work; c1 legs still use the round-count calculation.
 SESSIONS_PER_SLOT=${SESSIONS_PER_SLOT:-${NORMAL_REPLAYS:-auto}}
 MAX_SESSIONS_PER_SLOT=${MAX_SESSIONS_PER_SLOT:-${MAX_NORMAL_REPLAYS:-8}}
 
@@ -287,6 +290,10 @@ case "$PROFILE" in
         LONG_RAMP_TOKENS=${LONG_RAMP_TOKENS_OVERRIDE:-16384}
         ;;
     ci)
+        # Share a small compile grid across baseline and EAGLE. Compiling every
+        # derived shape for the 480B model can exhaust host RAM during startup.
+        export TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-4096}"
+        export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8 16}"
         # Budget: the JobSet gives rank-0's test file `timeout 3600`, of which the
         # health recheck can take the first 600, so the whole sweep must land
         # inside ~45 min with margin. The four legs at the extremes of the

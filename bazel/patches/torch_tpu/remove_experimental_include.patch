@@ -1,0 +1,18 @@
+diff --git a/cc/config/x86_64_ubuntu20_gcc10/sysroot.BUILD b/cc/config/x86_64_ubuntu20_gcc10/sysroot.BUILD
+--- a/cc/config/x86_64_ubuntu20_gcc10/sysroot.BUILD
++++ b/cc/config/x86_64_ubuntu20_gcc10/sysroot.BUILD
+@@ -67,5 +67,4 @@ cc_toolchain_import(
+         "usr/include/c++/{gcc_version}".format(gcc_version = GCC_VERSION),
+         "usr/include/x86_64-linux-gnu/c++/{gcc_version}".format(gcc_version = GCC_VERSION),
+         "usr/include/c++/{gcc_version}/backward".format(gcc_version = GCC_VERSION),
+-        "usr/include/c++/{gcc_version}/experimental".format(gcc_version = GCC_VERSION),
+     ],
+diff --git a/cc/config/aarch64_ubuntu20_gcc10/sysroot.BUILD b/cc/config/aarch64_ubuntu20_gcc10/sysroot.BUILD
+--- a/cc/config/aarch64_ubuntu20_gcc10/sysroot.BUILD
++++ b/cc/config/aarch64_ubuntu20_gcc10/sysroot.BUILD
+@@ -67,5 +67,4 @@ cc_toolchain_import(
+         "usr/include/c++/{gcc_version}".format(gcc_version = GCC_VERSION),
+         "usr/include/aarch64-linux-gnu/c++/{gcc_version}".format(gcc_version = GCC_VERSION),
+         "usr/include/c++/{gcc_version}/backward".format(gcc_version = GCC_VERSION),
+-        "usr/include/c++/{gcc_version}/experimental".format(gcc_version = GCC_VERSION),
+     ],

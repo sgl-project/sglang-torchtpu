@@ -1,0 +1,144 @@
+"""Handwritten targets for the sglang Python package.
+
+sglang ships as ONE py_library. Its own import scan shows 254 of 415 package
+directories sit in import cycles (the largest 158 directories) through
+top-level ``__init__`` re-export chains, so fine-grained per-directory Bazel
+targets cannot be acyclic -- the package is genuinely one coupled unit, and
+representing it as one target is the honest model. The cyclic imports resolve
+at import time; Bazel's job here is only to stage the sources and the external
+libraries they need.
+
+The ``deps`` list of ``:sglang`` is machine-generated from an AST scan of the
+TPU serving closure; the generator is a bootstrap script, not part of the
+repository. Regenerate after adding/removing a third-party import. First-party
+(sglang.*) imports intentionally produce no deps: this target already stages
+the whole package.
+"""
+
+load("@rules_python//python:defs.bzl", "py_library")
+load("@torch_tpu//build_files:py_dist_info.bzl", "py_dist_info")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["pyproject_tpu.toml"])
+
+# Keep these values aligned with [project.entry-points], [project.scripts],
+# and [tool.setuptools_scm].fallback_version in pyproject_tpu.toml.
+# The TPU plugin is discovered through importlib.metadata even for in-tree code.
+py_dist_info(
+    name = "dist_info",
+    entry_points = {
+        "console_scripts": ["sglang = sglang.cli.main:main"],
+        "sglang.srt.platforms": ["tpu = sglang.srt.hardware_backend.tpu:activate"],
+    },
+    package_name = "sglang",
+    target_path = "python",
+    version = "0.0.0.dev0",
+)
+
+# The whole sglang package. Sources come from //python/sglang:py_files and
+# resource trees from //python/sglang:data_files (filegroups own the globs
+# because the package lives in a subdirectory; a target's glob may not cross
+# a package boundary). kernels/jit's include/ and csrc/ trees -- resolved
+# from the filesystem at import time -- ride along via data_files.
+py_library(
+    name = "sglang",
+    srcs = ["//python/sglang:py_files"],
+    imports = ["."],
+    data = [
+        ":dist_info",
+        "//python/sglang:data_files",
+    ],
+    deps = [
+        "@sglang_pypi//accelerate",
+        "@sglang_pypi//aiohttp",
+        "@sglang_pypi//anthropic",
+        "@sglang_pypi//apache_tvm_ffi",
+        "@sglang_pypi//av",
+        "@sglang_pypi//blobfile",
+        "@sglang_pypi//cloudpickle",
+        "@sglang_pypi//compressed_tensors",
+        "@sglang_pypi//datasets",
+        "@sglang_pypi//dill",
+        "@sglang_pypi//einops",
+        "@sglang_pypi//fastapi",
+        "@sglang_pypi//filelock",
+        "@sglang_pypi//gguf",
+        "@sglang_pypi//grpcio",
+        "@sglang_pypi//grpcio_health_checking",
+        "@sglang_pypi//grpcio_reflection",
+        "@sglang_pypi//httpx",
+        "@sglang_pypi//huggingface_hub",
+        "@sglang_pypi//interegular",
+        "@sglang_pypi//ipython",
+        "@sglang_pypi//jinja2",
+        "@sglang_pypi//jsonschema",
+        "@sglang_pypi//llguidance",
+        "@sglang_pypi//lm_eval",
+        "@sglang_pypi//loguru",
+        "@sglang_pypi//lxml",
+        "@sglang_pypi//matplotlib",
+        "@sglang_pypi//mistral_common",
+        "@sglang_pypi//modelscope",
+        "@sglang_pypi//msgspec",
+        "@sglang_pypi//nest_asyncio",
+        "@sglang_pypi//numpy",
+        "@sglang_pypi//openai",
+        "@sglang_pypi//openai_harmony",
+        "@sglang_pypi//orjson",
+        "@sglang_pypi//outlines",
+        "@sglang_pypi//outlines_core",
+        "@sglang_pypi//packaging",
+        "@sglang_pypi//pandas",
+        "@sglang_pypi//partial_json_parser",
+        "@sglang_pypi//peft",
+        "@sglang_pypi//pillow",
+        "@sglang_pypi//prometheus_client",
+        "@sglang_pypi//psutil",
+        "@sglang_pypi//pybase64",
+        "@sglang_pypi//pydantic",
+        "@sglang_pypi//pydantic_core",
+        "@sglang_pypi//pytest",
+        "@sglang_pypi//python_dateutil",
+        "@sglang_pypi//python_multipart",
+        "@sglang_pypi//pyyaml",
+        "@sglang_pypi//pyzmq",
+        "@sglang_pypi//regex",
+        "@sglang_pypi//requests",
+        "@sglang_pypi//rich",
+        "@sglang_pypi//safetensors",
+        "@sglang_pypi//scipy",
+        "@sglang_pypi//sentence_transformers",
+        "@sglang_pypi//sentencepiece",
+        "@sglang_pypi//setproctitle",
+        "@sglang_pypi//setuptools",
+        "@sglang_pypi//smg_grpc_proto",
+        "@sglang_pypi//smg_grpc_servicer",
+        "@sglang_pypi//soundfile",
+        "@sglang_pypi//starlette",
+        "@sglang_pypi//tabulate",
+        "@sglang_pypi//tiktoken",
+        "@sglang_pypi//timm",
+        "@sglang_pypi//tokenizers",
+        "@sglang_pypi//torch",
+        "@sglang_pypi//torchvision",
+        "@sglang_pypi//tqdm",
+        "@sglang_pypi//transformers",
+        "@sglang_pypi//triton",
+        "@sglang_pypi//typing_extensions",
+        "@sglang_pypi//urllib3",
+        "@sglang_pypi//uvicorn",
+        "@sglang_pypi//uvloop",
+        "@sglang_pypi//xgrammar",
+        "@sglang_pypi//xxhash",
+        "@torch_tpu//shims/jax:pallas",
+        "@torch_tpu//torch_tpu",
+        # Pure-Python pallas package (torch_tpu._internal.pallas: __init__.py +
+        # pallas.py, which defines jax_op). The //torch_tpu aggregator only
+        # re-exports torch.tpu/xla modules and the pywrap only bundles the C++
+        # extensions, so without this dep the pallas __init__/pallas.py never
+        # reach runfiles and `from torch_tpu._internal.pallas import jax_op`
+        # fails with "cannot import name 'jax_op' ... (unknown location)".
+        "@torch_tpu//torch_tpu/_internal/pallas",
+    ],
+)

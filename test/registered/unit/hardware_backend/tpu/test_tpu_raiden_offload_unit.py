@@ -295,6 +295,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -310,6 +312,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -336,6 +340,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
+                mgr._announced_at = {}
+                mgr._timeout_s = 120.0
                 mgr._aborted = {}
                 mgr._send_reads = {}
                 mgr.failure_records = {}
@@ -392,6 +398,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -449,6 +457,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -490,6 +500,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     ):
         room = 29
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
@@ -572,6 +584,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -622,6 +636,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = Mock() if swa_limit is not None else None
         mgr._dynamic_host_staging = True
         mgr._pulling = StagingAdmission(pool_pages, swa_pool_pages)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._pulling_cleared = set()
         mgr._full_engine_max_blocks = full_limit
         mgr._swa_engine_max_blocks = swa_limit or 0
@@ -793,6 +809,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -918,6 +936,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1033,10 +1053,18 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
         mgr._local_blocks = {room: local}
+        mgr._local_swa_blocks = {}
+        mgr._remote_blocks = {}
+        mgr._remote_endpoint = {}
+        mgr._remote_swa_blocks = {}
+        mgr._remote_swa_endpoint = {}
+        mgr._decode_aux_index = {}
         mgr._remote_total = {room: 64}
         mgr._chunk_queue = {}
         mgr._chunk_reads = {}
         mgr._announced_spans = {}
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._final_seen = set()
         mgr._completed_send = set()
         mgr._completed_recv = set()
@@ -1049,6 +1077,53 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._reshard_slot_of = {}
         mgr._reshard_slot_rooms = [None]
         return mgr
+
+    def test_announced_and_closing_frames_preserve_page_pairs_across_prefix_hits(self):
+        for prefix_pages in (0, 8, 24, 48):
+            for offer_before_pull in (False, True):
+                with self.subTest(prefix=prefix_pages, offer_first=offer_before_pull):
+                    room = 61
+                    # Raiden does not publish decode_prefix_len to the sender:
+                    # announcements span the prompt, but decode owns its suffix.
+                    remote = list(range(100, 164))
+                    local = list(range(200, 264 - prefix_pages))
+                    prefill = self._prefill()
+                    decode = self._decode(room, local, pool_pages=64)
+                    pull = self._pull_req(room, len(local))
+                    if not offer_before_pull:
+                        prefill._on_pull_req(pull)
+                    for start in range(0, len(remote) - 16, 16):
+                        prefill.offer_chunk(
+                            room, start, remote[start : start + 16], len(remote)
+                        )
+                    if offer_before_pull:
+                        prefill._on_pull_req(pull)
+                    for call in prefill._socket.send_multipart.call_args_list:
+                        self.assertGreaterEqual(
+                            Chunk.from_frames(call.args[0]).start, prefix_pages
+                        )
+                        decode._on_chunk(call.args[0])
+                    decode._on_blocks(
+                        Blocks(
+                            room, remote, prefill.raiden_endpoint, [], "", b""
+                        ).to_frames()
+                    )
+                    self.assertFalse(decode.is_recv_done(room))
+                    # Complete each native read explicitly; no sleeps or timing races.
+                    for _ in range(4):
+                        decode.maybe_start_pull(room)
+                        for req_id in decode._chunk_reads.get(room, []):
+                            decode._completed_recv.add(req_id)
+                        with decode._state_lock:
+                            decode._release_pull_slots_locked()
+                    pairs = [
+                        pair
+                        for call in decode._engine.start_read.call_args_list
+                        for pair in zip(call.args[3], call.args[4])
+                    ]
+                    self.assertEqual(pairs, list(zip(remote[prefix_pages:], local)))
+                    self.assertTrue(decode.is_recv_done(room))
+                    self.assertEqual(len(decode._pulling), 0)
 
     def test_closing_read_carries_the_sliding_window_pages(self):
         room = 35
@@ -1608,6 +1683,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1791,6 +1867,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _decode(self):
         mgr = object.__new__(RaidenKVManager)
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1836,6 +1914,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._chunk_queue = {}
         mgr._final_seen = set()
         mgr._announced_spans = {}
+        mgr._announced_at = {}
+        mgr._timeout_s = 120.0
         mgr._remote_total = {}
         mgr._completed_send = set()
         mgr._completed_recv = set()

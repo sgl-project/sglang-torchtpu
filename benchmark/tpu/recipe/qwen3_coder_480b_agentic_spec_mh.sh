@@ -11,24 +11,17 @@ cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 
 PROFILE=${PROFILE:-ci}
 
-# The target checkpoint otherwise remains in the host page cache after loading.
-# Together with the pinned HiCache pool and compiler state, that can exhaust host
-# memory while TPU HBM still has headroom.
-EXTRA_ARGS="--weight-loader-drop-cache-after-load${EXTRA_ARGS:+ $EXTRA_ARGS}"
+# Simulate mean accept length 2.5, including the bonus, on synthetic prompts.
+# Fixed token output keeps this a synthetic throughput benchmark.
+export SGLANG_SIMULATE_ACC_LEN=2.5
+export SGLANG_SIMULATE_ACC_METHOD=match-expected
+export SGLANG_SIMULATE_ACC_TOKEN_MODE=fixed
+echo "[480b-agentic-spec] simulated accept_length=2.5 (includes bonus), method=$SGLANG_SIMULATE_ACC_METHOD, token_mode=$SGLANG_SIMULATE_ACC_TOKEN_MODE"
 
-# The CI sweep reaches 16 concurrent requests globally. With DP=2 that is eight
-# requests per attention-DP worker, so compile only the reachable batch buckets.
-if [[ "$PROFILE" == "ci" ]]; then
-  export MAX_RUNNING="${MAX_RUNNING:-8}"
-  export TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-8}"
-  export TPU_COMPILE_TOKENS="${TPU_COMPILE_TOKENS:-4096}"
-  export TPU_COMPILE_BS="${TPU_COMPILE_BS:-1 8}"
-fi
-
+# Capacity and compile buckets come from the same config as the baseline.
 exec env \
   MODEL="${MODEL:-/weights/Qwen3-Coder-480B-A35B-Instruct-FP8}" \
   DRAFT_MODEL="${DRAFT_MODEL:-/weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI}" \
   PROFILE="$PROFILE" \
-  EXTRA_ARGS="$EXTRA_ARGS" \
   ROLE=colocated \
   bash recipe/qwen3_coder_480b/nightly/serve.sh

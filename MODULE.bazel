@@ -1,0 +1,187 @@
+module(
+    name = "sglang_torchtpu",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "rules_python", version = "1.8.5")
+bazel_dep(name = "rules_uv", version = "0.89.2")
+bazel_dep(name = "rules_multitool", version = "0.11.0")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "torch_tpu", version = "0.1.1")
+
+# Build torch_tpu itself, including its native extension, from source. Pinning
+# a commit makes the dependency reproducible while retaining the requested SSH
+# transport. Developers can use --override_module=torch_tpu=../torch_tpu for a
+# neighboring checkout without changing this source-of-truth.
+git_override(
+    module_name = "torch_tpu",
+    commit = "caab3f95fb657540be716c81136322f8de45c056",
+    remote = "git@github.com:google-pytorch/torch_tpu.git",
+)
+
+# Bzlmod applies overrides only from the root module AND only with patch files
+# from the main repository ("only patches in the main repository can be
+# applied"), so torch_tpu's source overrides are redeclared here with local
+# copies of its patch files. The copies under bazel/patches/torch_tpu mirror
+# torch_tpu's bazel/patches/** at the pinned commit byte-for-byte (checked at
+# review time); re-sync them when the torch_tpu commit moves.
+single_version_override(
+    module_name = "curl",
+    patches = [
+        "//bazel/patches/torch_tpu:curl_remove_linker_script.patch",
+    ],
+    version = "8.11.0",
+)
+
+single_version_override(
+    module_name = "rules_python",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches/torch_tpu:rules_python_pip_version.patch",
+        "//bazel/patches/torch_tpu:rules_python_freethreaded.patch",
+        "//bazel/patches/torch_tpu:rules_python_versions.patch",
+        "//bazel/patches/torch_tpu:rules_python_scope.patch",
+    ],
+    version = "1.8.5",
+)
+
+single_version_override(
+    module_name = "grpc",
+    patch_strip = 1,
+    patches = ["//bazel/patches/torch_tpu:grpc.patch"],
+    version = "1.78.0",
+)
+
+single_version_override(
+    module_name = "googleapis",
+    version = "0.0.0-20240819-fe8ba054a",
+)
+
+archive_override(
+    module_name = "xla",
+    integrity = "sha256-4tVV9h5ob4q2vh571ofIbJFFwiH82ShQjEoSzKIi9d8=",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches/torch_tpu:remove_stablehlo_source_location.patch",
+    ],
+    strip_prefix = "xla-cc39fef7cae080ae61fc66bfe283bb80abcf409b",
+    urls = [
+        "https://github.com/openxla/xla/archive/cc39fef7cae080ae61fc66bfe283bb80abcf409b.tar.gz",
+    ],
+)
+
+archive_override(
+    module_name = "rules_ml_toolchain",
+    integrity = "sha256-izPVqzV2I7ox7EYzRzcRY6ogeLcHUr4LRP2xMrkWh6A=",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches/torch_tpu:remove_experimental_include.patch",
+    ],
+    strip_prefix = "rules_ml_toolchain-236a498d8624bef88e35ce2518a833204b0db19f",
+    urls = [
+        "https://github.com/google-ml-infra/rules_ml_toolchain/archive/236a498d8624bef88e35ce2518a833204b0db19f.tar.gz",
+    ],
+)
+
+archive_override(
+    module_name = "googletest",
+    integrity = "sha256-8lPKGgcmL4796DKOSyxol55A3fz8AB9w0dX2EsfeKXQ=",
+    strip_prefix = "googletest-28e9d1f26771c6517c3b4be10254887673c94018",
+    urls = [
+        "https://github.com/google/googletest/archive/28e9d1f26771c6517c3b4be10254887673c94018.zip",
+    ],
+)
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "3.12",
+)
+use_repo(python, "python_3_12")
+
+# Python 3.12 script launches use our bootstrap with opt-in PYTHON forwarding.
+register_toolchains("//bazel:python_toolchain")
+
+# //requirements:regenerate_lock resolves with the hermetic uv pinned in
+# requirements/uv.lock.json -- the same uv on every machine instead of whatever
+# happens to be on PATH. rules_uv also feeds rules_multitool its own vendored
+# (older) uv; our hub tag comes later, and rules_multitool merges lockfiles in
+# reverse module order with later entries winning, so this pin is the one that
+# @multitool//tools/uv serves to the main module.
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+multitool.hub(lockfile = "//requirements:uv.lock.json")
+use_repo(multitool, "multitool")
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+
+# ONE pip hub for the whole module graph. The lock behind it is a single uv
+# resolution of sglang's python/pyproject_tpu.toml AND @torch_tpu's
+# pyproject.toml together (see //requirements:regenerate_lock), so every
+# package torch_tpu references -- including the TPU stack (torch 2.11.0,
+# torchvision 0.26.0, libtpu 0.0.47, jax/jaxlib 0.10.2) pinned in
+# pyproject_tpu.toml -- resolves here, not in torch_tpu's own hub. The
+# override_repo below then substitutes this hub for torch_tpu's: the root
+# module gets the final say over the whole PyPI stack.
+pip.parse(
+    # The split-libtorch cc_library aliases torch_tpu's native glue links
+    # against (mirrored from torch_tpu's MODULE.bazel; keep in sync).
+    extra_hub_aliases = {
+        "torch": [
+            "torch_headers",
+            "torch_libs",
+            "libc10",
+            "libtorch_cpu",
+            "libtorch_python",
+            "libtorch",
+            "libshm",
+            "libtorch_global_deps",
+        ],
+    },
+    extra_pip_args = [
+        "--index-url",
+        "https://pypi.org/simple",
+        "--extra-index-url",
+        "https://download.pytorch.org/whl/cpu",
+        "--timeout",
+        "120",
+        "--retries",
+        "5",
+    ],
+    hub_name = "sglang_pypi",
+    python_version = "3.12",
+    requirements_lock = "//requirements:requirements_lock_3_12.txt",
+    # Injects the split libtorch cc_library targets into the torch spoke's
+    # BUILD (mirrored byte-for-byte from ../torch_tpu/bazel/torch_wheel.json).
+    whl_modifications = {"//bazel:torch_wheel.json": "torch"},
+)
+# xgrammar discovers its adjacent extension from wheel RECORD metadata. Point
+# its loader at the package directory because Bazel's wheel import omits RECORD.
+pip.override(
+    file = "xgrammar-0.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    patch_strip = 1,
+    patches = [
+        "//bazel/patches/xgrammar:bazel_runfiles.patch",
+        "//bazel/patches/xgrammar:record.patch",
+    ],
+)
+use_repo(
+    pip,
+    "sglang_pypi",
+    # The torch/libtpu spokes under their canonical names, so override_repo
+    # can map torch_tpu's spokes onto them.
+    "sglang_pypi_312_libtpu",
+    "sglang_pypi_312_torch",
+)
+
+# Replace the extension repos torch_tpu references with ours. Keys are the
+# apparent names torch_tpu's use_repo exports them under; values are repos
+# visible in this module's scope.
+override_repo(
+    pip,
+    # torch_tpu's hub -> our single hub (jax 0.10.2, torch 2.11.0, ...).
+    torch_tpu_pypi = "sglang_pypi",
+    # torch_tpu's 3.12 torch/libtpu spokes (consumed as @pypi_torch_312//...,
+    # @pypi_libtpu_312//... by its shims, and by canonical path in
+    # build_defs.bzl LD_LIBRARY_PATH) -> our hub's spokes.
+    torch_tpu_pypi_312_libtpu = "sglang_pypi_312_libtpu",
+    torch_tpu_pypi_312_torch = "sglang_pypi_312_torch",
+)

@@ -1,0 +1,74 @@
+# Keep the Bazel and Python configuration aligned with torch_tpu.
+common --announce_rc
+common --enable_bzlmod=true
+common --enable_workspace=false
+common --check_visibility=false
+common --repo_env=HERMETIC_PYTHON_VERSION=3.12
+common --repo_env=USE_PYWRAP_RULES=1
+common --experimental_repo_remote_exec
+common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+common --incompatible_strict_action_env=true
+common --enable_platform_specific_config
+common --per_file_copt=.*[.](cc|cpp|hpp)$@-std=c++20
+common --per_file_copt=external/.*(onednn|llvm-project).*[.](cc|cpp|hpp)$@-std=c++17
+
+build --compilation_mode=opt
+build --repo_env=LLVM_VERSION=20
+build --repo_env=SYSROOT_DIST=linux_glibc_2_31
+build --action_env=BAZEL_CXXOPTS=-std=c++20
+build --incompatible_disallow_empty_glob=false
+query --incompatible_disallow_empty_glob=false
+build --incompatible_default_to_explicit_init_py=true
+build --legacy_external_runfiles=false
+build --@rules_python//python/config_settings:precompile=force_disabled
+# Mute compiler warnings from external repos (XLA, LLVM, torch_tpu deps) so
+# their noise doesn't bury our own diagnostics. Same trick as openxla/xla's
+# warnings.bazelrc: -w for everything under external/. Warnings in our own
+# tree are unaffected.
+build --per_file_copt=external/.*@-w
+# Ship py_binary launchers as a self-contained bash script instead of the
+# default `#!/usr/bin/env python3` shebang. XNNPACK's codegen genrules (pulled
+# in via XLA for torch_tpu) run their py_binary generators as plain genrule
+# tools, and there is no `python3` on this image's PATH; with the script
+# bootstrap every py_binary brings up the hermetic toolchain interpreter from
+# MODULE.bazel itself, no PATH hacks anywhere.
+build --@rules_python//python/config_settings:bootstrap_impl=script
+
+# TPU e2e tests use the eternal timeout category. Model compilation plus long
+# evaluations (e.g. Kimi MMMU-pro at 6-7 hours) can exceed its one-hour default.
+# Allow 24 hours while preserving Bazel's short, moderate, and long defaults.
+# Override per invocation with --test_timeout=<seconds>.
+test --test_timeout=-1,-1,-1,86400
+
+# The integration target launches a long-lived server subprocess and needs
+# direct access to TPU devices and the network. The target carries the
+# `no-sandbox` execution tag, which disables sandboxing; this just runs it
+# locally with streamed output.
+test:tpu --test_strategy=local
+test:tpu --test_output=streamed
+test:tpu --test_env=PYTHONUNBUFFERED=1
+# launch_server.sh runs under `set -u` and derives cache dirs from $HOME
+# (torch_tpu tier-3 compile cache, HF cache); Bazel's clean test env does not
+# set it, so the recipe would die with "HOME: unbound variable".
+test:tpu --test_env=HOME
+
+# Forward the TPU topology variables used by torch_tpu and the SGLang launcher.
+test:tpu --test_env=TPU_SKIP_MDS_QUERY
+test:tpu --test_env=TPU_TOPOLOGY
+test:tpu --test_env=TPU_WORKER_ID
+test:tpu --test_env=TPU_TOPOLOGY_WRAP
+test:tpu --test_env=TPU_CHIPS_PER_HOST_BOUNDS
+test:tpu --test_env=TPU_ACCELERATOR_TYPE
+test:tpu --test_env=TPU_RUNTIME_METRICS_PORTS
+test:tpu --test_env=TPU_TOPOLOGY_ALT
+test:tpu --test_env=TPU_HOST_BOUNDS
+test:tpu --test_env=TPU_WORKER_HOSTNAMES
+test:tpu --test_env=TPU_PROCESS_ADDRESSES
+test:tpu --test_env=TPU_PROCESS_PORT
+test:tpu --test_env=CHIPS_PER_HOST_BOUNDS
+test:tpu --test_env=HOST_BOUNDS
+
+###############################################################################
+# Allow per-user, project-specific Bazel options. Keep this as the final line
+# so user settings take precedence over every repository default above.
+try-import %workspace%/user.bazelrc

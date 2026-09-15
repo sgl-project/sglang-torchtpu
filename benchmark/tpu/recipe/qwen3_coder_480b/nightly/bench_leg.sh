@@ -27,9 +27,9 @@
 #   OUTPUT_DIR=        REQUIRED
 #   TRACE=                       trace JSON; generated into TRACE_DIR if unset
 #   TRACE_DIR=$TRACE_CACHE_DIR   shared, persistent trace cache (see config.sh).
-#                                One trace serves every concurrency at a given
-#                                NUM_LONG: it is built for the largest leg in
-#                                SWEEP_BS and --num-prompts takes a prefix.
+#                                Legs with the same session-pool sizing share
+#                                a trace built for the largest SWEEP_BS leg;
+#                                --num-prompts takes a prefix.
 #   FLUSH_CACHE=1                POST /flush_cache first so legs are independent
 #   SEED=1
 set -euo pipefail
@@ -72,8 +72,7 @@ normal_rounds=$(( (TARGET_CONTEXT + _normal_growth / 2) / _normal_growth ))
 (( normal_rounds < 1 )) && normal_rounds=1
 
 # Extra fresh normal sessions keep the non-long slots busy for as long as the
-# long sessions run; see config.sh (SESSIONS_PER_SLOT). Depends only on the
-# round counts, so it is the same for every concurrency.
+# long sessions run; see config.sh (SESSIONS_PER_SLOT).
 sessions_per_slot=$SESSIONS_PER_SLOT
 if [[ "$sessions_per_slot" == "auto" ]]; then
     if (( NUM_LONG > 0 )); then
@@ -82,6 +81,13 @@ if [[ "$sessions_per_slot" == "auto" ]]; then
         (( sessions_per_slot < 1 )) && sessions_per_slot=1
     else
         sessions_per_slot=1
+    fi
+    # One session per slot leaves no replacements as faster sessions finish.
+    # Give concurrent CI legs a backlog to reduce the final drain's weight in
+    # average concurrency and throughput, without lengthening the c1 legs.
+    if [[ "$PROFILE" == "ci" ]] && (( BS > 1 && sessions_per_slot < 3 )); then
+        sessions_per_slot=3
+        (( sessions_per_slot > MAX_SESSIONS_PER_SLOT )) && sessions_per_slot=$MAX_SESSIONS_PER_SLOT
     fi
 fi
 sessions_for() {   # sessions a leg of concurrency $1 sends
@@ -92,12 +98,11 @@ sessions_for() {   # sessions a leg of concurrency $1 sends
 }
 num_sessions=$(sessions_for "$BS")
 
-# One trace serves every concurrency at this NUM_LONG: build it for the LARGEST
-# leg in the sweep and let --num-prompts take a prefix. That is exact, not an
+# Reuse a trace across legs with the same session-pool sizing: build it for the
+# LARGEST leg in the sweep and let --num-prompts take a prefix. That is exact, not an
 # approximation -- the generator emits the long sessions first and the loader
 # takes the first N conversations, so a prefix of the bs=32 trace is byte-for-byte
-# the trace a bs=16 leg would have generated for itself. Turns ~1 trace per leg
-# into 1 per SWEEP_LONG value.
+# the trace a bs=16 leg would have generated for itself.
 trace_bs=$MAX_CONCURRENCY
 (( BS > trace_bs )) && trace_bs=$BS       # a hand-run leg above the sweep's max
 trace_sessions=$(sessions_for "$trace_bs")

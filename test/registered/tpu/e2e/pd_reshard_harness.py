@@ -1,43 +1,42 @@
-"""P/D disaggregation with TP resharding integration test (issue #378).
+"""Shared harness for the multihost P/D TP-resharding tests (issue #378).
 
 Topology: a multihost PREFILL engine (TP16EP16) and a multihost DECODE engine
 (DP2TP8EP16), each spanning its own TPU slice, connected by the PD mini load
-balancer. Prefill engine uses attention TP=16; Decode engine uses DP=2 with
-attention TP=8 per DP replica (total 16 devices).
+balancer. Prefill uses attention TP=16; decode uses DP=2 with attention TP=8 per
+replica, so the KV transfer reshards 16 prefill shards onto 8 decode shards per
+replica via FAN_IN (2:1).
 
-The KV cache transfer reshards the prefill attention shards (16 ranks) to
-decode attention shards (8 ranks per DP replica) via FAN_IN resharding (2:1).
+Everything both models share lives here -- profiles, engine launch, role
+dispatch, probes and gsm8k. The dashboard contract is one job to one test file,
+so each model gets a thin sibling that carries the registration and calls
+main():
 
-The CI JobSet (.github/tpu-ci/jobset-tpu-pd.yaml) runs this file on every pod of
-both slices; roles are dispatched from the CI_PD_ROLE env plus the slice-local
-TPU worker env.
+  test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py     -> main("gpt_oss_120b")
+  test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py -> main("qwen3_coder_480b")
+
+Keeping both profiles here rather than in those files keeps the model matrix in
+one place; a file selects one by key. This module registers itself as a disabled
+helper, since run_suite requires a registration from every file under
+test/registered but this one owns no row.
 
 What each verification proves:
-  * quality:          gsm8k through the LB must clear the model's accuracy floor
-                      under TP resharding.
-  * KV resharding:    generation requests dispatched to prefill -> decode across
-                      both DP replicas produce valid, deterministic, and bit-equal
-                      greedy text, certifying that KV cache was resharded and
-                      transferred intact.
+  * quality:       gsm8k through the LB must clear the model's accuracy floor
+                   under TP resharding.
+  * KV resharding: generation requests dispatched to prefill -> decode across
+                   both DP replicas produce valid, deterministic, bit-equal
+                   greedy text, certifying the KV cache resharded and
+                   transferred intact.
 
 Roles (rank = slice-local TPU_WORKER_ID):
   prefill rank 0   launches the prefill engine, waits for decode, starts the
-                   mini-LB, runs the resharding generation probe + gsm8k -- its
-                   verdict gates the run.
+                   mini-LB, runs the probes + gsm8k -- its verdict gates the run.
   prefill rank >0  worker shard of the prefill engine.
-  decode any rank  launches/joins the decode engine (DP2TP8EP16), serves until
-                   the leader tears down.
-
-Run one model profile per invocation on hardware:
-
-  MODEL_PROFILE=gpt_oss_120b CI_PD_ROLE=prefill python3 \
-      test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_tp_resharding.py
-
-Without CI_PD_ROLE the file runs only its host-side configuration tests.
+  decode any rank  launches/joins the decode engine, serves until teardown.
 """
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -101,12 +100,13 @@ except ModuleNotFoundError as exc:
         return None
 
 
-# One invocation runs ONE model profile: two engines (weight load + compile),
-# the cache probe with device-pool churn, and gsm8k.
+# run_suite requires every file under test/registered to carry a registration;
+# same convention as bench_matrix_base.py. The per-model files register the real
+# rows.
 register_tpu_ci(
-    est_time=10800,
+    est_time=0,
     suite="tpu-integration",
-    labels=["multihost", "gpt-oss-120b", "pd", "tp-reshard"],
+    disabled="helper module, no tests",
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -216,11 +216,39 @@ MODEL_PROFILES = {
         mem_fraction_decode="0.6",
         quantization="fp8",
         kv_cache_dtype="fp8_e4m3",
-        max_total_tokens=32768,
-        device_pool_tokens_hint=32768,
+        # 262144 is what both green runs used; 32768 with the prefill cap below
+        # has never been exercised. An earlier theory that the smaller pool
+        # raced in-flight KV transfers was disproved (34282621754 failed with
+        # 262144 and no cap), so this is here to match a verified configuration,
+        # not because the pool was ever the fault.
+        max_total_tokens=262144,
+        device_pool_tokens_hint=262144,
         gsm8k_threshold=0.80,
         extra_server_args=("--tpu-fp8-runtime", "channelwise"),
-        extra_launch_env={"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"},
+        extra_launch_env={
+            "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+            # Keep every prefill forward inside the 256-token compile graph.
+            #
+            # Extends compiled at the 1024-token bucket corrupt this model's
+            # output; extends at 64 or 256 never do. Three runs pin it: with
+            # buckets "64 256 1024" cold prompts were clean to 216 tokens and
+            # 3/3 degenerate from 271 up (34317645114); moving the middle bucket
+            # to 128 moved the edge to 156 with prompt length and page count
+            # unchanged (34344878767); and compiling a single 1024 bucket
+            # corrupted even a 62-token prompt (34360046804). Warm prompts of
+            # any length were always clean because their extend is a couple of
+            # dozen new tokens and lands in the smallest graph.
+            #
+            # At 256 a ~900-token prompt is four extends instead of one padded
+            # to 1024, so the broken graph is never reached. gsm8k went from a
+            # flat 0.0 to 0.95 and 0.99 on repeat runs (34373221584, 34379061369).
+            #
+            # This is a workaround. The 1024 graph is still wrong, and it is
+            # wrong only for this model -- gpt-oss runs the same bucket set and
+            # scores 0.98 at 885 cold tokens, so fp8 weights are the suspect,
+            # gpt-oss being MXFP4-native. Remove this once that is fixed.
+            "CHUNKED_PREFILL_SIZE": "256",
+        },
         chat_template_kwargs={"enable_thinking": False},
     ),
 }
@@ -362,6 +390,31 @@ def validate_model_source(profile: ModelProfile, model_path: str) -> None:
         )
 
 
+def hicache_server_args(
+    profile: ModelProfile, env: Optional[Mapping[str, str]] = None
+) -> str:
+    """Prefill-side KV offload, matching the standalone kv-offload tests.
+
+    Offload runs on the prefill engine only: it is where the pages are produced
+    and where eviction pressure is, and the decode engine receives KV through
+    the reshard rather than reloading it from host. build_decode_env therefore
+    carries no hicache flag, and a test below pins that.
+    """
+    values = os.environ if env is None else env
+    return " ".join(
+        (
+            "--enable-hierarchical-cache",
+            "--hicache-ratio",
+            values.get("HICACHE_RATIO", "2"),
+            "--hicache-io-backend",
+            "raiden",
+            "--hicache-mem-layout",
+            "page_first_fused",
+            "--enable-cache-report",
+        )
+    )
+
+
 def _common_launch_env(
     profile: ModelProfile, group_hosts: int, env: Optional[Mapping[str, str]] = None
 ) -> Dict[str, str]:
@@ -438,6 +491,7 @@ def build_prefill_env(
         "EXTRA_ARGS": " ".join(
             (
                 *prefill_args,
+                hicache_server_args(profile, values),
                 *profile.extra_server_args,
                 values.get("EXTRA_PREFILL_ARGS", ""),
             )
@@ -549,6 +603,107 @@ def _generate(base_url: str, prompt: str, max_new_tokens: int = 32) -> Generatio
         completion_tokens=int(meta.get("completion_tokens") or 0),
         latency_seconds=round(time.perf_counter() - started, 3),
     )
+
+
+_SWEEP_PARAGRAPHS_TEXT = (
+    "The harbour master keeps a ledger of every vessel that clears the outer "
+    "channel, noting draught, cargo class and the pilot who signed the release. ",
+    "Cartographers working the northern survey preferred aneroid barometers to "
+    "mercury ones, since a broken column meant a week waiting on resupply. ",
+    "A cooper's apprenticeship ran seven years: two spent shaping staves, three "
+    "on hooping and fitting heads, and two repairing casks from the brewers. ",
+    "The observatory's transit telescope stood on a pier sunk to bedrock so that "
+    "footsteps on the gallery would not disturb a sighting. ",
+    "Millwrights judged a waterwheel by the sound of its buckets emptying rather "
+    "than by any gauge, and reset a wheel running dry at the crown. ",
+    "Copperplate engravers bevelled a finished plate so the press blanket would "
+    "not tear, retiring it for resurfacing after some hundreds of sheets. ",
+    "In the salt marshes the reed cutters worked from flat punts, taking only "
+    "second-year growth, because first-year reed shrank in the thatch. ",
+    "Lighthouse keepers logged the hour the lamp was lit and doused, the oil "
+    "drawn, and any vessel that passed close enough to hail. ",
+    "Bell founders buried the mould in packed sand so the metal cooled evenly; a "
+    "bell drawn too early rang false and went back to the furnace. ",
+)
+# One entry per KV page from 1 to 15, at roughly 31 tokens a paragraph, so the
+# sweep brackets the boundary from well below it to well above.
+_COLD_SWEEP_PARAGRAPHS = (1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 29)
+
+# The sweep buries "what is 17 plus 25?" behind a wall of filler, so the answer
+# is the evidence that the model read its whole context. Judge on that rather
+# than on whether the continuation stays tidy: gpt-oss answers correctly and
+# then rambles, which a spew detector reads as corruption on a model scoring
+# 0.98 (34383772574). Corrupt output never contains the answer.
+_SWEEP_ANSWER = "42"
+_SWEEP_ANSWER_WINDOW = 32
+
+
+def sweep_question(paragraphs: int, rotate: int = 0, tag: str = "") -> str:
+    """Filler of a given length, then the question, then a unique opening.
+
+    `rotate` and `tag` exist so two prompts of different lengths share no
+    prefix. Without them a length sweep is nested -- each prompt is the previous
+    one plus a paragraph -- and the prefill cache holds all but the last few
+    tokens, so it measures an incremental extend rather than the prompt.
+    """
+    filler = "".join(
+        _SWEEP_PARAGRAPHS_TEXT[(i + rotate) % len(_SWEEP_PARAGRAPHS_TEXT)]
+        for i in range(paragraphs)
+    )
+    return (
+        f"{tag}{filler}\n\nIgnore the notes above. Question: what is 17 plus 25? "
+        "Reply with only the number and nothing else."
+    )
+
+
+def sweep_answer_missing(text: str) -> bool:
+    """Whether the buried question went unanswered in the opening of a reply."""
+    return _SWEEP_ANSWER not in re.sub(r"\s+", "", text)[:_SWEEP_ANSWER_WINDOW]
+
+
+def run_cold_length_sweep(base_url: str, profile: ModelProfile) -> None:
+    """Prompt length against correctness, with every prompt cold.
+
+    gsm8k already fails when the context is corrupt, but it reports a flat 0.0
+    an hour later and says nothing about where the boundary is. This costs about
+    a minute and names the first bad length, which is what makes the failure
+    diagnosable -- the boundary is what identified the compile bucket as the
+    trigger rather than prompt length or KV page count.
+
+    Every length gets its own paragraph rotation and leading tag, so no prompt
+    shares a prefix with another and length is the only variable.
+    """
+    attempts = int(E("COLD_SWEEP_ATTEMPTS", "3"))
+    results = []
+    for step, paragraphs in enumerate(_COLD_SWEEP_PARAGRAPHS):
+        prompt = sweep_question(
+            paragraphs, rotate=step + 1, tag=f"Memo {step:02d}-{step * 7 + 3}. "
+        )
+        recs = [_generate(base_url, prompt, 64) for _ in range(attempts)]
+        flags = [sweep_answer_missing(r.text) for r in recs]
+        bad = [r for r, missing in zip(recs, flags) if missing]
+        results.append(
+            {
+                "prompt_tokens": recs[0].prompt_tokens,
+                "pages": -(-recs[0].prompt_tokens // profile.page_size),
+                "rate": f"{len(bad)}/{attempts}",
+                "sample_output": (bad[0] if bad else recs[0]).text[:100],
+            }
+        )
+    print(
+        json.dumps(
+            {"cold_length_sweep": profile.key, "results": results}, sort_keys=True
+        ),
+        flush=True,
+    )
+    lost = [r for r in results if not r["rate"].startswith("0/")]
+    if lost:
+        first = lost[0]
+        raise AssertionError(
+            f"Cold prompts stopped answering at {first['prompt_tokens']} tokens "
+            f"({first['pages']} KV pages, {first['rate']}); shorter ones answer. "
+            f"Full sweep: {json.dumps(results, sort_keys=True)[:700]}"
+        )
 
 
 def run_tp_resharding_probe(base_url: str, profile: ModelProfile) -> None:
@@ -811,6 +966,12 @@ class TestPdTpResharding(unittest.TestCase):
             profile=self.profile,
         )
 
+    def test_01a_cold_length_sweep(self) -> None:
+        run_cold_length_sweep(
+            base_url=f"http://127.0.0.1:{LB_PORT}",
+            profile=self.profile,
+        )
+
     def test_02_gsm8k_quality(self) -> None:
         score = run_gsm8k(
             base_url=f"http://127.0.0.1:{LB_PORT}",
@@ -827,6 +988,28 @@ class TestPdTpResharding(unittest.TestCase):
         )
         print(f"gsm8k score={score:.4f} floor={self.gsm8k_config.threshold:.4f}")
         self.assertGreaterEqual(score, self.gsm8k_config.threshold)
+
+    def test_02b_kv_offload_engaged(self) -> None:
+        """The prefill engine's host offload tier actually initialized.
+
+        Enabling --enable-hierarchical-cache is not evidence that offload ran.
+        If the raiden HiCache backend fails to come up, the engine serves
+        happily from the device pool alone and every other assertion here still
+        passes -- the combo silently degrades to the one it was meant to extend.
+        This marker is emitted by hardware_backend/tpu/raiden_transfer.py once
+        the host pool and DMA engine are up, so its absence is the direct
+        evidence of that silent skip.
+        """
+        with open(PREFILL_LOG, "r", errors="replace") as f:
+            log = f.read()
+        self.assertIn(
+            RAIDEN_READY_MARKER,
+            log,
+            "KV offload never engaged on the prefill engine: no "
+            f"{RAIDEN_READY_MARKER!r} in {PREFILL_LOG}. The run would still "
+            "pass every other check while serving entirely from the device "
+            "pool, so the offload half of this combo was not exercised.",
+        )
 
     def test_03_sliding_window_crossed_the_reshard(self) -> None:
         """A hybrid model's window must actually be resharded, not just its
@@ -965,6 +1148,10 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
             self.assertIn("--enable-dp-attention", d_env["EXTRA_ARGS"])
             self.assertIn("--enable-dp-lm-head", d_env["EXTRA_ARGS"])
             self.assertNotIn("hicache", d_env["EXTRA_ARGS"])
+            # Offload is prefill-side; decode receives KV through the reshard.
+            self.assertIn("--enable-hierarchical-cache", p_env["EXTRA_ARGS"])
+            self.assertIn("--hicache-io-backend raiden", p_env["EXTRA_ARGS"])
+            self.assertIn("--hicache-mem-layout page_first_fused", p_env["EXTRA_ARGS"])
 
     def test_heterogeneous_attention_tp_resharding_ratio(self) -> None:
         for profile in MODEL_PROFILES.values():
@@ -1035,6 +1222,50 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
             ).is_leader
         )
 
+    def test_sweep_answer_check_reads_real_replies(self) -> None:
+        """The sweep verdict, against replies both models actually produced.
+
+        gpt-oss answers correctly and then rambles, including into runs of
+        "... ... ...", and a spew-shaped check failed it on a bring-up scoring
+        0.98 (34383772574). qwen's corrupted replies never contain the answer.
+        Both directions matter: a check that flags the first costs a multi-hour
+        run to disprove, and one that misses the second is why the corruption
+        took so long to localize.
+        """
+        for label, text in (
+            ("bare answer", " 42"),
+            ("answer then ellipsis", '\n\n42\n\nThe user says: "... ... ... ..."'),
+            ("answer then note", "\n\n42\n\n(Note: the answer is 42.)"),
+            ("answer mid sentence", " The answer is 42."),
+        ):
+            with self.subTest(label):
+                self.assertFalse(sweep_answer_missing(text))
+
+        for label, text in (
+            ("backslash run", "\\" * 40),
+            ("multi-char cycle", " 4: 4: 4: 4: 4: 4: 4: 4:"),
+            ("newline-broken run", " bufsize\n___\n___\n___\n___"),
+            ("non-ascii repeat", "\u6a21\u6837" + "\uff1f" * 20),
+            ("empty", "   "),
+            ("answer only after the window", "x" * 40 + " 42"),
+        ):
+            with self.subTest(label):
+                self.assertTrue(sweep_answer_missing(text))
+
+    def test_qwen_prefill_is_capped_below_the_broken_bucket(self) -> None:
+        """qwen must not compile a prefill extend at the 1024-token bucket.
+
+        Removing the cap puts ~900-token prompts back in that graph and gsm8k
+        returns to 0.0. Reported as a plain 0.0 an hour into the run, that is
+        expensive to diagnose, so pin the cap and its relation to the buckets.
+        """
+        profile = MODEL_PROFILES["qwen3_coder_480b"]
+        env = build_prefill_env(profile, 2, env={})
+        cap = int(env["CHUNKED_PREFILL_SIZE"])
+        buckets = [int(b) for b in env["TPU_COMPILE_TOKENS"].split()]
+        self.assertIn(cap, buckets, "the cap must itself be a compiled bucket")
+        self.assertLess(cap, max(buckets), "the cap must stay below the top bucket")
+
     def test_model_specific_gsm8k_threshold_wins(self) -> None:
         config = Gsm8kConfig.from_env(
             MODEL_PROFILES["qwen3_coder_480b"],
@@ -1049,12 +1280,37 @@ class TestPdTpReshardingConfiguration(unittest.TestCase):
         validate_model_source(profile, "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8")
 
 
-if __name__ == "__main__":
+def _run_case(case: type) -> None:
+    """Run one TestCase and exit with its verdict."""
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    sys.exit(0 if result.wasSuccessful() else 1)
+
+
+def main(profile_key: str) -> None:
+    """Entry point for a per-model test file.
+
+    `profile_key` is the model that file exists to cover. It is a default rather
+    than a pin, so an explicit MODEL_PROFILE still wins and the combo dispatch
+    keeps working; in the nightly the two agree by construction, since each job
+    names one file and passes the matching profile.
+
+    Without CI_PD_ROLE only the host-side configuration cases run, so the file
+    is useful on a laptop. With it, non-leader ranks serve their engine and the
+    prefill leader runs the live suite and returns the verdict.
+    """
+    os.environ.setdefault("MODEL_PROFILE", profile_key)
     if not E("CI_PD_ROLE"):
-        sys.argv = [sys.argv[0], "TestPdTpReshardingConfiguration"]
-        unittest.main(verbosity=2)
+        _run_case(TestPdTpReshardingConfiguration)
     topology = PodTopology.from_env()
     if not topology.is_leader:
         sys.exit(_serve_role(topology, select_profile(E("MODEL_PROFILE", ""))))
-    sys.argv = [sys.argv[0], "TestPdTpResharding"]
+    _run_case(TestPdTpResharding)
+
+
+if __name__ == "__main__":
+    # Not a dashboard row -- the registration above is disabled and CI never
+    # invokes this file. Running it directly is for local work: it exercises the
+    # host-side configuration cases, which need no TPU and no live server.
+    sys.argv = [sys.argv[0], "TestPdTpReshardingConfiguration"]
     unittest.main(verbosity=2)

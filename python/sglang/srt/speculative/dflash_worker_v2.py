@@ -1862,8 +1862,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         else:
-            target_predict = torch.argmax(next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
+            # argmax straight to 2-D: a .view() of the 1-D result is an as_strided
+            # whose src-rank broadcast collapses to the flat base, so rank 0 enters
+            # this collective as s64[bs*block_size] and the rest as s64[bs,block_size].
+            target_predict = torch.argmax(
+                next_token_logits.view(bs, int(self.block_size), -1), dim=-1
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if _is_tpu:

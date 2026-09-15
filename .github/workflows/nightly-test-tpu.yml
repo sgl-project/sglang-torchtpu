@@ -47,10 +47,17 @@ on:
           - pd-mh-gpt-120b-spec
           - pd-mh-gpt-120b-pc-offload-spec
           - pd-mh-gpt-120b-pc-offload-spec-reshard
-          - pd-mh-gpt-120b-tp-reshard
+          - pd-mh-gpt-120b-kvoff-reshard
+          - pd-mh-qwen3-480b-kvoff-reshard
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
+          - pd-sh-gpt-120b-decode-radix
           - sh
+      test_filter:
+        description: "Substring of a test file path; runs only matching tests"
+        required: false
+        default: ""
+        type: string
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -81,6 +88,10 @@ jobs:
       ref: ${{ inputs.ref || 'main' }}
       image: ${{ needs.build.outputs.digest }}
       only: ${{ contains(fromJSON('["all","feature-validation"]'), inputs.only || 'all') && 'all' || inputs.only }}
+      test_filter: ${{ inputs.test_filter || '' }}
+      # Without this the test_filter/update-dashboard guard inside the called
+      # workflow never sees the flag, so a filtered run could publish.
+      update-dashboard: ${{ inputs.update-dashboard || false }}
     permissions:
       contents: read
       id-token: write

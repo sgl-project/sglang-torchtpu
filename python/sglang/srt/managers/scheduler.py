@@ -1546,6 +1546,18 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        self.tpu_async_copy_worker = None
+        if (
+            self.device == "tpu"
+            and self.enable_overlap
+            and envs.SGLANG_TPU_ASYNC_COPY_WORKER.get()
+        ):
+            from sglang.srt.hardware_backend.tpu.result_copy_worker import (
+                TPUAsyncCopyWorker,
+            )
+
+            self.tpu_async_copy_worker = TPUAsyncCopyWorker()
+            logger.info("TPU async result-copy worker enabled")
 
         # CUDA-style forward/copy/schedule streams only buy overlap on backends
         # with real multi-stream execution. Single-queue backends (see
@@ -1817,6 +1829,8 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        if self.tpu_async_copy_worker is not None:
+            self.tpu_async_copy_worker.close()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -4090,6 +4104,12 @@ class Scheduler(
                                 # Cross-stream sync costs more than the tiny D2H it
                                 # overlaps.
                                 batch_result.copy_to_cpu(
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
+                                )
+                            elif self.tpu_async_copy_worker is not None:
+                                self.tpu_async_copy_worker.submit(
+                                    batch_result,
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )

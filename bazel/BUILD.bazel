@@ -1,0 +1,36 @@
+load("@rules_python//python:defs.bzl", "py_runtime", "py_runtime_pair")
+
+# Reuse the same hermetic distribution as MODULE.bazel. Only the stage-1
+# bootstrap is customized.
+py_runtime(
+    name = "python_runtime",
+    bootstrap_template = "stage1_bootstrap_template.sh",
+    files = ["@python_3_12//:files"],
+    interpreter = "@python_3_12//:python3",
+    interpreter_version_info = {
+        "major": "3",
+        "minor": "12",
+    },
+    python_version = "PY3",
+)
+
+py_runtime_pair(
+    name = "python_runtimes",
+    py3_runtime = ":python_runtime",
+)
+
+config_setting(
+    name = "python_3_12_script",
+    flag_values = {
+        "@rules_python//python/config_settings:bootstrap_impl": "script",
+        "@rules_python//python/config_settings:python_version": "3.12",
+    },
+)
+
+toolchain(
+    name = "python_toolchain",
+    target_compatible_with = ["@platforms//os:linux"],
+    target_settings = [":python_3_12_script"],
+    toolchain = ":python_runtimes",
+    toolchain_type = "@rules_python//python:toolchain_type",
+)

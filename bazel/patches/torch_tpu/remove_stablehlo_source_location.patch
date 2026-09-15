@@ -1,0 +1,10 @@
+diff --git a/third_party/stablehlo/workspace.bzl b/third_party/stablehlo/workspace.bzl
+--- a/third_party/stablehlo/workspace.bzl
++++ b/third_party/stablehlo/workspace.bzl
+@@ -15,2 +15,6 @@
+         urls = tf_mirror_urls("https://github.com/openxla/stablehlo/archive/{commit}.zip".format(commit = STABLEHLO_COMMIT)),
++        patch_cmds = [
++            "sed -i '/#include <source_location>/d' stablehlo/integrations/cpp/builder/MlirBuilder.h",
++            "sed -i 's/if (arrayAttr) return arrayAttr.getValue().empty();/if (arrayAttr) return llvm::all_of(arrayAttr.getValue(), [](Attribute elem) { auto inner = dyn_cast<ArrayV1Attr>(elem); return inner \\&\\& inner.getValue().empty(); });/' stablehlo/transforms/VhloToVersion.cpp",
++        ],
+         patch_file = [

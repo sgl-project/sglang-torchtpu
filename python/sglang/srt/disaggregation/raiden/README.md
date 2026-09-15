@@ -27,8 +27,9 @@ prefill announces them, and the decode pulls each piece as soon as the host
 staging pool can seat it, so only the last chunk's transfer is left after the prefill. The
 closing message carries the aux blob and the remaining pages. A request keeps
 one chunk in flight at a time, and pages the decode already holds from its own
-prefix cache are never announced. A hybrid model's sliding-window pages ride on
-the closing read, since the window is only settled when the prefill ends.
+prefix cache are never announced; a decode that already holds every page settles
+the request on the closing message alone. A hybrid model's sliding-window pages
+ride on the closing read, since the window is only settled when the prefill ends.
 
 ## Asymmetric attention TP (strided push-resharding)
 
@@ -94,10 +95,10 @@ speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 | `SGLANG_RAIDEN_MAX_BLOCKS` | `0` (auto) | full-attention max pages/request; auto = `ceil(context_len/page_size)` |
 | `SGLANG_RAIDEN_SWA_MAX_BLOCKS` | `0` (auto) | SWA max pages/request; auto includes one page for an unaligned window start |
 | `SGLANG_RAIDEN_MAX_MODEL_LEN` | `8192` | fallback when `--context-length` is unset |
-| `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer timeout |
+| `SGLANG_RAIDEN_TIMEOUT_S` | `120` | raiden transfer deadline, set the same on prefill and decode: the prefill keeps a read registered for this long after announcing it and then releases its pages; a decode read that waited longer than this for a staging slot is failed instead of pulled |
 | `TPU_RAIDEN_DYNAMIC_HOST_STAGING` | `1` | raiden seats each transfer in its own pages of the pool pinned at startup; resharding stages each plan in its own host blocks instead of shadowing the device KV pool. Setting `0` keeps fixed slots, where every transfer takes a whole max-length slot, and rejects asymmetric resharding, which needs per-transfer staging |
 
-A decode rank issues a pull only while its host staging pool has the pages for it; requests past that stay in the transfer queue, in order, and are retried as pages free, so the pool does not have to hold a max-length transfer per running request. A pull that does not fit waits at the head of the queue, so smaller pulls cannot starve it.
+A decode rank issues a pull only while its host staging pool has the pages for it; requests past that stay in the transfer queue, in order, and are retried as pages free, so the pool does not have to hold a max-length transfer per running request. A pull that does not fit waits at the head of the queue, so smaller pulls cannot starve it. A request that waits in that queue for longer than `SGLANG_RAIDEN_TIMEOUT_S` fails with that reason: its KV is gone from the prefill by then, so the pull is never sent.
 
 ## Launch (one host each, equal TP)
 
