@@ -1602,6 +1602,7 @@ class Envs:
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
 
     # TPU
+    SGLANG_TPU_ASYNC_COPY_WORKER = EnvBool(True)
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)

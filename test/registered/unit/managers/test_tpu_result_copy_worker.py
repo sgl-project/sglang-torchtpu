@@ -1,0 +1,144 @@
+import sys
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from contextlib import contextmanager
+from threading import Event, get_ident
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from sglang.srt.hardware_backend.tpu.result_copy_worker import (
+    TpuAsyncCopyEvent,
+    TPUAsyncCopyWorker,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class DelayedCopyEvent:
+    def __init__(self):
+        self.recorded = Event()
+        self.waiting = Event()
+        self.transferred = Event()
+
+    def record(self):
+        self.recorded.set()
+
+    def synchronize(self):
+        assert self.recorded.is_set(), "consumer waited on an unrecorded event"
+        self.waiting.set()
+        assert self.transferred.wait(timeout=5)
+
+
+def test_consumer_waits_for_submission_and_transfer():
+    event = DelayedCopyEvent()
+    submitted = Future()
+    completion = TpuAsyncCopyEvent(event, submitted)
+    consumer_started = Event()
+
+    def consume():
+        consumer_started.set()
+        completion.synchronize()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        consumer = pool.submit(consume)
+        try:
+            assert consumer_started.wait(timeout=5)
+            with pytest.raises(TimeoutError):
+                consumer.result(timeout=0.05)
+            assert not event.waiting.is_set()
+            completion.record()
+            submitted.set_result(None)
+            assert event.waiting.wait(timeout=5)
+            assert not consumer.done()
+            event.transferred.set()
+            consumer.result(timeout=5)
+        finally:
+            if not submitted.done():
+                submitted.set_exception(RuntimeError("test cleanup"))
+            event.transferred.set()
+
+
+def test_worker_error_reaches_consumer_before_event_wait():
+    event = DelayedCopyEvent()
+    submitted = Future()
+    submitted.set_exception(RuntimeError("copy submission failed"))
+    completion = TpuAsyncCopyEvent(event, submitted)
+
+    with pytest.raises(RuntimeError, match="copy submission failed"):
+        completion.synchronize()
+    assert not event.waiting.is_set()
+
+
+def test_worker_preserves_context_and_serializes_copies(monkeypatch):
+    scheduler_thread = get_ident()
+    private_stream = object()
+    contexts = []
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+
+    @contextmanager
+    def context(kind, value):
+        contexts.append((kind, value))
+        try:
+            yield
+        finally:
+            contexts.pop()
+
+    device_module = SimpleNamespace(
+        current_device=lambda: 3,
+        Stream=Mock(return_value=private_stream),
+        device=lambda value: context("device", value),
+        stream=lambda value: context("stream", value),
+    )
+
+    get_device_module = Mock(return_value=device_module)
+    monkeypatch.setattr(torch, "get_device_module", get_device_module)
+
+    def make_result(first):
+        event = DelayedCopyEvent()
+        event.transferred.set()
+        result = SimpleNamespace(copy_done=event)
+
+        def copy_to_cpu(return_logprob, return_hidden_states):
+            assert get_ident() != scheduler_thread
+            assert torch.is_inference_mode_enabled()
+            assert contexts == [("device", 3), ("stream", private_stream)]
+            assert (return_logprob, return_hidden_states) == (True, False)
+            if first:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            else:
+                second_started.set()
+            result.copy_done.record()
+
+        result.copy_to_cpu = copy_to_cpu
+        return result, event
+
+    first, first_event = make_result(True)
+    second, second_event = make_result(False)
+    worker = TPUAsyncCopyWorker()
+    try:
+        get_device_module.assert_called_once_with("tpu")
+        device_module.Stream.assert_called_once_with(device=3)
+        worker.submit(first, return_logprob=True, return_hidden_states=False)
+        assert first_started.wait(timeout=5)
+        assert not first_event.recorded.is_set()
+        worker.submit(second, return_logprob=True, return_hidden_states=False)
+        assert not second_started.is_set()
+        release_first.set()
+        first.copy_done.synchronize()
+        second.copy_done.synchronize()
+        assert first_event.waiting.is_set()
+        assert second_event.waiting.is_set()
+    finally:
+        release_first.set()
+        worker.close()
+    assert contexts == []
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
