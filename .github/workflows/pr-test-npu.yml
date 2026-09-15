@@ -3,8 +3,10 @@ name: PR Test (NPU)
 on:
   push:
     branches: [ main ]
+  schedule:
+    - cron: '0 12 * * *'  # Run daily at 12:00 UTC
   # Disabled in sglang-torchtpu: TPU PRs should not spawn NPU checks.
-  # NPU CI remains available via push, workflow_dispatch, and workflow_call.
+  # NPU CI remains available via push, schedule, workflow_dispatch, and workflow_call.
   # pull_request:
   workflow_dispatch:
   workflow_call:
@@ -41,11 +43,11 @@ jobs:
       - name: Determine run mode
         id: run-mode
         run: |
-          # Run all tests for workflow_call (when ref input is provided)
+          # Run all tests for scheduled runs and workflow_call (when ref input is provided)
           # Note: github.event_name is inherited from caller, so we detect workflow_call by checking inputs.ref
-          if [[ "${{ inputs.run_all_tests }}" == "true" ]]; then
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ inputs.run_all_tests }}" == "true" ]]; then
             echo "run_all_tests=true" >> $GITHUB_OUTPUT
-            echo "Run mode: ALL TESTS (run_all_tests=${{ inputs.run_all_tests }})"
+            echo "Run mode: ALL TESTS (schedule=${{ github.event_name == 'schedule' }}, run_all_tests=${{ inputs.run_all_tests }})"
           else
             echo "run_all_tests=false" >> $GITHUB_OUTPUT
             echo "Run mode: FILTERED (triggered by ${{ github.event_name }})"
@@ -58,7 +60,9 @@ jobs:
         with:
           filters: |
             main_package:
-              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
+              - "python/sglang/**/!(*.md)"
+              - "!python/sglang/multimodal_gen/**"
+              - "!python/sglang/kernels/ops/diffusion/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/registered/npu/**"
@@ -66,7 +70,7 @@ jobs:
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/kernels/ops/diffusion/triton/npu_fallback.py"
+              - "python/sglang/kernels/ops/diffusion/**"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
