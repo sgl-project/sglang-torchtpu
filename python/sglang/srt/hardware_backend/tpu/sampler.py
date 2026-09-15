@@ -320,7 +320,7 @@ def sample_from_global_top_k_logits(
         )
     global_top_k_probs = torch.softmax(global_top_k_logits / temperatures, dim=-1)
     return sampling_from_probs_torch(
-        global_top_k_probs, sampling_fn=sample_exponential_race
+        global_top_k_probs, unseeded_sampling_fn=sample_exponential_race
     )
 
 
@@ -394,7 +394,7 @@ class TpuSampler(Sampler):
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
-                sampling_fn=sample_exponential_race,
+                unseeded_sampling_fn=sample_exponential_race,
             )
         top_k = sampling_info.uniform_top_k
         needs_top_p_or_min_p = (
@@ -417,7 +417,7 @@ class TpuSampler(Sampler):
                     global_top_k_probs, sampling_info
                 )
             sampled_top_k_position = sampling_from_probs_torch(
-                global_top_k_probs, sampling_fn=sample_exponential_race
+                global_top_k_probs, unseeded_sampling_fn=sample_exponential_race
             )
             return torch.gather(
                 global_top_k_token_ids,
