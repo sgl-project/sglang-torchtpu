@@ -142,7 +142,9 @@ jobs:
           mkdir -p ${test_data_output_path}
           tc_name=${test_case##*/}
           tc_name=${tc_name%.*}
-          metrics_data_path=${test_data_output_path}/${tc_name}
+          # Keep results from different CANN/device images in separate paths.
+          image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
+          metrics_data_path=${test_data_output_path}/${image_label}/${tc_name}
           mkdir -p ${metrics_data_path}
           echo "Metrics file path: ${metrics_data_path}"
 
