@@ -24,7 +24,6 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     CompiledForwardShim,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-    _TEXT_IDS_WARMUP_VARIANT,
     DecoderTpuCompilePolicy,
     Qwen3VLDecoderTpuCompilePolicy,
     _materialize_out,
@@ -999,7 +998,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             num_tokens=8,
             bs=8,
             mode=ForwardMode.DECODE,
-            variant=_TEXT_IDS_WARMUP_VARIANT,
+            variant="text_ids",
         )
 
         self.assertEqual(kwargs, {})
@@ -1272,7 +1271,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         )
         self.assertEqual(
             {call.kwargs["variant"] for call in policy._run_one.call_args_list},
-            {"text_only", _TEXT_IDS_WARMUP_VARIANT},
+            {"text_only", "text_ids"},
         )
 
     def test_qwen3_vl_decode_warms_both_call_conventions(self):
@@ -1303,8 +1302,8 @@ class TestPrecompileLoops(_PolicyTestCase):
             {
                 (64, "text_only"),
                 (128, "text_only"),
-                (64, _TEXT_IDS_WARMUP_VARIANT),
-                (128, _TEXT_IDS_WARMUP_VARIANT),
+                (64, "text_ids"),
+                (128, "text_ids"),
             },
         )
 

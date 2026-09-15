@@ -1207,24 +1207,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         )
 
 
-# A multimodal model still serves text-only requests, and those call the decoder
-# with positional (input_ids, positions, forward_batch) -- not the input_embeds
-# keyword convention the VL warmup uses. Dynamo guards on len(args), so a graph
-# warmed one way can never satisfy a call made the other way. This variant asks
-# the VL policy to warm the positional convention too.
-#
-# TODO(tpu): this is a stopgap for having two calling conventions into one
-# compiled decoder. The structural fix is a single convention -- decode hands the
-# compiled model raw input_ids, and the compile boundary moves to the VL wrapper
-# so the text/image split happens inside the graph (logits processor included,
-# which also puts the DP-attention logits gather in-graph). When that lands,
-# drop this variant and the input_embeds decode warmup; and add a precompile
-# coverage check (one dry call per served convention per bucket, assert a cache
-# hit) so a warmed-vs-served mismatch fails at startup instead of tripping
-# fail_on_recompile mid-serving.
-_TEXT_IDS_WARMUP_VARIANT = "text_ids"
-
-
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
 
@@ -1362,9 +1344,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 f"extend batch cap {self._extend_compile_cap()}."
             )
 
-        # Text-only requests reach the decoder positionally; without this the
-        # only warmed graphs are input_embeds ones no text request can use.
-        variants = (*self._extend_input_variants(), _TEXT_IDS_WARMUP_VARIANT)
+        # "text_ids" warms positional token-ID calls used by text-only serving,
+        # in addition to the input_embeds calls used by multimodal serving.
+        variants = (*self._extend_input_variants(), "text_ids")
 
         compile_items = [
             (num_tokens, bs, mode, variant, logits_output_mode)
@@ -1458,7 +1440,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         compile_items = [
             (bs, variant, logits_output_mode)
             for bs in bs_buckets
-            for variant in ("text_only", _TEXT_IDS_WARMUP_VARIANT)
+            for variant in ("text_only", "text_ids")
             for logits_output_mode in self._warmup_logits_output_modes(bs)
         ]
         logger.info(
@@ -1504,14 +1486,12 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: Any | None = None,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
-        if variant == _TEXT_IDS_WARMUP_VARIANT or not self._uses_input_embeds(
-            self.owner
-        ):
+        if variant == "text_ids" or not self._uses_input_embeds(self.owner):
             return super()._make_warmup_inputs(
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=mode,
-                variant="plain" if variant == _TEXT_IDS_WARMUP_VARIANT else variant,
+                variant="plain" if variant == "text_ids" else variant,
                 capture_hidden_mode=capture_hidden_mode,
                 spec_info=spec_info,
             )
