@@ -51,6 +51,7 @@ from sglang.srt.layers.logprob_processor import (
     get_top_logprobs_raw,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -58,7 +59,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     is_cpu,
