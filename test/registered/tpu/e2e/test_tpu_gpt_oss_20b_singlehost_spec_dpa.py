@@ -1,12 +1,18 @@
 """GPT-OSS-20B EAGLE3 + DP-attention PR gate on one TPU host."""
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 import requests
-
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.server_test_suite import resolve_tpu_model_path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.gpt_oss_120b.server import CONFIG
 
 register_tpu_ci(est_time=1800, suite="stage-b-test-tpu-4-v7")
 
@@ -80,38 +86,39 @@ def spec_dpa_runner(base_url: str):
     }
 
 
-LAUNCH_ENV = {
-    "MODEL": MODEL_PATH,
-    "DRAFT_MODEL": DRAFT_MODEL_PATH,
-    "ISL": "2048",
-    "OSL": "512",
-    "CONCUR": "4",
-    "CONTEXT_LEN": "4096",
-    "MAX_TOTAL_TOKENS": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
-    "TPU_COMPILE_BS": "1 2 4",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "DP_SIZE": str(DP_SIZE),
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm EAGLE3 "
-        f"--speculative-draft-model-path {DRAFT_MODEL_PATH} "
-        "--speculative-num-steps 3 "
-        "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4 "
-        "--tpu-compile-tracer dynamo "
-        "--trust-remote-code"
-    ),
-}
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 4096,
+        "max_running_requests": 4,
+        "torch_compile_max_bs": 4,
+        "chunked_prefill_size": min(max(2048, 2048), 8192),
+        "max_prefill_tokens": min(max(2048, 2048), 8192),
+        "max_total_tokens": 8192,
+        "model_path": MODEL_PATH,
+        "tpu_compile_tokens": [512, 1024, 2048],
+        "tpu_compile_bs": [1, 2, 4],
+        "dp_size": int(DP_SIZE),
+        "reasoning_parser": "gpt-oss",
+        "served_model_name": SERVED_MODEL_NAME,
+        "speculative_algorithm": "EAGLE3",
+        "speculative_draft_model_path": DRAFT_MODEL_PATH,
+        "speculative_num_steps": 3,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 4,
+        "tpu_compile_tracer": "dynamo",
+        "trust_remote_code": True,
+        "enable_dp_attention": True,
+        "enable_dp_lm_head": CONFIG["server_args"]["tp_size"] // (int(DP_SIZE)) > 1,
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-20b-spec-dpa",
     "variant": "TP8+EP8+DP2+EAGLE3",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-20b-spec-dpa-e2e",
     },

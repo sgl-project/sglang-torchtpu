@@ -12,3 +12,15 @@ py_test(
         "//python:sglang",
     ],
 )
+
+py_test(
+    name = "test_tpu_recipe_callers",
+    size = "small",
+    srcs = ["test_tpu_recipe_callers.py"],
+    env = {"TORCH_DEVICE_BACKEND_AUTOLOAD": "0"},
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+    ],
+)

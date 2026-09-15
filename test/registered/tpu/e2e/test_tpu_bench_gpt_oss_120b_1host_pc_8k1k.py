@@ -16,13 +16,12 @@ runs both files against it. All gates live in bench_matrix_base.py.
 import unittest
 
 from bench_matrix_base import build_matrix_test
-
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(est_time=5400, suite="external-nightly-2x2x2", nightly=True)
 
 MULTIHOST_LAUNCH = {
-    "launch_script": "recipe/bench_matrix/gpt_oss_120b_1host_pc.sh",
+    "launch_script": "recipe/bench_matrix/gpt_oss_120b_1host_pc.py",
     "weights": "gpt-oss-120b",
     "timeout_per_file": 8100,
 }

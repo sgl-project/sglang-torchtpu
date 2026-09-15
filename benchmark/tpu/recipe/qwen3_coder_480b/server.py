@@ -1,45 +1,39 @@
-#!/usr/bin/env bash
-# Sample usage: ISL=8192 OSL=1024 CONCUR=64 ./server.sh
-set -uo pipefail
+"""TPU serving configuration. Callers copy CONFIG before overriding it."""
 
-ISL=${ISL:-8192}
-OSL=${OSL:-1024}
-CONCUR=${CONCUR:-64}
-export CONTEXT_LEN=${CONTEXT_LEN:-$((ISL + OSL))}
-# KV pool sized so every in-flight request can hold a full context.
-export MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-$((CONCUR * CONTEXT_LEN))}
-CHUNK=${CHUNK:-$ISL}
+from copy import deepcopy
 
-export MODEL=${MODEL:-Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8}
-export TP_SIZE=8
-export EP_SIZE=8
-export QUANTIZATION=fp8
-export KV_CACHE_DTYPE=fp8_e4m3
-export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_batched}
-export PAGE_SIZE=256
-# The batched RPA kernel needs dynamic SMEM negotiation. Without it the
-# kernel's DMA pipeline serializes and runs much slower.
-export TORCH_TPU_INTERNAL_XLA_OPTIONS="xla_tpu_use_dynamic_smem_negotiation=true${TORCH_TPU_INTERNAL_XLA_OPTIONS:+ $TORCH_TPU_INTERNAL_XLA_OPTIONS}"
-export MEM_FRACTION_STATIC=0.8
-export MAX_RUNNING=$CONCUR
-export CHUNKED_PREFILL_SIZE=$CHUNK
-export MAX_PREFILL_TOKENS=$CHUNK
-export ENABLE_TORCH_COMPILE=1
-export TORCH_COMPILE_MAX_BS=$CONCUR
+from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
 
-# MoE: use dense matmul for small permute and unpermute/combine
-# which can be faster than gather/scatter.
-export SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD=2048
+INPUT_TOKENS = 8192
+OUTPUT_TOKENS = 1024
+CONCURRENCY = 64
+CONTEXT_LENGTH = INPUT_TOKENS + OUTPUT_TOKENS + 0
+PREFILL_TOKENS = INPUT_TOKENS
 
-extra_args=(
-  --tpu-compile-tracer direct
-  --tpu-fp8-runtime channelwise
-  --sampling-defaults openai
-  # Fuse the per-head q/k RMSNorms and the rotary embedding into one Pallas op
-  # which is faster than a series of separate ops.
-  --enable-fused-qk-norm-rope
+CONFIG = deepcopy(_FP8_BASE_CONFIG)
+CONFIG["server_args"].update(
+    {
+        "model_path": "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        "max_running_requests": CONCURRENCY,
+        "torch_compile_max_bs": CONCURRENCY,
+        "tp_size": 8,
+        "ep_size": 8,
+        "attention_backend": "pallas_tpu_rpa_batched",
+        "page_size": 256,
+        "mem_fraction_static": 0.8,
+        "context_length": CONTEXT_LENGTH,
+        "max_total_tokens": 1 * CONCURRENCY * CONTEXT_LENGTH,
+        "chunked_prefill_size": PREFILL_TOKENS,
+        "max_prefill_tokens": PREFILL_TOKENS,
+        "tpu_compile_tracer": "direct",
+        "tpu_fp8_runtime": "channelwise",
+        "sampling_defaults": "openai",
+        "enable_fused_qk_norm_rope": True,
+    }
 )
-export EXTRA_ARGS="${extra_args[*]}${EXTRA_ARGS:+ $EXTRA_ARGS}"
-
-cd "$(dirname "$0")/../.."
-exec ./launch_server.sh "$@"
+CONFIG["runtime_env"].update(
+    {
+        "SGLANG_TPU_FUSED_MOE_PERMUTE_DENSE_THRESHOLD": "2048",
+        "TORCH_TPU_INTERNAL_XLA_OPTIONS": "xla_tpu_use_dynamic_smem_negotiation=true",
+    }
+)

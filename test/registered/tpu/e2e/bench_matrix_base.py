@@ -17,11 +17,11 @@ Consumers:
   * the benchmark matrix cells (test_tpu_bench_*: GPT-OSS-120B /
     Qwen3-Coder-480B across serving recipes and workloads) via
     build_matrix_test(); their sweep harness is
-    benchmark/tpu/recipe/bench_matrix/run_sweep.sh, and two files sharing a
+    benchmark/tpu/recipe/bench_matrix/run_sweep.py, and two files sharing a
     (suite, launch_script, weights) triple share one server;
   * test_tpu_qwen3_coder_480b_multihost_agentic (the 480B nightly) via
     build_bench_test() over its own harness
-    (recipe/qwen3_coder_480b/nightly/run_nightly.sh).
+    (recipe/qwen3_coder_480b/nightly/run_nightly.py).
 
 WHAT IS ASSERTED, and what is not: throughput is *recorded*, never gated
 (the TPU slice is shared, so a tok/s floor would be a flake generator, and
@@ -39,12 +39,12 @@ is trustworthy at all:
 import json
 import os
 import subprocess
+import sys
 import time
 import unittest
 import urllib.request
 
 import requests
-
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, CustomTestCase, dump_metric
 from sglang.test.tpu import emit_result_payload
@@ -61,7 +61,7 @@ register_tpu_ci(
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, *[".."] * 4))
 MATRIX_SWEEP_SCRIPT = os.path.join(
-    REPO_ROOT, "benchmark", "tpu", "recipe", "bench_matrix", "run_sweep.sh"
+    REPO_ROOT, "benchmark", "tpu", "recipe", "bench_matrix", "run_sweep.py"
 )
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)
@@ -211,7 +211,7 @@ def _matrix_spec_metrics_url(bench_recipe: str, base_url: str) -> str:
     one server is the decode.
     """
     if bench_recipe.startswith("pd_"):
-        # Engine leaders follow PHYSICAL host order (serve_group.sh's
+        # Engine leaders follow PHYSICAL host order (serve_group.py's
         # rendezvous writes the map on this pod), not pod-index order.
         try:
             with open("/tmp/bench_matrix_phys_hosts") as f:
@@ -356,8 +356,12 @@ def build_bench_test(
                 flush=True,
             )
             proc = subprocess.run(
-                ["bash", sweep_script],
-                cwd=os.path.dirname(sweep_script),
+                [
+                    sys.executable,
+                    "-m",
+                    os.path.relpath(sweep_script, REPO_ROOT)[:-3].replace(os.sep, "."),
+                ],
+                cwd=REPO_ROOT,
                 env=env,
                 timeout=sweep_timeout,
             )

@@ -44,7 +44,6 @@ import os
 import unittest
 
 import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -291,7 +290,7 @@ class TestTpuQwen306bSinglehostSwaPrefixCache(TestTpuQwen306bSinglehostPrefixCac
     MEM_FRACTION_STATIC = 0.6
     # Experts go EP, not TP (MXFP4 block / MXU tile alignment), and only
     # pallas_tpu_rpa_v3 implements the attention sinks GPT-OSS needs. Both per
-    # benchmark/tpu/recipe/gpt_oss_120b/server.sh.
+    # benchmark/tpu/recipe/gpt_oss_120b/server.py.
     EXTRA_ENGINE_KWARGS = {
         "swa_full_tokens_ratio": SWA_RATIO,
         "ep_size": 8,

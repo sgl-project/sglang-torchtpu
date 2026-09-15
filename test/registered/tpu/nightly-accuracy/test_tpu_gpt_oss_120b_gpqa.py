@@ -1,11 +1,13 @@
 """GPT-OSS 120B TPU GPQA Diamond nightly score."""
 
+from copy import deepcopy
+
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import gpqa_openai_runner, model_config_main
 from sglang.test.tpu.gpt_oss_120b_eval_common import (
     BASE_URL,
+    CONFIG,
     SERVED_MODEL_NAME,
-    make_launch_env,
     make_model_config,
 )
 
@@ -18,12 +20,15 @@ register_tpu_ci(
 
 MAX_TOKENS = 65536
 
-LAUNCH_ENV = make_launch_env(
-    MAX_TOTAL_TOKENS="1114112",
-    OSL=str(MAX_TOKENS),
-    CONCUR="16",
-    CONTEXT_LEN="69632",
-    TPU_COMPILE_BS="1 2 4 8 16",
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "max_running_requests": 16,
+        "torch_compile_max_bs": 16,
+        "context_length": 69632,
+        "max_total_tokens": 1114112,
+        "tpu_compile_bs": [1, 2, 4, 8, 16],
+    }
 )
 
 GATE = {
@@ -44,7 +49,7 @@ MODEL_CONFIG = make_model_config(
     test_name="gpt-oss-120b-gpqa",
     series_id="accuracy-gpt-oss-120b-gpqa",
     tag="gpqa-e2e",
-    launch_env=LAUNCH_ENV,
+    launch_config=LAUNCH_CONFIG,
     gate=GATE,
 )
 

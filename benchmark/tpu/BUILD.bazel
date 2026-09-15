@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:public"])
 # Expose Python recipe configs to Bazel's hermetic Python interpreter.
 py_library(
     name = "python_configs",
-    srcs = glob(["recipe/configs/*.py"]),
+    srcs = glob(["recipe/**/*.py"]),
     imports = ["../.."],
 )
 
