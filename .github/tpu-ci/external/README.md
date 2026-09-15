@@ -62,7 +62,7 @@ launch/rank-0 run model, and the image are the same too. `tp = hosts × 8` (tpu7
 
    ```python
    MULTIHOST_LAUNCH = {
-       "launch_script": "recipe/qwen3_coder_30b_a3b_fp8.sh",  # relative to benchmark/tpu/
+       "launch_script": "recipe/qwen3_coder_30b_a3b_fp8.py",  # relative to benchmark/tpu/
        "weights": "Qwen3-Coder-30B-A3B-Instruct-FP8",         # subdir under weights/
        # "extra_args": "...",   # optional; overrides weights.default_extra_args
    }

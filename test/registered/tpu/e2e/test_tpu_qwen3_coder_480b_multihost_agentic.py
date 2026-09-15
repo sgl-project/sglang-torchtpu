@@ -1,7 +1,7 @@
 """Qwen3-Coder-480B-A35B-Instruct-FP8 multi-turn agentic serving benchmark
 (live-server mode), the colocated half of the team's standard 480B contract.
 
-Its MULTIHOST_LAUNCH forms its own launch group: recipe/qwen3_coder_480b_agentic_mh.sh
+Its MULTIHOST_LAUNCH forms its own launch group: recipe/qwen3_coder_480b_agentic_mh.py
 on 2 hosts, i.e. tp=16 / ep=16 / dp=2 -> attention_tp=8, prefix caching + HiCache
 KV offload on, 1M server context. The CI runs this file on rank-0 against the
 server the JobSet brought up; it skips unless a live server is provided. DP size
@@ -24,7 +24,6 @@ import os
 import unittest
 
 from bench_matrix_base import build_bench_test
-
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
@@ -37,7 +36,7 @@ register_tpu_ci(
 # Own launch group: the 480B agentic recipe + the shared ROX weights volume.
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/qwen3_coder_480b_agentic_mh.sh",
+    "launch_script": "recipe/qwen3_coder_480b_agentic_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 

@@ -84,7 +84,7 @@ The model+config is **not** bound to a suite — each multi-host test file decla
 own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
-MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
+MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.py",
                     "weights_pvc": "model-weights-rox"}   # weights_pvc optional
 ```
 

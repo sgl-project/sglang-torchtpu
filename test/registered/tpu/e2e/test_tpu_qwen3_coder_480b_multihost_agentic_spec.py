@@ -2,7 +2,7 @@
 
 This is the speculative-decoding counterpart to
 test_tpu_qwen3_coder_480b_multihost_agentic.py. Its MULTIHOST_LAUNCH forms a
-separate two-host launch group using recipe/qwen3_coder_480b_agentic_spec_mh.sh:
+separate two-host launch group using recipe/qwen3_coder_480b_agentic_spec_mh.py:
 tp=16 / ep=16 / dp=2 -> attention_tp=8, EAGLE3 speculative decoding, prefix
 caching + HiCache KV offload, and a 1M server context.
 
@@ -21,7 +21,6 @@ import os
 import unittest
 
 from bench_matrix_base import build_bench_test
-
 from sglang.test.ci.ci_register import register_tpu_ci
 
 register_tpu_ci(
@@ -33,7 +32,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/qwen3_coder_480b_agentic_spec_mh.sh",
+    "launch_script": "recipe/qwen3_coder_480b_agentic_spec_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 
