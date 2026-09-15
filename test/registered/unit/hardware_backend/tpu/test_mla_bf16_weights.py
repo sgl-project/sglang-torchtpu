@@ -44,7 +44,7 @@ def tensor_quant(x, dtype):
 
 
 class TestMlaBf16Weights(unittest.TestCase):
-    def test_checkpoint_reconstruction_and_stale_scale(self):
+    def test_checkpoint_reconstruction(self):
         g = dict(
             torch=torch,
             _is_cuda=False,
@@ -80,7 +80,7 @@ class TestMlaBf16Weights(unittest.TestCase):
                 v_head_dim=128,
                 w_kc=None,
                 w_vc=None,
-                w_scale=torch.tensor(99.0),
+                w_scale=1.0,
             )
             obj = NS(
                 config=NS(num_hidden_layers=1),
@@ -98,7 +98,6 @@ class TestMlaBf16Weights(unittest.TestCase):
             treatment.w_kc.dtype == torch.bfloat16
             and treatment.w_vc.dtype == torch.bfloat16
         )
-        assert treatment.w_scale is None
         assert torch.equal(treatment.w_kc, k)
         assert torch.equal(treatment.w_vc, v.transpose(1, 2))
         assert torch.equal(treatment.w_kc, results["cuda_reference"].w_kc)

@@ -46,17 +46,17 @@ class TestFp32MoeScales(unittest.TestCase):
                 expected = partial.astype(dtype) * lhs.astype(dtype)
                 if weight_scale is not None:
                     expected = expected * weight_scale.astype(dtype)
-                got = scale(partial, lhs, weight_scale, fp32_scales=precise)
+                got = scale(partial, lhs, weight_scale, scales_dtype=dtype)
                 self.assertEqual(got.dtype, partial.dtype)
                 np.testing.assert_array_equal(got, expected.astype(partial.dtype))
         self.assertTrue(
             np.any(
-                np.asarray(scale(partial, lhs, rhs, fp32_scales=True))
-                != np.asarray(scale(partial, lhs, rhs, fp32_scales=False))
+                np.asarray(scale(partial, lhs, rhs, scales_dtype=jnp.float32))
+                != np.asarray(scale(partial, lhs, rhs, scales_dtype=jnp.bfloat16))
             )
         )
         zeros = scale(
-            jnp.zeros_like(partial), jnp.zeros_like(lhs), rhs, fp32_scales=True
+            jnp.zeros_like(partial), jnp.zeros_like(lhs), rhs, scales_dtype=jnp.float32
         )
         np.testing.assert_array_equal(zeros, np.zeros(partial.shape))
 

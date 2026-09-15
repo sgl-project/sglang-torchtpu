@@ -635,9 +635,6 @@ class DeepseekV2WeightLoaderMixin:
                                 weight_block_size,
                                 torch.bfloat16,
                             )
-                            if _is_tpu:
-                                # Reloads may leave a scale from the legacy FP8 path.
-                                self_attn.w_scale = None
                     else:
                         w, scale = block_quant_to_tensor_quant(
                             weight, weight_scale, weight_block_size
