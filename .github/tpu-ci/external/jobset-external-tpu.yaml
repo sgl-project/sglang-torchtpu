@@ -108,7 +108,10 @@ spec:
                       # to the test, not the job.
                       echo "== test files: ${TEST_FILES} =="
                       ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
-                          bash "benchmark/tpu/${LAUNCH_SCRIPT}" ) > >(tee /tmp/server.log) 2>&1 &
+                          ; case "${LAUNCH_SCRIPT}" in \
+                            *.py) python3 -m benchmark.tpu.recipe.bench_matrix.serve_group --config "${LAUNCH_SCRIPT}" ;; \
+                            *) bash "benchmark/tpu/${LAUNCH_SCRIPT}" ;; \
+                          esac ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!
                       if [ "$RANK" = "0" ]; then
                         ok=0
