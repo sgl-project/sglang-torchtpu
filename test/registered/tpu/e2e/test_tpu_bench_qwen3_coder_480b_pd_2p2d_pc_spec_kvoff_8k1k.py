@@ -30,7 +30,7 @@ register_tpu_ci(
 )
 
 MULTIHOST_LAUNCH = {
-    "launch_script": "recipe/bench_matrix/qwen3_coder_480b_pd_2p2d_pc_spec_kvoff.sh",
+    "launch_script": "recipe/configs/bench_matrix/qwen3_coder_480b_pd_2p2d_pc_spec_kvoff.py",
     "weights": "Qwen3-Coder-480B-A35B-Instruct-FP8",
     "timeout_per_file": 8100,
 }

@@ -25,7 +25,7 @@ from sglang.test.ci.ci_register import register_tpu_ci
 register_tpu_ci(est_time=5400, suite="external-nightly-2x2x2", nightly=True)
 
 MULTIHOST_LAUNCH = {
-    "launch_script": "recipe/bench_matrix/gpt_oss_120b_1host_pc_spec_kvoff.sh",
+    "launch_script": "recipe/configs/bench_matrix/gpt_oss_120b_1host_pc_spec_kvoff.py",
     "weights": "gpt-oss-120b",
     "timeout_per_file": 8100,
 }

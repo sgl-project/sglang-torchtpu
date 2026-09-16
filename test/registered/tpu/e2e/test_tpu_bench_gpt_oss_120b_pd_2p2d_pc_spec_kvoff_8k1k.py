@@ -30,7 +30,7 @@ register_tpu_ci(
 )
 
 MULTIHOST_LAUNCH = {
-    "launch_script": "recipe/bench_matrix/gpt_oss_120b_pd_2p2d_pc_spec_kvoff.sh",
+    "launch_script": "recipe/configs/bench_matrix/gpt_oss_120b_pd_2p2d_pc_spec_kvoff.py",
     "weights": "gpt-oss-120b",
     "timeout_per_file": 8100,
 }

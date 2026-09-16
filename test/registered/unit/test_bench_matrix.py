@@ -2,7 +2,7 @@
 
 The matrix is stitched together by convention across three places -- the
 test files' MULTIHOST_LAUNCH dicts (AST-scanned), the launch wrappers under
-benchmark/tpu/recipe/bench_matrix/, and config.sh's (model, recipe,
+benchmark/tpu/recipe/bench_matrix/, and config.py's (model, recipe,
 workload) axes -- and nothing else in CI checks the stitching without a TPU
 slice. Each case here answers "someone extended X without updating Y":
 
@@ -13,7 +13,7 @@ slice. Each case here answers "someone extended X without updating Y":
     two full bring-ups;
   * a recipe registering against the wrong slice shape (a pd cell on the
     2-host suite) only fails at engine rendezvous, an hour into the run;
-  * config.sh losing a sweep axis (concurrency {1,16,32}; long requests
+  * config.py losing a sweep axis (concurrency {1,16,32}; long requests
     {1,2,4} for agentic, none for 8k1k) would keep every downstream gate
     green while measuring a smaller matrix.
 """
@@ -22,7 +22,6 @@ import ast
 import glob
 import importlib.util
 import os
-import subprocess
 import sys
 import unittest
 
@@ -39,6 +38,11 @@ BENCH_MATRIX = os.path.join(REPO, "benchmark", "tpu", "recipe", "bench_matrix")
 # checks every place that must agree with them.
 sys.path.insert(0, E2E)
 import bench_matrix_base as bench_base  # noqa: E402
+
+from benchmark.tpu.recipe.bench_matrix.bench_leg import (
+    selected_recipe,
+    workload_settings,
+)
 
 MODELS = ("gpt_oss_120b", "qwen3_coder_480b")
 RECIPES = {
@@ -186,42 +190,32 @@ class TestBenchMatrix(CustomTestCase):
         )
 
     def test_config_resolves_the_sweep_grid(self):
-        """config.sh must keep the CI grid: concurrency {1,16,32}, long
+        """config.py must keep the CI grid: concurrency {1,16,32}, long
         requests {1,2,4} for agentic and none for 8k1k, for every
         (model, recipe)."""
         expected_long = {"agentic": "1 2 4", "8k1k": "0"}
         for model in MODELS:
             for recipe in RECIPES:
                 for workload in WORKLOADS:
-                    out = subprocess.run(
-                        [
-                            "bash",
-                            "-c",
-                            'source ./config.sh && echo "BS=$SWEEP_BS|LONG=$SWEEP_LONG"',
-                        ],
-                        cwd=BENCH_MATRIX,
-                        env={
-                            **os.environ,
-                            "BENCH_MODEL": model,
-                            "BENCH_RECIPE": recipe,
-                            "WORKLOAD": workload,
-                            "PROFILE": "ci",
-                        },
-                        capture_output=True,
-                        text=True,
-                    )
+                    env = {
+                        "BENCH_MODEL": model,
+                        "BENCH_RECIPE": recipe,
+                        "WORKLOAD": workload,
+                        "PROFILE": "ci",
+                    }
+                    module = selected_recipe(env)
+                    settings = workload_settings(module.BENCHMARK, env)
+                    self.assertEqual(settings["sweep_bs"], [1, 16, 32])
                     self.assertEqual(
-                        out.returncode, 0, f"{model}/{recipe}/{workload}: {out.stderr}"
-                    )
-                    self.assertIn(
-                        f"BS=1 16 32|LONG={expected_long[workload]}", out.stdout
+                        settings["sweep_long"],
+                        [int(v) for v in expected_long[workload].split()],
                     )
 
     def test_reused_nightly_tools_exist(self):
-        """config.sh reaches into recipe/qwen3_coder_480b/nightly/ for the
+        """config.py reaches into recipe/qwen3_coder_480b/nightly/ for the
         trace generator, metrics probe, and summarizer instead of copying
         them. A rename there would otherwise surface as failed:trace-gen legs
-        an hour into a TPU run -- the one self-location coupling in config.sh
+        an hour into a TPU run -- the one self-location coupling in config.py
         whose failure is not loud at source time."""
         nightly = os.path.join(
             REPO, "benchmark", "tpu", "recipe", "qwen3_coder_480b", "nightly"
@@ -230,13 +224,13 @@ class TestBenchMatrix(CustomTestCase):
             self.assertTrue(
                 os.path.isfile(os.path.join(nightly, tool)),
                 f"{tool} moved out of {nightly}; update NIGHTLY_TOOLS_DIR in "
-                "benchmark/tpu/recipe/bench_matrix/config.sh",
+                "benchmark/tpu/recipe/configs/bench_matrix/config.py",
             )
 
     def test_time_budget_chain(self):
-        """The chain from config.sh: worst-case sweep <= SWEEP_TIMEOUT <
+        """The chain from config.py: worst-case sweep <= SWEEP_TIMEOUT <
         TIMEOUT_PER_FILE. Its links live in three files (test literals, the
-        base's constants, config.sh's profile) that nothing else cross-checks;
+        base's constants, config.py's profile) that nothing else cross-checks;
         this is what turns "we changed one number" into a red test instead of
         a silently truncated benchmark."""
         # Every cell's literal must equal the base's budget constant.
@@ -253,33 +247,20 @@ class TestBenchMatrix(CustomTestCase):
             bench_base.SWEEP_TIMEOUT_DEFAULT + bench_base.HEALTH_RECHECK_BUDGET,
             bench_base.TIMEOUT_PER_FILE_BUDGET,
         )
-        # config.sh's ci profile: attempted legs x leg cap must fit the sweep
+        # config.py's ci profile: attempted legs x leg cap must fit the sweep
         # budget (legs with long > bs are skipped and cost nothing).
-        out = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'source ./config.sh && echo "$SWEEP_BS|$SWEEP_LONG|$MAX_LEG_SECONDS"',
-            ],
-            cwd=BENCH_MATRIX,
-            env={
-                **os.environ,
-                "BENCH_MODEL": "gpt_oss_120b",
-                "BENCH_RECIPE": "1host_pc_spec_kvoff",
-                "WORKLOAD": "agentic",
-                "PROFILE": "ci",
-            },
-            capture_output=True,
-            text=True,
+        settings = workload_settings(
+            selected_recipe(
+                {"BENCH_MODEL": "gpt_oss_120b", "BENCH_RECIPE": "1host_pc"}
+            ).BENCHMARK,
+            {"PROFILE": "ci"},
         )
-        self.assertEqual(out.returncode, 0, out.stderr)
-        bs_axis, long_axis, leg_cap = out.stdout.strip().split("|")
-        attempted = [
-            (b, l)
-            for b in map(int, bs_axis.split())
-            for l in map(int, long_axis.split())
-            if l <= b
-        ]
+        bs_axis, long_axis, leg_cap = (
+            settings["sweep_bs"],
+            settings["sweep_long"],
+            settings["max_leg_seconds"],
+        )
+        attempted = [(b, l) for b in bs_axis for l in long_axis if l <= b]
         worst_case = len(attempted) * int(leg_cap)
         self.assertLessEqual(
             worst_case,
