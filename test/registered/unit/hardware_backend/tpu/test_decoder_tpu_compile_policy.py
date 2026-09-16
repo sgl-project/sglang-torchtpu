@@ -987,7 +987,9 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
             model.get_image_feature = lambda *args, **kwargs: None
         return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
 
-    def test_rejects_dp_attention_at_multimodal_install(self):
+    def test_allows_dp_attention_at_multimodal_install(self):
+        # Image steps run the padded input_embeds variant on every rank, so
+        # multimodal serving under DP attention installs (and says so).
         policy = self._policy_for(multimodal=True)
 
         with (
@@ -996,11 +998,18 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
                 "is_dp_attention_enabled",
                 return_value=True,
             ),
-            self.assertRaisesRegex(
-                NotImplementedError, "does not support DP attention"
-            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
+            self.assertLogs(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy",
+                level="INFO",
+            ) as logs,
         ):
-            policy.install()
+            self.assertTrue(policy.install())
+
+        base_install.assert_called_once()
+        self.assertTrue(any("DP attention with multimodal" in m for m in logs.output))
 
     def test_allows_dp_attention_at_text_only_install(self):
         # This policy is also attached to the text-only backbone, where none of
