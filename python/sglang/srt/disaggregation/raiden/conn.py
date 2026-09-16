@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import errno
 import logging
 import math
 import os
@@ -83,6 +84,30 @@ logger = logging.getLogger(__name__)
 # announcing every prefill step would spend more on rendezvous than it hides;
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
+
+# Send errors whose cause belongs to one peer, so they cost that peer's room
+# rather than the engine. Membership is an allow-list on purpose: an errno that
+# is not listed here is assumed to be engine-wide (ETERM, ENOMEM, ENOTSOCK,
+# EFAULT, ...) and is re-raised so the scheduler still dies loudly. Widening
+# this set means asserting that the new errno is attributable to a single peer.
+ROOM_SCOPED_SEND_ERRNOS = frozenset(
+    {
+        # The peer stopped draining and its queue filled, or SNDTIMEO expired
+        # waiting for it. A property of that peer, not of this rank.
+        zmq.EAGAIN,
+        # The peer is unreachable.
+        errno.EHOSTUNREACH,
+        # The endpoint is built from _decode_addr[room], which the decode
+        # supplied in its own PULL_REQ. A malformed address is untrusted input
+        # from one peer; crashing every rank over it hands any decode a remote
+        # kill switch.
+        errno.EINVAL,
+        # A signal interrupted the send. Transient and not engine-fatal; a
+        # retry would be better than failing the room, but failing one room is
+        # still far better than taking down the engine.
+        errno.EINTR,
+    }
+)
 
 # Base of the per-rank control ports (`base + 4*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
@@ -1127,7 +1152,38 @@ class RaidenKVManager(CommonKVManager):
                 endpoint=self.raiden_endpoint or "",
             ).to_frames()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
-            self._send_multipart_locked(endpoint, payload)
+            try:
+                self._send_multipart_locked(endpoint, payload)
+            except zmq.ZMQError as exc:
+                # Same contract as the closing reply in _maybe_reply: a
+                # rendezvous frame this rank cannot deliver fails its own
+                # room. Without this the error reaches the scheduler's
+                # top-level handler, which SIGQUITs the whole engine for what
+                # is a single room's transport failure.
+                #
+                # Only peer-attributable errnos are absorbed; anything else is
+                # engine-wide and must still reach that handler. See
+                # ROOM_SCOPED_SEND_ERRNOS.
+                if exc.errno not in ROOM_SCOPED_SEND_ERRNOS:
+                    raise
+                # record_failure only stores the reason; without this log an
+                # absorbed failure leaves no trace for an operator to find.
+                logger.error(
+                    "RaidenKVManager rank%d room %s: CHUNK announce to %s "
+                    "failed (errno %s), failing the room: %s",
+                    self.attn_tp_rank,
+                    room,
+                    endpoint,
+                    exc.errno,
+                    exc,
+                )
+                with self._state_lock:
+                    if room not in self._aborted:
+                        self._mark_aborted_locked(room)
+                        self._fail_room_locked(
+                            room, f"CHUNK announce to {endpoint} failed: {exc}"
+                        )
+                        self.update_status(room, KVPoll.Failed)
 
     def finalize_send(self, room: int, aux_index: Optional[int]) -> bool:
         """Announce the room's blocks to the decode. False if the room was aborted.
