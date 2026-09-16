@@ -109,7 +109,8 @@ spec:
                       echo "== test files: ${TEST_FILES} =="
                       ( HOST=127.0.0.1 PORT=30000 ENABLE_PROFILER_ENDPOINT=0 ENABLE_COMPILE_CACHE=0 \
                           ; case "${LAUNCH_SCRIPT}" in \
-                            *.py) python3 -m benchmark.tpu.recipe.bench_matrix.serve_group --config "${LAUNCH_SCRIPT}" ;; \
+                            *.py) python3 -m benchmark.tpu.recipe.bench_matrix.serve_group \
+                                --config "benchmark.tpu.$(echo "${LAUNCH_SCRIPT%.py}" | tr '/' '.')" ;; \
                             *) bash "benchmark/tpu/${LAUNCH_SCRIPT}" ;; \
                           esac ) > >(tee /tmp/server.log) 2>&1 &
                       spid=$!

@@ -32,14 +32,11 @@ SLICE_ENV = (
 )
 
 
-def load_recipe(name):
-    """Import a config selected by a CI matrix row, relative to benchmark/tpu."""
-    name = name.removesuffix(".py").replace("/", ".")
-    if name.startswith("recipe."):
-        name = "benchmark.tpu." + name
-    if not name.startswith("benchmark.tpu.recipe."):
+def load_recipe(module_name):
+    """Import a config module under benchmark.tpu.recipe."""
+    if not module_name.startswith("benchmark.tpu.recipe."):
         raise ValueError("Expected a module under benchmark.tpu.recipe")
-    return importlib.import_module(name)
+    return importlib.import_module(module_name)
 
 
 def wait_healthy(url, timeout, process=None, interval=10):
@@ -254,7 +251,9 @@ def serve(module, inherited=None, dry_run=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", required=True, help="Importable recipe module or recipe/name.py"
+        "--config",
+        required=True,
+        help="Importable recipe module, e.g. benchmark.tpu.recipe.qwen3_30b_a3b_fp8_mh",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
