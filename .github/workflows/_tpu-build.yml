@@ -71,13 +71,25 @@ jobs:
           src="${RUNNER_TEMP}/source.tgz"
           tar --exclude=./.git -czf "$src" -C "$GITHUB_WORKSPACE" .
 
-          base_exists=0
-          if gcloud artifacts docker images describe "${AR_BASE_IMAGE}:${base_tag}" \
-              --project "$GCP_PROJECT" --access-token-file="$tokfile" >/dev/null 2>&1; then
+          # Keep stderr. Discarding it makes a permission or quota-project error
+          # indistinguishable from a cache miss, and the ~20 min rebuild that
+          # follows looks like normal operation -- which is how this check came
+          # to miss on every run while reporting nothing.
+          if probe=$(gcloud artifacts docker images describe "${AR_BASE_IMAGE}:${base_tag}" \
+              --project "$GCP_PROJECT" --access-token-file="$tokfile" 2>&1); then
             echo "Base image ${AR_BASE_IMAGE}:${base_tag} already exists; reusing."
-            base_exists=1
           else
-            echo "Base image ${AR_BASE_IMAGE}:${base_tag} not found; building base image on Cloud Build."
+            case "$probe" in
+              *NOT_FOUND*|*"not found"*|*"was not found"*)
+                echo "Base image ${AR_BASE_IMAGE}:${base_tag} not found; building base image on Cloud Build."
+                ;;
+              *)
+                # Flattened: a ::warning:: annotation keeps only its first line,
+                # and the gcloud error is the whole point of emitting one.
+                echo "::warning::Base image existence check failed, so the base is being"\
+                  "rebuilt even though it may already exist. gcloud said: ${probe//$'\n'/ }"
+                ;;
+            esac
             base_object="source/base-${base_tag}-${{ github.run_id }}.tgz"
             gcloud storage cp "$src" "gs://${bucket}/${base_object}" --project "$GCP_PROJECT" \
               --access-token-file="$tokfile"
