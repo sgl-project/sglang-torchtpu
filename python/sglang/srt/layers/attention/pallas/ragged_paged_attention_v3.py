@@ -1593,15 +1593,18 @@ def get_default_block_sizes(
     bkv_csz = align_to(bkv_csz, bkv_alignment)
 
     # Reduce block sizes while the VMEM estimate exceeds the budget: 60% of
-    # the limit for prefill and mixed, 30% for decode. The estimate tracks the
-    # compiler's VMEM use to within a few percent on the shapes measured, so
-    # the budget is margin for shapes it has not been checked against. On
+    # the limit for prefill and mixed, 15% for decode, which keeps the decode
+    # KV block where it settled with half the capacity as the limit (on tpu7x
+    # a 16,384-row block ran 14% slower per token than 8,192 rows at 4K
+    # context with 32 concurrent requests). The estimate tracks the compiler's
+    # VMEM use to within a few percent on the shapes measured, so the budget
+    # is margin for shapes it has not been checked against. On
     # tpu7x with the whole 64 MiB as the limit this settles at 128-row query
     # blocks for 4 KV heads of 8 query heads each with fp8 KV (256 rows
     # compile there but run no faster) and at 64 rows for 8 KV heads with
     # bf16 KV (128 rows compile and run no faster).
     if vmem_limit_bytes is not None:
-        _budget_frac = 0.30 if case == RpaCase.DECODE else 0.60
+        _budget_frac = 0.15 if case == RpaCase.DECODE else 0.60
         vmem_budget = int(vmem_limit_bytes * _budget_frac)
         while bq_sz > 1 or bkv_sz > bkv_alignment:
             vmem_est = get_vmem_estimate_bytes(

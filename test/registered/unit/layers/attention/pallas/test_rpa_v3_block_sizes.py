@@ -84,5 +84,40 @@ class TestTpu7xPrefillBlocks(CustomTestCase):
         self.assertEqual((blocks["bq_sz"], blocks["bkv_sz"]), (64, 2048))
 
 
+def _decode_block_sizes(*, num_q_heads, num_kv_heads, head_dim, kv_dtype, vmem_limit):
+    """Decode-case blocks for a 32k-context batch at page 128."""
+    with mock.patch.object(rpa, "get_tpu_version", return_value=7):
+        return rpa.get_default_block_sizes(
+            jnp.bfloat16,
+            kv_dtype,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            128,
+            256,
+            256,
+            258,
+            case=rpa.RpaCase.DECODE,
+            vmem_limit_bytes=vmem_limit,
+        )
+
+
+class TestTpu7xDecodeBlocks(CustomTestCase):
+    def test_qwen3_30b_tp8_decode_keeps_8192_kv_rows_per_block(self):
+        """One KV head of 4 query heads per core with fp8 KV and the whole
+        64 MiB as the limit: the decode KV block stays at 8,192 rows, where it
+        settled with half the capacity as the limit. Measured on tpu7x at 4K
+        context with 32 concurrent requests: 16,384 rows run 14% slower per
+        token."""
+        blocks = _decode_block_sizes(
+            num_q_heads=4,
+            num_kv_heads=1,
+            head_dim=128,
+            kv_dtype=jnp.float8_e4m3fn,
+            vmem_limit=TPU7X_VMEM,
+        )
+        self.assertEqual((blocks["bq_sz"], blocks["bkv_sz"]), (1, 8192))
+
+
 if __name__ == "__main__":
     unittest.main()
