@@ -15,7 +15,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/gpt_120b_spec_mh.sh",
+    "launch_script": "recipe/configs/gpt_120b_spec_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 

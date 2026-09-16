@@ -19,7 +19,7 @@ register_tpu_ci(
 # Own launch group: 30B-A3B-FP8 MoE recipe + the ROX weights volume.
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
+    "launch_script": "recipe/configs/qwen3_30b_a3b_fp8_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 

@@ -1,6 +1,6 @@
 """DeepSeek-R1-0528 (671B MoE, fp8) multi-host e2e accuracy: GPQA, AIME25, MMLU.
 
-The JobSet launches the server (recipe/deepseek_r1_0528_mh.sh, 2 hosts, tp=16);
+The JobSet launches the server (recipe/configs/deepseek_r1_0528_mh.py, 2 hosts, tp=16);
 this file attaches to it — the same launch group as the GSM8K gate, so the two
 files share one bring-up. Each dataset runs twice (repeat=2, scores averaged)
 under the R1 card protocol (temperature 0.6, top_p 0.95, 32768-token budget).
@@ -36,7 +36,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/deepseek_r1_0528_mh.sh",
+    "launch_script": "recipe/configs/deepseek_r1_0528_mh.py",
     "weights_pvc": "model-weights-rox",
     "timeout_per_file": 10800,
 }

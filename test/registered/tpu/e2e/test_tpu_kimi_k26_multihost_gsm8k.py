@@ -1,6 +1,6 @@
 """Kimi-K2.6 (1T MoE, int4 W4A16, MoonViT VL) multi-host e2e accuracy: GSM8K.
 
-The JobSet launches the server (recipe/kimi_k26_mh.sh, 2 hosts, tp=16); this file
+The JobSet launches the server (recipe/configs/kimi_k26_mh.py, 2 hosts, tp=16); this file
 attaches to it and scores one gate:
 
   GSM8K  0.930  run_eval, 100 questions, single pass
@@ -35,7 +35,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/kimi_k26_mh.sh",
+    "launch_script": "recipe/configs/kimi_k26_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 
