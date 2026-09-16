@@ -168,11 +168,31 @@ class AscendKVManager(MooncakeKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_kv_item_len: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
     ):
         if dst_device_kv_indices is not None:
             raise NotImplementedError(
                 "Ascend PD transfer does not support HiSparse "
                 "destination device KV indices"
+            )
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
+        )
+        # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
+        # decode peer registers all model layers. Pair only this layout by
+        # global layer id; every other Ascend layout keeps the legacy path.
+        if self.is_hybrid_mla_backend and self.pp_size > 1:
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=self.kv_args.kv_data_ptrs,
+                dst_data_ptrs=dst_kv_ptrs,
+                item_lens=self.kv_args.kv_item_lens,
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                src_layer_ids=self.kv_args.kv_layer_ids,
+                dst_layer_ids=dst_layer_ids,
             )
 
         # Group by indices
