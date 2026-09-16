@@ -71,11 +71,14 @@ jobs:
           src="${RUNNER_TEMP}/source.tgz"
           tar --exclude=./.git -czf "$src" -C "$GITHUB_WORKSPACE" .
 
-          base_exists=0
-          if gcloud artifacts docker images describe "${AR_BASE_IMAGE}:${base_tag}" \
-              --project "$GCP_PROJECT" --access-token-file="$tokfile" >/dev/null 2>&1; then
+          # Image describe also queries Container Analysis, which requires unrelated
+          # permissions. Query tags only, and let lookup errors fail the build rather
+          # than silently turning authentication/service failures into cache misses.
+          cached_tag=$(gcloud artifacts docker tags list "$AR_BASE_IMAGE" \
+            --filter="tag~'/tags/${base_tag}$'" --format='value(tag)' \
+            --project "$GCP_PROJECT" --access-token-file="$tokfile")
+          if [ -n "$cached_tag" ]; then
             echo "Base image ${AR_BASE_IMAGE}:${base_tag} already exists; reusing."
-            base_exists=1
           else
             echo "Base image ${AR_BASE_IMAGE}:${base_tag} not found; building base image on Cloud Build."
             base_object="source/base-${base_tag}-${{ github.run_id }}.tgz"
