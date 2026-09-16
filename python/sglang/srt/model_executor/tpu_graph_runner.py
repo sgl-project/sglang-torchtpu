@@ -36,6 +36,9 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    arm_recompilation_checker,
+)
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
@@ -280,24 +283,16 @@ class TpuGraphRunner:
         if not installed_any:
             return
 
-        # Wire serving-time recompilation detection into installed shims
-        # after warmup establishes the expected compile baseline.
-        if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
-            return
-
-        from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-            RecompilationChecker,
-        )
-
-        checker = RecompilationChecker()
-        checker.snapshot_baseline()
-        model_name = type(self.model).__name__
-        is_draft = getattr(model_runner, "is_draft_worker", False)
-        label = f"{'draft ' if is_draft else ''}{model_name}"
-        for policy in installed_policies:
-            set_checker = getattr(policy, "set_recompilation_checker", None)
-            if callable(set_checker):
-                set_checker(checker, model_label=label)
+        # Arm here and nowhere earlier: every graph this model precompiles
+        # exists by now, so the baseline separates precompile from serving.
+        if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+            # A draft model precompiles later, from precompile_draft, and arms
+            # the checker itself once that is done.
+            if not model_runner.is_draft_worker:
+                arm_recompilation_checker(
+                    policies=installed_policies,
+                    model_label=type(self.model).__name__,
+                )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.
