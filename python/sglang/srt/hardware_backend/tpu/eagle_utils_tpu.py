@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -149,7 +149,11 @@ def prepare_device_accept_tpu(
             int(host_base[i]) + double_alloc <= req.kv.kv_allocated_len
             for i, req in enumerate(batch.reqs)
         ), "TPU acceptance routing requires KV slots reserved for two forwards"
-        candidate_width = 2 * spec.speculative_num_draft_tokens - 1
+        # Size the window with the same bound as the KV reservation: adaptive
+        # spec may switch to a longer state between this prepare and the
+        # verify whose acceptance selects the window.
+        num_draft_tokens = max_speculative_num_draft_tokens()
+        candidate_width = 2 * num_draft_tokens - 1
         offsets = torch.arange(candidate_width, dtype=torch.int64)
         rows = batch.req_pool_indices_cpu.to(dtype=torch.int64)[:, None]
         cols = host_base[:, None] + 1 + offsets[None, :]
@@ -157,8 +161,11 @@ def prepare_device_accept_tpu(
         draft_input.device_accept_candidate_locs = candidates.to(
             batch.device, dtype=torch.int64, non_blocking=True
         )
-        # Metadata still requires a host shadow. Preserve the pre-accept
-        # base while TPU consumers use FutureMap's resolved seq_lens.
+        # The host shadow stays one acceptance behind the device seq_lens.
+        # Verify and draft-extend kernel lengths come from device seq_lens;
+        # Pallas reads only the live-row count and the KV capacity check
+        # from seq_lens_cpu, and the draft-extend prefix_lens derived from
+        # it is ignored by the RPA backend (attention_pallas_rpa_base).
         batch.seq_lens_cpu = host_base
         batch.seq_lens_sum = int(host_base.sum())
 

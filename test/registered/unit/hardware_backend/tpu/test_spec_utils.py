@@ -502,11 +502,19 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
 
 
 @pytest.mark.parametrize(
-    "page_size,num_steps,num_draft_tokens,candidate_width",
-    [(1, 1, 2, 3), (16, 2, 3, 5), (64, 3, 4, 7), (64, 0, 1, None)],
+    "page_size,num_steps,num_draft_tokens,max_num_draft_tokens,candidate_width",
+    [
+        (1, 1, 2, 2, 3),
+        (16, 2, 3, 3, 5),
+        (64, 3, 4, 4, 7),
+        # Adaptive spec: the window follows the reserved bound, not the
+        # currently active draft-token count.
+        (64, 3, 4, 5, 9),
+        (64, 0, 1, 1, None),
+    ],
 )
 def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
-    page_size, num_steps, num_draft_tokens, candidate_width
+    page_size, num_steps, num_draft_tokens, max_num_draft_tokens, candidate_width
 ):
     spec = SimpleNamespace(
         speculative_num_steps=num_steps,
@@ -557,10 +565,15 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
         patch.object(
             eagle_utils,
             "get_alloc_reserve_per_decode",
-            return_value=2 * num_draft_tokens,
+            return_value=2 * max_num_draft_tokens,
         ),
         patch.object(eagle_utils, "get_spec", return_value=spec),
         patch.object(eagle_utils_tpu, "get_spec", return_value=spec),
+        patch.object(
+            eagle_utils_tpu,
+            "max_speculative_num_draft_tokens",
+            return_value=max_num_draft_tokens,
+        ),
         patch.object(kernels, "allocate_and_assign_decode_cache"),
     ):
         eagle_utils.eagle_prepare_for_decode(batch)
@@ -581,7 +594,7 @@ def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
         .reshape(1, candidate_width),
     )
     expected_alloc = (
-        (host_base + 2 * num_draft_tokens + page_size - 1) // page_size * page_size
+        (host_base + 2 * max_num_draft_tokens + page_size - 1) // page_size * page_size
     )
     assert req.kv.kv_allocated_len == expected_alloc
 
