@@ -6,14 +6,17 @@ on `tpu7x`: FP8 weights + FP8 KV cache, torch.compile, `pallas_tpu_rpa_v3` atten
 ## Files
 | file | what |
 |---|---|
-| `launch_mimo_25.sh` | MiMo-V2.5 310B — **single host** (tp8 / ep8 / dp2, attn_tp=4) |
-| `launch_mimo_25_pro_multihost.sh` | MiMo-V2.5-Pro 1T — **2 hosts** (tp16 / ep16 / dp2, attn_tp=8) |
+| `launch_mimo_25.py` | MiMo-V2.5 310B — **single host** (tp8 / ep8 / dp2, attn_tp=4) |
+| `launch_mimo_25_pro_multihost.py` | MiMo-V2.5-Pro 1T — **2 hosts** (tp16 / ep16 / dp2, attn_tp=8) |
 
 ## Launch
 
+The `.py` files export import-only `CONFIG` dictionaries. Run these commands from
+the repository root; edit a copied dictionary to override serving flags.
+
 ### MiMo-V2.5 (310B) — single host
 ```bash
-./launch_mimo_25.sh
+python -m benchmark.tpu.recipe.bench_matrix.serve_group --config recipe/configs/mimo/launch_mimo_25.py
 ```
 
 ### MiMo-V2.5-Pro (1T) — 2 hosts
@@ -21,9 +24,9 @@ Start **rank 0 first**; wait until it logs `Initializing TPU distributed runtime
 then start rank 1. Open `DIST_PORT` (10011) between the hosts.
 ```bash
 # host 0 (serves HTTP :30000):
-./launch_mimo_25_pro_multihost.sh 0
+NODE_RANK=0 python -m benchmark.tpu.recipe.bench_matrix.serve_group --config recipe/configs/mimo/launch_mimo_25_pro_multihost.py
 # host 1:
-RANK0_HOST=<host0-internal-ip> ./launch_mimo_25_pro_multihost.sh 1
+NODE_RANK=1 RANK0_HOST=<host0-internal-ip> python -m benchmark.tpu.recipe.bench_matrix.serve_group --config recipe/configs/mimo/launch_mimo_25_pro_multihost.py
 ```
 
 
