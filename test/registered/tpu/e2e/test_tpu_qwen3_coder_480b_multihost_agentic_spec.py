@@ -2,7 +2,7 @@
 
 This is the speculative-decoding counterpart to
 test_tpu_qwen3_coder_480b_multihost_agentic.py. Its MULTIHOST_LAUNCH forms a
-separate two-host launch group using recipe/qwen3_coder_480b_agentic_spec_mh.sh:
+separate two-host launch group using recipe/configs/qwen3_coder_480b_agentic_spec_mh.py:
 tp=16 / ep=16 / dp=2 -> attention_tp=8, EAGLE3 speculative decoding, prefix
 caching + HiCache KV offload, and a 1M server context.
 
@@ -33,7 +33,7 @@ register_tpu_ci(
 
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/qwen3_coder_480b_agentic_spec_mh.sh",
+    "launch_script": "recipe/configs/qwen3_coder_480b_agentic_spec_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 
@@ -48,7 +48,7 @@ TestTpuQwen3Coder480bMultihostAgenticSpec = build_bench_test(
     model_label="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
     series_id="perf-qwen3-coder-480b-agentic-eagle3",
     display_name="Qwen3-Coder-480B agentic EAGLE3",
-    sweep_script=os.path.join(RECIPE_DIR, "run_nightly.sh"),
+    sweep_script=os.path.join(RECIPE_DIR, "run_nightly.py"),
     sweep_env={
         "MODE": "external",
         "EXTERNAL_MODE_LABEL": "colocated",

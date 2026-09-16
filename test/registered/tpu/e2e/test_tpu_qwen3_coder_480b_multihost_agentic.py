@@ -1,7 +1,7 @@
 """Qwen3-Coder-480B-A35B-Instruct-FP8 multi-turn agentic serving benchmark
 (live-server mode), the colocated half of the team's standard 480B contract.
 
-Its MULTIHOST_LAUNCH forms its own launch group: recipe/qwen3_coder_480b_agentic_mh.sh
+Its MULTIHOST_LAUNCH forms its own launch group: recipe/configs/qwen3_coder_480b_agentic_mh.py
 on 2 hosts, i.e. tp=16 / ep=16 / dp=2 -> attention_tp=8, prefix caching + HiCache
 KV offload on, 1M server context. The CI runs this file on rank-0 against the
 server the JobSet brought up; it skips unless a live server is provided. DP size
@@ -12,7 +12,7 @@ The gates and their rationale live in bench_matrix_base.build_bench_test (this
 file predates the benchmark matrix and is its blueprint): every leg finished,
 prefix caching hit what the round count makes reachable at the measured DP,
 zero retract/abort, throughput recorded (never gated) and dumped for the
-dashboard. The sweep harness stays this recipe's own run_nightly.sh; only the
+dashboard. The sweep harness stays this recipe's own run_nightly.py; only the
 test machinery is shared. Metric names are bare leg tags (no namespace) --
 this file's dashboard trend predates the matrix and must not split.
 
@@ -37,7 +37,7 @@ register_tpu_ci(
 # Own launch group: the 480B agentic recipe + the shared ROX weights volume.
 MULTIHOST_LAUNCH = {
     "hosts": 2,
-    "launch_script": "recipe/qwen3_coder_480b_agentic_mh.sh",
+    "launch_script": "recipe/configs/qwen3_coder_480b_agentic_mh.py",
     "weights_pvc": "model-weights-rox",
 }
 
@@ -57,7 +57,7 @@ TestTpuQwen3Coder480bMultihostAgentic = build_bench_test(
     # the display name is free.
     series_id="perf-qwen3-coder-480b-agentic",
     display_name="Qwen3-Coder-480B agentic",
-    sweep_script=os.path.join(RECIPE_DIR, "run_nightly.sh"),
+    sweep_script=os.path.join(RECIPE_DIR, "run_nightly.py"),
     sweep_env={
         # MODE=external means "sweep this endpoint, launch nothing" -- the
         # JobSet owns the server. The layout is the colocated one (tp=16
