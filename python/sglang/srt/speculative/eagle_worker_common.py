@@ -44,6 +44,7 @@ _is_tpu = is_tpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         device_accept_verify_cache_locs_tpu,
+        draft_extend_positions_tpu,
         prepare_draft_cache_locs_tpu,
     )
 
@@ -152,6 +153,10 @@ def prepare_for_draft_extend(
             )
     else:
         batch.input_ids = predict
+        if _is_tpu and not batch.forward_mode.is_idle():
+            draft_extend_input.positions = draft_extend_positions_tpu(
+                batch.seq_lens, num_window_tokens
+            )
     maybe_detect_oob(
         batch.input_ids,
         0,

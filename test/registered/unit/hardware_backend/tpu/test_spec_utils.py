@@ -832,6 +832,73 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
     assert draft.device_accept_candidate_locs is candidates
 
 
+def test_draft_extend_positions_follow_device_seq_lens():
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        draft_extend_positions_tpu,
+    )
+
+    positions = draft_extend_positions_tpu(torch.tensor([5, 9]), 3)
+    assert torch.equal(positions, torch.tensor([5, 6, 7, 9, 10, 11]))
+
+
+def test_prepare_for_draft_extend_tpu_ignores_stale_host_seq_lens():
+    """Device accept routing leaves seq_lens_cpu one acceptance behind; the
+    draft-extend positions must come from the device seq_lens."""
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative import eagle_worker_common
+
+    seq_lens = torch.tensor([7, 12])
+    stale_seq_lens_cpu = torch.tensor([4, 10])
+    batch = SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cpu=stale_seq_lens_cpu,
+        forward_mode=ForwardMode.DECODE,
+        model_config=SimpleNamespace(vocab_size=100),
+        spec_info=None,
+    )
+    draft_extend_input = SimpleNamespace(
+        num_front_tokens=0, hidden_states=None, positions=None
+    )
+    forward_batch = SimpleNamespace(
+        seq_lens=seq_lens.clone(),
+        seq_lens_cpu=stale_seq_lens_cpu.clone(),
+        forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        mark_forward_metadata_ready=Mock(),
+    )
+    draft_model_runner = Mock()
+    draft_model_runner.spec_algorithm.is_standalone.return_value = False
+    with (
+        patch.object(eagle_worker_common, "_is_tpu", True),
+        patch.object(
+            eagle_worker_common,
+            "draft_extend_positions_tpu",
+            eagle_utils_tpu.draft_extend_positions_tpu,
+            create=True,
+        ),
+        patch.object(
+            eagle_worker_common.ForwardBatch, "init_new", return_value=forward_batch
+        ),
+        patch.object(eagle_worker_common, "maybe_detect_oob"),
+        patch.object(eagle_worker_common, "is_npu", return_value=False),
+    ):
+        eagle_worker_common.prepare_for_draft_extend(
+            draft_extend_input,
+            batch,
+            torch.arange(6),
+            3,
+            draft_model_runner,
+            None,
+            return_hidden_states_before_norm=False,
+        )
+
+    assert torch.equal(
+        draft_extend_input.positions, torch.tensor([7, 8, 9, 12, 13, 14])
+    )
+    # The host-derived prefix is still built for init_new but is not what
+    # the positions come from.
+    assert batch.prefix_lens == [4, 10]
+
+
 @pytest.mark.parametrize("algorithm", ("EAGLE3", "DFLASH", "DSPARK"))
 @pytest.mark.parametrize(
     "host_resident,overlap", ((True, True), (True, False), (False, True))

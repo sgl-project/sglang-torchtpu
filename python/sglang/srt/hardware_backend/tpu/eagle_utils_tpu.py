@@ -162,12 +162,25 @@ def prepare_device_accept_tpu(
             batch.device, dtype=torch.int64, non_blocking=True
         )
         # The host shadow stays one acceptance behind the device seq_lens.
-        # Verify and draft-extend kernel lengths come from device seq_lens;
+        # Verify and draft-extend kernel lengths and the draft-extend
+        # positions (draft_extend_positions_tpu) come from device seq_lens;
         # Pallas reads only the live-row count and the KV capacity check
-        # from seq_lens_cpu, and the draft-extend prefix_lens derived from
-        # it is ignored by the RPA backend (attention_pallas_rpa_base).
+        # from seq_lens_cpu, and the RPA backend ignores the draft-extend
+        # prefix_lens derived from it. pallas_tpu_flash reads that
+        # prefix_lens on host and has no spec support; it is not supported
+        # with device accept routing.
         batch.seq_lens_cpu = host_base
         batch.seq_lens_sum = int(host_base.sum())
+
+
+def draft_extend_positions_tpu(
+    seq_lens: torch.Tensor, num_window_tokens: int
+) -> torch.Tensor:
+    # Under device accept routing seq_lens_cpu is one acceptance behind, so
+    # the extend positions come from the device seq_lens, like the widened
+    # window's precomputed positions.
+    offsets = torch.arange(num_window_tokens, device=seq_lens.device, dtype=torch.int64)
+    return (seq_lens.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
 
 
 def prepare_draft_cache_locs_tpu(
