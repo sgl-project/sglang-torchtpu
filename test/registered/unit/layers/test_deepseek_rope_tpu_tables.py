@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.rotary_embedding import base as rope_base
 from sglang.srt.layers.rotary_embedding import rope_variant
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
@@ -16,7 +17,11 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _make(rotary_dim, head_size, neox, dtype):
     # Build with the TPU flag on so the tables are registered, on CPU tensors.
-    with patch.object(rope_variant, "_is_tpu", True):
+    # The base constructor must also select TPU to avoid optional GPU kernels.
+    with (
+        patch.object(rope_base, "_is_tpu", True),
+        patch.object(rope_variant, "_is_tpu", True),
+    ):
         return DeepseekScalingRotaryEmbedding(
             head_size=head_size,
             rotary_dim=rotary_dim,
