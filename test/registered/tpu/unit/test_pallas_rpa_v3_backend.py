@@ -30,12 +30,17 @@ register_tpu_ci(est_time=120, suite="stage-a-test-tpu-unit")
 import types
 import unittest
 from typing import Optional
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+    _resolve_decode_query_size,
+)
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     PallasForwardMetadata,
     TpuPallasRpaV3AttnBackend,
+    _invoke_v3_kernel,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -55,11 +60,13 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
         page_size: int,
         req_to_token: torch.Tensor,
         speculative_step_id: int = 0,
+        decode_query_size: int = 1,
     ) -> None:
         AttentionBackend.__init__(self)
         self.device = req_to_token.device
         self.page_size = page_size
         self.speculative_step_id = speculative_step_id
+        self.decode_query_size = decode_query_size
         self.max_context_len = req_to_token.shape[1]
         # _build_metadata reads req_to_token_pool.req_to_token only.
         self.req_to_token_pool = types.SimpleNamespace(req_to_token=req_to_token)
@@ -78,6 +85,7 @@ def _make_forward_batch(
     spec_info=None,
     seq_lens_cpu: Optional[torch.Tensor] = None,
     req_pool_indices_cpu: Optional[torch.Tensor] = None,
+    extend_seq_lens_cpu: Optional[list] = None,
 ):
     """Minimal fake ForwardBatch for ``_build_metadata``.
 
@@ -96,6 +104,7 @@ def _make_forward_batch(
         extend_seq_lens=extend_seq_lens,
         spec_info=spec_info,
         seq_lens_cpu=seq_lens_cpu,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
     )
 
 
@@ -137,6 +146,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
             active_num_tokens=torch.tensor(1, dtype=torch.int32),
         )
+        # ``decode_query_size`` defaults to 1 on the metadata, as for decode.
         backend.token_to_kv_pool = types.SimpleNamespace(
             get_fused_kv_buffer=lambda _layer_id: torch.empty(0)
         )
@@ -159,6 +169,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             soft_cap,
             k_scale,
             v_scale,
+            decode_query_size=1,
         ):
             captured["sliding_window"] = sliding_window
             return torch.zeros_like(q)
@@ -422,7 +433,8 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
             torch.int32
         )
         self.assertTrue(torch.equal(meta.cu_q_lens, expected_cu_q))
-        # TARGET_VERIFY is not decode: distribution = [0, bs, bs].
+        # Single-token decode (the default width): TARGET_VERIFY takes the
+        # extend range, distribution = [0, bs, bs].
         self.assertTrue(
             torch.equal(
                 meta.distribution,
@@ -516,6 +528,207 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         meta_plain = _build_meta(backend, fb_plain)
         self.assertTrue(torch.equal(meta_spec.page_indices, meta_plain.page_indices))
         self.assertTrue(torch.equal(meta_spec.cu_kv_lens, meta_plain.cu_kv_lens))
+
+
+class TestFixedWidthAsDecode(CustomTestCase):
+    """Fixed-width spec phases take the kernel's DECODE range.
+
+    The kernel's decode loop bounds are static, so the width forwarded to the
+    op must match the width this backend was built for. Target verification
+    of that width and a decode-phase draft extension whose every row has that
+    width qualify; every other forward stays on the dynamic routes with 1.
+    """
+
+    PAGE_SIZE = 16
+    WIDTH = 4
+
+    def _backend(self, decode_query_size):
+        backend = _BackendUnderTest(
+            page_size=self.PAGE_SIZE,
+            req_to_token=_build_req_to_token(num_reqs=8, max_context_len=64),
+            decode_query_size=decode_query_size,
+        )
+        backend.kv_cache_quant_dtype = None
+        backend.token_to_kv_pool = types.SimpleNamespace(
+            get_fused_kv_buffer=lambda _layer_id: torch.empty(0)
+        )
+        return backend
+
+    def _forward_batch(self, mode, num_tokens_per_req, extend_lens=None):
+        bs = 3
+        extend = (
+            None
+            if extend_lens is None
+            else torch.tensor(extend_lens, dtype=torch.int32)
+        )
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([10, 24, 33], dtype=torch.int32),
+            req_pool_indices=torch.tensor([5, 2, 7], dtype=torch.int64),
+            forward_mode=mode,
+            extend_seq_lens=extend,
+            spec_info=types.SimpleNamespace(num_tokens_per_req=num_tokens_per_req),
+            extend_seq_lens_cpu=extend_lens,
+        )
+        fb.capture_hidden_mode = None
+        return fb, bs
+
+    def _forward_width(self, backend, mode, num_tokens_per_req, extend_lens=None):
+        """The ``decode_query_size`` the op receives for one forward."""
+        forward_batch, bs = self._forward_batch(mode, num_tokens_per_req, extend_lens)
+        backend.forward_metadata = _build_meta(backend, forward_batch)
+        captured = {}
+
+        def recording_op(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            sinks,
+            scaling,
+            sliding_window,
+            soft_cap,
+            k_scale,
+            v_scale,
+            decode_query_size=1,
+        ):
+            captured["width"] = decode_query_size
+
+            def kernel(*_args, **kwargs):
+                captured["kernel_kwargs"] = kwargs
+
+            _invoke_v3_kernel(
+                kernel,
+                queries=q,
+                keys=k,
+                values=v,
+                kv_cache_fused=kv_cache,
+                kv_lens=kv_lens,
+                page_indices=page_indices,
+                cu_q_lens=cu_q_lens,
+                cu_kv_lens=cu_kv_lens,
+                distribution=distribution,
+                attention_sink=sinks,
+                sm_scale=scaling,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                decode_query_size=decode_query_size,
+            )
+            return torch.zeros_like(q)
+
+        backend._op = recording_op
+        layer = types.SimpleNamespace(
+            tp_q_head_num=2,
+            tp_k_head_num=1,
+            tp_v_head_num=1,
+            qk_head_dim=4,
+            v_head_dim=4,
+            layer_id=0,
+            sliding_window_size=None,
+            logit_cap=0,
+            scaling=1.0,
+        )
+        num_tokens = int(backend.forward_metadata.cu_q_lens[-1])
+        backend._forward(
+            q=torch.zeros(num_tokens, 8),
+            k=torch.zeros(num_tokens, 4),
+            v=torch.zeros(num_tokens, 4),
+            layer=layer,
+            forward_batch=forward_batch,
+        )
+        # The v3 invoker forwards the width as the kernel's static argument.
+        self.assertEqual(
+            captured["kernel_kwargs"]["decode_query_size"], captured["width"]
+        )
+        self.assertEqual(captured["kernel_kwargs"]["causal"], 1)
+        return captured["width"]
+
+    def test_verify_of_the_built_width_is_decode(self):
+        backend = self._backend(self.WIDTH)
+        self.assertEqual(
+            self._forward_width(backend, ForwardMode.TARGET_VERIFY, self.WIDTH),
+            self.WIDTH,
+        )
+
+    def test_other_modes_keep_single_token_decode(self):
+        # A width on spec_info is also present during draft decode and the
+        # ragged prompt-phase extension. Passing it there would impose static
+        # loop bounds on rows of other lengths.
+        backend = self._backend(self.WIDTH)
+        for mode, lens in (
+            (ForwardMode.DECODE, None),
+            (ForwardMode.EXTEND, [4, 4, 4]),
+            (ForwardMode.DRAFT_EXTEND_V2, [3, 4, 4]),
+            (ForwardMode.DRAFT_EXTEND_V2, [5, 5, 5]),
+        ):
+            with self.subTest(mode=mode, lens=lens):
+                self.assertEqual(
+                    self._forward_width(backend, mode, self.WIDTH, lens), 1
+                )
+
+    def test_uniform_draft_extension_is_decode(self):
+        backend = self._backend(self.WIDTH)
+        lens = [self.WIDTH] * 3
+        self.assertEqual(
+            self._forward_width(backend, ForwardMode.DRAFT_EXTEND_V2, self.WIDTH, lens),
+            self.WIDTH,
+        )
+        fb, bs = self._forward_batch(ForwardMode.DRAFT_EXTEND_V2, self.WIDTH, lens)
+        meta = _build_meta(backend, fb)
+        self.assertEqual(meta.distribution.tolist(), [bs, bs, bs])
+        # The draft's KV already holds the window; query rows are the window.
+        self.assertEqual(meta.cu_q_lens.tolist(), [0, 4, 8, 12])
+        fb, bs = self._forward_batch(ForwardMode.DRAFT_EXTEND_V2, self.WIDTH, [3, 4, 4])
+        self.assertEqual(_build_meta(backend, fb).distribution.tolist(), [0, bs, bs])
+
+    def test_verify_of_another_width_stays_dynamic(self):
+        backend = self._backend(self.WIDTH)
+        self.assertEqual(
+            self._forward_width(backend, ForwardMode.TARGET_VERIFY, self.WIDTH + 1),
+            1,
+        )
+
+    def _verify_distribution(self, backend, num_tokens_per_req):
+        bs = 3
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([10, 24, 33], dtype=torch.int32),
+            req_pool_indices=torch.tensor([5, 2, 7], dtype=torch.int64),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=types.SimpleNamespace(num_tokens_per_req=num_tokens_per_req),
+        )
+        return _build_meta(backend, fb).distribution.tolist(), bs
+
+    def test_verify_distribution_is_decode_only_for_the_built_width(self):
+        backend = self._backend(self.WIDTH)
+        dist, bs = self._verify_distribution(backend, self.WIDTH)
+        self.assertEqual(dist, [bs, bs, bs])
+        dist, bs = self._verify_distribution(backend, self.WIDTH + 1)
+        self.assertEqual(dist, [0, bs, bs])
+        dist, bs = self._verify_distribution(self._backend(1), self.WIDTH)
+        self.assertEqual(dist, [0, bs, bs])
+
+    def test_resolved_width_is_the_speculative_draft_token_count(self):
+        spec = types.SimpleNamespace(speculative_num_draft_tokens=self.WIDTH)
+        with patch(
+            "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base.get_spec",
+            return_value=spec,
+        ):
+            target = dict(supports_decode_query_size=True, spec_enabled=True)
+            self.assertEqual(_resolve_decode_query_size(**target), self.WIDTH)
+            for override in (
+                {"supports_decode_query_size": False},
+                {"spec_enabled": False},
+            ):
+                with self.subTest(override=override):
+                    self.assertEqual(
+                        _resolve_decode_query_size(**{**target, **override}), 1
+                    )
 
 
 class TestRpaDistribution(CustomTestCase):

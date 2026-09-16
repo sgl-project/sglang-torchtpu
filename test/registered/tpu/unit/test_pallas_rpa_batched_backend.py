@@ -38,6 +38,7 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self.forward_metadata = None
         self._op = None
         self._distribution_cache = {}
+        self.decode_query_size = 1
         self._is_hybrid_swa = False
         self.token_to_kv_pool = None
 

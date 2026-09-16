@@ -377,7 +377,9 @@ def _ragged_paged_attention_kernel_loop(
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
 
     use_causal_mask = causal
-    if case == RpaCase.DECODE:
+    if case == RpaCase.DECODE and static_q_len == 1:
+        # A single query row sees every cached key; wider DECODE rows
+        # (speculative verification) keep the causal mask.
         use_causal_mask = False
 
     out_dtype = acc_ref.dtype
@@ -875,7 +877,11 @@ def _ragged_paged_attention_kernel_loop(
             actual_bq_sz = min(bq_sz, static_q_len)
             num_bq = cdiv(static_q_len, actual_bq_sz)
 
+        # A short static width may not divide the compute tile; snap up to the
+        # width rather than to a divisor, which can collapse to single rows.
         actual_bq_csz = min(bq_csz, actual_bq_sz)
+        if actual_bq_sz % actual_bq_csz != 0:
+            actual_bq_csz = actual_bq_sz
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -1344,6 +1350,7 @@ def static_validate_inputs(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     chunk_prefill_size: int | None = None,
+    decode_query_size: int = 1,
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
@@ -1417,6 +1424,8 @@ def static_validate_inputs(
         raise ValueError(f"{soft_cap=} must not be 0.0.")
     if chunk_prefill_size is not None and chunk_prefill_size <= 0:
         raise ValueError(f"{chunk_prefill_size=} must be positive.")
+    if decode_query_size < 1:
+        raise ValueError(f"{decode_query_size=} must be positive.")
 
     use_causal_mask = causal == 1
     if skip_kv_mask and use_causal_mask:
@@ -1527,8 +1536,14 @@ def get_default_block_sizes(
     vmem_limit_bytes: int | None = None,
     use_custom_mask: bool = False,
     sliding_window: int | None = None,
+    decode_query_size: int = 1,
 ):
-    """Get (bq_sz, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas."""
+    """Get (bq_sz, bkv_sz, bq_csz, bkv_csz) by some heuristic formulas.
+
+    DECODE tiles hold ``decode_query_size`` query rows per sequence so a
+    fixed-width speculative verification runs on the decode schedule: one
+    query tile and the largest KV tile VMEM allows.
+    """
     tpu_version = get_tpu_version()
 
     kv_packing = get_dtype_packing(kv_dtype)
@@ -1547,13 +1562,13 @@ def get_default_block_sizes(
     match tpu_version:
         case 5 | 6:
             if case == RpaCase.DECODE:
-                bq_sz = 1
+                bq_sz = decode_query_size
                 bkv_sz = (
                     min(min_bkv_sz_to_peak, max_kv)
                     if sliding_window is None
                     else sliding_window
                 )
-                bq_csz = 1
+                bq_csz = decode_query_size
                 bkv_csz = bkv_sz
             else:
                 bq_sz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
@@ -1566,13 +1581,13 @@ def get_default_block_sizes(
                 )
         case 7:
             if case == RpaCase.DECODE:
-                bq_sz = 1
+                bq_sz = decode_query_size
                 bkv_sz = (
                     min(min_bkv_sz_to_peak, max_kv)
                     if sliding_window is None
                     else sliding_window
                 )
-                bq_csz = 1
+                bq_csz = decode_query_size
                 bkv_csz = bkv_sz
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
@@ -1600,7 +1615,9 @@ def get_default_block_sizes(
         # block measured slower per token.
         _budget_frac = 0.15 if case == RpaCase.DECODE else 0.60
         vmem_budget = int(vmem_limit_bytes * _budget_frac)
-        while bq_sz > 1 or bkv_sz > bkv_alignment:
+        # The DECODE query tile never shrinks below the static row count.
+        min_bq_sz = decode_query_size if case == RpaCase.DECODE else 1
+        while bq_sz > min_bq_sz or bkv_sz > bkv_alignment:
             vmem_est = get_vmem_estimate_bytes(
                 actual_num_kv_heads,
                 actual_num_q_heads_per_kv_head,
@@ -1618,7 +1635,7 @@ def get_default_block_sizes(
                 bkv_sz = max(bkv_sz // 2, bkv_alignment)
                 bkv_csz = bkv_sz
             else:
-                bq_sz = max(bq_sz // 2, 1)
+                bq_sz = max(bq_sz // 2, min_bq_sz)
                 bq_csz = bq_sz
             bkv_sz = align_to(bkv_sz, bkv_alignment)
             bkv_csz = align_to(bkv_csz, bkv_alignment)
@@ -1680,6 +1697,7 @@ def get_vmem_limit():
         "v_scale",
         "xai_temperature_len",
         "chunk_prefill_size",
+        "decode_query_size",
         "d_block_sizes",
         "p_block_sizes",
         "m_block_sizes",
@@ -1714,6 +1732,7 @@ def ragged_paged_attention(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     chunk_prefill_size: int | None = None,
+    decode_query_size: int = 1,
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
@@ -1747,6 +1766,10 @@ def ragged_paged_attention(
       v_scale: value scale.
       xai_temperature_len: length-based temperature for Grok-style models.
       chunk_prefill_size: chunk prefill size.
+      decode_query_size: static query rows per DECODE sequence (1 = ordinary
+        decode). Speculative verification passes its fixed width so the
+        decode range runs with static loop bounds and decode KV tiles. Active
+        DECODE rows whose length differs are processed by MIXED instead.
       d_block_sizes: block sizes for decode (bq_sz, bkv_sz, bq_csz, bkv_csz).
       p_block_sizes: block sizes for prefill.
       m_block_sizes: block sizes for mixed.
@@ -1781,6 +1804,7 @@ def ragged_paged_attention(
         v_scale=v_scale,
         xai_temperature_len=xai_temperature_len,
         chunk_prefill_size=chunk_prefill_size,
+        decode_query_size=decode_query_size,
         d_block_sizes=d_block_sizes,
         p_block_sizes=p_block_sizes,
         m_block_sizes=m_block_sizes,
@@ -2038,6 +2062,7 @@ def ragged_paged_attention(
                 vmem_limit_bytes=vmem_limit_bytes,
                 use_custom_mask=not use_causal_mask,
                 sliding_window=sliding_window,
+                decode_query_size=decode_query_size,
             )
 
         return {
@@ -2046,6 +2071,17 @@ def ragged_paged_attention(
             "bq_csz": block_sizes[2],
             "bkv_csz": block_sizes[3],
         }
+
+    if decode_query_size > 1:
+        # Static DECODE loop bounds are valid only when every active DECODE row
+        # has exactly decode_query_size queries. Otherwise the whole batch goes
+        # to MIXED, the only dynamic-q range, without a host sync or recompile.
+        seq_ids = jnp.arange(max_num_seqs)
+        is_decode = seq_ids < distribution[0]
+        uniform = jnp.all(~is_decode | (jnp.diff(cu_q_lens) == decode_query_size))
+        distribution = jnp.where(
+            uniform, distribution, jnp.array([0, 0, 1], jnp.int32) * distribution[2]
+        )
 
     # When chunk_prefill_size is None, PREFILL pallas_call is skipped.
     # Remap prefill sequences to MIXED so they are still processed.
@@ -2057,7 +2093,7 @@ def ragged_paged_attention(
         q,
         kv_cache_fused_processed,
         **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
-        static_q_len=1,
+        static_q_len=decode_query_size,
         case=RpaCase.DECODE,
     )
 

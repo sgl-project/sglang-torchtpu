@@ -14,6 +14,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -85,6 +86,8 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             token_to_kv_pool=SimpleNamespace(),
             is_hybrid_swa=False,
             kv_cache_dtype=torch.bfloat16,
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         )
         with patch(
             "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base."
