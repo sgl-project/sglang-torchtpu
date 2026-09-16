@@ -160,6 +160,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         target_worker: TpModelWorker,
     ):
         BaseSpecWorker.__init__(self)
+        self.tpu_step_preparer = None
 
         # Parse arguments
         self.server_args = server_args

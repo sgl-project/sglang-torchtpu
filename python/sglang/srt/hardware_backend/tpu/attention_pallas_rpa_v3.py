@@ -54,6 +54,7 @@ def _invoke_v3_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    verify_query_size=None,
 ):
     return jax_rpa(
         queries,
@@ -68,6 +69,7 @@ def _invoke_v3_kernel(
         None,  # custom_mask
         attention_sink,
         causal=1,
+        chunk_prefill_size=verify_query_size,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -77,10 +79,11 @@ def _invoke_v3_kernel(
 
 
 RPA_V3_SPEC = RpaKernelSpec(
-    op_name="sglang_tpu_pallas::ragged_paged_attention",
+    op_name="sglang_tpu_pallas::ragged_paged_attention_verify_prefill",
     import_kernel=_import_v3_kernel,
     invoke_kernel=_invoke_v3_kernel,
     supports_attention_sink=True,
+    supports_verify_prefill=True,
     extend_distribution_mask=(0, 1, 1),  # [0, n, n]
     uses_draft_extend_v2=True,
     min_page_size=None,

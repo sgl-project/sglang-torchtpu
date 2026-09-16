@@ -203,6 +203,64 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 
 class TestEagleWorkerV2FusedDraft(CustomTestCase):
+    def test_initial_reduced_vocabulary_mapping_is_inside_fused_steps(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            build_topk1_verify_chain_torch,
+        )
+
+        worker = _make_worker(num_steps=1, num_draft_tokens=2)
+        worker.draft_runner = SimpleNamespace(model=None)
+        mapping = torch.tensor([31, 47, 59], device=DEVICE)
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+            new=build_topk1_verify_chain_torch,
+            create=True,
+        ):
+            tree = worker._fused_draft_steps(
+                SimpleNamespace(positions=None, batch_size=2),
+                torch.ones((2, 1), device=DEVICE),
+                torch.tensor([[2], [0]], device=DEVICE),
+                torch.zeros((2, 2), device=DEVICE),
+                torch.zeros(2, dtype=torch.long, device=DEVICE),
+                mapping,
+                torch.tensor([101, 202], device=DEVICE),
+                torch.tensor([5, 10], device=DEVICE),
+            )
+        self.assertEqual(tree[-1].tolist(), [101, 59, 202, 31])
+
+    def test_fused_tree_keeps_target_dummy_inputs_zero(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            build_topk1_verify_chain_torch,
+        )
+
+        worker = _make_worker(num_steps=1, num_draft_tokens=2)
+        worker.draft_runner = SimpleNamespace(model=None)
+        tokens = torch.tensor([[11], [22]], device=DEVICE)
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.select_top_k_tokens",
+                return_value=(tokens, None, None, (None, tokens, None)),
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+                new=build_topk1_verify_chain_torch,
+                create=True,
+            ),
+        ):
+            tree = worker._fused_draft_steps(
+                SimpleNamespace(positions=None, batch_size=2),
+                None,
+                None,
+                None,
+                torch.zeros(2, dtype=torch.long, device=DEVICE),
+                None,
+                torch.tensor([101, 202], device=DEVICE),
+                torch.tensor([5, 0], device=DEVICE),
+            )
+        self.assertEqual(tree[1].tolist(), [5, 6, 0, 0])
+        self.assertEqual(tree[-1].tolist(), [101, 11, 0, 0])
+        self.assertEqual(tree[2].tolist(), [[0, 1], [2, 3]])
+
     def test_fused_steps_support_both_compile_tracers(self):
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
 
@@ -244,6 +302,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             model=SimpleNamespace(forward=model_forward)
         )
         forward_batch = SimpleNamespace(
+            batch_size=1,
             input_ids=None,
             positions=torch.tensor([5], device=DEVICE),
             out_cache_loc=None,
@@ -252,8 +311,7 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 rpa_draft_kv_lens=None,
             ),
         )
-        kv_lens = torch.tensor([[10], [11]], device=DEVICE)
-        out_cache_loc = torch.tensor([[20], [21]], device=DEVICE)
+        out_cache_loc = torch.tensor([20, 21, 22], device=DEVICE)
 
         def select_step(i, topk_p, topk_index, hidden_states, scores, topk):
             del topk_p, topk_index, scores, topk
@@ -276,19 +334,18 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.ones((1, 1), device=DEVICE),
                 torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
                 torch.zeros((1, 2), device=DEVICE),
-                kv_lens,
                 out_cache_loc,
                 None,
                 torch.tensor([99], dtype=torch.long, device=DEVICE),
                 torch.tensor([5], dtype=torch.long, device=DEVICE),
             )
 
-        self.assertEqual(tree[-1].tolist(), [[99, 100, 101, 102]])
+        self.assertEqual(tree[-1].tolist(), [99, 100, 101, 102])
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
-        self.assertEqual(calls[0][2].item(), 10)
-        self.assertEqual(calls[1][2].item(), 11)
+        self.assertEqual(calls[0][2].item(), 6)
+        self.assertEqual(calls[1][2].item(), 7)
         self.assertEqual(calls[0][3].tolist(), [[1.0, 1.0]])
         self.assertEqual(calls[1][3].tolist(), [[12.0, 12.0]])
         self.assertEqual(calls[0][4].item(), 20)
@@ -317,11 +374,13 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
             observed_prefill_only.append(args[0].is_prefill_only)
             return (
                 torch.empty((0,), dtype=torch.bool, device=DEVICE),
-                torch.tensor([[5, 6, 7, 8], [10, 11, 12, 13]], device=DEVICE),
+                torch.tensor([5, 6, 7, 8, 10, 11, 12, 13], device=DEVICE),
                 torch.arange(8, device=DEVICE).view(2, 4),
                 torch.tensor([[1, 2, 3, -1]] * 2, device=DEVICE),
                 torch.full((2, 4), -1, device=DEVICE),
-                torch.cat((torch.tensor([[7], [8]], device=DEVICE), tokens), dim=1),
+                torch.cat(
+                    (torch.tensor([[7], [8]], device=DEVICE), tokens), dim=1
+                ).flatten(),
             )
 
         reload_gate = MagicMock()

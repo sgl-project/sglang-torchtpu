@@ -26,6 +26,7 @@ sglang-jax specific features:
 import functools
 import inspect as _inspect
 import logging
+import math
 from enum import Enum
 
 import jax
@@ -875,7 +876,8 @@ def _ragged_paged_attention_kernel_loop(
             actual_bq_sz = min(bq_sz, static_q_len)
             num_bq = cdiv(static_q_len, actual_bq_sz)
 
-        actual_bq_csz = min(bq_csz, actual_bq_sz)
+        # A short static width may not divide the configured compute tile.
+        actual_bq_csz = math.gcd(min(bq_csz, actual_bq_sz), actual_bq_sz)
 
         def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
             next_bq_idx = bq_idx + 1
@@ -1371,8 +1373,7 @@ def static_validate_inputs(
 
     if actual_num_q_heads % actual_num_kv_heads != 0:
         raise ValueError(
-            f"Expected {actual_num_q_heads=} to be divisible by"
-            f" {actual_num_kv_heads=}."
+            f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
         )
 
     if kv_cache_fused is not None:
@@ -2051,6 +2052,17 @@ def ragged_paged_attention(
     # Remap prefill sequences to MIXED so they are still processed.
     if chunk_prefill_size is None:
         distribution = distribution.at[1].set(distribution[0])
+
+    else:
+        # Static loop bounds are valid only for uniform active PREFILL rows.
+        # Ignore inactive/padded rows and retain MIXED as the device-side
+        # fallback without a host sync or a shape-dependent compilation.
+        seq_ids = jnp.arange(max_num_seqs)
+        is_prefill = (seq_ids >= distribution[0]) & (seq_ids < distribution[1])
+        uniform = jnp.all(~is_prefill | (jnp.diff(cu_q_lens) == chunk_prefill_size))
+        distribution = distribution.at[1].set(
+            jnp.where(uniform, distribution[1], distribution[0])
+        )
 
     # Decode-only
     q, kv_cache_fused_processed = run_rpa_kernel(

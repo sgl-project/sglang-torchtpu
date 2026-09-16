@@ -1761,6 +1761,18 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
             capture_modes,
             [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
         )
+        for call in mr.model.forward.call_args_list[-2:]:
+            batch = call.args[2]
+            # The selected-row LM head needs one acceptance count per request,
+            # including exact-bucket warmups that never enter the padding path.
+            self.assertEqual(
+                batch.spec_info.num_accept_tokens.tolist(),
+                [policy.draft_token_num] * batch.batch_size,
+            )
+            self.assertEqual(
+                batch.spec_info.num_correct_drafts.tolist(),
+                [policy.draft_token_num - 1] * batch.batch_size,
+            )
 
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
         mr = _spec_model_runner(is_draft_worker=True)
@@ -1847,7 +1859,7 @@ class TestSpecDummyForwardBatch(_SpecPolicyTestCase):
             bs=4,
             mode=ForwardMode.DRAFT_EXTEND_V2,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            spec_info=policy._make_draft_extend_spec_info(),
+            spec_info=policy._make_draft_extend_spec_info(4),
         )
 
         self.assertEqual(fb.capture_hidden_mode, CaptureHiddenMode.FULL)
@@ -1880,7 +1892,7 @@ class TestSpecDummyForwardBatch(_SpecPolicyTestCase):
             bs=2,
             mode=ForwardMode.DRAFT_EXTEND_V2,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            spec_info=policy._make_draft_extend_spec_info(),
+            spec_info=policy._make_draft_extend_spec_info(2),
         )
 
         self.assertEqual(fb.positions.tolist(), [0, 1, 2, 3] * 2)
@@ -2636,6 +2648,9 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [4, 4, 4, 0])
+        self.assertEqual(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens.tolist()
+        )
         self.assertEqual(forward_batch.extend_prefix_lens.tolist(), [8, 7, 6, 0])
         self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
 
@@ -3060,7 +3075,8 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
         class FakeDraftBackend:
             attn_backends = step_backends
 
-            def init_forward_metadata(self, forward_batch):
+            def init_forward_metadata(self, forward_batch, *, fused_draft):
+                assert fused_draft
                 for backend in self.attn_backends:
                     backend.init_forward_metadata(forward_batch)
 
@@ -3560,6 +3576,43 @@ class TestSpecVerifyPaddingIsInert(_SpecPolicyTestCase):
         self.assertEqual(accept_lens.tolist(), expected_accept_lens)
         for a, b in zip(first, second):
             self.assertEqual(a.tolist(), b.tolist())
+
+    def test_physical_tree_retrieval_does_not_leak_dummy_acceptance(self):
+        reference = self._run(temperature=0.0, pad_seed=1)
+        batch = _make_batch(0.0)
+        verify_input = _make_verify_input()
+        original_tokens = verify_input.draft_token
+        original_retrieve = verify_input.retrieve_index
+        tokens = torch.cat((original_tokens, torch.zeros_like(original_tokens)))
+        rows = torch.arange(PADDED_TOKENS, dtype=original_retrieve.dtype).reshape(
+            BUCKET_BS, DRAFT_TOKEN_NUM
+        )
+        # Dummy rows retrieve their own positions, rather than the old -1
+        # filler. Their acceptance must never enter the scheduler prefix.
+        verify_input.tpu_verify_tree = (
+            None,
+            None,
+            rows,
+            None,
+            None,
+            tokens.reshape(BUCKET_BS, DRAFT_TOKEN_NUM),
+        )
+        logits = torch.cat(
+            (_accepting_logits(), torch.randn(LOGICAL_TOKENS, VOCAB_SIZE))
+        )
+        policy = _policy()
+        padding = policy.prepare_spec_verify(batch, verify_input, logits)
+        self.assertIs(verify_input.retrieve_index, rows)
+        self.assertEqual(verify_input.draft_token.data_ptr(), tokens.data_ptr())
+        with _serving_stubs():
+            result = eagle_sample(
+                verify_input, batch, SimpleNamespace(next_token_logits=logits), None
+            )
+        logical, _ = policy.finalize_spec_verify(padding, result, (None, None))
+        for got, expected in zip(logical, reference):
+            torch.testing.assert_close(got, expected)
+        self.assertIs(verify_input.draft_token, original_tokens)
+        self.assertIs(verify_input.retrieve_index, original_retrieve)
 
     def test_greedy_verify_ignores_the_padded_rows(self):
         # accept_lens counts accepted drafts plus the bonus token.

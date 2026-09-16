@@ -26,7 +26,7 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput, EagleVerifyInput
 from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
@@ -455,6 +455,16 @@ def _pad_forward_batch_inputs(
             )
         pad_t = t_bucketer.next_bucket(max(real_q, pad_b))
         real_q_out, real_b_out = real_q, real_b
+
+    spec_info = forward_batch.spec_info
+    if (
+        isinstance(spec_info, EagleVerifyInput)
+        and spec_info.tpu_verify_tree is not None
+    ):
+        tree = spec_info.tpu_verify_tree
+        if tree[-1].shape == (pad_b, spec_info.draft_token_num):
+            forward_batch.input_ids = tree[-1].flatten()
+            forward_batch.positions = tree[1].flatten()
 
     for field in _TOKEN_FIELDS:
         val = getattr(forward_batch, field, None)

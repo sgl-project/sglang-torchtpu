@@ -531,7 +531,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
-    def draft(self, batch: ScheduleBatch):
+    def draft(self, batch: ScheduleBatch, *, prepared_inputs=None):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
@@ -541,6 +541,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            prepared_inputs=prepared_inputs,
         )
         self.draft_runner.compile_policy.prepare_spec_draft_input(
             forward_batch, draft_input
@@ -596,6 +597,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif not can_run_decode_cuda_graph:
             parent_list, top_scores_index, draft_tokens, draft_probs = draft_outputs
 
+        physical_tree = None
+        if (
+            use_fused_draft
+            and current_platform.is_tpu()
+            and not self.seed_dsa_topk_from_draft_extend
+        ):
+            from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+                can_continue_padded_spec_tpu,
+            )
+
+            if can_continue_padded_spec_tpu(batch):
+                physical_tree = prebuilt_tree
         # Tree construction consumes scheduler-logical rows.
         padding = draft_input.padding_state
         if (
@@ -622,7 +635,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_probs = _unpad_rows(draft_probs)
                 draft_input.bonus_tokens = _unpad_rows(draft_input.bonus_tokens)
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -637,6 +650,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             device=self.device,
             prebuilt_tree=prebuilt_tree,
         )
+        verify_input.tpu_verify_tree = physical_tree
+        return verify_input
 
     def _prepare_draft_forward_batch(
         self, forward_batch: ForwardBatch, *, refresh_dp_metadata: bool
@@ -651,7 +666,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
                 forward_batch
             )
-        self.draft_attn_backend.init_forward_metadata(forward_batch)
+            self.draft_attn_backend.init_forward_metadata(
+                forward_batch, fused_draft=True
+            )
+        else:
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
 
     def _fused_draft_forward(self, forward_batch: ForwardBatch):
@@ -663,17 +682,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             spec_info.hidden_states,
         )
         maybe_detect_nan(topk_p, "fused_draft: NaN in initial topk_p")
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
 
         attn_backends = self.draft_attn_backend.attn_backends
-        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
-        out_cache_loc = per_step_draft_out_cache_loc(
-            forward_batch.out_cache_loc,
-            forward_batch.batch_size,
-            self.topk,
-            self.speculative_num_steps,
-        )
 
         steps_fn = self._compiled_fused_steps
         if steps_fn is None:
@@ -703,8 +713,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_p,
                     topk_index,
                     hidden_states,
-                    kv_lens_stack,
-                    out_cache_loc,
+                    forward_batch.out_cache_loc,
                     self.hot_token_id,
                     spec_info.bonus_tokens,
                     forward_batch.seq_lens,
@@ -713,7 +722,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             forward_batch.is_prefill_only = orig_prefill_only
         spec_info.rpa_draft_kv_lens = None
 
-        return tree_outputs
+        # Keep scheduler-facing rows while target flattening resolves directly
+        # to the compiled producer's flat buffers without TPU view programs.
+        tree_shape = tree_outputs[2].shape
+        return (
+            tree_outputs[0],
+            tree_outputs[1].view(tree_shape),
+            *tree_outputs[2:5],
+            tree_outputs[5].view(tree_shape),
+        )
 
     def _should_fuse_draft_steps(self) -> bool:
         return _is_tpu and self.speculative_num_steps > 1
@@ -724,7 +741,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         topk_p: torch.Tensor,
         topk_index: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_lens_stack: torch.Tensor,
         out_cache_loc: torch.Tensor,
         hot_token_id: torch.Tensor | None,
         bonus_tokens: torch.Tensor,
@@ -734,8 +750,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         num_steps = self.speculative_num_steps
         model = self.draft_runner.model
         base_positions = forward_batch.positions
+        base_kv_lens = seq_lens.to(torch.int32)
+        out_cache_loc = per_step_draft_out_cache_loc(
+            out_cache_loc, forward_batch.batch_size, self.topk, num_steps
+        )
         tokens: tuple = ()
         scores = None
+        if hot_token_id is not None:
+            topk_index = hot_token_id[topk_index]
         for i in range(num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -744,7 +766,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if i == num_steps - 1:
                 break
 
-            forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
+            forward_batch.spec_info.rpa_draft_kv_lens = base_kv_lens + i + 1
             if self.server_args.tpu_compile_tracer == "direct":
                 # direct_compile treats explicit inputs as immutable graph
                 # arguments. Rebind the traced ForwardBatch field instead of
@@ -760,10 +782,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if hot_token_id is not None:
                 topk_index = hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
-        return build_topk1_verify_chain_torch(
+        tree = build_topk1_verify_chain_torch(
             bonus_tokens,
             torch.cat(tokens, dim=1),
             seq_lens,
+        )
+        # Physical continuation exposes dummy rows to target execution. Keep
+        # its former zero-filled inputs without a separate padding program.
+        valid = seq_lens[:, None] > 0
+        return (
+            tree[0],
+            torch.where(valid, tree[1], 0).flatten(),
+            *tree[2:5],
+            torch.where(valid, tree[5], 0).flatten(),
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -1106,9 +1137,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return buf[:num_tokens]
 
     def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        *,
+        prepared_extend_metadata=None,
     ):
         # Batch 2: Draft extend
+        continuation = batch_result.next_draft_input.tpu_verify_continuation
+        batch_result.next_draft_input.tpu_verify_continuation = None
+        if self.seed_dsa_topk_from_draft_extend:
+            continuation = None
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
@@ -1119,16 +1158,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+        # TPU builds its physical-batch selector inside the compiled finalizer.
+        # DSA still needs a logical-batch selector for its separate seed gather.
+        if not current_platform.is_tpu() or self.seed_dsa_topk_from_draft_extend:
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
-        )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
@@ -1144,6 +1186,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
+                tpu_verify_continuation=continuation,
+                prepared_extend_metadata=prepared_extend_metadata,
             )
 
         if self.plan_stream:
@@ -1208,18 +1252,36 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         if current_platform.is_tpu():
-            execution_select_index = forward_batch.spec_info.last_accepted_indices()
+            physical_outputs = draft_logits_output.tpu_draft_extend_outputs
+            if physical_outputs is None:
+                physical_outputs = fused_draft_extend_select_argmax_func(
+                    next_token_logits=draft_logits_output.next_token_logits,
+                    hidden_states=draft_logits_output.hidden_states,
+                    num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
+                    num_tokens_per_req=forward_batch.spec_info.num_tokens_per_req,
+                )
+            if continuation is not None:
+                from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+                    DraftContinuation,
+                )
+
+                batch_result.next_draft_input.tpu_draft_continuation = (
+                    DraftContinuation(
+                        logical_batch_size=continuation.logical_batch_size,
+                        physical_batch_size=continuation.physical_batch_size,
+                        hidden_states=physical_outputs[0],
+                        topk_p=physical_outputs[1],
+                        topk_index=physical_outputs[2],
+                        bonus_tokens=continuation.bonus_tokens,
+                        accept_lens=continuation.accept_lens,
+                    )
+                )
             (
-                draft_logits_output.next_token_logits,
                 draft_logits_output.hidden_states,
                 ret_topk_p,
                 ret_topk_index,
             ) = self.draft_runner.compile_policy.finalize_spec_forward_batch(
-                outputs=fused_draft_extend_select_argmax_func(
-                    draft_logits_output.next_token_logits,
-                    draft_logits_output.hidden_states,
-                    execution_select_index,
-                ),
+                outputs=physical_outputs,
                 forward_batch=forward_batch,
             )
             ret_draft_probs = None
@@ -1314,6 +1376,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._hosts_draft
             else None
         )
+        self.tpu_step_preparer = None
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1350,6 +1413,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
+        if (
+            _is_tpu
+            and self.speculative_algorithm.is_eagle3()
+            and self._draft_worker is not None
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_step_preparation import (
+                EagleStepPreparer,
+            )
+
+            self.tpu_step_preparer = EagleStepPreparer.create(
+                target_runner=self.target_worker.model_runner,
+                draft_runner=self._draft_worker.draft_runner,
+                draft_attn_backend=self._draft_worker.draft_attn_backend,
+                server_args=self.server_args,
+            )
+
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
             with (
@@ -1449,43 +1528,74 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=capture_mode,
                     vocab_size=self.target_worker.model_config.vocab_size,
                 )
-            if self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
-                verify_input = self._build_trivial_verify_input(batch)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft"),
-                ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            if (
-                self.speculative_num_steps == 0
-                and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+            prepared_step = (
+                self.tpu_step_preparer.prepare(batch)
+                if self.tpu_step_preparer is not None
+                else None
+            )
+            with (
+                prepared_step if prepared_step is not None else contextlib.nullcontext()
             ):
-                self._stub_skipped_draft_extend(batch, batch_output)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
-                ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                return self._forward_spec_decode(
+                    batch,
+                    on_publish=on_publish,
+                    grammar_barrier=grammar_barrier,
+                    prepared_step=prepared_step,
+                )
 
-            return batch_output
+    def _forward_spec_decode(
+        self, batch, *, on_publish, grammar_barrier, prepared_step
+    ):
+        if self.speculative_num_steps == 0:
+            # Drafting disabled (high batch size). _draft_extend below still
+            # runs, keeping draft KV warm for when the batch shrinks.
+            verify_input = self._build_trivial_verify_input(batch)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft"),
+            ):
+                verify_input: EagleVerifyInput = self.draft_worker.draft(
+                    batch,
+                    prepared_inputs=(
+                        prepared_step.inputs if prepared_step is not None else None
+                    ),
+                )
+        assert verify_input.is_verify_input()
+        batch.spec_info = verify_input
+        batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+        # Publish before draft_extend so the fence is at verify-end.
+        if on_publish is not None:
+            on_publish(batch_output.new_seq_lens)
+        if (
+            self.speculative_num_steps == 0
+            and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+        ):
+            self._stub_skipped_draft_extend(batch, batch_output)
+        else:
+            with (
+                self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                spec_stage_span("draft_extend"),
+            ):
+                self.draft_worker._draft_extend_for_decode(
+                    batch,
+                    batch_output,
+                    prepared_extend_metadata=(
+                        prepared_step.extend_metadata
+                        if prepared_step is not None
+                        else None
+                    ),
+                )
+
+        return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.

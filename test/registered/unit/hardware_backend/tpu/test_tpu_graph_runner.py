@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
@@ -616,6 +618,93 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             worker._fused_draft_forward,
         )
 
+    def test_fused_draft_step_inputs_match_request_major_slots(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            build_topk1_verify_chain_torch,
+        )
+        from sglang.srt.speculative import eagle_worker_v2, spec_utils
+
+        for bs, steps in ((1, 2), (4, 3), (16, 5), (64, 3)):
+            with self.subTest(bs=bs, steps=steps):
+                worker = object.__new__(eagle_worker_v2.EagleDraftWorker)
+                worker.speculative_num_steps = steps
+                worker.topk = 1
+                worker.server_args = SimpleNamespace(tpu_compile_tracer="direct")
+                lengths = torch.arange(bs, dtype=torch.int64) + 63
+                if bs > 1:
+                    lengths[-1] = 0
+                slots = torch.arange(bs * steps, dtype=torch.int64) * 7 + 11
+                positions = lengths.clone()
+                batch = SimpleNamespace(
+                    batch_size=bs,
+                    positions=positions,
+                    spec_info=SimpleNamespace(),
+                )
+                observed = []
+
+                def model_forward(input_ids, step_positions, forward_batch):
+                    observed.append(
+                        (
+                            forward_batch.spec_info.rpa_draft_kv_lens.clone(),
+                            forward_batch.out_cache_loc.clone(),
+                            step_positions.clone(),
+                        )
+                    )
+                    return SimpleNamespace(
+                        next_token_logits=torch.arange(8, dtype=torch.float32).expand(
+                            bs, -1
+                        ),
+                        hidden_states=torch.zeros(bs, 2),
+                    )
+
+                worker.draft_runner = SimpleNamespace(
+                    model=SimpleNamespace(forward=model_forward)
+                )
+
+                def select(i, *args):
+                    if i == 0:
+                        return spec_utils._select_top_k_tokens_first(
+                            *args[:3], args[-1]
+                        )
+                    return spec_utils._select_top_k_tokens_later.__wrapped__(i, *args)
+
+                with patch.object(
+                    eagle_worker_v2, "select_top_k_tokens", select
+                ), patch.object(eagle_worker_v2, "fast_topk", torch.topk), patch.object(
+                    eagle_worker_v2,
+                    "build_topk1_verify_chain_torch",
+                    build_topk1_verify_chain_torch,
+                    create=True,
+                ):
+                    output = worker._fused_draft_steps(
+                        batch,
+                        torch.ones(bs, 1),
+                        torch.ones(bs, 1, dtype=torch.int64),
+                        torch.zeros(bs, 2),
+                        slots,
+                        None,
+                        torch.full((bs,), 2, dtype=torch.int64),
+                        lengths,
+                    )
+                self.assertEqual(len(observed), steps - 1)
+                for i, (kv_lens, cache_locs, actual_positions) in enumerate(observed):
+                    self.assertEqual(kv_lens.dtype, torch.int32)
+                    self.assertEqual(
+                        kv_lens.tolist(), [int(x) + i + 1 for x in lengths]
+                    )
+                    self.assertEqual(
+                        cache_locs.tolist(),
+                        [int(slots[row * steps + i]) for row in range(bs)],
+                    )
+                    self.assertEqual(
+                        actual_positions.tolist(), (positions + i).tolist()
+                    )
+                self.assertEqual(output[1].shape, (bs * (steps + 1),))
+                if bs > 1:
+                    self.assertEqual(
+                        output[1].reshape(bs, -1)[-1].tolist(), [0] * (steps + 1)
+                    )
+
     def test_fused_draft_refreshes_dp_metadata_after_spec_padding(self):
         """The direct fused call must publish its final padded DP shape."""
         from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -629,7 +718,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             ),
         )
         worker.draft_attn_backend = SimpleNamespace(
-            init_forward_metadata=lambda _batch: events.append("metadata")
+            init_forward_metadata=lambda _batch, *, fused_draft: events.append(
+                "metadata" if fused_draft else "unfused metadata"
+            )
         )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),

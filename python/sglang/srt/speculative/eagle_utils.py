@@ -60,6 +60,7 @@ _is_cpu = is_cpu()
 if _use_torch_native:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_tree_tpu,
+        prepare_device_accept_tpu,
     )
 
 logger = logging.getLogger(__name__)
@@ -428,7 +429,8 @@ def _verify_tree_greedy_torch(
     candidates: torch.Tensor,
     retrieve_index: torch.Tensor,
 ):
-    bs, num_verify_tokens = candidates.shape
+    bs, num_verify_tokens = retrieve_index.shape
+    candidates = candidates.reshape(bs, num_verify_tokens)
     target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
         bs, num_verify_tokens
     )
@@ -594,7 +596,11 @@ def verify_tree_greedy_func(
     elif _use_torch_native:
         assert next_token_logits is not None
         out_predicts, out_accept_index, out_accept_token_num = (
-            _verify_tree_greedy_torch(next_token_logits, candidates, retrieve_index)
+            # The draft producer owns flat token storage; reshape within the
+            # compiled sampler to avoid materializing another TPU input view.
+            _verify_tree_greedy_torch(
+                next_token_logits, candidates.flatten(), retrieve_index
+            )
         )
         bs, num_verify_tokens = candidates.shape
         predicts[: bs * num_verify_tokens] = out_predicts.to(predicts.dtype)
@@ -651,14 +657,29 @@ def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
 def fused_draft_extend_select_argmax_func(
     next_token_logits: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
-    select_index: torch.Tensor,
+    num_accept_tokens: torch.Tensor,
+    num_tokens_per_req: int,
+    *,
+    logits_are_selected: bool = False,
 ):
-    """Select draft-extend rows and compute their greedy next-draft tokens."""
-    selected_logits = next_token_logits[select_index]
+    """Build next-draft state without materializing selectors or selected logits."""
+    row_starts = (
+        torch.arange(
+            num_accept_tokens.shape[0],
+            dtype=torch.int64,
+            device=num_accept_tokens.device,
+        )
+        * num_tokens_per_req
+    )
+    # Zero-count compile-padding rows select their own first window row.
+    select_index = row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
+    selected_logits = (
+        next_token_logits if logits_are_selected else next_token_logits[select_index]
+    )
     selected_hidden = hidden_states[select_index] if hidden_states is not None else None
     topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-    return selected_logits, selected_hidden, topk_p, topk_index
+    return selected_hidden, topk_p, topk_index
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
@@ -757,18 +778,29 @@ def eagle_prepare_for_verify(
         )
         device = batch.device
         if _use_torch_native:
-            # TPU: torch-native gather routed through the host mirrors.
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + verify_input.draft_token_num,
-                batch_size=bs,
-                draft_token_num=verify_input.draft_token_num,
-                device=device,
-                host_req_pool_indices=batch.req_pool_indices_cpu,
-                host_seq_lens=batch.seq_lens_cpu,
-            )
+            precomputed_cache_locs = verify_input.device_accept_cache_locs
+            if precomputed_cache_locs is not None:
+                assert precomputed_cache_locs.shape == (
+                    bs * verify_input.draft_token_num,
+                ), "precomputed cache locations must match verify tokens"
+                # The overlap FutureMap selected the accepted-length-dependent
+                # window on device. Reuse it for verify instead of consulting
+                # a deliberately stale host seq-len mirror.
+                batch.out_cache_loc = precomputed_cache_locs
+                verify_input.device_accept_cache_locs = None
+            else:
+                # TPU: torch-native gather routed through the host mirrors.
+                batch.out_cache_loc = assign_extend_cache_locs_func(
+                    req_pool_indices=batch.req_pool_indices,
+                    req_to_token=req_to_token_pool.req_to_token,
+                    start_offset=batch.seq_lens,
+                    end_offset=batch.seq_lens + verify_input.draft_token_num,
+                    batch_size=bs,
+                    draft_token_num=verify_input.draft_token_num,
+                    device=device,
+                    host_req_pool_indices=batch.req_pool_indices_cpu,
+                    host_seq_lens=batch.seq_lens_cpu,
+                )
         else:
             # Uniform variant: end offsets (= start + draft_token_num) are computed
             # inside the kernel, keeping the eager `seq_lens + N` add off the host
@@ -1187,10 +1219,15 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
+    # In overlap mode req.seqlen is one pending accepted bonus ahead of honest
+    # kv_committed_len while the following batch is prepared. Include that slot
+    # in the page-aligned allocation used by device-resident accept routing.
+    tpu_overlap = _use_torch_native and batch.enable_overlap
+    allocation_reserve = double_alloc + int(tpu_overlap)
 
     cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
         batch.reqs,
-        reserve=double_alloc,
+        reserve=allocation_reserve,
         page_size=page_size,
     )
     for r in batch.reqs:
@@ -1216,17 +1253,20 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     if _use_torch_native and batch.req_to_token_pool.host_resident:
         # TPU: req_to_token lives on the host, so allocate and write the page
         # table through the host mirrors instead of the device alloc path.
-        allocate_and_assign_decode_cache(
-            tree_cache=batch.tree_cache,
-            req_to_token_pool=batch.req_to_token_pool,
-            req_pool_indices=batch.req_pool_indices,
-            cur_kv_lens_cpu=cur_kv_lens_cpu,
-            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-            num_needed_tokens=num_needed_tokens,
-            batch_size=bs,
-            device=batch.device,
-            host_req_pool_indices=batch.req_pool_indices_cpu,
-        )
+        # Most paged decode steps fit in the existing reservation. Avoid the
+        # per-request allocator walk and empty H2D copies until a page is needed.
+        if num_needed_tokens > 0:
+            allocate_and_assign_decode_cache(
+                tree_cache=batch.tree_cache,
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                cur_kv_lens_cpu=cur_kv_lens_cpu,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed_tokens,
+                batch_size=bs,
+                device=batch.device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
+            )
         # Bookkeeping that alloc_for_spec_decode does for the device path.
         for i, req in enumerate(batch.reqs):
             req.kv.kv_allocated_len = max(
@@ -1249,6 +1289,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             num_needed_tokens=num_needed_tokens,
             batch=batch,
         )
+
+    if _use_torch_native:
+        prepare_device_accept_tpu(batch, bs=bs, double_alloc=double_alloc)
 
 
 def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:

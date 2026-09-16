@@ -1,7 +1,13 @@
 import copy
 import logging
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+        DraftContinuation,
+        VerifyContinuation,
+    )
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +50,15 @@ from sglang.srt.utils import is_tpu, next_power_of_2
 
 _is_tpu = is_tpu()
 
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.eagle_step_inputs import EagleRelayInputs
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        filter_device_accept_tpu,
+        merge_device_accept_tpu,
+    )
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +92,10 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+
+    # TPU-selected KV locations for this verification.
+    device_accept_cache_locs: Optional[torch.Tensor] = None
+    tpu_verify_tree: Optional[tuple] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -712,8 +731,19 @@ class EagleDraftInput(SpecInput):
     future_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
 
+    # TPU overlap keeps verify acceptance on device and selects the matching
+    # pre-reserved host page-table window without a per-step D2H barrier.
+    accept_lens_device: Optional[torch.Tensor] = None
+    device_accept_candidate_locs: Optional[torch.Tensor] = None
+    device_accept_selected_cache_locs: Optional[torch.Tensor] = None
+    tpu_relay_inputs: Optional["EagleRelayInputs"] = None
+
     # TPU RPA KV lengths for the current fused draft step.
     rpa_draft_kv_lens: Optional[torch.Tensor] = None
+
+    # One-cycle TPU producer state; consumed before the result is published.
+    tpu_verify_continuation: Optional["VerifyContinuation"] = None
+    tpu_draft_continuation: Optional["DraftContinuation"] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -782,6 +812,8 @@ class EagleDraftInput(SpecInput):
         new_indices: torch.Tensor,
         new_indices_cpu: Optional[List[int]] = None,
     ):
+        if _is_tpu:
+            filter_device_accept_tpu(self, new_indices)
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -797,6 +829,7 @@ class EagleDraftInput(SpecInput):
             self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
+        self.tpu_relay_inputs = None
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
@@ -806,6 +839,8 @@ class EagleDraftInput(SpecInput):
                 self.future_dsa_topk_indices_available
                 and spec_info.future_dsa_topk_indices_available
             )
+            if _is_tpu:
+                merge_device_accept_tpu(self, spec_info)
             return
 
         # Detect idle stub by `topk_index` length (idle inputs have
@@ -818,6 +853,14 @@ class EagleDraftInput(SpecInput):
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
             self.dsa_topk_indices = spec_info.dsa_topk_indices
+            if _is_tpu:
+                self.accept_lens_device = spec_info.accept_lens_device
+                self.device_accept_candidate_locs = (
+                    spec_info.device_accept_candidate_locs
+                )
+                self.device_accept_selected_cache_locs = (
+                    spec_info.device_accept_selected_cache_locs
+                )
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -830,6 +873,8 @@ class EagleDraftInput(SpecInput):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if _is_tpu:
+            merge_device_accept_tpu(self, spec_info)
         if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
             self.dsa_topk_indices = torch.cat(
                 [self.dsa_topk_indices, spec_info.dsa_topk_indices]

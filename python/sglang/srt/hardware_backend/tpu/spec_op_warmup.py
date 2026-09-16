@@ -18,6 +18,58 @@ class SpecOpWarmupContext:
     draft_vocab_size: int
     hidden_size: int
     hidden_dtype: torch.dtype
+    req_pool_size: int
+    verify_hidden_size: int = 0
+
+
+def make_future_map_device_accept_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    candidate_width = 2 * context.num_verify_tokens - 1
+    return (
+        torch.arange(context.physical_bs, dtype=torch.int64, device=context.device),
+        torch.zeros(
+            (context.req_pool_size, 1), dtype=torch.float32, device=context.device
+        ),
+        torch.zeros(
+            (context.req_pool_size, 1), dtype=torch.int64, device=context.device
+        ),
+        torch.zeros((context.req_pool_size,), dtype=torch.int64, device=context.device),
+        torch.zeros(
+            (context.physical_bs, candidate_width),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.ones((context.physical_bs,), dtype=torch.int32, device=context.device),
+        context.num_verify_tokens,
+    )
+
+
+def make_direct_accept_cache_args(context: SpecOpWarmupContext) -> tuple:
+    return (
+        torch.zeros(
+            (context.physical_bs, 2 * context.num_verify_tokens - 1),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.ones(context.physical_bs, dtype=torch.int32, device=context.device),
+        context.num_verify_tokens,
+    )
+
+
+def make_future_map_device_accept_hidden_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    common = make_future_map_device_accept_args(context)
+    return (
+        *common[:4],
+        torch.zeros(
+            (context.req_pool_size, context.hidden_size),
+            dtype=context.hidden_dtype,
+            device=context.device,
+        ),
+        *common[4:],
+    )
 
 
 def make_verify_tree_greedy_args(
@@ -31,7 +83,7 @@ def make_verify_tree_greedy_args(
             device=context.device,
         ),
         torch.zeros(
-            (context.physical_bs, context.num_verify_tokens),
+            (num_verify_rows,),
             dtype=torch.int64,
             device=context.device,
         ),
@@ -57,14 +109,8 @@ def make_verify_bookkeeping_args(
 
 def make_draft_extend_select_args(
     context: SpecOpWarmupContext,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor | int, ...]:
     num_verify_rows = context.physical_bs * context.num_verify_tokens
-    select_index = (
-        torch.arange(context.physical_bs, dtype=torch.int64, device=context.device)
-        * context.num_verify_tokens
-        + context.num_verify_tokens
-        - 1
-    )
     return (
         torch.zeros(
             (num_verify_rows, context.draft_vocab_size),
@@ -76,7 +122,13 @@ def make_draft_extend_select_args(
             dtype=context.hidden_dtype,
             device=context.device,
         ),
-        select_index,
+        torch.full(
+            (context.physical_bs,),
+            context.num_verify_tokens,
+            dtype=torch.int32,
+            device=context.device,
+        ),
+        context.num_verify_tokens,
     )
 
 
@@ -97,6 +149,27 @@ def make_dflash_verify_bookkeeping_args(
         torch.zeros(
             (context.physical_bs,),
             dtype=torch.int64,
+            device=context.device,
+        ),
+    )
+
+
+def make_extend_continuation_args(context: SpecOpWarmupContext) -> tuple:
+    return (
+        torch.zeros(
+            context.physical_bs * context.num_verify_tokens,
+            dtype=torch.int32,
+            device=context.device,
+        ),
+        torch.ones(context.physical_bs, dtype=torch.int32, device=context.device),
+        torch.ones(context.physical_bs, dtype=torch.int64, device=context.device),
+        context.num_verify_tokens,
+        torch.zeros(
+            (
+                context.physical_bs * context.num_verify_tokens,
+                context.verify_hidden_size or context.hidden_size,
+            ),
+            dtype=context.hidden_dtype,
             device=context.device,
         ),
     )

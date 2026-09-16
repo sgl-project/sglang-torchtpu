@@ -6,6 +6,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -441,7 +442,7 @@ class TestGreedyVerifyTorchEquivalence(unittest.TestCase):
                     logits, candidates, retrieve_index
                 )
                 got_p, got_ai, got_lens = _verify_tree_greedy_torch(
-                    logits, candidates, retrieve_index
+                    logits, candidates.flatten(), retrieve_index
                 )
 
                 with self.subTest(bs=bs, ntv=ntv, trial=trial):
@@ -449,6 +450,36 @@ class TestGreedyVerifyTorchEquivalence(unittest.TestCase):
                     self.assertTrue(torch.equal(got_ai, want_ai))
                     # fused returns accept_len (incl. bonus); reference counts drafts
                     self.assertTrue(torch.equal(got_lens - 1, want_n))
+
+    def test_native_dispatch_keeps_flat_candidate_storage(self):
+        from sglang.srt.speculative import eagle_utils
+
+        flat_tokens = torch.arange(8, dtype=torch.int64)
+        retrieve_index = torch.arange(8).reshape(2, 4)
+        with (
+            patch.object(eagle_utils, "_is_cpu", False),
+            patch.object(eagle_utils, "_use_torch_native", True),
+            patch.object(
+                eagle_utils,
+                "_verify_tree_greedy_torch",
+                wraps=eagle_utils._verify_tree_greedy_torch,
+            ) as compiled_verify,
+        ):
+            eagle_utils.verify_tree_greedy_func(
+                torch.zeros(8, dtype=torch.int32),
+                torch.full((2, 4), -1, dtype=torch.int32),
+                torch.empty(2, dtype=torch.int32),
+                flat_tokens.view(2, 4),
+                retrieve_index,
+                None,
+                None,
+                None,
+                topk=1,
+                next_token_logits=torch.zeros((8, 8)),
+            )
+        dispatched_tokens = compiled_verify.call_args.args[1]
+        self.assertEqual(dispatched_tokens.shape, (8,))
+        self.assertEqual(dispatched_tokens.data_ptr(), flat_tokens.data_ptr())
 
     def test_handles_single_verify_token(self):
         from sglang.srt.speculative.eagle_utils import _verify_tree_greedy_torch
@@ -532,15 +563,14 @@ class TestDraftExtendSelectFused(unittest.TestCase):
                 torch.arange(0, bs * ndt, ndt, dtype=torch.int32) + accept_lens - 1
             ).long()
 
-            sel_l, sel_h, tp, ti = fused_draft_extend_select_argmax_func(
-                logits, hidden, select_index
+            sel_h, tp, ti = fused_draft_extend_select_argmax_func(
+                logits, hidden, accept_lens, ndt
             )
 
             want_l = logits[select_index]
             want_h = hidden[select_index]
             want_ti = torch.argmax(want_l, dim=-1, keepdim=True)
             with self.subTest(bs=bs, ndt=ndt):
-                self.assertTrue(torch.equal(sel_l, want_l))
                 self.assertTrue(torch.equal(sel_h, want_h))
                 self.assertTrue(torch.equal(ti, want_ti))
                 self.assertTrue(torch.all(tp == 1.0))
@@ -552,11 +582,31 @@ class TestDraftExtendSelectFused(unittest.TestCase):
         )
 
         logits = torch.randn(8, 16)
-        sel_l, sel_h, _, _ = fused_draft_extend_select_argmax_func(
-            logits, None, torch.tensor([1, 5])
+        sel_h, tp, ti = fused_draft_extend_select_argmax_func(
+            logits, None, torch.tensor([2, 2], dtype=torch.int32), 4
         )
         self.assertIsNone(sel_h)
-        self.assertEqual(sel_l.shape, (2, 16))
+        self.assertTrue(torch.equal(ti, logits[[1, 5]].argmax(-1, keepdim=True)))
+
+    def test_fused_finalize_preserves_padding_rows_and_argmax_ties(self):
+        from sglang.srt.speculative.eagle_utils import (
+            fused_draft_extend_select_argmax_func,
+        )
+
+        # Mixed acceptance selects rows 1, 7 and 8; padded row 8 must not
+        # alias the preceding request's final row 7. Equal maxima choose first.
+        logits = torch.zeros(12, 7)
+        logits[1, 2:4] = 5
+        logits[7, 4] = 6
+        logits[8, 1] = 7
+        hidden = torch.arange(36, dtype=torch.bfloat16).reshape(12, 3)
+        selected_hidden, probs, tokens = fused_draft_extend_select_argmax_func(
+            logits, hidden, torch.tensor([2, 4, 0], dtype=torch.int32), 4
+        )
+        self.assertTrue(torch.equal(tokens, torch.tensor([[2], [4], [1]])))
+        self.assertTrue(torch.equal(selected_hidden, hidden[[1, 7, 8]]))
+        self.assertEqual(probs.dtype, torch.float32)
+        self.assertEqual(tokens.dtype, torch.int64)
 
     def test_draft_extend_input_builds_a_safe_bucketed_selector(self):
         from sglang.srt.speculative.eagle_info import EagleDraftExtendInput

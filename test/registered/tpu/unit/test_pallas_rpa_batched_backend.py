@@ -38,6 +38,9 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self.forward_metadata = None
         self._op = None
         self._distribution_cache = {}
+        self._fixed_offsets_cache = {}
+        self._active_num_tokens_cache = {}
+        self._host_cu_lens_cache = None
         self._is_hybrid_swa = False
         self.token_to_kv_pool = None
 
@@ -60,6 +63,7 @@ def _make_forward_batch(
         req_pool_indices_cpu=req_pool_indices_cpu,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=None,
         spec_info=spec_info,
         seq_lens_cpu=seq_lens_cpu,
     )

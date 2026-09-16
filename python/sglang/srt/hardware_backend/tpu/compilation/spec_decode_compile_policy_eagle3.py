@@ -188,6 +188,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self._draft_eager_backbone_forward: Callable[..., Any] | None = None
         self._draft_eager_model_forward: Callable[..., Any] | None = None
         self._draft_eager_logits_forward: Callable[..., Any] | None = None
+        self.prepared_eagle_step = None
 
         if self.speculative_algorithm and self.speculative_algorithm != "EAGLE3":
             raise ValueError(
@@ -219,7 +220,22 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             self._draft_eager_backbone_forward = self.owner.model.forward
             self._draft_eager_model_forward = self.owner.forward
             self._draft_eager_logits_forward = self.owner.logits_processor.forward
-        return super().install()
+        installed = super().install()
+        if (
+            installed
+            and self.is_draft_worker
+            and self.tracer == "direct"
+            and self.speculative_eagle_topk == 1
+            and not is_dp_attention_enabled()
+            and not self.target_is_multimodal
+            and not get_spec().speculative_use_rejection_sampling
+        ):
+            from sglang.srt.hardware_backend.tpu.eagle_draft_extend import (
+                install_fused_draft_extend,
+            )
+
+            install_fused_draft_extend(self)
+        return installed
 
     def compile_fused_draft_steps(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Compile the multi-step EAGLE draft loop with the selected tracer."""
@@ -376,6 +392,12 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
     def prepare_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Bucket once, then record the phase's logical and physical shapes."""
+        if (
+            self.prepared_eagle_step is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            self.prepared_eagle_step.prepare_verify(forward_batch)
+            return
         spec_info = forward_batch.spec_info
         if spec_info is None:
             return super().prepare_forward_batch(forward_batch)
@@ -917,7 +939,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             # for every model call in the fused loop.
             self.prepare_spec_forward_batch(forward_batch)
             self.model_runner.model.prepare_forward_batch(forward_batch)
-            draft_attn_backend.init_forward_metadata(forward_batch)
+            draft_attn_backend.init_forward_metadata(forward_batch, fused_draft=True)
             forward_batch.mark_forward_metadata_ready()
             # The live draft path has consumed this seed before entering the
             # fused loop. Match its state so Dynamo reuses the warmup graph.
@@ -958,7 +980,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 bs=bs,
                 mode=ForwardMode.DRAFT_EXTEND_V2,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                spec_info=self._make_draft_extend_spec_info(),
+                spec_info=self._make_draft_extend_spec_info(bs),
                 attn_backend=attn_backend,
             )
             return f"bs={bs}, tokens={num_tokens}"
@@ -1011,8 +1033,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         )
         return spec_info
 
-    def _make_draft_extend_spec_info(self) -> EagleDraftExtendInput:
-        """EagleDraftExtendInput stub for DRAFT_EXTEND_V2 precompilation."""
+    def _make_draft_extend_spec_info(self, bs: int) -> EagleDraftExtendInput:
+        """Build batch-shaped acceptance for DRAFT_EXTEND_V2 precompilation."""
         spec_info = EagleDraftExtendInput.create_idle_input(
             device=self.model_runner.device,
             hidden_size=self.eagle_hidden_size or 1,
@@ -1021,6 +1043,16 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         )
         spec_info.num_tokens_per_req = self.draft_token_num
         spec_info.num_tokens_for_logprob_per_req = self.draft_token_num
+        # The fused extension selects one LM-head row per acceptance count.
+        # Exact-bucket warmups bypass padding, so an idle (empty) vector would
+        # produce zero logits rows and an invalid distributed all-gather.
+        spec_info.num_accept_tokens = torch.full(
+            (bs,),
+            self.draft_token_num,
+            device=self.model_runner.device,
+            dtype=torch.int32,
+        )
+        spec_info.num_correct_drafts = spec_info.num_accept_tokens - 1
         return spec_info
 
     def make_null_spec_info(self) -> EagleDraftInput:
@@ -1193,6 +1225,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
     def _pad_draft_decode(self, forward_batch: ForwardBatch) -> None:
         """Pad the speculative draft-decode batch to a torch.compile bs bucket."""
+        if self.prepared_eagle_step is not None:
+            self.prepared_eagle_step.prepare_draft(forward_batch)
+            return
         b_bucketer = self.b_bucketer
         if b_bucketer is None:
             return
@@ -1246,6 +1281,11 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # EagleDraftInput seeds consumed by select_top_k_tokens.
         spec_info = forward_batch.spec_info
         if isinstance(spec_info, EagleDraftInput):
+            from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+                install_draft_continuation_tpu,
+            )
+
+            install_draft_continuation_tpu(spec_info, pad_b)
             _pad_eagle_draft_input(spec_info, pad_b)
             logical_bs, logical_tokens = self._logical_spec_shape(
                 forward_batch,
@@ -1292,7 +1332,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             max(real_bs, self._dp_peer_draft_extend_rows(forward_batch))
         )
         pad_tokens = pad_b * self.draft_token_num
-        if pad_b != real_bs:
+        if self.prepared_eagle_step is not None:
+            self.prepared_eagle_step.prepare_extend(forward_batch)
+        elif pad_b != real_bs:
             # Draft extend has a fixed width, so it needs no token bucket.
             # This also grows its owned token- and request-axis tensors.
             forward_batch._pad_inputs_to_size(
@@ -1388,28 +1430,51 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
 
         # Build every replacement before publishing any of them, so an error
         # cannot leave the caller with a partially padded batch.
-        seq_lens = _pad_rows(padding.seq_lens, pad_bs, 0)
-        draft_token = _pad_rows(
-            padding.draft_token,
-            pad_bs * verify_input.draft_token_num,
-            _DRAFT_TOKEN_FILL,
-        )
-        retrieve_index = _pad_rows(padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL)
-        temperatures = (
-            _pad_rows(padding.temperatures, pad_bs, _TEMPERATURE_FILL)
-            if padding.temperatures is not None
-            else None
-        )
-        top_ks = (
-            _pad_rows(padding.top_ks, pad_bs, _TOP_K_FILL)
-            if padding.top_ks is not None
-            else None
-        )
-        top_ps = (
-            _pad_rows(padding.top_ps, pad_bs, _TOP_P_FILL)
-            if padding.top_ps is not None
-            else None
-        )
+        prepared = self.prepared_eagle_step
+        if prepared is not None:
+            assert padding.seq_lens is prepared.logical_seq_lens
+            assert prepared.verify_tokens is not None
+            seq_lens = prepared.inputs.seq_lens
+            draft_token = prepared.verify_tokens
+            retrieve_index = prepared.layout.retrieve_index
+            temperatures, top_ks, top_ps = prepared.sampling
+        else:
+            seq_lens = _pad_rows(padding.seq_lens, pad_bs, 0)
+            tree = (
+                verify_input.tpu_verify_tree
+                if isinstance(verify_input, EagleVerifyInput)
+                else None
+            )
+            if tree is not None and tree[-1].shape == (
+                state.physical_batch_size,
+                verify_input.draft_token_num,
+            ):
+                draft_token = tree[-1].flatten()
+                retrieve_index = tree[2]
+            else:
+                draft_token = _pad_rows(
+                    padding.draft_token,
+                    pad_bs * verify_input.draft_token_num,
+                    _DRAFT_TOKEN_FILL,
+                )
+                retrieve_index = _pad_rows(
+                    padding.retrieve_index, pad_bs, _RETRIEVE_INDEX_FILL
+                )
+            temperatures = (
+                _pad_rows(padding.temperatures, pad_bs, _TEMPERATURE_FILL)
+                if padding.temperatures is not None
+                else None
+            )
+            top_ks = (
+                _pad_rows(padding.top_ks, pad_bs, _TOP_K_FILL)
+                if padding.top_ks is not None
+                else None
+            )
+            top_ps = (
+                _pad_rows(padding.top_ps, pad_bs, _TOP_P_FILL)
+                if padding.top_ps is not None
+                else None
+            )
 
         # Publish padded tensors only while eagle_sample runs.
         # A logically idle DP peer must take the same sampling/bookkeeping

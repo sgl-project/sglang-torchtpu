@@ -79,10 +79,13 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         "next_token_global_top_k_logits",
         "next_token_global_top_k_token_ids",
         "next_draft_tokens",
+        "tpu_draft_extend_outputs",
     ):
         value = getattr(out, field, None)
         if isinstance(value, torch.Tensor):
             tensors.append(value)
+        elif isinstance(value, tuple):
+            tensors.extend(value)
 
     if getattr(attn_backend, "requires_kv_sync_after_compile", False):
         pool = token_to_kv_pool

@@ -20,6 +20,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.padded_spec_state import PaddedResultCopy
     from sglang.srt.hardware_backend.tpu.result_copy_worker import TpuAsyncCopyEvent
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.sampling.sampling_observer import HostAuxiliaryOutput
@@ -69,6 +70,7 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, TpuAsyncCopyEvent]] = None
+    tpu_padded_result: Optional[PaddedResultCopy] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -152,10 +154,15 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
             )
-        self.next_token_ids = _async_d2h(self.next_token_ids)
-
-        if self.accept_lens is not None:
-            self.accept_lens = _async_d2h(self.accept_lens)
+        if self.tpu_padded_result is not None:
+            self.next_token_ids, self.accept_lens = self.tpu_padded_result.copy_to_cpu(
+                _async_d2h
+            )
+            self.tpu_padded_result = None
+        else:
+            self.next_token_ids = _async_d2h(self.next_token_ids)
+            if self.accept_lens is not None:
+                self.accept_lens = _async_d2h(self.accept_lens)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

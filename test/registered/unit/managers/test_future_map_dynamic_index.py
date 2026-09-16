@@ -20,6 +20,7 @@ dynamic-index ``_store`` seam (fork PR #78) is preserved and is what we test.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -28,6 +29,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+    _select_device_accept_cache_locs,
+    resolve_spec_extras_tpu,
+)
 from sglang.srt.managers.overlap_utils import (
     _DYNAMIC_INDEX_DEVICE_TYPES,
     FutureMap,
@@ -129,6 +134,63 @@ class TestDynamicIndexEquivalence(CustomTestCase):
         fm._store(buf, torch.tensor([1, 2]), torch.tensor([5, 6], dtype=torch.int32))
         self.assertEqual(buf[1].item(), 5)
         self.assertEqual(buf[2].item(), 6)
+
+
+class TestNonEagleRelay(CustomTestCase):
+    def test_dflash_and_dspark_skip_eagle_acceptance_fields(self):
+        """Non-EAGLE overlap inputs do not carry EAGLE acceptance state."""
+        from sglang.srt.managers import overlap_utils
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        for algorithm in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DSPARK):
+            for is_tpu in (False, True):
+                with self.subTest(algorithm=algorithm, is_tpu=is_tpu):
+                    future_map = _make_future_map()
+                    future_map.spec_algo = algorithm
+                    future_map.need_topk = False
+                    future_map.need_hidden_states = False
+                    future_map.output_tokens_buf[1] = 29
+                    draft_input = DFlashDraftInputV2.create_idle_input(
+                        device=torch.device("cpu")
+                    )
+                    draft_input.future_indices = torch.tensor([1])
+                    batch = SimpleNamespace(
+                        spec_info=draft_input,
+                    )
+                    with (
+                        patch.object(overlap_utils, "_is_tpu", is_tpu),
+                        patch.object(
+                            overlap_utils,
+                            "resolve_spec_extras_tpu",
+                            resolve_spec_extras_tpu,
+                            create=True,
+                        ),
+                        patch.object(overlap_utils, "_DEBUG_ASSERT", False),
+                        patch.object(torch.Tensor, "record_stream"),
+                        patch.object(torch, "get_device_module") as device_module,
+                    ):
+                        device_module.return_value.current_stream.return_value = None
+                        future_map._resolve_spec_extras(batch)
+                    self.assertEqual(draft_input.bonus_tokens.tolist(), [29])
+
+
+class TestDeviceAcceptCacheSelection(CustomTestCase):
+    def test_selects_window_from_accepted_length(self):
+        # Exercise every acceptance length, including both reservation edges,
+        # for short proposals as well as the original four-token window.
+        for width in (2, 3, 4):
+            with self.subTest(width=width):
+                candidates = torch.arange(2 * width - 1).repeat(width, 1)
+                actual = _select_device_accept_cache_locs(
+                    candidates,
+                    torch.arange(1, width + 1, dtype=torch.int32),
+                    width=width,
+                )
+                expected = torch.tensor(
+                    [list(range(start, start + width)) for start in range(width)]
+                )
+                self.assertTrue(torch.equal(actual, expected))
 
 
 if __name__ == "__main__":

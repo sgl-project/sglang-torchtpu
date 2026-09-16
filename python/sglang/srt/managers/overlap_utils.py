@@ -16,6 +16,12 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu
 
 _is_tpu = is_tpu()
 
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        resolve_device_accept_seq_lens_tpu,
+        resolve_spec_extras_tpu,
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -288,6 +294,8 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
+        self._tpu_precompiled_batch_sizes: frozenset[int] = frozenset()
+        self.tpu_direct_handoff = None
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -346,6 +354,9 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+
+    def set_tpu_precompiled_batch_sizes(self, batch_sizes: Sequence[int]) -> None:
+        self._tpu_precompiled_batch_sizes = frozenset(batch_sizes)
 
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.
@@ -431,6 +442,8 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        if _is_tpu and resolve_spec_extras_tpu(self, batch):
+            return
         if self.spec_algo.is_ngram():
             draft_input = batch.spec_info
             if draft_input is None or draft_input.future_indices is None:
@@ -531,6 +544,8 @@ class FutureMap:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
+        if _is_tpu and resolve_device_accept_seq_lens_tpu(self, batch):
+            return
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
@@ -595,6 +610,12 @@ class FutureMap:
             )
 
     def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+        if _is_tpu:
+            from sglang.srt.hardware_backend.tpu.direct_handoff import (
+                flush_direct_handoff_tpu,
+            )
+
+            flush_direct_handoff_tpu(self)
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.

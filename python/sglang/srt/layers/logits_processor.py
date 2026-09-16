@@ -241,6 +241,11 @@ class LogitsProcessorOutput:
     # Sampled draft token IDs when draft sampling is fused into draft model forward
     next_draft_tokens: Optional[torch.Tensor] = None
 
+    # Owned physical-batch (hidden states, probabilities, tokens) on TPU.
+    tpu_draft_extend_outputs: Optional[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = None
+
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 

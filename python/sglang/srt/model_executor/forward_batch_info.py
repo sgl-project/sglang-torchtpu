@@ -34,6 +34,7 @@ from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.position import compute_position_triton
@@ -403,6 +404,15 @@ class NgramEmbeddingInfo:
         )
 
 
+class PreparedExtendMetadata(msgspec.Struct, frozen=True):
+    seq_lens: torch.Tensor
+    prefix_lens: torch.Tensor
+    positions: torch.Tensor
+    start_loc: torch.Tensor
+    seq_lens_cpu: list[int]
+    prefix_lens_cpu: list[int]
+
+
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     """Store all inputs of a forward pass."""
@@ -746,6 +756,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        prepared_extend_metadata: Optional[PreparedExtendMetadata] = None,
     ):
         # init_new must not mutate the input ScheduleBatch; per-forward
         # overrides go through explicit keyword arguments.
@@ -914,7 +925,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            if isinstance(extend_seq_lens, list):
+            if prepared_extend_metadata is not None:
+                ret.extend_seq_lens = prepared_extend_metadata.seq_lens
+                ret.extend_prefix_lens = prepared_extend_metadata.prefix_lens
+                ret.extend_seq_lens_cpu = prepared_extend_metadata.seq_lens_cpu
+                ret.extend_prefix_lens_cpu = prepared_extend_metadata.prefix_lens_cpu
+            elif isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
                 pin_memory = is_pin_memory_available(device)
@@ -932,12 +948,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
             ret.extend_num_tokens = batch.extend_num_tokens
-            positions, ret.extend_start_loc = compute_position(
-                model_runner.prefill_attention_backend_str,
-                ret.extend_prefix_lens,
-                ret.extend_seq_lens,
-                ret.extend_num_tokens,
-            )
+            if prepared_extend_metadata is not None:
+                positions = prepared_extend_metadata.positions
+                ret.extend_start_loc = prepared_extend_metadata.start_loc
+            else:
+                positions, ret.extend_start_loc = compute_position(
+                    model_runner.prefill_attention_backend_str,
+                    ret.extend_prefix_lens,
+                    ret.extend_seq_lens,
+                    ret.extend_num_tokens,
+                )
             if ret.positions is None:
                 ret.positions = positions
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
@@ -1297,6 +1317,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        if _is_tpu and tensor.shape[0] == size:
+            return tensor
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],

@@ -527,6 +527,7 @@ class TestEagle3SpecDecodeCompilePolicyPadding(CustomTestCase):
     def test_draft_decode_pads_req_pool_indices_cpu_to_bucket(self):
         policy = object.__new__(Eagle3SpecDecodeCompilePolicyMixin)
         policy.b_bucketer = _bucketer("Bs", [1, 2, 4])
+        policy.prepared_eagle_step = None
         fb = _forward_batch(real_t=3, real_b=3, mode="decode")
 
         policy._pad_draft_decode(fb)

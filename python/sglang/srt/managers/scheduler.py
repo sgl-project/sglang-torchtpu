@@ -1657,6 +1657,10 @@ class Scheduler(
             or draft_runner.model.config.vocab_size
         )
 
+        from sglang.srt.speculative.eagle_utils import (
+            get_draft_input_from_target_hidden_dim,
+        )
+
         precompile_spec_v2_ops(
             device=torch.device(self.device),
             physical_batch_buckets=compile_policy.b_bucketer.buckets,
@@ -1665,6 +1669,11 @@ class Scheduler(
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
+            req_pool_size=self.future_map.req_pool_size,
+            verify_hidden_size=get_draft_input_from_target_hidden_dim(draft_runner),
+        )
+        self.future_map.set_tpu_precompiled_batch_sizes(
+            compile_policy.b_bucketer.buckets
         )
 
     def maybe_init_ngram_embedding(self):
@@ -4286,6 +4295,15 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
+        if current_platform.is_tpu() and batch.beam_tail is None:
+            from sglang.srt.hardware_backend.tpu.direct_handoff import (
+                stash_direct_handoff_tpu,
+            )
+
+            if stash_direct_handoff_tpu(
+                self.future_map, batch, future_indices, payload, batch_result
+            ):
+                return
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req

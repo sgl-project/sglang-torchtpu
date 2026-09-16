@@ -7,10 +7,12 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 import sglang.srt.speculative.eagle_utils as eagle_utils
 import sglang.srt.speculative.spec_utils as kernels
+from sglang.srt.hardware_backend.tpu import eagle_utils_tpu
 
 
 class _ForceTpu:
@@ -393,11 +395,19 @@ def test_eagle_prepare_for_decode_uses_torch_native_allocator():
         req_pool_indices=req_pool_indices,
         req_pool_indices_cpu=req_pool_indices_cpu,
         device=torch.device("cpu"),
+        enable_overlap=False,
+        spec_info=None,
     )
     out = torch.arange(5)
 
     with (
         patch.object(eagle_utils, "_use_torch_native", True),
+        patch.object(
+            eagle_utils,
+            "prepare_device_accept_tpu",
+            eagle_utils_tpu.prepare_device_accept_tpu,
+            create=True,
+        ),
         patch.object(eagle_utils, "get_alloc_reserve_per_decode", return_value=4),
         patch.object(
             kernels, "allocate_and_assign_decode_cache", return_value=out
@@ -477,6 +487,407 @@ def test_dflash_prepare_for_decode_uses_torch_native_allocator():
     )
     assert reqs[0].kv.kv_allocated_len == 11
     assert reqs[1].kv.kv_allocated_len == 9
+
+
+@pytest.mark.parametrize("preallocated", [False, True])
+@pytest.mark.parametrize(
+    "page_size,num_steps,num_draft_tokens,candidate_width",
+    [(1, 1, 2, 3), (16, 2, 3, 5), (64, 3, 4, 7), (64, 0, 1, None)],
+)
+def test_eagle_prepare_for_decode_builds_device_accept_window_for_paged_tpu(
+    page_size, num_steps, num_draft_tokens, candidate_width, preallocated
+):
+    spec = SimpleNamespace(
+        speculative_num_steps=num_steps,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=num_draft_tokens,
+        speculative_use_rejection_sampling=False,
+    )
+    host_base = max(1, page_size - 2)
+    initial_alloc_len = 128 if preallocated else 0
+    req = SimpleNamespace(
+        kv=SimpleNamespace(
+            kv_allocated_len=initial_alloc_len, kv_committed_len=host_base - 1
+        ),
+        decode_batch_idx=0,
+        seqlen=host_base,
+        lora_id=None,
+    )
+    table = torch.arange(2 * 512, dtype=torch.int32).reshape(2, 512)
+    draft_input = SimpleNamespace(
+        accept_lens_device=torch.tensor([num_draft_tokens], dtype=torch.int32),
+        device_accept_candidate_locs=None,
+        device_accept_selected_cache_locs=torch.tensor([[999]]),
+    )
+    batch = SimpleNamespace(
+        maybe_evict_swa=Mock(),
+        batch_size=Mock(return_value=1),
+        sampling_info=SimpleNamespace(
+            penalizer_orchestrator=SimpleNamespace(is_required=False)
+        ),
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=page_size),
+        reqs=[req],
+        tree_cache=object(),
+        req_to_token_pool=SimpleNamespace(host_resident=True, req_to_token=table),
+        req_pool_indices=torch.tensor([1], dtype=torch.int64),
+        req_pool_indices_cpu=torch.tensor([1], dtype=torch.int64),
+        device=torch.device("cpu"),
+        enable_overlap=True,
+        spec_info=draft_input,
+        return_logprob=False,
+        has_grammar=False,
+    )
+
+    with (
+        patch.object(eagle_utils, "_use_torch_native", True),
+        patch.object(
+            eagle_utils,
+            "prepare_device_accept_tpu",
+            eagle_utils_tpu.prepare_device_accept_tpu,
+            create=True,
+        ),
+        patch.object(
+            eagle_utils,
+            "get_alloc_reserve_per_decode",
+            return_value=2 * num_draft_tokens,
+        ),
+        patch.object(eagle_utils, "get_spec", return_value=spec),
+        patch.object(eagle_utils_tpu, "get_spec", return_value=spec),
+        patch.object(kernels, "allocate_and_assign_decode_cache") as allocate,
+    ):
+        eagle_utils.eagle_prepare_for_decode(batch)
+
+    if preallocated:
+        allocate.assert_not_called()
+    else:
+        allocate.assert_called_once()
+    assert req.decode_batch_idx == 1
+    batch.maybe_evict_swa.assert_called_once()
+    expected_alloc = max(
+        initial_alloc_len,
+        (host_base + 2 * num_draft_tokens + page_size - 1) // page_size * page_size,
+    )
+    assert req.kv.kv_allocated_len == expected_alloc
+
+    if candidate_width is None:
+        assert draft_input.device_accept_candidate_locs is None
+        return
+
+    assert draft_input.device_accept_selected_cache_locs is None
+    assert torch.equal(batch.seq_lens_cpu, torch.tensor([host_base]))
+    assert batch.seq_lens_sum == host_base
+    # The candidate window covers minimum and maximum acceptance followed
+    # by the next full-width verification window.
+    assert torch.equal(
+        draft_input.device_accept_candidate_locs,
+        table[1, host_base + 1 : host_base + 1 + candidate_width]
+        .to(torch.int64)
+        .reshape(1, candidate_width),
+    )
+
+
+def test_device_accept_state_tracks_filtered_and_merged_future_rows():
+    from sglang.srt.speculative import eagle_info
+
+    candidates = torch.arange(15).reshape(3, 5)
+    draft = eagle_info.EagleDraftInput(
+        future_indices=torch.tensor([10, 11, 12]),
+        accept_lens_device=torch.tensor([1, 2, 3]),
+        device_accept_candidate_locs=candidates,
+        device_accept_selected_cache_locs=candidates[:, :3],
+    )
+    other = eagle_info.EagleDraftInput(
+        future_indices=torch.tensor([13]),
+        accept_lens_device=torch.tensor([2]),
+        device_accept_candidate_locs=torch.arange(20, 25).reshape(1, 5),
+    )
+    with (
+        patch.object(eagle_info, "_is_tpu", True),
+        patch.object(
+            eagle_info,
+            "filter_device_accept_tpu",
+            eagle_utils_tpu.filter_device_accept_tpu,
+            create=True,
+        ),
+        patch.object(
+            eagle_info,
+            "merge_device_accept_tpu",
+            eagle_utils_tpu.merge_device_accept_tpu,
+            create=True,
+        ),
+    ):
+        draft.filter_batch(torch.tensor([2, 0]))
+        torch.testing.assert_close(draft.future_indices, torch.tensor([12, 10]))
+        torch.testing.assert_close(draft.accept_lens_device, torch.tensor([3, 1]))
+        torch.testing.assert_close(
+            draft.device_accept_selected_cache_locs, candidates[[2, 0], :3]
+        )
+        draft.merge_batch(other)
+        torch.testing.assert_close(draft.future_indices, torch.tensor([12, 10, 13]))
+        torch.testing.assert_close(draft.accept_lens_device, torch.tensor([3, 1, 2]))
+        torch.testing.assert_close(
+            draft.device_accept_candidate_locs,
+            torch.cat([candidates[[2, 0]], other.device_accept_candidate_locs]),
+        )
+        assert draft.device_accept_selected_cache_locs is None
+        draft.merge_batch(eagle_info.EagleDraftInput(future_indices=torch.tensor([14])))
+        assert draft.accept_lens_device is None
+        assert draft.device_accept_candidate_locs is None
+
+
+@pytest.mark.parametrize(
+    "candidate_shape,accept_shape",
+    [((5,), (1,)), ((2, 5), (1,)), ((1, 5), (2,)), ((1, 4), (1,))],
+)
+def test_device_accept_rejects_invalid_future_window(candidate_shape, accept_shape):
+    from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        resolve_spec_extras_tpu,
+    )
+
+    batch = SimpleNamespace(
+        spec_info=SimpleNamespace(
+            future_indices=torch.tensor([0]),
+            device_accept_candidate_locs=torch.zeros(candidate_shape),
+            device_accept_selected_cache_locs=None,
+            accept_lens_device=torch.ones(accept_shape),
+            future_dsa_topk_indices_available=False,
+        ),
+    )
+    future_map = SimpleNamespace(need_topk=True, draft_probs_buf=None)
+    with pytest.raises(AssertionError, match="cache|acceptance"):
+        resolve_spec_extras_tpu(future_map, batch)
+
+
+@pytest.mark.parametrize("is_tpu", (False, True))
+def test_device_accept_cache_window_follows_verify_input(is_tpu):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.speculative import eagle_worker_common
+    from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+    selected = torch.arange(8).reshape(2, 4)
+    draft_input = EagleDraftInput(device_accept_selected_cache_locs=selected)
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        seq_lens=torch.tensor([10, 20]),
+        spec_info=draft_input,
+    )
+    prebuilt_tree = (torch.ones(1, dtype=torch.bool),) + tuple(
+        torch.zeros((2, 4), dtype=torch.int64) for _ in range(5)
+    )
+
+    def build():
+        return eagle_worker_common.build_eagle_verify_input(
+            batch,
+            batch.spec_info,
+            None,
+            None,
+            None,
+            None,
+            target_worker=None,
+            topk=1,
+            num_steps=3,
+            num_draft_tokens=4,
+            tree_mask_mode=None,
+            device="cpu",
+            prebuilt_tree=prebuilt_tree,
+        )
+
+    with (
+        patch.object(eagle_worker_common, "_is_tpu", is_tpu),
+        patch.object(
+            eagle_worker_common,
+            "device_accept_verify_cache_locs_tpu",
+            eagle_utils_tpu.device_accept_verify_cache_locs_tpu,
+            create=True,
+        ),
+    ):
+        verify_input = build()
+        batch.spec_info = verify_input
+        if is_tpu:
+            torch.testing.assert_close(
+                verify_input.device_accept_cache_locs, selected.flatten()
+            )
+        else:
+            assert verify_input.device_accept_cache_locs is None
+        # A fresh iteration must not inherit the previous verify window.
+        batch.spec_info = EagleDraftInput()
+        assert build().device_accept_cache_locs is None
+        # Resetting draft routing does not mutate an in-flight verify input.
+        draft_input.device_accept_selected_cache_locs = None
+        if is_tpu:
+            torch.testing.assert_close(
+                verify_input.device_accept_cache_locs, selected.flatten()
+            )
+
+
+@pytest.mark.parametrize("with_hidden", (False, True))
+@pytest.mark.parametrize(
+    "bs,buckets,compile_enabled,physical_bs",
+    [
+        (3, (), False, 3),
+        (2, (4, 2), True, 2),
+        (3, (4, 2), True, 4),
+        (4, (4, 2), True, 4),
+        (3, (), True, None),
+        (5, (4, 2), True, None),
+    ],
+)
+def test_device_accept_gather_uses_covering_bucket(
+    bs, with_hidden, buckets, compile_enabled, physical_bs
+):
+    from sglang.srt.hardware_backend.tpu import overlap_utils_tpu
+    from sglang.srt.managers import overlap_utils
+
+    indices = torch.arange(1, bs + 1, dtype=torch.int64)
+    candidates = torch.arange(bs * 7).reshape(bs, 7)
+    accept_lens = torch.arange(bs, dtype=torch.int32) % 4 + 1
+    draft = SimpleNamespace(
+        future_indices=indices,
+        device_accept_candidate_locs=candidates,
+        device_accept_selected_cache_locs=None,
+        accept_lens_device=accept_lens,
+        future_dsa_topk_indices_available=False,
+        tpu_draft_continuation=None,
+        hidden_states=None,
+    )
+    future_map = SimpleNamespace(
+        publish_ready=None,
+        tpu_direct_handoff=None,
+        new_seq_lens_buf=torch.arange(8) + 20,
+        need_topk=True,
+        need_hidden_states=with_hidden,
+        draft_probs_buf=None,
+        _tpu_precompiled_batch_sizes=frozenset(buckets),
+        topk_p_buf=torch.arange(8, dtype=torch.float32)[:, None],
+        topk_index_buf=torch.arange(8)[:, None],
+        output_tokens_buf=torch.arange(8) + 10,
+        hidden_states_buf=torch.arange(16).reshape(8, 2) if with_hidden else None,
+    )
+    batch = SimpleNamespace(spec_info=draft, seq_lens_cpu=torch.tensor([99]))
+    # Padding may read an unpopulated pool row, but must not publish or
+    # debug-check its token, nor invalidate it as a real consumed row.
+    future_map.output_tokens_buf[0] = -1
+    name = (
+        "fused_future_map_device_accept_hidden_tpu"
+        if with_hidden
+        else "fused_future_map_device_accept_tpu"
+    )
+    op = getattr(overlap_utils_tpu, name)
+
+    def invalidate(values, buf, rows):
+        assert (values >= 0).all()
+        buf[rows] = -1
+
+    with (
+        patch.object(overlap_utils, "_is_tpu", True),
+        patch.object(
+            overlap_utils,
+            "resolve_device_accept_seq_lens_tpu",
+            overlap_utils_tpu.resolve_device_accept_seq_lens_tpu,
+            create=True,
+        ),
+        patch.object(
+            overlap_utils,
+            "resolve_spec_extras_tpu",
+            overlap_utils_tpu.resolve_spec_extras_tpu,
+            create=True,
+        ),
+        patch.object(
+            overlap_utils_tpu.envs.SGLANG_ENABLE_TORCH_COMPILE,
+            "get",
+            return_value=compile_enabled,
+        ),
+        patch.object(overlap_utils_tpu, name, wraps=op.__wrapped__) as fused,
+        patch.object(overlap_utils, "_DEBUG_ASSERT", True),
+        patch.object(
+            overlap_utils, "_assert_nonneg_and_invalidate", side_effect=invalidate
+        ) as debug,
+    ):
+        if compile_enabled and (not buckets or bs > max(buckets)):
+            message = (
+                "must be precompiled at startup"
+                if not buckets
+                else "exceeds largest precompiled bucket"
+            )
+            with pytest.raises(AssertionError, match=message):
+                overlap_utils_tpu.resolve_spec_extras_tpu(
+                    future_map, SimpleNamespace(spec_info=draft)
+                )
+            fused.assert_not_called()
+            debug.assert_not_called()
+            return
+        overlap_utils.FutureMap.resolve_seq_lens_cpu(future_map, batch)
+        torch.testing.assert_close(batch.seq_lens, indices + 20)
+        torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([99]))
+        fused.assert_called_once()
+        args = fused.call_args.args
+        assert args[0].shape == (physical_bs,)
+        assert args[-3].shape == (physical_bs, 7)
+        assert args[-2].shape == (physical_bs,)
+        if physical_bs > bs:
+            assert (args[0][bs:] == 0).all()
+            assert (args[-3][bs:] == 0).all()
+            assert (args[-2][bs:] == 1).all()
+        torch.testing.assert_close(debug.call_args.args[2], indices)
+        # Reusing resolved state must neither gather nor invalidate again.
+        overlap_utils.FutureMap._resolve_spec_extras(future_map, batch)
+        assert debug.call_count == 1
+
+    torch.testing.assert_close(draft.topk_p, future_map.topk_p_buf[indices])
+    torch.testing.assert_close(draft.topk_index, future_map.topk_index_buf[indices])
+    torch.testing.assert_close(draft.bonus_tokens, indices + 10)
+    expected = torch.stack(
+        [
+            candidates[i, int(length) - 1 : int(length) + 3]
+            for i, length in enumerate(accept_lens)
+        ]
+    )
+    torch.testing.assert_close(draft.device_accept_selected_cache_locs, expected)
+    if with_hidden:
+        torch.testing.assert_close(
+            draft.hidden_states, future_map.hidden_states_buf[indices]
+        )
+    torch.testing.assert_close(
+        future_map.output_tokens_buf[bs + 1 :], torch.arange(bs + 1, 8) + 10
+    )
+    assert future_map.output_tokens_buf[0] == -1
+    assert draft.future_indices is indices
+    assert draft.accept_lens_device is accept_lens
+    assert draft.device_accept_candidate_locs is candidates
+
+
+@pytest.mark.parametrize("algorithm", ("EAGLE3", "DFLASH", "DSPARK"))
+@pytest.mark.parametrize("is_tpu,overlap", ((True, True), (True, False), (False, True)))
+def test_decode_reservation_matches_allocator_at_page_boundary(
+    algorithm, is_tpu, overlap
+):
+    from sglang.srt.managers import schedule_batch
+    from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    reqs = [
+        SimpleNamespace(kv=SimpleNamespace(kv_committed_len=96, kv_allocated_len=128))
+    ]
+    batch = SimpleNamespace(
+        enable_overlap=overlap,
+        spec_algorithm=SpeculativeAlgorithm[algorithm],
+    )
+    # A 16-token DFlash/DSpark block reserves 32 tokens. Only TPU EAGLE
+    # overlap needs the extra slot that crosses this page boundary.
+    expected_tokens = 16 if algorithm == "EAGLE3" and is_tpu and overlap else 0
+    with (
+        patch.object(schedule_batch, "_is_tpu", is_tpu),
+        patch.object(schedule_batch, "get_alloc_reserve_per_decode", return_value=32),
+    ):
+        estimate = (
+            schedule_batch.ScheduleBatch._new_tokens_required_next_decode_spec_v2(
+                batch, reqs, page_size=16
+            )
+        )
+    assert estimate == expected_tokens
+    if algorithm != "EAGLE3":
+        _, _, actual = page_aligned_decode_alloc_lens(reqs, reserve=32, page_size=16)
+        assert estimate == actual
 
 
 if __name__ == "__main__":

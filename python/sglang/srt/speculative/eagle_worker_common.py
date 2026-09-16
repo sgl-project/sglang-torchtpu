@@ -10,7 +10,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PreparedExtendMetadata,
 )
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
@@ -28,7 +30,7 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_each,
     record_stream_for_v2_verify,
 )
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_tpu
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -38,6 +40,20 @@ from sglang.srt.utils.common import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+        device_accept_verify_cache_locs_tpu,
+        prepare_draft_cache_locs_tpu,
+    )
+    from sglang.srt.hardware_backend.tpu.eagle_verify import try_verify_and_bookkeep_tpu
+    from sglang.srt.hardware_backend.tpu.padded_spec_state import (
+        PaddedResultCopy,
+        VerifyContinuation,
+        can_continue_padded_spec_tpu,
+        install_verify_continuation_tpu,
+    )
 
 if _is_cpu:
     from sgl_kernel import assign_draft_cache_locs_contiguous_cpu
@@ -111,6 +127,8 @@ def prepare_for_draft_extend(
     return_hidden_states_before_norm: bool,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
+    tpu_verify_continuation=None,
+    prepared_extend_metadata: Optional[PreparedExtendMetadata] = None,
 ):
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
@@ -152,7 +170,10 @@ def prepare_for_draft_extend(
     )
     # init_new requires both list or both Tensor;
     # gpu_only emits device tensors to skip H2D.
-    if gpu_only:
+    if prepared_extend_metadata is not None:
+        batch.prefix_lens = prepared_extend_metadata.prefix_lens_cpu[:bs]
+        batch.extend_lens = prepared_extend_metadata.seq_lens_cpu[:bs]
+    elif gpu_only:
         batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
@@ -178,19 +199,26 @@ def prepare_for_draft_extend(
         draft_model_runner,
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
+        prepared_extend_metadata=prepared_extend_metadata,
     )
     # Normalize idle DP ranks before the shared sequence-length update.
     draft_model_runner.compile_policy.normalize_spec_forward_batch(forward_batch)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-    forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
-    if not gpu_only:
-        forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
-        forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-    else:
-        # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
-        # backend max() reads from list without a per-iter D2H sync.
-        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
+    if prepared_extend_metadata is None:
+        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+        if not gpu_only:
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
+            forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
+        else:
+            # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
+            # backend max() reads from list without a per-iter D2H sync.
+            forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
+    # The prepared TPU policy binds its post-write lengths along with padding.
+    if tpu_verify_continuation is not None and prepared_extend_metadata is None:
+        install_verify_continuation_tpu(
+            forward_batch, tpu_verify_continuation, num_draft_tokens
+        )
     draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
@@ -219,6 +247,8 @@ def prepare_for_draft(
     draft_model_runner: ModelRunner,
     topk: int,
     num_steps: int,
+    *,
+    prepared_inputs=None,
 ):
 
     if not batch.forward_mode.is_idle():
@@ -226,7 +256,19 @@ def prepare_for_draft(
 
         # Assign cache locations (draft-write targets).
         page_size = batch.token_to_kv_pool_allocator.page_size
-        if page_size == 1 or topk == 1:
+        if prepared_inputs is not None:
+            batch.out_cache_loc = prepared_inputs.draft_cache_locs[: bs * num_steps]
+        elif _is_tpu and prepare_draft_cache_locs_tpu(
+            batch,
+            draft_input,
+            bs=bs,
+            topk=topk,
+            num_steps=num_steps,
+            num_verify_tokens=get_spec().speculative_num_draft_tokens,
+            host_resident=req_to_token_pool.host_resident,
+        ):
+            pass
+        elif page_size == 1 or topk == 1:
             batch.out_cache_loc = torch.empty(
                 (bs * topk * num_steps,),
                 dtype=torch.int64,
@@ -303,7 +345,11 @@ def prepare_for_draft(
         if draft_model_runner.spec_algorithm.is_standalone()
         else CaptureHiddenMode.LAST
     )
-    draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
+    draft_input.positions = (
+        prepared_inputs.seq_lens[:bs]
+        if prepared_inputs is not None
+        else batch.seq_lens.repeat_interleave(topk, dim=0)
+    )
     forward_batch = ForwardBatch.init_new(
         batch,
         draft_model_runner,
@@ -403,7 +449,7 @@ def build_eagle_verify_input(
             fill_prefix_mask=fill_mask,
         )
 
-    return EagleVerifyInput(
+    verify_input = EagleVerifyInput(
         draft_token=draft_tokens,
         custom_mask=tree_mask,
         positions=position,
@@ -419,6 +465,14 @@ def build_eagle_verify_input(
         seq_lens_cpu=None,
         draft_probs=draft_probs,
     )
+
+    if _is_tpu:
+        verify_input.device_accept_cache_locs = device_accept_verify_cache_locs_tpu(
+            draft_input,
+            bs=batch.seq_lens.shape[0],
+            num_verify_tokens=num_draft_tokens,
+        )
+    return verify_input
 
 
 def _finalize_accept_tree_path(
@@ -609,19 +663,48 @@ def run_eagle_verify(
     verify_padding = target_compile_policy.prepare_spec_verify(
         batch, verify_input, logits_output.next_token_logits
     )
+    tpu_verify_continuation = None
     verify_result = (None, None, None)
     verify_bookkeeping_result = (None, None)
     try:
-        verify_result = eagle_sample(verify_input, batch, logits_output, grammar_mask)
-        post_predict, post_accept_lens, post_accept_index = verify_result
-        # Sampling and bookkeeping must use the same physical rows, including
-        # padded idle DP peers. finalize_spec_verify restores the logical batch.
-        verify_bookkeeping_result = verify_bookkeeping_func(
-            batch.seq_lens,
-            post_accept_lens,
-            post_predict,
-            post_accept_index,
+        fused_result = (
+            try_verify_and_bookkeep_tpu(
+                batch=batch,
+                verify_input=verify_input,
+                logits_output=logits_output,
+                grammar_mask=grammar_mask,
+            )
+            if _is_tpu
+            else None
         )
+        if fused_result is not None:
+            verify_result = fused_result[:3]
+            verify_bookkeeping_result = fused_result[3:]
+        else:
+            verify_result = eagle_sample(
+                verify_input, batch, logits_output, grammar_mask
+            )
+            verify_bookkeeping_result = verify_bookkeeping_func(
+                batch.seq_lens, verify_result[1], verify_result[0], verify_result[2]
+            )
+        # Both results retain physical rows until finalize_spec_verify.
+        post_predict, post_accept_lens, post_accept_index = verify_result
+        if (
+            _is_tpu
+            and verify_padding is not None
+            and logits_output.hidden_states is not None
+            and can_continue_padded_spec_tpu(batch)
+        ):
+            state = verify_padding.state
+            tpu_verify_continuation = VerifyContinuation(
+                logical_batch_size=state.logical_batch_size,
+                physical_batch_size=state.physical_batch_size,
+                hidden_states=logits_output.hidden_states,
+                predict=post_predict,
+                accept_lens=post_accept_lens,
+                seq_lens=batch.seq_lens,
+                bonus_tokens=verify_bookkeeping_result[1],
+            )
     finally:
         # Restore logical tensors and finalize target outputs.
         verify_result, verify_bookkeeping_result = (
@@ -675,7 +758,11 @@ def run_eagle_verify(
             num_draft_tokens=num_draft_tokens,
         )
 
-    next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+    next_draft_input = EagleDraftInput(
+        bonus_tokens=bonus_tokens, tpu_verify_continuation=tpu_verify_continuation
+    )
+    if _is_tpu:
+        next_draft_input.accept_lens_device = accept_lens
 
     # verify_forward_batch transitively holds verify-time GPU tensors
     # (draft_token / out_cache_loc / ...) that must outlive the imminent
@@ -684,6 +771,16 @@ def run_eagle_verify(
     return GenerationBatchResult(
         logits_output=logits_output,
         next_token_ids=predict,
+        tpu_padded_result=(
+            PaddedResultCopy(
+                logical_batch_size=tpu_verify_continuation.logical_batch_size,
+                tokens_per_request=num_draft_tokens,
+                predict=tpu_verify_continuation.predict,
+                accept_lens=tpu_verify_continuation.accept_lens,
+            )
+            if tpu_verify_continuation is not None
+            else None
+        ),
         can_run_cuda_graph=can_run_cuda_graph,
         speculative_num_draft_tokens=num_draft_tokens,
         next_draft_input=next_draft_input,
