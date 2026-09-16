@@ -779,8 +779,8 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
         ),
         patch.object(
             overlap_utils,
-            "resolve_spec_extras_tpu",
-            overlap_utils_tpu.resolve_spec_extras_tpu,
+            "device_accept_resolved_tpu",
+            overlap_utils_tpu.device_accept_resolved_tpu,
             create=True,
         ),
         patch.object(overlap_utils, "gather_spec_extras_func", side_effect=gather),
@@ -820,9 +820,11 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
 
 
 @pytest.mark.parametrize("algorithm", ("EAGLE3", "DFLASH", "DSPARK"))
-@pytest.mark.parametrize("is_tpu,overlap", ((True, True), (True, False), (False, True)))
+@pytest.mark.parametrize(
+    "host_resident,overlap", ((True, True), (True, False), (False, True))
+)
 def test_decode_reservation_matches_allocator_at_page_boundary(
-    algorithm, is_tpu, overlap
+    algorithm, host_resident, overlap
 ):
     from sglang.srt.managers import schedule_batch
     from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
@@ -834,14 +836,13 @@ def test_decode_reservation_matches_allocator_at_page_boundary(
     batch = SimpleNamespace(
         enable_overlap=overlap,
         spec_algorithm=SpeculativeAlgorithm[algorithm],
+        req_to_token_pool=SimpleNamespace(host_resident=host_resident),
     )
-    # A 16-token DFlash/DSpark block reserves 32 tokens. Only TPU EAGLE
-    # overlap needs the extra slot that crosses this page boundary.
-    expected_tokens = 16 if algorithm == "EAGLE3" and is_tpu and overlap else 0
-    with (
-        patch.object(schedule_batch, "_is_tpu", is_tpu),
-        patch.object(schedule_batch, "get_alloc_reserve_per_decode", return_value=32),
-    ):
+    # A 16-token DFlash/DSpark block reserves 32 tokens. Only EAGLE device
+    # accept routing (host-resident req_to_token + overlap) needs the extra
+    # slot that crosses this page boundary.
+    expected_tokens = 16 if algorithm == "EAGLE3" and host_resident and overlap else 0
+    with patch.object(schedule_batch, "get_alloc_reserve_per_decode", return_value=32):
         estimate = (
             schedule_batch.ScheduleBatch._new_tokens_required_next_decode_spec_v2(
                 batch, reqs, page_size=16

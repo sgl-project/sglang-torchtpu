@@ -1179,11 +1179,17 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
-    # In overlap mode req.seqlen is one pending accepted bonus ahead of honest
-    # kv_committed_len while the following batch is prepared. Include that slot
-    # in the page-aligned allocation used by device-resident accept routing.
-    tpu_overlap = _is_tpu and batch.enable_overlap
-    allocation_reserve = double_alloc + int(tpu_overlap)
+    # Device accept routing (prepare_device_accept_tpu) exists only with a
+    # host-resident req_to_token: the device cannot write the page table, so the
+    # host pre-reserves every acceptance outcome and the device selects. In
+    # overlap mode its window base (req.seqlen) is one pending accepted bonus
+    # ahead of kv_committed_len, which the double buffer counts from, so the
+    # window needs one slot beyond it. Keep in sync with
+    # ScheduleBatch._new_tokens_required_next_decode_spec_v2.
+    device_accept_overlap = (
+        batch.req_to_token_pool.host_resident and batch.enable_overlap
+    )
+    allocation_reserve = double_alloc + int(device_accept_overlap)
 
     cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
         batch.reqs,

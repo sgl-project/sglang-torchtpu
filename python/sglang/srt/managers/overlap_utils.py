@@ -18,8 +18,8 @@ _is_tpu = is_tpu()
 
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        device_accept_resolved_tpu,
         resolve_device_accept_seq_lens_tpu,
-        resolve_spec_extras_tpu,
     )
 
 if TYPE_CHECKING:
@@ -437,7 +437,8 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
-        if _is_tpu and resolve_spec_extras_tpu(self, batch):
+        if _is_tpu and device_accept_resolved_tpu(self, batch):
+            # resolve_seq_lens_cpu already routed this batch on device.
             return
         if self.spec_algo.is_ngram():
             draft_input = batch.spec_info

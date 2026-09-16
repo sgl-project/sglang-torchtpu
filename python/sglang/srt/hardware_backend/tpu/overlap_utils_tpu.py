@@ -23,12 +23,25 @@ def _select_device_accept_cache_locs(
     return candidate_locs[rows, cols]
 
 
+def device_accept_resolved_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
+    """True if resolve_seq_lens_cpu already resolved this batch's spec extras
+    on device, so _resolve_spec_extras has nothing left to do."""
+    draft_input = batch.spec_info
+    return (
+        # Only the EAGLE relay (need_topk) has a selected window field.
+        future_map.need_topk
+        and draft_input is not None
+        and draft_input.device_accept_selected_cache_locs is not None
+    )
+
+
 def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
     draft_input = batch.spec_info
     if not future_map.need_topk or draft_input is None:
         return False
-    if draft_input.device_accept_selected_cache_locs is not None:
-        return True
+    assert (
+        draft_input.device_accept_selected_cache_locs is None
+    ), "device accept routing resolves once per prepared batch"
     indices = draft_input.future_indices
     candidate_locs = draft_input.device_accept_candidate_locs
     accept_lens = draft_input.accept_lens_device
@@ -85,8 +98,9 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
 def resolve_device_accept_seq_lens_tpu(
     future_map: FutureMap, batch: ScheduleBatch
 ) -> bool:
-    # Candidate locations gate device routing; selected locations let the
-    # subsequent relay resolution reuse the tensors resolved here.
+    # Candidate locations gate device routing. This also resolves the spec
+    # extras relay, so FutureMap._resolve_spec_extras only checks
+    # device_accept_resolved_tpu afterwards.
     if not resolve_spec_extras_tpu(future_map, batch):
         return False
     batch.seq_lens = future_map.new_seq_lens_buf[batch.spec_info.future_indices]

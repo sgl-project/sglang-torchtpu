@@ -31,7 +31,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
     _select_device_accept_cache_locs,
-    resolve_spec_extras_tpu,
+    device_accept_resolved_tpu,
 )
 from sglang.srt.managers.overlap_utils import (
     _DYNAMIC_INDEX_DEVICE_TYPES,
@@ -162,8 +162,8 @@ class TestNonEagleRelay(CustomTestCase):
                         patch.object(overlap_utils, "_is_tpu", is_tpu),
                         patch.object(
                             overlap_utils,
-                            "resolve_spec_extras_tpu",
-                            resolve_spec_extras_tpu,
+                            "device_accept_resolved_tpu",
+                            device_accept_resolved_tpu,
                             create=True,
                         ),
                         patch.object(overlap_utils, "_DEBUG_ASSERT", False),

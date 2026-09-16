@@ -140,7 +140,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list, is_tpu
+from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -160,7 +160,6 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 _MM_HASH_MASK = (1 << 64) - 1
 
 logger = logging.getLogger(__name__)
-_is_tpu = is_tpu()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -2925,8 +2924,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
+        # EAGLE device accept routing (host-resident req_to_token + overlap)
+        # reserves one slot beyond the double buffer; see the matching
+        # comment in eagle_prepare_for_decode. DFlash/DSpark never route on
+        # device.
         reserve = get_alloc_reserve_per_decode() + int(
-            _is_tpu
+            self.req_to_token_pool.host_resident
             and self.enable_overlap
             and not self.spec_algorithm.is_dflash_family()
         )
