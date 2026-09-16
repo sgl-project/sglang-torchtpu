@@ -707,7 +707,8 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             need_min_p=False,
         )
         sample.assert_called_once_with(
-            filtered_block, sampling_fn=tpu_sampler_module.sample_exponential_race
+            filtered_block,
+            unseeded_sampling_fn=tpu_sampler_module.sample_exponential_race,
         )
 
     def test_kill_switch_restores_the_torch_reference_path(self):
@@ -766,7 +767,8 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
         torch.testing.assert_close(actual, torch.tensor([17], dtype=torch.int32))
         top_k.assert_called_once_with(probs, 50)
         sample.assert_called_once_with(
-            global_top_k_probs, sampling_fn=tpu_sampler_module.sample_exponential_race
+            global_top_k_probs,
+            unseeded_sampling_fn=tpu_sampler_module.sample_exponential_race,
         )
 
 
