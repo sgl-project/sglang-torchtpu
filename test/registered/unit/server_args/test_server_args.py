@@ -103,6 +103,24 @@ _mock_device = patch(
 _mock_device.start()
 
 
+class TestEnableMultimodalFlag(CustomTestCase):
+    def test_enable_multimodal_is_a_boolean_optional_flag(self):
+        # Optional[bool] used to fall through to type=str: "--enable-multimodal
+        # false" stored the truthy string "false" and --no-enable-multimodal
+        # did not exist.
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base = ["--model-path", "dummy"]
+        self.assertIsNone(parser.parse_args(base).enable_multimodal)
+        self.assertIs(
+            parser.parse_args(base + ["--enable-multimodal"]).enable_multimodal, True
+        )
+        self.assertIs(
+            parser.parse_args(base + ["--no-enable-multimodal"]).enable_multimodal,
+            False,
+        )
+
+
 class TestPrepareServerArgs(CustomTestCase):
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
