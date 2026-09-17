@@ -41,6 +41,7 @@ from sglang.srt.utils import (
     get_compiler_backend,
     is_cpu,
     is_npu,
+    is_tpu,
     set_weight_attrs,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -50,6 +51,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +137,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
     org_vocab_start_index: int,
@@ -566,9 +568,14 @@ class VocabParallelEmbedding(torch.nn.Module):
     def forward(self, input_):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
-        maybe_detect_oob(
-            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
-        )
+        # Skipped while tracing on TPU: direct_compile runs this function against
+        # placeholders, and torch._assert_async has no lowering there (the probe
+        # is off by default anyway -- SGLANG_ENABLE_ASYNC_ASSERT). Other backends
+        # keep the probe inside their compiled regions.
+        if not (_is_tpu and torch.compiler.is_compiling()):
+            maybe_detect_oob(
+                input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+            )
         output_parallel = self._embed_local_shard(input_)
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:
