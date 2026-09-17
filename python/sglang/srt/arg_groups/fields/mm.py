@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 from typing import (
     Any,
     Dict,
@@ -26,7 +27,12 @@ class Mm(msgspec.Struct):
     _NS_PATH = "mm"
     enable_multimodal: A[
         Optional[bool],
-        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        Arg(
+            help="Enable the multimodal functionality for the served model. If "
+            "the model being served is not multimodal, nothing will happen. "
+            "--no-enable-multimodal serves a multimodal checkpoint text-only.",
+            action=argparse.BooleanOptionalAction,
+        ),
     ] = None
     mm_attention_backend: A[
         Optional[str],
