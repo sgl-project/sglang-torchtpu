@@ -899,45 +899,25 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-        # TPU compile boundary. Inert unless --enable-torch-compile.
+        # TPU compile boundary (inert unless --enable-torch-compile): the
+        # language model including its logits processor. Under DP attention an
+        # eager logits processor issues torch_tpu collectives that CHECK-fail
+        # (attn_tp=1) or deadlock (attn_tp>1). The vision encoder and the embed
+        # merge stay eager in front; the VL policy warms both the positional
+        # input_ids convention (text prefill, decode) and the input_embeds
+        # convention general_mm_embed_routine uses.
         if _is_tpu and self.language_model is not None:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
-            from sglang.srt.server_args import get_global_server_args
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
 
-            if get_global_server_args().enable_multimodal is False:
-                # Text-only serving (--no-enable-multimodal): compile this
-                # wrapper's forward, which forward() routes straight into the
-                # language model, logits processor included -- the same
-                # boundary a text model gets. The alternative below leaves the
-                # logits processor eager, and under DP attention its DP gather
-                # and attention-TP all-gather then run as eager torch_tpu
-                # collectives, which CHECK-fail (attn_tp=1, lowering_util.cc)
-                # or deadlock (attn_tp>1) on the first request.
-                from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-                    DecoderTpuCompilePolicy,
-                )
-
-                support_torch_compile(self, policy=DecoderTpuCompilePolicy)
-            else:
-                # Multimodal serving: annotate the inner DeepSeek-V3 decoder
-                # (mirrors Qwen3-VL) so the data-dependent multimodal merge and
-                # the logits stay out of the graph.
-                from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-                    Qwen3VLDecoderTpuCompilePolicy,
-                )
-
-                # Boundary = the language model INCLUDING its logits processor:
-                # under DP attention the eager logits collectives CHECK-fail or
-                # deadlock (see the text-only branch). The vision encoder and the
-                # embed merge stay eager in front; the VL policy warms both the
-                # positional input_ids convention (text prefill, decode) and the
-                # input_embeds keyword convention general_mm_embed_routine uses.
-                support_torch_compile(
-                    self.language_model,
-                    policy=Qwen3VLDecoderTpuCompilePolicy,
-                )
+            support_torch_compile(
+                self.language_model,
+                policy=Qwen3VLDecoderTpuCompilePolicy,
+            )
 
     @property
     def model(self):
@@ -947,9 +927,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
     @property
     def logits_processor(self):
-        # The TPU decoder compile policy reads the compiled model's logits
-        # processor (input-logprob flag, distributed top-k width) when this
-        # wrapper is the compile boundary (text-only serving).
+        # The TPU compile policy and sampler look these up on model_runner.model
+        # (this wrapper); the language model owns them.
         return getattr(self.language_model, "logits_processor", None)
 
     def get_output_embeddings(self):
