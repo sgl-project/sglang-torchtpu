@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
     PallasForwardMetadata,
     TpuPallasRpaBatchedAttnBackend,
 )
+from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +40,7 @@ class _BackendUnderTest(TpuPallasRpaBatchedAttnBackend):
         self._op = None
         self._distribution_cache = {}
         self.decode_query_size = 1
+        self._host_metadata_cache = HostMetadataCache()
         self._is_hybrid_swa = False
         self.token_to_kv_pool = None
 
@@ -61,6 +63,7 @@ def _make_forward_batch(
         req_pool_indices_cpu=req_pool_indices_cpu,
         forward_mode=forward_mode,
         extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=None,
         spec_info=spec_info,
         seq_lens_cpu=seq_lens_cpu,
     )

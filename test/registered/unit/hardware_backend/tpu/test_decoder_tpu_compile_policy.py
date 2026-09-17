@@ -2636,6 +2636,9 @@ class TestSpecDraftExtendPadding(_SpecPolicyTestCase):
 
         self.assertEqual(forward_batch.batch_size, 4)
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [4, 4, 4, 0])
+        self.assertEqual(
+            forward_batch.extend_seq_lens_cpu, forward_batch.extend_seq_lens.tolist()
+        )
         self.assertEqual(forward_batch.extend_prefix_lens.tolist(), [8, 7, 6, 0])
         self.assertEqual(forward_batch.extend_start_loc.tolist(), [0, 4, 8, 0])
 
@@ -3003,6 +3006,7 @@ class TestSpecForwardBatchPreparation(_SpecPolicyTestCase):
             spec_info=draft_extend_input,
             input_ids=draft_extend_input.input_ids,
             seq_lens=draft_extend_input.seq_lens,
+            extend_seq_lens_cpu=None,
             batch_size=2,
             _pad_inputs_to_size=fake_pad_inputs_to_size,
         )
