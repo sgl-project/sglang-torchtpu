@@ -456,8 +456,7 @@ def prepare_mlp_sync_batch_raw(
     )
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
-    # An extend carrying multimodal inputs takes the model's input_embeds path;
-    # gathered so every DP rank can take that same path (and compiled program).
+    # Gathered so every DP rank takes the same input_embeds program on image steps.
     is_tpu_mm_extend_in_batch = is_extend_in_batch and _batch_has_mm_inputs(local_batch)
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch

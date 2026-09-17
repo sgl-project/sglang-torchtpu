@@ -826,12 +826,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
     # where image embeddings are spliced. The TPU decoder compile policy reads
     # this to warm the input_ids decode / verify variants.
     decode_embeds_in_language_model: bool = _is_tpu
-    # Text-only prefill (no image anywhere in the batch) takes the same direct
-    # path. The routine would embed eagerly and call the decoder with
-    # input_embeds sized by the real token count, which under DP attention
-    # disagrees with the padded bucket the compile policy set the DP gather
-    # slots for (rank-divergent metadata, watchdog abort on the first request).
-    # The policy warms the input_ids extend variant, so nothing recompiles.
+    # Text-only prefill takes the same direct path; the routine's eager embeds
+    # are sized by real tokens and disagree with the DP-padded bucket.
     text_prefill_in_language_model: bool = _is_tpu
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
@@ -862,11 +858,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
-        # Under DP attention on TPU only the group that owns an image launches
-        # the encoder program, and a TPU program with a collective must be
-        # launched by every chip. Build the tower replicated (attention
-        # tp_size=1, no all-reduce) and let each rank of the group encode the
-        # group's images itself (no cross-rank image sharding either).
+        # Under DP attention only the image-owning group runs the encoder, and a
+        # TPU program with a collective needs every chip: build it collective-free.
         self.replicate_vision_tower = _is_tpu and is_dp_attention_enabled()
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(
@@ -899,13 +892,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
             self.vision_tower = self.vision_tower.to(dtype=target_dtype)
             self.mm_projector = self.mm_projector.to(dtype=target_dtype)
 
-        # TPU compile boundary (inert unless --enable-torch-compile): the
-        # language model including its logits processor. Under DP attention an
-        # eager logits processor issues torch_tpu collectives that CHECK-fail
-        # (attn_tp=1) or deadlock (attn_tp>1). The vision encoder and the embed
-        # merge stay eager in front; the VL policy warms both the positional
-        # input_ids convention (text prefill, decode) and the input_embeds
-        # convention general_mm_embed_routine uses.
+        # TPU compile boundary: the language model with its logits processor
+        # (an eager logits processor deadlocks under DP attention). Vision
+        # encoder and embed merge stay eager in front.
         if _is_tpu and self.language_model is not None:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
@@ -927,8 +916,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
     @property
     def logits_processor(self):
-        # The TPU compile policy and sampler look these up on model_runner.model
-        # (this wrapper); the language model owns them.
+        # Looked up on model_runner.model by the TPU policy and sampler.
         return getattr(self.language_model, "logits_processor", None)
 
     def get_output_embeddings(self):
@@ -1075,17 +1063,12 @@ class KimiK25ForConditionalGeneration(nn.Module):
             or (
                 self.text_prefill_in_language_model
                 and not forward_batch.contains_mm_inputs()
-                # Under DP attention every rank must launch the same compiled
-                # program: a text-only or idle rank takes the input_embeds path
-                # whenever another rank's extend carries an image.
+                # A DP peer's image step puts every rank on the input_embeds path.
                 and not forward_batch.is_tpu_mm_extend_in_batch
             )
         ):
-            # Decode / verify (sampled or drafted text tokens) and text-only
-            # prefill: let the language model embed inside its compiled graph.
-            # Positional: the compiled language model's text variants are warmed
-            # with (input_ids, positions, forward_batch); Dynamo guards on the
-            # call shape, so a keyword call here would miss every warmed graph.
+            # Embed in-graph. Positional: the warmed text variants guard on this
+            # call shape.
             return self.language_model(
                 input_ids,
                 positions,
@@ -1093,9 +1076,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
 
-        # The routine forwards extra kwargs to the (compiled) language model;
-        # an explicit pp_proxy_tensors=None is a different Dynamo call shape
-        # from the warmed one, so only pass it when set.
+        # An explicit pp_proxy_tensors=None is a different guarded call shape.
         extra = (
             {"pp_proxy_tensors": pp_proxy_tensors}
             if pp_proxy_tensors is not None

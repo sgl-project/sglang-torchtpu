@@ -768,8 +768,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Only the final pipeline stage runs the logits processor.
             return False
         runner_model = self.model_runner.model
-        # A multimodal wrapper compiles its language model (which owns the
-        # logits processor) rather than itself, so that owner counts too.
+        # A multimodal wrapper compiles its language model, which owns the logits.
         owns_logits = self.owner is runner_model or (
             self.owner is getattr(runner_model, "language_model", None)
         )
@@ -1475,9 +1474,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
     def install(self) -> bool:
         outer = getattr(self.model_runner, "model", None)
         if hasattr(outer, "get_image_feature") and is_dp_attention_enabled():
-            # Under DP attention every rank launches the same program: on a
-            # step where any rank's extend carries an image, all ranks take
-            # the padded input_embeds variant (ScheduleBatch.is_tpu_mm_extend_in_batch).
+            # Image steps run the padded input_embeds variant on every rank
+            # (ScheduleBatch.is_tpu_mm_extend_in_batch).
             logger.info(
                 "[decoder compile policy] DP attention with multimodal "
                 "serving: image steps use the padded input_embeds variant "

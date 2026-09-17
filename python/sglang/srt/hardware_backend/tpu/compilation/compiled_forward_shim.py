@@ -977,8 +977,7 @@ class CompiledForwardShim:
         if not self._prompt_logprob_enabled and hasattr(
             forward_batch, "extend_logprob_start_lens_cpu"
         ):
-            # Only the eager input-logprob gather reads these; left in place the
-            # graph guards on them (None vs a list) and a chat prefill recompiles.
+            # Only the eager input-logprob gather reads these; keep them out of the guards.
             saved.update(
                 _pin_fields(forward_batch, {"extend_logprob_start_lens_cpu": None})
             )
