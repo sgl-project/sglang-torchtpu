@@ -687,7 +687,7 @@ if _is_tpu:
     # Register MoonViT's encoder as a torch.compile boundary for the TPU graph
     # runner to discover (inert unless --enable-torch-compile).
     from sglang.srt.compilation.support_torch_compile import support_torch_compile
-    from sglang.srt.hardware_backend.tpu.graph_runner.moonvit_tpu_compile_runner import (
+    from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
         MoonVitTpuCompilePolicy,
     )
 

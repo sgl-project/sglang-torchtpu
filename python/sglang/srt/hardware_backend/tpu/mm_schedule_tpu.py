@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def _patch_budget() -> int:
     """Patches one vision-encoder call may carry."""
-    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
         precompiled_max_patch_count,
     )
 

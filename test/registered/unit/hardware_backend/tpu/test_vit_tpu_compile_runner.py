@@ -7,16 +7,18 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.graph_runner import (
-    vit_tpu_compile_runner as vit_runner,
+from sglang.srt.hardware_backend.tpu.compilation import (
+    encoder_compile_policy as policy_module,
 )
-from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
     Qwen3VLVisionTpuCompilePolicy,
     VisionPaddingContext,
     VisionTpuCompilePolicy,
+    _Qwen3VLRunContext,
+)
+from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
     ViTTpuCompileRunner,
     _cu_seqlens_to_segment_ids,
-    _Qwen3VLRunContext,
 )
 from sglang.srt.layers.attention.vision import (
     VisionTpuAttention,
@@ -180,10 +182,10 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         policy.owner = SimpleNamespace()
         policy.compiled_fn = MagicMock(return_value=torch.zeros(1))
         with patch.object(
-            vit_runner, "_precompiled_max_patch_count", None
-        ), patch.object(vit_runner, "tpu_sync"):
+            policy_module, "_precompiled_max_patch_count", None
+        ), patch.object(policy_module, "tpu_sync"):
             policy.precompile(patch_counts=[196, 324, 4900])
-            self.assertEqual(vit_runner.precompiled_max_patch_count(), 4900)
+            self.assertEqual(policy_module.precompiled_max_patch_count(), 4900)
 
     def test_qwen3_vl_warmup_covers_the_whole_pass_not_just_the_compiled_region(self):
         """Warmup must enter at the encoder, ahead of patch_embed.
@@ -218,22 +220,22 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         policy = _FakeVisionPolicy()
         policy.owner = SimpleNamespace()
         policy.compiled_fn = MagicMock(return_value=torch.zeros(1))
-        with patch.object(vit_runner, "_precompiled_max_patch_count", None):
+        with patch.object(policy_module, "_precompiled_max_patch_count", None):
             policy.precompile(patch_counts=[])
-            self.assertIsNone(vit_runner._precompiled_max_patch_count)
+            self.assertIsNone(policy_module._precompiled_max_patch_count)
 
     def test_batching_budget_prefers_the_warmed_ladder_over_the_env_cap(self):
-        with patch.object(vit_runner, "_precompiled_max_patch_count", 2304):
-            self.assertEqual(vit_runner.precompiled_max_patch_count(), 2304)
+        with patch.object(policy_module, "_precompiled_max_patch_count", 2304):
+            self.assertEqual(policy_module.precompiled_max_patch_count(), 2304)
 
     def test_batching_budget_falls_back_to_env_before_precompile_runs(self):
-        unwarmed = patch.object(vit_runner, "_precompiled_max_patch_count", None)
+        unwarmed = patch.object(policy_module, "_precompiled_max_patch_count", None)
         with unwarmed, _unset(
             envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
         ), envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600):
-            self.assertEqual(vit_runner.precompiled_max_patch_count(), 1600)
+            self.assertEqual(policy_module.precompiled_max_patch_count(), 1600)
         with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
-            self.assertEqual(vit_runner.precompiled_max_patch_count(), 1024)
+            self.assertEqual(policy_module.precompiled_max_patch_count(), 1024)
 
     def test_qwen3_vl_unpad_trims_bucket_padding_and_selects_rows(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
@@ -254,7 +256,7 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         )
         self.assertEqual(selected.tolist(), [2.0, 0.0])
 
-    def test_qwen3_vl_unpad_moves_to_host_before_trimming(self):
+    def test_run_moves_compiled_output_to_host_before_trimming(self):
         """The D2H must happen while the shape is still the static bucket.
 
         Everything downstream of unpad (per-image split, embedding cache, chunk
@@ -277,12 +279,15 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
         spy = _HostMoveSpy(torch.arange(8).float())
-        padding = VisionPaddingContext(
-            real_seq_len=12, bucket_len=16, padded=True, merge_sq=4
-        )
+        policy.compiled_fn = MagicMock(return_value=spy)
 
-        trimmed = policy.unpad_outputs(
-            spy, _Qwen3VLRunContext(padding=padding, output_indices=None)
+        # 12 real patches padded to a 16 bucket, 2x2 merge => 3 real output rows.
+        trimmed = policy.run(
+            torch.zeros(16, 1, 4),
+            torch.tensor([0, 12], dtype=torch.int32),
+            torch.zeros(16, 2),
+            torch.zeros(16, 2),
+            None,
         )
 
         self.assertEqual(spy.to_calls, [("cpu", (8,))])
@@ -510,7 +515,7 @@ class TestRunnerHostState(unittest.TestCase):
     def _runner(**vit_attrs):
         """Bare ViTTpuCompileRunner: __init__ inspects a real ViT we do not need."""
         runner = ViTTpuCompileRunner.__new__(ViTTpuCompileRunner)
-        runner.vit = SimpleNamespace(**vit_attrs)
+        runner.encoder = SimpleNamespace(**vit_attrs)
         runner.padded_patch_buckets = ()
         runner._warned_oversize_patches = set()
         runner._rotary_cos_sin_cache_cpu = None

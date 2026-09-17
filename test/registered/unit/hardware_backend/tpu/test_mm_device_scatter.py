@@ -11,11 +11,11 @@ from torch_tpu._internal import execution_mode
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu import mm_embed_tpu
-from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
     Qwen3VLVisionTpuCompilePolicy,
-    VisionPaddingContext,
+)
+from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
     ViTTpuCompileRunner,
-    _Qwen3VLRunContext,
 )
 from sglang.srt.hardware_backend.tpu.patches import _register_aten_fallbacks
 from sglang.srt.managers import mm_schedule, mm_utils
@@ -165,24 +165,27 @@ class TestDeviceEncoderScatter(unittest.TestCase):
         runner = ViTTpuCompileRunner(vit)
         expected = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
         padded = torch.cat([expected, torch.full_like(expected, -100)]).to("tpu")
-        padding = VisionPaddingContext(
-            real_seq_len=12, bucket_len=24, padded=True, merge_sq=4
-        )
+        # 12 real patches in a 24 bucket, 2x2 merge => 3 of the 6 rows are real.
+        policy.compiled_fn = lambda *args: padded
         with patch.object(
             runner, "_blocks_and_merger_fallback", return_value=padded[:3]
         ):
             for on_device in (False, True):
                 for indices in (None, torch.tensor([2, 0])):
-                    for path in ("unpad", "eager"):
+                    for path in ("compiled", "eager"):
                         with (
                             self.subTest(
                                 on_device=on_device, indices=indices, path=path
                             ),
                             envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.override(on_device),
                         ):
-                            if path == "unpad":
-                                actual = policy.unpad_outputs(
-                                    padded, _Qwen3VLRunContext(padding, indices)
+                            if path == "compiled":
+                                actual = policy.run(
+                                    torch.zeros(24, 1, 4, device="tpu"),
+                                    torch.tensor([0, 12], dtype=torch.int32),
+                                    None,
+                                    None,
+                                    indices,
                                 )
                             else:
                                 actual = runner.run(

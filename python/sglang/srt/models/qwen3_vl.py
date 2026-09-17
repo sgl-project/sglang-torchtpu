@@ -97,8 +97,10 @@ if _is_npu:
     graph_runners_dict["npu"] = ViTNpuGraphRunner
 
 if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
+    from sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy import (
         Qwen3VLVisionTpuCompilePolicy,
+    )
+    from sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner import (
         ViTTpuCompileRunner,
     )
 

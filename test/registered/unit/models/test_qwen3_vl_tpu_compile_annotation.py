@@ -56,8 +56,14 @@ def _stub_tpu_modules():
         "sglang.srt.hardware_backend.tpu.graph_runner.vit_tpu_compile_runner"
     )
     vit_module.ViTTpuCompileRunner = FakeViTTpuCompileRunner
-    vit_module.VisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy
-    vit_module.Qwen3VLVisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy
+
+    encoder_policy_module = types.ModuleType(
+        "sglang.srt.hardware_backend.tpu.compilation.encoder_compile_policy"
+    )
+    encoder_policy_module.VisionTpuCompilePolicy = FakeQwen3VLVisionTpuCompilePolicy
+    encoder_policy_module.Qwen3VLVisionTpuCompilePolicy = (
+        FakeQwen3VLVisionTpuCompilePolicy
+    )
 
     decoder_policy_module = types.ModuleType(
         "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy"
@@ -70,6 +76,7 @@ def _stub_tpu_modules():
     return {
         attention_module.__name__: attention_module,
         vit_module.__name__: vit_module,
+        encoder_policy_module.__name__: encoder_policy_module,
         decoder_policy_module.__name__: decoder_policy_module,
     }
 
