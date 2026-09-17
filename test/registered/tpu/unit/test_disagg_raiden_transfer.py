@@ -439,8 +439,8 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
 
         decode._on_blocks(self.inboxes[decode.endpoint].take(MessageTag.BLOCKS))
 
-        self.assertEqual(decode._remote_blocks[room], blocks)
-        self.assertEqual(decode._remote_endpoint[room], prefill.raiden_endpoint)
+        self.assertEqual(decode._decode.remote_blocks[room], blocks)
+        self.assertEqual(decode._decode.remote_endpoint[room], prefill.raiden_endpoint)
 
     def test_decode_records_its_own_pages_for_the_pull(self):
         prefill, decode = self._prefill(), self._decode()
@@ -454,7 +454,7 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
             bootstrap_infos=self._bootstrap_info(prefill),
         )
 
-        self.assertEqual(decode._local_blocks[room], local_blocks)
+        self.assertEqual(decode._decode.local_blocks[room], local_blocks)
 
     def test_prefill_records_the_decode_address_and_page_count(self):
         """_maybe_reply gates on both, and the page count sizes the pull
@@ -464,9 +464,11 @@ class TestRaidenDecodeBookkeeping(RaidenRendezvousTestCase):
 
         prefill._on_pull_req(self._pull_req_frames(decode, room, pages, swa_pages))
 
-        self.assertEqual(prefill._decode_addr[room], ("127.0.0.1", decode.rank_port))
-        self.assertEqual(prefill._decode_pages[room], pages)
-        self.assertEqual(prefill._decode_swa_pages[room], swa_pages)
+        self.assertEqual(
+            prefill._prefill.decode_addr[room], ("127.0.0.1", decode.rank_port)
+        )
+        self.assertEqual(prefill._prefill.decode_pages[room], pages)
+        self.assertEqual(prefill._prefill.decode_swa_pages[room], swa_pages)
 
 
 class TestRaidenMessageValidation(CustomTestCase):

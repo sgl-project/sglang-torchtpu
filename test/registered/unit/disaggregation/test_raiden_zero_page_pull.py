@@ -8,6 +8,7 @@ from unittest.mock import Mock
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 from sglang.srt.disaggregation.raiden.serde import Blocks
+from sglang.srt.disaggregation.raiden.state import DecodeState
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -18,6 +19,8 @@ ROOM = 41
 def _decode_manager(hybrid):
     """A chunked-transfer decode manager with its room tables, no sockets."""
     mgr = object.__new__(RaidenKVManager)
+    mgr._prefill = None
+    mgr._decode = DecodeState()
     mgr.attn_tp_rank = 0
     mgr.chunked_transfer = True
     mgr._state_lock = threading.Lock()
@@ -38,20 +41,7 @@ def _decode_manager(hybrid):
     mgr._completed_recv = set()
     mgr._failed = set()
     mgr._native_failed = set()
-    mgr._local_blocks = {}
-    mgr._local_swa_blocks = {}
-    mgr._remote_blocks = {}
-    mgr._remote_swa_blocks = {}
-    mgr._remote_endpoint = {}
-    mgr._remote_swa_endpoint = {}
-    mgr._remote_total = {}
-    mgr._announced_spans = {}
-    mgr._chunk_queue = {}
-    mgr._chunk_reads = {}
-    mgr._announced_at = {}
     mgr._timeout_s = 120.0
-    mgr._final_seen = set()
-    mgr._decode_aux_index = {}
     return mgr
 
 
@@ -71,8 +61,8 @@ class TestZeroPagePull(unittest.TestCase):
         mgr = _decode_manager(hybrid)
         # A page-aligned full prefix hit: the decode allocated no page, so the
         # prefill announced no chunk and registered no read.
-        mgr._local_blocks[ROOM] = []
-        mgr._local_swa_blocks[ROOM] = []
+        mgr._decode.local_blocks[ROOM] = []
+        mgr._decode.local_swa_blocks[ROOM] = []
 
         mgr._on_blocks(_blocks(hybrid))
 
@@ -92,8 +82,8 @@ class TestZeroPagePull(unittest.TestCase):
 
     def test_decode_holding_a_page_still_pulls_it(self):
         mgr = _decode_manager(hybrid=False)
-        mgr._local_blocks[ROOM] = [100]
-        mgr._local_swa_blocks[ROOM] = []
+        mgr._decode.local_blocks[ROOM] = [100]
+        mgr._decode.local_swa_blocks[ROOM] = []
 
         mgr._on_blocks(_blocks(hybrid=False))
 

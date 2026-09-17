@@ -55,11 +55,11 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
-            self._decode_addr[room] = (decode_ip, decode_port)
-            self._decode_pages[room] = decode_pages
-            self._decode_swa_pages[room] = decode_swa_pages
-            held = self._held_chunks.pop(room, [])
-            total_pages = self._send_total.get(room, 0)
+            self._prefill.decode_addr[room] = (decode_ip, decode_port)
+            self._prefill.decode_pages[room] = decode_pages
+            self._prefill.decode_swa_pages[room] = decode_swa_pages
+            held = self._prefill.held_chunks.pop(room, [])
+            total_pages = self._prefill.send_total.get(room, 0)
         for start, block_ids in held:
             self._announce_chunk(room, start, block_ids, total_pages)
         self._maybe_reply(room)
@@ -114,11 +114,11 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return None
-            accumulated = self._send_blocks.setdefault(room, [])
+            accumulated = self._prefill.send_blocks.setdefault(room, [])
             start = len(accumulated)
             accumulated.extend(block_ids)
             if swa_block_ids is not None:
-                self._send_swa_blocks[room] = list(swa_block_ids)
+                self._prefill.send_swa_blocks[room] = list(swa_block_ids)
         return start
 
     def offer_chunk(
@@ -136,20 +136,22 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
-            self._send_total[room] = total_pages
-            p_start, p_blocks = self._pending_offer.get(room, (start, []))
+            self._prefill.send_total[room] = total_pages
+            p_start, p_blocks = self._prefill.pending_offer.get(room, (start, []))
             p_blocks = p_blocks + list(block_ids)
-            if len(p_blocks) < self._announce_pages:
-                self._pending_offer[room] = (p_start, p_blocks)
+            if len(p_blocks) < self._prefill.announce_pages:
+                self._prefill.pending_offer[room] = (p_start, p_blocks)
                 return
-            self._pending_offer.pop(room, None)
+            self._prefill.pending_offer.pop(room, None)
             start, block_ids = p_start, p_blocks
-            if room in self._decode_addr:
+            if room in self._prefill.decode_addr:
                 resharded = False
-            elif room in self._reshard_req:
+            elif room in self._prefill.reshard_req:
                 resharded = True
             else:
-                self._held_chunks.setdefault(room, []).append((start, list(block_ids)))
+                self._prefill.held_chunks.setdefault(room, []).append(
+                    (start, list(block_ids))
+                )
                 return
         if resharded:
             self._announce_reshard_chunk(room, start, list(block_ids), total_pages)
@@ -171,9 +173,9 @@ class RaidenSenderMixin:
         with self._announce_lock:
             with self._state_lock:
                 if (
-                    room in self._replied
+                    room in self._prefill.replied
                     or room in self._aborted
-                    or room not in self._decode_pages
+                    or room not in self._prefill.decode_pages
                 ):
                     # The closing reply is out (or the room is gone): these
                     # pages travel with the closing transfer instead. A late
@@ -181,7 +183,7 @@ class RaidenSenderMixin:
                     # counts the room done when the closing read completes.
                     return
                 window = chunk_pull_window(
-                    start, len(block_ids), total_pages, self._decode_pages[room]
+                    start, len(block_ids), total_pages, self._prefill.decode_pages[room]
                 )
                 if not window:
                     return
@@ -189,11 +191,11 @@ class RaidenSenderMixin:
                 block_ids = block_ids[
                     window.chunk_offset : window.chunk_offset + window.length
                 ]
-                index = self._chunk_seq.get(room, 0)
-                self._chunk_seq[room] = index + 1
+                index = self._prefill.chunk_seq.get(room, 0)
+                self._prefill.chunk_seq[room] = index + 1
                 self._uuid_seq += 1
                 uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
-                addr = self._decode_addr[room]
+                addr = self._prefill.decode_addr[room]
             req_id = f"{room}#{index}"
             self._register_sender_read(
                 room, self._ensure_engine(), req_id, uuid, block_ids
@@ -229,13 +231,13 @@ class RaidenSenderMixin:
             if room in self._aborted:
                 return False
             if aux_index is not None:
-                self._send_aux[room] = read_aux_blob(
+                self._prefill.send_aux[room] = read_aux_blob(
                     self.kv_args.aux_data_ptrs,
                     self.kv_args.aux_item_lens,
                     aux_index,
                 )
-            self._reshard_finalized.add(room)
-            is_reshard = room in self._reshard_req
+            self._prefill.reshard_finalized.add(room)
+            is_reshard = room in self._prefill.reshard_req
             self.update_status(room, KVPoll.Transferring)
         # The request type is selected by the decode handshake, not by whether
         # reshard support is globally enabled. Symmetric TP uses PULL_REQ even
@@ -258,10 +260,10 @@ class RaidenSenderMixin:
         decode's court, the window is timed from that latest progress.
         """
         with self._state_lock:
-            if room in self._decode_addr or room in self._reshard_ready:
+            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
                 return None
-            if room in self._reshard_req:
-                return self._reshard_replied_at.get(room)
+            if room in self._prefill.reshard_req:
+                return self._prefill.reshard_replied_at.get(room)
             return since
 
     def fail_decode_silence(self, room: int, since: float, timeout: float) -> bool:
@@ -273,10 +275,10 @@ class RaidenSenderMixin:
         decode can never be told to pull KV whose room just failed.
         """
         with self._state_lock:
-            if room in self._decode_addr or room in self._reshard_ready:
+            if room in self._prefill.decode_addr or room in self._prefill.reshard_ready:
                 return False
-            if room in self._reshard_req:
-                started = self._reshard_replied_at.get(room)
+            if room in self._prefill.reshard_req:
+                started = self._prefill.reshard_replied_at.get(room)
             else:
                 started = since
             if started is None or time.time() - started < timeout:
@@ -361,22 +363,25 @@ class RaidenSenderMixin:
 
     def _maybe_reply(self, room: int) -> None:
         with self._state_lock:
-            if room in self._replied or room in self._aborted:
+            if room in self._prefill.replied or room in self._aborted:
                 return
             if (
-                room not in self._reshard_finalized
-                or room not in self._send_blocks
-                or (self._swa_engine is not None and room not in self._send_swa_blocks)
-                or room not in self._decode_addr
+                room not in self._prefill.reshard_finalized
+                or room not in self._prefill.send_blocks
+                or (
+                    self._swa_engine is not None
+                    and room not in self._prefill.send_swa_blocks
+                )
+                or room not in self._prefill.decode_addr
             ):
                 return
-            swa_blocks = list(self._send_swa_blocks.get(room, []))
-            blocks = list(self._send_blocks[room])
-            addr = self._decode_addr[room]
-            aux_blob = self._send_aux.get(room, b"")
-            decode_pages = self._decode_pages[room]
-            decode_swa_pages = self._decode_swa_pages[room]
-            self._replied.add(room)
+            swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            blocks = list(self._prefill.send_blocks[room])
+            addr = self._prefill.decode_addr[room]
+            aux_blob = self._prefill.send_aux.get(room, b"")
+            decode_pages = self._prefill.decode_pages[room]
+            decode_swa_pages = self._prefill.decode_swa_pages[room]
+            self._prefill.replied.add(room)
         # Register only the suffix requested by the decode node to prevent
         # unread blocks from leaking leases until deadline timeout.
         read_blocks = whole_pull_registration(blocks, decode_pages)
@@ -448,7 +453,7 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
-            self._reshard_req[room] = dict(
+            self._prefill.reshard_req[room] = dict(
                 reply_addr=(decode_ip, decode_port),
                 push_endpoint=push_endpoint,
                 decode_blocks=decode_blocks,
@@ -456,8 +461,8 @@ class RaidenSenderMixin:
                 decode_swa_blocks=decode_swa_blocks,
                 swa_push_endpoint=swa_push_endpoint,
             )
-            held = self._held_chunks.pop(room, [])
-            total_pages = self._send_total.get(room, 0)
+            held = self._prefill.held_chunks.pop(room, [])
+            total_pages = self._prefill.send_total.get(room, 0)
         for start, block_ids in held:
             self._announce_reshard_chunk(room, start, block_ids, total_pages)
         self._maybe_reshard_reply(room)
@@ -473,15 +478,15 @@ class RaidenSenderMixin:
         with self._announce_lock:
             with self._state_lock:
                 if (
-                    room in self._reshard_replied
+                    room in self._prefill.reshard_replied
                     or room in self._aborted
-                    or room not in self._reshard_req
+                    or room not in self._prefill.reshard_req
                 ):
                     # The closing message is out (or the room is gone): these
                     # pages travel with the closing transfer, whose span the
                     # decode decides from the chunks that did arrive.
                     return
-                req = self._reshard_req[room]
+                req = self._prefill.reshard_req[room]
                 window = chunk_pull_window(
                     start, len(block_ids), total_pages, len(req["decode_blocks"])
                 )
@@ -491,9 +496,12 @@ class RaidenSenderMixin:
                 block_ids = block_ids[
                     window.chunk_offset : window.chunk_offset + window.length
                 ]
-                index = self._chunk_seq.get(room, 0)
-                self._chunk_seq[room] = index + 1
-                self._reshard_chunks.setdefault(room, {})[index] = (start, block_ids)
+                index = self._prefill.chunk_seq.get(room, 0)
+                self._prefill.chunk_seq[room] = index + 1
+                self._prefill.reshard_chunks.setdefault(room, {})[index] = (
+                    start,
+                    block_ids,
+                )
                 addr = req["reply_addr"]
             payload = ReshardChunk(
                 room=room,
@@ -514,7 +522,7 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
-            chunk = self._reshard_chunks.get(room, {}).get(index)
+            chunk = self._prefill.reshard_chunks.get(room, {}).get(index)
             if chunk is None:
                 logger.error(
                     "RaidenKVManager rank%d room %s asked to push unknown chunk %d",
@@ -523,7 +531,7 @@ class RaidenSenderMixin:
                     index,
                 )
                 return
-            acked = self._reshard_chunk_acked.setdefault(room, set())
+            acked = self._prefill.reshard_chunk_acked.setdefault(room, set())
             if index in acked:
                 return
             acked.add(index)
@@ -532,31 +540,34 @@ class RaidenSenderMixin:
             )
             # The decode is making progress; time the wait for its next
             # message from here.
-            self._reshard_replied_at[room] = time.time()
+            self._prefill.reshard_replied_at[room] = time.time()
         self._push_executor.submit(self._do_reshard_push, room, index, uuid)
 
     def _maybe_reshard_reply(self, room: int) -> None:
         with self._state_lock:
             # Only reply once, and only after send() finished accumulating this
             # room's blocks (a RESHARD_REQ may arrive mid-accumulation).
-            if room in self._reshard_replied:
+            if room in self._prefill.reshard_replied:
                 return
-            if room not in self._reshard_req or room not in self._reshard_finalized:
+            if (
+                room not in self._prefill.reshard_req
+                or room not in self._prefill.reshard_finalized
+            ):
                 return
-            addr = self._reshard_req[room]["reply_addr"]
-            blocks = list(self._send_blocks.get(room, []))
+            addr = self._prefill.reshard_req[room]["reply_addr"]
+            blocks = list(self._prefill.send_blocks.get(room, []))
             # The sliding-window pages are settled by the time this reply is
             # owed (it is sent once the send accumulation is finalized), so the
             # closing push can carry them; earlier chunks never do.
-            swa_blocks = list(self._send_swa_blocks.get(room, []))
-            aux_blob = self._send_aux.get(room, b"")
+            swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
+            aux_blob = self._prefill.send_aux.get(room, b"")
         with self._announce_lock:
             with self._state_lock:
-                if room not in self._reshard_req:
+                if room not in self._prefill.reshard_req:
                     return
                 # Committed under the order lock: no announcement can follow.
-                self._reshard_replied.add(room)
-                self._reshard_replied_at[room] = time.time()
+                self._prefill.reshard_replied.add(room)
+                self._prefill.reshard_replied_at[room] = time.time()
             endpoint = _tcp_endpoint(ip=addr[0], port=addr[1])
             payload = ReshardBlocks(
                 room=room,
@@ -574,21 +585,21 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
-            self._reshard_ready.add(room)
-            self._reshard_ready_pages[room] = pages
+            self._prefill.reshard_ready.add(room)
+            self._prefill.reshard_ready_pages[room] = pages
         self._maybe_reshard_push(room)
 
     def _maybe_reshard_push(self, room: int) -> None:
         with self._state_lock:
             if (
                 room in self._aborted
-                or room not in self._reshard_ready
-                or room not in self._reshard_req
-                or room not in self._send_blocks
-                or room in self._reshard_pushed
+                or room not in self._prefill.reshard_ready
+                or room not in self._prefill.reshard_req
+                or room not in self._prefill.send_blocks
+                or room in self._prefill.reshard_pushed
             ):
                 return
-            self._reshard_pushed.add(room)
+            self._prefill.reshard_pushed.add(room)
             self._reshard_pushes_pending[room] = (
                 self._reshard_pushes_pending.get(room, 0) + 1
             )
@@ -618,11 +629,11 @@ class RaidenSenderMixin:
                     # The room is sent once its closing push and every chunk
                     # push asked for before it have finished.
                     if chunk is None:
-                        self._reshard_final_pushed.add(room)
+                        self._prefill.reshard_final_pushed.add(room)
                     if (
                         left <= 0
-                        and room in self._reshard_final_pushed
-                        and room in self._reshard_req
+                        and room in self._prefill.reshard_final_pushed
+                        and room in self._prefill.reshard_req
                     ):
                         self._completed_send.add(str(room))
 
@@ -776,17 +787,17 @@ class RaidenSenderMixin:
         )
 
         with self._state_lock:
-            if room in self._aborted or room not in self._reshard_req:
+            if room in self._aborted or room not in self._prefill.reshard_req:
                 return  # the room failed or was cleared before the push ran
-            req_meta = dict(self._reshard_req[room])
+            req_meta = dict(self._prefill.reshard_req[room])
             if chunk is None:
-                prefill_blocks = list(self._send_blocks[room])
-                ready_pages = list(self._reshard_ready_pages.get(room, []))
-                swa_blocks = list(self._send_swa_blocks.get(room, []))
+                prefill_blocks = list(self._prefill.send_blocks[room])
+                ready_pages = list(self._prefill.reshard_ready_pages.get(room, []))
+                swa_blocks = list(self._prefill.send_swa_blocks.get(room, []))
                 start = 0
             else:
-                start, prefill_blocks = self._reshard_chunks[room].pop(chunk)
-            total_pages = self._send_total.get(room, len(prefill_blocks))
+                start, prefill_blocks = self._prefill.reshard_chunks[room].pop(chunk)
+            total_pages = self._prefill.send_total.get(room, len(prefill_blocks))
 
         # The window rides on the closing push only, and has to go out even when
         # the closing full-attention push has nothing left to move: chunks can

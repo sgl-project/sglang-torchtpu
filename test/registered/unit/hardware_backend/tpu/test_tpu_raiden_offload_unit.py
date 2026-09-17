@@ -24,6 +24,7 @@ import time
 import types
 import unittest
 from collections import defaultdict
+from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -50,7 +51,12 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
-from sglang.srt.disaggregation.utils import KVClassType, TransferBackend
+from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    KVClassType,
+    TransferBackend,
+)
 from sglang.srt.hardware_backend.tpu.kv_pool_host import (
     RAIDEN_LAYOUT,
     TpuRaidenHostKVCache,
@@ -296,7 +302,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -313,7 +320,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     def test_hybrid_swa_max_blocks_override_is_independent(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -341,7 +349,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         for finalize_first in (False, True):
             with self.subTest(finalize_first=finalize_first):
                 mgr = object.__new__(RaidenKVManager)
-                mgr._announced_at = {}
+                mgr._prefill = PrefillState(announce_pages=1)
+                mgr._decode = None
                 mgr._timeout_s = 120.0
                 mgr._aborted = {}
                 mgr._send_reads = {}
@@ -351,21 +360,14 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 mgr._state_lock = threading.Lock()
                 mgr._status_lock = threading.Lock()
                 mgr._announce_lock = threading.Lock()
-                mgr._send_blocks = {}
                 mgr._read_leases = {}
                 mgr._aborted = {}
                 mgr._send_reads = {}
-                mgr._send_aux = {}
-                mgr._decode_addr = {}
-                mgr._decode_pages = {room: len(blocks)}
-                mgr._decode_swa_pages = {room: 0}
-                mgr._replied = set()
-                mgr._reshard_req = {}
-                mgr._reshard_finalized = set()
+                mgr._prefill.decode_pages = {room: len(blocks)}
+                mgr._prefill.decode_swa_pages = {room: 0}
                 mgr._engine = _Engine()
                 mgr._swa_engine = None
                 mgr._swa_kv_caches = []
-                mgr._send_swa_blocks = {}
                 mgr.swa_raiden_endpoint = None
                 mgr.raiden_endpoint = "127.0.0.1:31020"
                 socket = Mock()
@@ -382,10 +384,10 @@ class TestRaidenHostPoolPaging(CustomTestCase):
                 if finalize_first:
                     mgr.finalize_send(room, None)
                     mgr._engine.register_read.assert_not_called()
-                    mgr._decode_addr[room] = ("127.0.0.1", 31002)
+                    mgr._prefill.decode_addr[room] = ("127.0.0.1", 31002)
                     mgr._maybe_reply(room)
                 else:
-                    mgr._decode_addr[room] = ("127.0.0.1", 31002)
+                    mgr._prefill.decode_addr[room] = ("127.0.0.1", 31002)
                     mgr._maybe_reply(room)
                     mgr._engine.register_read.assert_not_called()
                     mgr.finalize_send(room, None)
@@ -399,7 +401,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         full_blocks = [3, 9]
         swa_blocks = [5, 7]
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = PrefillState(announce_pages=1)
+        mgr._decode = None
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -410,18 +413,11 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
-        mgr._send_blocks = {}
         mgr._read_leases = {}
         mgr._aborted = {}
         mgr._send_reads = {}
-        mgr._send_swa_blocks = {}
-        mgr._send_aux = {}
-        mgr._decode_addr = {}
-        mgr._decode_pages = {room: len(full_blocks)}
-        mgr._decode_swa_pages = {room: len(swa_blocks)}
-        mgr._replied = set()
-        mgr._reshard_req = {}
-        mgr._reshard_finalized = set()
+        mgr._prefill.decode_pages = {room: len(full_blocks)}
+        mgr._prefill.decode_swa_pages = {room: len(swa_blocks)}
         mgr._engine = Mock()
         mgr._swa_engine = Mock()
         mgr._swa_kv_caches = [object()]
@@ -440,7 +436,7 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
         swa_from_state = mgr._swa_blocks_from_state_indices([swa_blocks])
         mgr.append_send_blocks(room, full_blocks, swa_from_state)
-        mgr._decode_addr[room] = ("127.0.0.1", 31002)
+        mgr._prefill.decode_addr[room] = ("127.0.0.1", 31002)
         mgr.finalize_send(room, None)
 
         mgr._engine.register_read.assert_called_once_with(str(room), room, full_blocks)
@@ -458,7 +454,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_hybrid_swa_decode_starts_both_pulls_with_separate_pages(self):
         room = 29
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -473,12 +470,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._pulling = StagingAdmission(2, 1)
         mgr._full_engine_max_blocks = 2
         mgr._swa_engine_max_blocks = 1
-        mgr._local_blocks = {room: [8, 9]}
-        mgr._local_swa_blocks = {room: [7]}
-        mgr._remote_blocks = {room: [1, 2, 3]}
-        mgr._remote_swa_blocks = {room: [4, 5]}
-        mgr._remote_endpoint = {room: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.local_blocks = {room: [8, 9]}
+        mgr._decode.local_swa_blocks = {room: [7]}
+        mgr._decode.remote_blocks = {room: [1, 2, 3]}
+        mgr._decode.remote_swa_blocks = {room: [4, 5]}
+        mgr._decode.remote_endpoint = {room: "127.0.0.1:31020"}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
         mgr.chunked_transfer = False
         mgr._failed = set()
         mgr._native_failed = set()
@@ -501,7 +498,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     ):
         room = 29
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr.attn_tp_rank = 0
         mgr.chunked_transfer = False
@@ -522,12 +520,12 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._failed = set()
         mgr._native_failed = set()
         mgr.record_failure = Mock()
-        mgr._local_blocks = {room: list(range(1000, 1000 + full_pages))}
-        mgr._local_swa_blocks = {room: list(range(2000, 2000 + swa_pages))}
-        mgr._remote_blocks = {room: list(range(full_pages))}
-        mgr._remote_swa_blocks = {room: list(range(swa_pages))}
-        mgr._remote_endpoint = {room: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.local_blocks = {room: list(range(1000, 1000 + full_pages))}
+        mgr._decode.local_swa_blocks = {room: list(range(2000, 2000 + swa_pages))}
+        mgr._decode.remote_blocks = {room: list(range(full_pages))}
+        mgr._decode.remote_swa_blocks = {room: list(range(swa_pages))}
+        mgr._decode.remote_endpoint = {room: "127.0.0.1:31020"}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
         return room, mgr
 
     def test_hybrid_swa_decode_accepts_full_request_larger_than_swa_window(self):
@@ -585,7 +583,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_decode_defers_pull_until_the_pool_has_room(self):
         first, second = 29, 30
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -604,12 +603,9 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
-        mgr._local_blocks = {first: [8], second: [9]}
-        mgr._local_swa_blocks = {}
-        mgr._remote_blocks = {first: [1], second: [2]}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_endpoint = {r: "127.0.0.1:31020" for r in (first, second)}
-        mgr._remote_swa_endpoint = {}
+        mgr._decode.local_blocks = {first: [8], second: [9]}
+        mgr._decode.remote_blocks = {first: [1], second: [2]}
+        mgr._decode.remote_endpoint = {r: "127.0.0.1:31020" for r in (first, second)}
 
         self.assertTrue(mgr.maybe_start_pull(first))
         self.assertFalse(mgr.maybe_start_pull(second))
@@ -625,6 +621,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _decode_mgr(pool_pages, full_limit, swa_limit=None, swa_pool_pages=None):
         mgr = object.__new__(RaidenKVManager)
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -637,7 +635,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._swa_engine = Mock() if swa_limit is not None else None
         mgr._dynamic_host_staging = True
         mgr._pulling = StagingAdmission(pool_pages, swa_pool_pages)
-        mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._pulling_cleared = set()
         mgr._full_engine_max_blocks = full_limit
@@ -646,12 +643,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
-        mgr._local_blocks = {}
-        mgr._local_swa_blocks = {}
-        mgr._remote_blocks = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_endpoint = {}
-        mgr._remote_swa_endpoint = {}
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
         # clear_room sweeps the reshard bookkeeping too.
@@ -661,13 +652,13 @@ class TestRaidenHostPoolPaging(CustomTestCase):
 
     @staticmethod
     def _announce(mgr, room, full_pages, swa_pages=0):
-        mgr._local_blocks[room] = list(range(100, 100 + full_pages))
-        mgr._remote_blocks[room] = list(range(full_pages))
-        mgr._remote_endpoint[room] = "127.0.0.1:31020"
+        mgr._decode.local_blocks[room] = list(range(100, 100 + full_pages))
+        mgr._decode.remote_blocks[room] = list(range(full_pages))
+        mgr._decode.remote_endpoint[room] = "127.0.0.1:31020"
         if mgr._swa_engine is not None:
-            mgr._local_swa_blocks[room] = list(range(200, 200 + swa_pages))
-            mgr._remote_swa_blocks[room] = list(range(swa_pages))
-            mgr._remote_swa_endpoint[room] = "127.0.0.1:31022"
+            mgr._decode.local_swa_blocks[room] = list(range(200, 200 + swa_pages))
+            mgr._decode.remote_swa_blocks[room] = list(range(swa_pages))
+            mgr._decode.remote_swa_endpoint[room] = "127.0.0.1:31022"
 
     def test_hybrid_swa_checks_each_pool_against_its_own_page_limit(self):
         # gpt-oss at page 64: a 128-token window is 3 pages, the full pool 128.
@@ -696,7 +687,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr = self._decode_mgr(pool_pages=2, full_limit=8)
         self._announce(mgr, first, full_pages=2)
         self._announce(mgr, second, full_pages=2)
-        mgr._send_blocks = {}
         mgr._read_leases = {}
 
         self.assertTrue(mgr.maybe_start_pull(first))
@@ -716,7 +706,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         mgr = self._decode_mgr(pool_pages=2, full_limit=8)
         self._announce(mgr, first, full_pages=2)
         self._announce(mgr, second, full_pages=2)
-        mgr._send_blocks = {}
         mgr._read_leases = {}
 
         self.assertTrue(mgr.maybe_start_pull(first))
@@ -795,7 +784,6 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     def test_clearing_a_waiting_room_frees_the_line(self):
         holder, big, small = 60, 61, 62
         mgr = self._decode_mgr(pool_pages=8, full_limit=8)
-        mgr._send_blocks = {}
         mgr._read_leases = {}
         self._announce(mgr, holder, full_pages=6)
         self._announce(mgr, big, full_pages=4)
@@ -810,7 +798,8 @@ class TestRaidenHostPoolPaging(CustomTestCase):
     @staticmethod
     def _reshard_decode_mgr():
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -937,7 +926,8 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     @staticmethod
     def _prefill():
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = PrefillState(announce_pages=1)
+        mgr._decode = None
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -951,20 +941,9 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._engine.register_read = Mock(return_value=True)
         mgr._swa_engine = None
         mgr._local_rank = 3
-        mgr._chunk_seq = {}
         mgr._uuid_seq = 0
-        mgr._held_chunks = {}
-        mgr._send_total = {}
-        mgr._decode_addr = {}
-        mgr._decode_pages = {}
-        mgr._decode_swa_pages = {}
-        mgr._send_blocks = {}
         mgr._read_leases = {}
-        mgr._replied = set()
-        mgr._pending_offer = {}
-        mgr._announce_pages = 16
-        mgr._reshard_req = {}
-        mgr._reshard_finalized = set()
+        mgr._prefill.announce_pages = 16
         mgr.raiden_endpoint = "127.0.0.1:31020"
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
@@ -985,7 +964,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         room = 31
         mgr = self._prefill()
         mgr._on_pull_req(self._pull_req(room, 40))
-        self.assertEqual(mgr._decode_pages[room], 40)
+        self.assertEqual(mgr._prefill.decode_pages[room], 40)
 
         # 64 prefill pages; the decode already holds the first 24.
         blocks = list(range(100, 164))
@@ -1018,7 +997,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[0:16])
         msg = mgr._socket.send_multipart.call_args.args[0]
         self.assertEqual(Chunk.from_frames(msg).start, 0)
-        self.assertNotIn(room, mgr._pending_offer)
+        self.assertNotIn(room, mgr._prefill.pending_offer)
 
     def test_chunks_offered_before_the_pull_request_are_held_then_filtered(self):
         room = 32
@@ -1031,11 +1010,13 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._on_pull_req(self._pull_req(room, 40))
         self.assertEqual(mgr._engine.register_read.call_count, 1)
         self.assertEqual(mgr._engine.register_read.call_args.args[2], blocks[24:32])
-        self.assertNotIn(room, mgr._held_chunks)
+        self.assertNotIn(room, mgr._prefill.held_chunks)
 
     @staticmethod
     def _decode(room, local, pool_pages, swa_pool_pages=8):
         mgr = object.__new__(RaidenKVManager)
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1053,20 +1034,9 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._swa_engine_max_blocks = 2
         mgr.attn_tp_rank = 0
         mgr.record_failure = Mock()
-        mgr._local_blocks = {room: local}
-        mgr._local_swa_blocks = {}
-        mgr._remote_blocks = {}
-        mgr._remote_endpoint = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_swa_endpoint = {}
-        mgr._decode_aux_index = {}
-        mgr._remote_total = {room: 64}
-        mgr._chunk_queue = {}
-        mgr._chunk_reads = {}
-        mgr._announced_spans = {}
-        mgr._announced_at = {}
+        mgr._decode.local_blocks = {room: local}
+        mgr._decode.remote_total = {room: 64}
         mgr._timeout_s = 120.0
-        mgr._final_seen = set()
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
@@ -1113,7 +1083,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
                     # Complete each native read explicitly; no sleeps or timing races.
                     for _ in range(4):
                         decode.maybe_start_pull(room)
-                        for req_id in decode._chunk_reads.get(room, []):
+                        for req_id in decode._decode.chunk_reads.get(room, []):
                             decode._completed_recv.add(req_id)
                         with decode._state_lock:
                             decode._release_pull_slots_locked()
@@ -1133,11 +1103,11 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, pool_pages=256)
         mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {room: [4, 5]}
-        mgr._local_swa_blocks = {room: [7]}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
-        mgr._final_seen.add(room)
-        mgr._chunk_queue[room] = [
+        mgr._decode.remote_swa_blocks = {room: [4, 5]}
+        mgr._decode.local_swa_blocks = {room: [7]}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.final_seen.add(room)
+        mgr._decode.chunk_queue[room] = [
             (str(room), room, list(range(48, 48 + 16)), remote[48:64], endpoint)
         ]
 
@@ -1159,7 +1129,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, pool_pages=256)
-        mgr._chunk_queue[room] = [
+        mgr._decode.chunk_queue[room] = [
             ("33#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
             ("33#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
@@ -1189,7 +1159,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         mgr = self._decode(room, local, pool_pages=256)
         mgr._full_engine_max_blocks = 8
-        mgr._chunk_queue[room] = [
+        mgr._decode.chunk_queue[room] = [
             ("43#0", 11, list(range(0, 0 + 16)), remote[0:16], "127.0.0.1:31020")
         ]
 
@@ -1205,10 +1175,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         mgr = self._decode(room, local, pool_pages=256)
         mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {room: [4, 5, 6]}
-        mgr._local_swa_blocks = {room: [7, 8, 9]}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
-        mgr._chunk_queue[room] = [
+        mgr._decode.remote_swa_blocks = {room: [4, 5, 6]}
+        mgr._decode.local_swa_blocks = {room: [7, 8, 9]}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.chunk_queue[room] = [
             (
                 str(room),
                 room,
@@ -1239,7 +1209,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         # The second chunk overtakes the first on the wire.
         mgr._on_chunk(chunk("45#1", 16, remote[16:32]))
         mgr._on_chunk(chunk("45#0", 0, remote[0:16]))
-        self.assertEqual(sorted(mgr._announced_spans[room]), [(0, 16), (16, 32)])
+        self.assertEqual(sorted(mgr._decode.announced_spans[room]), [(0, 16), (16, 32)])
 
     def test_closing_read_covers_a_chunk_lost_mid_range(self):
         # Chunk 0:16 lost its announcement race while 16:32 got through; the
@@ -1247,18 +1217,18 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         room = 46
         remote = list(range(100, 164))
         mgr = self._decode(room, list(range(200, 264)), pool_pages=256)
-        mgr._remote_blocks = {}
-        mgr._remote_endpoint = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_swa_endpoint = {}
-        mgr._decode_aux_index = {}
+        mgr._decode.remote_blocks = {}
+        mgr._decode.remote_endpoint = {}
+        mgr._decode.remote_swa_blocks = {}
+        mgr._decode.remote_swa_endpoint = {}
+        mgr._decode.decode_aux_index = {}
         mgr._on_chunk(
             Chunk(
                 room, "46#1", 11, 16, 64, remote[16:32], "127.0.0.1:31020"
             ).to_frames()
         )
         mgr._on_blocks(Blocks(room, remote, "127.0.0.1:31020", [], "", b"").to_frames())
-        req_id, uuid, pages, blocks, _ = mgr._chunk_queue[room][-1]
+        req_id, uuid, pages, blocks, _ = mgr._decode.chunk_queue[room][-1]
         self.assertEqual(req_id, str(room))
         self.assertEqual(pages, list(range(0, 16)) + list(range(32, 64)))
         self.assertEqual(blocks, remote[0:16] + remote[32:64])
@@ -1266,11 +1236,11 @@ class TestRaidenChunkedTransfer(CustomTestCase):
     def test_discarded_waiter_does_not_block_closing_read(self):
         room = 48
         mgr = self._decode(room, list(range(200, 208)), pool_pages=8)
-        mgr._remote_blocks = {}
-        mgr._remote_endpoint = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_swa_endpoint = {}
-        mgr._decode_aux_index = {}
+        mgr._decode.remote_blocks = {}
+        mgr._decode.remote_endpoint = {}
+        mgr._decode.remote_swa_blocks = {}
+        mgr._decode.remote_swa_endpoint = {}
+        mgr._decode.decode_aux_index = {}
 
         # Leave only two pages free, so the four-page chunk becomes the
         # head-of-line waiter.
@@ -1317,9 +1287,9 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(rooms[0], local, pool_pages=32)
         for room in rooms:
-            mgr._local_blocks[room] = local
-            mgr._remote_total[room] = 64
-            mgr._chunk_queue[room] = [
+            mgr._decode.local_blocks[room] = local
+            mgr._decode.remote_total[room] = 64
+            mgr._decode.chunk_queue[room] = [
                 (f"{room}#0", room, list(range(0, 16)), remote[0:16], endpoint)
             ]
 
@@ -1341,7 +1311,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, pool_pages=256)
-        mgr._chunk_queue[room] = [
+        mgr._decode.chunk_queue[room] = [
             ("42#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
             ("42#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
@@ -1365,12 +1335,12 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(first, local, pool_pages=16)
-        mgr._local_blocks[second] = local
-        mgr._remote_total[second] = 64
-        mgr._chunk_queue[first] = [
+        mgr._decode.local_blocks[second] = local
+        mgr._decode.remote_total[second] = 64
+        mgr._decode.chunk_queue[first] = [
             ("36#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint)
         ]
-        mgr._chunk_queue[second] = [
+        mgr._decode.chunk_queue[second] = [
             ("37#0", 21, list(range(0, 0 + 16)), remote[0:16], endpoint)
         ]
 
@@ -1396,7 +1366,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         remote = list(range(100, 164))
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, pool_pages=256)
-        mgr._chunk_queue[room] = [
+        mgr._decode.chunk_queue[room] = [
             ("38#0", 11, list(range(0, 0 + 16)), remote[0:16], endpoint),
             ("38#1", 12, list(range(16, 16 + 16)), remote[16:32], endpoint),
         ]
@@ -1421,15 +1391,18 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(first, local, pool_pages=64, swa_pool_pages=1)
         mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {first: [4, 5], second: [4, 5]}
-        mgr._local_swa_blocks = {first: [7], second: [7]}
-        mgr._remote_swa_endpoint = {first: "127.0.0.1:31022", second: "127.0.0.1:31022"}
-        mgr._local_blocks[second] = local
-        mgr._remote_total[second] = 64
-        mgr._chunk_queue[first] = [
+        mgr._decode.remote_swa_blocks = {first: [4, 5], second: [4, 5]}
+        mgr._decode.local_swa_blocks = {first: [7], second: [7]}
+        mgr._decode.remote_swa_endpoint = {
+            first: "127.0.0.1:31022",
+            second: "127.0.0.1:31022",
+        }
+        mgr._decode.local_blocks[second] = local
+        mgr._decode.remote_total[second] = 64
+        mgr._decode.chunk_queue[first] = [
             (str(first), first, list(range(48, 48 + 16)), remote[48:64], endpoint)
         ]
-        mgr._chunk_queue[second] = [
+        mgr._decode.chunk_queue[second] = [
             (str(second), second, list(range(48, 48 + 16)), remote[48:64], endpoint)
         ]
 
@@ -1457,10 +1430,10 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         endpoint = "127.0.0.1:31020"
         mgr = self._decode(room, local, pool_pages=64, swa_pool_pages=1)
         mgr._swa_engine = Mock()
-        mgr._remote_swa_blocks = {room: [4, 5]}
-        mgr._local_swa_blocks = {room: [7]}
-        mgr._remote_swa_endpoint = {room: "127.0.0.1:31022"}
-        mgr._chunk_queue[room] = [
+        mgr._decode.remote_swa_blocks = {room: [4, 5]}
+        mgr._decode.local_swa_blocks = {room: [7]}
+        mgr._decode.remote_swa_endpoint = {room: "127.0.0.1:31022"}
+        mgr._decode.chunk_queue[room] = [
             (str(room), room, list(range(48, 48 + 16)), remote[48:64], endpoint)
         ]
 
@@ -1481,15 +1454,11 @@ class TestRaidenChunkedTransfer(CustomTestCase):
 
 
 class TestRaidenRoleStatePlacement(CustomTestCase):
-    """RaidenKVManager.__init__ splits its state between a prefill branch and a
-    decode branch, so state declared in the wrong one is simply absent at
-    runtime -- an AttributeError the first time that role reaches the code that
-    reads it, and only on a path CI happens to exercise.
+    """Role handlers must only access fields owned by their state record.
 
-    `_reshard_covered` shipped in the prefill branch while both of its readers
-    are decode-side. Nothing caught it until a hybrid model first reached the
-    decode-side chunked reshard path on hardware, ~45 minutes into a two-slice
-    P/D run. This asserts statically what that run discovered.
+    A decode-only field once lived in prefill initialization and caused an
+    AttributeError on the chunked reshard path. Check all mixin methods so
+    moving fields or methods cannot silently remove that coverage.
     """
 
     # Handlers named by the message each side receives; the reshard handshake is
@@ -1518,70 +1487,132 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
         }
     )
 
+    def test_role_state_is_declared_in_the_record_that_reads_it(self):
+        from sglang.srt.disaggregation.raiden.receiver import RaidenReceiverMixin
+        from sglang.srt.disaggregation.raiden.sender import RaidenSenderMixin
+
+        roles = (
+            ("_prefill", PrefillState, RaidenSenderMixin, self.PREFILL_SIDE),
+            ("_decode", DecodeState, RaidenReceiverMixin, self.DECODE_SIDE),
+        )
+        state_fields = {
+            role: {f.name for f in fields(state)} for role, state, _, _ in roles
+        }
+        self.assertIn("reshard_covered", state_fields["_decode"])
+        self.assertNotIn("reshard_covered", state_fields["_prefill"])
+        old_attributes = {
+            "_" + name for names in state_fields.values() for name in names
+        }
+        for role, _, mixin, expected in roles:
+            methods = dict(inspect.getmembers(mixin, inspect.isfunction))
+            self.assertFalse(
+                expected - methods.keys(),
+                f"Missing role methods: {sorted(expected - methods.keys())}",
+            )
+            for name, method in methods.items():
+                with self.subTest(role=role, method=name):
+                    tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+                    for node in ast.walk(tree):
+                        if not isinstance(node, ast.Attribute):
+                            continue
+                        owner = node.value
+                        if isinstance(owner, ast.Name) and owner.id == "self":
+                            self.assertNotIn(node.attr, old_attributes)
+                            if node.attr in state_fields:
+                                self.assertEqual(node.attr, role)
+                        if (
+                            isinstance(owner, ast.Attribute)
+                            and isinstance(owner.value, ast.Name)
+                            and owner.value.id == "self"
+                            and owner.attr in state_fields
+                        ):
+                            self.assertIn(node.attr, state_fields[owner.attr])
+
     @staticmethod
-    def _self_attrs(nodes, *, stored_only):
-        found = set()
-        for node in nodes:
-            for sub in ast.walk(node):
-                if (
-                    isinstance(sub, ast.Attribute)
-                    and isinstance(sub.value, ast.Name)
-                    and sub.value.id == "self"
-                    and (not stored_only or isinstance(sub.ctx, ast.Store))
-                ):
-                    found.add(sub.attr)
-        return found
+    def _manager(mode):
+        def init_base(mgr, args, disaggregation_mode, *_):
+            mgr.kv_args = args
+            mgr.disaggregation_mode = disaggregation_mode
+            mgr.attn_tp_rank = mgr.attn_dp_rank = mgr.attn_cp_rank = 0
+            mgr.attn_tp_size = mgr.attn_dp_size = mgr.attn_cp_size = 1
+            mgr.system_dp_rank = 0
+            mgr.request_status = {}
+            mgr.failure_records = {}
+            mgr.failure_lock = threading.Lock()
 
-    def test_role_state_is_declared_in_the_branch_that_reads_it(self):
-        # Resolve inherited handlers too: their source lives in the sender
-        # and receiver mixins, while state initialization stays in conn.py.
-        resolved = dict(inspect.getmembers(RaidenKVManager, inspect.isfunction))
-        expected = self.DECODE_SIDE | self.PREFILL_SIDE
-        self.assertFalse(
-            expected - resolved.keys(),
-            f"Missing role methods: {sorted(expected - resolved.keys())}",
-        )
-        methods = [
-            ast.parse(textwrap.dedent(inspect.getsource(resolved[name]))).body[0]
-            for name in sorted(expected)
-        ]
-        init = ast.parse(
-            textwrap.dedent(inspect.getsource(RaidenKVManager.__init__))
-        ).body[0]
+        with (
+            patch(
+                "sglang.srt.disaggregation.common.conn.CommonKVManager.__init__",
+                init_base,
+            ),
+            patch("sglang.srt.disaggregation.raiden.conn.threading.Thread"),
+            patch(
+                "sglang.srt.disaggregation.raiden.conn.concurrent.futures.ThreadPoolExecutor"
+            ),
+            patch.object(RaidenKVManager, "_start_heartbeat_checker_thread"),
+        ):
+            return RaidenKVManager(SimpleNamespace(page_size=128), mode, Mock())
 
-        prefill_only, decode_only = set(), set()
-        for stmt in init.body:
-            if isinstance(stmt, ast.If) and "PREFILL" in ast.dump(stmt.test):
-                p = self._self_attrs(stmt.body, stored_only=True)
-                d = self._self_attrs(stmt.orelse, stored_only=True)
-                prefill_only |= p - d
-                decode_only |= d - p
-        shared = prefill_only & decode_only
-        prefill_only -= shared
-        decode_only -= shared
-        self.assertIn(
-            "_reshard_covered",
-            decode_only,
-            "_reshard_covered is decode state; both readers run on decode",
-        )
+    def test_constructor_creates_only_its_role_state(self):
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                first, second = self._manager(mode), self._manager(mode)
+                if mode == DisaggregationMode.PREFILL:
+                    self.assertIsInstance(first._prefill, PrefillState)
+                    self.assertIsNone(first._decode)
+                    first._prefill.send_blocks[41] = [1]
+                    self.assertEqual(second._prefill.send_blocks, {})
+                else:
+                    self.assertIsInstance(first._decode, DecodeState)
+                    self.assertIsNone(first._prefill)
+                    first._decode.local_blocks[41] = [1]
+                    self.assertEqual(second._decode.local_blocks, {})
 
-        readers = {}
-        for fn in methods:
-            for attr in self._self_attrs([fn], stored_only=False):
-                readers.setdefault(attr, set()).add(fn.name)
+    def test_cleanup_preserves_other_rooms_and_native_io(self):
+        room, other = 41, 42
+        for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                mgr = self._manager(mode)
+                state = mgr._prefill if mgr._prefill is not None else mgr._decode
+                # Populate every protocol collection so newly added fields
+                # cannot silently escape the manager's cleanup sweep.
+                for field in fields(state):
+                    value = getattr(state, field.name)
+                    if isinstance(value, dict):
+                        if field.name == "announced_at":
+                            value.update({f"{room}#0": 1.0, f"{other}#0": 1.0})
+                        else:
+                            value.update({room: object(), other: object()})
+                    elif isinstance(value, set):
+                        value.update((room, other))
+                mgr._aborted[room] = 1.0
+                if mode == DisaggregationMode.PREFILL:
+                    mgr._send_reads[room] = {str(room)}
+                    mgr._reshard_pushes_pending[room] = 1
+                    pending_copy = (room, room, Mock())
+                    mgr._stale_plans.append(pending_copy)
+                else:
+                    mgr._reshard_plans[room] = {str(room): room}
 
-        wrong = []
-        for attr in sorted(prefill_only):
-            used = sorted(readers.get(attr, set()) & self.DECODE_SIDE)
-            if used:
-                wrong.append(f"{attr}: prefill-only, read by decode-side {used}")
-        for attr in sorted(decode_only):
-            used = sorted(readers.get(attr, set()) & self.PREFILL_SIDE)
-            if used:
-                wrong.append(f"{attr}: decode-only, read by prefill-side {used}")
-        self.assertEqual(
-            wrong, [], "state declared in the wrong role branch:\n" + "\n".join(wrong)
-        )
+                mgr.clear_room(room)
+
+                for field in fields(state):
+                    value = getattr(state, field.name)
+                    if isinstance(value, (dict, set)):
+                        key = f"{room}#0" if field.name == "announced_at" else room
+                        other_key = (
+                            f"{other}#0" if field.name == "announced_at" else other
+                        )
+                        self.assertNotIn(key, value, field.name)
+                        self.assertIn(other_key, value, field.name)
+                self.assertIn(room, mgr._aborted)
+                if mode == DisaggregationMode.PREFILL:
+                    self.assertEqual(mgr._send_reads[room], {str(room)})
+                    self.assertEqual(mgr._reshard_pushes_pending[room], 1)
+                    self.assertIn(pending_copy, mgr._stale_plans)
+                else:
+                    self.assertNotIn(room, mgr._reshard_plans)
+                    self.assertEqual(mgr._cleared_plans, {str(room): room})
 
 
 class TestRaidenDefaultPort(CustomTestCase):
@@ -1686,7 +1717,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _prefill(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = PrefillState(announce_pages=1)
+        mgr._decode = None
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr.failure_records = {}
@@ -1711,31 +1743,10 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._timeout_s = 5
         mgr._push_executor = _InlineExecutor()
         mgr._make_geometry = self._geometry
-        mgr._send_blocks = {}
         mgr._read_leases = {}
-        mgr._send_swa_blocks = {}
-        mgr._send_aux = {}
-        mgr._send_total = {}
-        mgr._held_chunks = {}
-        mgr._decode_addr = {}
-        mgr._decode_pages = {}
-        mgr._decode_swa_pages = {}
-        mgr._chunk_seq = {}
         mgr._uuid_seq = 0
-        mgr._reshard_req = {}
-        mgr._reshard_finalized = set()
-        mgr._reshard_replied = set()
-        mgr._reshard_ready = set()
-        mgr._reshard_pushed = set()
-        mgr._reshard_replied_at = {}
-        mgr._reshard_chunks = {}
-        mgr._reshard_covered = {}
-        mgr._reshard_ready_pages = {}
-        mgr._reshard_chunk_acked = {}
-        mgr._pending_offer = {}
-        mgr._announce_pages = 16
+        mgr._prefill.announce_pages = 16
         mgr._reshard_pushes_pending = {}
-        mgr._reshard_final_pushed = set()
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
@@ -1785,28 +1796,31 @@ class TestRaidenChunkedResharding(CustomTestCase):
         # the chunk's push, and a duplicate request moves nothing twice.
         mgr = self._prefill()
         room = self.ROOM
-        mgr._reshard_req[room] = dict(
+        mgr._prefill.reshard_req[room] = dict(
             reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(64))
         )
-        mgr._reshard_chunks[room] = {0: (0, list(range(16))), 1: (16, list(range(16)))}
+        mgr._prefill.reshard_chunks[room] = {
+            0: (0, list(range(16))),
+            1: (16, list(range(16))),
+        }
         mgr._push_executor = Mock()  # hold the push; only the accounting matters
         mgr._on_reshard_chunk_ready(ReshardChunkReady(41, 0, 7).to_frames())
-        self.assertEqual(mgr._reshard_chunk_acked[room], {0})
+        self.assertEqual(mgr._prefill.reshard_chunk_acked[room], {0})
         mgr._on_reshard_chunk_ready(ReshardChunkReady(41, 0, 7).to_frames())
-        self.assertEqual(mgr._reshard_chunk_acked[room], {0})
+        self.assertEqual(mgr._prefill.reshard_chunk_acked[room], {0})
         self.assertEqual(mgr._reshard_pushes_pending[room], 1)
         self.assertEqual(mgr._push_executor.submit.call_count, 1)
 
     def test_reshard_chunk_racing_the_closing_message_is_skipped(self):
         mgr = self._prefill()
         room = self.ROOM
-        mgr._reshard_req[room] = dict(
+        mgr._prefill.reshard_req[room] = dict(
             reply_addr=("10.0.0.2", 5555), decode_blocks=list(range(40))
         )
-        mgr._reshard_replied.add(room)
+        mgr._prefill.reshard_replied.add(room)
         mgr._announce_reshard_chunk(room, 0, list(range(16)), 64)
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK), [])
-        self.assertNotIn(room, mgr._reshard_chunk_acked)
+        self.assertNotIn(room, mgr._prefill.reshard_chunk_acked)
 
     def test_chunk_racing_the_closing_reply_is_skipped(self):
         # A chunk announced after the reply would arrive after it and outlive
@@ -1814,9 +1828,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr = self._prefill()
         mgr._ensure_engine = Mock()
         room = self.ROOM
-        mgr._decode_addr[room] = ("10.0.0.2", 5555)
-        mgr._decode_pages[room] = 40
-        mgr._replied = {room}
+        mgr._prefill.decode_addr[room] = ("10.0.0.2", 5555)
+        mgr._prefill.decode_pages[room] = 40
+        mgr._prefill.replied = {room}
         mgr._announce_chunk(room, 0, list(range(16)), 64)
         mgr._ensure_engine.assert_not_called()
         mgr._socket.send_multipart.assert_not_called()
@@ -1870,7 +1884,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
 
     def _decode(self):
         mgr = object.__new__(RaidenKVManager)
-        mgr._announced_at = {}
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr._timeout_s = 120.0
         mgr._aborted = {}
         mgr._send_reads = {}
@@ -1889,7 +1904,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._local_rank = 0
         mgr._uuid_seq = 0
         mgr._make_geometry = self._geometry
-        mgr._reshard_meta = {
+        mgr._decode.reshard_meta = {
             self.ROOM: dict(
                 local_blocks=list(self.DECODE_BLOCKS),
                 source_ranks=[0, 1],
@@ -1898,14 +1913,9 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 ready_endpoints=["tcp://10.0.0.10:1", "tcp://10.0.0.11:1"],
             )
         }
-        mgr._reshard_sources = {self.ROOM: {}}
+        mgr._decode.reshard_sources = {self.ROOM: {}}
         # Same shape for the window pool; _on_reshard_blocks records both.
-        mgr._reshard_swa_sources = {self.ROOM: {}}
-        mgr._reshard_registered = set()
-        mgr._reshard_chunk_sources = {}
-        mgr._reshard_covered = {}
-        mgr._reshard_ready_pages = {}
-        mgr._reshard_chunk_registering = {}
+        mgr._decode.reshard_swa_sources = {self.ROOM: {}}
         mgr._reshard_plans = {}
         mgr._cleared_plans = {}
         mgr._stale_plans = []
@@ -1913,13 +1923,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._aborted = {}
         mgr._send_reads = {}
         mgr._pulling_cleared = set()
-        mgr._chunk_reads = {}
-        mgr._chunk_queue = {}
-        mgr._final_seen = set()
-        mgr._announced_spans = {}
-        mgr._announced_at = {}
+        mgr._decode.announced_at = {}
         mgr._timeout_s = 120.0
-        mgr._remote_total = {}
         mgr._completed_send = set()
         mgr._completed_recv = set()
         mgr._failed = set()
@@ -2068,7 +2073,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.d2h = Mock(return_value=fut)
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_req(self._reshard_req())
-            mgr._send_blocks[room] = list(blocks[:32])
+            mgr._prefill.send_blocks[room] = list(blocks[:32])
             for start in (0, 16):
                 mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
             chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
@@ -2109,7 +2114,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._engine.d2h = Mock(return_value=fut)
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_req(self._reshard_req())
-            mgr._send_blocks[room] = list(blocks[:32])
+            mgr._prefill.send_blocks[room] = list(blocks[:32])
             for start in (0, 16):
                 mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
             chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
@@ -2133,7 +2138,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._push_executor = Mock()  # hold the push instead of running it
         with patch.dict(sys.modules, _pb2_modules()):
             mgr._on_reshard_req(self._reshard_req())
-            mgr._send_blocks[room] = list(blocks[:32])
+            mgr._prefill.send_blocks[room] = list(blocks[:32])
             for start in (0, 16):
                 mgr.offer_chunk(room, start, blocks[start : start + 16], 64)
             chunk_msg = self._sent(mgr, MessageTag.RESHARD_CHUNK)[0]
@@ -2198,7 +2203,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         # The plan is dropped again, nothing is recreated, no push is asked for.
         uuid = mgr._engine.register_active_plan.call_args.args[0]
         mgr._engine.unregister_active_plan.assert_called_once_with(uuid)
-        self.assertEqual(mgr._chunk_reads.get(room, []), [])
+        self.assertEqual(mgr._decode.chunk_reads.get(room, []), [])
         self.assertEqual(mgr._reshard_plans.get(room, {}), {})
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
         self.assertFalse(mgr.is_failed(room))
@@ -2221,7 +2226,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertTrue(mgr.is_failed(room))
         self.assertIn("RESOURCE_EXHAUSTED", mgr.record_failure.call_args.args[1])
         # The chunk is not admitted anywhere a completion could be faked from.
-        self.assertEqual(mgr._chunk_reads.get(room, []), [])
+        self.assertEqual(mgr._decode.chunk_reads.get(room, []), [])
         self.assertEqual(mgr._reshard_plans.get(room, {}), {})
         self.assertEqual(self._sent(mgr, MessageTag.RESHARD_CHUNK_READY), [])
 
@@ -2265,7 +2270,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
             )
             self.assertEqual(len(self._sent(mgr, MessageTag.RESHARD_READY)), 2)
 
-        self.assertEqual(mgr._chunk_reads[room], ["41#0", "41"])
+        self.assertEqual(mgr._decode.chunk_reads[room], ["41#0", "41"])
         self.assertFalse(mgr.is_recv_done(room))
         mgr._completed_recv.update({"41#0", "41"})
         self.assertTrue(mgr.is_recv_done(room))
@@ -2290,8 +2295,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
         self.assertEqual((uuid, req.req_id), (room, "41"))
         self.assertEqual(_plan_blocks(req, 0), (src[0][24:64], self.DECODE_BLOCKS))
         self.assertEqual(_plan_blocks(req, 1), (src[1][24:64], self.DECODE_BLOCKS))
-        self.assertNotIn(room, mgr._reshard_chunk_sources)
-        self.assertEqual(mgr._chunk_reads[room], ["41"])
+        self.assertNotIn(room, mgr._decode.reshard_chunk_sources)
+        self.assertEqual(mgr._decode.chunk_reads[room], ["41"])
 
     def test_closing_plan_covers_a_reshard_chunk_lost_mid_range(self):
         # Chunk 0 (pages 24:32) lost its race; chunk 1 (pages 32:40) was
@@ -2336,7 +2341,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
                 mgr._on_reshard_blocks(_reshard_blocks_frames(41, src[rank], rank))
             seen_during_chunk_registration.append(
                 (
-                    room in mgr._reshard_registered,
+                    room in mgr._decode.reshard_registered,
                     mgr.is_recv_done(room),
                 )
             )
@@ -2354,8 +2359,8 @@ class TestRaidenChunkedResharding(CustomTestCase):
             [c.args[1].req_id for c in mgr._engine.register_active_plan.call_args_list],
             ["41#0", "41"],
         )
-        self.assertEqual(mgr._chunk_reads[room], ["41#0", "41"])
-        self.assertNotIn(room, mgr._reshard_chunk_registering)
+        self.assertEqual(mgr._decode.chunk_reads[room], ["41#0", "41"])
+        self.assertNotIn(room, mgr._decode.reshard_chunk_registering)
 
 
 class _FakeFuture:
@@ -2432,20 +2437,19 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_producer(self, decode_pages):
         mgr = object.__new__(RaidenKVManager)
+        mgr._prefill = PrefillState(announce_pages=1)
+        mgr._decode = None
         mgr.attn_tp_rank = 0
         mgr._state_lock = threading.Lock()
         mgr._announce_lock = threading.Lock()
         mgr._aborted = {}
         mgr._send_reads = {}
-        mgr._send_blocks = {self.ROOM: list(self.BLOCKS)}
-        mgr._send_swa_blocks = {}
-        mgr._send_aux = {self.ROOM: b"aux"}
-        mgr._decode_addr = {self.ROOM: ("127.0.0.1", 31002)}
-        mgr._decode_pages = {self.ROOM: decode_pages}
-        mgr._decode_swa_pages = {self.ROOM: 0}
-        mgr._replied = set()
-        mgr._reshard_req = {}
-        mgr._reshard_finalized = {self.ROOM}
+        mgr._prefill.send_blocks = {self.ROOM: list(self.BLOCKS)}
+        mgr._prefill.send_aux = {self.ROOM: b"aux"}
+        mgr._prefill.decode_addr = {self.ROOM: ("127.0.0.1", 31002)}
+        mgr._prefill.decode_pages = {self.ROOM: decode_pages}
+        mgr._prefill.decode_swa_pages = {self.ROOM: 0}
+        mgr._prefill.reshard_finalized = {self.ROOM}
         mgr._completed_send = set()
         mgr._failed = set()
         mgr.record_failure = Mock()
@@ -2468,6 +2472,8 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _make_receiver(self, local_blocks):
         mgr = object.__new__(RaidenKVManager)
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr.chunked_transfer = False
         mgr._state_lock = threading.Lock()
         mgr._status_lock = threading.Lock()
@@ -2481,18 +2487,14 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         mgr._pulling = StagingAdmission(128, 8)
         mgr._pulling_cleared = set()
         mgr._dynamic_host_staging = True
-        mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._full_engine_max_blocks = 128
         mgr._completed_recv = set()
         mgr._failed = set()
         mgr._native_failed = set()
-        mgr._local_blocks = {self.ROOM: list(local_blocks)}
-        mgr._local_swa_blocks = {}
-        mgr._remote_blocks = {self.ROOM: list(self.BLOCKS)}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_endpoint = {self.ROOM: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {}
+        mgr._decode.local_blocks = {self.ROOM: list(local_blocks)}
+        mgr._decode.remote_blocks = {self.ROOM: list(self.BLOCKS)}
+        mgr._decode.remote_endpoint = {self.ROOM: "127.0.0.1:31020"}
         return mgr
 
     def test_partial_hit_registers_the_tail_but_announces_everything(self):
@@ -2547,14 +2549,14 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
 
     def _add_swa_producer(self, mgr):
         mgr._swa_engine = Mock()
-        mgr._send_swa_blocks = {self.ROOM: list(self.SWA_BLOCKS)}
-        mgr._decode_swa_pages = {self.ROOM: len(self.SWA_BLOCKS)}
+        mgr._prefill.send_swa_blocks = {self.ROOM: list(self.SWA_BLOCKS)}
+        mgr._prefill.decode_swa_pages = {self.ROOM: len(self.SWA_BLOCKS)}
         mgr.swa_raiden_endpoint = "127.0.0.1:31022"
 
     def test_swa_partial_hit_trims_the_window_registration(self):
         mgr, _ = self._make_producer(decode_pages=2)
         self._add_swa_producer(mgr)
-        mgr._decode_swa_pages = {self.ROOM: 1}
+        mgr._prefill.decode_swa_pages = {self.ROOM: 1}
         mgr._maybe_reply(self.ROOM)
         mgr._engine.register_read.assert_called_once_with(
             str(self.ROOM), self.ROOM, self.BLOCKS[-2:]
@@ -2567,7 +2569,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
     def test_swa_full_hit_completes_both_engines_without_registration(self):
         mgr, socket = self._make_producer(decode_pages=0)
         self._add_swa_producer(mgr)
-        mgr._decode_swa_pages = {self.ROOM: 0}
+        mgr._prefill.decode_swa_pages = {self.ROOM: 0}
         mgr._maybe_reply(self.ROOM)
         mgr._engine.register_read.assert_not_called()
         mgr._swa_engine.register_read.assert_not_called()
@@ -2581,7 +2583,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         # registrations regardless of window page counts to avoid orphaned leases.
         mgr, _ = self._make_producer(decode_pages=0)
         self._add_swa_producer(mgr)
-        mgr._decode_swa_pages = {self.ROOM: len(self.SWA_BLOCKS)}
+        mgr._prefill.decode_swa_pages = {self.ROOM: len(self.SWA_BLOCKS)}
         mgr._maybe_reply(self.ROOM)
         mgr._swa_engine.register_read.assert_not_called()
         self.assertTrue(mgr.is_send_done(self.ROOM))
@@ -2590,23 +2592,23 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
         # A PULL_REQ without the window count is a decode without a window
         # pool; the sender then registers no window blocks.
         mgr, _ = self._make_producer(decode_pages=len(self.BLOCKS))
-        mgr._held_chunks = {}
-        mgr._send_total = {}
+        mgr._prefill.held_chunks = {}
+        mgr._prefill.send_total = {}
         mgr._on_pull_req(PullReq(self.ROOM, "127.0.0.1", 31002, 2).to_frames())
-        self.assertEqual(mgr._decode_pages[self.ROOM], 2)
-        self.assertEqual(mgr._decode_swa_pages[self.ROOM], 0)
-        mgr._replied = set()
+        self.assertEqual(mgr._prefill.decode_pages[self.ROOM], 2)
+        self.assertEqual(mgr._prefill.decode_swa_pages[self.ROOM], 0)
+        mgr._prefill.replied = set()
         mgr._on_pull_req(
             PullReq(self.ROOM, "127.0.0.1", 31002, 2, decode_swa_pages=1).to_frames()
         )
-        self.assertEqual(mgr._decode_swa_pages[self.ROOM], 1)
+        self.assertEqual(mgr._prefill.decode_swa_pages[self.ROOM], 1)
 
     def _add_swa_receiver(self, mgr):
         mgr._swa_engine = Mock()
         mgr._swa_engine_max_blocks = 8
-        mgr._local_swa_blocks = {self.ROOM: []}
-        mgr._remote_swa_blocks = {self.ROOM: list(self.SWA_BLOCKS)}
-        mgr._remote_swa_endpoint = {self.ROOM: "127.0.0.1:31022"}
+        mgr._decode.local_swa_blocks = {self.ROOM: []}
+        mgr._decode.remote_swa_blocks = {self.ROOM: list(self.SWA_BLOCKS)}
+        mgr._decode.remote_swa_endpoint = {self.ROOM: "127.0.0.1:31022"}
 
     def test_receiver_swa_full_hit_settles_the_window_key_too(self):
         mgr = self._make_receiver(local_blocks=[])
@@ -2619,7 +2621,7 @@ class TestDecodeRadixPullRegistration(CustomTestCase):
     def test_receiver_swa_partial_hit_reads_both_tails(self):
         mgr = self._make_receiver(local_blocks=[8, 9])
         self._add_swa_receiver(mgr)
-        mgr._local_swa_blocks = {self.ROOM: [2]}
+        mgr._decode.local_swa_blocks = {self.ROOM: [2]}
         self.assertTrue(mgr.maybe_start_pull(self.ROOM))
         mgr._engine.start_read.assert_called_once_with(
             str(self.ROOM), self.ROOM, "127.0.0.1:31020", self.BLOCKS[-2:], [8, 9]

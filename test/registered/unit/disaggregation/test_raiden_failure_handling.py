@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.raiden.conn import (
     RaidenKVSender,
 )
 from sglang.srt.disaggregation.raiden.serde import MessageTag, PullReq, ReshardReq
+from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -33,6 +34,8 @@ def _abort_frame(room):
 def _prefill_manager():
     """A prefill-mode RaidenKVManager with its room tables, no sockets or engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr._prefill = PrefillState(announce_pages=1)
+    mgr._decode = None
     mgr.disaggregation_mode = DisaggregationMode.PREFILL
     mgr.request_status = {}
     mgr.failure_records = {}
@@ -45,41 +48,18 @@ def _prefill_manager():
     mgr._failed = set()
     mgr._native_failed = set()
     mgr._swa_engine = None
-    mgr._send_blocks = {}
-    mgr._send_swa_blocks = {}
-    mgr._send_aux = {}
-    mgr._decode_addr = {}
-    mgr._replied = set()
-    mgr._reshard_req = {}
-    mgr._reshard_finalized = set()
-    mgr._reshard_replied = set()
-    mgr._reshard_ready = set()
-    mgr._reshard_pushed = set()
-    mgr._reshard_replied_at = {}
     mgr._reshard_slot_rooms = [None]
     mgr._reshard_slot_of = {}
     mgr._aborted = {}
     mgr._pulling = None
-    mgr._announced_at = {}
     # Settle-aware cleanup state shared by every manager mode.
     mgr._pulling_cleared = set()
     mgr._cleared_plans = {}
     mgr._stale_plans = []
     mgr.chunked_transfer = False
-    # Chunked-transfer send state swept by _drop_room_state.
-    mgr._held_chunks = {}
-    mgr._send_total = {}
     mgr._send_reads = {}
     mgr._timeout_s = 120.0
-    mgr._decode_pages = {}
-    mgr._decode_swa_pages = {}
-    mgr._reshard_chunks = {}
-    mgr._reshard_covered = {}
-    mgr._reshard_ready_pages = {}
     mgr._reshard_pushes_pending = {}
-    mgr._reshard_final_pushed = set()
-    mgr._pending_offer = {}
-    mgr._chunk_seq = {}
     mgr._message_handlers = {
         PullReq.TAG: mgr._on_pull_req,
     }
@@ -88,12 +68,12 @@ def _prefill_manager():
 
 def _populate_send_state(mgr, room):
     mgr.request_status[room] = KVPoll.Transferring
-    mgr._send_blocks[room] = [1, 2, 3]
-    mgr._send_swa_blocks[room] = [4]
-    mgr._send_aux[room] = b"aux"
-    mgr._decode_addr[room] = ("10.0.0.2", 5555)
-    mgr._replied.add(room)
-    mgr._reshard_finalized.add(room)
+    mgr._prefill.send_blocks[room] = [1, 2, 3]
+    mgr._prefill.send_swa_blocks[room] = [4]
+    mgr._prefill.send_aux[room] = b"aux"
+    mgr._prefill.decode_addr[room] = ("10.0.0.2", 5555)
+    mgr._prefill.replied.add(room)
+    mgr._prefill.reshard_finalized.add(room)
 
 
 class TestPrefillAbortHandling(unittest.TestCase):
@@ -118,12 +98,12 @@ class TestPrefillAbortHandling(unittest.TestCase):
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
         self.assertIn(ROOM, mgr.failure_records)
         for table in (
-            mgr._send_blocks,
-            mgr._send_swa_blocks,
-            mgr._send_aux,
-            mgr._decode_addr,
-            mgr._replied,
-            mgr._reshard_finalized,
+            mgr._prefill.send_blocks,
+            mgr._prefill.send_swa_blocks,
+            mgr._prefill.send_aux,
+            mgr._prefill.decode_addr,
+            mgr._prefill.replied,
+            mgr._prefill.reshard_finalized,
         ):
             self.assertNotIn(ROOM, table)
             self.assertIn(OTHER_ROOM, table)
@@ -138,7 +118,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
 
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Success)
         self.assertNotIn(ROOM, mgr.failure_records)
-        self.assertIn(ROOM, mgr._send_blocks)
+        self.assertIn(ROOM, mgr._prefill.send_blocks)
 
     def test_abort_for_unknown_room_tombstones_it(self):
         """ABORT and PULL_REQ travel on different sockets, so the abort can
@@ -155,7 +135,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
 
         # The delayed pull request finds the tombstone and is dropped.
         mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
-        self.assertNotIn(ROOM, mgr._decode_addr)
+        self.assertNotIn(ROOM, mgr._prefill.decode_addr)
 
     def test_malformed_abort_is_ignored(self):
         mgr = _prefill_manager()
@@ -168,7 +148,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
         self.assertEqual(log_error.call_count, 2)
 
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Transferring)
-        self.assertIn(ROOM, mgr._send_blocks)
+        self.assertIn(ROOM, mgr._prefill.send_blocks)
 
     def test_abort_without_sender_address_is_still_honored(self):
         mgr = _prefill_manager()
@@ -177,7 +157,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
         mgr._dispatch([MessageTag.ABORT, str(ROOM).encode("ascii")])
 
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
-        self.assertNotIn(ROOM, mgr._send_blocks)
+        self.assertNotIn(ROOM, mgr._prefill.send_blocks)
 
     def test_abort_propagates_to_sender_poll_and_clear(self):
         mgr = _prefill_manager()
@@ -209,7 +189,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
         mgr._ensure_engine = lambda: None
         mgr.is_dummy_cp_rank = False
         mgr.request_status[ROOM] = KVPoll.WaitingForInput
-        mgr._decode_addr[ROOM] = ("10.0.0.2", 5555)
+        mgr._prefill.decode_addr[ROOM] = ("10.0.0.2", 5555)
         sender = RaidenKVSender.__new__(RaidenKVSender)
         sender.kv_mgr = mgr
         sender.bootstrap_room = ROOM
@@ -224,7 +204,7 @@ class TestPrefillAbortHandling(unittest.TestCase):
         sender.send(np.asarray([1, 2], dtype=np.int32))
 
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
-        self.assertNotIn(ROOM, mgr._send_blocks)
+        self.assertNotIn(ROOM, mgr._prefill.send_blocks)
         self.assertFalse(sender._started)
 
 
@@ -300,6 +280,8 @@ class TestReceiverFailurePaths(unittest.TestCase):
 
         engine.start_read.side_effect = blocking_start
         mgr = RaidenKVManager.__new__(RaidenKVManager)
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
         mgr.failure_records = {}
         mgr.failure_lock = threading.Lock()
@@ -308,19 +290,15 @@ class TestReceiverFailurePaths(unittest.TestCase):
         mgr._aborted = {}
         mgr._failed = set()
         mgr._native_failed = set()
-        mgr._remote_blocks = {ROOM: [11, 12]}
-        mgr._remote_endpoint = {ROOM: "peer"}
-        mgr._local_blocks = {ROOM: [21, 22]}
-        mgr._local_swa_blocks = {}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_swa_endpoint = {}
+        mgr._decode.remote_blocks = {ROOM: [11, 12]}
+        mgr._decode.remote_endpoint = {ROOM: "peer"}
+        mgr._decode.local_blocks = {ROOM: [21, 22]}
         mgr._swa_engine = None
         mgr.chunked_transfer = False
         mgr._full_engine_max_blocks = 4
         mgr._swa_engine_max_blocks = 0
         mgr._dynamic_host_staging = True
         mgr._pulling = StagingAdmission(4)
-        mgr._announced_at = {}
         mgr._timeout_s = 120.0
         mgr._ensure_engine = lambda: engine
         mgr._drain_engine = lambda: None
@@ -401,10 +379,10 @@ class TestSenderBootstrapTimeout(unittest.TestCase):
             waiting_timeout=300,
             _state_lock=threading.Lock(),
             _aborted={},
-            _decode_addr=({ROOM: ("10.0.0.2", 5555)} if has_decode_request else {}),
-            _reshard_ready=set(),
-            _reshard_req={},
-            _reshard_replied_at={},
+            _prefill=PrefillState(
+                announce_pages=1,
+                decode_addr=({ROOM: ("10.0.0.2", 5555)} if has_decode_request else {}),
+            ),
             _failed=set(),
             _native_failed=set(),
             sender_has_active_io=lambda room: False,
@@ -457,20 +435,20 @@ class TestReshardHandshakeWindow(unittest.TestCase):
 
         # The decode asked for the room; until the prefill announces its
         # blocks the wait is on local compute, which has no deadline here.
-        mgr._reshard_req[ROOM] = {}
+        mgr._prefill.reshard_req[ROOM] = {}
         self.assertIsNone(mgr.awaiting_decode_since(ROOM, start))
 
         # Blocks announced: the decode now owes RESHARD_READY, timed from here.
-        mgr._reshard_replied.add(ROOM)
-        mgr._reshard_replied_at[ROOM] = 1500.0
+        mgr._prefill.reshard_replied.add(ROOM)
+        mgr._prefill.reshard_replied_at[ROOM] = 1500.0
         self.assertEqual(mgr.awaiting_decode_since(ROOM, start), 1500.0)
 
-        mgr._reshard_ready.add(ROOM)
+        mgr._prefill.reshard_ready.add(ROOM)
         self.assertIsNone(mgr.awaiting_decode_since(ROOM, start))
 
     def test_pull_request_closes_the_window(self):
         mgr = _prefill_manager()
-        mgr._decode_addr[ROOM] = ("10.0.0.2", 5555)
+        mgr._prefill.decode_addr[ROOM] = ("10.0.0.2", 5555)
         self.assertIsNone(mgr.awaiting_decode_since(ROOM, 1000.0))
 
 
@@ -497,9 +475,9 @@ class TestAbortIsTerminal(unittest.TestCase):
 
     def test_reply_is_never_built_for_an_aborted_room(self):
         mgr = self._mgr()
-        mgr._send_blocks[ROOM] = [1, 2]
-        mgr._reshard_finalized.add(ROOM)
-        mgr._decode_addr[ROOM] = ("10.0.0.2", 5555)
+        mgr._prefill.send_blocks[ROOM] = [1, 2]
+        mgr._prefill.reshard_finalized.add(ROOM)
+        mgr._prefill.decode_addr[ROOM] = ("10.0.0.2", 5555)
         mgr._dispatch(_abort_frame(ROOM))
         mgr._maybe_reply(ROOM)
         mgr._ensure_engine.assert_not_called()
@@ -511,7 +489,7 @@ class TestAbortIsTerminal(unittest.TestCase):
         self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
         # The pull request that raced the deadline finds the tombstone.
         mgr._dispatch(PullReq(ROOM, "10.0.0.2", 5555, 4).to_frames())
-        self.assertNotIn(ROOM, mgr._decode_addr)
+        self.assertNotIn(ROOM, mgr._prefill.decode_addr)
         mgr._ensure_engine.assert_not_called()
 
     def test_frames_after_clear_do_not_rebuild_the_room(self):
@@ -524,8 +502,8 @@ class TestAbortIsTerminal(unittest.TestCase):
                 ROOM, "10.0.0.2", 5555, "10.0.0.2:31000", [], 4, [], ""
             ).to_frames()
         )
-        self.assertNotIn(ROOM, mgr._decode_addr)
-        self.assertNotIn(ROOM, mgr._reshard_req)
+        self.assertNotIn(ROOM, mgr._prefill.decode_addr)
+        self.assertNotIn(ROOM, mgr._prefill.reshard_req)
         mgr._send_multipart_locked.assert_not_called()
 
 
@@ -567,11 +545,11 @@ class TestOffersRespectTheTombstone(unittest.TestCase):
     def test_offer_after_abort_recreates_nothing(self):
         mgr = _prefill_manager()
         mgr.request_status = {ROOM: KVPoll.WaitingForInput}
-        mgr._announce_pages = 1
+        mgr._prefill.announce_pages = 1
         mgr._dispatch(_abort_frame(ROOM))
         mgr.offer_chunk(ROOM, 0, [1, 2, 3], 8)
-        self.assertNotIn(ROOM, mgr._send_total)
-        self.assertNotIn(ROOM, mgr._pending_offer)
+        self.assertNotIn(ROOM, mgr._prefill.send_total)
+        self.assertNotIn(ROOM, mgr._prefill.pending_offer)
 
     def test_announce_after_abort_is_dropped(self):
         # The room fails between the offer's snapshot and the announcement.
@@ -763,7 +741,7 @@ class TestGroupFailureQuiescesRaiden(unittest.TestCase):
         self.assertIn(ROOM, mgr._aborted)
         self.assertEqual(mgr.check_status(ROOM), KVPoll.Failed)
         self.assertIsNone(sender.conclude_state)
-        self.assertNotIn(ROOM, mgr._send_blocks)
+        self.assertNotIn(ROOM, mgr._prefill.send_blocks)
         self.assertEqual(set(mgr._send_reads[ROOM]), {f"{ROOM}#0"})
         self.assertFalse(sender.drained())
 
@@ -786,6 +764,9 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
         from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
 
         mgr = _prefill_manager()  # provides locks and the tombstone dict
+        mgr.disaggregation_mode = DisaggregationMode.DECODE
+        mgr._prefill = None
+        mgr._decode = DecodeState()
         mgr.chunked_transfer = False
         mgr._engine = Mock()
         mgr._swa_engine = None
@@ -793,12 +774,12 @@ class TestAdmissionRespectsTheTombstone(unittest.TestCase):
         mgr._pulling = StagingAdmission(32)
         mgr._full_engine_max_blocks = 8
         mgr._swa_engine_max_blocks = 0
-        mgr._local_blocks = {ROOM: [8]}
-        mgr._local_swa_blocks = {}
-        mgr._remote_blocks = {ROOM: [1]}
-        mgr._remote_swa_blocks = {}
-        mgr._remote_endpoint = {ROOM: "127.0.0.1:31020"}
-        mgr._remote_swa_endpoint = {}
+        mgr._decode.local_blocks = {ROOM: [8]}
+        mgr._decode.local_swa_blocks = {}
+        mgr._decode.remote_blocks = {ROOM: [1]}
+        mgr._decode.remote_swa_blocks = {}
+        mgr._decode.remote_endpoint = {ROOM: "127.0.0.1:31020"}
+        mgr._decode.remote_swa_endpoint = {}
         with mgr._state_lock:
             mgr._mark_aborted_locked(ROOM)
         self.assertFalse(mgr.maybe_start_pull(ROOM))

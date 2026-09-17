@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.raiden.serde import (
     Chunk,
     PullReq,
 )
+from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -44,6 +45,10 @@ V6_PREFILL = "2a03:83e4:4021:302:0:13:0:12"
 def _bare_manager(mode):
     """A RaidenKVManager with only the state the tested paths touch."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr._prefill = (
+        PrefillState(announce_pages=1) if mode == DisaggregationMode.PREFILL else None
+    )
+    mgr._decode = DecodeState() if mode == DisaggregationMode.DECODE else None
     mgr.disaggregation_mode = mode
     mgr.attn_tp_rank = 0
     mgr.request_status = {}
@@ -69,17 +74,6 @@ def _prefill_manager():
     mgr = _bare_manager(DisaggregationMode.PREFILL)
     mgr.raiden_endpoint = f"[{V6_PREFILL}]:31000"
     mgr.swa_raiden_endpoint = None
-    mgr._send_blocks = {}
-    mgr._send_swa_blocks = {}
-    mgr._send_aux = {}
-    mgr._decode_addr = {}
-    mgr._replied = set()
-    mgr._reshard_finalized = set()
-    mgr._reshard_req = {}
-    mgr._decode_pages = {}
-    mgr._decode_swa_pages = {}
-    mgr._send_total = {}
-    mgr._chunk_seq = {}
     mgr._uuid_seq = 0
     mgr._local_rank = 0
     return mgr
@@ -90,9 +84,6 @@ def _decode_manager():
     mgr.local_ip = V6_DECODE
     mgr.rank_port = 7000
     mgr._dynamic_host_staging = True
-    mgr._local_blocks = {}
-    mgr._local_swa_blocks = {}
-    mgr._decode_aux_index = {}
     return mgr
 
 
@@ -154,13 +145,13 @@ class TestHandshakeEndpoints(CustomTestCase):
 
     def test_prefill_reply_targets_bracketed_decode_endpoint(self):
         mgr = _prefill_manager()
-        mgr._send_blocks[ROOM] = [1, 2, 3]
-        mgr._send_aux[ROOM] = b""
-        mgr._reshard_finalized.add(ROOM)
+        mgr._prefill.send_blocks[ROOM] = [1, 2, 3]
+        mgr._prefill.send_aux[ROOM] = b""
+        mgr._prefill.reshard_finalized.add(ROOM)
         # As stored by _on_pull_req from the PULL_REQ frames.
-        mgr._decode_addr[ROOM] = (V6_DECODE, 5555)
-        mgr._decode_pages[ROOM] = 3
-        mgr._decode_swa_pages[ROOM] = 0
+        mgr._prefill.decode_addr[ROOM] = (V6_DECODE, 5555)
+        mgr._prefill.decode_pages[ROOM] = 3
+        mgr._prefill.decode_swa_pages[ROOM] = 0
         mgr.request_status[ROOM] = KVPoll.Transferring
         mgr._register_sender_read = Mock()
         mgr._send_multipart_locked = Mock()
@@ -176,8 +167,8 @@ class TestHandshakeEndpoints(CustomTestCase):
     def test_chunk_announcement_targets_bracketed_decode_endpoint(self):
         mgr = _prefill_manager()
         mgr.chunked_transfer = True
-        mgr._decode_addr[ROOM] = (V6_DECODE, 5555)
-        mgr._decode_pages[ROOM] = 4
+        mgr._prefill.decode_addr[ROOM] = (V6_DECODE, 5555)
+        mgr._prefill.decode_pages[ROOM] = 4
         mgr._register_sender_read = Mock()
         mgr._send_multipart_locked = Mock()
 

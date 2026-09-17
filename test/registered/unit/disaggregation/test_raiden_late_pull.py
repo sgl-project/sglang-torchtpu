@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager, RaidenKVReceiver
 from sglang.srt.disaggregation.raiden.host_pool import StagingAdmission
+from sglang.srt.disaggregation.raiden.state import DecodeState
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -20,6 +21,8 @@ TIMEOUT_S = 120.0
 def _decode_manager(engine, chunked=False):
     """A decode-mode RaidenKVManager with one staging slot and a stub engine."""
     mgr = RaidenKVManager.__new__(RaidenKVManager)
+    mgr._prefill = None
+    mgr._decode = DecodeState()
     mgr.attn_tp_rank = 0
     mgr.request_status = {ROOM: KVPoll.WaitingForInput}
     mgr.failure_records = {}
@@ -35,16 +38,10 @@ def _decode_manager(engine, chunked=False):
     mgr._cleared_plans = {}
     mgr._stale_plans = []
     mgr._swa_engine = None
-    mgr._local_blocks = {ROOM: [21, 22]}
-    mgr._local_swa_blocks = {}
-    mgr._remote_blocks = {ROOM: [11, 12]}
-    mgr._remote_swa_blocks = {}
-    mgr._remote_endpoint = {ROOM: "peer"}
-    mgr._remote_swa_endpoint = {}
-    mgr._remote_total = {ROOM: 2}
-    mgr._chunk_queue = {}
-    mgr._chunk_reads = {}
-    mgr._announced_at = {}
+    mgr._decode.local_blocks = {ROOM: [21, 22]}
+    mgr._decode.remote_blocks = {ROOM: [11, 12]}
+    mgr._decode.remote_endpoint = {ROOM: "peer"}
+    mgr._decode.remote_total = {ROOM: 2}
     mgr._timeout_s = TIMEOUT_S
     mgr.chunked_transfer = chunked
     mgr._full_engine_max_blocks = 4
@@ -74,7 +71,7 @@ class TestLatePullIsNotIssued(unittest.TestCase):
     def test_whole_read_past_deadline_fails_without_a_pull(self):
         engine = Mock()
         mgr = _decode_manager(engine)
-        mgr._announced_at[str(ROOM)] = time.monotonic() - TIMEOUT_S - 10
+        mgr._decode.announced_at[str(ROOM)] = time.monotonic() - TIMEOUT_S - 10
 
         self.assertFalse(mgr.maybe_start_pull(ROOM))
 
@@ -87,7 +84,7 @@ class TestLatePullIsNotIssued(unittest.TestCase):
     def test_whole_read_within_deadline_is_pulled(self):
         engine = Mock()
         mgr = _decode_manager(engine)
-        mgr._announced_at[str(ROOM)] = time.monotonic()
+        mgr._decode.announced_at[str(ROOM)] = time.monotonic()
 
         self.assertTrue(mgr.maybe_start_pull(ROOM))
 
@@ -97,8 +94,8 @@ class TestLatePullIsNotIssued(unittest.TestCase):
     def test_chunk_past_deadline_fails_the_room(self):
         engine = Mock()
         mgr = _decode_manager(engine, chunked=True)
-        mgr._chunk_queue[ROOM] = [(f"{ROOM}#0", 900, [0, 1], [11, 12], "peer")]
-        mgr._announced_at[f"{ROOM}#0"] = time.monotonic() - TIMEOUT_S - 10
+        mgr._decode.chunk_queue[ROOM] = [(f"{ROOM}#0", 900, [0, 1], [11, 12], "peer")]
+        mgr._decode.announced_at[f"{ROOM}#0"] = time.monotonic() - TIMEOUT_S - 10
 
         self.assertFalse(mgr.maybe_start_pull(ROOM))
 
@@ -109,7 +106,7 @@ class TestLatePullIsNotIssued(unittest.TestCase):
     def test_expired_room_concludes_failed_and_tells_the_prefill(self):
         engine = Mock()
         mgr = _decode_manager(engine)
-        mgr._announced_at[str(ROOM)] = time.monotonic() - TIMEOUT_S - 10
+        mgr._decode.announced_at[str(ROOM)] = time.monotonic() - TIMEOUT_S - 10
         recv = _receiver(mgr)
 
         with patch.object(RaidenKVReceiver, "_send_abort_notification") as send_abort:
@@ -124,7 +121,7 @@ class TestLatePullIsNotIssued(unittest.TestCase):
 
     def test_dropping_the_room_forgets_its_announcements(self):
         mgr = _decode_manager(Mock())
-        mgr._announced_at = {
+        mgr._decode.announced_at = {
             str(ROOM): 1.0,
             f"{ROOM}#0": 1.0,
             str(OTHER_ROOM): 2.0,
@@ -132,7 +129,7 @@ class TestLatePullIsNotIssued(unittest.TestCase):
 
         mgr._drop_room_state(ROOM)
 
-        self.assertEqual(mgr._announced_at, {str(OTHER_ROOM): 2.0})
+        self.assertEqual(mgr._decode.announced_at, {str(OTHER_ROOM): 2.0})
 
 
 if __name__ == "__main__":

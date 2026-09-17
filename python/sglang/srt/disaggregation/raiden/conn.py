@@ -66,6 +66,7 @@ from sglang.srt.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
 )
+from sglang.srt.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.server_args import ServerArgs
@@ -213,104 +214,24 @@ class RaidenKVManager(
         self._announce_lock = threading.Lock()
         self._state_lock = threading.Lock()
 
+        self._prefill: Optional[PrefillState] = None
+        self._decode: Optional[DecodeState] = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # room -> accumulated page block-ids, aux blob, decode reply addr
-            self._send_blocks: Dict[int, List[int]] = {}
-            self._send_swa_blocks: Dict[int, List[int]] = {}
-            self._send_aux: Dict[int, bytes] = {}
-            self._decode_addr: Dict[int, Tuple[str, int]] = {}
-            self._replied: Set[int] = set()
-            # Chunks announced before the decode asked for the room, held until
-            # a PULL_REQ names it (a resharded room never gets one).
-            self._held_chunks: Dict[int, List[Tuple[int, List[int]]]] = {}
-            self._send_total: Dict[int, int] = {}
-            # Pages the decode allocated for the room, so a chunk it already
-            # holds is never registered or announced.
-            self._decode_pages: Dict[int, int] = {}
-            # Window pages allocated by the decode node, used to restrict
-            # sender registrations.
-            self._decode_swa_pages: Dict[int, int] = {}
-            # Chunks announced to a resharding decode, by chunk index, until it
-            # asks for their push; how far its announcements reach; and the
-            # pushes still running, so the room counts as sent only after the
-            # last one.
-            self._reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = {}
-            # Pages each decode declared for its closing push, from its
-            # RESHARD_READY. The closing push moves exactly these.
-            self._reshard_ready_pages: Dict[int, List[int]] = {}
-            self._reshard_pushes_pending: Dict[int, int] = {}
-            self._reshard_final_pushed: Set[int] = set()
-            # Committed pages not yet announced, gathered until they make a
-            # piece worth a read.
-            self._pending_offer: Dict[int, Tuple[int, List[int]]] = {}
-            self._announce_pages = max(
-                1, -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
+            self._prefill = PrefillState(
+                announce_pages=max(
+                    1, -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
+                )
             )
-            self._chunk_seq: Dict[int, int] = {}
             self._uuid_seq = 0
         else:
             # Detects a prefill that stopped answering and fails its rooms.
             self._start_heartbeat_checker_thread()
-            # room -> local page block-ids, remote page block-ids, endpoint
-            self._local_blocks: Dict[int, List[int]] = {}
-            self._local_swa_blocks: Dict[int, List[int]] = {}
-            self._decode_aux_index: Dict[int, int] = {}
-            self._remote_blocks: Dict[int, List[int]] = {}
-            self._remote_swa_blocks: Dict[int, List[int]] = {}
-            self._remote_endpoint: Dict[int, str] = {}
-            self._remote_swa_endpoint: Dict[int, str] = {}
-            # When each of a room's reads was announced, by read id. The
-            # prefill keeps a read registered for the transfer deadline and
-            # then releases its pages, so a read that waited longer than
-            # that for a staging slot is failed instead of issued.
-            self._announced_at: Dict[str, float] = {}
-            # Chunk announcements waiting for a staging slot, and the reads
-            # already issued for a room.
-            self._chunk_queue: Dict[int, List[tuple]] = {}
-            self._remote_total: Dict[int, int] = {}
-            # Page spans covered by chunk announcements, as (start, end).
-            # Chunks are announced from two threads and can cross on the wire,
-            # so a later span can arrive first and the covered set can have
-            # holes; the closing read pulls exactly the uncovered pages.
-            self._announced_spans: Dict[int, List[Tuple[int, int]]] = {}
-            self._chunk_reads: Dict[int, List[str]] = {}
-            self._final_seen: Set[int] = set()
-            # Chunk announcements from each resharding source, by chunk index,
-            # until every source of the room has announced it; the receive
-            # plans registered for the room, by their request id.
-            self._reshard_chunk_sources: Dict[
-                int, Dict[int, Dict[int, Tuple[int, List[int]]]]
-            ] = {}
-            # Chunk indexes whose receive-plan registration is in flight; the
-            # closing plan waits for them so completion never overtakes one.
-            self._reshard_chunk_registering: Dict[int, Set[int]] = {}
-            self._reshard_plans: Dict[int, Dict[str, int]] = {}
-            # Page spans whose chunk plan this decode registered; the closing
-            # plan covers exactly the pages outside their union, so a chunk
-            # that lost its race anywhere in the range is not skipped. Decode
-            # state: _on_reshard_chunk records the spans and
-            # _register_receiver_and_signal takes their complement. It used to
-            # be declared in the prefill branch above, where neither reader
-            # could see it -- the decode died with "object has no attribute
-            # '_reshard_covered'" the first time a resharding room announced a
-            # chunk. Nothing caught it because until now no CI run reached the
-            # decode-side chunked reshard path at all.
-            self._reshard_covered: Dict[int, List[Tuple[int, int]]] = {}
+            self._decode = DecodeState()
             self._uuid_seq = 0
 
-        # Asymmetric-TP resharding state, populated lazily on the push path.
+        # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # room -> decode meta from RESHARD_REQ
-            self._reshard_req: Dict[int, dict] = {}
-            self._reshard_finalized: Set[int] = set()  # send accumulation complete
-            # Chunks the decode acknowledged with a push request. Only these
-            # leave the closing transfer: an unacknowledged chunk's pages are
-            # still owed, so the closing span keeps them.
-            self._reshard_chunk_acked: Dict[int, Set[int]] = {}
-            self._reshard_replied: Set[int] = set()  # RESHARD_BLOCKS sent
-            self._reshard_ready: Set[int] = set()  # rooms cleared to push
-            self._reshard_replied_at: Dict[int, float] = {}  # RESHARD_BLOCKS sent at
-            self._reshard_pushed: Set[int] = set()
+            self._reshard_pushes_pending: Dict[int, int] = {}
             # Push (d2h wait + per-layer push_registered_plan) runs off the
             # _listen dispatch thread. raiden runs SyncPush unlocked, so
             # _reshard_push_lock serializes register+push across workers.
@@ -322,14 +243,7 @@ class RaidenKVManager(
             )
             self._reshard_push_lock = threading.Lock()
         else:
-            # room -> {src_prefill_rank: prefill_block_ids} and per-room meta.
-            self._reshard_sources: Dict[int, Dict[int, List[int]]] = {}
-            # Same shape for the sliding-window pool: src_rank -> its SWA pages.
-            # A hybrid model's window is only settled when the prefill ends, so
-            # these arrive once, on the closing RESHARD_BLOCKS, never per chunk.
-            self._reshard_swa_sources: Dict[int, Dict[int, List[int]]] = {}
-            self._reshard_meta: Dict[int, dict] = {}
-            self._reshard_registered: Set[int] = set()
+            self._reshard_plans: Dict[int, Dict[str, int]] = {}
         self._listener = threading.Thread(target=self._listen, daemon=True)
         self._listener.start()
 
@@ -829,9 +743,11 @@ class RaidenKVManager(
     def is_recv_done(self, room: int) -> bool:
         if self.chunked_transfer:
             with self._state_lock:
-                if room not in self._final_seen or self._chunk_queue.get(room):
+                if room not in self._decode.final_seen or self._decode.chunk_queue.get(
+                    room
+                ):
                     return False
-                reads = list(self._chunk_reads.get(room, []))
+                reads = list(self._decode.chunk_reads.get(room, []))
             return all(rid in self._completed_recv for rid in reads) and (
                 self._swa_engine is None
                 or self._swa_req_id(room) in self._completed_recv
@@ -896,8 +812,8 @@ class RaidenKVManager(
             return key == rid or key == swa_rid or key.startswith(chunk_prefix)
 
         with self._state_lock:
-            if hasattr(self, "_reshard_replied_at"):
-                self._reshard_replied_at.pop(room, None)
+            if self._prefill is not None:
+                self._prefill.reshard_replied_at.pop(room, None)
             # A read raiden still holds keeps its admission, and a push it is
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
@@ -929,58 +845,63 @@ class RaidenKVManager(
             )
             for ids in (self._completed_recv, self._failed, self._native_failed):
                 ids.difference_update([k for k in ids if belongs(k) and k not in held])
-            announced = getattr(self, "_announced_at", None)
+            announced = self._decode.announced_at if self._decode is not None else None
             if announced is not None:
                 for key in [k for k in announced if belongs(k)]:
                     del announced[key]
-            for d in (
-                getattr(self, "_chunk_queue", None),
-                getattr(self, "_remote_total", None),
-                getattr(self, "_announced_spans", None),
-                getattr(self, "_chunk_reads", None),
-                getattr(self, "_held_chunks", None),
-                getattr(self, "_send_total", None),
-                getattr(self, "_decode_pages", None),
-                getattr(self, "_decode_swa_pages", None),
-                getattr(self, "_chunk_seq", None),
-                getattr(self, "_reshard_chunks", None),
-                getattr(self, "_pending_offer", None),
-                getattr(self, "_reshard_covered", None),
-                getattr(self, "_reshard_ready_pages", None),
-                getattr(self, "_reshard_chunk_acked", None),
-                getattr(self, "_reshard_chunk_registering", None),
-                getattr(self, "_reshard_chunk_sources", None),
-                getattr(self, "_send_blocks", None),
-                getattr(self, "_send_swa_blocks", None),
-                getattr(self, "_send_aux", None),
-                getattr(self, "_decode_addr", None),
-                getattr(self, "_local_blocks", None),
-                getattr(self, "_local_swa_blocks", None),
-                getattr(self, "_decode_aux_index", None),
-                getattr(self, "_remote_blocks", None),
-                getattr(self, "_remote_swa_blocks", None),
-                getattr(self, "_remote_endpoint", None),
-                getattr(self, "_remote_swa_endpoint", None),
-                getattr(self, "_reshard_req", None),
-                getattr(self, "_reshard_meta", None),
-                getattr(self, "_reshard_sources", None),
-                getattr(self, "_reshard_swa_sources", None),
-            ):
-                if d is not None:
-                    d.pop(room, None)
-            if hasattr(self, "_replied"):
-                self._replied.discard(room)
-            for s in (
-                getattr(self, "_final_seen", None),
-                getattr(self, "_reshard_final_pushed", None),
-                getattr(self, "_reshard_finalized", None),
-                getattr(self, "_reshard_replied", None),
-                getattr(self, "_reshard_ready", None),
-                getattr(self, "_reshard_pushed", None),
-                getattr(self, "_reshard_registered", None),
-            ):
-                if s is not None:
-                    s.discard(room)
+            if self._prefill is not None:
+                for table in (
+                    self._prefill.held_chunks,
+                    self._prefill.send_total,
+                    self._prefill.decode_pages,
+                    self._prefill.decode_swa_pages,
+                    self._prefill.chunk_seq,
+                    self._prefill.reshard_chunks,
+                    self._prefill.pending_offer,
+                    self._prefill.reshard_ready_pages,
+                    self._prefill.reshard_chunk_acked,
+                    self._prefill.send_blocks,
+                    self._prefill.send_swa_blocks,
+                    self._prefill.send_aux,
+                    self._prefill.decode_addr,
+                    self._prefill.reshard_req,
+                ):
+                    table.pop(room, None)
+                for table in (
+                    self._prefill.replied,
+                    self._prefill.reshard_final_pushed,
+                    self._prefill.reshard_finalized,
+                    self._prefill.reshard_replied,
+                    self._prefill.reshard_ready,
+                    self._prefill.reshard_pushed,
+                ):
+                    table.discard(room)
+            if self._decode is not None:
+                for table in (
+                    self._decode.chunk_queue,
+                    self._decode.remote_total,
+                    self._decode.announced_spans,
+                    self._decode.chunk_reads,
+                    self._decode.reshard_covered,
+                    self._decode.reshard_chunk_registering,
+                    self._decode.reshard_chunk_sources,
+                    self._decode.local_blocks,
+                    self._decode.local_swa_blocks,
+                    self._decode.decode_aux_index,
+                    self._decode.remote_blocks,
+                    self._decode.remote_swa_blocks,
+                    self._decode.remote_endpoint,
+                    self._decode.remote_swa_endpoint,
+                    self._decode.reshard_meta,
+                    self._decode.reshard_sources,
+                    self._decode.reshard_swa_sources,
+                ):
+                    table.pop(room, None)
+                for table in (
+                    self._decode.final_seen,
+                    self._decode.reshard_registered,
+                ):
+                    table.discard(room)
             if clear_failure_record:
                 # Failure publication takes _state_lock before failure_lock as
                 # well, so clear and publication have one total order.
