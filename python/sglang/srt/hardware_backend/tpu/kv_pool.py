@@ -137,7 +137,9 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim if v_head_dim is not None else head_dim
+            else v_head_dim
+            if v_head_dim is not None
+            else head_dim
         )
         # Asymmetric K/V head dims (e.g. MiMo / DeepSeek-style qk=192, v=128):
         # the fused KV buffer stores a single shared head_dim, so V is padded up

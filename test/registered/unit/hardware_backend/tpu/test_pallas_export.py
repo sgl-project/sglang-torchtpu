@@ -32,10 +32,13 @@ class TestPallasExportEnvironment(CustomTestCase):
             ("TPU v5e", "TPU v5e"),
         )
         for torch_device_kind, pallas_device_kind in cases:
-            with self.subTest(torch_device_kind=torch_device_kind), patch.object(
-                pallas_export,
-                "get_torch_tpu_device_kind",
-                return_value=torch_device_kind,
+            with (
+                self.subTest(torch_device_kind=torch_device_kind),
+                patch.object(
+                    pallas_export,
+                    "get_torch_tpu_device_kind",
+                    return_value=torch_device_kind,
+                ),
             ):
                 self.assertEqual(
                     pallas_export.get_pallas_tpu_device_kind(), pallas_device_kind

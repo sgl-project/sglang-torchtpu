@@ -112,9 +112,9 @@ def ref_ragged_paged_attention(
 ):
     """Reference implementation for ragged paged attention."""
     if not causal:
-        assert (
-            custom_mask is not None and custom_mask.size > jnp.cumsum(kv_lens)[-1]
-        ), f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
+        assert custom_mask is not None and custom_mask.size > jnp.cumsum(kv_lens)[-1], (
+            f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
+        )
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
@@ -1378,8 +1378,7 @@ def static_validate_inputs(
 
     if actual_num_q_heads % actual_num_kv_heads != 0:
         raise ValueError(
-            f"Expected {actual_num_q_heads=} to be divisible by"
-            f" {actual_num_kv_heads=}."
+            f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
         )
 
     if kv_cache_fused is not None:

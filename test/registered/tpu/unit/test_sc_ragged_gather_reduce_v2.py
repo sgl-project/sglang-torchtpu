@@ -113,8 +113,7 @@ class ScatterTest(jtu.JaxTestCase):
             raise
         except Exception as e:  # pylint: disable=broad-except
             print(
-                "Skipping ragged_gather_reduce_v2 correctness check due to "
-                f"error: {e}"
+                f"Skipping ragged_gather_reduce_v2 correctness check due to error: {e}"
             )
 
     # The first perf test case approximates the DeepSeekV3, 2k-batch-size, EP=16.

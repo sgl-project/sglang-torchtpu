@@ -1421,8 +1421,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
         logger.info(
-            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets "
-            "in %.1fs",
+            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
             time.perf_counter() - start,
         )

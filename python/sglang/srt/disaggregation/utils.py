@@ -250,8 +250,7 @@ def _gate_group_failure_on_drain(polls, pollers, groups):
         quiesce = getattr(pollers[i], "quiesce_group_failure", None)
         if quiesce is None:
             raise RuntimeError(
-                "A drain-gated transfer poller must implement "
-                "quiesce_group_failure()"
+                "A drain-gated transfer poller must implement quiesce_group_failure()"
             )
         quiesce()
     drained = torch.tensor(

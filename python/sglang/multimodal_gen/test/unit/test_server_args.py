@@ -3421,7 +3421,6 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
 
 
 class TestTpuDistributedArgs(unittest.TestCase):
-
     def _args(self, num_gpus):
         with patch.object(PipelineConfig, "from_kwargs", return_value=PipelineConfig()):
             args = ServerArgs.from_dict({"model_path": "/fake"})

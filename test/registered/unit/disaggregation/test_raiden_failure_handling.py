@@ -645,9 +645,12 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce_attn_cp_tp_group([poller], cp_group, tp_group)
@@ -685,12 +688,16 @@ class TestGroupFailureDrainGate(unittest.TestCase):
             if reduce_count == 2:
                 tensor.fill_(int(KVPoll.Failed))
 
-        with patch("sglang.srt.disaggregation.utils.dist") as dist, patch(
-            "sglang.srt.disaggregation.utils._poll_with_failure_injection",
-            return_value=[int(KVPoll.Success)],
-        ), patch(
-            "sglang.srt.disaggregation.utils._apply_metadata_gate",
-            side_effect=lambda *args: events.append("metadata"),
+        with (
+            patch("sglang.srt.disaggregation.utils.dist") as dist,
+            patch(
+                "sglang.srt.disaggregation.utils._poll_with_failure_injection",
+                return_value=[int(KVPoll.Success)],
+            ),
+            patch(
+                "sglang.srt.disaggregation.utils._apply_metadata_gate",
+                side_effect=lambda *args: events.append("metadata"),
+            ),
         ):
             dist.all_reduce = all_reduce
             polls = poll_and_all_reduce(

@@ -132,9 +132,9 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.
-        assert (
-            need_size % self.page_size == 0
-        ), "The allocation size should be page-aligned"
+        assert need_size % self.page_size == 0, (
+            "The allocation size should be page-aligned"
+        )
         num_pages = need_size // self.page_size
         if self.need_sort and num_pages > len(self.free_pages):
             # Pools are host-resident; keep release_pages on CPU (the parent

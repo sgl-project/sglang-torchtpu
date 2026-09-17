@@ -84,34 +84,62 @@ def _git_lines(*args: str) -> list[str] | None:
     return [line for line in result.stdout.splitlines() if line]
 
 
-def _changed_registered_files() -> set[str]:
-    """Return added, copied, or renamed registered-test destinations."""
-
-    lines = _git_lines("diff", "--cached", "--name-status", "--diff-filter=ACR")
-    if not lines:
-        base_ref = os.environ.get("GITHUB_BASE_REF", "main")
-        for candidate in (f"origin/{base_ref}", base_ref):
-            if _git_lines("rev-parse", "--verify", candidate) is None:
-                continue
-            merge_base = _git_lines("merge-base", candidate, "HEAD")
-            if not merge_base:
-                continue
-            lines = _git_lines(
-                "diff",
-                "--name-status",
-                "--diff-filter=ACR",
-                merge_base[0],
-                "HEAD",
-            )
-            break
-
+def _registered_destinations(lines: list[str]) -> set[str]:
     selected = set()
-    for line in lines or []:
-        fields = line.split("\t")
-        destination = fields[-1]
+    for line in lines:
+        destination = line.split("\t")[-1]
         if destination.startswith("test/registered/") and destination.endswith(".py"):
             selected.add(destination)
     return selected
+
+
+def _changed_registered_files() -> set[str]:
+    """Return locally added, copied, or renamed registered-test destinations."""
+
+    lines = _git_lines("diff", "--cached", "--name-status", "--diff-filter=ACR")
+    if lines:
+        return _registered_destinations(lines)
+
+    base_ref = os.environ.get("GITHUB_BASE_REF", "main")
+    for candidate in (f"origin/{base_ref}", base_ref):
+        if _git_lines("rev-parse", "--verify", candidate) is None:
+            continue
+        merge_base = _git_lines("merge-base", candidate, "HEAD")
+        if not merge_base:
+            continue
+        lines = _git_lines(
+            "diff",
+            "--name-status",
+            "--diff-filter=ACR",
+            merge_base[0],
+            "HEAD",
+        )
+        selected = _registered_destinations(lines or [])
+
+        # A sync PR merges another repository's history. Files already present
+        # in that merged parent are imported, not newly admitted by this branch,
+        # so leave them to the source repository's incremental taxonomy ratchet.
+        merges = _git_lines(
+            "rev-list",
+            "--first-parent",
+            "--merges",
+            "--parents",
+            f"{merge_base[0]}..HEAD",
+        )
+        for merge in merges or []:
+            for merged_parent in merge.split()[2:]:
+                imported = _git_lines(
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    merged_parent,
+                    "--",
+                    "test/registered",
+                )
+                selected.difference_update(imported or [])
+        return selected
+
+    return set()
 
 
 def _contains_call(tree: ast.AST, name: str) -> bool:

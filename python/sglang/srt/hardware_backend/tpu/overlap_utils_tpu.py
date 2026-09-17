@@ -39,9 +39,9 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
     draft_input = batch.spec_info
     if not future_map.need_topk or draft_input is None:
         return False
-    assert (
-        draft_input.device_accept_selected_cache_locs is None
-    ), "device accept routing resolves once per prepared batch"
+    assert draft_input.device_accept_selected_cache_locs is None, (
+        "device accept routing resolves once per prepared batch"
+    )
     indices = draft_input.future_indices
     candidate_locs = draft_input.device_accept_candidate_locs
     accept_lens = draft_input.accept_lens_device
@@ -55,15 +55,15 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
     ):
         return False
 
-    assert (
-        candidate_locs.ndim == 2 and candidate_locs.shape[0] == indices.shape[0]
-    ), "candidate cache locations must match future rows"
-    assert accept_lens.shape == (
-        indices.shape[0],
-    ), "acceptance lengths must match future rows"
-    assert (
-        candidate_locs.shape[1] >= 3 and candidate_locs.shape[1] % 2 == 1
-    ), "candidate cache window must have width 2 * verify_width - 1"
+    assert candidate_locs.ndim == 2 and candidate_locs.shape[0] == indices.shape[0], (
+        "candidate cache locations must match future rows"
+    )
+    assert accept_lens.shape == (indices.shape[0],), (
+        "acceptance lengths must match future rows"
+    )
+    assert candidate_locs.shape[1] >= 3 and candidate_locs.shape[1] % 2 == 1, (
+        "candidate cache window must have width 2 * verify_width - 1"
+    )
 
     hidden_buf = future_map.hidden_states_buf if future_map.need_hidden_states else None
     width = (candidate_locs.shape[1] + 1) // 2

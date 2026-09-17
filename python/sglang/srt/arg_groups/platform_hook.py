@@ -226,6 +226,6 @@ def handle_unsafe_torch_compile_bundle(server_args: Any):
         return
     if cfg.device != "tpu":
         raise ValueError("torch.compile bundles are currently supported only on TPU")
-    assert (
-        cfg.enable_torch_compile
-    ), "torch.compile bundles require --enable-torch-compile"
+    assert cfg.enable_torch_compile, (
+        "torch.compile bundles require --enable-torch-compile"
+    )

@@ -451,9 +451,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         # Cached ``distribution`` tensors on TPU, keyed by
         # (is_decode, real_batch, device) -- it depends only on those, so a
         # cached buffer is reused every step (see init_forward_metadata).
-        self._distribution_cache: dict[tuple[bool, int, torch.device], torch.Tensor] = (
-            {}
-        )
+        self._distribution_cache: dict[
+            tuple[bool, int, torch.device], torch.Tensor
+        ] = {}
         # Register the custom op eagerly so the (Python-introspection-heavy)
         # ``jax_op`` registration does not happen inside a ``torch.compile``
         # traced region — dynamo can't handle ``inspect.signature`` on the

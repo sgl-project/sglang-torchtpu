@@ -613,11 +613,14 @@ class TestDecodePrebuilt(unittest.TestCase):
         )
         new_batch.process_prebuilt.side_effect = lambda *_: call_order.append("process")
 
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ), get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ),
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch

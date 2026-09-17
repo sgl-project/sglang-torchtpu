@@ -113,7 +113,8 @@ class _StubDraftModel(nn.Module):
     def __init__(self, rotary_emb: nn.Module) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
-            nn.Module() for _ in range(LAYERS)  # containers for self_attn
+            nn.Module()
+            for _ in range(LAYERS)  # containers for self_attn
         )
         for layer in self.layers:
             layer.self_attn = _StubAttention(rotary_emb)

@@ -439,9 +439,9 @@ def _pad_forward_batch_inputs(
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)
         num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert (
-            num_tokens_per_req > 0
-        ), f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        assert num_tokens_per_req > 0, (
+            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        )
         pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     else:

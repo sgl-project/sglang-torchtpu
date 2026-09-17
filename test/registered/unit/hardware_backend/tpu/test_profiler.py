@@ -52,7 +52,7 @@ class TestInstallTpuProfileOptionsPatch(CustomTestCase):
         *,
         num_chips,
         num_sparse_cores,
-        profile_options_cls=_BaseProfileOptions
+        profile_options_cls=_BaseProfileOptions,
     ):
         with (
             envs.SGLANG_TPU_PROFILE_NUM_CHIPS.override(num_chips),

@@ -179,9 +179,9 @@ def _build_tree_kernel_efficient_torch(
     retrieve_next_token: torch.Tensor,
 ):
     """TPU-specific tree construction for EAGLE (topk=1 only)."""
-    assert (
-        topk == 1
-    ), f"TPU EAGLE tree construction currently supports topk=1, got {topk=}."
+    assert topk == 1, (
+        f"TPU EAGLE tree construction currently supports topk=1, got {topk=}."
+    )
     assert tree_mask_mode == TreeMaskMode.FULL_MASK
     token_offsets = torch.arange(num_verify_tokens, device=device, dtype=torch.long)
     positions.copy_((seq_lens[:, None] + token_offsets[None, :]).flatten())
@@ -376,9 +376,9 @@ def _verify_tree_greedy_torch_inplace(
     topk: int,
 ):
     """TPU-specific greedy tree verification for EAGLE (topk=1 only)."""
-    assert (
-        topk == 1
-    ), f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
+    assert topk == 1, (
+        f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
+    )
 
     bs, num_verify_tokens = candidates.shape
     predicts[: bs * num_verify_tokens] = target_predict.flatten().to(predicts.dtype)

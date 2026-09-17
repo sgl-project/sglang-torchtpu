@@ -228,8 +228,9 @@ def _run_gate(tmp, record, returncode=0, seen=None, **runner_kw):
             seen.update(kwargs.get("env") or {})
         return MagicMock(returncode=returncode)
 
-    with patch.dict(os.environ, {"TPU_CI_BENCH_OUTPUT_ROOT": tmp}), patch.object(
-        eval_support.subprocess, "run", side_effect=fake_run
+    with (
+        patch.dict(os.environ, {"TPU_CI_BENCH_OUTPUT_ROOT": tmp}),
+        patch.object(eval_support.subprocess, "run", side_effect=fake_run),
     ):
         return runner("http://127.0.0.1:30000")
 
@@ -292,12 +293,19 @@ class TestGate(CustomTestCase):
             test_name="m",
             smoke_state={"failures": ["server health check timed out after 1800s"]},
         )
-        with patch.object(
-            eval_support,
-            "dump_metric",
-            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
-        ), patch.object(
-            eval_support.subprocess, "run", side_effect=lambda *a, **k: ran.append(a)
+        with (
+            patch.object(
+                eval_support,
+                "dump_metric",
+                side_effect=lambda name, value, labels=None: dumped.append(
+                    (name, labels)
+                ),
+            ),
+            patch.object(
+                eval_support.subprocess,
+                "run",
+                side_effect=lambda *a, **k: ran.append(a),
+            ),
         ):
             result = runner("http://127.0.0.1:30000")
         self.assertFalse(result["_passed"])
@@ -481,12 +489,19 @@ class TestSmokeLegs(CustomTestCase):
         gates[0].runner("http://127.0.0.1:30000")
 
         dumped, ran = [], []
-        with patch.object(
-            eval_support,
-            "dump_metric",
-            side_effect=lambda name, value, labels=None: dumped.append((name, labels)),
-        ), patch.object(
-            eval_support.subprocess, "run", side_effect=lambda *a, **k: ran.append(a)
+        with (
+            patch.object(
+                eval_support,
+                "dump_metric",
+                side_effect=lambda name, value, labels=None: dumped.append(
+                    (name, labels)
+                ),
+            ),
+            patch.object(
+                eval_support.subprocess,
+                "run",
+                side_effect=lambda *a, **k: ran.append(a),
+            ),
         ):
             result = gates[1].runner("http://127.0.0.1:30000")
         self.assertFalse(result["_passed"])

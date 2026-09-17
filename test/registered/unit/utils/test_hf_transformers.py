@@ -786,8 +786,11 @@ class TestDynamicModuleCacheLock(unittest.TestCase):
         other_holder = filelock.FileLock(
             hf_transformers_patches._dynamic_module_cache_lock().lock_file
         )
-        with other_holder, patch.object(
-            hf_transformers_patches, "_DYNAMIC_MODULE_LOCK_TIMEOUT_S", 0.1
+        with (
+            other_holder,
+            patch.object(
+                hf_transformers_patches, "_DYNAMIC_MODULE_LOCK_TIMEOUT_S", 0.1
+            ),
         ):
             hf_transformers_patches._dynamic_module_locks.clear()
             with self.assertRaises(filelock.Timeout):

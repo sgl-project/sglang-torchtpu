@@ -38,7 +38,7 @@ def kernel(
     cost_estimate=None,
     debug=False,
     name=None,
-    metadata=None
+    metadata=None,
 ):
     """Drop-in replacement for ``pl.kernel`` that lowers via ``core_map``."""
     single_output = not isinstance(out_type, (tuple, list))

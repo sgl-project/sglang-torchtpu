@@ -145,9 +145,9 @@ class TpuRaidenHostKVCache(HostKVCache):
         Returns page-aligned token indices (int64) so ``// page_size`` yields
         exact raiden page ids, or ``None`` if the pool is full.
         """
-        assert (
-            need_size % self.page_size == 0
-        ), "host alloc size must be a multiple of page_size"
+        assert need_size % self.page_size == 0, (
+            "host alloc size must be a multiple of page_size"
+        )
         num_pages = need_size // self.page_size
         with self.lock:
             if num_pages > len(self.free_pages):

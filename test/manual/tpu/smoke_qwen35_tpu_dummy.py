@@ -93,9 +93,9 @@ def main():
             print("Generated token ids:", token_ids)
             vocab = TINY_TEXT_CONFIG["vocab_size"]
             assert len(token_ids) > 0, "no tokens generated"
-            assert all(
-                0 <= t < vocab for t in token_ids
-            ), f"token id out of range [0,{vocab})"
+            assert all(0 <= t < vocab for t in token_ids), (
+                f"token id out of range [0,{vocab})"
+            )
             print("SMOKE PASS: tiny dense hybrid Qwen3.5 ran E2E on TPU.")
         finally:
             engine.shutdown()

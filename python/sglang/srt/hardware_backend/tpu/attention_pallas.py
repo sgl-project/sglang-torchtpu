@@ -312,8 +312,7 @@ class TpuPallasAttnBackend(AttentionBackend):
         # We assert so any future regression surfaces here, not as silent
         # KV truncation passed to the kernel.
         assert max_len <= req_to_token.shape[1], (
-            f"seq_len {max_len} exceeds req_to_token capacity "
-            f"{req_to_token.shape[1]}"
+            f"seq_len {max_len} exceeds req_to_token capacity {req_to_token.shape[1]}"
         )
         Lb = max(_PAGE_SIZE, _bucket_kv_len(max_len))
         pps = Lb // _PAGE_SIZE

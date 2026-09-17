@@ -23,6 +23,7 @@ from sglang.srt.utils import is_tpu
 
 logger = logging.getLogger(__name__)
 
+
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_worker: TpModelWorker
     draft_model_runner: ModelRunner

@@ -71,9 +71,9 @@ def test_raiden_dma_roundtrip():
 
     got4 = float(data[4, 0, 0, 0, 0].cpu())
     got5 = float(data[5, 0, 0, 0, 0].cpu())
-    assert (
-        abs(got4 - 101.0) < 1e-2 and abs(got5 - 102.0) < 1e-2
-    ), f"round-trip mismatch: pages 4,5 = {got4},{got5} (expected 101,102)"
+    assert abs(got4 - 101.0) < 1e-2 and abs(got5 - 102.0) < 1e-2, (
+        f"round-trip mismatch: pages 4,5 = {got4},{got5} (expected 101,102)"
+    )
     print(f"  pages 4,5 after D2h->H2d = {got4},{got5} OK")
 
 

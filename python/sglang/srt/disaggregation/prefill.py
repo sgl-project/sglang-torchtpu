@@ -93,7 +93,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_schedule,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_cuda, is_npu
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -103,6 +103,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 

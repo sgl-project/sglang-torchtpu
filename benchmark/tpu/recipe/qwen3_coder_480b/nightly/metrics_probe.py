@@ -418,9 +418,7 @@ def main() -> int:
         f.write("\n")
     for warning in delta["warnings"]:
         print(f"[metrics_probe] WARN: {warning}", file=sys.stderr)
-    print(
-        f"[metrics_probe] diff -> {args.out} " f"({len(delta['warnings'])} warning(s))"
-    )
+    print(f"[metrics_probe] diff -> {args.out} ({len(delta['warnings'])} warning(s))")
     return 0
 
 

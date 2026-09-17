@@ -111,8 +111,9 @@ class TestMXINT8Geometry(CustomTestCase):
 
     def test_requires_dummy_page_even_without_allocatable_blocks(self):
         for num_blocks in (0, -1):
-            with self.subTest(blocks=num_blocks), self.assertRaisesRegex(
-                ValueError, "num_blocks must be positive"
+            with (
+                self.subTest(blocks=num_blocks),
+                self.assertRaisesRegex(ValueError, "num_blocks must be positive"),
             ):
                 exponent_cache_shape(num_blocks, 1, 64, 128)
         self.assertEqual(exponent_cache_shape(1, 1, 64, 128), (1, 32, 128))

@@ -404,8 +404,7 @@ class RpaConfigs:
 
         if kv_cache.shape != expected_kv_cache_shape:
             raise ValueError(
-                f"Expected {kv_cache.shape=} to be equal to"
-                f" {expected_kv_cache_shape=}"
+                f"Expected {kv_cache.shape=} to be equal to {expected_kv_cache_shape=}"
             )
 
         # Integer kv quantization is currently not supported.

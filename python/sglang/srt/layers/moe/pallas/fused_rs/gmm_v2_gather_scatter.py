@@ -1631,7 +1631,9 @@ def validate_inputs(
     assert lhs.shape == (
         size_m,
         size_k,
-    ), f"lhs.shape={lhs.shape} expected=({size_m}, {size_k}), rhs.shape={rhs.shape}, group_sizes.shape={group_sizes.shape}"
+    ), (
+        f"lhs.shape={lhs.shape} expected=({size_m}, {size_k}), rhs.shape={rhs.shape}, group_sizes.shape={group_sizes.shape}"
+    )
     assert rhs.shape == (size_group, size_k_raw, size_n)
     if rhs_bias is not None:
         assert rhs_bias.shape == (size_group, 1, size_n)

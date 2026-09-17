@@ -184,7 +184,7 @@ class HiCacheRestoreGatedKVReceiver:
         quiesce = getattr(self.decode_req.kv_receiver, "quiesce_group_failure", None)
         if quiesce is None:
             raise RuntimeError(
-                "The wrapped drain-gated receiver has no " "quiesce_group_failure()"
+                "The wrapped drain-gated receiver has no quiesce_group_failure()"
             )
         quiesce()
 

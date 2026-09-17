@@ -437,9 +437,10 @@ class TestForwardTpuContract(CustomTestCase):
         would break GeluAndMul-using models on TPU.
         """
         for activation in ("silu", "gelu"):
-            with self.subTest(activation=activation), _MoeMockRunner(
-                activation=activation
-            ) as r:
+            with (
+                self.subTest(activation=activation),
+                _MoeMockRunner(activation=activation) as r,
+            ):
                 layer = r.make_layer()
                 d_out = r.make_dispatch_output()
                 r.tpu_forward(layer, d_out)

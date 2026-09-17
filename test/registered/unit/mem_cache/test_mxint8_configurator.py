@@ -151,10 +151,11 @@ class TestMXINT8Configurator(CustomTestCase):
                 ("fp8_e4m3", torch.float8_e4m3fn),
                 ("fp8_e5m2", torch.float8_e5m2),
             ):
-                with self.subTest(
-                    algorithm=algorithm, format=name
-                ), get_context().override_server_args(
-                    speculative_draft_kv_cache_dtype="mxint8"
+                with (
+                    self.subTest(algorithm=algorithm, format=name),
+                    get_context().override_server_args(
+                        speculative_draft_kv_cache_dtype="mxint8"
+                    ),
                 ):
                     self._assert_preflight_error(
                         kv_cache_dtype_str=name,
