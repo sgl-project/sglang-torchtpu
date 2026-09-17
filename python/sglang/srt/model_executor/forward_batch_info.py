@@ -718,6 +718,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
+    # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
+    # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).
+    engram_history: Optional[torch.Tensor] = None
+
     # For dumper: int-hashed request / bootstrap-room IDs (derived from rids)
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -920,6 +924,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices_cpu=batch.req_pool_indices_cpu,
             orig_seq_lens=batch.orig_seq_lens,
             out_cache_loc_dsv4=batch.out_cache_loc_dsv4,
+            engram_history=batch.engram_history,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
