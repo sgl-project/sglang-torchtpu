@@ -234,7 +234,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ) as poll:
             preallocated, failed = queue.pop_preallocated()
 
-        poll.assert_called_once_with([receiver], queue.gloo_group)
+        poll.assert_called_once_with(
+            [receiver], queue.gloo_group, additional_groups=None
+        )
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [decode_req])
         self.assertEqual(queue.queue, [])

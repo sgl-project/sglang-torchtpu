@@ -259,6 +259,18 @@ class SWAPrefillBudget(PrefillBudget):
             available = min(available, int(self.remaining_swa) - self.page_size)
         return available if available > 0 else None
 
+    def fit_chunk(
+        self,
+        *,
+        extend_input_len: int,
+        max_new_tokens: int,
+        chunk_limit: int,
+    ) -> int | None:
+        if self.req_ring:
+            return chunk_limit
+        cap = self._chunk_cap(max_new_tokens)
+        return min(chunk_limit, cap) if cap > 0 else None
+
     def can_allocate_prefill(
         self,
         *,

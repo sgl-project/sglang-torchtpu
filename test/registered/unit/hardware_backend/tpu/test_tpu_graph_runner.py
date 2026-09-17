@@ -131,6 +131,11 @@ class TestTpuGraphRunner(CustomTestCase):
         precompile_patcher = patch(DECODER_POLICY_PRECOMPILE)
         self.mock_precompile = precompile_patcher.start()
         self.addCleanup(precompile_patcher.stop)
+        dispatch_patcher = patch(
+            "sglang.srt.model_executor.tpu_graph_runner._resolve_fused_op_dispatch"
+        )
+        dispatch_patcher.start()
+        self.addCleanup(dispatch_patcher.stop)
         platform_patcher = patch(
             "sglang.srt.model_executor.tpu_graph_runner.current_platform",
             SimpleNamespace(device_type="tpu"),

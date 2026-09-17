@@ -71,7 +71,8 @@ class TestMXINT8Configurator(CustomTestCase):
         self.addCleanup(override.restore)
         self.platform_pool = Mock(name="platform_pool")
         self.platform = SimpleNamespace(
-            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool)
+            get_mha_kv_pool_cls=Mock(return_value=self.platform_pool),
+            is_cpu=lambda: False,
         )
         self.swa_pool = Mock(name="swa_pool")
         self.hybrid_pool = Mock(name="hybrid_pool")
