@@ -135,6 +135,7 @@ class TpuMambaPool(MambaPool):
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         self.replayssm_is_kda = False
         self.replayssm_write_pos = None
+        self.replayssm_spec_write_pos = None
         self.replayssm_spec_fold = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None

@@ -215,6 +215,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
             # A Req aborted mid chunked-prefill has no events and no output tokens yet.
             weight_version_events=[],
             output_ids=array("q"),
+            cache_request_handle=object(),
         )
         scheduler = self._scheduler(req)
 

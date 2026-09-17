@@ -526,7 +526,6 @@ class TestDraftTorchCompileInstall(CustomTestCase):
         from sglang.srt.runtime_context import get_flags
 
         runner = self._runner("tpu")
-        runner.server_args.forward_hooks = [{"name": "capture"}]
         events = []
 
         with (
@@ -545,6 +544,7 @@ class TestDraftTorchCompileInstall(CustomTestCase):
                 f"{self._SETUP_MOD}.capture_decode_graph",
                 side_effect=lambda **_: events.append("decode") or MagicMock(),
             ),
+            get_context().override_server_args(forward_hooks=[{"name": "capture"}]),
             get_flags().capture.override(enable_torch_compile=True),
         ):
             capture_cuda_graphs(model_runner=runner)

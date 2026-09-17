@@ -212,6 +212,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
+        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
+        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
