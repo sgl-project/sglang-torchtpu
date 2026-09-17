@@ -629,7 +629,9 @@ class TestDraftPrecompileOrdering(CustomTestCase):
             ),
         )
         worker.draft_attn_backend = SimpleNamespace(
-            init_forward_metadata=lambda _batch: events.append("metadata")
+            init_forward_metadata=lambda _batch, fused_draft=False: events.append(
+                "fused metadata" if fused_draft else "metadata"
+            )
         )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_idle=lambda: False),
@@ -637,8 +639,12 @@ class TestDraftPrecompileOrdering(CustomTestCase):
         )
 
         worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=True)
+        self.assertEqual(events, ["spec", "dp", "fused metadata", "ready"])
 
-        self.assertEqual(events, ["spec", "dp", "metadata", "ready"])
+        # The per-step draft path still needs eagerly bumped lengths.
+        events.clear()
+        worker._prepare_draft_forward_batch(batch, refresh_dp_metadata=False)
+        self.assertEqual(events, ["spec", "metadata", "ready"])
 
 
 if __name__ == "__main__":

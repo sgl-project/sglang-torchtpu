@@ -651,7 +651,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.compile_policy.refresh_fused_draft_dp_metadata(
                 forward_batch
             )
-        self.draft_attn_backend.init_forward_metadata(forward_batch)
+            self.draft_attn_backend.init_forward_metadata(
+                forward_batch, fused_draft=True
+            )
+        else:
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.mark_forward_metadata_ready()
 
     def _fused_draft_forward(self, forward_batch: ForwardBatch):

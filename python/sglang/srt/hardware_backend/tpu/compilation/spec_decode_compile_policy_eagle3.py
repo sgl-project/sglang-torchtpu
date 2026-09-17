@@ -917,7 +917,7 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             # for every model call in the fused loop.
             self.prepare_spec_forward_batch(forward_batch)
             self.model_runner.model.prepare_forward_batch(forward_batch)
-            draft_attn_backend.init_forward_metadata(forward_batch)
+            draft_attn_backend.init_forward_metadata(forward_batch, fused_draft=True)
             forward_batch.mark_forward_metadata_ready()
             # The live draft path has consumed this seed before entering the
             # fused loop. Match its state so Dynamo reuses the warmup graph.

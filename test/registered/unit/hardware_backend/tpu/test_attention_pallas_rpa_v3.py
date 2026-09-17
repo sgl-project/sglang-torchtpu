@@ -11,6 +11,7 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
 )
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
+    TpuPallasRpaV3MultiStepDraftBackend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
@@ -95,7 +96,9 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
                 model_runner, speculative_step_id=speculative_step_id
             )
 
-    def _build_metadata(self, backend, forward_mode, spec_info, seq_len=None):
+    def _build_metadata(
+        self, backend, forward_mode, spec_info, seq_len=None, fused_draft=False
+    ):
         seq_len = self.CONTEXT_LEN - 2 if seq_len is None else seq_len
         seq_lens = torch.tensor([seq_len], dtype=torch.int32)
         forward_batch = SimpleNamespace(
@@ -107,7 +110,9 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             extend_seq_lens=None,
             spec_info=spec_info,
         )
-        return backend._build_metadata(forward_batch, non_empty_bs=1)
+        return backend._build_metadata(
+            forward_batch, non_empty_bs=1, fused_draft=fused_draft
+        )
 
     def _build_padded_decode_metadata(self, backend, active_bs):
         physical_bs = 128
@@ -193,6 +198,80 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
                         SimpleNamespace(),
                         seq_len=131194,
                     )
+
+    def test_fused_draft_lengths_match_eager_step_bump(self):
+        """The fused loop's ``seq_lens + step + 1`` must equal the eager bump."""
+        for req_to_token_device in ("cpu", "meta"):
+            for dtype in (torch.int32, torch.int64):
+                for step_id in range(3):
+                    with self.subTest(
+                        req_to_token_device=req_to_token_device,
+                        dtype=dtype,
+                        step_id=step_id,
+                    ):
+                        self._check_fused_draft_lengths(
+                            req_to_token_device, dtype, step_id
+                        )
+
+    def _check_fused_draft_lengths(self, req_to_token_device, dtype, step_id):
+        backend = self._make_backend(
+            speculative_step_id=step_id, req_to_token_device=req_to_token_device
+        )
+        # Straddle a page boundary so the bump crosses into the next page.
+        seq_lens = torch.tensor([self.PAGE_SIZE - 1, self.PAGE_SIZE], dtype=dtype)
+        pool_indices = torch.zeros(2, dtype=torch.int64)
+        forward_batch = SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.clone(),
+            req_pool_indices=pool_indices.to(req_to_token_device),
+            req_pool_indices_cpu=pool_indices,
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            spec_info=SimpleNamespace(),
+        )
+        eager = backend._build_metadata(forward_batch, non_empty_bs=2)
+        fused = backend._build_metadata(forward_batch, non_empty_bs=2, fused_draft=True)
+        self.assertIs(fused.kv_lens, seq_lens)
+        self.assertEqual(eager.kv_lens.dtype, torch.int32)
+        self.assertEqual(
+            (fused.kv_lens.to(torch.int32) + step_id + 1).tolist(),
+            eager.kv_lens.tolist(),
+        )
+
+    def test_fused_draft_keeps_step_capacity_guard(self):
+        for req_to_token_device in ("cpu", "meta"):
+            with self.subTest(req_to_token_device=req_to_token_device):
+                backend = self._make_backend(
+                    speculative_step_id=self.DRAFT_TOKENS - 1,
+                    req_to_token_device=req_to_token_device,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "exceeds the per-request page-table capacity"
+                ):
+                    self._build_metadata(
+                        backend,
+                        ForwardMode.DECODE,
+                        SimpleNamespace(),
+                        seq_len=131194,
+                        fused_draft=True,
+                    )
+
+    def test_multistep_draft_backend_forwards_fused_draft(self):
+        calls = []
+        draft = object.__new__(TpuPallasRpaV3MultiStepDraftBackend)
+        draft.attn_backends = [
+            SimpleNamespace(
+                init_forward_metadata=lambda _batch, **kwargs: calls.append(kwargs)
+            )
+            for _ in range(2)
+        ]
+        batch = SimpleNamespace(spec_info=SimpleNamespace())
+        draft.init_forward_metadata(batch, fused_draft=True)
+        draft.init_forward_metadata(batch)
+        self.assertEqual(
+            calls,
+            [{"fused_draft": True}] * 2 + [{"fused_draft": False}] * 2,
+        )
 
     def test_seq_lens_cpu_list_and_empty_inputs(self):
         backend = self._make_backend()

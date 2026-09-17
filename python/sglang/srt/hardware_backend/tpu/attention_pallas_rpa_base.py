@@ -449,7 +449,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             return forward_mode.is_extend(include_draft_extend_v2=True)
         return forward_mode.is_extend()
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, fused_draft: bool = False
+    ):
         # Land deferred HiCache reload commits into the KV buffers before any
         # layer reads KV; this hook runs per forward in eager AND compiled.
         # Use the backend's cached pool: upstream moved token_to_kv_pool off
@@ -458,7 +460,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
         # Build metadata and its cached distribution from the same active width.
         non_empty_bs = self._non_empty_batch_size(forward_batch)
-        self.forward_metadata = self._build_metadata(forward_batch, non_empty_bs)
+        self.forward_metadata = self._build_metadata(
+            forward_batch, non_empty_bs, fused_draft=fused_draft
+        )
 
     @staticmethod
     def _pre_bucket_padded_batch_size(forward_batch: ForwardBatch) -> int:
@@ -526,6 +530,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         self,
         forward_batch: ForwardBatch,
         non_empty_bs: int,
+        *,
+        fused_draft: bool = False,
     ) -> PallasForwardMetadata:
         """Build per-forward-pass metadata for the Pallas kernel.
 
@@ -565,6 +571,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 pages_per_seq,
                 distribution,
                 non_empty_bs,
+                fused_draft=fused_draft,
             )
 
         # -------------------------------------------------------------- #
@@ -596,7 +603,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
         else:
             # Decode (including draft decode).
-            seq_lens = forward_batch.seq_lens.to(torch.int32)
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
@@ -605,7 +611,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # different speculative_step_id.  Bump seq_lens so the
                 # kernel sees KV entries from prior draft steps.
                 kv_len_bump = self.speculative_step_id + 1
-                seq_lens = seq_lens + kv_len_bump
+            if fused_draft:
+                # The fused draft loop derives each step's int32 lengths in
+                # its graph. Validate capacity below without eager arithmetic.
+                seq_lens = forward_batch.seq_lens
+            else:
+                seq_lens = forward_batch.seq_lens.to(torch.int32)
+                if kv_len_bump:
+                    seq_lens = seq_lens + kv_len_bump
             extend_seq_lens = torch.ones(bs, dtype=torch.int32, device=device)
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
@@ -681,6 +694,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         pages_per_seq,
         distribution: torch.Tensor,
         non_empty_bs: int,
+        *,
+        fused_draft: bool = False,
     ) -> PallasForwardMetadata:
         """Host-resident metadata build (gated in ``_build_metadata``).
 
@@ -701,7 +716,6 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
         else:
-            kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (
                 forward_batch.forward_mode.is_decode()
                 and forward_batch.spec_info is not None
@@ -710,7 +724,14 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 # speculative_step_id.  Bump seq_lens so the kernel sees KV
                 # entries from prior draft steps.
                 kv_len_bump = self.speculative_step_id + 1
-                kv_lens = kv_lens + kv_len_bump
+            if fused_draft:
+                # The fused draft loop derives each step's int32 lengths in its
+                # graph. Validate capacity below without eager arithmetic.
+                kv_lens = forward_batch.seq_lens
+            else:
+                kv_lens = forward_batch.seq_lens.to(torch.int32)
+                if kv_len_bump:
+                    kv_lens = kv_lens + kv_len_bump
             extend_seq_lens = torch.ones(bs, dtype=torch.int32)
 
         seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
@@ -969,10 +990,12 @@ class BaseTpuPallasRpaMultiStepDraftBackend:
             for i in range(self.speculative_num_steps - 1)
         ]
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(
+        self, forward_batch: ForwardBatch, *, fused_draft: bool = False
+    ):
         assert forward_batch.spec_info is not None
         for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_metadata(forward_batch, fused_draft=fused_draft)
 
     def init_cuda_graph_state(self, max_bs, max_num_tokens):
         pass
