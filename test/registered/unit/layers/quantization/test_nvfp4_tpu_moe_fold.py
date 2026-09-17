@@ -460,6 +460,116 @@ class TestNvfp4Block512Contract(CustomTestCase):
                     (EXPERTS, INTERMEDIATE_SIZE // group_size, 1, HIDDEN_SIZE),
                 )
 
+    def test_helion_fused_backend_tiles_packed_weights(self):
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+
+        group_size = 256
+        layer = _make_block512_layer(group_size=group_size)
+        layer.hidden_size = HIDDEN_SIZE
+        norm_weight = torch.ones(HIDDEN_SIZE, dtype=torch.bfloat16)
+        layer.supports_tpu_fused_rs_post_expert_norm = True
+        layer.tpu_fused_rs_post_expert_norm_weight = lambda: norm_weight
+
+        expected_w1 = fp4_moe._transpose_packed_fp4(layer.w13_weight.detach())
+        expected_w2 = fp4_moe._transpose_packed_fp4(layer.w2_weight.detach())
+        expected_w1_scale = (
+            layer.w13_weight_scale.detach().permute(0, 2, 1).unsqueeze(2)
+        )
+        expected_w2_scale = layer.w2_weight_scale.detach().permute(0, 2, 1).unsqueeze(2)
+        prepare_helion = mock.Mock()
+        tile_weights = mock.Mock(side_effect=lambda *weights: weights)
+        helion_module = types.SimpleNamespace(
+            prepare_helion_fused_moe_rs=prepare_helion,
+            tile_weights_for_helion_fused_rs=tile_weights,
+        )
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"sglang.srt.layers.moe.helion.fused_moe_rs": helion_module},
+            ),
+            mock.patch.object(
+                fp4_moe,
+                "_materialize_packed_fp4",
+                side_effect=lambda weight: weight,
+            ),
+        ):
+            fp4_moe.prepare_tpu_nvfp4_moe_weights(
+                layer,
+                group_size=group_size,
+                use_fused_rs=True,
+                use_helion_fused_rs=True,
+            )
+
+        prepare_helion.assert_called_once_with(layer)
+        tile_weights.assert_called_once()
+        for actual, expected in zip(
+            tile_weights.call_args.args,
+            (expected_w1, expected_w2, expected_w1_scale, expected_w2_scale),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(layer.w13_weight, expected_w1)
+        torch.testing.assert_close(layer.w2_weight, expected_w2)
+        self.assertEqual(layer.w13_weight.dtype, torch.uint8)
+        self.assertEqual(layer.w2_weight.dtype, torch.uint8)
+
+    def test_helion_fused_apply_uses_helion_gather(self):
+        from sglang.srt.hardware_backend.tpu import fp4_moe
+
+        hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
+        topk_weights = torch.rand(3, 2, dtype=torch.bfloat16)
+        topk_ids = torch.tensor([[0, 1], [1, -1], [0, 1]], dtype=torch.int64)
+        dispatch_output = types.SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_output=(topk_weights, topk_ids, None),
+        )
+        layer = _make_block512_layer(include_unused_params=False)
+        layer.moe_ep_rank = 0
+        layer.moe_ep_size = 1
+        layer._tpu_fused_rs_has_post_expert_norm = True
+        layer._tpu_fused_rs_post_expert_norm_weight = torch.ones(
+            HIDDEN_SIZE, dtype=torch.bfloat16
+        )
+        layer._tpu_helion_fused_rs_expert_offsets = torch.zeros(1, dtype=torch.int32)
+        layer._tpu_helion_fused_rs_tp_rank_to_physical = torch.zeros(
+            1, dtype=torch.int32
+        )
+        layer._tpu_helion_fused_rs_physical_rank = torch.zeros(1, dtype=torch.int32)
+        layer._tpu_helion_fused_rs_process_group_name = "world"
+        layer._tpu_fused_rs_tp_rank_to_device_id = torch.zeros(1, dtype=torch.int32)
+        helion_gather = mock.Mock(
+            return_value=torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
+        )
+        helion_module = types.SimpleNamespace(helion_fused_moe_rs_gather=helion_gather)
+
+        with mock.patch.dict(
+            sys.modules,
+            {"sglang.srt.layers.moe.helion.fused_moe_rs": helion_module},
+        ):
+            result = fp4_moe.apply_tpu_nvfp4_moe(
+                layer=layer,
+                dispatch_output=dispatch_output,
+                activation="silu",
+                apply_router_weight_on_input=False,
+                use_fused_rs=True,
+                use_helion_fused_rs=True,
+            )
+
+        call = helion_gather.call_args.kwargs
+        torch.testing.assert_close(
+            call["tp_rank_to_physical"],
+            layer._tpu_helion_fused_rs_tp_rank_to_physical,
+        )
+        torch.testing.assert_close(
+            call["physical_rank"], layer._tpu_helion_fused_rs_physical_rank
+        )
+        self.assertEqual(call["world_size"], 1)
+        self.assertEqual(call["topk_ids"][1, 1].item(), 0)
+        self.assertEqual(call["topk_weights"][1, 1].item(), 0)
+        self.assertFalse(call["keep_token_shard"])
+        self.assertEqual(tuple(result.hidden_states.shape), (3, HIDDEN_SIZE))
+
     def test_fused_prepare_supplies_every_attribute_apply_reads(self):
         """Producer -> consumer contract for the shared fused-RS attributes.
 
@@ -1265,6 +1375,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
         model_contract: bool = False,
         backend: str = "auto",
         group_size: int = BLOCK_SIZE,
+        helion: bool = False,
     ):
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.quantization import modelopt_quant
@@ -1334,6 +1445,7 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 "sglang.srt.hardware_backend.tpu.fp4_moe.prepare_tpu_nvfp4_moe_weights",
                 _fake_prepare,
             ),
+            modelopt_quant.envs.SGLANG_TPU_HELION_FUSED_MOE.override(helion),
         ):
             method = modelopt_quant.TpuModelOptNvFp4FusedMoEMethod(config)
             method.create_moe_runner(layer, moe_runner_config)
@@ -1355,13 +1467,34 @@ class TestNvfp4FusedRsGateTiming(CustomTestCase):
                 )
                 self.assertTrue(resolved)
                 self.assertTrue(prepared["use_fused_rs"])
+                self.assertFalse(prepared["use_helion_fused_rs"])
 
     def test_gate_accepts_post_expert_norm_contract(self):
         _, resolved, prepared, layer = self._run_gate(model_contract=True)
 
         self.assertTrue(resolved)
         self.assertTrue(prepared["use_fused_rs"])
+        self.assertFalse(prepared["use_helion_fused_rs"])
         self.assertTrue(layer.allow_backend_reduction)
+
+    def test_helion_flag_selects_helion_for_the_supported_contract(self):
+        _, resolved, prepared, _ = self._run_gate(
+            model_contract=True,
+            group_size=256,
+            helion=True,
+        )
+
+        self.assertTrue(resolved)
+        self.assertTrue(prepared["use_fused_rs"])
+        self.assertTrue(prepared["use_helion_fused_rs"])
+
+    def test_helion_flag_rejects_missing_post_expert_norm(self):
+        with self.assertRaisesRegex(ValueError, "post-expert RMSNorm"):
+            self._run_gate(group_size=256, helion=True)
+
+    def test_helion_flag_rejects_unvalidated_group_size(self):
+        with self.assertRaisesRegex(ValueError, "group_size=256"):
+            self._run_gate(model_contract=True, group_size=512, helion=True)
 
     def test_explicit_pallas_backend_selects_fused_rs(self):
         _, resolved, prepared, _ = self._run_gate(backend="pallas_tpu_fused_rs")

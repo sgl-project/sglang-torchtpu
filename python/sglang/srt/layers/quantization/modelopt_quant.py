@@ -3115,6 +3115,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
         self.quant_config = quant_config
         self.enable_flashinfer_trtllm_moe = False
+        self.use_helion_fused_rs = False
 
     def _weight_scale_dtype(self) -> torch.dtype:
         return self._checkpoint_scale_dtype
@@ -3178,7 +3179,21 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
         self.handles_moe_reduction = not unmet_requirements
         if self.handles_moe_reduction:
-            logger.info("Using TPU Pallas NVFP4 fused-RS MoE backend")
+            self.use_helion_fused_rs = envs.SGLANG_TPU_HELION_FUSED_MOE.get()
+            if self.use_helion_fused_rs:
+                if self.quant_config.group_size != 256:
+                    raise ValueError(
+                        "SGLANG_TPU_HELION_FUSED_MOE currently requires "
+                        "NVFP4 group_size=256"
+                    )
+                if not has_post_expert_norm:
+                    raise ValueError(
+                        "SGLANG_TPU_HELION_FUSED_MOE requires the Tier5 "
+                        "post-expert RMSNorm contract"
+                    )
+                logger.info("Using TPU Helion NVFP4 fused-RS MoE backend")
+            else:
+                logger.info("Using TPU Pallas NVFP4 fused-RS MoE backend")
         elif (
             self.quant_config.group_size != 512
             or moe_runner_backend.is_pallas_tpu_fused_rs()
@@ -3209,6 +3224,7 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             group_size=self.quant_config.group_size,
             scale_dtype=self._prepared_scale_dtype,
             use_fused_rs=self.handles_moe_reduction,
+            use_helion_fused_rs=self.use_helion_fused_rs,
         )
 
     def create_moe_runner(
@@ -3243,4 +3259,5 @@ class TpuModelOptNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             ),
             no_combine=self.moe_runner_config.no_combine,
             use_fused_rs=self.handles_moe_reduction,
+            use_helion_fused_rs=self.use_helion_fused_rs,
         )

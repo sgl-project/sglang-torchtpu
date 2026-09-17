@@ -200,8 +200,9 @@ def prepare_tpu_nvfp4_moe_weights(
     align_to: int = TPU_NVFP4_GROUP_SIZE,
     scale_dtype: torch.dtype = torch.float32,
     use_fused_rs: bool = False,
+    use_helion_fused_rs: bool = False,
 ) -> None:
-    """Format NVFP4 MoE weights/scales for the TPU gmm_v2 backend.
+    """Format NVFP4 MoE weights/scales for the selected TPU implementation.
 
     Keeps weights packed (uint8), stores the checkpoint's effective per-block
     scale as ``scale_dtype``, transposes to gmm_v2 layout, and pads the
@@ -269,7 +270,30 @@ def prepare_tpu_nvfp4_moe_weights(
     w2_s = _pad_last_axis(w2_s, pad_k_blocks)  # (E, H, I_pad/G)
     w2_scale = _to_gmm_v2_scale_layout(w2_s, scale_dtype)  # (E, I_pad/G, 1, H)
 
-    if use_fused_rs:
+    if use_helion_fused_rs:
+        if not use_fused_rs:
+            raise ValueError("Helion fused-RS requires use_fused_rs=True")
+        if group_size != 256:
+            raise NotImplementedError(
+                "Helion NVFP4 fused-RS currently supports group_size=256, "
+                f"got {group_size}"
+            )
+        from sglang.srt.layers.moe.helion.fused_moe_rs import (
+            prepare_helion_fused_moe_rs,
+            tile_weights_for_helion_fused_rs,
+        )
+
+        prepare_tpu_fused_rs_post_expert_norm(layer)
+        prepare_helion_fused_moe_rs(layer)
+        w13_w, w2_w, w13_scale, w2_scale = tile_weights_for_helion_fused_rs(
+            _transpose_packed_fp4(w13_w),
+            _transpose_packed_fp4(w2_w),
+            w13_scale,
+            w2_scale,
+        )
+        w13_w = _materialize_packed_fp4(w13_w)
+        w2_w = _materialize_packed_fp4(w2_w)
+    elif use_fused_rs:
         from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
             prepare_fused_moe_rs,
         )
@@ -299,8 +323,9 @@ def apply_tpu_nvfp4_moe(
     apply_router_weight_on_input: bool,
     no_combine: bool = False,
     use_fused_rs: bool = False,
+    use_helion_fused_rs: bool = False,
 ):
-    """Run TPU NVFP4 MoE through the Pallas grouped-GEMM backend.
+    """Run TPU NVFP4 MoE through the selected packed-weight implementation.
 
     With ``no_combine=True`` returns raw per-slot outputs ``[num_tokens, topk,
     hidden]`` (non-local EP slots zeroed) for a caller doing its own post-expert
@@ -310,12 +335,10 @@ def apply_tpu_nvfp4_moe(
         raise NotImplementedError(
             "apply_router_weight_on_input is not supported on TPU yet."
         )
+    if use_helion_fused_rs and not use_fused_rs:
+        raise ValueError("Helion fused-RS requires use_fused_rs=True")
 
     if use_fused_rs:
-        from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
-            fused_moe_rs_gather,
-        )
-
         prepared_input = prepare_fused_moe_sequence_parallel_input(
             layer, dispatch_output
         )
@@ -333,6 +356,15 @@ def apply_tpu_nvfp4_moe(
         has_post_expert_norm = post_expert_norm_weight is not None
         if post_expert_norm_weight is None:
             post_expert_norm_weight = hidden_states.new_zeros((1,))
+
+        if use_helion_fused_rs:
+            from sglang.srt.layers.moe.helion.fused_moe_rs import (
+                helion_fused_moe_rs_gather,
+            )
+        else:
+            from sglang.srt.layers.moe.pallas.fused_moe_rs_op import (
+                fused_moe_rs_gather,
+            )
 
         tp_world_size = int(layer._tpu_fused_rs_tp_rank_to_device_id.numel())
         if keep_output_shard:
@@ -374,25 +406,45 @@ def apply_tpu_nvfp4_moe(
             chunk_weights = weights_by_partition[:, token_start:token_end].flatten(0, 1)
             chunk_ids = ids_by_partition[:, token_start:token_end].flatten(0, 1)
 
-            output = fused_moe_rs_gather(
-                hidden_states=chunk_hidden,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                w1_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                topk_weights=chunk_weights,
-                topk_ids=chunk_ids,
-                post_expert_norm_weight=post_expert_norm_weight,
-                group_offset=layer._tpu_fused_rs_group_offset,
-                topk=int(topk_ids.shape[-1]),
-                activation=activation,
-                has_post_expert_norm=has_post_expert_norm,
-                # Block-128 uses W4A16; block-256/512 already quantize the
-                # GMM activation. A direct FP8 write would add another loss.
-                fp8_direct_write=False,
-                tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
-                keep_token_shard=keep_output_shard,
-            )
+            if use_helion_fused_rs:
+                output = helion_fused_moe_rs_gather(
+                    hidden_states=chunk_hidden,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    topk_weights=chunk_weights,
+                    topk_ids=chunk_ids,
+                    post_expert_norm_weight=post_expert_norm_weight,
+                    expert_offsets=layer._tpu_helion_fused_rs_expert_offsets,
+                    tp_rank_to_physical=(
+                        layer._tpu_helion_fused_rs_tp_rank_to_physical
+                    ),
+                    physical_rank=layer._tpu_helion_fused_rs_physical_rank,
+                    world_size=layer.moe_ep_size,
+                    process_group_name=(layer._tpu_helion_fused_rs_process_group_name),
+                    keep_token_shard=keep_output_shard,
+                )
+            else:
+                output = fused_moe_rs_gather(
+                    hidden_states=chunk_hidden,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    topk_weights=chunk_weights,
+                    topk_ids=chunk_ids,
+                    post_expert_norm_weight=post_expert_norm_weight,
+                    group_offset=layer._tpu_fused_rs_group_offset,
+                    topk=int(topk_ids.shape[-1]),
+                    activation=activation,
+                    has_post_expert_norm=has_post_expert_norm,
+                    # Block-128 uses W4A16; block-256/512 already quantize the
+                    # GMM activation. A direct FP8 write would add another loss.
+                    fp8_direct_write=False,
+                    tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
+                    keep_token_shard=keep_output_shard,
+                )
             outputs.append(output[:output_rows])
         return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
 

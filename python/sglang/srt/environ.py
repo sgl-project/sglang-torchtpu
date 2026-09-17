@@ -1628,6 +1628,9 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
+    # Use the source Helion implementation under the validated NVFP4 fused-RS
+    # backend. The existing hand-written Pallas path remains the default.
+    SGLANG_TPU_HELION_FUSED_MOE = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
