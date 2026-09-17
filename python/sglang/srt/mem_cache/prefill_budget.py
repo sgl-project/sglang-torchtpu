@@ -31,6 +31,7 @@ def estimate_swa_kv_tokens(
     page_size: int,
     allocation_limit: Optional[int] = None,
     host_hit_length: int = 0,
+    additive_chunk: bool = False,
 ) -> int:
     """Peak SWA reservation for one prefill/decode request."""
     if sliding_window_size is None or sliding_window_size <= 0:
@@ -43,7 +44,7 @@ def estimate_swa_kv_tokens(
         )
         allocated_tail = (
             allocated
-            if allocation_limit is not None
+            if additive_chunk and allocation_limit is not None
             else max(allocated - sliding_window_size, 0)
         )
         # With a roughly two-window SWA pool, a cached prefix can already lock
@@ -162,6 +163,7 @@ class SWAPrefillBudget(PrefillBudget):
         super().__init__(*args, **kwargs)
         self.all_swa = all_swa
         self.req_ring = is_swa_req_ring(self.allocator)
+        self.additive_chunk = True
 
     def _available_and_evictable(self):
         if self.all_swa:
@@ -195,6 +197,7 @@ class SWAPrefillBudget(PrefillBudget):
             page_size=self.page_size,
             allocation_limit=chunk_limit,
             host_hit_length=swa_host_hit_length,
+            additive_chunk=self.additive_chunk,
         )
 
     def swa_never_fits(self, extend_input_len, max_new_tokens, **kwargs):
@@ -323,6 +326,7 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
             *args, num_mixed_decode_tokens=num_mixed_decode_tokens, **kwargs
         )
         self.swa_offset = num_mixed_decode_tokens
+        self.additive_chunk = False
 
     def _fits(self, full_tokens, swa_tokens, *, empty_pool=False):
         return self.allocator.can_reserve(

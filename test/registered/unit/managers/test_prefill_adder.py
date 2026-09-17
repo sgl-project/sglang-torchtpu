@@ -776,6 +776,7 @@ class TestPrefillAdder(CustomTestCase):
                         sliding_window_size=window,
                         page_size=page,
                         allocation_limit=rem_chunk,
+                        additive_chunk=True,
                     ),
                     expected,
                 )
