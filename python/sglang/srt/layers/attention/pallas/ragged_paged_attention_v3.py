@@ -275,9 +275,8 @@ def get_vmem_estimate_bytes(
     # Attention compute intermediates (f32). The for-loop over kv_heads is
     # statically unrolled by the compiler, so all heads' intermediates coexist
     # in VMEM.  Per head: QK^T scores (bq*qpkv, bkv_csz) + PV result (bq*qpkv, hd)
-    # in f32, counted once, which tracks what the compiler reports; for
-    # instance, gpt-oss-120b at 256 query rows on tpu7x: 86.0 MiB estimated
-    # here, 81.7 MiB reported.
+    # in f32, counted once (e.g. gpt-oss-120b at 256 query rows: 86.0 MiB
+    # estimated, 81.7 MiB reported by the compiler).
     # Use bkv_csz (compute size) since that determines the matmul tile size.
     compute_bkv = bkv_csz if bkv_csz is not None else bkv_sz
     compute_bits = (
@@ -1593,18 +1592,12 @@ def get_default_block_sizes(
     bq_csz = max(1, bq_csz)
     bkv_csz = align_to(bkv_csz, bkv_alignment)
 
-    # Reduce block sizes while the VMEM estimate exceeds the budget: 60% of
-    # the limit for prefill and mixed, 15% for decode, which keeps the decode
-    # KV block where it settled with half the capacity as the limit (on tpu7x
-    # a 16,384-row block ran 14% slower per token than 8,192 rows at 4K
-    # context with 32 concurrent requests). The estimate tracks the compiler's
-    # VMEM use to within a few percent on the shapes measured, so the budget
-    # is margin for shapes it has not been checked against. On
-    # tpu7x with the whole 64 MiB as the limit this settles at 128-row query
-    # blocks for 4 KV heads of 8 query heads each with fp8 KV (256 rows
-    # compile there but run no faster) and at 64 rows for 8 KV heads with
-    # bf16 KV (128 rows compile and run no faster).
+    # Reduce block sizes if VMEM estimate exceeds limit.
+    # Use a fraction of vmem_limit as margin for shapes the estimate has not
+    # been checked against.
     if vmem_limit_bytes is not None:
+        # Give higher vmem budget for prefill and mixed; a larger decode KV
+        # block measured slower per token.
         _budget_frac = 0.15 if case == RpaCase.DECODE else 0.60
         vmem_budget = int(vmem_limit_bytes * _budget_frac)
         while bq_sz > 1 or bkv_sz > bkv_alignment:
