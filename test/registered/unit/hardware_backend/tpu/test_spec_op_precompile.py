@@ -39,12 +39,15 @@ def test_warmup_inputs_match_physical_helper_shapes():
     assert predict.shape == (12,)
     assert accept_index.shape == (4, 3)
 
-    draft_logits, hidden_states, select_index = make_draft_extend_select_args(context)
+    draft_logits, hidden_states, num_accept_tokens = make_draft_extend_select_args(
+        context
+    )
     assert draft_logits.shape == (12, 5)
     assert draft_logits.dtype == torch.float32
     assert hidden_states.shape == (12, 6)
     assert hidden_states.dtype == torch.bfloat16
-    assert select_index.tolist() == [2, 5, 8, 11]
+    assert num_accept_tokens.tolist() == [3, 3, 3, 3]
+    assert num_accept_tokens.dtype == torch.int32
 
     dflash_cands, dflash_target_top1, dflash_prefix_lens = (
         make_dflash_verify_bookkeeping_args(context)

@@ -532,8 +532,10 @@ class TestDraftExtendSelectFused(unittest.TestCase):
                 torch.arange(0, bs * ndt, ndt, dtype=torch.int32) + accept_lens - 1
             ).long()
 
+            # The helper rebuilds select_index from the counts, reading the
+            # window width off the logits rows.
             sel_l, sel_h, tp, ti = fused_draft_extend_select_argmax_func(
-                logits, hidden, select_index
+                logits, hidden, accept_lens
             )
 
             want_l = logits[select_index]
@@ -553,10 +555,11 @@ class TestDraftExtendSelectFused(unittest.TestCase):
 
         logits = torch.randn(8, 16)
         sel_l, sel_h, _, _ = fused_draft_extend_select_argmax_func(
-            logits, None, torch.tensor([1, 5])
+            logits, None, torch.tensor([1, 4], dtype=torch.int32)
         )
         self.assertIsNone(sel_h)
         self.assertEqual(sel_l.shape, (2, 16))
+        self.assertTrue(torch.equal(sel_l, logits[torch.tensor([0, 7])]))
 
     def test_draft_extend_input_builds_a_safe_bucketed_selector(self):
         from sglang.srt.speculative.eagle_info import EagleDraftExtendInput

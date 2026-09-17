@@ -58,7 +58,6 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -1336,12 +1335,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
+        # TPU builds the selection index inside the compiled select/argmax
+        # executable from the acceptance counts, so the eager index is needed
+        # only by the non-TPU selection below and by the DSA seed gather.
         select_index = None
-        if not (
-            _is_tpu
-            and envs.SGLANG_TPU_EAGLE_FUSED_REFRESH_INDICES.get()
-            and not self.seed_dsa_topk_from_draft_extend
-        ):
+        if not _is_tpu or self.seed_dsa_topk_from_draft_extend:
             select_index = (
                 torch.arange(
                     0,
@@ -1428,14 +1426,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        if current_platform.is_tpu():
-            if envs.SGLANG_TPU_EAGLE_FUSED_REFRESH_INDICES.get():
-                selection_args = (
-                    forward_batch.spec_info.num_accept_tokens,
-                    forward_batch.spec_info.num_tokens_per_req,
-                )
-            else:
-                selection_args = (forward_batch.spec_info.last_accepted_indices(),)
+        if _is_tpu:
             (
                 draft_logits_output.next_token_logits,
                 draft_logits_output.hidden_states,
@@ -1445,7 +1436,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 outputs=fused_draft_extend_select_argmax_func(
                     draft_logits_output.next_token_logits,
                     draft_logits_output.hidden_states,
-                    *selection_args,
+                    forward_batch.spec_info.num_accept_tokens,
                 ),
                 forward_batch=forward_batch,
             )
@@ -1461,7 +1452,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
                 ]
-        if current_platform.is_tpu():
+        # The draft-extend graph only anchors full logits; selected-row topk is
+        # owned by the worker for both graph and eager paths.
+        if _is_tpu:
             pass
         elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(

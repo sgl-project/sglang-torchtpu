@@ -22,6 +22,7 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import (
+    last_accepted_row_indices,
     top_k_renorm_prob_func,
     top_p_renorm_prob_func,
     tree_speculative_sampling_target_only_func,
@@ -927,19 +928,9 @@ class EagleDraftExtendInput(SpecInput):
 
     def last_accepted_indices(self) -> torch.Tensor:
         """Return the final accepted row for every request in this batch shape."""
-        assert self.num_tokens_per_req > 0
-        num_requests = self.num_accept_tokens.shape[0]
-        row_starts = torch.arange(
-            0,
-            num_requests * self.num_tokens_per_req,
-            self.num_tokens_per_req,
-            dtype=torch.int64,
-            device=self.num_accept_tokens.device,
+        return last_accepted_row_indices(
+            self.num_accept_tokens, self.num_tokens_per_req
         )
-        # Compile-policy padding uses zero accept counts. Select the first row
-        # for those inert requests so padded indices remain in bounds.
-        accept_offsets = self.num_accept_tokens.to(torch.int64).clamp_min(1) - 1
-        return row_starts + accept_offsets
 
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:

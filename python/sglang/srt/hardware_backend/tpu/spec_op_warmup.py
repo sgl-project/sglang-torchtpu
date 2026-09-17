@@ -7,8 +7,6 @@ from typing import Any
 
 import torch
 
-from sglang.srt.environ import envs
-
 
 @dataclass(frozen=True)
 class SpecOpWarmupContext:
@@ -60,15 +58,17 @@ def make_verify_bookkeeping_args(
 
 def make_draft_extend_select_args(
     context: SpecOpWarmupContext,
-) -> tuple[torch.Tensor | int, ...]:
+) -> tuple[torch.Tensor, ...]:
     num_verify_rows = context.physical_bs * context.num_verify_tokens
-    select_index = (
-        torch.arange(context.physical_bs, dtype=torch.int64, device=context.device)
-        * context.num_verify_tokens
-        + context.num_verify_tokens
-        - 1
+    # int32 matches `num_correct_drafts` from `eagle_sample`, which the padding
+    # helpers preserve; the helper reads the window width off the logits rows.
+    num_accept_tokens = torch.full(
+        (context.physical_bs,),
+        context.num_verify_tokens,
+        dtype=torch.int32,
+        device=context.device,
     )
-    args = (
+    return (
         torch.zeros(
             (num_verify_rows, context.draft_vocab_size),
             dtype=torch.float32,
@@ -79,18 +79,8 @@ def make_draft_extend_select_args(
             dtype=context.hidden_dtype,
             device=context.device,
         ),
-        select_index,
+        num_accept_tokens,
     )
-
-    if envs.SGLANG_TPU_EAGLE_FUSED_REFRESH_INDICES.get():
-        counts = torch.full(
-            (context.physical_bs,),
-            context.num_verify_tokens,
-            dtype=torch.int32,
-            device=context.device,
-        )
-        return (*args[:2], counts, context.num_verify_tokens)
-    return args
 
 
 def make_dflash_verify_argmax_args(
