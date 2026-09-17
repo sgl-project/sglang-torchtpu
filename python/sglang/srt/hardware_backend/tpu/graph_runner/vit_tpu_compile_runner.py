@@ -146,8 +146,8 @@ class VisionTpuCompilePolicy(CompilePolicy):
             vit = getattr(owner, "vit", owner)
         self.vit = vit
         self.compiled_fn = None
-        # The bound eager method install() wraps; a shape outside the bucket
-        # ladder runs through this instead of forcing a recompile.
+        # The original uncompiled method, saved by install(); an image larger
+        # than the top precompiled bucket runs through it instead of recompiling.
         self.eager_fn = None
         self._patch_buckets: list[int] | None = None
         self._graph_cu_seqlens_cache: dict[int, torch.Tensor] = {}
