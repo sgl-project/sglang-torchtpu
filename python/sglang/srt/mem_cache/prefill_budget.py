@@ -41,7 +41,11 @@ def estimate_swa_kv_tokens(
             if allocation_limit is None
             else min(extend_input_len, allocation_limit)
         )
-        allocated_tail = max(allocated - sliding_window_size, 0)
+        allocated_tail = (
+            allocated
+            if allocation_limit is not None
+            else max(allocated - sliding_window_size, 0)
+        )
         # With a roughly two-window SWA pool, a cached prefix can already lock
         # one window. Charging another whole window for a short resume can then
         # block admission forever on an idle pool. Reserve only its uncached

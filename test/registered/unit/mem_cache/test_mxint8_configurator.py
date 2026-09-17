@@ -101,6 +101,7 @@ class TestMXINT8Configurator(CustomTestCase):
                 ),
                 swa_attention_layer_ids=[1],
                 full_attention_layer_ids=[0],
+                hf_config=SimpleNamespace(),
             ),
             server_args=get_server_args(),
             kv_cache_dtype=torch.int8,

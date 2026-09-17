@@ -351,6 +351,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         mr, _, config = self._run(1 << 20, enable_unified_memory=True)
         self.assertIsNotNone(config.unified_memory_pool_bytes)
         configurator = object.__new__(KVCacheConfigurator)
+        configurator.device = "cpu"
         configurator.model_config = mr.model_config
         configurator.is_hybrid_swa = True
         configurator.is_draft_worker = False
