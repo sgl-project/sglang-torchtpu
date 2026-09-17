@@ -275,8 +275,9 @@ def get_vmem_estimate_bytes(
     # Attention compute intermediates (f32). The for-loop over kv_heads is
     # statically unrolled by the compiler, so all heads' intermediates coexist
     # in VMEM.  Per head: QK^T scores (bq*qpkv, bkv_csz) + PV result (bq*qpkv, hd)
-    # in f32, counted once: on tpu7x the compiler reports 81.7 MiB for the
-    # gpt-oss-120b shape at 256 query rows against 86.0 MiB estimated here.
+    # in f32, counted once, which tracks what the compiler reports; for
+    # instance, gpt-oss-120b at 256 query rows on tpu7x: 86.0 MiB estimated
+    # here, 81.7 MiB reported.
     # Use bkv_csz (compute size) since that determines the matmul tile size.
     compute_bkv = bkv_csz if bkv_csz is not None else bkv_sz
     compute_bits = (
