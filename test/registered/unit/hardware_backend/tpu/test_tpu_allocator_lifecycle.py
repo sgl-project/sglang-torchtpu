@@ -13,6 +13,29 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestTpuAllocatorLifecycle(unittest.TestCase):
+    def test_direct_page_release_preserves_decode_dtype(self):
+        page_size = 4
+        allocator = TpuPagedTokenToKVPoolAllocator(
+            size=6 * page_size,
+            page_size=page_size,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        allocated = allocator.alloc(page_size)
+
+        allocator.free_page_ids((allocated[::page_size] // page_size).long())
+
+        self.assertEqual(allocator.free_pages.dtype, torch.int32)
+        out = allocator.alloc_decode(
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([15], dtype=torch.int32),
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(out.dtype, torch.int32)
+
     def test_exhaustion_grouped_release_and_retry_preserve_ownership(self):
         for page_size in (4, 8, 32):
             for need_sort in (False, True):

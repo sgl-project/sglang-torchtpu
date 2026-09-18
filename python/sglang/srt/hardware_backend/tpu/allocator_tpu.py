@@ -276,6 +276,13 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
 
         return out_indices.int()
 
+    def _release_page_ids(self, *page_ids: torch.Tensor) -> None:
+        """Keep every page-id release path on the host pool's int32 dtype."""
+        normalized = tuple(
+            page_id.to(device="cpu", dtype=torch.int32) for page_id in page_ids
+        )
+        super()._release_page_ids(*normalized)
+
     def free(self, free_index: torch.Tensor) -> None:
         # Page pools are host-resident int32 tensors. Scheduler locations can
         # be int64, so normalize before the parent derives and reinserts page
