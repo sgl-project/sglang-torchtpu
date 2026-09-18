@@ -415,7 +415,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 # TPUs don't support returning input logprobs -- this errors elsewhere.
                 logits_processor.compute_input_logprobs = False
 
-        compiled = self._compile(compile_fn)
+        # The runner can own other modules outside this compiled region.
+        compiled = self._compile(compile_fn, model=compile_owner)
         compiled.__signature__ = inspect.signature(compile_fn)
         setattr(
             compile_owner,
@@ -508,9 +509,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.compiled_forward_shim = CompiledForwardShim(shim_target, policy=self)
         setattr(self.owner, self.method_name, self.compiled_forward_shim)
 
-    def _compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+    def _compile(
+        self, fn: Callable[..., Any], *, model: torch.nn.Module
+    ) -> Callable[..., Any]:
         if self.tracer == "direct":
-            return self._direct_compile(fn)
+            return self._direct_compile(fn, model=model)
 
         server_args = self.model_runner.server_args
         use_bundle = (
@@ -525,14 +528,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             dynamic=self.dynamic,
         )
 
-    def _direct_compile(self, fn: Callable[..., Any]) -> Callable[..., Any]:
-        """Compile directly through TorchTPU without Dynamo or AOTAutograd."""
+    def _direct_compile(
+        self, fn: Callable[..., Any], *, model: torch.nn.Module
+    ) -> Callable[..., Any]:
+        """Compile directly through TorchTPU using ``model`` as the state scope."""
         from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
             direct_compile,
         )
 
         fn = torch.no_grad()(fn)
-        model = self.model_runner.model
 
         def trace_forward(
             attention_metadata: Any,
@@ -588,15 +592,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         return ()
 
     def get_model_extra_tensor_attrs(self) -> tuple[str, ...]:
-        """Returns paths to non-param non-buffer Tensor attrs on the model.
+        """Return non-parameter, non-buffer tensor paths for direct compilation.
 
-        This is only used for direct_compile. direct_compile accepts a model
-        and needs to know where all of the Tensors in the model are. It knows
-        that Tensors can be a part of the parameters and buffers but
-        we need to explicitly tell it where all of the non-parameter non-buffer
-        Tensors are.
+        Paths are relative to the module passed as ``model`` to direct_compile:
+        the annotated decoder or draft backbone for ordinary forward compilation.
+        Fused draft loops and KV appenders explicitly use the whole draft model.
 
-        Example: ("foo.bar.baz",).
+        Example: ("object_state.value",).
         """
         return self.model_extra_tensor_attrs
 

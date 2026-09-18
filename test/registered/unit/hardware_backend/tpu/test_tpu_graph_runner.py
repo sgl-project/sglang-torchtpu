@@ -277,15 +277,80 @@ class TestTpuGraphRunner(CustomTestCase):
         # Most text decoder models should not need an explicit annotation.
         # If no annotated boundary is installed, TPU compile falls back to
         # the generic decoder policy on the model forward.
-        model = _model_with(forward=MagicMock())
+        original_forward = MagicMock()
+        model = _model_with(forward=original_forward)
         runner = self._runner_for(model, tpu_compile_tracer="direct")
         TpuGraphRunner(runner)
-        self.mock_direct_compile.assert_called_once()
+        self.mock_direct_compile.assert_called_once_with(original_forward, model=model)
         self.mock_compile.assert_not_called()
         self.assertIsInstance(runner.compile_policy, DecoderTpuCompilePolicy)
         self.assertEqual(runner.compile_policy.tracer, "direct")
         # Backend registration still happens — the gate is _can_torch_compile.
         self.mock_register.assert_called_once()
+
+    def test_direct_tracer_uses_annotated_decoder_state(self):
+        original_decoder = MagicMock(name="decoder_forward")
+        decoder = self._annotate(_model_with(forward=original_decoder))
+        original_outer = MagicMock(name="outer_forward")
+        model = _model_with(
+            forward=original_outer,
+            model=decoder,
+            logits_processor=_model_with(compute_input_logprobs=True),
+        )
+        model.modules = lambda: (model, decoder)
+        runner = self._runner_for(model, tpu_compile_tracer="direct")
+
+        TpuGraphRunner(runner)
+
+        self.mock_direct_compile.assert_called_once_with(
+            original_decoder, model=decoder
+        )
+        self.mock_compile.assert_not_called()
+        self.assertIs(runner.compile_policy.owner, decoder)
+        self.assertIs(decoder.forward, runner.compile_policy.compiled_forward_shim)
+        self.assertIs(model.forward, original_outer)
+        self.assertTrue(model.logits_processor.compute_input_logprobs)
+
+    def test_direct_draft_tracer_uses_backbone_state(self):
+        original_outer = MagicMock(name="outer_forward")
+        original_backbone = MagicMock(name="backbone_forward")
+        original_logits = MagicMock(name="logits_forward")
+        backbone = _model_with(forward=original_backbone)
+        model = self._annotate(
+            _model_with(
+                forward=original_outer,
+                model=backbone,
+                logits_processor=_model_with(forward=original_logits),
+            )
+        )
+        runner = self._runner_for(model, tpu_compile_tracer="direct")
+        runner.is_draft_worker = True
+
+        TpuGraphRunner(runner)
+
+        self.mock_direct_compile.assert_called_once_with(
+            original_backbone, model=backbone
+        )
+        self.assertIs(backbone.forward, self.mock_direct_compile.return_value)
+        self.assertIs(runner.compile_policy.compiled_forward_shim.fn, original_outer)
+        self.mock_compile.assert_called_once()
+        self.assertIs(self.mock_compile.call_args.args[0].__wrapped__, original_logits)
+
+    def test_direct_draft_tracer_uses_model_without_backbone(self):
+        original_forward = MagicMock(name="draft_forward")
+        model = self._annotate(_model_with(forward=original_forward))
+        runner = self._runner_for(model, tpu_compile_tracer="direct")
+        runner.is_draft_worker = True
+
+        TpuGraphRunner(runner)
+
+        self.mock_direct_compile.assert_called_once_with(original_forward, model=model)
+        self.mock_compile.assert_not_called()
+        self.assertIs(model.forward, runner.compile_policy.compiled_forward_shim)
+        self.assertIs(
+            runner.compile_policy.compiled_forward_shim.fn,
+            self.mock_direct_compile.return_value,
+        )
 
     def test_augment_spec_policy_mixes_spec_over_base_for_eagle3(self):
         # EAGLE3 spec composes the Eagle3 spec mixin over the resolved policy.
