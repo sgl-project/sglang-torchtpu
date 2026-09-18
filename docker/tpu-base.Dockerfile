@@ -24,7 +24,6 @@ WORKDIR /sgl-workspace/sglang
 # resolution succeeds without invalidating on SGLang source changes.
 COPY README.md LICENSE ./
 COPY python/pyproject_tpu.toml ./python/pyproject.toml
-COPY scripts/ci/utils/sgl_eval_ref.sh ./scripts/ci/utils/sgl_eval_ref.sh
 COPY scripts/ci/tpu/warm_mmlu_cache.py ./scripts/ci/tpu/warm_mmlu_cache.py
 
 # Install the pinned TPU stack (dev_tpu extra = all_tpu + test + ray) without sglang itself.
@@ -39,8 +38,7 @@ RUN --mount=type=secret,id=gcp_token \
       --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
-    rm -rf sglang && \
-    . ../scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"
+    rm -rf sglang
 
 # Fill sgl-eval's mmlu cache so the accuracy suite runs the eval offline.
 RUN python scripts/ci/tpu/warm_mmlu_cache.py
