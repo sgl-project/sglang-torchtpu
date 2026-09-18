@@ -1419,6 +1419,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # MegaMoE uses this method for weight preparation only and calls
             # DeepGEMM directly instead of dispatching through a MoeRunner.
             return
+        if moe_runner_backend.is_pallas_tpu():
+            # TPU dispatches directly through UnquantizedFusedMoEMethod.forward_tpu
+            # in apply(), so there is no generic MoeRunner to construct here.
+            return
 
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
