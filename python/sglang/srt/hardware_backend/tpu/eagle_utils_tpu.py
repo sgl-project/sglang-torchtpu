@@ -82,6 +82,31 @@ def build_topk1_verify_tree_tpu(
     )
 
 
+def _gather_token_window(
+    req_to_token: torch.Tensor,
+    rows: torch.Tensor,
+    starts: torch.Tensor,
+    width: int,
+    *,
+    clamp_columns: bool = False,
+) -> torch.Tensor:
+    """Gather `width` consecutive page-table slots per row, as [len(rows), width].
+
+    The window is a dense rectangle, so the columns are one broadcast add and
+    the read is a single advanced index: no ragged segmentation, no cumsum, and
+    no zero-initialized output to mask into. Set `clamp_columns` where the
+    consumer ignores the slots past the row (the verify window reads only the
+    reserved prefix); leave it off where an out-of-range start is a bug that
+    should raise instead of silently folding onto the row edge.
+    """
+    device = req_to_token.device
+    offsets = torch.arange(width, device=device, dtype=torch.int64)
+    columns = starts.to(device, torch.int64)[:, None] + offsets[None, :]
+    if clamp_columns:
+        columns = columns.clamp(min=0, max=req_to_token.shape[1] - 1)
+    return req_to_token[rows.to(device, torch.int64)[:, None], columns]
+
+
 def prepare_verify_cache_locs_tpu(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
@@ -97,19 +122,27 @@ def prepare_verify_cache_locs_tpu(
         verify_input.device_accept_cache_locs = None
         return precomputed_cache_locs
 
-    from sglang.srt.speculative.spec_utils import assign_extend_cache_locs_func
-
-    return assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=req_to_token_pool.req_to_token,
-        start_offset=batch.seq_lens,
-        end_offset=batch.seq_lens + verify_input.draft_token_num,
-        batch_size=bs,
-        draft_token_num=verify_input.draft_token_num,
-        device=batch.device,
-        host_req_pool_indices=batch.req_pool_indices_cpu,
-        host_seq_lens=batch.seq_lens_cpu,
+    # Verification reserves exactly draft_token_num slots per request, so the
+    # window is a fixed-width rectangle rather than a ragged range. Read it
+    # where the page table lives: host-resident tables use the host mirrors of
+    # the row and length tensors so the gather never touches the device.
+    req_to_token = req_to_token_pool.req_to_token
+    host_table = req_to_token.device.type == "cpu"
+    rows = batch.req_pool_indices
+    starts = batch.seq_lens
+    if host_table:
+        if batch.req_pool_indices_cpu is not None:
+            rows = batch.req_pool_indices_cpu
+        if batch.seq_lens_cpu is not None:
+            starts = batch.seq_lens_cpu
+    window = _gather_token_window(
+        req_to_token,
+        rows[:bs],
+        starts[:bs],
+        verify_input.draft_token_num,
+        clamp_columns=True,
     )
+    return window.reshape(-1).to(batch.device, dtype=torch.int64)
 
 
 def prepare_device_accept_tpu(
@@ -154,10 +187,12 @@ def prepare_device_accept_tpu(
         # verify whose acceptance selects the window.
         num_draft_tokens = max_speculative_num_draft_tokens()
         candidate_width = 2 * num_draft_tokens - 1
-        offsets = torch.arange(candidate_width, dtype=torch.int64)
-        rows = batch.req_pool_indices_cpu.to(dtype=torch.int64)[:, None]
-        cols = host_base[:, None] + 1 + offsets[None, :]
-        candidates = batch.req_to_token_pool.req_to_token[rows, cols]
+        candidates = _gather_token_window(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices_cpu,
+            host_base + 1,
+            candidate_width,
+        )
         draft_input.device_accept_candidate_locs = candidates.to(
             batch.device, dtype=torch.int64, non_blocking=True
         )

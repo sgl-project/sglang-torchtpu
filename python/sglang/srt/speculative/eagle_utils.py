@@ -1302,59 +1302,76 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+    # Whole-page reserves usually cover several speculative iterations. The
+    # host page table needs no update until a request crosses its reserve;
+    # avoid invoking the allocator (and staging empty device tensors) otherwise.
+    # num_needed_tokens == 0 means nxt == cur for every request, so the
+    # kv_allocated_len bookkeeping below would be a no-op too, and the
+    # page>1 topk>1 row-width assert has nothing to guard: nothing is written.
+    # Eviction, penalties, per-request iteration counters and the device-accept
+    # routing prepared at the end of this function all still run.
+    skip_allocation = (
+        num_needed_tokens == 0 and _is_tpu and batch.req_to_token_pool.host_resident
+    )
 
-    # Fail fast if the page>1 + topk>1 draft over-allocation
-    # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
-    # would OOB and free would leak KV. The row is widened to hold it in _init_pools
-    # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
+    if not skip_allocation:
+        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
-    if page_size > 1 and (get_spec().speculative_eagle_topk or 1) > 1:
-        max_alloc_len = int(nxt_kv_lens_cpu.max())
-        row_width = batch.req_to_token_pool.req_to_token.shape[1]
-        assert max_alloc_len <= row_width, (
-            f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
-            f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
-            f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
-        )
+        # Fail fast if the page>1 + topk>1 draft over-allocation
+        # (get_alloc_reserve_per_decode) outgrows the req_to_token row: the write below
+        # would OOB and free would leak KV. The row is widened to hold it in _init_pools
+        # (PR #26972); fail here with a clear error, not on a later cryptic CUDA assert.
 
-    if _is_tpu and batch.req_to_token_pool.host_resident:
-        # TPU: req_to_token lives on the host, so allocate and write the page
-        # table through the host mirrors instead of the device alloc path.
-        allocate_and_assign_decode_cache(
-            tree_cache=batch.tree_cache,
-            req_to_token_pool=batch.req_to_token_pool,
-            req_pool_indices=batch.req_pool_indices,
-            cur_kv_lens_cpu=cur_kv_lens_cpu,
-            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-            num_needed_tokens=num_needed_tokens,
-            batch_size=bs,
-            device=batch.device,
-            host_req_pool_indices=batch.req_pool_indices_cpu,
-        )
-        # Bookkeeping that alloc_for_spec_decode does for the device path.
-        for i, req in enumerate(batch.reqs):
-            req.kv.kv_allocated_len = max(
-                req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i])
+        if page_size > 1 and (get_spec().speculative_eagle_topk or 1) > 1:
+            max_alloc_len = int(nxt_kv_lens_cpu.max())
+            row_width = batch.req_to_token_pool.req_to_token.shape[1]
+            assert max_alloc_len <= row_width, (
+                f"spec v2 page>1 topk>1 draft over-allocation ({max_alloc_len}) exceeds "
+                f"req_to_token row width ({row_width}); page_size={page_size}. Widen the "
+                f"row to hold committed + get_alloc_reserve_per_decode (PR #26972)."
             )
-    else:
-        # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
-        # barrier has chained to the prev forward -> host stalls a full forward.
-        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-        alloc_for_spec_decode(
-            batch.tree_cache,
-            batch.req_to_token_pool,
-            reqs=batch.reqs,
-            req_pool_indices=batch.req_pool_indices,
-            cur_kv_lens=cur_kv_lens_device,
-            cur_kv_lens_cpu=cur_kv_lens_cpu,
-            nxt_kv_lens=nxt_kv_lens_device,
-            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-            num_needed_tokens=num_needed_tokens,
-            batch=batch,
-        )
+
+        if _is_tpu and batch.req_to_token_pool.host_resident:
+            # TPU: req_to_token lives on the host, so allocate and write the page
+            # table through the host mirrors instead of the device alloc path.
+            allocate_and_assign_decode_cache(
+                tree_cache=batch.tree_cache,
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                cur_kv_lens_cpu=cur_kv_lens_cpu,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed_tokens,
+                batch_size=bs,
+                device=batch.device,
+                host_req_pool_indices=batch.req_pool_indices_cpu,
+            )
+            # Bookkeeping that alloc_for_spec_decode does for the device path.
+            for i, req in enumerate(batch.reqs):
+                req.kv.kv_allocated_len = max(
+                    req.kv.kv_allocated_len, int(nxt_kv_lens_cpu[i])
+                )
+        else:
+            # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
+            # barrier has chained to the prev forward -> host stalls a full forward.
+            cur_kv_lens_device = cur_kv_lens_cpu.to(
+                device=batch.device, non_blocking=True
+            )
+            nxt_kv_lens_device = nxt_kv_lens_cpu.to(
+                device=batch.device, non_blocking=True
+            )
+            alloc_for_spec_decode(
+                batch.tree_cache,
+                batch.req_to_token_pool,
+                reqs=batch.reqs,
+                req_pool_indices=batch.req_pool_indices,
+                cur_kv_lens=cur_kv_lens_device,
+                cur_kv_lens_cpu=cur_kv_lens_cpu,
+                nxt_kv_lens=nxt_kv_lens_device,
+                nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+                num_needed_tokens=num_needed_tokens,
+                batch=batch,
+            )
 
     if _is_tpu:
         prepare_device_accept_tpu(batch, bs=bs, double_alloc=double_alloc)
