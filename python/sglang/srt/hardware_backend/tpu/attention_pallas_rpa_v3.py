@@ -6,7 +6,9 @@ Thin wrapper over :class:`BaseTpuPallasRpaAttnBackend` (see
 (``sglang.srt.layers.attention.pallas.ragged_paged_attention_v3``). Selected via
 ``--attention-backend pallas_tpu_rpa_v3`` (the TPU platform default). Supports
 attention sinks, custom masks, and EAGLE speculative decoding (TARGET_VERIFY,
-DRAFT_EXTEND_V2, multi-step draft decode).
+DRAFT_EXTEND_V2, multi-step draft decode). Target verification and the
+decode-phase draft extension run on the kernel's DECODE range with a static
+``decode_query_size``.
 """
 
 # NOTE: do *not* add ``from __future__ import annotations`` here (see
@@ -54,6 +56,7 @@ def _invoke_v3_kernel(
     soft_cap,
     k_scale,
     v_scale,
+    decode_query_size=1,
 ):
     return jax_rpa(
         queries,
@@ -73,6 +76,7 @@ def _invoke_v3_kernel(
         soft_cap=soft_cap,
         k_scale=k_scale,
         v_scale=v_scale,
+        decode_query_size=decode_query_size,
     )
 
 
@@ -84,6 +88,7 @@ RPA_V3_SPEC = RpaKernelSpec(
     extend_distribution_mask=(0, 1, 1),  # [0, n, n]
     uses_draft_extend_v2=True,
     min_page_size=None,
+    supports_decode_query_size=True,
 )
 
 

@@ -858,23 +858,20 @@ def build_bucketers(
     """Build token and batch size bucketers."""
     token_paddings = server_args.tpu_compile_tokens
     if token_paddings:
-        # Token buckets are consumed only by the EXTEND path, and extend never
-        # runs longer than max_t (= min(chunked_prefill_size, max_prefill_tokens,
-        # context_len)). Drop any user buckets above it -- they'd compile dead
-        # shapes that serving can never reach.
-        capped = [t for t in token_paddings if t <= max_t]
-        dropped = [t for t in token_paddings if t > max_t]
+        # Keep the smallest configured bucket covering the extend limit to
+        # preserve its shape alignment. Leave undersized lists unchanged.
+        max_bucket = min((t for t in token_paddings if t >= max_t), default=max_t)
+        kept = [t for t in token_paddings if t <= max_bucket]
+        dropped = [t for t in token_paddings if t > max_bucket]
         if dropped:
             logger.warning(
-                "[compiled forward shim] Dropping --tpu-compile-tokens %s above the "
-                "max extend length %d; extend is capped there (chunked prefill / "
-                "context), so those buckets would never be used.",
+                "[compiled forward shim] Dropping --tpu-compile-tokens %s above "
+                "the last needed token bucket %d (max extend length %d).",
                 dropped,
+                max_bucket,
                 max_t,
             )
-        token_bucketer: Bucketer = Bucketer(
-            name="TokenBucketer", buckets=sorted(capped) or [max_t]
-        )
+        token_bucketer: Bucketer = Bucketer(name="TokenBucketer", buckets=kept)
     else:
         token_bucketer = PowerBucketer(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2

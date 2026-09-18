@@ -744,6 +744,7 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+            self._update_kv_transfer_age()
 
             # Utilization / LoRA / HiCache
             self._calculate_utilization()
@@ -968,6 +969,7 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+            self._update_kv_transfer_age()
 
             # Streaming session metrics
             self.stats.num_streaming_sessions = (
@@ -1210,6 +1212,27 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _update_kv_transfer_age(self) -> None:
+        """Measure queue residence, including waits before transport admission."""
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            entry_times = (
+                req.time_stats.prefill_transfer_queue_entry_time
+                for req in self.scheduler.disagg_prefill_inflight_queue
+            )
+        elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+            entry_times = (
+                entry.req.time_stats.decode_transfer_queue_entry_time
+                for entry in self.scheduler.disagg_decode_transfer_queue.queue
+            )
+        else:
+            self.stats.kv_transfer_oldest_inflight_age_seconds = 0.0
+            return
+
+        now = time.perf_counter()
+        # Zero timestamps are unset, not requests waiting since process start.
+        oldest = min((ts for ts in entry_times if ts > 0), default=now)
+        self.stats.kv_transfer_oldest_inflight_age_seconds = max(0.0, now - oldest)
+
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
@@ -1266,4 +1289,5 @@ class SchedulerMetricsReporter:
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
+        self._update_kv_transfer_age()
         self.metrics_collector.log_stats(self.stats)

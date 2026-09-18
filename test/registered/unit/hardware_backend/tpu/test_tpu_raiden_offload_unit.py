@@ -18,6 +18,7 @@ import collections
 import inspect
 import os
 import sys
+import textwrap
 import threading
 import time
 import types
@@ -1532,22 +1533,21 @@ class TestRaidenRoleStatePlacement(CustomTestCase):
         return found
 
     def test_role_state_is_declared_in_the_branch_that_reads_it(self):
-        source = inspect.getsource(sys.modules[RaidenKVManager.__module__])
-        cls = next(
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.ClassDef) and node.name == "RaidenKVManager"
+        # Resolve inherited handlers too: their source lives in the sender
+        # and receiver mixins, while state initialization stays in conn.py.
+        resolved = dict(inspect.getmembers(RaidenKVManager, inspect.isfunction))
+        expected = self.DECODE_SIDE | self.PREFILL_SIDE
+        self.assertFalse(
+            expected - resolved.keys(),
+            f"Missing role methods: {sorted(expected - resolved.keys())}",
         )
         methods = [
-            n
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name != "__init__"
+            ast.parse(textwrap.dedent(inspect.getsource(resolved[name]))).body[0]
+            for name in sorted(expected)
         ]
-        init = next(
-            n
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
-        )
+        init = ast.parse(
+            textwrap.dedent(inspect.getsource(RaidenKVManager.__init__))
+        ).body[0]
 
         prefill_only, decode_only = set(), set()
         for stmt in init.body:
@@ -1603,13 +1603,16 @@ class TestNoPushLock(CustomTestCase):
         # The per-endpoint send helper replaced the old global push lock; a
         # send site reintroducing it would crash in production while unit
         # fixtures could mask the missing constructor field.
-        import sglang.srt.disaggregation.raiden.conn as conn_module
+        from sglang.srt.disaggregation.raiden import conn, receiver, sender
 
-        self.assertNotIn("_push_lock\n", inspect.getsource(conn_module))
-        self.assertNotIn(
-            "self._push_lock",
-            inspect.getsource(conn_module).replace("self._reshard_push_lock", ""),
-        )
+        for module in (conn, sender, receiver):
+            with self.subTest(module=module.__name__):
+                source = inspect.getsource(module)
+                self.assertNotIn("_push_lock\n", source)
+                self.assertNotIn(
+                    "self._push_lock",
+                    source.replace("self._reshard_push_lock", ""),
+                )
 
 
 class _InlineExecutor:

@@ -1128,9 +1128,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
     ) -> CombineInput:
         from sglang.srt.layers.moe.pallas.fused_moe_op import fused_moe_call
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.tpu_moe_utils import (
-            mask_tpu_moe_non_local_experts,
-        )
 
         moe_runner_config = self.moe_runner_config
         if moe_runner_config.apply_router_weight_on_input:
@@ -1147,16 +1144,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 "Fused shared experts are not supported on the TPU MoE path."
             )
         no_combine = moe_runner_config.no_combine
-        # The kernel gets the EP-masked weights (non-local slots -> 0) so it can
-        # zero those slots in the no_combine output; the combine downstream uses
-        # the original unmasked router weights (from dispatch_output).
         kernel_topk_weights = topk_weights.to(x.dtype)
-        kernel_topk_weights, topk_ids = mask_tpu_moe_non_local_experts(
-            kernel_topk_weights,
-            topk_ids,
-            layer.num_local_experts,
-            get_parallel().moe_ep_rank,
-        )
+        # Hand the router's global expert IDs to the kernel unchanged, together
+        # with the window this rank owns, [expert_group_offset,
+        # expert_group_offset + num_local_experts). gmm_v2 only touches the rows
+        # of expert groups inside that window, so non-local experts cost nothing
+        # and no remapping to local IDs is needed. Under EP1 the offset is 0 and
+        # the window spans every expert, so the window check is a no-op.
+        global_num_experts = layer.num_local_experts * get_parallel().moe_ep_size
+        expert_group_offset = layer.num_local_experts * get_parallel().moe_ep_rank
+        # gmm_v2 indexes its weights by expert ID, so IDs outside the global
+        # range would read out of bounds. Clamp them and zero their routing
+        # weight, so the expert-0 slot they land on contributes nothing.
+        # Defensive: no router on this path emits out-of-range IDs today.
+        valid = (topk_ids >= 0) & (topk_ids < global_num_experts)
+        topk_ids = torch.where(valid, topk_ids, 0)
+        kernel_topk_weights = kernel_topk_weights * valid.to(x.dtype)
 
         # Weights are already in gmm_v2's (num_experts, k, n) layout — the swap
         # from SGLang's (num_experts, n, k) happens once in
@@ -1175,7 +1178,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             topk=int(topk_ids.shape[-1]),
             activation=moe_runner_config.activation,
             no_combine=no_combine,
+            global_num_experts=global_num_experts,
+            expert_group_offset=expert_group_offset,
         )
+        if no_combine:
+            # The kernel masks non-local groups, but invalid IDs mapped to
+            # expert 0 appear local on rank 0. Preserve zero-weight slot masking
+            # before the caller applies per-expert normalization and weights.
+            output = torch.where(kernel_topk_weights.unsqueeze(-1) != 0, output, 0)
         return StandardCombineInput(hidden_states=output)
 
     def forward_musa(self, *args, **kwargs) -> CombineInput:

@@ -757,6 +757,28 @@ class TestBuildBucketers(CustomTestCase):
         # Only what production still reads off the handed record.
         return SimpleNamespace(tpu_compile_tokens=tpu_compile_tokens)
 
+    def test_clipping_keeps_smallest_configured_bucket_covering_scheduler_limit(self):
+        # Keep the next configured shape even when the real token limit is
+        # unaligned; synthesizing a bucket at that limit loses its alignment.
+        cases = (
+            ([512], 256, [512]),
+            ([128, 512, 1024], 256, [128, 512]),
+            ([128, 256, 512, 1024], 257, [128, 256, 512]),
+            ([512, 1024], 257, [512]),
+            ([1024, 512, 128, 512, 256], 257, [128, 256, 512]),
+        )
+        for buckets, max_t, expected in cases:
+            with self.subTest(buckets=buckets, max_t=max_t):
+                args = self._server_args(tpu_compile_tokens=buckets)
+                with get_context().override_server_args(tpu_compile_bs=[1, 4]):
+                    token_buckets, batch_buckets = build_bucketers(
+                        args, max_t=max_t, max_b=4
+                    )
+                self.assertEqual(token_buckets.buckets, expected)
+                fb = _forward_batch(real_t=max_t, real_b=1)
+                _pad_forward_batch_inputs(fb, token_buckets, batch_buckets)
+                self.assertEqual(fb.input_ids.shape[0], expected[-1])
+
     def test_uses_user_buckets_as_plain_bucketer(self):
         # User list yields a plain Bucketer (not the PowerBucketer fallback).
         sa = self._server_args(tpu_compile_tokens=[64, 512, 2048])
@@ -775,17 +797,11 @@ class TestBuildBucketers(CustomTestCase):
         self.assertEqual(t_b.buckets, [64, 512])
         self.assertEqual(b_b.buckets, [1, 2])
 
-    def test_token_buckets_above_max_t_dropped(self):
-        # Token buckets feed only the EXTEND path, which never exceeds max_t
-        # (chunked-prefill / context cap), so buckets above it are dropped --
-        # they would compile dead shapes serving can't reach.
+    def test_token_buckets_above_exact_max_t_dropped(self):
+        # A terminal bucket already at max_t is retained without duplication.
         sa = self._server_args(tpu_compile_tokens=[64, 512, 2048, 4096])
         t_b, _ = build_bucketers(sa, max_t=2048, max_b=8)
         self.assertEqual(t_b.buckets, [64, 512, 2048])  # 4096 dropped
-        # If every user bucket is above the cap, fall back to max_t itself.
-        sa2 = self._server_args(tpu_compile_tokens=[4096])
-        t_b2, _ = build_bucketers(sa2, max_t=2048, max_b=8)
-        self.assertEqual(t_b2.buckets, [2048])
 
     def test_falls_back_to_power_bucketer_when_unset(self):
         # min_val hardcoded: 64 (T), 1 (B).

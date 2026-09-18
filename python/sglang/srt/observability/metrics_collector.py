@@ -133,6 +133,7 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    kv_transfer_oldest_inflight_age_seconds: float = 0.0
     pending_prealloc_token_usage: float = 0.0
 
     # Utilization
@@ -566,6 +567,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
+        )
+        self.kv_transfer_oldest_inflight_age_seconds = Gauge(
+            name="sglang:kv_transfer_oldest_inflight_age_seconds",
+            documentation="Age in seconds of the oldest request in the KV transfer queue; zero when empty.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         # =================================================================
@@ -1374,6 +1381,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+        )
+        self._log_gauge(
+            self.kv_transfer_oldest_inflight_age_seconds,
+            stats.kv_transfer_oldest_inflight_age_seconds,
         )
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
