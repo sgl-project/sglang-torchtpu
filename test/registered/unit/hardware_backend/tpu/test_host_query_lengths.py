@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -324,3 +325,7 @@ def test_padding_does_not_mutate_a_borrowed_cpu_query_list():
     batch._pad_inputs_to_size(runner, 16, 4)
     assert original == [4, 4]
     assert batch.extend_seq_lens_cpu == batch.extend_seq_lens.tolist() == [4, 4, 4, 4]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

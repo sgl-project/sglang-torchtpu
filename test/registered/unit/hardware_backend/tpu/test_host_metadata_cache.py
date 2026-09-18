@@ -1,3 +1,6 @@
+import sys
+
+import pytest
 import torch
 
 from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
@@ -77,3 +80,7 @@ def test_active_scalar_is_owned_across_batch_sizes_and_source_mutation():
         query.fill_(999)
         assert scalar.item() == live
         previous = scalar
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
