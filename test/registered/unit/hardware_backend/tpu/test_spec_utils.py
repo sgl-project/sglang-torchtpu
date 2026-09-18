@@ -759,6 +759,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
     )
     future_map = SimpleNamespace(
         publish_ready=None,
+        tpu_direct_handoff=None,
         new_seq_lens_buf=torch.arange(8) + 20,
         need_topk=True,
         need_hidden_states=with_hidden,

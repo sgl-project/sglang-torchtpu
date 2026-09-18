@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -95,9 +96,109 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
     return True
 
 
+class DirectHandoff(msgspec.Struct, frozen=True):
+    draft_input: Any
+    indices: torch.Tensor
+    payload: Any
+    seq_lens: torch.Tensor
+
+
+def flush_direct_handoff_tpu(future_map: FutureMap) -> None:
+    pending = future_map.tpu_direct_handoff
+    if pending is None:
+        return
+    # Clear before calling the normal store path, which also checks for a flush.
+    future_map.tpu_direct_handoff = None
+    future_map.stash(pending.indices, pending.payload)
+
+
+def stash_tpu(
+    future_map: FutureMap,
+    indices: torch.Tensor,
+    payload: Any,
+    batch: ScheduleBatch | None,
+    result: Any,
+) -> bool:
+    """Flush any pending handoff, then defer this store when the next step can
+    consume the payload directly. Returns True when the store was deferred.
+
+    Only owned finalizer outputs in the top-k-1 decode path qualify.
+    """
+    # A different batch may still need rows from the previous pending result.
+    flush_direct_handoff_tpu(future_map)
+    draft = result.next_draft_input if result is not None else None
+    # Only gate what the resolve step itself relies on. Anything about the next
+    # batch (overlap, logprob, grammar, filtering) is re-checked there, and a
+    # mismatch just flushes the pending payload into the normal store.
+    if (
+        # Plain stash call: nothing to hand off.
+        batch is None
+        or draft is None
+        # Only the EAGLE3 topk-1 decode path keeps acceptance on device.
+        or not future_map.spec_algo.is_eagle3()
+        or draft.accept_lens_device is None
+        or payload.topk_index is None
+        or payload.topk_index.shape[1] != 1
+        # DP idle stub: an empty payload has nothing to relay.
+        or indices.shape[0] == 0
+        # Resolve copies these directly. Multi-layer EAGLE3 does not relay
+        # hidden states, and draft probabilities are not carried at all.
+        or payload.hidden_states is None
+        or payload.draft_probs is not None
+    ):
+        return False
+    future_map._maybe_init_forward_bufs(payload)
+    future_map.tpu_direct_handoff = DirectHandoff(
+        draft_input=draft,
+        indices=indices,
+        payload=payload,
+        seq_lens=result.new_seq_lens,
+    )
+    return True
+
+
+def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool:
+    pending = future_map.tpu_direct_handoff
+    if pending is None:
+        return False
+    draft = batch.spec_info
+    # filter_batch and merge_batch rebind future_indices. Never compare device
+    # values on the host. The draft object also identifies this generation.
+    if (
+        draft is not pending.draft_input
+        or draft.future_indices is not pending.indices
+        or draft.device_accept_candidate_locs is None
+        or draft.accept_lens_device is None
+        or draft.device_accept_candidate_locs.shape[0] != pending.indices.shape[0]
+        or draft.future_dsa_topk_indices_available
+    ):
+        flush_direct_handoff_tpu(future_map)
+        return False
+    candidates = draft.device_accept_candidate_locs
+    assert candidates.shape[1] >= 3 and candidates.shape[1] % 2 == 1
+    draft.device_accept_selected_cache_locs = _select_device_accept_cache_locs(
+        candidates, draft.accept_lens_device, (candidates.shape[1] + 1) // 2
+    )
+    draft.bonus_tokens = pending.payload.bonus_tokens.to(
+        future_map.output_tokens_buf.dtype
+    )
+    draft.topk_p = pending.payload.topk_p.to(future_map.topk_p_buf.dtype)
+    draft.topk_index = pending.payload.topk_index.to(future_map.topk_index_buf.dtype)
+    draft.hidden_states = pending.payload.hidden_states.to(
+        future_map.hidden_states_buf.dtype
+    )
+    batch.seq_lens = pending.seq_lens.to(future_map.new_seq_lens_buf.dtype)
+    # All rows were consumed in order. The batch now owns these references;
+    # subsequent filtered/merged generations use their own pending payload.
+    future_map.tpu_direct_handoff = None
+    return True
+
+
 def resolve_device_accept_seq_lens_tpu(
     future_map: FutureMap, batch: ScheduleBatch
 ) -> bool:
+    if resolve_direct_handoff_tpu(future_map, batch):
+        return True
     # Candidate locations gate device routing. This also resolves the spec
     # extras relay, so FutureMap._resolve_spec_extras only checks
     # device_accept_resolved_tpu afterwards.

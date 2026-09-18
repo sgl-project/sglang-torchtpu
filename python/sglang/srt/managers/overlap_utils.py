@@ -20,6 +20,7 @@ if _is_tpu:
     from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
         device_accept_resolved_tpu,
         resolve_device_accept_seq_lens_tpu,
+        stash_tpu,
     )
 
 if TYPE_CHECKING:
@@ -296,6 +297,7 @@ class FutureMap:
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
+        self.tpu_direct_handoff = None
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -658,7 +660,15 @@ class FutureMap:
                 publish_ready=self.publish_ready,
             )
 
-    def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+    def stash(
+        self,
+        future_indices: torch.Tensor,
+        payload: RelayPayload,
+        batch: Optional[ScheduleBatch] = None,
+        result: Any = None,
+    ) -> None:
+        if _is_tpu and stash_tpu(self, future_indices, payload, batch, result):
+            return
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
