@@ -364,6 +364,29 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
 
 
 class TestLogitsOutputMode(_PolicyTestCase):
+    def test_compiled_logits_ignore_logical_mode_after_tpu_dp_padding(self):
+        policy = _make_distributed_top_k_policy()
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64, bs=64, mode=ForwardMode.EXTEND
+        )
+
+        def consume_mode(value, batch):
+            metadata = LogitsMetadata.from_forward_batch(batch)
+            return value + int(metadata.forward_mode)
+
+        with patch("sglang.srt.layers.logits_processor._is_tpu", True):
+            torch._dynamo.reset()
+            self.addCleanup(torch._dynamo.reset)
+            compiled = torch.compile(consume_mode, backend="eager", fullgraph=True)
+            value = torch.zeros(1)
+            compiled(value, forward_batch)
+
+            forward_batch._original_forward_mode = ForwardMode.IDLE
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                result = compiled(value, forward_batch)
+
+        self.assertEqual(result.item(), int(ForwardMode.EXTEND))
+
     def test_specialization_key_uses_selected_logits_mode(self):
         policy = _make_policy()
         forward_batch = SimpleNamespace(

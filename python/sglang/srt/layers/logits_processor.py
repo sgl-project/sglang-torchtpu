@@ -367,14 +367,24 @@ class LogitsMetadata:
 
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
         # graphs. It still has no real request whose last token needs logits.
+        # TPU intentionally runs the synchronized physical mode and restores
+        # the logical mode after the compiled forward; reading the optional
+        # original mode here would also create a serving-only Dynamo variant.
         forward_mode = forward_batch.forward_mode
-        if forward_batch._original_forward_mode == ForwardMode.IDLE:
+        if not _is_tpu and forward_batch._original_forward_mode == ForwardMode.IDLE:
             forward_mode = ForwardMode.IDLE
         if (
             compute_input_logprobs
-            and forward_mode.is_extend()
+            # Keep this explicit: TPU full-graph tracing cannot wrap a bound
+            # IntEnum method after the idle-mode substitution above.
+            and forward_mode
+            in (
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.SPLIT_PREFILL,
+                ForwardMode.DLLM_EXTEND,
+            )
             and forward_batch.return_logprob
-            and not forward_mode.is_target_verify()
         ):
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums
@@ -407,7 +417,7 @@ class LogitsMetadata:
             token_ids_logprobs = None
             extend_input_logprob_token_ids_gpu = None
 
-        if forward_batch.forward_mode.is_draft_extend_v2():
+        if forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
             draft_extend_select_index = forward_batch.spec_info.select_index
         else:
             draft_extend_select_index = None
@@ -609,7 +619,7 @@ class LogitsProcessor(nn.Module):
             )
 
         # Diffusion LLM only.
-        if logits_metadata.forward_mode.is_dllm_extend():
+        if logits_metadata.forward_mode == ForwardMode.DLLM_EXTEND:
             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
@@ -702,10 +712,11 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states = None
         token_to_seq_idx = []
 
-        if (
-            logits_metadata.forward_mode.is_decode_or_idle()
-            or logits_metadata.forward_mode.is_target_verify()
-            or logits_metadata.forward_mode.is_draft_extend_v2()
+        if logits_metadata.forward_mode in (
+            ForwardMode.DECODE,
+            ForwardMode.IDLE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
         ):
             draft_extend_select_index = logits_metadata.draft_extend_select_index
             if draft_extend_select_index is not None:
@@ -742,7 +753,14 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = None
 
         elif (
-            logits_metadata.forward_mode.is_extend()
+            logits_metadata.forward_mode
+            in (
+                ForwardMode.EXTEND,
+                ForwardMode.MIXED,
+                ForwardMode.TARGET_VERIFY,
+                ForwardMode.SPLIT_PREFILL,
+                ForwardMode.DLLM_EXTEND,
+            )
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
@@ -1029,7 +1047,7 @@ class LogitsProcessor(nn.Module):
         if (
             _is_tpu
             and self.do_tensor_parallel_all_gather
-            and logits_metadata.forward_mode.is_target_verify()
+            and logits_metadata.forward_mode == ForwardMode.TARGET_VERIFY
             and logits.dtype != torch.float32
         ):
             logits = logits.float()
