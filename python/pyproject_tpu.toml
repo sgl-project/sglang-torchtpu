@@ -113,15 +113,11 @@ test = [
   "jsonlines",
   "lm-eval[api]>=0.4.9.2",
   "matplotlib",
-  # Keep the parser version required by sgl-eval's math_verify grader.
-  "antlr4-python3-runtime==4.9.3",
   "openai",
   "pandas",
   "peft>=0.18.0",
   "pytest",
   "sentence_transformers",
-  # Match the upstream test extra; score changes require re-baselining evals.
-  "sgl-eval==0.1.0",
   # mini-LB for the P/D feature-combo row (sglang_router.launch_router --mini-lb).
   "sglang-router",
   "tabulate",

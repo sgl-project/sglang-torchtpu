@@ -38,7 +38,8 @@ RUN --mount=type=secret,id=gcp_token \
       --index-url "https://oauth2accesstoken:${TOKEN}@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/" \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
-    rm -rf sglang
+    rm -rf sglang && \
+    pip install "antlr4-python3-runtime==4.9.3" "sgl-eval==0.1.0"
 
 # Fill sgl-eval's mmlu cache so the accuracy suite runs the eval offline.
 RUN python scripts/ci/tpu/warm_mmlu_cache.py
