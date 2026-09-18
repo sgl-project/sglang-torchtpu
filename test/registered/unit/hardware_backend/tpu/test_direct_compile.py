@@ -647,9 +647,6 @@ class TestDirectCompile(CustomTestCase):
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
             patch.object(
-                direct_compile, "_live_model_input_indices", return_value=(0, 1)
-            ),
-            patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
             ),
             patch.object(compiler, "execute", return_value=[result, callback_output]),
@@ -732,6 +729,9 @@ class TestDirectCompile(CustomTestCase):
             ),
             patch.object(
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(
+                direct_compile, "_live_model_input_indices", return_value=(0, 1)
             ),
             patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
