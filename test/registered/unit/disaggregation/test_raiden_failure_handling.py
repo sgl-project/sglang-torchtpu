@@ -1165,8 +1165,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class PausingStatus(dict):
             paused = False
 
-            def __getitem__(self, room):
-                value = super().__getitem__(room)
+            def get(self, room, default=None):
+                value = super().get(room, default)
                 if threading.current_thread().name == "waiting" and not self.paused:
                     self.paused = True
                     inspected_waiting.set()
@@ -1205,8 +1205,8 @@ class TestNodeFailureEvictsSockets(unittest.TestCase):
         class PausingStatus(dict):
             paused = False
 
-            def __getitem__(self, room):
-                value = super().__getitem__(room)
+            def get(self, room, default=None):
+                value = super().get(room, default)
                 if threading.current_thread().name == "waiting" and not self.paused:
                     self.paused = True
                     inspected_waiting.set()
