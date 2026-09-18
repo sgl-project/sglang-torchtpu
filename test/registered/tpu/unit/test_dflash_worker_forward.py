@@ -177,6 +177,9 @@ def _create_dflash_worker_for_tpu(
     worker.selector = None
     worker._selector_sample = None
     worker._draft_probs_buf = None
+    # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
+    worker._full_embed_gpu = None
+    worker.draft_tp_context = dflash_worker_mod.empty_context
     worker.nccl_port = 0
     worker._need_mamba_verify_commit = False
     worker._warned_sampling_fallback = False
