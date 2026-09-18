@@ -345,6 +345,7 @@ def _create_dflash_worker_for_tpu(
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         prefill_attention_backend_str="torch_native",
         ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        tp_group=None,
         model=draft_model,
         model_config=SimpleNamespace(
             vocab_size=vocab_size,
