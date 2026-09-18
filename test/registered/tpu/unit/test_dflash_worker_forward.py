@@ -273,6 +273,7 @@ def _create_dflash_worker_for_tpu(
             vocab_size=vocab_size,
             model_is_mrope=False,
             is_matryoshka=False,
+            requires_mm_token_modalities=False,
             hidden_size=hidden_size,
         ),
         prefill_attention_backend_str="torch_native",
@@ -349,6 +350,7 @@ def _create_dflash_worker_for_tpu(
         model=draft_model,
         model_config=SimpleNamespace(
             vocab_size=vocab_size,
+            requires_mm_token_modalities=False,
             hf_config=SimpleNamespace(
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
