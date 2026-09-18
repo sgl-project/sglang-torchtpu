@@ -106,7 +106,7 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_supporting_platforms_get_plain_pickle(self):
         import pickle
 
-        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+        from sglang.multimodal_gen.runtime.distributed import utils as dist_utils
 
         platform = MagicMock()
         platform.supports_device_tensor_pickle.return_value = True
@@ -117,7 +117,7 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_cpu_tensors_are_pickled_untouched(self):
         import pickle
 
-        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+        from sglang.multimodal_gen.runtime.distributed import utils as dist_utils
 
         platform = MagicMock()
         platform.supports_device_tensor_pickle.return_value = False
