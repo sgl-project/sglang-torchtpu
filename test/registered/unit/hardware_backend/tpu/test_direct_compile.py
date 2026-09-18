@@ -1,5 +1,6 @@
 """Tests for direct TPU compilation and artifact dispatch."""
 
+import io
 import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_tpu_ci(est_time=15, suite="stage-a-test-tpu-unit")
 
 _COMPILE_RESULT = SimpleNamespace(executable="executable")
+_TPU_AVAILABLE = hasattr(torch, "tpu") and torch.tpu.is_available()
 
 
 def _make_artifact(traced_shapes):
@@ -85,6 +87,49 @@ class _ModelWithObjectTensorState(torch.nn.Module):
         self.object_state = _ObjectWithTensorState(torch.full((2,), 2.0), self.weight)
 
 
+class _ModelWithUnusedInputs(torch.nn.Module):
+    def __init__(self, device="cpu"):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2, device=device))
+        self.unused_weight = torch.nn.Parameter(torch.full((2,), 9.0, device=device))
+        self.register_buffer("weight_alias", self.weight, persistent=False)
+        self.register_buffer(
+            "unused_buffer",
+            torch.view_as_complex(torch.zeros((2, 2), device=device)),
+            persistent=False,
+        )
+        self.register_buffer("kv_bias", torch.full((2,), 5.0, device=device))
+        self.object_state = _ObjectWithTensorState(
+            torch.full((2,), 3.0, device=device), self.weight
+        )
+
+
+def _pruning_mlir_bytecode():
+    """Model inputs 1 and 2 are unused; 3 and 4 feed only KV/callback outputs."""
+    from jax._src.interpreters import mlir
+    from jaxlib.mlir import ir
+
+    with mlir.make_ir_context():
+        module = ir.Module.parse("""module {
+              func.func @main(
+                  %weight: tensor<2xf32>, %unused_weight: tensor<2xf32>,
+                  %unused_buffer: tensor<2xcomplex<f32>>, %kv_bias: tensor<2xf32>,
+                  %callback_bias: tensor<2xf32>, %kv: tensor<2xf32>,
+                  %value: tensor<2xf32>, %unused_runtime: tensor<2xf32>
+              ) -> (tensor<2xf32>, tensor<2xf32>, tensor<2xf32>) {
+                %first = stablehlo.add %value, %weight : tensor<2xf32>
+                %result = stablehlo.add %first, %weight : tensor<2xf32>
+                %updated_kv = stablehlo.add %kv, %kv_bias : tensor<2xf32>
+                %callback = stablehlo.add %value, %callback_bias : tensor<2xf32>
+                return %result, %updated_kv, %callback
+                    : tensor<2xf32>, tensor<2xf32>, tensor<2xf32>
+              }
+            }""")
+        bytecode = io.BytesIO()
+        module.operation.write_bytecode(bytecode)
+        return bytecode.getvalue()
+
+
 class _KVPool:
     def __init__(self, value):
         self.value = value
@@ -94,6 +139,23 @@ class _KVPool:
 
     def set_state(self, state):
         self.value = state[0]
+
+
+def _make_pruning_function(model, kv_pool, callback_values):
+    def fn(value, unused_runtime):
+        kv_pool.value.add_(model.kv_bias)
+        direct_compile.insert_callback(
+            value + model.object_state.value, callback_values.append
+        )
+        return value + model.weight_alias + model.object_state.weight_alias
+
+    return direct_compile.direct_compile(
+        fn,
+        specialization_key=lambda value, unused_runtime: tuple(value.shape),
+        model=model,
+        model_extra_tensor_attrs=("object_state.value", "object_state.weight_alias"),
+        kv_pool=kv_pool,
+    )
 
 
 class TestDirectCompile(CustomTestCase):
@@ -115,7 +177,7 @@ class TestDirectCompile(CustomTestCase):
 
         compile_fn.assert_called_once()
 
-    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_torch_tpu_cache_hit_for_equivalent_compilations(self):
         def fn(value):
             return value + value
@@ -250,6 +312,9 @@ class TestDirectCompile(CustomTestCase):
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
             patch.object(
+                direct_compile, "_live_model_input_indices", return_value=(0, 1)
+            ),
+            patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
             ),
             patch.object(compiler, "execute", return_value=[result]) as execute,
@@ -320,6 +385,9 @@ class TestDirectCompile(CustomTestCase):
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
             patch.object(
+                direct_compile, "_live_model_input_indices", return_value=(0,)
+            ),
+            patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
             ),
             patch.object(compiler, "execute", return_value=[result]) as execute,
@@ -358,6 +426,184 @@ class TestDirectCompile(CustomTestCase):
         self.assertIsNone(rebuilt[0].topk_p)
         self.assertIs(rebuilt[1].hidden_states, draft_extend_hidden_states)
         self.assertIsNone(rebuilt[1].input_ids)
+
+    def test_prunes_model_inputs_and_preserves_runtime_state(self):
+        model = _ModelWithUnusedInputs()
+        kv_pool = _KVPool(torch.zeros(2))
+        pool_input = kv_pool.value
+        callback_values = []
+        compiled = _make_pruning_function(model, kv_pool, callback_values)
+        compiler = direct_compile.tpu_torch_compile
+
+        def execute(_executable, inputs):
+            weight, kv_bias, callback_bias, kv, value, _unused_runtime = inputs
+            return [value + weight + weight, kv + kv_bias, value + callback_bias]
+
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda value: isinstance(value, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(compiler, "build_mlir", return_value=object()) as lower,
+            patch.object(
+                compiler,
+                "serialize_mlir_bytecode",
+                return_value=_pruning_mlir_bytecode(),
+            ),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ) as traverse,
+            patch.object(compiler, "execute", side_effect=execute) as run,
+        ):
+            for step, value in enumerate((2.0, 7.0), start=1):
+                result = compiled(torch.full((2,), value), torch.zeros(2))
+                torch.testing.assert_close(result, torch.full((2,), value + 2))
+                torch.testing.assert_close(kv_pool.value, torch.full((2,), 5.0 * step))
+                torch.testing.assert_close(
+                    callback_values[-1], torch.full((2,), value + 3)
+                )
+
+            # Explicit runtime arguments keep their shape guard even when the
+            # model does not read them. Pruning is limited to immutable state.
+            with self.assertRaisesRegex(ValueError, "tensor input changed shape"):
+                compiled(torch.ones(2), torch.zeros(3))
+
+        self.assertEqual(lower.call_count, 2)
+        traverse.assert_called_once()
+        self.assertEqual(run.call_count, 2)
+        original_graph_inputs = lower.call_args_list[0].args[1]
+        retained_graph_inputs = traverse.call_args.args[1]
+        self.assertEqual(len(original_graph_inputs), 8)
+        self.assertEqual(len(retained_graph_inputs), 6)
+        for tensor, index in zip(retained_graph_inputs, (0, 3, 4, 5, 6, 7)):
+            self.assertIs(tensor, original_graph_inputs[index])
+        for tensor, validated in zip(
+            retained_graph_inputs, lower.call_args_list[1].args[1], strict=True
+        ):
+            self.assertIs(tensor, validated)
+        self.assertEqual(traverse.call_args.kwargs["argument_layouts"], [[]] * 6)
+        model_inputs = next(iter(compiled.cache.values())).model_inputs
+        self.assertEqual(len(model_inputs), 3)
+        for tensor, expected in zip(
+            model_inputs, (model.weight, model.kv_bias, model.object_state.value)
+        ):
+            self.assertIs(tensor, expected)
+        self.assertIs(model.weight_alias, model.weight)
+        self.assertIs(model.object_state.weight_alias, model.weight)
+        self.assertIs(kv_pool.value, pool_input)
+
+    def test_model_input_pruning_checks_exported_signature(self):
+        compiler = direct_compile.tpu_torch_compile
+        with patch.object(compiler, "build_mlir") as lower:
+            self.assertEqual(direct_compile._live_model_input_indices([], [], 0), ())
+        lower.assert_not_called()
+
+        with (
+            patch.object(compiler, "build_mlir", return_value=object()),
+            patch.object(
+                compiler,
+                "serialize_mlir_bytecode",
+                return_value=_pruning_mlir_bytecode(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "expected 7, got 8"),
+        ):
+            direct_compile._live_model_input_indices([], [torch.zeros(2)] * 7, 5)
+
+    def test_model_input_pruning_preserves_dependencies_discarded_by_lowering(self):
+        compiler = direct_compile.tpu_torch_compile
+        value = compiler.placeholder([2], torch.int64, False)
+        with direct_compile.execution_mode.set_eager_mode(
+            direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+        ):
+            result = torch.isnan(value)
+
+        # Integer isnan exports a constant false, so its MLIR argument has no
+        # uses. The original deferred graph still needs that argument to lower.
+        self.assertEqual(
+            direct_compile._live_model_input_indices([result], [value], 1), (0,)
+        )
+
+    def test_model_input_pruning_propagates_unrelated_export_errors(self):
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            patch.object(
+                compiler,
+                "build_mlir",
+                side_effect=[object(), RuntimeError("unrelated lowering failure")],
+            ),
+            patch.object(
+                compiler,
+                "serialize_mlir_bytecode",
+                return_value=_pruning_mlir_bytecode(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "unrelated lowering failure"),
+        ):
+            direct_compile._live_model_input_indices([], [torch.zeros(2)] * 8, 5)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_constant_folded_model_input_on_tpu(self):
+        model = torch.nn.Module()
+        model.register_buffer(
+            "integers", torch.ones(2, dtype=torch.int64, device="tpu")
+        )
+        compiled = direct_compile.direct_compile(
+            lambda: torch.isnan(model.integers),
+            specialization_key=lambda: None,
+            model=model,
+        )
+
+        for _ in range(2):
+            torch.testing.assert_close(
+                compiled().cpu(), torch.zeros(2, dtype=torch.bool)
+            )
+        artifact = compiled.cache[None]
+        self.assertEqual(len(artifact.model_inputs), 1)
+        self.assertIs(artifact.model_inputs[0], model.integers)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_pruned_model_inputs_on_tpu_across_specializations(self):
+        model = _ModelWithUnusedInputs(device="tpu")
+        kv_pool = _KVPool(torch.zeros(2, device="tpu"))
+        pool_input = kv_pool.value
+        callback_values = []
+        compiled = _make_pruning_function(model, kv_pool, callback_values)
+        compiler = direct_compile.tpu_torch_compile
+
+        with (
+            patch.object(compiler, "build_mlir", wraps=compiler.build_mlir) as lower,
+            patch.object(compiler, "execute", wraps=compiler.execute) as run,
+        ):
+            for step, rows in enumerate((2, 4, 2), start=1):
+                value = torch.full((rows, 2), float(step), device="tpu")
+                result = compiled(value, torch.zeros(2, device="tpu"))
+                torch.testing.assert_close(
+                    result.cpu(), torch.full((rows, 2), float(step + 2))
+                )
+                torch.testing.assert_close(
+                    kv_pool.value.cpu(), torch.full((2,), 5.0 * step)
+                )
+                torch.testing.assert_close(
+                    callback_values[-1].cpu(), torch.full((rows, 2), float(step + 3))
+                )
+
+        self.assertEqual(lower.call_count, 4)
+        self.assertEqual(len(compiled.cache), 2)
+        self.assertIs(kv_pool.value, pool_input)
+        for artifact in compiled.cache.values():
+            self.assertEqual(len(artifact.model_inputs), 3)
+        for call in run.call_args_list:
+            self.assertEqual(len(call.args[1]), 6)
+            self.assertFalse(any(t is model.unused_buffer for t in call.args[1]))
+            self.assertFalse(any(t is model.unused_weight for t in call.args[1]))
 
     def test_forward_hook_dispatches_inserted_callback(self):
         model = torch.nn.Identity()
@@ -399,6 +645,9 @@ class TestDirectCompile(CustomTestCase):
             ),
             patch.object(
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(
+                direct_compile, "_live_model_input_indices", return_value=(0, 1)
             ),
             patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
