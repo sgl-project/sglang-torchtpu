@@ -280,7 +280,7 @@ class TestNightlyConfigLabelLint(CustomTestCase):
             config = mod.MODEL_CONFIG
             launch = config.get("launch") or {}
             self.assertTrue(
-                launch.get("recipe"),
+                launch.get("recipe") or launch.get("server_args"),
                 f"{path.name}: perf must launch through a recipe (RecipeLauncher)",
             )
             self.assertFalse(launch.get("external"), path.name)

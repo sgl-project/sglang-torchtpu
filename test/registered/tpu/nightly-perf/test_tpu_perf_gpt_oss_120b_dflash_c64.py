@@ -9,9 +9,16 @@ See test_tpu_perf_gpt_oss_120b.py for the ADDING A MODEL guide.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # Longer than the non-speculative c64 file: bring-up also loads the draft model
 # and compiles the draft forward. Drives the JobSet poll budget.
@@ -46,6 +53,32 @@ DFLASH_BLOCK_SIZE = 3
 SIMULATE_ACC_LEN = 2.5
 
 
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": int(ISL) + int(OSL) + 64,
+        "max_running_requests": int(CONCUR),
+        "torch_compile_max_bs": int(CONCUR),
+        "chunked_prefill_size": min(max(int(ISL), 2048), 8192),
+        "max_prefill_tokens": min(max(int(ISL), 2048), 8192),
+        "max_total_tokens": 2 * (int(CONCUR)) * (int(ISL) + int(OSL) + 64),
+        "model_path": WEIGHTS,
+        "disable_radix_cache": True,
+        "tpu_compile_tokens": [ISL],
+        "tpu_compile_bs": [CONCUR],
+        "served_model_name": MODEL,
+        "speculative_algorithm": "DFLASH",
+        "speculative_draft_model_path": DRAFT_MODEL,
+        "speculative_dflash_block_size": DFLASH_BLOCK_SIZE,
+    }
+)
+LAUNCH_CONFIG["runtime_env"].update(
+    {
+        "SGLANG_SIMULATE_ACC_LEN": str(SIMULATE_ACC_LEN),
+        "SGLANG_SPEC_TP_SYNC": "rng",
+    }
+)
+
 MODEL_CONFIG = {
     "model": MODEL,
     "test_name": "gpt-oss-120b-dflash-c64",
@@ -53,32 +86,7 @@ MODEL_CONFIG = {
     "display_name": "GPT-OSS 120B DFlash (c64)",
     "variant": "TP8+EP8+DFLASH-c64",
     "launch": {
-        # Deltas over the c64 baseline: the draft model and its block size. As
-        # with EAGLE3, the draft weights share MEM_FRACTION_STATIC with the
-        # target's KV pool -- tune that fraction on an OOM, not the pool size,
-        # which has to match the baseline for the numbers to compare.
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-            "DISABLE_RADIX_CACHE": "1",
-            "TPU_COMPILE_TOKENS": str(ISL),
-            "TPU_COMPILE_BS": str(CONCUR),
-            "ENABLE_PROFILER_ENDPOINT": "0",
-            "SGLANG_SIMULATE_ACC_LEN": str(SIMULATE_ACC_LEN),
-            # Match the DFlash accuracy gates, so this measures the configuration
-            # they validate. Only the sites that can differ across ranks are
-            # broadcast; the deterministic ones would cost a collective per step.
-            "SGLANG_SPEC_TP_SYNC": "rng",
-            "EXTRA_ARGS": (
-                f"--served-model-name {MODEL} "
-                "--speculative-algorithm DFLASH "
-                f"--speculative-draft-model-path {DRAFT_MODEL} "
-                f"--speculative-dflash-block-size {DFLASH_BLOCK_SIZE}"
-            ),
-        },
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gpt-oss-dflash-c64",
     },

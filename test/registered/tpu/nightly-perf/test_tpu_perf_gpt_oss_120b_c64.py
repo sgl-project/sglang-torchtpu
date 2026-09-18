@@ -12,9 +12,16 @@ question than the c16 file does, so the trends would not be comparable.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # One bring-up plus one sweep leg. Longer than the c16 file's 1800: a 64-wide
 # decode bucket compiles slower and the KV pool is 4x. Drives the JobSet poll
@@ -36,6 +43,23 @@ MODEL = "openai/gpt-oss-120b"
 WEIGHTS = "/weights/gpt-oss-120b"
 
 
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": int(ISL) + int(OSL) + 64,
+        "max_running_requests": int(CONCUR),
+        "torch_compile_max_bs": int(CONCUR),
+        "chunked_prefill_size": min(max(int(ISL), 2048), 8192),
+        "max_prefill_tokens": min(max(int(ISL), 2048), 8192),
+        "max_total_tokens": 2 * (int(CONCUR)) * (int(ISL) + int(OSL) + 64),
+        "model_path": WEIGHTS,
+        "disable_radix_cache": True,
+        "tpu_compile_tokens": [ISL],
+        "tpu_compile_bs": [CONCUR],
+        "served_model_name": MODEL,
+    }
+)
+
 MODEL_CONFIG = {
     "model": MODEL,
     "test_name": "gpt-oss-120b-c64",
@@ -43,23 +67,7 @@ MODEL_CONFIG = {
     "display_name": "GPT-OSS 120B (c64)",
     "variant": "TP8+EP8-c64",
     "launch": {
-        # Same deltas as the c16 file; see it for why each one is here. The only
-        # change is CONCUR, from which server.sh derives MAX_RUNNING,
-        # TORCH_COMPILE_MAX_BS and a 2*CONCUR*CONTEXT_LEN = 1.19M-token fp8 KV
-        # pool -- still under the ~1.5M where its extend precompile OOMs, but
-        # with far less slack than c16's 297k.
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-            "DISABLE_RADIX_CACHE": "1",
-            "TPU_COMPILE_TOKENS": str(ISL),
-            "TPU_COMPILE_BS": str(CONCUR),
-            "ENABLE_PROFILER_ENDPOINT": "0",
-        },
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gpt-oss-c64",
     },

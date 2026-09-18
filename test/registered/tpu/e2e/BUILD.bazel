@@ -9,7 +9,7 @@ sglang_tpu_e2e_test(
     data = [
         # Shell recipes, eval configs, and helpers the launcher resolves at
         # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
-        "//benchmark/tpu:runtime",
+        "//benchmark/tpu:recipe",
     ],
     main = "test_tpu_gpt_oss_120b_singlehost_spec.py",
     tags = [
@@ -27,7 +27,7 @@ sglang_tpu_e2e_test(
     data = [
         # Shell recipes, eval configs, and helpers the launcher resolves at
         # runtime (benchmark/tpu/**, reached via _TPU_BENCH_DIR).
-        "//benchmark/tpu:runtime",
+        "//benchmark/tpu:recipe",
     ],
     main = "test_tpu_gpt_oss_120b_singlehost_dpa.py",
     tags = [
@@ -43,7 +43,7 @@ sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_30b_singlehost_lm_eval",
     srcs = ["test_tpu_qwen3_coder_30b_singlehost_lm_eval.py"],
     data = [
-        "//benchmark/tpu:runtime",
+        "//benchmark/tpu:recipe",
         "//test/lm_eval_configs:Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml",
     ],
     main = "test_tpu_qwen3_coder_30b_singlehost_lm_eval.py",
@@ -59,7 +59,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_compile_tracer",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_compile_tracer.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_0_6b_singlehost_compile_tracer.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -72,7 +72,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_0_6b_singlehost_eval_accuracy_large.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -84,7 +84,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_prefix_cache",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_prefix_cache.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_0_6b_singlehost_prefix_cache.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -96,7 +96,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_prompt_logprob",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_prompt_logprob.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_0_6b_singlehost_prompt_logprob.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -108,7 +108,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_smoke",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_smoke.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_0_6b_singlehost_smoke.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -120,7 +120,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_0_6b_singlehost_torch_compile_bundle",
     srcs = ["test_tpu_qwen3_0_6b_singlehost_torch_compile_bundle.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_0_6b_singlehost_torch_compile_bundle.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -135,7 +135,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k",
     srcs = ["test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_coder_480b_singlehost_prefix_cache_kv_offload_gsm8k.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -147,7 +147,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k",
     srcs = ["test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_coder_480b_singlehost_spec_decoding_gsm8k.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -159,7 +159,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_qwen3_coder_480b_singlehost_spec_dpa_gsm8k",
     srcs = ["test_tpu_qwen3_coder_480b_singlehost_spec_dpa_gsm8k.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     main = "test_tpu_qwen3_coder_480b_singlehost_spec_dpa_gsm8k.py",
     tags = ["requires-tpu-v7x"],
     deps = [
@@ -183,7 +183,7 @@ py_library(
 sglang_tpu_e2e_test(
     name = "test_tpu_bench_qwen3_coder_480b_1host_pc_8k1k",
     srcs = ["test_tpu_bench_qwen3_coder_480b_1host_pc_8k1k.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     env = {"SGLANG_TPU_USE_LIVE_SERVER": "1"},
     main = "test_tpu_bench_qwen3_coder_480b_1host_pc_8k1k.py",
     tags = [
@@ -200,7 +200,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_bench_qwen3_coder_480b_1host_pc_agentic",
     srcs = ["test_tpu_bench_qwen3_coder_480b_1host_pc_agentic.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     env = {"SGLANG_TPU_USE_LIVE_SERVER": "1"},
     main = "test_tpu_bench_qwen3_coder_480b_1host_pc_agentic.py",
     tags = [
@@ -217,7 +217,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_bench_qwen3_coder_480b_1host_pc_spec_kvoff_8k1k",
     srcs = ["test_tpu_bench_qwen3_coder_480b_1host_pc_spec_kvoff_8k1k.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     env = {"SGLANG_TPU_USE_LIVE_SERVER": "1"},
     main = "test_tpu_bench_qwen3_coder_480b_1host_pc_spec_kvoff_8k1k.py",
     tags = [
@@ -234,7 +234,7 @@ sglang_tpu_e2e_test(
 sglang_tpu_e2e_test(
     name = "test_tpu_bench_qwen3_coder_480b_1host_pc_spec_kvoff_agentic",
     srcs = ["test_tpu_bench_qwen3_coder_480b_1host_pc_spec_kvoff_agentic.py"],
-    data = ["//benchmark/tpu:runtime"],
+    data = ["//benchmark/tpu:recipe"],
     env = {"SGLANG_TPU_USE_LIVE_SERVER": "1"},
     main = "test_tpu_bench_qwen3_coder_480b_1host_pc_spec_kvoff_agentic.py",
     tags = [

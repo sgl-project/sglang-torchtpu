@@ -2,10 +2,9 @@
 
 Plugs into the two extension points on the shared accuracy runner:
 
-* ``ModelLaunchSettings.launcher`` -- a TPU server cannot be started from a bare
-  argv, because chiplet visibility, the torch_tpu compile cache and the multi-host
-  topology must all be exported before exec, and only ``launch_server.sh`` (plus its
-  recipe wrappers) knows how.
+* ``ModelLaunchSettings.launcher`` -- keeps a server alive across gates. Python
+  recipes supply CLI settings and a runtime environment to the existing
+  ``popen_launch_server`` helper; legacy shell launchers remain supported.
 * ``AccuracyTestParams.runner`` -- scores a gate with a harness the shared runner has
   no dependency on: lm-eval, and OpenAI's own gpt_oss.evals package.
 """
@@ -17,14 +16,21 @@ import os
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.lm_eval_kit import LMEvalMixin
-from sglang.test.test_utils import ModelLaunchSettings, dump_metric
+from sglang.test.test_utils import ModelLaunchSettings, dump_metric, popen_launch_server
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.bench_matrix.serve_group import dump_launch
+from benchmark.tpu.recipe.configs.config_eval import server_args_to_cli
 
 DEFAULT_HEALTH_TIMEOUT = 1800.0
 
@@ -55,8 +61,7 @@ def wait_for_health(
             response = requests.get(base_url.rstrip("/") + endpoint, timeout=10)
             if response.status_code == 200:
                 print(
-                    f"[{tag}] server healthy after "
-                    f"{time.perf_counter() - start:.0f}s",
+                    f"[{tag}] server healthy after {time.perf_counter() - start:.0f}s",
                     flush=True,
                 )
                 return
@@ -82,7 +87,7 @@ _HOLDERS: Dict[str, "RecipeLauncher"] = {}
 
 
 class RecipeLauncher:
-    """Launch a TPU server from a shell recipe, and keep it up across evals.
+    """Launch from a Python config or shell recipe, keeping the server up across evals.
 
     The shared runner brings the server up once per evaluation, but a TPU boot costs
     tens of minutes (weight load plus per-shape compile). This boots on first entry,
@@ -94,15 +99,19 @@ class RecipeLauncher:
 
     def __init__(
         self,
-        script: str,
+        script: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
         health_timeout: float = DEFAULT_HEALTH_TIMEOUT,
         tag: str = "tpu-e2e",
+        server_args: Optional[Dict[str, Any]] = None,
     ):
-        self.script = os.path.abspath(script)
-        if not os.path.exists(self.script):
+        self.script = os.path.abspath(script) if script else "Python config"
+        self.server_args = deepcopy(server_args)
+        if script and not os.path.exists(self.script):
             raise FileNotFoundError(f"launch recipe not found: {self.script}")
+        if (script is None) == (server_args is None):
+            raise ValueError("Supply either a shell recipe or server_args")
         self.env = dict(env or {})
         self.cwd = cwd or os.path.dirname(self.script)
         self.health_timeout = health_timeout
@@ -130,16 +139,42 @@ class RecipeLauncher:
             # The whole invocation, env included: this line is what a reader reproduces
             # a red nightly with.
             overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))
-            print(
-                f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
-                f"bash {self.script} (cwd={self.cwd})",
-                flush=True,
-            )
-            self._process = subprocess.Popen(
-                ["bash", self.script], cwd=self.cwd, env=env
-            )
-            # The recipe and launch_server.sh both `exec`, so this pid IS the
-            # server process -- kill_process_tree on it does the right thing.
+            if self.server_args is not None:
+                settings = deepcopy(self.server_args)
+                model = settings.pop("model_path")
+                for key in ("host", "port"):
+                    settings.pop(key, None)
+                command = [
+                    sys.executable,
+                    "-m",
+                    "sglang.launch_server",
+                    "--model-path",
+                    model,
+                    *server_args_to_cli(settings),
+                ]
+                address = urlsplit(base_url)
+                command.extend(
+                    ["--host", address.hostname, "--port", str(address.port)]
+                )
+                dump_launch({"server_args": self.server_args}, command, env)
+                self._process = popen_launch_server(
+                    model,
+                    base_url,
+                    timeout=self.health_timeout,
+                    other_args=server_args_to_cli(settings),
+                    env=self.env,
+                    device="tpu",
+                )
+            else:
+                print(
+                    f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
+                    f"bash {self.script} (cwd={self.cwd})",
+                    flush=True,
+                )
+                self._process = subprocess.Popen(
+                    ["bash", self.script], cwd=self.cwd, env=env
+                )
+            # Both paths retain the server pid for worker-tree teardown.
             _HOLDERS[base_url] = self
             self._base_url = base_url
             atexit.register(self.shutdown)
@@ -197,9 +232,8 @@ class TpuModelLaunchSettings(ModelLaunchSettings):
     """ModelLaunchSettings that delegates bring-up to a ``launcher``.
 
     ``launcher`` itself is a plain ModelLaunchSettings field; this subclass exists
-    only to clear ``extra_args``, because the base class synthesises ``--tp`` /
-    ``--enable-multimodal`` -- dead config here (the recipe derives every flag from
-    environment) that would mislead in reports.
+    only to clear ``extra_args``: the launcher already owns the complete serving
+    config, including parallelism and multimodal flags.
     """
 
     def __init__(self, model_path: str, **kwargs):

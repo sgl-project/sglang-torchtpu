@@ -1,9 +1,16 @@
 """GPT-OSS-120B full data-parallel-attention single-host quality gate."""
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 register_tpu_ci(
     est_time=3600,
@@ -19,33 +26,34 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 GSM8K_ACCURACY = 0.70
 DP_SIZE = 8
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "16",
-    "CONTEXT_LEN": "8192",
-    "TPU_COMPILE_TOKENS": "512 1024 2048 4096",
-    # Two requests per DP rank at the configured global concurrency.
-    "TPU_COMPILE_BS": "1 2",
-    "MAX_TOTAL_TOKENS": "8192",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    # TP8 / DP8 gives attention TP=1: this is full DPA, not hybrid TP+DPA.
-    "DP_SIZE": str(DP_SIZE),
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--tpu-compile-tracer dynamo"
-    ),
-}
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 8192,
+        "max_running_requests": 16,
+        "torch_compile_max_bs": 16,
+        "chunked_prefill_size": min(max(4096, 2048), 8192),
+        "max_prefill_tokens": min(max(4096, 2048), 8192),
+        "max_total_tokens": 8192,
+        "model_path": "/weights/gpt-oss-120b",
+        "tpu_compile_tokens": [512, 1024, 2048, 4096],
+        "tpu_compile_bs": [1, 2],
+        "dp_size": int(DP_SIZE),
+        "reasoning_parser": "gpt-oss",
+        "served_model_name": SERVED_MODEL_NAME,
+        "tpu_compile_tracer": "dynamo",
+        "enable_dp_attention": True,
+        "enable_dp_lm_head": CONFIG["server_args"]["tp_size"] // (int(DP_SIZE)) > 1,
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-dpa-gsm8k",
     "variant": "TP8+EP8+DP8(attn-tp1)",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-dpa-gsm8k-e2e",
     },

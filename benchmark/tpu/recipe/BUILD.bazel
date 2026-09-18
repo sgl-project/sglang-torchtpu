@@ -1,0 +1,132 @@
+load("@rules_python//python:defs.bzl", "py_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# The recipe subtree: Python launch configs, bench/nightly drivers, and READMEs,
+# resolved as runfiles by sglang.test.tpu and the py_binary launchers below.
+filegroup(
+    name = "pkg",
+    srcs = glob(["**"]),
+)
+
+# Export sources across the recipe package boundary for python_configs.
+filegroup(
+    name = "py_files",
+    srcs = glob(["**/*.py"]),
+)
+
+# One py_binary per single-host serve config: `bazel run //benchmark/tpu/recipe:<model>`
+# boots that model's server. The binary is serve_group.py with the config fixed;
+# extra serve_group args (e.g. --dry-run) pass through after `--`.
+#
+# The launcher re-execs `sys.executable -m sglang.launch_server`, so the
+# hermetic interpreter must carry sglang on its path (//python:sglang). The
+# recipe configs are read as runfiles, not installed packages (see the sys.path
+# bootstrap in serve_group.py), so the benchmark/tpu tree rides along in data.
+_SINGLE_HOST_CONFIGS = {
+    "gpt_oss_120b": "gpt_oss_120b/server.py",
+    "mimo_25": "mimo/launch_mimo_25.py",
+    "qwen3_coder_480b": "qwen3_coder_480b/server.py",
+    "qwen3_coder_30b": "qwen3_coder_30b_a3b_fp8.py",
+    "qwen3_0_6b": "qwen3_0_6b.py",
+}
+
+# pywrap_torch_tpu supplies the native extensions needed by the server;
+# //python:sglang supplies its Python modules but not the extension bundle.
+# Keep executable paths distinct from recipe directories in runfiles.
+[py_binary(
+    name = name + "_server",
+    srcs = ["bench_matrix/serve_group.py"],
+    args = ["--config", "recipe/configs/%s" % config],
+    data = ["//benchmark/tpu:runtime"],
+    main = "bench_matrix/serve_group.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+) for name, config in _SINGLE_HOST_CONFIGS.items()]
+
+[alias(
+    name = name,
+    actual = ":" + name + "_server",
+) for name in _SINGLE_HOST_CONFIGS]
+
+# Same launcher for the multihost recipes: each host runs the binary and
+# serve_group.py derives its node rank from TPU_WORKER_ID.
+[py_binary(
+    name = name,
+    srcs = ["bench_matrix/serve_group.py"],
+    args = ["--config", "recipe/configs/%s" % config],
+    data = [":pkg"],
+    main = "bench_matrix/serve_group.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+) for name, config in {
+    "deepseek_r1_0528_mh": "deepseek_r1_0528_mh.py",
+    "gpt_120b_dflash_mh": "gpt_120b_dflash_mh.py",
+    "gpt_120b_spec_mh": "gpt_120b_spec_mh.py",
+    "kimi_k26_mh": "kimi_k26_mh.py",
+    "mimo_25_pro_mh": "mimo/launch_mimo_25_pro_multihost.py",
+    "mimo_v25_pro_mh": "mimo_v25_pro_mh.py",
+    "qwen3_30b_a3b_fp8_mh": "qwen3_30b_a3b_fp8_mh.py",
+    "qwen3_coder_480b_agentic_mh": "qwen3_coder_480b_agentic_mh.py",
+    "qwen3_coder_480b_agentic_spec_mh": "qwen3_coder_480b_agentic_spec_mh.py",
+}.items()]
+
+# One py_binary per bench-matrix serve group (single-host and P/D), the rows
+# the registered e2e bench cells point their JobSet launch at.
+[py_binary(
+    name = name,
+    srcs = ["bench_matrix/serve_group.py"],
+    args = ["--config", "recipe/configs/bench_matrix/%s.py" % name],
+    data = [":pkg"],
+    main = "bench_matrix/serve_group.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+) for name in [
+    "gpt_oss_120b_1host_pc",
+    "gpt_oss_120b_1host_pc_spec_kvoff",
+    "gpt_oss_120b_pd_2p2d_pc_spec_kvoff",
+    "qwen3_coder_480b_1host_pc",
+    "qwen3_coder_480b_1host_pc_spec_kvoff",
+    "qwen3_coder_480b_pd_2p2d_pc_spec_kvoff",
+]]
+
+# The bench-matrix sweep driver. BENCH_MODEL/BENCH_RECIPE select the matrix row
+# at runtime (bench_leg.py:selected_recipe), so one binary serves every row.
+py_binary(
+    name = "run_sweep",
+    srcs = ["bench_matrix/run_sweep.py"],
+    data = [":pkg"],
+    main = "bench_matrix/run_sweep.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
+
+# The Qwen3-Coder-480B agentic nightly driver (colocated/external/P/D modes
+# via MODE; the multihost JobSet runs it with MODE=external).
+py_binary(
+    name = "qwen3_coder_480b_nightly",
+    srcs = ["qwen3_coder_480b/nightly/run_nightly.py"],
+    main = "qwen3_coder_480b/nightly/run_nightly.py",
+    python_version = "3.12",
+    deps = [
+        "//benchmark/tpu:python_configs",
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)

@@ -49,9 +49,16 @@ predecessor here, test_tpu_perf_qwen3_30b.py, was retired with it.)
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # One bring-up (weight load + per-shape compile, ~10 min with the single-bucket
 # compile below) plus one sweep leg. Drives the JobSet poll budget, so an
@@ -78,6 +85,23 @@ MODEL = "openai/gpt-oss-120b"
 WEIGHTS = "/weights/gpt-oss-120b"
 
 
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": int(ISL) + int(OSL) + 64,
+        "max_running_requests": int(CONCUR),
+        "torch_compile_max_bs": int(CONCUR),
+        "chunked_prefill_size": min(max(int(ISL), 2048), 8192),
+        "max_prefill_tokens": min(max(int(ISL), 2048), 8192),
+        "max_total_tokens": 2 * (int(CONCUR)) * (int(ISL) + int(OSL) + 64),
+        "model_path": WEIGHTS,
+        "disable_radix_cache": True,
+        "tpu_compile_tokens": [ISL],
+        "tpu_compile_bs": [CONCUR],
+        "served_model_name": MODEL,
+    }
+)
+
 MODEL_CONFIG = {
     "model": MODEL,
     "test_name": "gpt-oss-120b",
@@ -89,38 +113,7 @@ MODEL_CONFIG = {
     "display_name": "GPT-OSS 120B",
     "variant": "TP8+EP8",
     "launch": {
-        # server.sh's own sample usage is `ISL=8192 OSL=1024 CONCUR=N ./server.sh`
-        # -- it derives context, prefill chunk, KV pool and compile buckets from
-        # exactly those three. Delta on top of the recipe:
-        #   MODEL         the ROX PVC mount; server.sh defaults to the HF id.
-        #   EXTRA_ARGS    serve under the canonical HF name (see MODEL).
-        #   ISL/OSL/CONCUR  the shape. These give CONTEXT_LEN = 9280, an
-        #                 8192-token prefill chunk (a cold 8k prompt is one
-        #                 chunk), MAX_RUNNING/TORCH_COMPILE_MAX_BS = CONCUR, and
-        #                 a 2*CONCUR*CONTEXT_LEN = 297k-token fp8 KV pool -- far
-        #                 below the ~1.5M where its extend precompile OOMs.
-        #   DISABLE_RADIX_CACHE  the recipe leaves prefix caching ON because it
-        #                 is paired with a deliberate cache-hit sweep. This is
-        #                 the opposite measurement: random-prompt throughput at
-        #                 InferenceX parity, where a cache hit would let a
-        #                 request skip a real prefill and drift the trend upward
-        #                 for no serving reason.
-        #   TPU_COMPILE_*  one prefill and one decode bucket, keeping bring-up
-        #                 ~10 min; the derived default is powers of two up to
-        #                 CONCUR. Same trade the accuracy nightly makes.
-        #   ENABLE_PROFILER_ENDPOINT  a nightly captures no traces.
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "EXTRA_ARGS": f"--served-model-name {MODEL}",
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-            "DISABLE_RADIX_CACHE": "1",
-            "TPU_COMPILE_TOKENS": str(ISL),
-            "TPU_COMPILE_BS": str(CONCUR),
-            "ENABLE_PROFILER_ENDPOINT": "0",
-        },
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gpt-oss",
     },

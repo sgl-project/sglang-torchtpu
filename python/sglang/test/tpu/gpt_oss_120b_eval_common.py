@@ -1,32 +1,28 @@
 """Shared serving configuration for GPT-OSS 120B TPU evals."""
 
 import os
+from copy import deepcopy
 from typing import Any
 
 SERVED_MODEL_NAME = "gpt-oss-120b"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
-_BASE_LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "EXTRA_ARGS": (
-        f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}"
-    ),
-    "KV_CACHE_DTYPE": "",
-    "PAGE_SIZE": "128",
-    "DISABLE_RADIX_CACHE": "1",
-    "MEM_FRACTION_STATIC": "0.60",
-    "ISL": "4096",
-    "TPU_COMPILE_TOKENS": "4096",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-}
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG as BASE_CONFIG
 
-
-def make_launch_env(**overrides: str) -> dict[str, str]:
-    """Return a fresh launch environment with eval-specific sizing."""
-    env = dict(_BASE_LAUNCH_ENV)
-    env.update(overrides)
-    return env
+CONFIG = deepcopy(BASE_CONFIG)
+CONFIG["server_args"].update(
+    model_path="/weights/gpt-oss-120b",
+    served_model_name=SERVED_MODEL_NAME,
+    reasoning_parser="gpt-oss",
+    kv_cache_dtype=None,
+    page_size=128,
+    disable_radix_cache=True,
+    mem_fraction_static=0.6,
+    chunked_prefill_size=4096,
+    max_prefill_tokens=4096,
+    tpu_compile_tokens=[4096],
+)
 
 
 def make_model_config(
@@ -34,7 +30,7 @@ def make_model_config(
     test_name: str,
     series_id: str,
     tag: str,
-    launch_env: dict[str, str],
+    launch_config: dict[str, Any],
     gate: dict[str, Any],
 ) -> dict[str, Any]:
     """Build one isolated model configuration for one eval."""
@@ -51,8 +47,7 @@ def make_model_config(
         "dashboard": "accuracy",
         "dashboard_model": SERVED_MODEL_NAME,
         "launch": {
-            "recipe": "recipe/gpt_oss_120b/server.sh",
-            "env": launch_env,
+            **launch_config,
             "health_timeout": HEALTH_TIMEOUT,
             "tag": tag,
         },

@@ -5,10 +5,17 @@ quality. The 120B variant provides broader nightly coverage.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # Expected runtime includes model download, compilation, and the eviction probe.
 register_tpu_ci(
@@ -28,41 +35,39 @@ PROBE_TOKENS = 1024
 PAGE_SIZE = 64
 GSM8K_ACCURACY = 0.60
 
-LAUNCH_ENV = {
-    "MODEL": "openai/gpt-oss-20b",
-    "ISL": "2048",
-    "OSL": "512",
-    "CONCUR": "8",
-    "CONTEXT_LEN": "4096",
-    "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
-    "PAGE_SIZE": str(PAGE_SIZE),
-    "TPU_COMPILE_TOKENS": "512 1024 2048",
-    "TPU_COMPILE_BS": "1 2 4 8",
-    # Raiden reloads require RPA v3 and the fused host-pool layout.
-    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-    "HICACHE_MEM_LAYOUT": "page_first_fused",
-    # Prefix caching is the substrate HiCache is built on, and launch_server.sh
-    # defaults it OFF.
-    "DISABLE_RADIX_CACHE": "0",
-    "KV_OFFLOAD": "1",
-    "HICACHE_IO_BACKEND": "raiden",
-    "HICACHE_RATIO": str(HICACHE_RATIO),
-    # Back up each prefix before device eviction.
-    "HICACHE_WRITE_POLICY": "write_through",
-    "ENABLE_CACHE_REPORT": "1",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss " f"--served-model-name {SERVED_MODEL_NAME}"
-    ),
-}
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 4096,
+        "max_running_requests": 8,
+        "torch_compile_max_bs": 8,
+        "chunked_prefill_size": min(max(2048, 2048), 8192),
+        "max_prefill_tokens": min(max(2048, 2048), 8192),
+        "max_total_tokens": int(DEVICE_POOL_TOKENS),
+        "model_path": "openai/gpt-oss-20b",
+        "page_size": int(PAGE_SIZE),
+        "tpu_compile_tokens": [512, 1024, 2048],
+        "tpu_compile_bs": [1, 2, 4, 8],
+        "attention_backend": "pallas_tpu_rpa_v3",
+        "hicache_mem_layout": "page_first_fused",
+        "disable_radix_cache": False,
+        "enable_hierarchical_cache": True,
+        "hicache_io_backend": "raiden",
+        "hicache_ratio": float(HICACHE_RATIO),
+        "hicache_write_policy": "write_through",
+        "enable_cache_report": True,
+        "reasoning_parser": "gpt-oss",
+        "served_model_name": SERVED_MODEL_NAME,
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-20b-prefix-cache-kv-offload",
     "variant": "TP8+EP8+HiCache-raiden",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-20b-prefix-cache-kv-offload-e2e",
     },

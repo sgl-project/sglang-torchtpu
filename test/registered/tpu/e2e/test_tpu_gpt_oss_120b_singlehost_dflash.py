@@ -5,9 +5,16 @@ functional integration test, then scores 200 GSM8K examples through run_eval.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 register_tpu_ci(
     est_time=3600,
@@ -33,38 +40,39 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
     os.environ.get("SPEC_ACCEPT_LENGTH_THRESHOLD", "3.0")
 )
 
-LAUNCH_ENV = {
-    "MODEL": MODEL_PATH,
-    "DRAFT_MODEL": DRAFT_MODEL_PATH,
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "16",
-    "CONTEXT_LEN": "8192",
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 16",
-    "MAX_TOTAL_TOKENS": "8192",
-    "MEM_FRACTION_STATIC": os.environ.get("MEM_FRACTION_STATIC", "0.6"),
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    # Broadcast only the sites that can genuinely differ across ranks -- memory
-    # init and the RNG draws. The deterministic ones (greedy accept) compute the
-    # same answer everywhere, so syncing them costs a collective per step.
-    "SGLANG_SPEC_TP_SYNC": "rng",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm DFLASH "
-        f"--speculative-draft-model-path {DRAFT_MODEL_PATH} "
-        f"--speculative-dflash-block-size {DFLASH_BLOCK_SIZE}"
-    ),
-}
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 8192,
+        "max_running_requests": 16,
+        "torch_compile_max_bs": 16,
+        "chunked_prefill_size": min(max(4096, 2048), 8192),
+        "max_prefill_tokens": min(max(4096, 2048), 8192),
+        "max_total_tokens": 8192,
+        "model_path": MODEL_PATH,
+        "tpu_compile_tokens": [512, 2048, 4096],
+        "tpu_compile_bs": [1, 2, 4, 16],
+        "mem_fraction_static": float(os.environ.get("MEM_FRACTION_STATIC", "0.6")),
+        "reasoning_parser": "gpt-oss",
+        "served_model_name": SERVED_MODEL_NAME,
+        "speculative_algorithm": "DFLASH",
+        "speculative_draft_model_path": DRAFT_MODEL_PATH,
+        "speculative_dflash_block_size": DFLASH_BLOCK_SIZE,
+    }
+)
+LAUNCH_CONFIG["runtime_env"].update(
+    {
+        "SGLANG_SPEC_TP_SYNC": "rng",
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-dflash-gsm8k",
     "variant": "TP8+EP8+DFLASH",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-dflash-gsm8k-e2e",
     },

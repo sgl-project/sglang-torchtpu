@@ -15,10 +15,17 @@ controls. GSM8K then scores the same boot, with prefix caching still on.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.qwen3_coder_480b.server import CONFIG
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
@@ -43,61 +50,42 @@ GSM8K_ACCURACY = 0.65
 DEVICE_POOL_TOKENS = 16384
 HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
-# recipe/qwen3_coder_480b/server.sh exports PAGE_SIZE unconditionally, so this is
+# recipe/configs/qwen3_coder_480b/server.py exports PAGE_SIZE unconditionally, so this is
 # not overridable from `env` -- it is restated because the gate's "at least one
 # page" checks are in terms of it, and a prefix match is floored to a page multiple.
 PAGE_SIZE = 256
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "8",
-    "CONTEXT_LEN": "8192",
-    "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
-    # CHUNK caps --chunked-prefill-size and --max-prefill-tokens, and it defaults to
-    # ISL. Pinned to 512 because a larger EXTEND is not served correctly at this
-    # config, tracked on issue #372: at 2048 the model emits nothing but token 0
-    # (`!!!!...`) for any prompt over 512 tokens, and at 4096 the TPU compiler wedges
-    # for ~10 minutes and then aborts every rank on `raw_hash_map<>::at`. A prompt
-    # length sweep on a TPU7x-8 host puts the cliff exactly at the tier boundary --
-    # 512 tokens is clean, 520 is garbage -- and it moves with the tier rather than
-    # with the prompt, so it is the size of one prefill graph. Ruled out on that same
-    # sweep, each changed alone: page size (64 fails identically to 256) and
-    # xla_tpu_use_dynamic_smem_negotiation. Capping here keeps every EXTEND on the
-    # 512 graph, and costs nothing the gate needs -- the probe is 2048 tokens and
-    # GSM8K prompts are shorter, so both just chunk.
-    "CHUNK": "512",
-    "TPU_COMPILE_TOKENS": "512",
-    "TPU_COMPILE_BS": "1 2 4 8",
-    # The recipe serves this model on pallas_tpu_rpa_batched, which raiden rejects:
-    # RPA v3 is the only TPU backend carrying the HiCache reload-commit hook and the
-    # fused KV pool. Overridden here, together with the layout it forces.
-    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-    "HICACHE_MEM_LAYOUT": "page_first_fused",
-    # Prefix caching is the substrate HiCache is built on, and launch_server.sh
-    # defaults it OFF.
-    "DISABLE_RADIX_CACHE": "0",
-    "KV_OFFLOAD": "1",
-    "HICACHE_IO_BACKEND": "raiden",
-    "HICACHE_RATIO": str(HICACHE_RATIO),
-    # Write through on every prefill so the probe is already on host by the time the
-    # fillers evict it. write_back would race that eviction and drop it instead.
-    "HICACHE_WRITE_POLICY": "write_through",
-    # cached_tokens_details in meta_info is how the gate tells a device hit from a
-    # host reload. Without this flag both read 0.
-    "ENABLE_CACHE_REPORT": "1",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "EXTRA_ARGS": f"--served-model-name {SERVED_MODEL_NAME}",
-}
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 8192,
+        "max_running_requests": 8,
+        "torch_compile_max_bs": 8,
+        "chunked_prefill_size": 512,
+        "max_prefill_tokens": 512,
+        "max_total_tokens": int(DEVICE_POOL_TOKENS),
+        "model_path": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
+        "tpu_compile_tokens": [512],
+        "tpu_compile_bs": [1, 2, 4, 8],
+        "attention_backend": "pallas_tpu_rpa_v3",
+        "hicache_mem_layout": "page_first_fused",
+        "disable_radix_cache": False,
+        "enable_hierarchical_cache": True,
+        "hicache_io_backend": "raiden",
+        "hicache_ratio": float(HICACHE_RATIO),
+        "hicache_write_policy": "write_through",
+        "enable_cache_report": True,
+        "served_model_name": SERVED_MODEL_NAME,
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "qwen3-coder-480b-prefix-cache-kv-offload",
     "variant": "TP8+EP8+HiCache-raiden",
     "launch": {
-        "recipe": "recipe/qwen3_coder_480b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "qwen3-coder-480b-prefix-cache-kv-offload-e2e",
     },

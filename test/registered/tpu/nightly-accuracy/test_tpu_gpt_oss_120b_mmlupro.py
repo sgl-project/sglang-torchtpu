@@ -1,10 +1,12 @@
 """GPT-OSS 120B TPU MMLU-Pro nightly score."""
 
+from copy import deepcopy
+
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.gpt_oss_120b_eval_common import (
     BASE_URL,
-    make_launch_env,
+    CONFIG,
     make_model_config,
 )
 
@@ -15,12 +17,15 @@ register_tpu_ci(
     labels=["singlehost", "gpt-oss-120b", "accuracy"],
 )
 
-LAUNCH_ENV = make_launch_env(
-    MAX_TOTAL_TOKENS="1179648",
-    OSL="32768",
-    CONCUR="32",
-    CONTEXT_LEN="36864",
-    TPU_COMPILE_BS="1 2 4 8 16 32",
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "max_running_requests": 32,
+        "torch_compile_max_bs": 32,
+        "context_length": 36864,
+        "max_total_tokens": 1179648,
+        "tpu_compile_bs": [1, 2, 4, 8, 16, 32],
+    }
 )
 
 GATE = {
@@ -34,7 +39,7 @@ MODEL_CONFIG = make_model_config(
     test_name="gpt-oss-120b-mmlupro",
     series_id="accuracy-gpt-oss-120b-mmlupro",
     tag="mmlupro-e2e",
-    launch_env=LAUNCH_ENV,
+    launch_config=LAUNCH_CONFIG,
     gate=GATE,
 )
 

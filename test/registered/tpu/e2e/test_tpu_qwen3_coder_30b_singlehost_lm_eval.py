@@ -5,13 +5,20 @@ mmlu_llama / mmlu_pro ground truths and tolerances. The gate runs on lm-eval bec
 mmlu_pro has no simple-evals equivalent, and mmlu_llama's few-shot protocol is what
 the reference values were measured with.
 
-Serving config lives in recipe/qwen3_coder_30b_a3b_fp8.sh, which CI runs verbatim.
+Serving config lives in recipe/configs/qwen3_coder_30b_a3b_fp8.py, which CI runs verbatim.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.qwen3_coder_30b_a3b_fp8 import CONFIG
 
 register_tpu_ci(
     est_time=3600,
@@ -26,12 +33,14 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 
 
+LAUNCH_CONFIG = deepcopy(CONFIG)
+
 MODEL_CONFIG = {
     "model": MODEL_PATH,
     "test_name": "Qwen3-Coder-30B-A3B-Instruct-FP8",
     "variant": "TP8+EP8",
     "launch": {
-        "recipe": "recipe/qwen3_coder_30b_a3b_fp8.sh",
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "qwen3-coder-e2e",
     },

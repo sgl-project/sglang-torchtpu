@@ -1,14 +1,21 @@
-"""Single-chip Qwen3 config with small shapes for the compile-tracer e2e test."""
+"""Single-chip Qwen3 config with small shapes for the compile-tracer e2e test.
+
+Sample usage (from the repo root):
+    python3 -m benchmark.tpu.recipe.bench_matrix.serve_group \\
+        --config recipe/configs/qwen3_0_6b.py
+    # add --dry-run to print the resolved sglang.launch_server command
+    # (inherited base args included) without launching.
+"""
 
 from copy import deepcopy
 
-from benchmark.tpu.recipe.configs.base import CONFIG as BASE_CONFIG
+from benchmark.tpu.recipe.configs.base import _BASE_CONFIG
 
 INPUT_TOKENS = 64
 OUTPUT_TOKENS = 64
 CONCURRENCY = 1
 
-CONFIG = deepcopy(BASE_CONFIG)
+CONFIG = deepcopy(_BASE_CONFIG)
 CONFIG["server_args"].update(
     {
         "model_path": "Qwen/Qwen3-0.6B",

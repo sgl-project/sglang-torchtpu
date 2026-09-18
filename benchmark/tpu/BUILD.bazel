@@ -5,13 +5,30 @@ package(default_visibility = ["//visibility:public"])
 # Expose Python recipe configs to Bazel's hermetic Python interpreter.
 py_library(
     name = "python_configs",
-    srcs = glob(["recipe/configs/*.py"]),
+    srcs = ["//benchmark/tpu/recipe:py_files"],
     imports = ["../.."],
 )
 
-# Shell recipes, evaluation configs, and helper programs resolved at runtime by
-# sglang.test.tpu. Executable bits are preserved in Bazel runfiles.
+# Shell launchers, evaluation configs, and helper programs in this directory,
+# resolved at runtime by sglang.test.tpu. Executable bits are preserved in
+# Bazel runfiles.
+filegroup(
+    name = "pkg",
+    srcs = glob(["*"]),
+)
+
+# The whole benchmark/tpu tree, including helpers such as dump_meta.py and
+# the recipe configs used by the server launchers.
 filegroup(
     name = "runtime",
-    srcs = glob(["**"], exclude = ["BUILD.bazel"]),
+    srcs = [
+        ":pkg",
+        "//benchmark/tpu/recipe:pkg",
+    ],
+)
+
+# Compatibility label for callers that need the recipe subtree.
+alias(
+    name = "recipe",
+    actual = "//benchmark/tpu/recipe:pkg",
 )

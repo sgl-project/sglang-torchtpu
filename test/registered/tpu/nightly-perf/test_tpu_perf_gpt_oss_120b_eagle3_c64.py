@@ -11,9 +11,16 @@ serves from its own recipe rather than the accuracy nightly's.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # Longer than the non-speculative c64 file: bring-up also loads the draft model
 # and compiles the draft forward. Drives the JobSet poll budget.
@@ -49,6 +56,32 @@ NUM_STEPS, EAGLE_TOPK = 3, 1
 SIMULATE_ACC_LEN = 2.5
 
 
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": int(ISL) + int(OSL) + 64,
+        "max_running_requests": int(CONCUR),
+        "torch_compile_max_bs": int(CONCUR),
+        "chunked_prefill_size": min(max(int(ISL), 2048), 8192),
+        "max_prefill_tokens": min(max(int(ISL), 2048), 8192),
+        "max_total_tokens": 2 * (int(CONCUR)) * (int(ISL) + int(OSL) + 64),
+        "model_path": WEIGHTS,
+        "disable_radix_cache": True,
+        "tpu_compile_tokens": [ISL],
+        "tpu_compile_bs": [CONCUR],
+        "served_model_name": MODEL,
+        "speculative_algorithm": "EAGLE3",
+        "speculative_draft_model_path": DRAFT_MODEL,
+        "speculative_num_steps": NUM_STEPS,
+        "speculative_eagle_topk": EAGLE_TOPK,
+    }
+)
+LAUNCH_CONFIG["runtime_env"].update(
+    {
+        "SGLANG_SIMULATE_ACC_LEN": str(SIMULATE_ACC_LEN),
+    }
+)
+
 MODEL_CONFIG = {
     "model": MODEL,
     "test_name": "gpt-oss-120b-eagle3-c64",
@@ -56,29 +89,7 @@ MODEL_CONFIG = {
     "display_name": "GPT-OSS 120B EAGLE3 (c64)",
     "variant": "TP8+EP8+EAGLE3-c64",
     "launch": {
-        # Deltas over the c64 baseline: the draft model and its chain. The draft
-        # weights come out of the same MEM_FRACTION_STATIC budget as the target's
-        # KV pool, so if bring-up OOMs, that fraction is the knob -- not the pool
-        # size, which has to stay at the baseline's for the numbers to compare.
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": {
-            "MODEL": WEIGHTS,
-            "ISL": str(ISL),
-            "OSL": str(OSL),
-            "CONCUR": str(CONCUR),
-            "DISABLE_RADIX_CACHE": "1",
-            "TPU_COMPILE_TOKENS": str(ISL),
-            "TPU_COMPILE_BS": str(CONCUR),
-            "ENABLE_PROFILER_ENDPOINT": "0",
-            "SGLANG_SIMULATE_ACC_LEN": str(SIMULATE_ACC_LEN),
-            "EXTRA_ARGS": (
-                f"--served-model-name {MODEL} "
-                "--speculative-algorithm EAGLE3 "
-                f"--speculative-draft-model-path {DRAFT_MODEL} "
-                f"--speculative-num-steps {NUM_STEPS} "
-                f"--speculative-eagle-topk {EAGLE_TOPK}"
-            ),
-        },
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "perf-gpt-oss-eagle3-c64",
     },

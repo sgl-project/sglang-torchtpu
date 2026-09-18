@@ -15,10 +15,17 @@ controls. GSM8K then scores the same boot, with prefix caching still on.
 """
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # Bring-up plus the offload probe's ~26k tokens of filler prefill plus 200 GSM8K
 # examples. Above the 3600 the spec-decoding lane uses, by the probe's cost.
@@ -47,47 +54,39 @@ PROBE_TOKENS = 2048
 # are in terms of it -- a prefix match is floored to a page multiple.
 PAGE_SIZE = 64
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "ISL": "4096",
-    "OSL": "512",
-    "CONCUR": "64",
-    "CONTEXT_LEN": "8192",
-    "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
-    "PAGE_SIZE": str(PAGE_SIZE),
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
-    # raiden requires the RPA v3 backend (the only TPU backend with the HiCache
-    # reload-commit hook) and the fused page-first layout, and server_args rejects any
-    # other combination. Both are already the recipe's default -- pinned here so a
-    # recipe change cannot silently take the offload path away from this gate.
-    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-    "HICACHE_MEM_LAYOUT": "page_first_fused",
-    # Prefix caching is the substrate HiCache is built on, and launch_server.sh
-    # defaults it OFF.
-    "DISABLE_RADIX_CACHE": "0",
-    "KV_OFFLOAD": "1",
-    "HICACHE_IO_BACKEND": "raiden",
-    "HICACHE_RATIO": str(HICACHE_RATIO),
-    # Write through on every prefill so the probe is already on host by the time the
-    # fillers evict it. write_back would race that eviction and drop it instead.
-    "HICACHE_WRITE_POLICY": "write_through",
-    # cached_tokens_details in meta_info is how the gate tells a device hit from a
-    # host reload. Without this flag both read 0.
-    "ENABLE_CACHE_REPORT": "1",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss " f"--served-model-name {SERVED_MODEL_NAME}"
-    ),
-}
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 8192,
+        "max_running_requests": 64,
+        "torch_compile_max_bs": 64,
+        "chunked_prefill_size": min(max(4096, 2048), 8192),
+        "max_prefill_tokens": min(max(4096, 2048), 8192),
+        "max_total_tokens": int(DEVICE_POOL_TOKENS),
+        "model_path": "/weights/gpt-oss-120b",
+        "page_size": int(PAGE_SIZE),
+        "tpu_compile_tokens": [512, 2048, 4096],
+        "tpu_compile_bs": [1, 2, 4, 8, 16, 32, 64],
+        "attention_backend": "pallas_tpu_rpa_v3",
+        "hicache_mem_layout": "page_first_fused",
+        "disable_radix_cache": False,
+        "enable_hierarchical_cache": True,
+        "hicache_io_backend": "raiden",
+        "hicache_ratio": float(HICACHE_RATIO),
+        "hicache_write_policy": "write_through",
+        "enable_cache_report": True,
+        "reasoning_parser": "gpt-oss",
+        "served_model_name": SERVED_MODEL_NAME,
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-prefix-cache-kv-offload",
     "variant": "TP8+EP8+HiCache-raiden",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-prefix-cache-kv-offload-e2e",
     },

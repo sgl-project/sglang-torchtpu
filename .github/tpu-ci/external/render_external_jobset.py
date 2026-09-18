@@ -13,7 +13,7 @@ An external multi-host test declares a module-level MULTIHOST_LAUNCH dict and re
 external suite:
 
     MULTIHOST_LAUNCH = {
-        "launch_script": "recipe/qwen3_coder_30b_a3b_fp8.sh",  # relative to benchmark/tpu/
+        "launch_script": "recipe/configs/qwen3_coder_30b_a3b_fp8.py",  # relative to benchmark/tpu/
         "weights": "Qwen3-Coder-30B-A3B-Instruct-FP8",         # subdir under gs://<bucket>/weights/
         # "extra_args": "...",   # optional; overrides weights.default_extra_args
     }

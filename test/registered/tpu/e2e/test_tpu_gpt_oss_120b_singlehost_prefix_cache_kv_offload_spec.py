@@ -1,10 +1,17 @@
 """GPT-OSS-120B single-host prefix caching + KV offload (raiden) + EAGLE3 gate."""
 
 import os
+import sys
+from copy import deepcopy
+from pathlib import Path
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
 from sglang.test.tpu.kv_offload_probe import kv_offload_runner
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
+
+from benchmark.tpu.recipe.configs.gpt_oss_120b.server import CONFIG
 
 # Expected runtime: 45 minutes; CI uses this for scheduling and timeouts.
 register_tpu_ci(
@@ -32,48 +39,44 @@ HICACHE_RATIO = 3.0
 PROBE_TOKENS = 2048
 PAGE_SIZE = 64
 
-LAUNCH_ENV = {
-    "MODEL": "/weights/gpt-oss-120b",
-    "ISL": "4096",
-    "OSL": "512",
-    # Keep concurrency within the small device pool.
-    "CONCUR": "8",
-    "CONTEXT_LEN": "8192",
-    "MAX_TOTAL_TOKENS": str(DEVICE_POOL_TOKENS),
-    "PAGE_SIZE": str(PAGE_SIZE),
-    "TPU_COMPILE_TOKENS": "512 2048 4096",
-    "TPU_COMPILE_BS": "1 2 4 8",
-    # Raiden requires RPA v3 and the fused layout.
-    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
-    "HICACHE_MEM_LAYOUT": "page_first_fused",
-    # Enable the radix cache used by HiCache.
-    "DISABLE_RADIX_CACHE": "0",
-    "KV_OFFLOAD": "1",
-    "HICACHE_IO_BACKEND": "raiden",
-    "HICACHE_RATIO": str(HICACHE_RATIO),
-    # Copy the probe to host before device eviction.
-    "HICACHE_WRITE_POLICY": "write_through",
-    # Include cache-hit details in OpenAI API responses.
-    "ENABLE_CACHE_REPORT": "1",
-    "ENABLE_PROFILER_ENDPOINT": "0",
-    "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss "
-        f"--served-model-name {SERVED_MODEL_NAME} "
-        "--speculative-algorithm EAGLE3 "
-        f"--speculative-draft-model-path {DRAFT_MODEL_PATH} "
-        "--speculative-num-steps 3 "
-        "--speculative-eagle-topk 1 "
-        "--speculative-num-draft-tokens 4"
-    ),
-}
+
+LAUNCH_CONFIG = deepcopy(CONFIG)
+LAUNCH_CONFIG["server_args"].update(
+    {
+        "context_length": 8192,
+        "max_running_requests": 8,
+        "torch_compile_max_bs": 8,
+        "chunked_prefill_size": min(max(4096, 2048), 8192),
+        "max_prefill_tokens": min(max(4096, 2048), 8192),
+        "max_total_tokens": int(DEVICE_POOL_TOKENS),
+        "model_path": "/weights/gpt-oss-120b",
+        "page_size": int(PAGE_SIZE),
+        "tpu_compile_tokens": [512, 2048, 4096],
+        "tpu_compile_bs": [1, 2, 4, 8],
+        "attention_backend": "pallas_tpu_rpa_v3",
+        "hicache_mem_layout": "page_first_fused",
+        "disable_radix_cache": False,
+        "enable_hierarchical_cache": True,
+        "hicache_io_backend": "raiden",
+        "hicache_ratio": float(HICACHE_RATIO),
+        "hicache_write_policy": "write_through",
+        "enable_cache_report": True,
+        "reasoning_parser": "gpt-oss",
+        "served_model_name": SERVED_MODEL_NAME,
+        "speculative_algorithm": "EAGLE3",
+        "speculative_draft_model_path": DRAFT_MODEL_PATH,
+        "speculative_num_steps": 3,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 4,
+    }
+)
 
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "gpt-oss-120b-prefix-cache-kv-offload-spec",
     "variant": "TP8+EP8+HiCache-raiden+EAGLE3",
     "launch": {
-        "recipe": "recipe/gpt_oss_120b/server.sh",
-        "env": LAUNCH_ENV,
+        **LAUNCH_CONFIG,
         "health_timeout": HEALTH_TIMEOUT,
         "tag": "gpt-oss-prefix-cache-kv-offload-spec-e2e",
     },

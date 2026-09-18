@@ -61,7 +61,7 @@ def sglang_tpu_e2e_test(name, env = None, tags = None, **kwargs):
         torch.compile, and long evaluations; HEALTH_TIMEOUT only bounds startup
 
     Callers add the test-specific pieces: srcs/main, deps, data (typically
-    //benchmark/tpu:runtime), hardware-specific tags (e.g. requires-tpu-v7x),
+    //benchmark/tpu:recipe), hardware-specific tags (e.g. requires-tpu-v7x),
     and any extra env.
 
     Bazel's eternal timeout defaults to one hour without the repository's
