@@ -84,10 +84,10 @@ logger = logging.getLogger(__name__)
 # pieces of this size keep the overlap while costing a few reads per request.
 CHUNK_ANNOUNCE_TOKENS = 8192
 
-# TCP streams a resharding push spreads its blocks over, the same count
-# raiden's reads use per rank. One stream moves about 27 Gb/s, so a single
-# stream per prefill rank leaves most of the decode NIC idle.
-RESHARD_PUSH_STREAMS = 4
+# Parallelism of a resharding push: the blocks of one push are spread over this
+# many TCP connections, the count raiden's same-layout reads use per rank. On a
+# single connection a push fills only a fraction of the prefill rank's NIC.
+RESHARD_PUSH_PARALLELISM = 4
 
 # Base of the per-rank control ports (`base + 4*local_rank`). Not 30000: that
 # puts rank 0 on the default HTTP serving port, and the engine wins the bind --
@@ -2548,7 +2548,7 @@ class RaidenKVManager(CommonKVManager):
                         swa_blocks,
                         decode_swa_blocks,
                         layer_idx,
-                        parallelism=RESHARD_PUSH_STREAMS,
+                        parallelism=RESHARD_PUSH_PARALLELISM,
                     )
             # INFO, not debug: this is the only evidence the window actually
             # crossed. Everything else about a hybrid reshard looks identical
@@ -2715,7 +2715,7 @@ class RaidenKVManager(CommonKVManager):
                         prefill_blocks,
                         decode_blocks,
                         layer_idx,
-                        parallelism=RESHARD_PUSH_STREAMS,
+                        parallelism=RESHARD_PUSH_PARALLELISM,
                     )
         finally:
             # Frees the plan's staging on the sender; the receiver's is freed
