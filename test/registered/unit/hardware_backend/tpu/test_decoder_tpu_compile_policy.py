@@ -256,7 +256,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
 
         kv_pool = object()
         model_runner = SimpleNamespace(
-            model=SimpleNamespace(model=model),
+            model=model,
             token_to_kv_pool=kv_pool,
             is_draft_worker=False,
         )
@@ -272,7 +272,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
         compile_module.direct_compile = MagicMock(return_value=MagicMock())
 
         with patch.dict(sys.modules, {compile_module_name: compile_module}):
-            policy._compile(model.forward, model=model)
+            policy._direct_compile(model.forward)
 
         compile_module.direct_compile.assert_called_once()
         kwargs = compile_module.direct_compile.call_args.kwargs
