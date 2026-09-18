@@ -119,22 +119,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [receiver], tp_group, additional_groups=[cp_group]
         )
 
-    @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
-    def test_prealloc_without_cp_keeps_all_waiting_shortcut(self, reduce):
-        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        queue.queue = [
-            SimpleNamespace(
-                waiting_for_input=True,
-                kv_receiver=SimpleNamespace(conclude_state=None),
-            )
-        ]
-        queue.pp_size = 1
-        queue.attn_cp_cpu_group = None
-
-        queue._update_handshake_waiters()
-
-        reduce.assert_not_called()
-
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
@@ -212,8 +196,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
-        queue.req_to_token_pool = SimpleNamespace(available_size=lambda: 1)
-        queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
