@@ -219,7 +219,6 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         )
 
         worker = _make_worker(num_steps=3, num_draft_tokens=4)
-        worker.server_args.tpu_compile_tracer = "direct"
         worker.hot_token_id = None
 
         calls = []
@@ -240,8 +239,11 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 hidden_states=forward_batch.spec_info.hidden_states + 10,
             )
 
+        # The rebind-vs-copy branch reads the draft policy's tracer, so the
+        # fixture must carry the policy the fused loop is compiled by.
         worker.draft_runner = SimpleNamespace(
-            model=SimpleNamespace(forward=model_forward)
+            model=SimpleNamespace(forward=model_forward),
+            compile_policy=SimpleNamespace(tracer="direct"),
         )
         forward_batch = SimpleNamespace(
             input_ids=None,
