@@ -403,7 +403,9 @@ class RayEngine(Engine):
                     compute_single_host_tpu_env,
                 )
 
-                single_host_env = compute_single_host_tpu_env(get_parallel().tp_size)
+                single_host_env = compute_single_host_tpu_env(
+                    get_parallel().tp_size * get_parallel().pp_size
+                )
                 server_args = server_args.replace_resolved(
                     "ray.tpu_single_host_env",
                     # Force TPU_WORKER_HOSTNAMES="" into every actor. On a

@@ -3620,6 +3620,7 @@ class Scheduler(
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            one_partial_prefill=current_platform.is_tpu() and self.ps.pp_size > 1,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )
@@ -5585,7 +5586,7 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
-    initialize_torch_tpu_worker(server_args, tp_rank)
+    initialize_torch_tpu_worker(server_args, tp_rank, pp_rank)
 
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()

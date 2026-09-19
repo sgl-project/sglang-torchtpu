@@ -23,6 +23,9 @@ from torch_tpu._internal.compile import tpu_torch_compile
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     PallasForwardMetadata,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pp_proxy_pytree import (
+    register_pp_proxy_pytree,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -123,6 +126,8 @@ class KVPool(Protocol):
 tree_util.register_dataclass(ForwardBatch)
 tree_util.register_dataclass(PallasForwardMetadata)
 tree_util.register_dataclass(LogitsProcessorOutput)
+# Pipeline stages exchange PPProxyTensors as the compiled input and output.
+register_pp_proxy_pytree(tree_util)
 
 
 def direct_compile(
@@ -479,7 +484,21 @@ class _CompiledArtifact:
         for path, traced_shape in zip(
             self.tensor_inputs_key_paths, self.tensor_inputs_traced_shapes
         ):
-            value = _get_path(call, path)
+            try:
+                value = _get_path(call, path)
+            except (IndexError, KeyError, AttributeError) as exc:
+                # The raw error names only the failing subscript, not which
+                # input it belongs to, and the traceback stops inside the
+                # generic walker. A caller that reshapes the call between
+                # tracing and replay cannot act on that.
+                raise ValueError(
+                    "A direct_compile tensor input disappeared at runtime: "
+                    f"{tree_util.keystr(path)}, traced as {traced_shape}, is no "
+                    f"longer reachable ({type(exc).__name__}: {exc}). Runtime "
+                    f"call: {len(call[0])} positional, kwargs {sorted(call[1])}. "
+                    "Traced tensor inputs: "
+                    f"{[tree_util.keystr(p) for p in self.tensor_inputs_key_paths]}"
+                ) from exc
             if not _is_tpu_tensor(value):
                 raise TypeError(
                     "A direct_compile tensor input changed type at runtime: "

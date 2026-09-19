@@ -24,7 +24,10 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
@@ -99,6 +102,56 @@ def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
     return type(value) is type(default) and value == default
+
+
+def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
+    """Bring a pipeline proxy to the padded batch's token axis.
+
+    The ICI wave delivers the previous stage's activations at its fixed buffer
+    size (the largest token bucket), so a longer proxy is trimmed to this
+    stage's padded token count; a shorter one means the two stages padded to
+    different buckets and is rejected.
+    """
+    reference = input_ids if input_ids is not None else forward_batch.input_ids
+    if reference is None:
+        return proxy
+    expected = int(reference.shape[0])
+    tensors = {}
+    trimmed = False
+    for name, tensor in proxy.tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            rows = int(tensor.shape[0])
+            if rows < expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the previous pipeline "
+                    "stage and this one padded to different token buckets."
+                )
+            if rows > expected:
+                tensor = tensor[:expected]
+                trimmed = True
+        tensors[name] = tensor
+    return type(proxy)(tensors) if trimmed else proxy
+
+
+def _fit_pp_proxy_in_args(
+    args: tuple[Any, ...], input_ids: Any, forward_batch: Any
+) -> tuple[Any, ...]:
+    """Trim a pipeline proxy that arrived as a positional argument.
+
+    Most models hand the proxy to the compiled decoder as the
+    ``pp_proxy_tensors`` keyword, which the kwarg lookup above covers; several
+    (glm4_moe, kimi_k3, minimax_m3, sarvam_moe, ...) pass it positionally. A
+    proxy that slips past the lookup reaches direct_compile at the wave's full
+    row count, which the specialization key does not cover.
+    """
+    for index, value in enumerate(args):
+        if isinstance(value, PPProxyTensors):
+            fitted = _fit_pp_proxy_rows(value, input_ids, forward_batch)
+            if fitted is not value:
+                return args[:index] + (fitted,) + args[index + 1 :]
+            break
+    return args
 
 
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
@@ -685,6 +738,10 @@ class CompiledForwardShim:
         self._recompilation_checker = checker
         self._model_label = model_label
 
+    def _is_first_pp_stage(self) -> bool:
+        pp_group = self.policy.model_runner.pp_group
+        return pp_group is not None and bool(pp_group.is_first_rank)
+
     def wait_for_hicache_reload(self) -> None:
         """Wait for the current HiCache reload outside compiled regions."""
         model_runner = self.policy.model_runner
@@ -737,6 +794,18 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if pp_proxy_tensors is not None:
+            if self._is_first_pp_stage():
+                # The first stage embeds its own input; its graph takes no proxy.
+                kwargs.pop("pp_proxy_tensors")
+            else:
+                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
+                    pp_proxy_tensors, input_ids, forward_batch
+                )
+        elif any(isinstance(value, PPProxyTensors) for value in args):
+            if not self._is_first_pp_stage():
+                args = _fit_pp_proxy_in_args(args, input_ids, forward_batch)
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across

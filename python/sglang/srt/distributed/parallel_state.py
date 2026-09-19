@@ -119,6 +119,13 @@ class P2PWork:
     payload: Optional[torch.Tensor]
 
 
+def _tpu_pp_transfer():
+    """The TPU host-channel helpers for the tensor-dict hand-off."""
+    from sglang.srt.hardware_backend.tpu import pp_transfer
+
+    return pp_transfer
+
+
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
@@ -1748,6 +1755,11 @@ class GroupCoordinator:
                 # Skip sending empty tensors.
                 continue
 
+            if _is_tpu:
+                # TPU has no device send/recv: ship a host copy on the gloo
+                # cpu_group (the copy also waits for the producing program).
+                tensor = _tpu_pp_transfer().to_host(tensor)
+
             # send-allgather: send only a slice, then do allgather.
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
@@ -1786,9 +1798,22 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                # On TPU a device tensor arrives as a host copy on the gloo
+                # cpu_group and is uploaded to the sender's device type after
+                # the receive.
+                upload = _is_tpu and value.device != "cpu"
+                if upload:
+                    tensor = _tpu_pp_transfer().alloc_recv_buffer(
+                        value.size, value.dtype
+                    )
+                else:
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
+                    if upload:
+                        tensor = _tpu_pp_transfer().to_device(tensor, value.device)
                     tensor_dict[key] = tensor
                     continue
 
@@ -1813,6 +1838,8 @@ class GroupCoordinator:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
                     tensor = tensor.reshape(orig_shape)
 
+                if upload:
+                    tensor = _tpu_pp_transfer().to_device(tensor, value.device)
                 tensor_dict[key] = tensor
             else:
                 tensor_dict[key] = value
@@ -2735,6 +2762,9 @@ def initialize_model_parallel(
         group_ranks,
         get_world_group().local_rank,
         backend,
+        # The TPU stage hand-off runs on the gloo cpu_group; no NCCL
+        # communicator is ever used on the PP group there.
+        use_pynccl=False if _is_tpu else None,
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,

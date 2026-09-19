@@ -185,6 +185,7 @@ class TestTpuGraphRunner(CustomTestCase):
             is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             server_args=server_args,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
     def _annotate(self, model: Any) -> Any:

@@ -135,6 +135,44 @@ PROFILE=smoke MODE=colocated ./run_nightly.sh     # plumbing check
 SGLANG_USE_RAY=1 NNODES=2 MODE=colocated ./run_nightly.sh
 ```
 
+## Pipeline parallelism (PP8 x TP1)
+
+`--pp-size N --tp-size 1` runs N pipeline stages, one chiplet per stage, on
+one host. Each stage owns `num_hidden_layers / N` layers and its own KV pool
+for those layers; the stages hand their activations (hidden states and
+residual summed into one buffer, padded to the largest token bucket under
+`--enable-torch-compile`) to the next stage over ICI, as one `jax.lax.ppermute`
+collective-permute ring per iteration (`pp_wave.py`), and the last stage
+samples. Each stage logs `pipeline wave stage r/N: hand-off cycle over devices
+[...]` once at startup; the gloo `cpu_group` carries only the last stage's
+output dict and control traffic.
+Set `--pp-max-micro-batch-size` so that `max_running_requests /
+pp_max_micro_batch_size >= pp_size`: the pipeline is full only when at least
+one microbatch per stage is in flight (the default is `max_running_requests /
+pp_size`, i.e. half the stages idle at 4-request microbatches). Long prompts
+are still split by `--chunked-prefill-size`.
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+TP_SIZE=1 PP_SIZE=8 PP_MAX_MICRO_BATCH_SIZE=4 \
+PAGE_SIZE=128 CONTEXT_LEN=32768 CONC=32 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MAX_TOTAL_TOKENS=1048576 MEM_FRACTION_STATIC=0.30 \
+TORCH_COMPILE_MAX_BS=32 \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
+```
+
+Supported: `--enable-torch-compile` and eager, chunked prefill,
+`--kv-cache-dtype fp8_e4m3`, `--max-total-tokens` (every stage sizes its pool
+to the smallest stage). Rejected at launch with `--pp-size > 1` on TPU:
+`--tp-size > 1` (a pipeline stage is one device), speculative decoding, and
+`--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
+`--ep-size` and `--dp-size` have not been run with pipeline parallelism on
+TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
+stage waiting for the previous stage looks idle to the watchdog, so pass
+`--watchdog-timeout` at least `pp_size` times the longest microbatch.
+
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
 

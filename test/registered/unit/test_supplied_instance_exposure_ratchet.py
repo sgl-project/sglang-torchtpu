@@ -145,7 +145,6 @@ _EXPOSED: frozenset = frozenset(
         ("hardware_backend/tpu/tpu_platform.py", "model_path"),
         ("layers/dp_attention.py", "device"),
         # The Ray driver rows are gone: test_ray_driver_reads_the_bags.py pins those at zero.
-        ("utils/patch_torch.py", "device"),
     }
 )
 

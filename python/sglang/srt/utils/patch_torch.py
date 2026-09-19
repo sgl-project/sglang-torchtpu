@@ -104,7 +104,7 @@ def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
-def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
+def monkey_patch_torch_tpu_env(server_args, tp_rank: int, pp_rank: int = 0):
     """Set TorchTPU's per-worker distributed environment.
 
     Sets torchrun-style env vars for torch_tpu's PJRT slicebuilder
@@ -112,24 +112,33 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     in each worker reads these to coordinate; sglang's mp.Process spawn path
     doesn't otherwise set them.
 
+    The PJRT world is one slice of ``tp_size * pp_size`` devices, one per
+    scheduler process, in the same rank order torch.distributed uses
+    (``pp_rank * tp_size + tp_rank``). Under pipeline parallelism every stage
+    therefore binds its own device, exactly as the ranks of a TP-only run do.
+
     No-op for non-TPU runs.
     """
-    if server_args.device != "tpu":
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    cfg = resolving_view(server_args)
+    if cfg.device != "tpu":
         return
 
     import os
 
-    world_size = server_args.tp_size
-    local_world_size = max(world_size // server_args.nnodes, 1)
-    os.environ["RANK"] = str(tp_rank)
-    os.environ["LOCAL_RANK"] = str(tp_rank % local_world_size)
+    world_size = cfg.tp_size * cfg.pp_size
+    rank = pp_rank * cfg.tp_size + tp_rank
+    local_world_size = max(world_size // cfg.nnodes, 1)
+    local_rank = rank % local_world_size
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
 
     if envs.SGLANG_TPU_PD_COLOCATED.get():
-        assert not server_args.use_ray, "TPU P/D co-location does not support Ray"
-        local_rank = tp_rank % local_world_size
-        physical_device = server_args.base_gpu_id + local_rank * server_args.gpu_id_step
+        assert not cfg.use_ray, "TPU P/D co-location does not support Ray"
+        physical_device = cfg.base_gpu_id + local_rank * cfg.gpu_id_step
         # Assign an individual TPU device to each rank.
         os.environ["TPU_VISIBLE_DEVICES"] = str(physical_device)
 
@@ -140,7 +149,7 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     # path a launcher (e.g. torchrun) may have set MASTER_ADDR correctly, so only
     # fill it in when unset (defaulting to hosts[0] for multihost, else loopback).
     hosts = [h for h in os.environ.get("TPU_WORKER_HOSTNAMES", "").split(",") if h]
-    if server_args.use_ray and len(hosts) > 1:
+    if cfg.use_ray and len(hosts) > 1:
         os.environ["MASTER_ADDR"] = hosts[0]
     else:
         os.environ.setdefault(
@@ -149,10 +158,13 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int):
     os.environ.setdefault("MASTER_PORT", "29500")
 
 
-def initialize_torch_tpu_worker(server_args, tp_rank: int):
+def initialize_torch_tpu_worker(server_args, tp_rank: int, pp_rank: int = 0):
     """Configure and initialize TorchTPU in a scheduler worker."""
-    monkey_patch_torch_tpu_env(server_args, tp_rank)
-    if server_args.device != "tpu":
+    monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank)
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+
+    cfg = resolving_view(server_args)
+    if cfg.device != "tpu":
         return
 
     from sglang.srt.platforms import current_platform

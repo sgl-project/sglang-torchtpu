@@ -1,9 +1,13 @@
-"""Unit tests for model-runner layer discovery."""
+"""Unit tests for model-runner layer discovery and pipeline ownership."""
 
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    adjust_hybrid_swa_layer_ids,
     compute_attention_and_moe_layers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +48,61 @@ class TestComputeAttentionAndMoeLayers(unittest.TestCase):
 
         self.assertEqual(attention_layers, [None, None, local_attention])
         self.assertEqual(mha_companion_layers, [None, None, None])
+
+
+class TestAdjustHybridSWALayerIds(unittest.TestCase):
+    @staticmethod
+    def _model_config(*, is_deepseek_v4_arch=False):
+        return SimpleNamespace(
+            full_attention_layer_ids=list(range(1, 36, 2)),
+            swa_attention_layer_ids=list(range(0, 36, 2)),
+            is_deepseek_v4_arch=is_deepseek_v4_arch,
+        )
+
+    def test_pipeline_stages_own_each_hybrid_layer_once(self):
+        for pp_size in (1, 8):
+            with self.subTest(pp_size=pp_size), patch.dict(os.environ):
+                os.environ.pop("SGLANG_PP_LAYER_PARTITION", None)
+                full_ids = []
+                swa_ids = []
+                for rank in range(pp_size):
+                    start, end = get_pp_indices(36, rank, pp_size)
+                    config = self._model_config()
+                    adjust_hybrid_swa_layer_ids(
+                        model_config=config,
+                        start_layer=start,
+                        end_layer=end,
+                        is_hybrid_swa=True,
+                    )
+                    self.assertEqual(
+                        sorted(
+                            config.full_attention_layer_ids
+                            + config.swa_attention_layer_ids
+                        ),
+                        list(range(start, end)),
+                    )
+                    full_ids.extend(config.full_attention_layer_ids)
+                    swa_ids.extend(config.swa_attention_layer_ids)
+
+                self.assertEqual(full_ids, list(range(1, 36, 2)))
+                self.assertEqual(swa_ids, list(range(0, 36, 2)))
+
+    def test_non_hybrid_and_deepseek_v4_keep_layer_ids(self):
+        for hybrid, deepseek in ((False, False), (True, True)):
+            with self.subTest(is_hybrid_swa=hybrid, is_deepseek_v4_arch=deepseek):
+                config = self._model_config(is_deepseek_v4_arch=deepseek)
+                full_ids = config.full_attention_layer_ids
+                swa_ids = config.swa_attention_layer_ids
+                adjust_hybrid_swa_layer_ids(
+                    model_config=config,
+                    start_layer=4,
+                    end_layer=8,
+                    is_hybrid_swa=hybrid,
+                )
+                self.assertIs(config.full_attention_layer_ids, full_ids)
+                self.assertIs(config.swa_attention_layer_ids, swa_ids)
+                self.assertEqual(full_ids, list(range(1, 36, 2)))
+                self.assertEqual(swa_ids, list(range(0, 36, 2)))
 
 
 if __name__ == "__main__":

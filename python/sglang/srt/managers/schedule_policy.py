@@ -529,6 +529,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        one_partial_prefill: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -539,6 +540,10 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
+        # Start a new partial prefill only when none is in flight: a pipeline
+        # keeps the in-flight one in another micro-batch, whose continuation
+        # this batch does not carry.
+        self.one_partial_prefill = one_partial_prefill
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -1090,7 +1095,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1204,6 +1209,9 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            if has_chunked_req and self.one_partial_prefill:
+                return AddReqResult.OTHER
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -1239,7 +1247,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1405,6 +1413,9 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
+                if has_chunked_req and self.one_partial_prefill:
+                    return AddReqResult.OTHER
+
                 # Make sure at least one page is available
                 trunc_len = chunk_tokens_limit // self.page_size * self.page_size
 

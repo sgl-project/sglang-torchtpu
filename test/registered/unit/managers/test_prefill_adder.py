@@ -2,8 +2,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.managers.schedule_policy as schedule_policy
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -91,6 +93,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
+        req.kv = ReqKvInfo()
         req.rid = str(rid)
         req.priority = priority
         req.prefix_indices = []
@@ -119,6 +122,124 @@ class TestPrefillAdder(CustomTestCase):
         )
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
+
+    def _continuation_adder(self, rem_chunk_tokens=512):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.is_tree_cache.return_value = False
+        self.mock_token_allocator.available_size.return_value = 65536
+        self.mock_token_allocator.full_available_size.return_value = 65536
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=128,
+            rem_chunk_tokens=rem_chunk_tokens,
+            one_partial_prefill=True,
+        )
+
+    def _continuation_candidate(self, tokens, rid="waiting", ignore_eos=False):
+        req = self._create_delayer_req(tokens)
+        req.rid = rid
+        req.origin_input_ids = list(range(tokens))
+        req.sampling_params = SimpleNamespace(max_new_tokens=16, ignore_eos=ignore_eos)
+        req.swa_host_hit_length = 0
+        return req
+
+    def test_existing_continuation_rejects_partial_after_empty_host_load(self):
+        adder = self._continuation_adder(rem_chunk_tokens=128)
+        req = self._continuation_candidate(16389)
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.host_hit_length = 16384
+        req.best_match_node = MagicMock()
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.empty(0, dtype=torch.int64),
+            req.last_node,
+        )
+        result = adder.add_one_req(req, True, None)
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(req.kv.cache_protected_len, 0)
+        self.assertEqual(len(req.prefix_indices), 0)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 128)
+
+    def test_existing_continuation_allows_completed_host_loaded_tail(self):
+        adder = self._continuation_adder(rem_chunk_tokens=128)
+        req = self._continuation_candidate(16389)
+        req.prefix_indices = torch.empty(0, dtype=torch.int64)
+        req.host_hit_length = 16384
+        req.best_match_node = MagicMock()
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (
+            torch.arange(16384),
+            req.best_match_node,
+        )
+        adder.add_one_req(req, True, None)
+        self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(req.kv.cache_protected_len, 16384)
+        self.assertEqual(len(req.prefix_indices), 16384)
+        self.assertEqual(adder.can_run_list, [req])
+        req.set_extend_range.assert_called_once_with(16384, 16389)
+        self.assertIsNone(adder.new_chunked_req)
+        self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_swa_clipping_respects_existing_continuation(self):
+        for has_chunked_req in (False, True):
+            with self.subTest(has_chunked_req=has_chunked_req):
+                adder = self._continuation_adder(rem_chunk_tokens=256)
+                adder.is_hybrid_swa = True
+                self.mock_tree_cache.sliding_window_size = 128
+                self.mock_token_allocator.size_swa = 512
+                self.mock_token_allocator.swa_available_size.return_value = 384
+                req = self._continuation_candidate(256)
+                result = adder.add_one_req(req, has_chunked_req, None)
+                if has_chunked_req:
+                    self.assertEqual(result, AddReqResult.OTHER)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(adder.new_chunked_req)
+                    req.set_extend_range.assert_not_called()
+                else:
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertIs(adder.new_chunked_req, req)
+                    req.set_extend_range.assert_called_once_with(0, 128)
+
+    def test_ignore_eos_respects_existing_continuation(self):
+        for has_chunked_req in (False, True):
+            with self.subTest(has_chunked_req=has_chunked_req):
+                adder = self._continuation_adder(rem_chunk_tokens=128)
+                self.mock_tree_cache.disable = True
+                req = self._continuation_candidate(512, ignore_eos=True)
+                result = adder.add_one_req(req, has_chunked_req, None)
+                if has_chunked_req:
+                    self.assertEqual(result, AddReqResult.OTHER)
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(adder.new_chunked_req)
+                    self.assertEqual(adder.rem_chunk_tokens, 128)
+                else:
+                    self.assertEqual(adder.can_run_list, [req])
+                    self.assertIs(adder.new_chunked_req, req)
+                    req.set_extend_range.assert_called_once_with(0, 128)
+
+    def test_whole_requests_pack_beside_an_existing_continuation(self):
+        for ignore_eos in (False, True):
+            with self.subTest(ignore_eos=ignore_eos):
+                adder = self._continuation_adder()
+                self.mock_tree_cache.disable = ignore_eos
+                requests = [
+                    self._continuation_candidate(tokens, str(tokens), ignore_eos)
+                    for tokens in (5, 129)
+                ]
+                for req in requests:
+                    self.assertEqual(
+                        adder.add_one_req(req, True, None), AddReqResult.CONTINUE
+                    )
+                    req.set_extend_range.assert_called_once_with(
+                        0, len(req.full_untruncated_fill_ids)
+                    )
+                self.assertEqual(adder.can_run_list, requests)
+                self.assertIsNone(adder.new_chunked_req)
+                self.assertEqual(adder.rem_chunk_tokens, 128)
 
     def test_preempt_success_high_priority_values_first(self):
         params = [

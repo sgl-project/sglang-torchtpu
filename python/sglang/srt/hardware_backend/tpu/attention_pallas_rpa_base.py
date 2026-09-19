@@ -44,7 +44,7 @@ from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_expor
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -376,6 +376,9 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
 
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
+    # One device per pipeline stage: the host copy of the extend lengths is
+    # read instead of the device tensor (set from the parallel context at init).
+    _pipeline_stage: bool = False
 
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
@@ -392,6 +395,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
         super().__init__()
         self.device = model_runner.device
         self.speculative_step_id = speculative_step_id
+        self._pipeline_stage = get_parallel().pp_size > 1
         self.page_size = model_runner.page_size
         self.max_context_len = (
             model_runner.model_config.context_len + get_req_to_token_extra_context_len()
@@ -762,7 +766,15 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
             # EXTEND and DRAFT_EXTEND use current lengths.
             assert forward_batch.extend_seq_lens is not None
             kv_lens = forward_batch.seq_lens.to(torch.int32)
-            extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
+            # A pipeline stage reads the host copy: reading the device copy
+            # back would wait for every program queued before it, the
+            # previous stage's forward included.
+            if self._pipeline_stage and forward_batch.extend_seq_lens_cpu is not None:
+                extend_seq_lens = torch.tensor(
+                    forward_batch.extend_seq_lens_cpu[:bs], dtype=torch.int32
+                )
+            else:
+                extend_seq_lens = forward_batch.extend_seq_lens.to("cpu", torch.int32)
         else:
             kv_lens = forward_batch.seq_lens.to(torch.int32)
             if (

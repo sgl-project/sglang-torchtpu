@@ -55,6 +55,11 @@
 #   HOST=127.0.0.1
 #   PORT=30000
 #   TP_SIZE=8                      # tensor-parallel ranks (= chiplets)
+#   PP_SIZE=1                      # pipeline stages; >1 passes --pp-size N and
+#                                  # requires TP_SIZE=1 (one chiplet per stage,
+#                                  # TP_SIZE*PP_SIZE chiplets in all)
+#   PP_MAX_MICRO_BATCH_SIZE=       # requests per pipeline microbatch; passed
+#                                  # only when set (default MAX_RUNNING/PP_SIZE)
 #   EP_SIZE=                       # expert-parallel ranks; passed only when set.
 #                                  # Default off (sglang ep_size=1: experts run
 #                                  # tensor-parallel within the TP group). For a
@@ -214,6 +219,10 @@ else
 fi
 
 TP_SIZE=${TP_SIZE:-$DEFAULT_TP}
+PP_SIZE=${PP_SIZE:-1}
+PP_MAX_MICRO_BATCH_SIZE=${PP_MAX_MICRO_BATCH_SIZE:-}
+# One PjRt device per scheduler process: TP ranks per stage times stages.
+WORLD_SIZE_DEVICES=$((TP_SIZE * PP_SIZE))
 EP_SIZE=${EP_SIZE:-}
 # DP attention: attention runs data-parallel across DP_SIZE groups of
 # TP_SIZE/DP_SIZE ranks each ("attn_tp"), while the MoE stays TP/EP-sharded.
@@ -266,8 +275,8 @@ if [[ -n "$JAX_BAZEL" ]]; then
     export PYTHONPATH="${_jax_pp}${PYTHONPATH:+:$PYTHONPATH}"
 fi
 
-# Chiplet visibility, derived from TP_SIZE.
-if [[ "$TP_SIZE" == "1" ]]; then
+# Chiplet visibility, derived from the device count (TP_SIZE * PP_SIZE).
+if [[ "$WORLD_SIZE_DEVICES" == "1" ]]; then
     # tp=1: torch_tpu requires exactly one addressable PjRt device at
     # process-group init (process_group_tpu.cc: "expected exactly one TPU
     # device per PyTorch process."). On a multichip host the PjRt client would
@@ -276,8 +285,8 @@ if [[ "$TP_SIZE" == "1" ]]; then
     export TPU_CHIPS_PER_HOST_BOUNDS=${TPU_CHIPS_PER_HOST_BOUNDS:-1,1,1}
     export TPU_HOST_BOUNDS=${TPU_HOST_BOUNDS:-1,1,1}
 else
-    # tp>1: leave all chiplets visible. hardware_backend/tpu/patches.py::
-    # _prepare_tpu_env(world_size=TP_SIZE) sets TORCH_TPU_TOPOLOGY and
+    # tp*pp>1: leave all chiplets visible. hardware_backend/tpu/patches.py::
+    # _prepare_tpu_env(world_size=TP_SIZE*PP_SIZE) sets TORCH_TPU_TOPOLOGY and
     # TORCH_TPU_SLICEBUILDER_ADDRESSES per-worker, so do NOT pin
     # TPU_VISIBLE_CHIPS / TPU_CHIPS_PER_HOST_BOUNDS — that would mask chiplets
     # and break the slicebuilder handshake.
@@ -403,6 +412,7 @@ echo "==== launch config ===="
 echo "  model              = $MODEL"
 echo "  model_slug         = $MODEL_SLUG"
 echo "  tp_size            = $TP_SIZE"
+echo "  pp_size            = $PP_SIZE  (micro-batch=${PP_MAX_MICRO_BATCH_SIZE:-<default>})"
 if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
   if [[ "$USE_RAY" == "1" ]]; then
     echo "  multihost          = ray-discovered (nnodes hint=$NNODES, chips/host=$CHIPS_PER_HOST)"
@@ -466,6 +476,10 @@ args=(
 [[ -n "$TPU_COMPILE_BS" ]] && args+=(--tpu-compile-bs $TPU_COMPILE_BS)
 [[ -n "$NUM_CONTINUOUS_DECODE_STEPS" ]] && args+=(--num-continuous-decode-steps "$NUM_CONTINUOUS_DECODE_STEPS")
 [[ -n "$EP_SIZE" ]] && args+=(--ep-size "$EP_SIZE")
+if (( PP_SIZE > 1 )); then
+    args+=(--pp-size "$PP_SIZE")
+    [[ -n "$PP_MAX_MICRO_BATCH_SIZE" ]] && args+=(--pp-max-micro-batch-size "$PP_MAX_MICRO_BATCH_SIZE")
+fi
 # --enable-dp-lm-head is not optional here: tpu_platform.apply_server_args_defaults
 # REJECTS attn_tp > 1 under DP attention without it ("--enable-dp-lm-head must be
 # enabled"), so a tp=16 dp=4 launch dies in prepare_server_args before the server
@@ -542,6 +556,7 @@ if [[ "$DUMP_META" == "1" ]]; then
         --set dtype=bfloat16 \
         --set device=tpu \
         --set tp_size="$TP_SIZE" \
+        --set pp_size="$PP_SIZE" \
         --set ep_size="${EP_SIZE:-}" \
         --set dp_size="${DP_SIZE:-}" \
         --set attn_tp_size="$ATTN_TP_SIZE" \

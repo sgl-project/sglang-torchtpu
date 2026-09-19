@@ -1145,6 +1145,7 @@ def _policy(model):
         model=model,
         # Read by the HiCache reload gate on every eager call.
         token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     return policy
 

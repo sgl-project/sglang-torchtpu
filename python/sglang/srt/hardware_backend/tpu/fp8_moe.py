@@ -275,7 +275,19 @@ def prepare_tpu_fp8_moe_weights(
     if block_quant and weight_block_size is None:
         raise ValueError("TPU block-FP8 MoE requires weight_block_size.")
 
-    if block_quant and _get_tpu_fp8_runtime() == "channelwise":
+    pipeline_stage = get_parallel().pp_size > 1
+    if pipeline_stage:
+        # A pipeline stage holds every expert of its layers on one device, so
+        # the runtime weights are converted and transposed a few experts at a
+        # time instead of through whole-layer intermediates.
+        from sglang.srt.hardware_backend.tpu.expert_loading import (
+            prepare_pipeline_stage_fp8_moe_weights,
+        )
+
+        block_quant = prepare_pipeline_stage_fp8_moe_weights(
+            layer, block_quant=block_quant, weight_block_size=weight_block_size
+        )
+    elif block_quant and _get_tpu_fp8_runtime() == "channelwise":
         print_warning_once(
             "TPU FP8 MoE is converting block-FP8 checkpoint weights to "
             "channelwise runtime scales by default for performance. Use "
@@ -287,9 +299,10 @@ def prepare_tpu_fp8_moe_weights(
 
     # gmm_v2 consumes RHS weights as [expert, K, N]. SGLang loads MoE weights
     # as [expert, N, K], so make the TPU runtime layout explicit at load time.
-    for name in ("w13_weight", "w2_weight"):
-        param = getattr(layer, name)
-        param.data = param.data.transpose(1, 2).contiguous()
+    if not pipeline_stage:
+        for name in ("w13_weight", "w2_weight"):
+            param = getattr(layer, name)
+            param.data = param.data.transpose(1, 2).contiguous()
 
     if block_quant:
         old_w13_scale = layer.w13_weight_scale_inv.data

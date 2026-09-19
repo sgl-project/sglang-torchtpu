@@ -829,6 +829,11 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
             )
         else:
             chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
+            if get_parallel().pp_size > 1:
+                # A pipeline stage keeps one chunk per pipeline slot in flight.
+                chunks_in_flight *= (
+                    get_parallel().pp_size + get_parallel().pp_async_batch_depth
+                )
             self._swa_cap = (
                 per_request * num_reqs
                 + chunks_in_flight * get_schedule().chunked_prefill_size

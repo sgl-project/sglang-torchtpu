@@ -157,6 +157,7 @@ def _model_runner(device="cpu"):
         model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
 
 
@@ -259,6 +260,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             model=model,
             token_to_kv_pool=kv_pool,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
         policy = policy_cls(
             model_runner=model_runner,
@@ -519,16 +521,18 @@ class TestInstallExtendCap(_PolicyTestCase):
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
         )
-        # install() takes the compile grid from the bags; prefill_max_requests stays on the instance.
+        # install() reads the compile grid and prefill cap from the published config.
         self.publish_config(
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
             torch_compile_max_bs=64,
+            prefill_max_requests=prefill_max_requests,
         )
         model_runner = SimpleNamespace(
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=prefill_max_requests,
@@ -584,6 +588,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             # The context limit applies to each request, while the flattened
             # token dimension covers the aggregate prefill batch.
             model_config=SimpleNamespace(context_len=4096),
@@ -635,6 +640,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -695,6 +701,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=True,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -752,6 +759,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=True,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -1529,6 +1537,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
         ),
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
     )
 
@@ -1909,6 +1918,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         target_hidden_size=32,
         draft_token_num=4,
         is_draft_worker=True,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         tracer="dynamo",
     ):
         model = SimpleNamespace(
@@ -1931,6 +1941,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             ),
             model_config=SimpleNamespace(hidden_size=hidden_size, model_is_mrope=False),
             is_draft_worker=is_draft_worker,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
         )
         # _infer_dflash_block_size reads get_spec() at construction; publish the block size.
@@ -2368,6 +2379,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             bs_buckets=(1, 4),
             draft_token_num=4,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
         # precompile() reads get_disagg().disaggregation_mode per call; scope each half.
@@ -2384,6 +2396,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             bs_buckets=(1, 4),
             draft_token_num=4,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
         with (
@@ -3105,6 +3118,7 @@ def _policy():
     model_runner = SimpleNamespace(
         model=SimpleNamespace(forward=None, prepare_forward_batch=None),
         is_draft_worker=False,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         model_config=SimpleNamespace(hidden_size=16, model_is_mrope=False),
     )
     with _target_model_config():

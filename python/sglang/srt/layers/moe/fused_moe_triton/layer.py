@@ -1147,6 +1147,23 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        if _is_tpu and param.device.type == "tpu" and "input_scale" not in weight_name:
+            from sglang.srt.hardware_backend.tpu.expert_loading import (
+                get_expert_stager,
+            )
+
+            stager = get_expert_stager()
+            if stager is not None and stager.staging(param):
+                self._weight_loader_impl(
+                    param=stager.host_param(param),
+                    loaded_weight=loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                stager.written(param, expert_id, shard_id)
+                return
+
         tp_rank = self.moe_tp_rank
 
         # Special case for GGUF weights
