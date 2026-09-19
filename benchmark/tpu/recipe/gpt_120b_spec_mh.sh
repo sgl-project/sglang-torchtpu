@@ -24,7 +24,7 @@ spec_args=(
   --speculative-num-steps 3
   --speculative-eagle-topk 1
   --speculative-num-draft-tokens 4
-  --tpu-compile-tracer dynamo
+  --tpu-compile-tracer direct
 )
 
 exec env \
