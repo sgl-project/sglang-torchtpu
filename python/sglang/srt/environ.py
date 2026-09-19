@@ -557,6 +557,8 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
+    SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)

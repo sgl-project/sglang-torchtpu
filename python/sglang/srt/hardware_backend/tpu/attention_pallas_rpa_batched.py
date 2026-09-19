@@ -133,6 +133,21 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
 
     kernel_spec = RPA_BATCHED_SPEC
 
+    def __init__(self, model_runner, speculative_step_id=0):
+        super().__init__(model_runner, speculative_step_id)
+        from sglang.srt.runtime_context import get_parallel
+
+        self._pp_schedule_runner = model_runner if get_parallel().pp_size > 1 else None
+
+    def init_forward_metadata(self, forward_batch):
+        if self._pp_schedule_runner is not None:
+            from sglang.srt.hardware_backend.tpu.pp_attention_capacity import (
+                check_batch_schedule,
+            )
+
+            check_batch_schedule(self._pp_schedule_runner, self, forward_batch)
+        super().init_forward_metadata(forward_batch)
+
 
 class TpuPallasRpaBatchedMultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):
     """One batched-RPA backend per EAGLE draft decode step."""

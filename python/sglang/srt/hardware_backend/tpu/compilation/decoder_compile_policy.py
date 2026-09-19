@@ -987,7 +987,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
-    ) -> None:
+        profile_prefix: int | None = None,
+    ) -> float | None:
         """Build and execute one dummy forward pass for compilation."""
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -1000,6 +1001,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch = (
             kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         )
+        if profile_prefix is not None:
+            from sglang.srt.hardware_backend.tpu.pp_profile import set_profile_inputs
+
+            args, kwargs = set_profile_inputs(
+                self, forward_batch, args, kwargs, num_tokens, profile_prefix
+            )
+
         if spec_info is None:
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
                 forward_batch.sampling_info = self._make_top_k_warmup_sampling_info(bs)
@@ -1032,18 +1040,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             forward_context,
         )
 
+        # Profiling enters at the outer model: only that wrapper passes
+        # input_embeds and the proxy positionally, and direct_compile resolves
+        # its recorded tensor paths against that exact call structure.
+        entry = model if profile_prefix is not None else self.owner
+
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with (
             forward_context(ForwardContext(attn_backend=forward_attn_backend)),
             torch.no_grad(),
         ):
-            out = self.owner.forward(*args, **kwargs)
+            started = time.perf_counter()
+            out = entry.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
             _materialize_out(
                 out,
                 forward_attn_backend,
                 self.model_runner.token_to_kv_pool,
             )
+
+        if profile_prefix is not None:
+            return (time.perf_counter() - started) * 1000
+        return None
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         return _unpad_decoder_outputs(outputs, forward_batch)

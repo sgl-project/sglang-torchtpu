@@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
 
@@ -944,6 +944,24 @@ def build_bucketers(
     else:
         token_bucketer = PowerBucketer(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
+        )
+
+    from sglang.srt.hardware_backend.tpu.pp_chunks import uses_dynamic_chunks
+
+    if uses_dynamic_chunks():
+        from sglang.srt.hardware_backend.tpu.pp_chunks import (
+            chunk_buckets,
+            chunk_granularity,
+        )
+
+        granularity = chunk_granularity(get_schedule().page_size, max_t, True)
+        token_bucketer = Bucketer(
+            name="TokenBucketer",
+            buckets=sorted(
+                set(
+                    token_bucketer.buckets + chunk_buckets(max_t, granularity) + [max_t]
+                )
+            ),
         )
 
     # tpu_compile_bs is reconciled in resolution; read the resolved leaf.
