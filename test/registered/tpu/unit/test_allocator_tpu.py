@@ -320,14 +320,14 @@ class TestFreeRoundTrip(CustomTestCase):
     def test_free_segment_int64_preserves_pool_dtype_for_decode(self):
         # Radix-cache eviction frees int64 node values through free_segment.
         # When need_sort is enabled for P/D disaggregation, released pages pass
-        # through release_pages and merge_and_sort_free. An upcasted pool causes
+        # through staged_pages and merge_and_sort_free. An upcasted pool causes
         # mixed-dtype index_put rejections during boundary-crossing decode allocations.
         a = _make_allocator(size=32, page_size=4, need_sort=True)
         allocated = a.alloc(4)
 
         a.free_segment(allocated.to(torch.int64), start_pos=0)
-        self.assertEqual(a.release_pages.dtype, torch.int32)
-        a.merge_and_sort_free(device="cpu")
+        self.assertTrue(all(pages.dtype == torch.int32 for pages in a.staged_pages))
+        a.merge_and_sort_free()
 
         self.assertEqual(a.free_pages.dtype, torch.int32)
         out = a.alloc_decode(
@@ -536,58 +536,56 @@ class TestAllocExtend(CustomTestCase):
 
 class TestNeedSortMergePath(CustomTestCase):
     """``need_sort=True`` (PD-disaggregation mode) routes frees into
-    ``release_pages`` and defers consolidation to ``merge_and_sort_free``.
+    ``staged_pages`` and defers consolidation to ``merge_and_sort_free``.
     The default ``need_sort=False`` suites never touch this path; these
     exercise it on CPU (sort correctness + the auto-merge-when-short guard
     in ``alloc`` / ``alloc_extend``)."""
 
-    def test_need_sort_routes_free_to_release_pages(self):
+    def test_need_sort_routes_free_to_staged_pages(self):
         a = _make_allocator(size=32, page_size=4, need_sort=True)
         out = a.alloc(8)  # consumes pages 1, 2
         self.assertEqual(len(a.free_pages), 6)
-        self.assertEqual(len(a.release_pages), 0)
+        self.assertEqual(a.num_staged_pages, 0)
 
         a.free(out)
-        # Frees are staged in release_pages, NOT merged into free_pages yet.
+        # Frees are staged, NOT merged into free_pages yet.
         self.assertEqual(len(a.free_pages), 6)
-        self.assertEqual(len(a.release_pages), 2)
+        self.assertEqual(a.num_staged_pages, 2)
 
     def test_merge_and_sort_restores_sorted_pool(self):
         a = _make_allocator(size=32, page_size=4, need_sort=True)
         out = a.alloc(8)  # pages 1,2 -> free_pages = [3,4,5,6,7,8]
-        a.free(out)  # release_pages = [1,2]
+        a.free(out)  # staged_pages = [[1,2]]
         # A plain cat would give [3,4,5,6,7,8,1,2] (unsorted); merge must sort.
         a.merge_and_sort_free()
 
-        self.assertEqual(len(a.release_pages), 0)
+        self.assertEqual(a.num_staged_pages, 0)
+        self.assertEqual(a.staged_pages, [])
         self.assertTrue(
             torch.equal(a.free_pages, torch.arange(1, 9, dtype=torch.int32))
         )
-        # Pools stay host-resident int32 (parent recreates release_pages on
-        # free_pages.device, which is CPU for this subclass).
+        # Pools stay host-resident int32.
         self.assertEqual(a.free_pages.device.type, "cpu")
-        self.assertEqual(a.release_pages.device.type, "cpu")
         self.assertEqual(a.free_pages.dtype, torch.int32)
-        self.assertEqual(a.release_pages.dtype, torch.int32)
 
     def test_alloc_auto_merges_when_free_pages_short(self):
         a = _make_allocator(size=32, page_size=4, need_sort=True)
         first = a.alloc(16)  # pages 1..4 -> free_pages = [5,6,7,8]
-        a.free(first)  # release_pages = [1,2,3,4]; free_pages = [5,6,7,8]
+        a.free(first)  # staged_pages = [[1,2,3,4]]; free_pages = [5,6,7,8]
         self.assertEqual(len(a.free_pages), 4)
-        self.assertEqual(len(a.release_pages), 4)
+        self.assertEqual(a.num_staged_pages, 4)
 
         # Needs 6 pages but only 4 in free_pages -> alloc must merge first.
         out = a.alloc(24)
         self.assertIsNotNone(out)
         self.assertEqual(out.shape, (24,))
-        self.assertEqual(len(a.release_pages), 0)  # merged
+        self.assertEqual(a.num_staged_pages, 0)  # merged
         self.assertEqual(len(a.free_pages), 2)  # 8 - 6 consumed
 
     def test_alloc_extend_auto_merges_when_free_pages_short(self):
         a = _make_allocator(size=32, page_size=4, need_sort=True)
         first = a.alloc(16)  # pages 1..4 -> free_pages = [5,6,7,8]
-        a.free(first)  # release_pages = [1,2,3,4]
+        a.free(first)  # staged_pages = [[1,2,3,4]]
         # Extend needing 6 fresh pages while free_pages holds 4 -> merge, succeed.
         prefix = torch.tensor([0], dtype=torch.int32)
         seq = torch.tensor([24], dtype=torch.int32)
@@ -601,16 +599,16 @@ class TestNeedSortMergePath(CustomTestCase):
         )
         self.assertIsNotNone(out)
         self.assertEqual(out.shape, (24,))
-        self.assertEqual(len(a.release_pages), 0)
+        self.assertEqual(a.num_staged_pages, 0)
         self.assertEqual(len(a.free_pages), 2)
 
     def test_decode_auto_merges_when_free_pages_short(self):
         # alloc_decode calls merge_and_sort_free unconditionally when short.
         a = _make_allocator(size=32, page_size=4, need_sort=True)
         first = a.alloc(28)  # pages 1..7 -> free_pages = [8]
-        a.free(first)  # release_pages = [1..7]; free_pages = [8]
+        a.free(first)  # staged_pages = [[1..7]]; free_pages = [8]
         self.assertEqual(len(a.free_pages), 1)
-        self.assertEqual(len(a.release_pages), 7)
+        self.assertEqual(a.num_staged_pages, 7)
 
         # Two reqs both crossing a boundary need 2 pages; free_pages has 1.
         out = a.alloc_decode(
@@ -620,7 +618,7 @@ class TestNeedSortMergePath(CustomTestCase):
         )
         self.assertIsNotNone(out)
         self.assertEqual(out.shape, (2,))
-        self.assertEqual(len(a.release_pages), 0)  # merged
+        self.assertEqual(a.num_staged_pages, 0)  # merged
         self.assertEqual(len(a.free_pages), 8 - 2)
 
 
@@ -697,7 +695,7 @@ class TestAllocatorOnTpuDevice(CustomTestCase):
         self.assertTrue(torch.equal(out_tpu.cpu(), out_cpu))
 
     def test_pools_stay_on_host(self):
-        # Even with device="tpu", the free/release pools are host bookkeeping
+        # Even with device="tpu", the free/staged pools are host bookkeeping
         # and must never end up on the accelerator.
         a = _make_allocator(size=32, page_size=4, device="tpu")
         a.alloc_decode(
@@ -706,23 +704,19 @@ class TestAllocatorOnTpuDevice(CustomTestCase):
             torch.tensor([15, 23], dtype=torch.int32, device="tpu"),
         )
         self.assertEqual(a.free_pages.device.type, "cpu")
-        self.assertEqual(a.release_pages.device.type, "cpu")
+        self.assertTrue(all(pages.device.type == "cpu" for pages in a.staged_pages))
 
-    def test_merge_keeps_release_pages_on_host(self):
-        # need_sort=True routes frees into release_pages. The parent's
-        # merge_and_sort_free defaults to self.device (the accelerator), so
-        # the subclass passes device="cpu" to keep the host-resident pools on
-        # host — verify release_pages stays on CPU and free()-after-merge
-        # works (a cpu release_pages cat'd with cpu page indices).
+    def test_merge_keeps_staged_pages_on_host(self):
+        # need_sort=True routes frees into staged_pages. Verify those pages stay
+        # on CPU and free()-after-merge keeps the pool host-resident.
         a = _make_allocator(size=32, page_size=4, device="tpu", need_sort=True)
         out = a.alloc(8)
         a.free(out)
-        self.assertEqual(a.release_pages.device.type, "cpu")
+        self.assertTrue(all(pages.device.type == "cpu" for pages in a.staged_pages))
 
-        # Mirror the subclass's own call convention.
-        a.merge_and_sort_free(device="cpu")
+        a.merge_and_sort_free()
         self.assertEqual(a.free_pages.device.type, "cpu")
-        self.assertEqual(a.release_pages.device.type, "cpu")
+        self.assertEqual(a.staged_pages, [])
         # Pool fully restored and sorted.
         self.assertEqual(len(a.free_pages), 8)
         self.assertTrue(torch.equal(a.free_pages, torch.sort(a.free_pages).values))
@@ -730,7 +724,7 @@ class TestAllocatorOnTpuDevice(CustomTestCase):
         # free() after a merge must not hit a cpu/tpu device mismatch.
         out2 = a.alloc(8)
         a.free(out2)
-        self.assertEqual(a.release_pages.device.type, "cpu")
+        self.assertTrue(all(pages.device.type == "cpu" for pages in a.staged_pages))
 
 
 if __name__ == "__main__":

@@ -8,11 +8,12 @@ from sglang.srt.hardware_backend.tpu.allocator_tpu import (
     TpuPagedTokenToKVPoolAllocator,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestTpuAllocatorLifecycle(unittest.TestCase):
+class TestTpuAllocatorLifecycle(CustomTestCase):
     def test_direct_page_release_preserves_decode_dtype(self):
         page_size = 4
         allocator = TpuPagedTokenToKVPoolAllocator(
@@ -107,7 +108,7 @@ class TestTpuAllocatorLifecycle(unittest.TestCase):
         self.assertEqual(sum(map(len, owners)), len(occupied))
         for row in requests:
             self.assertEqual(row.numel(), torch.unique(row).numel())
-        free = torch.cat((allocator.free_pages, allocator.release_pages))
+        free = allocator.get_all_free_pages()
         self.assertEqual(free.dtype, torch.int32)
         self.assertEqual(free.device.type, "cpu")
         available = set(free.tolist())
