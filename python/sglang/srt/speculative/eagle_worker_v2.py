@@ -835,6 +835,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             device=self.device,
             prebuilt_tree=prebuilt_tree,
         )
+        if with_topology:
+            # PP+spec relays the tree so every stage rebuilds the same verify
+            # input; the mask build needs the topology this one was built from.
+            # Returned rather than stashed on self so the caller owns lifetime.
+            return verify_input, parent_list, top_scores_index
+        return verify_input
 
     def _prepare_draft_forward_batch(
         self, forward_batch: ForwardBatch, *, refresh_dp_metadata: bool
@@ -963,12 +969,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             torch.cat(tokens, dim=1),
             seq_lens,
         )
-        if with_topology:
-            # PP+spec relays the tree so every stage rebuilds the same verify
-            # input; the mask build needs the topology this one was built from.
-            # Returned rather than stashed on self so the caller owns lifetime.
-            return verify_input, parent_list, top_scores_index
-        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
