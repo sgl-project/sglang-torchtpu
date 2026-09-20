@@ -116,6 +116,11 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+    "torch_native",
+    "pallas_tpu_flash",
+    "pallas_tpu_rpa_v3",
+    "pallas_tpu_rpa_batched",
+    "pallas_tpu_mla",
     "intel_xpu",
 ]
 

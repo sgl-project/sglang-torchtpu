@@ -155,7 +155,14 @@ class Spec(msgspec.Struct):
             "pool; the saving shows up as free device memory, so raise "
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            choices=[
+                "auto",
+                "fp8_e5m2",
+                "fp8_e4m3",
+                "mxint8",
+                "bf16",
+                "bfloat16",
+            ],
         ),
     ] = None
     speculative_draft_window_size: A[

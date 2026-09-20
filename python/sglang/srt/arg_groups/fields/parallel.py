@@ -49,11 +49,14 @@ class Parallel(msgspec.Struct):
     ] = None
     nnodes: A[int, "The number of nodes."] = 1
     node_rank: A[int, "The node rank."] = 0
+    tpu_worker_hostnames: A[Optional[str], Arg(no_cli=True)] = None
+    torch_tpu_slicebuilder_addresses: A[Optional[str], Arg(no_cli=True)] = None
+    torch_tpu_topology: A[Optional[str], Arg(no_cli=True)] = None
     tp_size: A[
         int,
         Arg(
             help="The tensor parallelism size.",
-            aliases=["--tensor-parallel-size"],
+            aliases=["--tensor-parallel-size", "--tp"],
         ),
     ] = 1
     dcp_size: A[
@@ -273,12 +276,6 @@ class Parallel(msgspec.Struct):
         Optional[int],
         "Maximum EP size the server can scale to at runtime. Pre-allocates active-rank state and backend buffers to this size. Defaults to the launch-time world size.",
     ] = None
-
-    # TPU multihost launch settings keep hand-written argparse registrations in
-    # ServerArgs.add_cli_args.
-    tpu_worker_hostnames: Optional[str] = None
-    torch_tpu_slicebuilder_addresses: Optional[str] = None
-    torch_tpu_topology: Optional[str] = None
 
     # ---- derived: the quotients of the leaves above -------------------------
     #

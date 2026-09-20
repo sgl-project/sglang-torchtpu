@@ -583,8 +583,8 @@ class ExecGraph(msgspec.Struct):
         "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
     ] = ""
     # These keep hand-written argparse registrations in ServerArgs.add_cli_args.
-    tpu_compile_tokens: Optional[List[int]] = None
-    tpu_compile_bs: Optional[List[int]] = None
+    tpu_compile_tokens: A[Optional[List[int]], Arg(no_cli=True)] = None
+    tpu_compile_bs: A[Optional[List[int]], Arg(no_cli=True)] = None
 
 
 class ExecComm(msgspec.Struct):

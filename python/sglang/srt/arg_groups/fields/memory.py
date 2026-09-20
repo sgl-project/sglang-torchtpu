@@ -131,8 +131,9 @@ class Memory(msgspec.Struct):
     hicache_io_backend: A[
         str,
         Arg(
-            help="The IO backend for KV cache transfer between CPU and GPU",
-            choices=["direct", "kernel", "kernel_ascend"],
+            help="The IO backend for KV cache transfer between CPU and GPU "
+            "('raiden' offloads TPU<->host via the raiden DMA engine)",
+            choices=["direct", "kernel", "kernel_ascend", "torch_tpu", "raiden"],
         ),
     ] = "kernel"
     hicache_mem_layout: A[
@@ -145,6 +146,7 @@ class Memory(msgspec.Struct):
                 "page_first_direct",
                 "page_first_kv_split",
                 "page_head",
+                "page_first_fused",
             ],
         ),
     ] = "page_first"
