@@ -438,7 +438,7 @@ class ServerArgs:
         parser.add_argument(
             "--tpu-worker-hostnames",
             type=str,
-            default=ServerArgs.tpu_worker_hostnames,
+            default=None,
             help=(
                 "Comma-separated TPU worker hostnames (TPU_WORKER_HOSTNAMES). "
                 "Auto-discovered by the Ray engine for multihost when unset."
@@ -447,7 +447,7 @@ class ServerArgs:
         parser.add_argument(
             "--torch-tpu-slicebuilder-addresses",
             type=str,
-            default=ServerArgs.torch_tpu_slicebuilder_addresses,
+            default=None,
             help=(
                 "TORCH_TPU_SLICEBUILDER_ADDRESSES for the TPU backend. "
                 "Auto-populated by the Ray engine when unset."
@@ -456,7 +456,7 @@ class ServerArgs:
         parser.add_argument(
             "--torch-tpu-topology",
             type=str,
-            default=ServerArgs.torch_tpu_topology,
+            default=None,
             help=(
                 "TORCH_TPU_TOPOLOGY for the TPU backend. "
                 "Auto-populated by the Ray engine when unset."
