@@ -23,12 +23,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_cfg_world_size,
+    get_classifier_free_guidance_world_size as get_cfg_world_size,
     get_sp_world_size,
     get_world_group,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.layers.sp_shard import (
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     build_shard_plan,
     join_seqs,
     shard_like,
