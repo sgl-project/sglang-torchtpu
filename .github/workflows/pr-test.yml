@@ -512,7 +512,7 @@ jobs:
       run_timeout_minutes: '30'
       timeout_per_file: '1800'
       # The one aarch64 stage, so it takes the aarch64 build, not rust-ext-build's.
-    rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
+      rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-8-gpu-b300:

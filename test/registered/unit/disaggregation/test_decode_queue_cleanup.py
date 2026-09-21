@@ -14,8 +14,8 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.fake.conn import (
     FakeKVManager,
-    FakeKVReceiver as DisaggFakeKVReceiver,
 )
+from sglang.srt.disaggregation.fake.conn import FakeKVReceiver as DisaggFakeKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
