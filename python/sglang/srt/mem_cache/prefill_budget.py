@@ -217,6 +217,15 @@ class SWAPrefillBudget(PrefillBudget):
         cap = int(self.remaining_swa) - headroom
         return max(0, cap // self.page_size * self.page_size)
 
+    def _continuation_chunk_cap(self):
+        # With overlap scheduling, the preceding chunk's retained window can
+        # still appear evictable until its result commits. A continuation must
+        # therefore reserve the full window plus allocator page slack, even
+        # when the request has fewer than one window of decode tokens left.
+        headroom = self.tree_cache.sliding_window_size + self.page_size
+        cap = int(self.remaining_swa) - headroom
+        return max(0, cap // self.page_size * self.page_size)
+
     def check_prefill(
         self,
         *,
@@ -275,7 +284,7 @@ class SWAPrefillBudget(PrefillBudget):
     ) -> int | None:
         if self.req_ring:
             return chunk_limit
-        cap = self._chunk_cap(max_new_tokens)
+        cap = self._continuation_chunk_cap()
         return min(chunk_limit, cap) if cap > 0 else None
 
     def can_allocate_prefill(

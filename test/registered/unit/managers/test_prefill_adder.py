@@ -670,6 +670,7 @@ class TestPrefillAdder(CustomTestCase):
         rem_swa,
         rem_chunk=2048,
         extend_input_len=500,
+        max_new_tokens=128,
         is_hybrid_swa=True,
         full_available=100_000,
     ):
@@ -688,7 +689,7 @@ class TestPrefillAdder(CustomTestCase):
                 self.mock_token_allocator, self.mock_tree_cache
             )
 
-        req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
+        req = self.create_mock_req("chunked", priority=0, max_new_tokens=max_new_tokens)
         req.prefix_indices = []
         req.full_untruncated_fill_ids = list(range(extend_input_len))
         # set_extend_range is the only writer of extend_range; the production
@@ -708,20 +709,26 @@ class TestPrefillAdder(CustomTestCase):
         PAGE_SIZE = 64
         WINDOW_SIZE = 128
         REM_SWA = 300
-        adder, req = self._build_hybrid_swa_chunked_req(
-            page_size=PAGE_SIZE, rem_swa=REM_SWA
-        )
+        for max_new_tokens in (1, WINDOW_SIZE):
+            with self.subTest(max_new_tokens=max_new_tokens):
+                adder, req = self._build_hybrid_swa_chunked_req(
+                    page_size=PAGE_SIZE,
+                    rem_swa=REM_SWA,
+                    max_new_tokens=max_new_tokens,
+                )
 
-        result = adder.add_chunked_req(req)
+                result = adder.add_chunked_req(req)
 
-        self.assertIs(result, req)  # truncated → chunked prefill continues
-        req.set_extend_range.assert_called_once()
-        start, end = req.set_extend_range.call_args.args
-        new_len = end - start
-        self.assertLessEqual(new_len + WINDOW_SIZE + PAGE_SIZE, REM_SWA)
-        expected_len = (REM_SWA - WINDOW_SIZE - PAGE_SIZE) // PAGE_SIZE * PAGE_SIZE
-        self.assertEqual(new_len, expected_len)
-        self.assertEqual(new_len % PAGE_SIZE, 0)
+                self.assertIs(result, req)  # truncated → chunked prefill continues
+                req.set_extend_range.assert_called_once()
+                start, end = req.set_extend_range.call_args.args
+                new_len = end - start
+                self.assertLessEqual(new_len + WINDOW_SIZE + PAGE_SIZE, REM_SWA)
+                expected_len = (
+                    (REM_SWA - WINDOW_SIZE - PAGE_SIZE) // PAGE_SIZE * PAGE_SIZE
+                )
+                self.assertEqual(new_len, expected_len)
+                self.assertEqual(new_len % PAGE_SIZE, 0)
 
     def test_add_chunked_req_hybrid_swa_defers_without_overlap_headroom(self):
         # Without room beyond the retained window and allocator page, defer the
