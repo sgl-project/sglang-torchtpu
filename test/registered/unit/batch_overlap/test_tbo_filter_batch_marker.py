@@ -19,7 +19,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_target_verify_batch(bs: int) -> ForwardBatch:
@@ -40,9 +40,12 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
 def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
     # filter_batch reads attention_backend (get_server_args) and
     # moe_dense_tp_size (get_parallel) from the published config.
-    with get_context().override_server_args(
-        attention_backend="fa3", moe_dense_tp_size=None
-    ), get_parallel().override(attn_tp_size=1):
+    with (
+        get_context().override_server_args(
+            attention_backend="fa3", moe_dense_tp_size=None
+        ),
+        get_parallel().override(attn_tp_size=1),
+    ):
         return TboForwardBatchPreparer.filter_batch(
             batch,
             start_token_index=lo,
@@ -81,6 +84,7 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertFalse(child.forward_metadata_ready)
         self.assertFalse(child.forward_metadata_replan_equivalent)
 
+<<<<<<< HEAD
     def test_filter_slices_req_pool_indices_cpu_with_device_mirror(self):
         parent = _make_target_verify_batch(8)
         parent.req_pool_indices = torch.arange(8, dtype=torch.long)
@@ -101,6 +105,18 @@ class TestTboFilterBatchMarker(CustomTestCase):
             child.logits_output_mode,
             LogitsOutputMode.DISTRIBUTED_TOP_K,
         )
+=======
+    def test_filter_batch_children_inherit_deferred_logits(self):
+        """A graph that defers logits to an eager tail defers them for both
+        TBO halves; a child that reset the flag would run the logits processor
+        inside the captured body."""
+        for deferred in (False, True):
+            with self.subTest(deferred=deferred):
+                parent = _make_target_verify_batch(8)
+                parent.defer_logits_to_eager = deferred
+                child = _filter(parent, lo=0, hi=4)
+                self.assertEqual(child.defer_logits_to_eager, deferred)
+>>>>>>> upstream/main
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:

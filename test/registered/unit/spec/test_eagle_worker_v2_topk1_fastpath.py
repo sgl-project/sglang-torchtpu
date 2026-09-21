@@ -11,6 +11,7 @@ from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
+from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
@@ -19,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -129,6 +130,19 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+    def test_idle_verify_input_keeps_required_layout_tensors(self):
+        verify_input = EagleVerifyInput.create_idle_input(
+            topk=1,
+            spec_steps=3,
+            num_verify_tokens=4,
+            device=DEVICE,
+        )
+
+        self.assertEqual(verify_input.custom_mask.dtype, torch.bool)
+        self.assertEqual(verify_input.custom_mask.shape, (0,))
+        self.assertEqual(verify_input.positions.dtype, torch.int64)
+        self.assertEqual(verify_input.positions.shape, (0,))
 
     def test_idle_draft_runs_each_eager_forward_without_tree_layout(self):
         worker = object.__new__(EagleDraftWorker)
@@ -483,6 +497,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.speculative_num_steps = 1
                 worker.speculative_num_draft_tokens = 2
                 worker.device = DEVICE
+                worker.plan_stream = None
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
@@ -511,12 +526,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 
@@ -529,7 +547,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         worker.server_args = _fake_server_args()
         worker.draft_runner = SimpleNamespace(
+<<<<<<< HEAD
             attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+=======
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+>>>>>>> upstream/main
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -553,7 +576,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
         worker.draft_runner = SimpleNamespace(
+<<<<<<< HEAD
             attn_backend=existing_backend, compile_policy=NoopCompilePolicy()
+=======
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+>>>>>>> upstream/main
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
