@@ -158,12 +158,16 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
         sin: torch.Tensor,
         cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
-        """One compiled call per image, each padded to its own bucket.
+        """Run the compiled encoder once per image.
 
-        The packed multi-image sequence is unbounded and misses every bucket;
-        attention never crosses image boundaries, so the split is exact.
-        Slices are cloned: torch_tpu passes a view's backing buffer to the
-        compiled fn, which fails on an exact bucket hit (no pad copy).
+        ``x`` holds every image of the batch packed along the patch axis, with
+        ``cu_seqlens`` marking the boundaries. Compiled graphs exist only for
+        the precompiled patch-count buckets and the packed total rarely matches
+        one, so each image is sliced out and run at its own bucket. Attention
+        does not cross image boundaries, so the result is unchanged.
+
+        The slices are cloned because torch_tpu passes a compiled function the
+        full backing buffer of a view rather than the view itself.
         """
         bounds = cu_seqlens.tolist()
         if len(bounds) <= 2:
@@ -179,7 +183,7 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
                     single,
                 )
             )
-        # Outputs are [1, S_i, D]; the patch axis is second to last.
+        # Each output is [1, S_i, D]; concatenate along the patch axis.
         return torch.cat(outs, dim=outs[0].ndim - 2)
 
     def _run_one(
@@ -191,7 +195,9 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
     ) -> torch.Tensor:
         seq_len = x.shape[0]
         if self._bucket_for(seq_len) is None and self.eager_fn is not None:
-            # Past the ladder: run eagerly; fail_on_recompile is armed after warmup.
+            # No precompiled bucket fits this image, and recompiling is not
+            # allowed once warmup has finished (fail_on_recompile), so run the
+            # uncompiled encoder for it.
             if seq_len not in self._warned_oversize:
                 self._warned_oversize.add(seq_len)
                 buckets = self.resolve_patch_buckets()
@@ -276,7 +282,8 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
             )
             segment_ids = torch.cat([segment_ids, pad_segment], dim=1)
         else:
-            # Exact bucket hit (oversize never gets here: _run_one runs it eagerly).
+            # seq_len matches a bucket exactly, so no padding is needed.
+            # Oversized images never reach this point; _run_one handles them.
             segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x.device)
 
         ctx = VisionPaddingContext(

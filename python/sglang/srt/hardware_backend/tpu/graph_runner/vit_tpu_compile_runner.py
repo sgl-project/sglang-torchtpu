@@ -146,8 +146,9 @@ class VisionTpuCompilePolicy(CompilePolicy):
             vit = getattr(owner, "vit", owner)
         self.vit = vit
         self.compiled_fn = None
-        # The original uncompiled method, saved by install(); an image larger
-        # than the top precompiled bucket runs through it instead of recompiling.
+        # The uncompiled forward, saved by install(). Images larger than the
+        # largest precompiled bucket run through it; see
+        # MoonVitTpuCompilePolicy._run_one.
         self.eager_fn = None
         self._patch_buckets: list[int] | None = None
         self._graph_cu_seqlens_cache: dict[int, torch.Tensor] = {}
