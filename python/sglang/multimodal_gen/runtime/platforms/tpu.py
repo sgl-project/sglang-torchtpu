@@ -180,7 +180,12 @@ class TpuPlatform(Platform):
         # PJRT owns the chiplet binding; local_rank is only a label.
         _patch_set_device_tolerate_mismatch()
 
+        from sglang.multimodal_gen.runtime.platforms.tpu_spmd import (
+            install_tpu_spmd_overrides,
+        )
+
         _install_device_module_shims()
+        install_tpu_spmd_overrides()
         torch.zeros(1, device="tpu")
 
     def get_torch_distributed_backend_str(self) -> str:

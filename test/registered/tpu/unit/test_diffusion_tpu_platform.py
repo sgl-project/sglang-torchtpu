@@ -9,6 +9,9 @@ import unittest
 import torch
 
 from sglang.multimodal_gen.runtime.platforms.tpu import TpuPlatform
+from sglang.multimodal_gen.test.unit.test_cfg_text_alignment import (  # noqa: F401
+    TestTpuSpmdSubclasses,
+)
 from sglang.multimodal_gen.test.unit.test_server_args import (  # noqa: F401
     TestTpuDistributedArgs,
 )

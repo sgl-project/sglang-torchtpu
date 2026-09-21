@@ -221,7 +221,6 @@ class Platform:
         return True
 
     @classmethod
-    @lru_cache(maxsize=1)
     def is_float64_supported(cls) -> bool:
         """Whether the device computes float64 elementwise.
 
