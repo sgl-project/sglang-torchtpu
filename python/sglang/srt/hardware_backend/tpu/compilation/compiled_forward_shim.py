@@ -478,13 +478,18 @@ def _pad_forward_batch_inputs(
         if isinstance(val, torch.Tensor) and val.shape[0] < pad_b:
             setattr(forward_batch, field, _zero_pad_dim0(val, pad_b))
 
-    # Match the lists used during precompilation, including when DP attention
-    # converts decode tensors to extend metadata.
+    # Normalize tensor/None values to padded lists so every extend batch
+    # presents the same type to the compiled graph (the precompile dummy uses
+    # lists, and DP attention derives tensors when converting decode batches
+    # to extend). Non-extend batches keep the upstream None.
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
         if field == "extend_seq_lens_cpu" and (val is None or len(val) < real_b):
-            # Zero-filling missing counts for real requests would make an
-            # incomplete host mirror look valid.
+            # The attention backend prefers this mirror over the device query
+            # lengths whenever it covers the batch, so padding a missing or
+            # stale one out to pad_b would hand the draft/extend path zeros or
+            # an earlier batch's counts for real requests. Clearing it keeps
+            # _extend_query_lens on the device lengths instead.
             forward_batch.extend_seq_lens_cpu = None
             continue
         if val is None:
