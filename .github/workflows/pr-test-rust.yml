@@ -204,10 +204,16 @@ jobs:
   gateway-e2e:
     name: ${{ matrix.name }}
     needs: build-wheel
+    # [Do Not Upstream] This fork has no 2-gpu-h100 or 4-gpu-h100 runners.
+    # Keep the hosted SMG build/unit/integration coverage without queuing these
+    # jobs for 24 hours until GitHub cancels them.
     if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+      github.repository != 'sgl-project/sglang-torchtpu' &&
+      (
+        github.event_name != 'pull_request' ||
+        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+      )
     # The `responses` matrix entry is intentionally omitted. It needs
     # `docker run gvenzl/oracle-xe` + `docker run shoofio/brave-search-mcp-sse`
     # on the runner host, but the 2-/4-gpu-h100 runners are themselves
@@ -443,6 +449,7 @@ jobs:
 
   finish:
     needs: [build-wheel, python-unit-tests, unit-tests, gateway-e2e, docker-build-test, k8s-integration]
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Finish
