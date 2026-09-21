@@ -133,6 +133,7 @@ def direct_compile(
     model_extra_tensor_attrs: Sequence[str] = (),
     kv_pool: KVPool | None = None,
     ignored_argnames: tuple[str, ...] = (),
+    prune_unused_inputs: bool = True,
 ) -> CompiledFunction:
     """Compile and dispatch ``fn`` directly, without torch.compile's
     Dynamo or AOTAutograd.
@@ -171,8 +172,13 @@ def direct_compile(
     Please pass paths to non-param non-buffer Tensor attributes via
     `model_extra_tensor_attrs` to tell `direct_compile` where to find those.
     `direct_compile` assumes that the values of Tensors on the model do not
-    change during inference. Model tensors unused by a specialization are
-    excluded from its executable and runtime arguments.
+    change during inference.
+
+    `prune_unused_inputs` excludes model tensors unused by a specialization
+    from its executable and runtime arguments. Set it to False to retain all
+    model tensors and skip pruning's MLIR inspection and extra lowerings.
+    This option is fixed when constructing the compiled function; explicit
+    function inputs and KV-pool state are never pruned.
 
     `kv_pool` exposes every KV-cache Tensor through `get_state`; all of
     them are assumed to be mutated during inference and are copied back
@@ -209,6 +215,7 @@ def direct_compile(
         model_extra_tensor_attrs=model_extra_tensor_attrs,
         kv_pool=kv_pool,
         ignored_argnames=ignored_argnames,
+        prune_unused_inputs=prune_unused_inputs,
     )
     return functools.update_wrapper(compiled, fn)
 
@@ -229,6 +236,7 @@ class CompiledFunction:
         model_extra_tensor_attrs: Sequence[str] = (),
         kv_pool: KVPool | None = None,
         ignored_argnames: tuple[str, ...] = (),
+        prune_unused_inputs: bool = True,
     ) -> None:
         self.fn = fn
         self.specialization_key = specialization_key
@@ -244,6 +252,7 @@ class CompiledFunction:
             raise ValueError("model_extra_tensor_attrs contains duplicate paths")
         self._kv_pool = kv_pool
         self._ignored_argnames = ignored_argnames
+        self._prune_unused_inputs = prune_unused_inputs
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         key = self.specialization_key(*args, **kwargs)
@@ -425,25 +434,26 @@ class CompiledFunction:
                 "direct_compile requires TPU tensor outputs or KV-pool mutations"
             )
 
-        # Only immutable model state can be dropped. Keep every explicit input
-        # (and its runtime shape check), KV input/output, and callback output.
-        # Compute liveness after collecting all three kinds of graph roots.
-        with dynamo_timed("direct_compile_prune_model_inputs"):
-            live_model_indices = _live_model_input_indices(
-                result_tensors, graph_inputs, model_input_count
+        if self._prune_unused_inputs:
+            # Only immutable model state can be dropped. Keep every explicit input
+            # (and its runtime shape check), KV input/output, and callback output.
+            # Compute liveness after collecting all three kinds of graph roots.
+            with dynamo_timed("direct_compile_prune_model_inputs"):
+                live_model_indices = _live_model_input_indices(
+                    result_tensors, graph_inputs, model_input_count
+                )
+            retained_indices = (
+                *live_model_indices,
+                *range(model_input_count, len(graph_inputs)),
             )
-        retained_indices = (
-            *live_model_indices,
-            *range(model_input_count, len(graph_inputs)),
-        )
-        model_inputs = [model_inputs[index] for index in live_model_indices]
-        graph_inputs = [graph_inputs[index] for index in retained_indices]
-        flat_inputs = [flat_inputs[index] for index in retained_indices]
-        logger.info(
-            "[direct_compile] retained %d/%d model inputs",
-            len(model_inputs),
-            model_input_count,
-        )
+            model_inputs = [model_inputs[index] for index in live_model_indices]
+            graph_inputs = [graph_inputs[index] for index in retained_indices]
+            flat_inputs = [flat_inputs[index] for index in retained_indices]
+            logger.info(
+                "[direct_compile] retained %d/%d model inputs",
+                len(model_inputs),
+                model_input_count,
+            )
 
         # Step 4: Finish lowering to MLIR, then compile it.
         logger.info(

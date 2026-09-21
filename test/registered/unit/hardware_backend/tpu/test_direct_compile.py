@@ -141,7 +141,7 @@ class _KVPool:
         self.value = state[0]
 
 
-def _make_pruning_function(model, kv_pool, callback_values):
+def _make_pruning_function(model, kv_pool, callback_values, **compile_options):
     def fn(value, unused_runtime):
         kv_pool.value.add_(model.kv_bias)
         direct_compile.insert_callback(
@@ -155,6 +155,7 @@ def _make_pruning_function(model, kv_pool, callback_values):
         model=model,
         model_extra_tensor_attrs=("object_state.value", "object_state.weight_alias"),
         kv_pool=kv_pool,
+        **compile_options,
     )
 
 
@@ -428,15 +429,36 @@ class TestDirectCompile(CustomTestCase):
         self.assertIsNone(rebuilt[1].input_ids)
 
     def test_prunes_model_inputs_and_preserves_runtime_state(self):
+        self._check_model_input_pruning()
+
+    def test_disabling_model_input_pruning_preserves_all_inputs(self):
+        self._check_model_input_pruning(prune_unused_inputs=False)
+
+    def _check_model_input_pruning(self, **compile_options):
+        prune_unused_inputs = compile_options.get("prune_unused_inputs", True)
         model = _ModelWithUnusedInputs()
         kv_pool = _KVPool(torch.zeros(2))
         pool_input = kv_pool.value
         callback_values = []
-        compiled = _make_pruning_function(model, kv_pool, callback_values)
+        compiled = _make_pruning_function(
+            model, kv_pool, callback_values, **compile_options
+        )
         compiler = direct_compile.tpu_torch_compile
 
         def execute(_executable, inputs):
-            weight, kv_bias, callback_bias, kv, value, _unused_runtime = inputs
+            if prune_unused_inputs:
+                weight, kv_bias, callback_bias, kv, value, _unused_runtime = inputs
+            else:
+                (
+                    weight,
+                    _unused_weight,
+                    _unused_buffer,
+                    kv_bias,
+                    callback_bias,
+                    kv,
+                    value,
+                    _unused_runtime,
+                ) = inputs
             return [value + weight + weight, kv + kv_bias, value + callback_bias]
 
         with (
@@ -453,12 +475,17 @@ class TestDirectCompile(CustomTestCase):
             patch.object(
                 compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
             ),
+            patch.object(
+                direct_compile,
+                "_live_model_input_indices",
+                wraps=direct_compile._live_model_input_indices,
+            ) as prune,
             patch.object(compiler, "build_mlir", return_value=object()) as lower,
             patch.object(
                 compiler,
                 "serialize_mlir_bytecode",
-                return_value=_pruning_mlir_bytecode(),
-            ),
+                side_effect=lambda _: _pruning_mlir_bytecode(),
+            ) as serialize,
             patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
             ) as traverse,
@@ -477,25 +504,47 @@ class TestDirectCompile(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "tensor input changed shape"):
                 compiled(torch.ones(2), torch.zeros(3))
 
-        self.assertEqual(lower.call_count, 2)
         traverse.assert_called_once()
         self.assertEqual(run.call_count, 2)
-        original_graph_inputs = lower.call_args_list[0].args[1]
         retained_graph_inputs = traverse.call_args.args[1]
-        self.assertEqual(len(original_graph_inputs), 8)
-        self.assertEqual(len(retained_graph_inputs), 6)
-        for tensor, index in zip(retained_graph_inputs, (0, 3, 4, 5, 6, 7)):
-            self.assertIs(tensor, original_graph_inputs[index])
-        for tensor, validated in zip(
-            retained_graph_inputs, lower.call_args_list[1].args[1], strict=True
-        ):
-            self.assertIs(tensor, validated)
-        self.assertEqual(traverse.call_args.kwargs["argument_layouts"], [[]] * 6)
+        if prune_unused_inputs:
+            prune.assert_called_once()
+            self.assertEqual(lower.call_count, 2)
+            serialize.assert_called_once()
+            original_graph_inputs = lower.call_args_list[0].args[1]
+            self.assertEqual(len(original_graph_inputs), 8)
+            expected_indices = (0, 3, 4, 5, 6, 7)
+            self.assertEqual(len(retained_graph_inputs), len(expected_indices))
+            for tensor, index in zip(retained_graph_inputs, expected_indices):
+                self.assertIs(tensor, original_graph_inputs[index])
+            for tensor, validated in zip(
+                retained_graph_inputs, lower.call_args_list[1].args[1], strict=True
+            ):
+                self.assertIs(tensor, validated)
+            expected_model_inputs = (
+                model.weight,
+                model.kv_bias,
+                model.object_state.value,
+            )
+        else:
+            prune.assert_not_called()
+            lower.assert_not_called()
+            serialize.assert_not_called()
+            self.assertEqual(len(retained_graph_inputs), 8)
+            expected_model_inputs = (
+                model.weight,
+                model.unused_weight,
+                model.unused_buffer,
+                model.kv_bias,
+                model.object_state.value,
+            )
+        self.assertEqual(
+            traverse.call_args.kwargs["argument_layouts"],
+            [[]] * len(retained_graph_inputs),
+        )
         model_inputs = next(iter(compiled.cache.values())).model_inputs
-        self.assertEqual(len(model_inputs), 3)
-        for tensor, expected in zip(
-            model_inputs, (model.weight, model.kv_bias, model.object_state.value)
-        ):
+        self.assertEqual(len(model_inputs), len(expected_model_inputs))
+        for tensor, expected in zip(model_inputs, expected_model_inputs):
             self.assertIs(tensor, expected)
         self.assertIs(model.weight_alias, model.weight)
         self.assertIs(model.object_state.weight_alias, model.weight)
@@ -571,11 +620,21 @@ class TestDirectCompile(CustomTestCase):
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_pruned_model_inputs_on_tpu_across_specializations(self):
+        self._check_model_input_pruning_on_tpu()
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_disabled_model_input_pruning_on_tpu_across_specializations(self):
+        self._check_model_input_pruning_on_tpu(prune_unused_inputs=False)
+
+    def _check_model_input_pruning_on_tpu(self, **compile_options):
+        prune_unused_inputs = compile_options.get("prune_unused_inputs", True)
         model = _ModelWithUnusedInputs(device="tpu")
         kv_pool = _KVPool(torch.zeros(2, device="tpu"))
         pool_input = kv_pool.value
         callback_values = []
-        compiled = _make_pruning_function(model, kv_pool, callback_values)
+        compiled = _make_pruning_function(
+            model, kv_pool, callback_values, **compile_options
+        )
         compiler = direct_compile.tpu_torch_compile
 
         with (
@@ -595,15 +654,23 @@ class TestDirectCompile(CustomTestCase):
                     callback_values[-1].cpu(), torch.full((rows, 2), float(step + 3))
                 )
 
-        self.assertEqual(lower.call_count, 4)
+        self.assertEqual(lower.call_count, 4 if prune_unused_inputs else 0)
         self.assertEqual(len(compiled.cache), 2)
         self.assertIs(kv_pool.value, pool_input)
         for artifact in compiled.cache.values():
-            self.assertEqual(len(artifact.model_inputs), 3)
+            self.assertEqual(
+                len(artifact.model_inputs), 3 if prune_unused_inputs else 5
+            )
         for call in run.call_args_list:
-            self.assertEqual(len(call.args[1]), 6)
-            self.assertFalse(any(t is model.unused_buffer for t in call.args[1]))
-            self.assertFalse(any(t is model.unused_weight for t in call.args[1]))
+            self.assertEqual(len(call.args[1]), 6 if prune_unused_inputs else 8)
+            self.assertEqual(
+                any(t is model.unused_buffer for t in call.args[1]),
+                not prune_unused_inputs,
+            )
+            self.assertEqual(
+                any(t is model.unused_weight for t in call.args[1]),
+                not prune_unused_inputs,
+            )
 
     def test_forward_hook_dispatches_inserted_callback(self):
         model = torch.nn.Identity()
