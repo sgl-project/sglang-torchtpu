@@ -1,0 +1,27 @@
+"""Kimi MMMU-Pro: one TP16/EP16, attention-DP4 instance per 2x2x2 slice."""
+
+ENV = {
+    "MODEL": "/weights/Kimi-K2.6",
+    "NNODES": "2",
+    "TP_SIZE": "16",
+    "EP_SIZE": "16",
+    "DP_SIZE": "4",
+    "QUANTIZATION": "",
+    "KV_CACHE_DTYPE": "fp8_e4m3",
+    "ATTENTION_BACKEND": "pallas_tpu_mla",
+    "PAGE_SIZE": "128",
+    "MEM_FRACTION_STATIC": "0.88",
+    "MAX_RUNNING": "512",
+    "CONTEXT_LEN": "106496",
+    "CHUNKED_PREFILL_SIZE": "16384",
+    "MAX_PREFILL_TOKENS": "16384",
+    "TPU_COMPILE_TOKENS": "4096",
+    "TPU_COMPILE_BS": "1 16 32 64 128",
+    "TORCH_COMPILE_MAX_BS": "128",
+    "DISABLE_RADIX_CACHE": "1",
+    "ENABLE_PROFILER_ENDPOINT": "0",
+    "SGLANG_TPU_MM_EMBED_ON_DEVICE": "1",
+    "SGLANG_ENABLE_EMBED_REPLICATION": "1",
+    "SGLANG_TPU_VIT_PRECOMPILE_SIZES": "256,400,576,784,1024,1600,2304,3136,4096,6400,9216,12544,16900",
+    "EXTRA_ARGS": "--trust-remote-code --skip-server-warmup --scheduler-recv-interval 8 --weight-loader-drop-cache-after-load",
+}

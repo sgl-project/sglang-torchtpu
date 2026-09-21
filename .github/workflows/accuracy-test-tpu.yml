@@ -7,9 +7,8 @@
 # datapoint on demand without waiting for a nightly:
 #   gh workflow run accuracy-test-tpu.yml [-f model=gpt-oss-120b] [-f ref=<branch>]
 #
-# Single-host models go through run_suite (`accuracy`); the multihost ones parked out
-# of the nightly lane (DeepSeek-R1-0528, Kimi-K2.6) take the JobSet launch path
-# (`accuracy-multihost`).
+# Single-host models go through run_suite; multihost accuracy uses JobSets.
+# Each model uses the same serving recipe for scheduled and manual runs.
 name: Accuracy Test (TPU)
 run-name: "Accuracy Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
@@ -21,14 +20,17 @@ on:
         required: false
         default: main
       model:
-        # `nightly` is what nightly-test-tpu.yml passes: every single-host
-        # accuracy suite, but NOT the ondemand multihost models parked out of
-        # the nightly lane (their slices are dispatch-only on purpose).
+        # `nightly` selects scheduled single-host and multihost accuracy suites.
         description: "Which model to evaluate"
         required: false
         default: all
         type: choice
-        options: [all, nightly, gpt-oss-120b, deepseek-r1-0528, kimi-k26]
+        options: [all, nightly, full-set, gpt-oss-120b, gpt-oss-20b, deepseek-r1-0528, deepseek-v3-1, kimi-k26]
+      test_filter:
+        description: "Substring of a multihost test file path; runs only matching tests"
+        required: false
+        default: ""
+        type: string
       update-dashboard:
         description: "Publish this run's results to the dashboard (main only)"
         required: false
@@ -43,6 +45,10 @@ on:
       model:
         required: false
         default: all
+        type: string
+      test_filter:
+        required: false
+        default: ""
         type: string
       image:
         required: false
@@ -112,14 +118,32 @@ jobs:
       contents: read
       id-token: write
 
-  # Discovers suite nightly-tpu-multihost-ondemand, which the nightly lane does not
-  # scan, so each test file keeps owning its launch spec. `model` filters the
-  # discovered groups by name.
+  accuracy-gpt-oss-20b:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","nightly","full-set","gpt-oss-20b"]'), inputs.model || 'all') }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: nightly-tpu-accuracy-gpt-oss-20b
+      run_name: accuracy-gpt-oss-20b
+      nightly: true
+      weights_pvc: model-weights-rox
+      timeout_per_file: 10800
+    permissions:
+      contents: read
+      id-token: write
+
+  # Scheduled and manually dispatched accuracy share the same multihost suite.
   discover-multihost:
     needs: build
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","deepseek-r1-0528","kimi-k26"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","deepseek-r1-0528","deepseek-v3-1","kimi-k26"]'), inputs.model || 'all') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -132,13 +156,27 @@ jobs:
       - id: d
         env:
           MODEL: ${{ inputs.model || 'all' }}
+          TEST_FILTER: ${{ inputs.test_filter }}
+          UPDATE_DASHBOARD: ${{ inputs.update-dashboard }}
         run: |
           set -euo pipefail
+          if [ -n "$TEST_FILTER" ] && [ "$UPDATE_DASHBOARD" = "true" ]; then
+            echo "::error::test_filter cannot be combined with update-dashboard"
+            exit 1
+          fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
-                      --suite nightly-tpu-multihost-ondemand)"
-          if [ "$MODEL" != "all" ]; then
+                      --suite nightly-tpu-multihost-accuracy)"
+          if [ "$MODEL" != "all" ] && [ "$MODEL" != "nightly" ] && [ "$MODEL" != "full-set" ]; then
             groups="$(jq -c --arg m "$MODEL" \
-                        '[.[] | select(.name | contains($m))]' <<< "$groups")"
+                        '[.[] | select(.name | contains($m | gsub("-"; "_")))]' <<< "$groups")"
+          fi
+          if [ -n "$TEST_FILTER" ]; then
+            groups="$(jq -c --arg f "$TEST_FILTER" \
+                        '[.[] | select(.files | contains($f))]' <<< "$groups")"
+            if [ "$groups" = "[]" ]; then
+              echo "::error::test_filter matched no multihost tests"
+              exit 1
+            fi
           fi
           echo "groups=$groups" >> "$GITHUB_OUTPUT"
           echo "discovered groups: $groups"
@@ -172,3 +210,28 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+  collect-full-evaluations:
+    needs: accuracy-multihost
+    if: ${{ always() && needs.accuracy-multihost.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+      - name: Collect predictions and validate full MMMU-Pro coverage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: python3 .github/tpu-ci/collect_full_evals.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: full-evaluation-results
+          path: full-eval-results/
+          if-no-files-found: ignore
+          retention-days: 30

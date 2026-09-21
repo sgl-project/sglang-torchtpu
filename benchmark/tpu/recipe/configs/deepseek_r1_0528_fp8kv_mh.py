@@ -1,0 +1,25 @@
+"""R1-0528: one TP16/EP16 instance across a 2x2x2 slice, no DP attention."""
+
+ENV = {
+    "MODEL": "/weights/DeepSeek-R1-0528",
+    "NNODES": "2",
+    "TP_SIZE": "16",
+    "EP_SIZE": "16",
+    "DP_SIZE": "1",
+    "ATTENTION_BACKEND": "pallas_tpu_mla",
+    "QUANTIZATION": "fp8",
+    "KV_CACHE_DTYPE": "fp8_e4m3",
+    "MEM_FRACTION_STATIC": "0.85",
+    "MAX_RUNNING": "128",
+    "PAGE_SIZE": "64",
+    "CONTEXT_LEN": "73728",
+    "CHUNKED_PREFILL_SIZE": "8192",
+    "MAX_PREFILL_TOKENS": "8192",
+    "TPU_COMPILE_TOKENS": "8192",
+    "TPU_COMPILE_BS": "64 128",
+    "TORCH_COMPILE_MAX_BS": "128",
+    "DISABLE_RADIX_CACHE": "1",
+    "ENABLE_PROFILER_ENDPOINT": "0",
+    "SGLANG_TPU_FP8_MOE_FP32_SCALES": "1",
+    "EXTRA_ARGS": "--reasoning-parser deepseek-r1 --weight-loader-drop-cache-after-load",
+}

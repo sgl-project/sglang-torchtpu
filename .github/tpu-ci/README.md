@@ -100,12 +100,11 @@ claims; an empty value mounts no weights. The container mount remains `/weights`
 manifests must still name the actual cluster resources; changing `weights.yaml`
 selects a claim, it does not create one.
 
-`launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
-and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a
-suite, **groups** those with an identical `(launch_script, weights_pvc, hosts)`, and
-emits one group per unique setup. Each group → **one** JobSet: launch the server once,
-rank 0 runs every file in the group against it. So files with the same setup **share a
-launched server** (no redundant bring-up); different setups get their own server.
+`launch_script` is a shell recipe relative to `benchmark/tpu/`. The accuracy
+recipes apply their Python configuration and execute the existing
+`launch_server.sh`. `discover_multihost.py` emits one JobSet per registered test
+file, even when multiple files use the same recipe. This lets the two Kimi
+MMMU-Pro shards use independent slices with identical serving settings.
 
 To add a **single-host** suite: `register_*_ci(..., suite="…")`, add it to `run_suite.py`,
 and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a file with a
@@ -626,3 +625,34 @@ python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost   # -
 The old per-manifest files (`job-integration.yaml`, `job-nightly.yaml`,
 `jobset-nightly.yaml`) and `_tpu-test-stage.yml` were replaced by the unified
 template + `_tpu-build`/`_tpu-test`.
+
+### Full accuracy runs from an unmerged branch
+
+The scheduled accuracy suite includes R1-0528 (GPQA, AIME25, full MMLU-Redux
+2.0), V3.1, GPT-OSS-20B, and two Kimi MMMU-Pro shards. Each Kimi shard uses its
+own two-host 2x2x2 slice and evaluates 865 distinct questions, one pass at 98,304
+output tokens. The collector rejects missing/duplicate IDs and reports the
+combined 1,730-question score. Predictions and metrics are retained in the
+`full-evaluation-results` workflow artifact.
+
+Redux generates all 5,700 rows at 65,536 output tokens, scoring only rows marked
+`ok` or with an unambiguous corrected answer key (5,431 rows in the pinned
+revision). This preserves the September experiment's protocol; it is not the
+original 14,042-question MMLU benchmark or an exact model-card reproduction.
+
+Run the same accuracy configuration from an unmerged branch:
+
+```sh
+gh workflow run accuracy-test-tpu.yml --ref test/deepseek-r1-0528-dpa \
+  -f ref=test/deepseek-r1-0528-dpa -f model=full-set -f update-dashboard=false
+```
+
+`model=full-set` selects one serving configuration each for R1-0528, V3.1,
+GPT-OSS-20B, and Kimi. Kimi has two jobs using the same recipe, solely to split
+MMMU-Pro into disjoint halves. The former R1 DPA variant and older on-demand
+R1/Kimi accuracy entries are removed. Feature-specific tests remain separate.
+
+Model settings are Python `ENV` dictionaries applied by a small adapter to the
+existing `benchmark/tpu/launch_server.sh`; no unmerged Python launcher framework
+is required. Kimi uses main's native W4A16 path; this PR does not add #725's
+optimized kernel or claim its previously measured performance.

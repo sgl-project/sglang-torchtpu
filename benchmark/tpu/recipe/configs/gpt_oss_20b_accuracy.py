@@ -1,0 +1,25 @@
+"""GPT-OSS-20B: one TP8/EP8 instance with high-reasoning evaluation gates."""
+
+ENV = {
+    "MODEL": "openai/gpt-oss-20b",
+    "FORCE_SINGLE_HOST": "1",
+    "TP_SIZE": "8",
+    "EP_SIZE": "8",
+    "QUANTIZATION": "",
+    "KV_CACHE_DTYPE": "auto",
+    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
+    "MEM_FRACTION_STATIC": "0.6",
+    "PAGE_SIZE": "128",
+    "DISABLE_RADIX_CACHE": "1",
+    "MAX_RUNNING": "16",
+    "TORCH_COMPILE_MAX_BS": "16",
+    "CONTEXT_LEN": "69632",
+    "MAX_TOTAL_TOKENS": "1114112",
+    "CHUNKED_PREFILL_SIZE": "4096",
+    "MAX_PREFILL_TOKENS": "4096",
+    "TPU_COMPILE_TOKENS": "4096",
+    "TPU_COMPILE_BS": "1 2 4 8 16",
+    "ENABLE_PROFILER_ENDPOINT": "0",
+    "SGLANG_TPU_FUSED_MOE_SC_GATHER": "0",
+    "EXTRA_ARGS": "--served-model-name gpt-oss-20b --reasoning-parser gpt-oss --tpu-compile-tracer direct",
+}

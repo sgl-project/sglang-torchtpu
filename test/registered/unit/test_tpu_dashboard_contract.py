@@ -149,6 +149,9 @@ class TestJobMapsToOneTest(CustomTestCase):
         cls.multihost = _discover(
             "discover_multihost.py", "--suite", "nightly-tpu-multihost"
         )
+        cls.multihost_accuracy = _discover(
+            "discover_multihost.py", "--suite", "nightly-tpu-multihost-accuracy"
+        )
         cls.ondemand = _discover(
             "discover_multihost.py", "--suite", "nightly-tpu-multihost-ondemand"
         )
@@ -158,10 +161,59 @@ class TestJobMapsToOneTest(CustomTestCase):
     def test_multihost_groups_carry_exactly_one_file(self):
         # `files` is space-separated by contract; a group bundling two files
         # would make a red JobSet ambiguous about which test failed.
-        for row in self.multihost + self.ondemand:
+        for row in self.multihost + self.multihost_accuracy + self.ondemand:
             self.assertEqual(
                 len(row["files"].split()), 1, f"group {row['name']} bundles files"
             )
+
+    def test_scheduled_accuracy_discovers_deepseek_models(self):
+        import os
+        import tempfile
+
+        import yaml
+
+        workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
+        job = workflow["jobs"]["discover-multihost"]
+        self.assertIn('"nightly"', job["if"])
+        step = next(s for s in job["steps"] if s.get("id") == "d")
+        with tempfile.NamedTemporaryFile() as output:
+            subprocess.run(
+                ["bash", "-c", step["run"]],
+                cwd=REPO,
+                env={
+                    **os.environ,
+                    "MODEL": "nightly",
+                    "TEST_FILTER": "",
+                    "UPDATE_DASHBOARD": "false",
+                    "GITHUB_OUTPUT": output.name,
+                },
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            groups = json.loads(Path(output.name).read_text().removeprefix("groups="))
+        self.assertEqual(
+            {g["name"] for g in groups},
+            {
+                "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
+                "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
+                "test_tpu_kimi_k26_mmmu_shard0",
+                "test_tpu_kimi_k26_mmmu_shard1",
+            },
+        )
+        recipes = [g["launch_script"] for g in groups]
+        self.assertEqual(recipes.count("recipe/deepseek_r1_0528_fp8kv_mh.sh"), 1)
+        self.assertEqual(recipes.count("recipe/kimi_k26_mmmu.sh"), 2)
+        for group in groups:
+            self.assertTrue((REPO / "benchmark/tpu" / group["launch_script"]).is_file())
+            # A hosted runner has six hours, including startup and cleanup.
+            runtime = 3600 + group["timeout_per_file"] + 600
+            self.assertGreater(21600 - runtime - 900 - 600, 0, group["name"])
+        gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
+        self.assertIn('"nightly"', gpt["if"])
+        self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
+        nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
+        self.assertEqual(nightly["jobs"]["accuracy"]["with"]["model"], "nightly")
 
     def test_static_pd_jobs_carry_exactly_one_existing_file(self):
         self.assertTrue(self.static_pd, "no static P/D jobs found; did they move?")
@@ -176,6 +228,7 @@ class TestJobMapsToOneTest(CustomTestCase):
         job_files = (
             [row["file"] for row in self.single_host]
             + [row["files"] for row in self.multihost]
+            + [row["files"] for row in self.multihost_accuracy]
             + list(self.static_pd)
             + list(self.external)
         )

@@ -208,6 +208,7 @@ NIGHTLY_SUITES = {
     HWBackend.TPU: [
         "nightly-tpu-4-v7",
         "nightly-tpu-multihost",
+        "nightly-tpu-multihost-accuracy",
         # One suite per perf model, so the nightly can fan them out as separate
         # jobs on separate slices instead of one sequential single-host job.
         "nightly-tpu-perf-gpt-oss-120b",
@@ -216,6 +217,7 @@ NIGHTLY_SUITES = {
         "nightly-tpu-perf-gpt-oss-120b-dflash-c64",
         "nightly-perf-tpu",
         # One suite per quality eval so each gets an independent TPU slice.
+        "nightly-tpu-accuracy-gpt-oss-20b",
         "nightly-tpu-accuracy-gpt-oss-120b-aime",
         "nightly-tpu-accuracy-gpt-oss-120b-gpqa",
         "nightly-tpu-accuracy-gpt-oss-120b-gsm8k",

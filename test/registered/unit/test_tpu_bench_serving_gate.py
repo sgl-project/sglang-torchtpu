@@ -56,6 +56,28 @@ class _FakeSampler:
         return {"role": role, "content": content}
 
 
+class TestThinkingGate(CustomTestCase):
+    def test_thinking_and_effort_reach_eval_runner_together(self):
+        gates = model_config.build_gates(
+            {
+                "model": "deepseek-ai/DeepSeek-V3.1",
+                "test_name": "thinking-test",
+                "gates": [
+                    {
+                        "dataset": "gpqa",
+                        "report_only": True,
+                        "thinking": True,
+                        "reasoning_effort": "high",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(
+            gates[0].extra_eval_args,
+            {"sgl_eval_thinking": True, "reasoning_effort": "high"},
+        )
+
+
 class TestBoundedGptOssSampler(CustomTestCase):
     @staticmethod
     def _module(sleeps):
@@ -609,15 +631,27 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
             # files sharing one would quietly serialise onto the same slice.
             suite = _registered_suite(path)
             self.assertTrue(suite, f"{path.name} registers no suite")
-            self.assertNotIn(suite, suites, f"{path.name} shares a suite")
-            suites.add(suite)
+            # Multi-host discovery creates one job per file, even when files
+            # share a suite. Single-host discovery creates one job per suite.
+            if not hasattr(mod, "MULTIHOST_LAUNCH"):
+                self.assertNotIn(suite, suites, f"{path.name} shares a suite")
+                suites.add(suite)
 
-    def test_every_gate_is_report_only(self):
+    def test_every_gate_declares_its_accuracy_policy(self):
         for path, mod in self._accuracy_modules():
             for gate in mod.MODEL_CONFIG["gates"]:
-                self.assertTrue(gate.get("report_only"), path.name)
-                self.assertNotIn("baseline", gate, path.name)
-                self.assertNotIn("atol", gate, path.name)
+                if (
+                    mod.MODEL_CONFIG["id"] == "accuracy-deepseek-r1-0528"
+                    and gate["dataset"] != "mmlu-redux-2.0"
+                ):
+                    # Preserve R1's existing regression floors after relocation.
+                    self.assertFalse(gate.get("report_only"), path.name)
+                    self.assertIn("baseline", gate, path.name)
+                    self.assertIn("atol", gate, path.name)
+                else:
+                    self.assertTrue(gate.get("report_only"), path.name)
+                    self.assertNotIn("baseline", gate, path.name)
+                    self.assertNotIn("atol", gate, path.name)
 
     def test_every_gate_reaches_the_dashboard(self):
         # "accuracy" is the literal the dashboard's metric_kind() matches on; a
@@ -632,7 +666,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 )
                 self.assertEqual(
                     (params.metric_labels or {}).get("model"),
-                    "gpt-oss-120b",
+                    mod.MODEL_CONFIG["dashboard_model"],
                     f"{path.name}: gate {params.name} has the wrong model series",
                 )
 
