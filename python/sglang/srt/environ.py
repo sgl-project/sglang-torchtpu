@@ -1608,6 +1608,7 @@ class Envs:
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
+    SGLANG_TPU_ENABLE_RAIDEN_RUNTIME_VERIFICATION = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill
     # row (CaptureHiddenMode.FULL), and capture_hidden_mode is part of the

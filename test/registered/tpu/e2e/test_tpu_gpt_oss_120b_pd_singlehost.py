@@ -1,8 +1,10 @@
 """GPT-OSS-120B P/D disaggregation GSM8K quality gate, one host per engine."""
 
 import argparse
+import concurrent.futures
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -92,6 +94,10 @@ HICACHE_IO_BACKEND = "raiden"
 EXTRA_SERVER_ARGS: Tuple[str, ...] = ("--reasoning-parser", "gpt-oss")
 # GPT-OSS does not support the SparseCore fused-MoE gather path.
 EXTRA_LAUNCH_ENV: Dict[str, str] = {"SGLANG_TPU_FUSED_MOE_SC_GATHER": "0"}
+RUNTIME_VERIFICATION_SMOKE = (
+    E("SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_SMOKE", "0") == "1"
+)
+RUNTIME_VERIFICATION_REQUESTS = 4
 
 # Defaults to a 0.77 passing floor; this topology measured 0.97.
 GSM8K_BASELINE = float(E("GSM8K_THRESHOLD_GPT_OSS_120B", E("GSM8K_THRESHOLD", "0.80")))
@@ -147,7 +153,7 @@ def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
 
 def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     values = os.environ if env is None else env
-    return {
+    launch_env = {
         "MODEL": resolve_model_path(values),
         "TP_SIZE": str(TP_SIZE),
         "EP_SIZE": str(EP_SIZE),
@@ -163,6 +169,9 @@ def _common_launch_env(env: Optional[Mapping[str, str]] = None) -> Dict[str, str
         "PYTHON": PYTHON,
         **EXTRA_LAUNCH_ENV,
     }
+    if RUNTIME_VERIFICATION_SMOKE:
+        launch_env["SGLANG_TPU_ENABLE_RAIDEN_RUNTIME_VERIFICATION"] = "1"
+    return launch_env
 
 
 def _shared_server_args() -> List[str]:
@@ -308,6 +317,103 @@ def _get_json(url: str, timeout: int = 30) -> Dict[str, Any]:
         return json.loads(r.read().decode("utf-8"))
 
 
+def _post_json(url: str, payload: Dict[str, Any], timeout: int = 300) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(f"{url} returned HTTP {response.status}")
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _runtime_verification_log_failures(
+    log_path: str, *, offset: int, expected_rooms: int
+) -> List[str]:
+    required = (
+        "kv_poll_bootstrapping",
+        "kv_poll_waiting_for_input",
+        "kv_poll_transferring",
+        "kv_poll_success",
+        "kv_poll_no_entry",
+        "raiden_sender_poll",
+        "register_read",
+    )
+    deadline = time.time() + 30
+    while True:
+        with open(log_path, "rb") as log:
+            log.seek(offset)
+            text = log.read().decode("utf-8", errors="replace")
+
+        failures = []
+        for marker in ("accepted=False", "detected a violation", "'call_failed'"):
+            if marker in text:
+                failures.append(f"runtime-verification log contains {marker!r}")
+
+        missing = [ap for ap in required if ap not in text]
+        completed_rooms = set(
+            re.findall(
+                r"GeneratedRuntimeMonitor trace_id=([^ ]+).*"
+                r"kv_poll_no_entry.*accepted=True",
+                text,
+            )
+        )
+        if not failures and not missing and len(completed_rooms) >= expected_rooms:
+            return []
+        if failures or time.time() >= deadline:
+            failures.extend(f"missing atomic proposition {ap!r}" for ap in missing)
+            if len(completed_rooms) < expected_rooms:
+                failures.append(
+                    f"only {len(completed_rooms)}/{expected_rooms} rooms reached "
+                    "kv_poll_no_entry"
+                )
+            return failures
+        time.sleep(1)
+
+
+def run_runtime_verification_smoke(*, base_url: str, log_path: str) -> None:
+    """Run concurrent requests and validate the real Raiden monitor trace."""
+    offset = os.path.getsize(log_path)
+
+    def send(index: int) -> Dict[str, Any]:
+        return _post_json(
+            f"{base_url}/v1/chat/completions",
+            {
+                "model": SERVED_MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Reply with only the integer {index}.",
+                    }
+                ],
+                "max_tokens": 8,
+                "temperature": 0,
+            },
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=RUNTIME_VERIFICATION_REQUESTS
+    ) as executor:
+        responses = list(executor.map(send, range(RUNTIME_VERIFICATION_REQUESTS)))
+    if any(not response.get("choices") for response in responses):
+        raise AssertionError("runtime-verification smoke response has no choices")
+
+    failures = _runtime_verification_log_failures(
+        log_path,
+        offset=offset,
+        expected_rooms=RUNTIME_VERIFICATION_REQUESTS,
+    )
+    if failures:
+        raise AssertionError("; ".join(failures))
+    print(
+        f"[runtime-verification] {RUNTIME_VERIFICATION_REQUESTS} concurrent "
+        "Raiden requests completed with accepted monitor traces",
+        flush=True,
+    )
+
+
 def _wait_http_200(
     *, url: str, secs: int, procs: Tuple[Tuple[str, subprocess.Popen], ...] = ()
 ) -> None:
@@ -431,10 +537,20 @@ def run_prefill_leader() -> int:
             url=f"http://{LOCAL_HOST}:{LB_PORT}/health", secs=300, procs=tuple(procs)
         )
 
-        model_config_main(
-            build_model_config(decode_host=decode_host),
-            base_url=f"http://{LOCAL_HOST}:{LB_PORT}",
-        )
+        base_url = f"http://{LOCAL_HOST}:{LB_PORT}"
+        if RUNTIME_VERIFICATION_SMOKE:
+            transport = pd_transport_runner(
+                prefill_url=f"http://{LOCAL_HOST}:{PREFILL_PORT}",
+                decode_url=f"http://{decode_host}:{DECODE_PORT}",
+            )(base_url)
+            if not transport["_passed"]:
+                raise AssertionError("; ".join(transport["_failures"]))
+            run_runtime_verification_smoke(base_url=base_url, log_path=PREFILL_LOG)
+        else:
+            model_config_main(
+                build_model_config(decode_host=decode_host),
+                base_url=base_url,
+            )
         return 0
     finally:
         if not KEEP_UP:

@@ -1,0 +1,26 @@
+// One LTL property per line. All properties are conjoined into one monitor.
+// This file is passed through cpp before Spot parses it.
+#define KV_STATE_OBSERVATION ((update_status | clear_status | raiden_sender_poll | raiden_receiver_poll) & on_return)
+#define KV_STATE(phi) (KV_STATE_OBSERVATION -> (phi))
+#define X_KV_STATE(phi) X((!KV_STATE_OBSERVATION) W (KV_STATE_OBSERVATION & (phi)))
+
+// Announce the complete instrumentation alphabet to Spot.
+G(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_success | kv_poll_failed | kv_poll_no_entry | register_read | start_read | register_active_plan | push_registered_plan | unregister_active_plan | update_status | clear_status | raiden_sender_poll | raiden_receiver_poll | call_started | call_completed | call_failed | on_call | on_return)
+
+// Every KV-state observation contains an observable state.
+G(KV_STATE(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_success | kv_poll_failed | kv_poll_no_entry))
+
+// Allowed successor states.
+G(KV_STATE(kv_poll_bootstrapping -> X_KV_STATE(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_failed)))
+G(KV_STATE(kv_poll_waiting_for_input -> X_KV_STATE(kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_failed)))
+G(KV_STATE(kv_poll_transferring -> X_KV_STATE(kv_poll_transferring | kv_poll_success | kv_poll_failed)))
+G(KV_STATE(kv_poll_success -> X_KV_STATE(kv_poll_success | kv_poll_no_entry | kv_poll_failed)))
+G(KV_STATE(kv_poll_failed -> X_KV_STATE(kv_poll_failed | kv_poll_no_entry)))
+
+// KVPoll state propositions are mutually exclusive.
+G(KV_STATE(kv_poll_bootstrapping -> !(kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_success | kv_poll_failed | kv_poll_no_entry)))
+G(KV_STATE(kv_poll_waiting_for_input -> !(kv_poll_bootstrapping | kv_poll_transferring | kv_poll_success | kv_poll_failed | kv_poll_no_entry)))
+G(KV_STATE(kv_poll_transferring -> !(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_success | kv_poll_failed | kv_poll_no_entry)))
+G(KV_STATE(kv_poll_success -> !(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_failed | kv_poll_no_entry)))
+G(KV_STATE(kv_poll_failed -> !(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_success | kv_poll_no_entry)))
+G(KV_STATE(kv_poll_no_entry -> !(kv_poll_bootstrapping | kv_poll_waiting_for_input | kv_poll_transferring | kv_poll_success | kv_poll_failed)))
