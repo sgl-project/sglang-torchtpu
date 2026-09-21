@@ -274,7 +274,7 @@ def distributed_top_k_for_batch(
         return None
     if info.has_custom_logit_processor or info.logit_bias is not None:
         return None
-    if any(info.grammars or ()) or getattr(info, "sampling_mask_max_top_k", 0) > 0:
+    if any(info.grammars or ()) or info.sampling_mask_batch_indices is not None:
         return None
     if (
         info.acc_additive_penalties is not None

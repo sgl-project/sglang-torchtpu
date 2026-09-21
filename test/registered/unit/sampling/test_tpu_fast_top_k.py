@@ -56,7 +56,7 @@ def _forward_batch(*, batch_size=1, **info_overrides):
         logit_bias=None,
         grammars=None,
         return_sampling_masks=None,
-        sampling_mask_max_top_k=0,
+        sampling_mask_batch_indices=None,
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
         penalizer_orchestrator=SimpleNamespace(is_required=False),
@@ -383,7 +383,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
             "custom processor": {"has_custom_logit_processor": True},
             "logit bias": {"logit_bias": torch.zeros(1, 8)},
             "grammar": {"grammars": [object()]},
-            "sampling mask": {"sampling_mask_max_top_k": 50},
+            "sampling mask": {"sampling_mask_batch_indices": torch.tensor([0])},
             "additive penalty": {"acc_additive_penalties": torch.zeros(1, 8)},
             "scaling penalty": {"acc_scaling_penalties": torch.ones(1, 8)},
             "live penalizer": {
