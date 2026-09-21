@@ -47,9 +47,6 @@ def _should_use_auto_spatial_shard_parallel_decode(
 def should_use_spatial_shard_parallel_decode(
     config: Any, z: torch.Tensor | None = None, world_size: int = 1
 ) -> bool:
-    if not config.use_parallel_decode:
-        return False
-
     # Height shards exchange conv halos with isend/irecv.
     if not current_platform.supports_distributed_p2p():
         if is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode):
@@ -59,6 +56,9 @@ def should_use_spatial_shard_parallel_decode(
                 "has collectives only, so the VAE decodes on one rank. "
                 "'tiled' and 'patch' still use every rank."
             )
+        return False
+
+    if not config.use_parallel_decode:
         return False
 
     if is_spatial_shard_parallel_decode_mode(config.parallel_decode_mode):
