@@ -1653,6 +1653,9 @@ class Envs:
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
+    # Capture xprof on every rank. One process owns one chip, so turning this
+    # off narrows the trace to the global primary rank's single chip.
+    SGLANG_TPU_PROFILE_ALL_RANKS = EnvBool(True)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.

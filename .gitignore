@@ -302,3 +302,5 @@ internal-docs/
 
 # Candidate wheel override files
 wheel_override/*.whl
+
+profile/
