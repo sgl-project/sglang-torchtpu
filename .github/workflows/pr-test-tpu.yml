@@ -178,6 +178,7 @@ jobs:
       pd_decode_hosts: 1
       exec_cmd: >-
         env SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_SMOKE=1
+        SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_FUZZ_MAX_DELAY_MS=10
         python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
       weights_pvc: model-weights-rox

@@ -9,6 +9,13 @@ from sglang.srt.raiden_runtime_verification import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_concurrency_fuzz_config():
+    instrumentation._concurrency_fuzz_max_delay_seconds.cache_clear()
+    yield
+    instrumentation._concurrency_fuzz_max_delay_seconds.cache_clear()
+
+
 @pytest.fixture
 def observed(monkeypatch):
     events = []
@@ -62,6 +69,59 @@ def test_tpu_sync_api_instrumentation(monkeypatch, observed):
         (None, ("register_read", "call_completed")),
         (None, ("start_read", "call_started")),
         (None, ("start_read", "call_failed")),
+    ]
+
+
+def test_instrumented_methods_support_random_delay(monkeypatch, observed):
+    class FakeKVCacheManager:
+        def register_read(self):
+            return True
+
+        def start_read(self):
+            pass
+
+        def register_active_plan(self):
+            pass
+
+        def push_registered_plan(self):
+            pass
+
+        def unregister_active_plan(self):
+            pass
+
+    module = ModuleType("tpu_sync.api.torch.kv_cache_manager")
+    module.KVCacheManager = FakeKVCacheManager
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv(
+        "SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_FUZZ_MAX_DELAY_MS",
+        "10",
+    )
+    uniform_bounds = []
+
+    def choose_delay(lower, upper):
+        uniform_bounds.append((lower, upper))
+        return 0.004
+
+    monkeypatch.setattr(instrumentation.random, "uniform", choose_delay)
+    sleeps = []
+    monkeypatch.setattr(instrumentation.time, "sleep", sleeps.append)
+
+    instrumentation.install_tpu_sync_api_instrumentation()
+    manager = FakeKVCacheManager()
+    assert manager.register_read()
+    monkeypatch.setenv(
+        "SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_FUZZ_MAX_DELAY_MS",
+        "20",
+    )
+    assert manager.register_read()
+
+    assert sleeps == [0.004, 0.004]
+    assert uniform_bounds == [(0.0, 0.01), (0.0, 0.01)]
+    assert observed == [
+        (None, ("register_read", "call_started")),
+        (None, ("register_read", "call_completed")),
+        (None, ("register_read", "call_started")),
+        (None, ("register_read", "call_completed")),
     ]
 
 

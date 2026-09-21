@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import functools
 import inspect
+import math
+import random
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -13,6 +16,23 @@ from sglang.srt.raiden_runtime_verification.runtime_monitor_driver import (
 )
 
 _METHOD_HOOKS_MARKER = "_sglang_raiden_runtime_verification_hooks_registered"
+
+
+@functools.cache
+def _concurrency_fuzz_max_delay_seconds() -> float:
+    max_delay_ms = envs.SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_FUZZ_MAX_DELAY_MS.get()
+    if max_delay_ms < 0 or not math.isfinite(max_delay_ms):
+        raise ValueError(
+            "SGLANG_TPU_RAIDEN_RUNTIME_VERIFICATION_FUZZ_MAX_DELAY_MS must be a "
+            f"non-negative finite number, got {max_delay_ms!r}"
+        )
+    return max_delay_ms / 1000.0
+
+
+def inject_concurrency_fuzz_delay() -> None:
+    max_delay_seconds = _concurrency_fuzz_max_delay_seconds()
+    if max_delay_seconds > 0:
+        time.sleep(random.uniform(0.0, max_delay_seconds))
 
 
 def _register_method_hooks(
@@ -71,6 +91,14 @@ def install_tpu_sync_api_instrumentation() -> None:
     ) -> None:
         get_runtime_monitor_driver().step(method_name, phase)
 
+    def publish_call_and_delay(
+        method_name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        publish_call(method_name, "call_started", args, kwargs)
+        inject_concurrency_fuzz_delay()
+
     for method_name in (
         "register_read",
         "start_read",
@@ -81,7 +109,7 @@ def install_tpu_sync_api_instrumentation() -> None:
         _register_method_hooks(
             KVCacheManager,
             method_name,
-            on_call=functools.partial(publish_call, method_name, "call_started"),
+            on_call=functools.partial(publish_call_and_delay, method_name),
             on_return=functools.partial(publish_call, method_name, "call_completed"),
             on_error=functools.partial(publish_call, method_name, "call_failed"),
         )
@@ -129,11 +157,19 @@ def install_kv_transfer_state_instrumentation() -> None:
         if method_name == "clear_status" and phase == "on_return":
             monitor.discard(bootstrap_room)
 
+    def publish_state_and_delay(
+        method_name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> None:
+        publish_state(method_name, "on_call", args, kwargs)
+        inject_concurrency_fuzz_delay()
+
     for method_name in ("update_status", "clear_status"):
         _register_method_hooks(
             CommonKVManager,
             method_name,
-            on_call=functools.partial(publish_state, method_name, "on_call"),
+            on_call=functools.partial(publish_state_and_delay, method_name),
             on_return=functools.partial(publish_state, method_name, "on_return"),
         )
 
@@ -163,15 +199,23 @@ def install_kv_transfer_state_instrumentation() -> None:
             bootstrap_room=poller.bootstrap_room,
         )
 
+    def delay_poll(
+        _args: tuple[Any, ...],
+        _kwargs: dict[str, Any],
+    ) -> None:
+        inject_concurrency_fuzz_delay()
+
     _register_method_hooks(
         RaidenKVSender,
         "poll",
+        on_call=delay_poll,
         on_return=functools.partial(publish_poll_result, "raiden_sender_poll"),
         on_error=functools.partial(publish_poll_error, "raiden_sender_poll"),
     )
     _register_method_hooks(
         RaidenKVReceiver,
         "poll",
+        on_call=delay_poll,
         on_return=functools.partial(publish_poll_result, "raiden_receiver_poll"),
         on_error=functools.partial(publish_poll_error, "raiden_receiver_poll"),
     )
