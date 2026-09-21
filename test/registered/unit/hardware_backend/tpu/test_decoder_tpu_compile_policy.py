@@ -157,6 +157,7 @@ def _model_runner(device="cpu"):
         model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
 
@@ -1436,6 +1437,12 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
 
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
+
+        def mark_sequence_sharded(forward_batch):
+            forward_batch.attn_tp_sequence_sharded = True
+            return forward_batch
+
+        mr.prepare_dummy_forward_batch = MagicMock(side_effect=mark_sequence_sharded)
         policy = _make_policy(mr)
         policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         # prepare_forward_batch runs first so model-specific prep hooks
@@ -1448,6 +1455,8 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(args[0].shape, (64,))
         self.assertEqual(args[1].shape, (64,))
         self.assertEqual(args[2].batch_size, 4)
+        self.assertTrue(args[2].attn_tp_sequence_sharded)
+        mr.prepare_dummy_forward_batch.assert_called_once_with(args[2])
 
     def test_run_one_uses_no_grad_not_inference_mode(self):
         mr = _model_runner()
@@ -1553,6 +1562,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
 
@@ -1955,6 +1965,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             model_config=SimpleNamespace(hidden_size=hidden_size, model_is_mrope=False),
             is_draft_worker=is_draft_worker,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
         )
         # _infer_dflash_block_size reads get_spec() at construction; publish the block size.
         self.publish_config(speculative_num_draft_tokens=draft_token_num)
