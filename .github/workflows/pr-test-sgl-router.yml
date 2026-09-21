@@ -338,7 +338,11 @@ jobs:
   sgl-router-e2e:
     name: tier-3 — e2e
     needs: [sgl-router-gate, sgl-router-build-and-test]
-    if: needs.sgl-router-gate.outputs.should_run == 'true'
+    # [Do Not Upstream] This fork has no 2-gpu-h100 runner. Keep the hosted
+    # router checks without leaving the required finish job blocked for a day.
+    if: |
+      github.repository != 'sgl-project/sglang-torchtpu' &&
+      needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
     steps:
