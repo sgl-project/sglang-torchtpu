@@ -1214,6 +1214,24 @@ def generate_simulated_accept_index(
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
     simulate_acc_token_mode: str = SIMULATE_ACC_TOKEN_MODE,
 ):
+    if _is_tpu:
+        from sglang.srt.hardware_backend.tpu.spec_utils_tpu import (
+            generate_simulated_accept_index_tpu,
+        )
+
+        return generate_simulated_accept_index_tpu(
+            accept_index=accept_index,
+            predict=predict,
+            num_correct_drafts=num_correct_drafts,
+            candidates=candidates,
+            target_predict=target_predict,
+            bs=bs,
+            spec_steps=spec_steps,
+            simulate_acc_len=simulate_acc_len,
+            simulate_acc_method=simulate_acc_method,
+            simulate_acc_token_mode=simulate_acc_token_mode,
+        )
+
     use_real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
 
     assert simulate_acc_len > 0.0
