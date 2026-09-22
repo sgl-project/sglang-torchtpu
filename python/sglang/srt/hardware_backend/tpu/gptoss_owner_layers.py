@@ -153,18 +153,25 @@ def forward_owner_layer(
     if projected.shape != residual.shape:
         raise ValueError("Attention output and residual must share owner rows.")
     normalized, residual = layer.post_attention_layernorm(projected, residual)
-    global_input = parallel.tp_group.all_gather(normalized, dim=0)
-    if baseline_moe:
-        router_logits, _ = layer.mlp.router(global_input)
-        topk_output = layer.mlp.topk(global_input, router_logits)
-        # Each rank contributes only its local experts, including their biases.
-        # Sum directly into the same global row owners used by the input gather.
-        partial = layer.mlp.experts(global_input, topk_output)
-        result = parallel.tp_group.reduce_scatter_along_dim(partial, dim=0).contiguous()
-    else:
-        result = layer.mlp.forward_normal(
-            global_input, token_owned=True, return_owner=True
+    if not baseline_moe and getattr(layer.mlp, "_tpu_native_packed_moe", False):
+        from sglang.srt.hardware_backend.tpu.gptoss_packed_mxfp4 import (
+            forward_owner_native_mxfp4_mlp,
         )
+
+        result = forward_owner_native_mxfp4_mlp(normalized, layer.mlp)
+    else:
+        global_input = parallel.tp_group.all_gather(normalized, dim=0)
+        if baseline_moe:
+            router_logits, _ = layer.mlp.router(global_input)
+            topk_output = layer.mlp.topk(global_input, router_logits)
+            partial = layer.mlp.experts(global_input, topk_output)
+            result = parallel.tp_group.reduce_scatter_along_dim(
+                partial, dim=0
+            ).contiguous()
+        else:
+            result = layer.mlp.forward_normal(
+                global_input, token_owned=True, return_owner=True
+            )
     if result.shape != (owner_rows, layer.hidden_size):
         raise ValueError("MoE direct output must preserve global token-owner rows.")
     return result, residual

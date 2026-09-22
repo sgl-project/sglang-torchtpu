@@ -8,6 +8,7 @@ original block-32 weights into BF16 in VMEM for both decode and prefill.
 import torch
 
 _OP = None
+_OWNER_OP = None
 
 _PARAMETERS = (
     "w13_weight",
@@ -44,6 +45,7 @@ def configure_gptoss_native_mxfp4(layer):
         )
     layer._tpu_native_mxfp4_configured = True
     build_packed_moe_op()
+    build_packed_owner_moe_op()
 
 
 def prepare_gptoss_native_mxfp4(layer):
@@ -92,6 +94,59 @@ def prepare_gptoss_native_mxfp4(layer):
             )
             for name in _PARAMETERS
         },
+    )
+
+
+def forward_owner_native_mxfp4_mlp(
+    owner_hidden: torch.Tensor, mlp: torch.nn.Module
+) -> torch.Tensor:
+    """Compute router+topk on 64 owner rows, pre-pad to [64, 3072] with packed routing, and all-gather once."""
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    tp = parallel.tp_group
+    layer = mlp.experts
+    owner_rows, hidden_dim = owner_hidden.shape
+    if (
+        not getattr(layer, "_tpu_native_mxfp4_loaded", False)
+        or owner_hidden.dtype != torch.bfloat16
+        or hidden_dim != 2880
+        or layer.w13_weight.dtype != torch.float4_e2m1fn_x2
+        or layer.w2_weight.dtype != torch.float4_e2m1fn_x2
+    ):
+        raise ValueError(
+            "Owner native GPT-OSS MoE requires loaded packed weights and BF16 H2880."
+        )
+
+    with torch.profiler.record_function("tp8dp2_owner_router_topk_64"):
+        router_logits, _ = mlp.router(owner_hidden)
+        topk_weights, topk_ids, _ = mlp.topk(owner_hidden, router_logits)
+        valid = (topk_ids >= 0) & (topk_ids < 128)
+        clean_ids = torch.where(valid, topk_ids, 0)
+        owner_weights_bf16 = topk_weights.to(torch.bfloat16) * valid.to(torch.bfloat16)
+        owner_ids_bf16 = clean_ids.to(torch.bfloat16)
+
+    with torch.profiler.record_function("tp8dp2_owner_pack_all_gather"):
+        owner_padded_2944 = torch.nn.functional.pad(owner_hidden, (0, 64)).view(
+            owner_rows, 23, 128
+        )
+        tile_23 = torch.nn.functional.pad(owner_ids_bf16, (0, 124)).view(
+            owner_rows, 1, 128
+        )
+        packed_owner_3d = torch.cat((owner_padded_2944, tile_23), dim=1)
+        packed_global_3d = tp.all_gather(packed_owner_3d, dim=0)
+
+    return build_packed_owner_moe_op()(
+        packed_global_3d,
+        owner_weights_bf16,
+        layer.w13_weight,
+        layer.w13_weight_scale,
+        layer.w13_weight_bias,
+        layer.w2_weight,
+        layer.w2_weight_scale,
+        layer.w2_weight_bias,
+        layer._tpu_fused_rs_group_offset,
+        layer._tpu_fused_rs_tp_rank_to_device_id,
     )
 
 
@@ -144,8 +199,6 @@ def gptoss_native_mxfp4_moe(x, layer, topk_weights, topk_ids, *, output_layout):
             if output_layout == "owner"
             else parallel.attn_tp_group.all_gather(shard, dim=0)
         )
-    # Normal MLP input is replicated over the full EP group, including DP rows.
-    # Bound prefill staging without changing rank ownership within each chunk.
     outputs = []
     for start in range(0, x.shape[0], 8192):
         rows = min(8192, x.shape[0] - start)
@@ -161,12 +214,7 @@ def gptoss_native_mxfp4_moe(x, layer, topk_weights, topk_ids, *, output_layout):
 
 
 def prepare_packed_weights(w1, s1, b1, w2, s2, b2, *, alignment=256):
-    """Return N-packed bytes, FP32 block scales and biases from HF CPU tensors.
-
-    Input W1 rows are interleaved gate/up. Hidden and intermediate dimensions
-    are padded independently; original codes and E8M0 scales are never requantized.
-    Materialization as the TorchTPU native FP4 dtype is a separate device step.
-    """
+    """Return N-packed bytes, FP32 block scales and biases from HF CPU tensors."""
     from sglang.srt.hardware_backend.tpu.fp4_moe import _transpose_packed_fp4
     from sglang.srt.layers.quantization.mxfp4_tpu_util import (
         _deinterleave_axis1,
@@ -195,8 +243,6 @@ def prepare_packed_weights(w1, s1, b1, w2, s2, b2, *, alignment=256):
         or b2.shape != (experts, hidden)
     ):
         raise ValueError("Checkpoint weights, scales and biases disagree.")
-    # The serving BF16 dequantizer computes powers of two in FP32. Restrict this
-    # prototype to the normal BF16 exponent range so scale casting is exact.
     if any(bool(((s < 1) | (s > 253)).any()) for s in (s1, s2)):
         raise ValueError("Prototype requires finite normal BF16 block scales.")
     hp = ((hidden + alignment - 1) // alignment) * alignment
@@ -289,4 +335,74 @@ def build_packed_moe_op():
         return x.new_empty((x.shape[0] // destinations.shape[0], x.shape[1]))
 
     _OP = op
+    return op
+
+
+def build_packed_owner_moe_op():
+    """Register owner-packed [1024, 3072] custom op before Dynamo capture."""
+    global _OWNER_OP
+    if _OWNER_OP is not None:
+        return _OWNER_OP
+    import jax
+    from torch_tpu._internal.pallas import jax_op
+
+    from sglang.srt.layers.moe.pallas.fused_moe_rs_op import _get_mesh
+    from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
+
+    mesh = _get_mesh()
+
+    def fused_owner(
+        packed_x: jax.Array,
+        owner_weights: jax.Array,
+        w1: jax.Array,
+        s1: jax.Array,
+        b1: jax.Array,
+        w2: jax.Array,
+        s2: jax.Array,
+        b2: jax.Array,
+        group: jax.Array,
+        destinations: jax.Array,
+    ) -> jax.Array:
+        if (
+            packed_x.ndim != 3
+            or packed_x.shape[0] % mesh.shape["model"]
+            or packed_x.shape[1:] != (24, 128)
+        ):
+            raise ValueError(
+                "Packed owner MoE requires [M, 24, 128] EP-divisible input."
+            )
+        with jax.named_scope("tp8dp2_unpack_routing"):
+            ids_bf16 = packed_x[:, 23, :4]
+            ids = ids_bf16.astype(jax.numpy.int32)
+        return fused_moe_func_rs(
+            hidden_states=packed_x,
+            w1=w1,
+            w2=w2,
+            w1_scale=s1,
+            w2_scale=s2,
+            w1_bias=b1,
+            w2_bias=b2,
+            gating_output=None,
+            topk=4,
+            renormalize=False,
+            mesh=mesh,
+            activation="swigluoai",
+            scoring_fn="softmax",
+            topk_weights=ids_bf16,
+            topk_indices=ids,
+            group_offset_input=group,
+            fp8_direct_write=False,
+            tp_rank_to_device_id=destinations,
+            owner_topk_weights=owner_weights,
+            skip_routing_psum=True,
+            unpadded_hidden_size=2880,
+        )
+
+    op = jax_op("sglang_tpu_pallas::gptoss_packed_owner_mxfp4", fused_owner)
+
+    @op.register_fake
+    def fake(packed_x, owner_weights, w1, s1, b1, w2, s2, b2, group, destinations):
+        return owner_weights.new_empty((owner_weights.shape[0], 2880))
+
+    _OWNER_OP = op
     return op

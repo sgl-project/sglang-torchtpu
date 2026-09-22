@@ -130,6 +130,7 @@ def moe_gmm_local_rs_nodedup(
     topk_indices: jax.Array,
     post_expert_norm_weight_input: jax.Array | None,
     tp_rank_to_device_id: jax.Array | None,
+    owner_topk_weights: jax.Array | None = None,
     *,
     activation: str,
     topk: int,
@@ -138,6 +139,8 @@ def moe_gmm_local_rs_nodedup(
     has_post_norm: bool = False,
     sp_enabled: bool = True,
     fp8_direct_write: bool = False,
+    skip_routing_psum: bool = False,
+    unpadded_hidden_size: int | None = None,
 ) -> jax.Array:
     """Per-chip MoE using the nodedup gmm_fused_rs kernel.
 
@@ -166,7 +169,7 @@ def moe_gmm_local_rs_nodedup(
     # fixed at its root cause:
     # https://github.com/sgl-project/sglang-torchtpu/issues/308
     # https://github.com/google-pytorch/torch_tpu/issues/2794
-    if not sp_enabled:
+    if not sp_enabled and not skip_routing_psum:
         route_source = my_id == 0
         routing = jnp.stack(
             (topk_indices.astype(jnp.bfloat16), topk_weights.astype(jnp.bfloat16)),
@@ -272,13 +275,19 @@ def moe_gmm_local_rs_nodedup(
     # (matches v1 — no fp32 cast needed for topk=8).
     # SP off: topk_weights is replicated; slice this chip's [chunk_size] shard
     # to match out_3d (SP on already passes the local shard).
-    local_topk_weights = (
-        topk_weights
-        if sp_enabled
-        else jax.lax.dynamic_slice_in_dim(
-            topk_weights, my_id * chunk_size, chunk_size, axis=0
+    if owner_topk_weights is not None:
+        local_topk_weights = owner_topk_weights
+    else:
+        local_topk_weights = (
+            topk_weights
+            if sp_enabled
+            else jax.lax.dynamic_slice_in_dim(
+                topk_weights, my_id * chunk_size, chunk_size, axis=0
+            )
         )
-    )
+    if unpadded_hidden_size is not None and unpadded_hidden_size < hidden_size:
+        out_buf = out_buf[:, :unpadded_hidden_size]
+        hidden_size = unpadded_hidden_size
     out_3d = out_buf.reshape(chunk_size, topk, hidden_size)
     post_expert_norm_weight = post_expert_norm_weight_input if has_post_norm else None
     if post_expert_norm_weight is not None:
@@ -339,6 +348,9 @@ def expert_parallel_gmm_rs(
     w2_global_scale: jax.Array | None = None,
     fp8_direct_write: bool = False,
     tp_rank_to_device_id: jax.Array | None = None,
+    owner_topk_weights: jax.Array | None = None,
+    skip_routing_psum: bool = False,
+    unpadded_hidden_size: int | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel.
 
@@ -397,6 +409,7 @@ def expert_parallel_gmm_rs(
         if post_expert_norm_weight is not None
         else jnp.zeros((1,), jnp.bfloat16)
     )
+    owner_topk_w_spec = None if owner_topk_weights is None else P()
     result = jax.shard_map(
         functools.partial(
             _MOE_GMM_LOCAL_RS,
@@ -407,6 +420,8 @@ def expert_parallel_gmm_rs(
             has_post_norm=_has_pn_rs,
             sp_enabled=sp_enabled,
             fp8_direct_write=fp8_direct_write,
+            skip_routing_psum=skip_routing_psum,
+            unpadded_hidden_size=unpadded_hidden_size,
         ),
         mesh=mesh,
         in_specs=(
@@ -424,6 +439,7 @@ def expert_parallel_gmm_rs(
             topk_i_spec,  # topk_indices (replicated when SP off)
             P(),  # post_expert_norm_weight (replicated)
             P(),  # tp_rank_to_device_id (replicated)
+            owner_topk_w_spec,  # owner_topk_weights (local per-rank tensor)
         ),
         out_specs=moe_out_spec,
         # SP on: token sharded over data plus the runtime expert axes;
@@ -444,6 +460,7 @@ def expert_parallel_gmm_rs(
         topk_indices,
         _pnw_rs,
         tp_rank_to_device_id,
+        owner_topk_weights,
     )
 
     return result
@@ -463,6 +480,8 @@ def expert_parallel_gmm_rs(
         "activation",
         "scoring_fn",
         "fp8_direct_write",
+        "skip_routing_psum",
+        "unpadded_hidden_size",
     ),
     compiler_options={
         # "xla_enable_transpose_trace": True,
@@ -488,6 +507,9 @@ def fused_moe_func_rs(
     group_offset_input: jax.Array | None = None,
     fp8_direct_write: bool = False,
     tp_rank_to_device_id: jax.Array | None = None,
+    owner_topk_weights: jax.Array | None = None,
+    skip_routing_psum: bool = False,
+    unpadded_hidden_size: int | None = None,
 ) -> jax.Array:
     """EP MoE with ICI reduce-scatter fused in kernel (gmm_fused_rs).
 
@@ -506,7 +528,11 @@ def fused_moe_func_rs(
     Communication pattern: ICI reduce-scatter fused in kernel.
     This replaces the standard EP pattern of psum (after kernel).
     """
-    num_tokens, hidden_size = hidden_states.shape
+    if hidden_states.ndim == 3:
+        num_tokens = hidden_states.shape[0]
+        hidden_size = hidden_states.shape[1] * hidden_states.shape[2]
+    else:
+        num_tokens, hidden_size = hidden_states.shape
     global_num_experts, padded_hidden_size, _ = w1.shape
     dtype = hidden_states.dtype
 
@@ -523,7 +549,7 @@ def fused_moe_func_rs(
     )
 
     # Pad hidden_states to match w1's K dimension if needed.
-    if padded_hidden_size != hidden_size:
+    if hidden_states.ndim == 2 and padded_hidden_size != hidden_size:
         hidden_states = jnp.pad(
             hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size))
         )
@@ -547,9 +573,15 @@ def fused_moe_func_rs(
         post_expert_norm_weight=post_expert_norm_weight,
         fp8_direct_write=fp8_direct_write,
         tp_rank_to_device_id=tp_rank_to_device_id,
+        owner_topk_weights=owner_topk_weights,
+        skip_routing_psum=skip_routing_psum,
+        unpadded_hidden_size=unpadded_hidden_size,
     )
 
-    return result[:num_tokens, :hidden_size]
+    out_hidden_size = (
+        unpadded_hidden_size if unpadded_hidden_size is not None else hidden_size
+    )
+    return result[:num_tokens, :out_hidden_size]
 
 
 __all__ = [
