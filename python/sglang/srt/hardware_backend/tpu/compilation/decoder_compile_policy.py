@@ -1194,6 +1194,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
     def _model_is_mrope(self) -> bool:
         return self.model_runner.model_config.model_is_mrope
 
+    # TODO(junyanxu): rename without the leading underscore; subclasses override
+    # this, so it is a public extension hook rather than an internal helper.
     def _make_dummy_forward_batch(
         self,
         num_tokens: int,

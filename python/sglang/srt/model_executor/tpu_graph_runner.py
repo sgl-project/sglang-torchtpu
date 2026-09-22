@@ -46,6 +46,9 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecodeCompilePolicyMixin,
 )
+from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dspark import (
+    DsparkSpecDecodeCompilePolicyMixin,
+)
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_eagle3 import (
     Eagle3SpecDecodeCompilePolicyMixin,
 )
@@ -61,7 +64,7 @@ def _spec_enabled(model_runner: ModelRunner) -> bool:
     """Whether this runner uses speculative decoding on TPU."""
     return (
         model_runner.spec_algorithm.is_eagle3()
-        or model_runner.spec_algorithm.is_dflash()
+        or model_runner.spec_algorithm.is_dflash_family()
     )
 
 
@@ -71,6 +74,8 @@ def _resolve_spec_compile_policy_mixin(
     """Resolve speculative compile policy mixin class based on algorithm."""
     if spec_algorithm.is_dflash():
         return DFlashSpecDecodeCompilePolicyMixin
+    if spec_algorithm.is_dspark():
+        return DsparkSpecDecodeCompilePolicyMixin
     return Eagle3SpecDecodeCompilePolicyMixin
 
 

@@ -118,6 +118,43 @@ def make_dflash_verify_bookkeeping_args(
     )
 
 
+def make_dspark_accept_greedy_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+        torch.zeros(
+            (context.physical_bs * context.num_verify_tokens, context.vocab_size),
+            dtype=torch.float32,
+            device=context.device,
+        ),
+        torch.full(
+            (context.physical_bs,),
+            context.num_verify_tokens,
+            dtype=torch.int64,
+            device=context.device,
+        ),
+    )
+
+
+def make_dspark_finalize_accept_args(
+    context: SpecOpWarmupContext,
+) -> tuple[torch.Tensor, ...]:
+    return (
+        torch.zeros((3, context.physical_bs), dtype=torch.int64, device=context.device),
+        torch.zeros((context.physical_bs,), dtype=torch.int64, device=context.device),
+        torch.zeros(
+            (context.physical_bs, context.num_verify_tokens - 1),
+            dtype=torch.int64,
+            device=context.device,
+        ),
+    )
+
+
 def make_dflash_verify_cache_locs_args(
     context: SpecOpWarmupContext,
 ) -> tuple[torch.Tensor | int, ...]:

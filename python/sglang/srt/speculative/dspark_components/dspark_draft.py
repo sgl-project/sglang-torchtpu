@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import Optional
 
 import msgspec
 import torch
+from torch import nn
 
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+    EMPTY_TPU_DRAFT_EXTEND,
+    build_tpu_draft_extend_metadata,
+)
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
@@ -19,9 +24,15 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     enable_num_token_non_padded,
 )
+from sglang.srt.models.dspark import MarkovHead
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
-from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.draft_worker_common import (
+    make_draft_input_v2,
+    resolve_req_pool_indices_cpu,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -29,10 +40,25 @@ from sglang.srt.speculative.spec_info import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils import is_tpu
 from sglang.srt.utils.common import is_pin_memory_available
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
+
+_is_tpu = is_tpu()
+
+
+def draft_owns_embed(draft_model: nn.Module) -> bool:
+    """Whether the draft embeds input_ids itself instead of taking input_embeds.
+
+    The TPU compile policy must mirror this when it builds warmup batches, or
+    precompile traces the input_embeds graph while serving takes the in-graph
+    embedding one and every draft forward recompiles.
+    """
+    return envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
+        draft_model, "forward_embed"
+    )
 
 
 def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
@@ -50,6 +76,21 @@ _DRAFT_STEP_LOGITS = Invariant("dspark.draft.step_logits", Bucket.GUARD, NotNaN(
 _DRAFT_PROBS = Invariant(
     "dspark.draft.probs", Bucket.SOFTEN, NotNaN(), recover=_one_hot_token0
 )
+
+
+def _pad_host_lens(
+    seq_lens_cpu: Optional[torch.Tensor], rows: int
+) -> Optional[torch.Tensor]:
+    """Widen the host length mirror so both extend CPU lists span the bucket.
+
+    None passes through so the builder raises its own missing-mirror error.
+    """
+    if seq_lens_cpu is None:
+        return None
+    pad_rows = rows - int(seq_lens_cpu.shape[0])
+    if pad_rows <= 0:
+        return seq_lens_cpu
+    return torch.nn.functional.pad(seq_lens_cpu, (0, pad_rows))
 
 
 def _make_num_token_non_padded(
@@ -76,6 +117,9 @@ class DraftForwardResult(msgspec.Struct, frozen=True):
     raw_hidden: torch.Tensor
     draft_hidden_3d: torch.Tensor
     can_run_graph: bool
+    # TPU only: the greedy block the draft graph already sampled in place of
+    # the eager tail. None on every other backend.
+    next_draft_tokens: Optional[torch.Tensor] = None
 
 
 class DraftProposal(msgspec.Struct, frozen=True):
@@ -116,15 +160,42 @@ def make_next_draft_input(
     return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
 
+# Grown to the largest batch seen, so the slice below is a view rather than a
+# shape-varying op torch_tpu would lazy-JIT once per live batch size.
+_all_greedy_masks: dict[str, torch.Tensor] = {}
+
+
+def _all_greedy_mask(bs: int, device: torch.device | str) -> torch.Tensor:
+    """Read-only all-True mask of length bs; callers must not write into it."""
+    key = str(device)
+    buf = _all_greedy_masks.get(key)
+    if buf is None or buf.shape[0] < bs:
+        buf = torch.ones(max(bs, 64), dtype=torch.bool, device=device)
+        _all_greedy_masks[key] = buf
+    return buf[:bs]
+
+
 def resolve_greedy_mask(
     *,
     bs: int,
-    sampling_info,
+    sampling_info: Optional[SamplingBatchInfo],
+    device: torch.device,
+) -> torch.Tensor:
+    # is_all_greedy means every top_k <= 1, so the compare would be all-True.
+    if sampling_info is None or sampling_info.is_all_greedy:
+        return _all_greedy_mask(bs, device)
+    return (sampling_info.top_ks <= 1).view(-1)
+
+
+def resolve_temperatures(
+    *,
+    bs: int,
+    sampling_info: Optional[SamplingBatchInfo],
     device: torch.device,
 ) -> torch.Tensor:
     if sampling_info is None:
-        return torch.ones(bs, dtype=torch.bool, device=device)
-    return (sampling_info.top_ks <= 1).view(-1)
+        return torch.ones(bs, dtype=torch.float32, device=device)
+    return sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
 
 
 def sample_draft_block(
@@ -132,8 +203,8 @@ def sample_draft_block(
     base_logits: torch.Tensor,
     anchor_tokens: torch.Tensor,
     draft_hidden: torch.Tensor,
-    sampling_info,
-    markov_head,
+    sampling_info: Optional[SamplingBatchInfo],
+    markov_head: MarkovHead,
     device: torch.device,
     tp_sync: SpecTpSync,
 ) -> DraftBlockResult:
@@ -142,12 +213,9 @@ def sample_draft_block(
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
 
-    if sampling_info is None:
-        temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-    else:
-        temperatures = (
-            sampling_info.temperatures.view(-1).to(torch.float32).clamp_min(1e-5)
-        )
+    temperatures = resolve_temperatures(
+        bs=bs, sampling_info=sampling_info, device=device
+    )
 
     if not any_sampling:
 
@@ -163,7 +231,9 @@ def sample_draft_block(
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             if fast_sampling:
                 exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
+                    step_logits.shape,
+                    dtype=torch.float32,
+                    device=step_logits.device,
                 ).exponential_(1)
                 return tp_sync.sync(
                     SpecTpSyncSite.DSPARK_DRAFT_SAMPLE,
@@ -204,11 +274,11 @@ class DraftBlockProposer:
     def __init__(
         self,
         *,
-        draft_model,
+        draft_model: nn.Module,
         draft_model_runner,
         gamma: int,
         mask_token_id: int,
-        draft_block_spec_info,
+        draft_block_spec_info: DFlashVerifyInput,
         tp_sync: SpecTpSync,
         dp_moe_sync: bool = False,
     ) -> None:
@@ -230,11 +300,12 @@ class DraftBlockProposer:
             if enable_num_token_non_padded()
             else None
         )
+        self._draft_extend_seq_lens_buf: Optional[torch.Tensor] = None
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
 
-    def _base_logits_context(self):
+    def _base_logits_context(self) -> AbstractContextManager[None]:
         if self._dp_moe_sync:
             return draft_tp_context(get_parallel().attn_tp_group)
         return nullcontext()
@@ -245,10 +316,10 @@ class DraftBlockProposer:
         batch: ScheduleBatch,
         draft_input: DFlashDraftInputV2,
         verify_window: VerifyWindow,
-        bs: int,
         device: str,
-        target_model,
-        sampling_info,
+        target_model: nn.Module,
+        sampling_info: Optional[SamplingBatchInfo],
+        host_len_slack: int = 0,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -257,15 +328,18 @@ class DraftBlockProposer:
         )
         draft_sampler = self._draft_sampler
         all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        # Entry padding already widened the batch, so these are the rows the
+        # draft runs on. Off TPU nothing pads, so they are also the live rows.
+        bs = int(batch.seq_lens.shape[0])
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
             verify_window=verify_window,
-            bs=bs,
             device=device,
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            host_len_slack=host_len_slack,
         )
         draft_block_ids = fwd.draft_block_ids
 
@@ -297,14 +371,9 @@ class DraftBlockProposer:
                 greedy_mask = resolve_greedy_mask(
                     bs=bs, sampling_info=sampling_info, device=device
                 )
-                if sampling_info is None:
-                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-                else:
-                    temperatures = (
-                        sampling_info.temperatures.view(-1)
-                        .to(torch.float32)
-                        .clamp_min(1e-5)
-                    )
+                temperatures = resolve_temperatures(
+                    bs=bs, sampling_info=sampling_info, device=device
+                )
                 corrected_logits = None
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
@@ -314,7 +383,33 @@ class DraftBlockProposer:
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]
+        elif fwd.next_draft_tokens is not None and all_greedy:
+            # DSparkDraftMixin.sample_draft_tokens_tpu already ran the chain in
+            # the draft graph; only greedy accept reaches here, and it compares
+            # tokens rather than the corrected logits.
+            folded = True
+            draft_block = DraftBlockResult(
+                draft_tokens=fwd.next_draft_tokens,
+                corrected_logits=None,
+                greedy_mask=resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
+                temperatures=resolve_temperatures(
+                    bs=bs, sampling_info=sampling_info, device=device
+                ),
+            )
         else:
+            if _is_tpu and all_greedy:
+                # DFLASH raises the same way. The tail runs gamma uncompiled
+                # programs keyed on the live bs; taking it silently would turn a
+                # draft-graph coverage gap into an invisible per-step stall.
+                raise RuntimeError(
+                    "DSpark greedy decode on TPU expected next_draft_tokens from "
+                    "the draft graph, got None."
+                )
+            # TODO(junyanxu): shard markov_w2 to match the lm_head so the folded
+            # block can reach distributed_tpu_top_k per step instead of gathering
+            # the full vocab, and so sampling batches stop taking this tail.
             with self._base_logits_context():
                 base_logits, confidence_tap = self.draft_model.compute_base_logits(
                     fwd.raw_hidden
@@ -372,17 +467,20 @@ class DraftBlockProposer:
         batch: ScheduleBatch,
         draft_input: DFlashDraftInputV2,
         verify_window: VerifyWindow,
-        bs: int,
         device: str,
-        embed_module,
+        embed_module: nn.Module,
         draft_sampler=None,
-        sampling_info=None,
+        sampling_info: Optional[SamplingBatchInfo] = None,
+        host_len_slack: int = 0,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
         prefix_lens = batch.seq_lens
         positions_2d = verify_window.positions_2d
         verify_cache_loc_2d = verify_window.verify_cache_loc_2d
+        # Entry padding already widened the batch, so the rows it handed us are
+        # the rows the draft runs on -- there is no live/padded split in here.
+        bs = int(prefix_lens.shape[0])
 
         buf = self._draft_block_ids_buf
         if buf is None or buf.shape[0] < bs or buf.device != prefix_lens.device:
@@ -399,16 +497,13 @@ class DraftBlockProposer:
         draft_positions = positions_2d[:, :query_token_num].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :query_token_num].reshape(-1)
 
-        draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
-            self.draft_model, "forward_embed"
-        )
         draft_input_embeds: Optional[torch.Tensor] = None
-        if not draft_owns_embed:
+        if not draft_owns_embed(self.draft_model):
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         if batch.seq_lens_cpu is not None:
-            draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
+            draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num + host_len_slack
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
         elif draft_input.nxt_kv_lens_cpu is not None:
             draft_seq_lens_cpu = draft_input.nxt_kv_lens_cpu
@@ -417,12 +512,36 @@ class DraftBlockProposer:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
         draft_num_tokens = bs * query_token_num
+        if _is_tpu:
+            extend_buf = self._draft_extend_seq_lens_buf
+            if extend_buf is None or extend_buf.shape[0] < bs:
+                extend_buf = torch.empty(
+                    (bs,), dtype=torch.int32, device=prefix_lens.device
+                )
+                self._draft_extend_seq_lens_buf = extend_buf
+            tpu_extend = build_tpu_draft_extend_metadata(
+                bs=bs,
+                width=query_token_num,
+                draft_prefix_lens=prefix_lens,
+                seq_lens_cpu=_pad_host_lens(batch.seq_lens_cpu, bs),
+                extend_seq_lens_buf=extend_buf,
+            )
+            draft_seq_lens = tpu_extend.seq_lens
+            req_pool_indices_cpu = resolve_req_pool_indices_cpu(
+                req_pool_indices=batch.req_pool_indices,
+                req_pool_indices_cpu=batch.req_pool_indices_cpu,
+            )
+        else:
+            tpu_extend = EMPTY_TPU_DRAFT_EXTEND
+            draft_seq_lens = prefix_lens
+            req_pool_indices_cpu = None
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
             input_ids=draft_block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
-            seq_lens=prefix_lens,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            seq_lens=draft_seq_lens,
             out_cache_loc=draft_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=draft_seq_lens_cpu,
@@ -435,6 +554,11 @@ class DraftBlockProposer:
                 draft_num_tokens, device
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
+            extend_prefix_lens=tpu_extend.extend_prefix_lens,
+            extend_seq_lens=tpu_extend.extend_seq_lens,
+            extend_prefix_lens_cpu=tpu_extend.extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=tpu_extend.extend_seq_lens_cpu,
+            extend_num_tokens=tpu_extend.extend_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
@@ -444,7 +568,8 @@ class DraftBlockProposer:
             and graph_runner.can_run_graph(draft_forward_batch)
         ):
             draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
-        with torch.inference_mode():
+        grad_context = torch.no_grad if _is_tpu else torch.inference_mode
+        with grad_context():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
         raw_hidden = logits_output.hidden_states
@@ -470,6 +595,7 @@ class DraftBlockProposer:
             raw_hidden=model_hidden,
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
+            next_draft_tokens=logits_output.next_draft_tokens,
         )
 
     def _fill_dp_moe_sync_metadata(

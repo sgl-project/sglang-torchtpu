@@ -11,6 +11,12 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.dspark_utils_tpu import (
+    DsparkTpuVerifyWindow,
+    pad_decode_batch,
+    restore_decode_batch,
+    unpad_verify_outputs,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -68,6 +74,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     CommitInjectCtx,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+    trim_accept_to_live,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
@@ -82,11 +89,13 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_npu,
     is_pin_memory_available,
+    is_tpu,
 )
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 
 @runtime_checkable
@@ -243,6 +252,15 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.query_token_num), device=self.device
         )
+        self._tpu_verify_window = (
+            DsparkTpuVerifyWindow(
+                device=self.device,
+                verify_num_draft_tokens=int(self.verify_num_draft_tokens),
+                block_pos_offsets=self._block_pos_offsets,
+            )
+            if _is_tpu
+            else None
+        )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
             if self.ps.tp_rank == 0:
@@ -359,6 +377,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._forced_budget_frac: Optional[float] = None
         self._need_mamba_verify_commit = False
+        self._verify_ids_2d_buf: Optional[torch.Tensor] = None
 
         self._observers = DsparkStepObservers(
             planner=self._verify_planner,
@@ -387,6 +406,12 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
         )
+
+    @property
+    def kv_injector(self) -> TargetHiddenKvInjector:
+        # The TPU compile policy wraps inject_target_hidden with its compiled,
+        # bucket-padded variant.
+        return self._kv_injector
 
     def __getattr__(self, name):
         if name == "_target_worker":
@@ -430,7 +455,36 @@ class DSparkWorkerV2(BaseSpecWorker):
             "update_mamba_state_after_mtp_verify",
         )
 
+    def _init_tpu_graphs(self) -> None:
+        """Initialize TPU draft graphs and precompile policies during warmup."""
+        target_model = self._target_worker.model_runner.model
+        if target_model.lm_head is None:
+            raise RuntimeError(
+                "Target model must have an lm_head for DSPARK TPU draft sampling."
+            )
+        self.draft_model.lm_head = target_model.lm_head
+        with self._draft_context():
+            self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+        # Function scope: the policy module imports this one at top level.
+        from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dspark import (
+            DsparkSpecDecodeCompilePolicyMixin,
+        )
+
+        compile_policy = self.draft_model_runner.compile_policy
+        if not isinstance(compile_policy, DsparkSpecDecodeCompilePolicyMixin):
+            raise RuntimeError(
+                "DSpark on TPU requires --enable-torch-compile; the draft runner "
+                f"has no spec compile policy (got {type(compile_policy).__name__})."
+            )
+        compile_policy.precompile_draft(
+            self.draft_model_runner.attn_backend,
+            dspark_worker=self,
+        )
+
     def init_cuda_graphs(self):
+        if _is_tpu:
+            return self._init_tpu_graphs()
+
         capture_decode_cuda_graph = self._decode_graph_allowed
         available_mem = self._tp_sync.available_memory_gb(
             SpecTpSyncSite.DSPARK_MEM,
@@ -607,6 +661,43 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         return batch_output
 
+    def _verify_ids_2d(
+        self, *, anchor_tokens: torch.Tensor, draft_tokens: torch.Tensor, bs: int
+    ) -> torch.Tensor:
+        """The [bs, 1 + gamma] verify chain, written into a persistent buffer.
+
+        A fresh torch.cat here is a new lazy-JIT program per live batch size on
+        TPU; DFLASH writes the same chain into a preallocated buffer.
+        """
+        width = 1 + draft_tokens.shape[1]
+        # torch.cat promoted; a fixed-dtype buffer would truncate instead.
+        dtype = torch.promote_types(anchor_tokens.dtype, draft_tokens.dtype)
+        buf = self._verify_ids_2d_buf
+        if (
+            buf is None
+            or buf.shape[0] < bs
+            or buf.shape[1] != width
+            or buf.dtype != dtype
+        ):
+            buf = torch.empty(
+                (self._pad_verify_bs(bs), width),
+                dtype=dtype,
+                device=draft_tokens.device,
+            )
+            self._verify_ids_2d_buf = buf
+        out = buf[:bs]
+        out[:, :1].copy_(anchor_tokens)
+        out[:, 1:].copy_(draft_tokens)
+        return out
+
+    def _pad_verify_bs(self, bs: int) -> int:
+        """Round bs up to the TPU compile bucket; identity on other backends."""
+        if not _is_tpu:
+            return int(bs)
+        b_bucketer = self.model_runner.compile_policy.b_bucketer
+        assert b_bucketer is not None
+        return int(b_bucketer.next_bucket(int(bs)))
+
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
         if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
             return None
@@ -676,23 +767,47 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
+        # `seq_lens` is carried over from the previous overlap iteration and may
+        # have been produced on another stream.
+        if not _is_tpu:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+        # Real row count, read before padding: it stays the live-request count
+        # every ghost row has to be trimmed back to.
         bs = len(batch.seq_lens)
+        pad_bs = self._pad_verify_bs(bs)
+        padding = pad_decode_batch(batch=batch, draft_input=draft_input, pad_bs=pad_bs)
         device = self.device
         prefix_lens = batch.seq_lens
 
         self._observers.begin_step()
 
         target_model = self.target_worker.model_runner.model
-        verify_window = alloc_verify_window(
-            batch=batch,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-            model_runner=self.model_runner,
+        if self._tpu_verify_window is not None:
+            verify_window = self._tpu_verify_window.alloc(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                prefix_lens=prefix_lens,
+                bs=pad_bs,
+                candidates=draft_input.tpu_verify_cache_candidates,
+                committed_lens=draft_input.tpu_committed_lens,
+            )
+        else:
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=pad_bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+            )
+        # The host mirror then holds the committed base, one commit behind the
+        # device, so every bound derived from it needs a second block.
+        host_len_slack = (
+            self.verify_num_draft_tokens
+            if draft_input.tpu_host_seq_lens_is_committed
+            else 0
         )
 
         sampling_info = batch.sampling_info
@@ -701,10 +816,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 batch=batch,
                 draft_input=draft_input,
                 verify_window=verify_window,
-                bs=bs,
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
+                host_len_slack=host_len_slack,
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
@@ -744,13 +859,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
-        verify_ids_2d = torch.cat(
-            [draft_block_ids[:, :1], draft_tokens], dim=1
-        ).contiguous()
+        verify_ids_2d = self._verify_ids_2d(
+            anchor_tokens=draft_block_ids[:, :1], draft_tokens=draft_tokens, bs=pad_bs
+        )
 
-        # Must stay ahead of the target verify launch below.
+        # Must stay ahead of the target verify launch below. Live rows only: the
+        # tree is walked against batch.reqs.
         grammar_tree = (
-            GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
+            GrammarTree.from_linear_chain(verify_ids_2d[:bs])
+            if batch.has_grammar
+            else None
         )
 
         # A live grammar forces the eager path: the folded epilogue accepts inside
@@ -774,7 +892,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     layout=layout,
                     draft_block_ids=draft_block_ids,
                     draft_tokens=draft_tokens,
-                    bs=bs,
+                    bs=pad_bs,
                     device=device,
                     sampling_info=sampling_info,
                     inject_gate=fold_eligible,
@@ -786,10 +904,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    host_len_slack=host_len_slack,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        verify_padding = target_verify.verify_padding
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -801,45 +921,69 @@ class DSparkWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
             if grammar_mask is not None:
-                grammar_mask.apply(logits_output.next_token_logits)
+                # A prefix view writes through, and the mask is sized for the
+                # live requests even when the outputs stayed padded.
+                grammar_mask.apply(
+                    logits_output.next_token_logits[: bs * self.verify_num_draft_tokens]
+                )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
         accept = self._verify_executor.accept_and_finalize(
             folded_accept=folded_accept,
-            bs=bs,
+            bs=pad_bs,
             verify_ids_2d=verify_ids_2d,
             target_logits=logits_output.next_token_logits,
+            logits_output=logits_output,
             draft_block=draft_block,
             sampling_info=sampling_info,
             draft_input=draft_input,
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+            verify_padding=verify_padding,
         )
+        if target_verify.verify_forward_batch is not None and _is_tpu:
+            logits_output = unpad_verify_outputs(
+                compile_policy=self.model_runner.compile_policy,
+                logits_output=logits_output,
+                verify_forward_batch=target_verify.verify_forward_batch,
+            )
+
+        # Everything the scheduler sees must be back on the live rows: the
+        # result feeds filter_batch, which a ghost row would corrupt.
+        restore_decode_batch(batch=batch, padding=padding)
+        live = trim_accept_to_live(accept, bs)
+        live_confidence = None if confidence is None else confidence[:bs]
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            : bs * self.verify_num_draft_tokens
+        ]
+
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
                 logits_output,
-                accept.out_tokens.reshape(-1),
+                live.out_tokens.reshape(-1),
                 chain_stride=self.verify_num_draft_tokens,
             )
 
         if on_publish is not None:
-            if confidence is not None:
-                on_publish(accept.new_seq_lens, confidence=confidence)
+            if live_confidence is not None:
+                on_publish(live.new_seq_lens, confidence=live_confidence)
             else:
-                on_publish(accept.new_seq_lens)
+                on_publish(live.new_seq_lens)
 
         self._commit_target_mamba_states_after_verify(
             batch=batch,
-            seq_lens_pre_verify=prefix_lens,
-            seq_lens_post_verify=accept.new_seq_lens,
-            commit_lens=accept.commit_lens,
+            seq_lens_pre_verify=prefix_lens[:bs],
+            seq_lens_post_verify=live.new_seq_lens,
+            commit_lens=live.commit_lens,
         )
 
         folded_commit = folded_accept and epilogue.folds_commit
         if not folded_commit:
+            # Still padded: the verify window it writes spans the bucket, and
+            # ghost rows land on the reserved dummy page.
             self._verify_executor.commit_hidden(
                 batch=batch,
                 layout=layout,
@@ -847,7 +991,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 verify_window=verify_window,
                 logits_output=logits_output,
                 commit_lens=accept.commit_lens,
-                bs=bs,
+                bs=pad_bs,
                 run_compact=run_compact,
             )
         logits_output.hidden_states = None
@@ -857,18 +1001,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             reqs=batch.reqs,
             bs=bs,
             proposal_folded=proposal.folded,
-            verify_ids_2d=verify_ids_2d,
+            verify_ids_2d=verify_ids_2d[:bs],
             target_logits=logits_output.next_token_logits,
             layout=layout,
-            confidence=confidence,
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
+            confidence=live_confidence,
+            prefix_lens=prefix_lens[:bs],
+            draft_tokens=draft_tokens[:bs],
             draft_block=draft_block,
             sampling_info=sampling_info,
-            correct_len=accept.correct_len,
-            cap_trim_lens=accept.cap_trim_lens,
-            bonus=accept.bonus,
-            commit_lens=accept.commit_lens,
+            correct_len=live.correct_len,
+            cap_trim_lens=live.cap_trim_lens,
+            bonus=live.bonus,
+            commit_lens=live.commit_lens,
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
@@ -876,21 +1020,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         next_draft_input = make_next_draft_input(
-            bonus_tokens=accept.bonus,
-            new_seq_lens=accept.new_seq_lens,
+            bonus_tokens=live.bonus,
+            new_seq_lens=live.new_seq_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=accept.out_tokens.reshape(-1),
-            accept_lens=accept.commit_lens,
-            block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
+            next_token_ids=live.out_tokens.reshape(-1),
+            accept_lens=live.commit_lens,
+            block_accept_lens=live.commit_lens + live.cap_trim_lens,
             cap_lens=(
-                layout.verify_lens.to(torch.int32) if layout is not None else None
+                layout.verify_lens[:bs].to(torch.int32) if layout is not None else None
             ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
-            new_seq_lens=accept.new_seq_lens,
+            new_seq_lens=live.new_seq_lens,
         )
 
     def _commit_target_mamba_states_after_verify(

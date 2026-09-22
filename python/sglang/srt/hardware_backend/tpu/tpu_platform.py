@@ -354,7 +354,7 @@ class TpuSRTPlatform(SRTPlatform):
                     raise NotImplementedError(
                         "EAGLE3 topk > 1 is not supported on TPU yet."
                     )
-            elif spec_algo == "DFLASH":
+            elif spec_algo in ("DFLASH", "DSPARK"):
                 pass
             else:
                 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -365,7 +365,7 @@ class TpuSRTPlatform(SRTPlatform):
                 if spec_algo.upper() in SpeculativeAlgorithm.__members__:
                     raise NotImplementedError(
                         f"Speculative algorithm {spec_algo!r} is not supported on TPU "
-                        "yet (only EAGLE3 and DFLASH among builtin algorithms)."
+                        "yet (only EAGLE3, DFLASH and DSPARK among builtin algorithms)."
                     )
 
         if cfg.enable_dp_attention:

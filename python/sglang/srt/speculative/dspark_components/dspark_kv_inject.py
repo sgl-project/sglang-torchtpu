@@ -5,13 +5,30 @@ import torch
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
-from sglang.kernels.ops.speculative.cache_locs import assign_extend_cache_locs_func
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func as _cuda_assign_extend_cache_locs_func,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildCommitInjectLayout,
     build_unified_commit_inject_layout,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_utils import (
+    assign_extend_cache_locs_func as _tpu_assign_extend_cache_locs_func,
+)
+from sglang.srt.utils import is_tpu
+
+_is_tpu = is_tpu()
+
+# The kernels/ops variant has no TPU arm and falls off the end returning None;
+# the spec_utils one (shared with EAGLE / DFLASH) does. Keep every other device
+# on the variant DSpark already shipped with.
+assign_extend_cache_locs_func = (
+    _tpu_assign_extend_cache_locs_func
+    if _is_tpu
+    else _cuda_assign_extend_cache_locs_func
+)
 
 
 class TargetHiddenKvInjector:
@@ -71,6 +88,17 @@ class TargetHiddenKvInjector:
             )
 
         pool = self.draft_model_runner.token_to_kv_pool
+        if _is_tpu:
+            self._inject_tpu_fused(
+                pool=pool,
+                target_hidden=target_hidden,
+                cache_loc=cache_loc,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+            )
+            return
+
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
             if target_hidden_is_projected:
                 raise RuntimeError(
@@ -98,6 +126,41 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+            )
+
+    def _inject_tpu_fused(
+        self,
+        *,
+        pool,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor],
+        commit_lens: Optional[torch.Tensor],
+    ) -> None:
+        """Write draft KV through the fused TPU pool.
+
+        The generic pool API writes separate k_buffer / v_buffer, but the TPU
+        pool interleaves K and V in one kv_buffer, so reuse the DFlash
+        single-launch rope+scatter: DSparkDraftModel subclasses DFlashDraftModel
+        and its per-layer projections line up.
+        """
+        from sglang.srt.hardware_backend.tpu.dflash_draft_kv_write import (
+            dflash_write_draft_kv,
+        )
+
+        if cache_loc_2d is not None and int(cache_loc_2d.shape[0]) == 0:
+            return
+        with torch.no_grad():
+            dflash_write_draft_kv(
+                draft_model=self.draft_model,
+                kv_pool=pool,
+                ctx_hidden=self.draft_model.project_target_hidden(target_hidden),
+                ctx_positions=positions,
+                ctx_cache_loc=cache_loc,
+                cache_loc_2d=cache_loc_2d,
+                commit_lens=commit_lens,
+                max_num_reqs=int(self.model_runner.req_to_token_pool.size),
             )
 
     def _inject_mla(

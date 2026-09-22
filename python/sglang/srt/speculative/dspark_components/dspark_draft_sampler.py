@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
-from sglang.srt.models.dspark import VanillaMarkov
+from sglang.srt.models.dspark import VanillaMarkov, greedy_step_sampler
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
 )
@@ -28,11 +28,6 @@ def _base_logits_dtype(model) -> torch.dtype:
     if weight.is_floating_point():
         return weight.dtype
     return next(model.markov_head.parameters()).dtype
-
-
-def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-    del step_idx
-    return torch.argmax(step_logits, dim=-1)
 
 
 class DsparkDraftSampler:

@@ -9,6 +9,7 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.compilation.compiled_op import get_compiled_ops
+from sglang.srt.hardware_backend.tpu import dspark_utils_tpu as _dspark  # noqa: F401
 from sglang.srt.hardware_backend.tpu import (  # noqa: F401
     eagle_utils_tpu as _eagle_utils_tpu,
 )

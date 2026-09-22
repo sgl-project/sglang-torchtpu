@@ -571,10 +571,25 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    _is_tpu = cfg.device.startswith("tpu")
+    if not cfg.device.startswith(("cuda", "npu", "tpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU, or TPU device."
         )
+    if _is_tpu:
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        # Non-static modes key verify graphs on token buckets owned by the
+        # decode cuda graph runner, which TPU does not have.
+        tpu_ragged_mode = read_ragged_verify_mode()
+        if tpu_ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "DSpark on TPU requires SGLANG_RAGGED_VERIFY_MODE=static, got "
+                f"{tpu_ragged_mode.value!r}."
+            )
 
     # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
     if cfg.enable_dp_attention and cfg.dp_size > 1:

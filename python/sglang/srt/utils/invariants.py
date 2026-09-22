@@ -186,10 +186,12 @@ class _CheckReporter:
             self._logged_total[key] = 0
 
         dev.add_(hit_count.reshape(1).to(torch.int64))
-        self._host[key].copy_(dev, non_blocking=True)  # async, no sync
+        # Only pinned-host CUDA mirrors are truly async; elsewhere (TPU) this
+        # readback stalls, so it carries a span.
+        self._host[key].copy_(dev, non_blocking=True)
+        total = int(self._host[key][0])
         self._calls[key] += 1
 
-        total = int(self._host[key][0])  # stale host read, no sync
         last = self._logged_total[key]
         first_hit = last == 0 and total > 0
         cadence = self._calls[key] % _FLUSH_EVERY == 0

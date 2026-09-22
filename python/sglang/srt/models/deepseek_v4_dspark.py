@@ -45,10 +45,9 @@ from sglang.srt.models.deepseek_v4 import (
 )
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
-    StepSampler,
+    MarkovHead,
     gather_and_crop_vocab,
     project_through_lm_head,
-    run_markov_block,
 )
 from sglang.srt.runtime_context import (
     get_parallel,
@@ -360,7 +359,7 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
     num_embeddings_padded: int
 
 
-class DSparkV4MarkovHead(nn.Module):
+class DSparkV4MarkovHead(MarkovHead):
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -480,24 +479,6 @@ class DSparkV4MarkovHead(nn.Module):
         embed = self.get_prev_embeddings(token_ids)
         logits = self.project_bias(embed)
         return logits, embed
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
 
 
 def build_dspark_v4_confidence_head(

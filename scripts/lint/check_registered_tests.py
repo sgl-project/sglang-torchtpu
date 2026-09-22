@@ -142,6 +142,11 @@ def _changed_registered_files() -> set[str]:
     return set()
 
 
+def _is_unit_suite(suite: str | None) -> bool:
+    """Upstream spells it stage-a-unit-test-npu; the TPU stage, stage-a-test-tpu-unit."""
+    return "unit" in (suite or "").split("-")
+
+
 def _contains_call(tree: ast.AST, name: str) -> bool:
     return any(
         isinstance(node, ast.Call)
@@ -173,12 +178,13 @@ def taxonomy_errors(path: str, registries: list, tree: ast.AST) -> list[str]:
         invalid = [
             r
             for r in registries
-            if r.backend.name != "CPU" and "-unit-" not in (r.effective_suite or "")
+            if r.backend.name != "CPU" and not _is_unit_suite(r.effective_suite)
         ]
         if invalid:
             errors.append(f"{path}: unit tests must use CPU or dedicated unit suites")
-        if any(r.est_time > 60 for r in registries):
-            errors.append(f"{path}: unit test est_time must be <= 60 seconds")
+        # Device lanes budget their own stage; 60s is the CPU unit lane's cap.
+        if any(r.backend.name == "CPU" and r.est_time > 60 for r in registries):
+            errors.append(f"{path}: CPU unit test est_time must be <= 60 seconds")
         if _contains_call(tree, "popen_launch_server"):
             errors.append(f"{path}: unit tests may not launch a server")
     elif kind == "kernel":

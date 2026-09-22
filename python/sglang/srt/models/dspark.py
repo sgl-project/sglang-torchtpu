@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
 
 
+def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+    del step_idx
+    return torch.argmax(step_logits, dim=-1)
+
+
 def gather_and_crop_vocab(
     local_logits: torch.Tensor, lm_head: nn.Module
 ) -> torch.Tensor:
@@ -48,42 +53,84 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
-def run_markov_block(
-    head: nn.Module,
-    base_logits: torch.Tensor,
-    *,
-    first_prev_tokens: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    sampler: StepSampler,
-    collect_corrected: bool = True,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    batch_size, proposal_len = base_logits.shape[:2]
-    if proposal_len == 0:
-        empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-        return empty, base_logits
+class MarkovHead(nn.Module):
+    """Step-bias head of the DSpark semi-AR draft: it corrects each block step's
+    logits from the previously drafted token and, for stateful heads, the draft
+    hidden state."""
 
-    sampled_tokens = []
-    corrected_logits = []
-    prev_tokens = first_prev_tokens.long()
-    for step_idx in range(proposal_len):
-        step_hidden = None if hidden_states is None else hidden_states[:, step_idx, ...]
-        step_logits = head.apply_step_logits(
-            base_logits[:, step_idx, :],
-            token_ids=prev_tokens,
-            hidden_states=step_hidden,
+    markov_head_type: str
+
+    def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def apply_step_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        token_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def sample_block(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        sampler: StepSampler,
+        collect_corrected: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size, proposal_len = base_logits.shape[:2]
+        if proposal_len == 0:
+            empty = torch.empty(
+                batch_size, 0, dtype=torch.long, device=base_logits.device
+            )
+            return empty, base_logits
+
+        sampled_tokens = []
+        corrected_logits = []
+        prev_tokens = first_prev_tokens.long()
+        for step_idx in range(proposal_len):
+            step_hidden = (
+                None if hidden_states is None else hidden_states[:, step_idx, ...]
+            )
+            step_logits = self.apply_step_logits(
+                base_logits[:, step_idx, :],
+                token_ids=prev_tokens,
+                hidden_states=step_hidden,
+            )
+            next_tokens = sampler(step_logits, step_idx)
+            sampled_tokens.append(next_tokens)
+            if collect_corrected:
+                corrected_logits.append(step_logits.unsqueeze(1))
+            prev_tokens = next_tokens
+        # Separate statements: torch_tpu names a JIT region after one op and its
+        # source line, so a combined return tuple cannot be told apart in a trace.
+        draft_tokens = torch.stack(sampled_tokens, dim=1)
+        corrected = torch.cat(corrected_logits, dim=1) if collect_corrected else None
+        return draft_tokens, corrected
+
+    def sample_block_greedy(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Draft block under argmax, dropping the corrected logits only the
+        sampling accept path reads."""
+        draft_tokens, _ = self.sample_block(
+            base_logits,
+            first_prev_tokens=first_prev_tokens,
+            hidden_states=hidden_states,
+            sampler=greedy_step_sampler,
+            collect_corrected=False,
         )
-        next_tokens = sampler(step_logits, step_idx)
-        sampled_tokens.append(next_tokens)
-        if collect_corrected:
-            corrected_logits.append(step_logits.unsqueeze(1))
-        prev_tokens = next_tokens
-    return (
-        torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1) if collect_corrected else None,
-    )
+        return draft_tokens
 
 
-class VanillaMarkov(nn.Module):
+class VanillaMarkov(MarkovHead):
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -130,24 +177,6 @@ class VanillaMarkov(nn.Module):
         if base_logits.size(-2) == 0:
             return base_logits
         return base_logits + self.compute_step_bias(token_ids, hidden_states)
-
-    def sample_block(
-        self,
-        base_logits: torch.Tensor,
-        *,
-        first_prev_tokens: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        sampler: StepSampler,
-        collect_corrected: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return run_markov_block(
-            self,
-            base_logits,
-            first_prev_tokens=first_prev_tokens,
-            hidden_states=hidden_states,
-            sampler=sampler,
-            collect_corrected=collect_corrected,
-        )
 
     def sample_block_greedy_fused(
         self,
@@ -370,7 +399,7 @@ class RNNHead(VanillaMarkov):
         return None
 
 
-def build_markov_head(config) -> Optional[nn.Module]:
+def build_markov_head(config) -> MarkovHead:
     markov_rank = int(getattr(config, "markov_rank", 0))
     if markov_rank <= 0:
         raise ValueError(
@@ -393,7 +422,7 @@ def build_markov_head(config) -> Optional[nn.Module]:
     raise ValueError(f"Unsupported DSpark markov_head_type={markov_head_type!r}.")
 
 
-def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> nn.Module:
+def build_nemotron_35_markov_head(config, quant_config, prefix: str) -> MarkovHead:
     markov_head_type = str(getattr(config, "markov_head_type", "vanilla")).lower()
     if markov_head_type != "vanilla":
         raise ValueError(
@@ -493,6 +522,7 @@ class DSparkDraftMixin:
             )
         self.gamma = int(dspark_config.resolve_gamma(default=self.block_size))
         self.sample_from_anchor = get_dspark_sample_from_anchor(config)
+        self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
         if self.is_nemotron_35_draft:
             self.markov_head = build_nemotron_35_markov_head(
                 config, quant_config, prefix
@@ -546,6 +576,32 @@ class DSparkDraftMixin:
         local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
+
+    def sample_draft_tokens_tpu(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Greedy draft block, in the draft graph instead of the eager tail.
+
+        Eager, every semi-AR step is its own lazy-JIT program keyed on the live
+        batch size; in the graph the block rides the forward's padded bucket.
+        Sampling keeps the tail: it needs corrected logits and RNG, and the
+        trace cannot branch on either.
+        """
+        hidden_by_query = hidden_states.view(
+            -1, self.query_token_num, hidden_states.shape[-1]
+        )
+        draft_hidden = (
+            hidden_by_query if self.sample_from_anchor else hidden_by_query[:, 1:, :]
+        )
+        bs = draft_hidden.shape[0]
+        base_logits, _ = self.compute_base_logits(
+            draft_hidden.reshape(bs * self.gamma, -1)
+        )
+        return self.markov_head.sample_block_greedy(
+            base_logits.view(bs, self.gamma, -1),
+            first_prev_tokens=input_ids.view(bs, self.query_token_num)[:, 0],
+            hidden_states=draft_hidden,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         markov_weights = []

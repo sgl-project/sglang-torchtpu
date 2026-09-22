@@ -26,6 +26,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.srt.hardware_backend.tpu.dspark_utils_tpu import (
+    DsparkTpuAcceptor,
+    logical_verify_logits,
+    physical_verify_candidates,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -46,10 +51,11 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_npu, is_tpu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
@@ -76,6 +82,10 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    # TPU only: set when the target outputs stayed on their bucket shape, so
+    # accept runs on padded rows and the caller trims afterwards.
+    verify_padding: object = None
+    verify_forward_batch: object = None
 
 
 class TargetVerifyExecutor:
@@ -101,6 +111,16 @@ class TargetVerifyExecutor:
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
         self._simulated_correct_drafts_buf: Optional[torch.Tensor] = None
+        # TPU counterpart of the CUDA-only DsparkVerifyEpilogue fold.
+        self._tpu_acceptor = (
+            DsparkTpuAcceptor(
+                device=model_runner.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                tp_sync=tp_sync,
+            )
+            if _is_tpu
+            else None
+        )
 
     def accept_and_finalize(
         self,
@@ -109,12 +129,14 @@ class TargetVerifyExecutor:
         bs: int,
         verify_ids_2d: torch.Tensor,
         target_logits: Optional[torch.Tensor],
+        logits_output: object,
         draft_block: DraftBlockResult,
         sampling_info,
         draft_input: DFlashDraftInputV2,
         layout: Optional[RaggedVerifyLayout],
         prefix_lens: torch.Tensor,
         draft_tokens: torch.Tensor,
+        verify_padding: object = None,
     ) -> AcceptOuts:
         """Produce the per-request accept outcome after target verify.
 
@@ -126,8 +148,27 @@ class TargetVerifyExecutor:
         if folded_accept:
             return self.verify_epilogue.read_accept(bs)
 
+        candidates = physical_verify_candidates(
+            verify_ids_2d=verify_ids_2d, padding=verify_padding
+        )
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        if (
+            self._tpu_acceptor is not None
+            and all_greedy
+            and self._simulate_acc_len <= 0
+        ):
+            return self._tpu_accept(
+                candidates=candidates,
+                target_logits=target_logits,
+                layout=layout,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                verify_padding=verify_padding,
+                logits_output=logits_output,
+            )
+
         correct_len, bonus, cap_trim_lens = accept_draft_tokens(
-            candidates=verify_ids_2d,
+            candidates=candidates,
             target_logits=target_logits,
             draft_block=draft_block,
             sampling_info=sampling_info,
@@ -136,6 +177,11 @@ class TargetVerifyExecutor:
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
         )
+        if verify_padding is not None:
+            compile_policy = self.target_worker.model_runner.compile_policy
+            correct_len, bonus, cap_trim_lens = compile_policy.finalize_dflash_verify(
+                verify_padding, (correct_len, bonus, cap_trim_lens), logits_output
+            )
         if self._simulate_acc_len > 0:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
@@ -143,7 +189,7 @@ class TargetVerifyExecutor:
 
         site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
-            if sampling_info is None or sampling_info.is_all_greedy
+            if all_greedy
             else SpecTpSyncSite.DSPARK_ACCEPT_SAMPLE
         )
         self._tp_sync.sync(site, correct_len)
@@ -168,6 +214,40 @@ class TargetVerifyExecutor:
             cap_trim_lens=finalized.cap_trim_lens,
             commit_lens=finalized.commit_lens,
             new_seq_lens=finalized.new_seq_lens,
+            out_tokens=out_tokens,
+        )
+
+    def _tpu_accept(
+        self,
+        *,
+        candidates: torch.Tensor,
+        target_logits: torch.Tensor,
+        layout: Optional[RaggedVerifyLayout],
+        prefix_lens: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        verify_padding: object,
+        logits_output: object,
+    ) -> AcceptOuts:
+        """Greedy accept through the two fused TPU graphs."""
+        outs = self._tpu_acceptor.accept(
+            candidates=candidates,
+            target_logits=target_logits,
+            verify_lens=None if layout is None else layout.verify_lens,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+        )
+        if verify_padding is not None:
+            compile_policy = self.target_worker.model_runner.compile_policy
+            outs = compile_policy.finalize_dflash_verify(
+                verify_padding, outs, logits_output
+            )
+        correct_len, bonus, cap_trim_lens, commit_lens, new_seq_lens, out_tokens = outs
+        return AcceptOuts(
+            correct_len=correct_len,
+            bonus=bonus,
+            cap_trim_lens=cap_trim_lens,
+            commit_lens=commit_lens,
+            new_seq_lens=new_seq_lens,
             out_tokens=out_tokens,
         )
 
@@ -248,6 +328,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        host_len_slack: int = 0,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -266,27 +347,52 @@ class TargetVerifyExecutor:
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
             if seq_lens_cpu_backup is not None:
-                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
+                batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w + host_len_slack
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             elif draft_input.nxt_kv_lens_cpu is not None:
                 batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
                 batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
+        compile_policy = self.target_worker.model_runner.compile_policy
+        # Trimmed logits key every accept helper on the live batch size, which
+        # costs a fresh ~0.4s program compile per size not yet seen.
+        keep_padded = _is_tpu and compile_policy.should_defer_verify_output_unpadding(
+            batch, verify_input
+        )
         result = self._forward_prepared_verify(
             batch=batch,
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            keep_outputs_padded=keep_padded,
         )
 
+        next_token_logits = result.logits_output.next_token_logits
+        if keep_padded:
+            # Live rows, not the bucket: the adjustments below are sized off
+            # sampling_info, which entry padding deliberately leaves logical.
+            next_token_logits = logical_verify_logits(
+                next_token_logits=next_token_logits,
+                bs=len(batch.reqs),
+                verify_num_draft_tokens=verify_w,
+            )
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=result.logits_output.next_token_logits,
+                next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
             )
+        if not keep_padded:
+            return result
 
-        return result
+        # After the adjustments: prepare_spec_verify widens sampling_info, and
+        # they are sized for the live requests.
+        return msgspec.structs.replace(
+            result,
+            verify_padding=compile_policy.prepare_spec_verify(
+                batch, verify_input, result.logits_output.next_token_logits
+            ),
+        )
 
     def _forward_prepared_verify(
         self,
@@ -295,10 +401,12 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        keep_outputs_padded: bool = False,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
+        verify_forward_batch.spec_info.keep_outputs_padded = keep_outputs_padded
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
@@ -311,6 +419,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            verify_forward_batch=verify_forward_batch,
         )
 
     def commit_hidden(
@@ -488,6 +597,18 @@ class AcceptOuts(msgspec.Struct):
     commit_lens: torch.Tensor
     new_seq_lens: torch.Tensor
     out_tokens: torch.Tensor
+
+
+def trim_accept_to_live(accept: AcceptOuts, bs: int) -> AcceptOuts:
+    """The live rows of an accept that ran on the padded batch bucket."""
+    return AcceptOuts(
+        correct_len=accept.correct_len[:bs],
+        bonus=accept.bonus[:bs],
+        cap_trim_lens=accept.cap_trim_lens[:bs],
+        commit_lens=accept.commit_lens[:bs],
+        new_seq_lens=accept.new_seq_lens[:bs],
+        out_tokens=accept.out_tokens[:bs],
+    )
 
 
 class DsparkVerifyEpilogue:

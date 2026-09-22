@@ -165,7 +165,7 @@ class SpeculativeAlgorithm(Enum):
 
     def supports_tpu_direct_compile(self) -> bool:
         """Whether this algorithm supports TPU direct compilation."""
-        return self.is_eagle3() or self.is_dflash()
+        return self.is_eagle3() or self.is_dflash_family()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
