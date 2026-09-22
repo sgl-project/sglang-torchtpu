@@ -1082,12 +1082,13 @@ def get_generate_fn(
 
         job_completed = False
         is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
-        # Check if running on AMD GPU - use longer timeout
+        # Slower accelerator backends need more than the default 20 minutes.
         is_amd = current_platform.is_hip()
+        is_tpu = current_platform.is_tpu()
         if is_baseline_generation_mode:
             timeout = 3600.0
-        elif is_amd:
-            timeout = 2400.0  # 40 minutes for AMD
+        elif is_amd or is_tpu:
+            timeout = 2400.0
         else:
             timeout = 1200.0
         deadline = time.time() + timeout
