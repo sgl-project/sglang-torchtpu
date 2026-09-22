@@ -1642,6 +1642,7 @@ class Scheduler(
         from sglang.srt.hardware_backend.tpu.spec_op_precompile import (
             precompile_spec_v2_ops,
         )
+        from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 
         compile_policy = self.tp_worker.model_runner.compile_policy
         if not isinstance(compile_policy, BaseSpecDecodeCompilePolicyMixin):
@@ -1665,6 +1666,11 @@ class Scheduler(
             draft_vocab_size=draft_vocab_size,
             hidden_size=hidden_size,
             hidden_dtype=hidden_dtype,
+            req_pool_size=self.future_map.req_pool_size,
+            need_hidden_states=spec_need_hidden_states(),
+        )
+        self.future_map.set_tpu_precompiled_batch_sizes(
+            compile_policy.b_bucketer.buckets
         )
 
     def maybe_init_ngram_embedding(self):

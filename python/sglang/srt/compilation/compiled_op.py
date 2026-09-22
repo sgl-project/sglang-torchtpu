@@ -12,7 +12,8 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_tpu
 
-WarmupArgsFactory = Callable[[Any], tuple[Any, ...]]
+# A recipe returns None when its helper is never dispatched in this configuration.
+WarmupArgsFactory = Callable[[Any], tuple[Any, ...] | None]
 
 
 @dataclass(frozen=True)

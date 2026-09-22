@@ -294,6 +294,7 @@ class FutureMap:
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
+        self.tpu_precompiled_batch_sizes: frozenset[int] = frozenset()
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -352,6 +353,9 @@ class FutureMap:
             req_pool_size=self.req_pool_size,
             pool=req_to_token_pool,
         )
+
+    def set_tpu_precompiled_batch_sizes(self, batch_sizes: Sequence[int]) -> None:
+        self.tpu_precompiled_batch_sizes = frozenset(batch_sizes)
 
     def _maybe_init_forward_bufs(self, payload: RelayPayload) -> None:
         # Local import (see decide_needs_cpu_seq_lens): keep module-level deps leaf.

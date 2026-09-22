@@ -742,11 +742,23 @@ def test_device_accept_cache_window_follows_verify_input(is_tpu):
 
 
 @pytest.mark.parametrize("with_hidden", (False, True))
-def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
+@pytest.mark.parametrize(
+    "bs,buckets,compile_enabled,physical_bs",
+    [
+        (3, (), False, 3),
+        (2, (4, 2), True, 2),
+        (3, (4, 2), True, 4),
+        (4, (4, 2), True, 4),
+        (3, (), True, None),
+        (5, (4, 2), True, None),
+    ],
+)
+def test_device_accept_gather_uses_covering_bucket(
+    bs, with_hidden, buckets, compile_enabled, physical_bs
+):
     from sglang.srt.hardware_backend.tpu import overlap_utils_tpu
     from sglang.srt.managers import overlap_utils
 
-    bs = 3
     indices = torch.arange(1, bs + 1, dtype=torch.int64)
     candidates = torch.arange(bs * 7).reshape(bs, 7)
     accept_lens = torch.arange(bs, dtype=torch.int32) % 4 + 1
@@ -763,20 +775,22 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
         need_topk=True,
         need_hidden_states=with_hidden,
         draft_probs_buf=None,
+        tpu_precompiled_batch_sizes=frozenset(buckets),
         topk_p_buf=torch.arange(8, dtype=torch.float32)[:, None],
         topk_index_buf=torch.arange(8)[:, None],
         output_tokens_buf=torch.arange(8) + 10,
         hidden_states_buf=torch.arange(16).reshape(8, 2) if with_hidden else None,
     )
     batch = SimpleNamespace(spec_info=draft, seq_lens_cpu=torch.tensor([99]))
-
-    def gather(rows, probs, topk, tokens, hidden):
-        return (
-            probs[rows],
-            topk[rows],
-            tokens[rows],
-            hidden[rows] if hidden is not None else None,
-        )
+    # Padding may read an unpopulated pool row, but must not publish or
+    # debug-check its token, nor invalidate it as a real consumed row.
+    future_map.output_tokens_buf[0] = -1
+    name = (
+        "fused_future_map_device_accept_hidden_tpu"
+        if with_hidden
+        else "fused_future_map_device_accept_tpu"
+    )
+    op = getattr(overlap_utils_tpu, name)
 
     def invalidate(values, buf, rows):
         assert (values >= 0).all()
@@ -796,15 +810,42 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
             overlap_utils_tpu.device_accept_resolved_tpu,
             create=True,
         ),
-        patch.object(overlap_utils, "gather_spec_extras_func", side_effect=gather),
+        patch.object(
+            overlap_utils_tpu.envs.SGLANG_ENABLE_TORCH_COMPILE,
+            "get",
+            return_value=compile_enabled,
+        ),
+        patch.object(overlap_utils_tpu, name, wraps=op.__wrapped__) as fused,
         patch.object(overlap_utils, "_DEBUG_ASSERT", True),
         patch.object(
             overlap_utils, "_assert_nonneg_and_invalidate", side_effect=invalidate
         ) as debug,
     ):
+        if compile_enabled and (not buckets or bs > max(buckets)):
+            message = (
+                "must be precompiled at startup"
+                if not buckets
+                else "exceeds largest precompiled bucket"
+            )
+            with pytest.raises(AssertionError, match=message):
+                overlap_utils_tpu.resolve_spec_extras_tpu(
+                    future_map, SimpleNamespace(spec_info=draft)
+                )
+            fused.assert_not_called()
+            debug.assert_not_called()
+            return
         overlap_utils.FutureMap.resolve_seq_lens_cpu(future_map, batch)
         torch.testing.assert_close(batch.seq_lens, indices + 20)
         torch.testing.assert_close(batch.seq_lens_cpu, torch.tensor([99]))
+        fused.assert_called_once()
+        args = fused.call_args.args
+        assert args[0].shape == (physical_bs,)
+        assert args[-3].shape == (physical_bs, 7)
+        assert args[-2].shape == (physical_bs,)
+        if physical_bs > bs:
+            assert (args[0][bs:] == 0).all()
+            assert (args[-3][bs:] == 0).all()
+            assert (args[-2][bs:] == 1).all()
         torch.testing.assert_close(debug.call_args.args[2], indices)
         # Reusing resolved state must neither gather nor invalidate again.
         overlap_utils.FutureMap._resolve_spec_extras(future_map, batch)
@@ -827,6 +868,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
     torch.testing.assert_close(
         future_map.output_tokens_buf[bs + 1 :], torch.arange(bs + 1, 8) + 10
     )
+    assert future_map.output_tokens_buf[0] == -1
     assert draft.future_indices is indices
     assert draft.accept_lens_device is accept_lens
     assert draft.device_accept_candidate_locs is candidates
