@@ -1,6 +1,8 @@
 """Correctness tests for diffusion platforms that use PyTorch fallbacks."""
 
+import sys
 import unittest
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -13,7 +15,6 @@ from sglang.kernels.ops.diffusion.common.fallback_torch import (
     triton_one_pass_rms_norm_native,
 )
 from sglang.kernels.ops.diffusion.common.platform import platform_key, select_impl
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -26,14 +27,26 @@ register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 class TestDiffusionPlatformDispatch(CustomTestCase):
     def test_tpu_uses_its_own_fallback_key(self):
         """TPU must not inherit CPU-only kernels through the default key."""
-        triton_impl = lambda: None
-        cpu_impl = lambda: None
-        tpu_impl = lambda: None
 
-        with (
-            patch.object(current_platform, "is_cuda", return_value=False),
-            patch.object(current_platform, "is_hip", return_value=False),
-            patch.object(current_platform, "is_tpu", return_value=True),
+        def triton_impl():
+            pass
+
+        def cpu_impl():
+            pass
+
+        def tpu_impl():
+            pass
+
+        platforms_module = ModuleType("sglang.multimodal_gen.runtime.platforms")
+        platforms_module.current_platform = SimpleNamespace(
+            is_cuda=lambda: False,
+            is_hip=lambda: False,
+            is_tpu=lambda: True,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {platforms_module.__name__: platforms_module},
         ):
             self.assertEqual(platform_key(), "tpu")
             self.assertIs(
