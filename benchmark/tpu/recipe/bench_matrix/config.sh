@@ -179,7 +179,7 @@ case "$BENCH_MODEL" in
         MODEL=${MODEL:-$GCS_WEIGHTS_ROOT/gpt-oss-120b}
         DRAFT_MODEL=${DRAFT_MODEL:-$GCS_WEIGHTS_ROOT/EAGLE3-gpt-oss-120b-bf16}
         # MXFP4 is declared by the checkpoint's own quantization_config.
-        QUANTIZATION=
+        QUANTIZATION=unquant
         KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
         # rpa_v3: the only TPU backend with attention sinks (GPT-OSS needs
         # them) AND the HiCache reload-commit hook KV offload requires.

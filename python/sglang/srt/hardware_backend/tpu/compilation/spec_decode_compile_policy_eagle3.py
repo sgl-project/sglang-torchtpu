@@ -1292,6 +1292,10 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             max(real_bs, self._dp_peer_draft_extend_rows(forward_batch))
         )
         pad_tokens = pad_b * self.draft_token_num
+        # Padding must not disguise missing active-row query counts.
+        query_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if query_lens_cpu is None or len(query_lens_cpu) < real_bs:
+            forward_batch.extend_seq_lens_cpu = None
         if pad_b != real_bs:
             # Draft extend has a fixed width, so it needs no token bucket.
             # This also grows its owned token- and request-axis tensors.
@@ -1300,9 +1304,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 num_tokens=pad_tokens,
                 bs=pad_b,
             )
-            # _pad_inputs_to_size skips the extend metadata tensors, but the
-            # compiled graph was traced with them at the bucket length. Zero
-            # rows are safe: padded requests' outputs are discarded.
+            # Pad any remaining extend metadata to the compiled batch size.
+            # Outputs for padded requests are discarded.
             for field in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
                 value = getattr(forward_batch, field, None)
                 if isinstance(value, torch.Tensor) and value.shape[0] < pad_b:
@@ -1315,10 +1318,9 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             # prefix unpadding.
             setattr(forward_batch, _REAL_B_KEY, real_bs)
 
-        # ForwardBatch.init_new may carry CPU extend metadata padded for the
-        # previous prefill cap. Draft extend bypasses model.prepare_forward_batch
-        # after attention metadata is marked ready, so normalize it here even
-        # when the live batch already lands exactly on a batch bucket.
+        # Prefill may leave CPU metadata padded to a different batch size.
+        # Draft extend skips model.prepare_forward_batch, so resize these lists
+        # here even when the current batch already matches a bucket.
         for field in (
             "extend_seq_lens_cpu",
             "extend_prefix_lens_cpu",
@@ -1326,6 +1328,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         ):
             value = getattr(forward_batch, field, None)
             if value is None:
+                if field == "extend_seq_lens_cpu":
+                    continue
                 value = []
             elif isinstance(value, torch.Tensor):
                 value = value.tolist()

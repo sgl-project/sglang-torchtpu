@@ -39,6 +39,7 @@ on:
           - pd-mh-gpt-120b-pc-offload-spec-reshard
           - pd-mh-gpt-120b-kvoff-reshard
           - pd-mh-qwen3-480b-kvoff-reshard
+          - pd-mh-qwen3-vl-8b-spec
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix
@@ -172,7 +173,9 @@ jobs:
       run_name: ${{ matrix.test.run_name }}
       # The spec-decoding gsm8k gates serve gpt-oss-120b / qwen3-coder-480b from
       # the ROX weights disk at /weights; harmless for tests that don't use it.
-      weights_pvc: model-weights-rox
+      # A test whose checkpoint lives on another disk overrides it via
+      # register_tpu_ci(weights_pvc=...).
+      weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights-rox' }}
     permissions:
       contents: read
       id-token: write
@@ -394,6 +397,33 @@ jobs:
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
       weights_pvc: model-weights-rox
       run_name: pd-mh-gpt-120b-spec
+    permissions:
+      contents: read
+      id-token: write
+
+  # Qwen3-VL-8B 2P+2D gate: the prefill owns the ViT, so the handoff carries
+  # image-derived KV into an EAGLE3 draft/verify decode loop. Scores MMMU-Pro.
+  pd-mh-qwen3-vl-8b-spec:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","pd-mh-qwen3-vl-8b-spec"]'), inputs.only || 'all')
+          && contains('test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py', inputs.test_filter) }}
+    name: pd-mh-qwen3-vl-8b-spec
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      display_name: test_tpu_qwen3_vl_8b_pd_multihost_eagle3
+      lane: nightly
+      hosts: 2
+      pd_prefill_hosts: 2
+      pd_decode_hosts: 2
+      exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
+      files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
+      # Qwen3-VL-8B is not on model-weights-rox; it has its own ROX disk.
+      weights_pvc: qwen3-spec-vl-rox
+      run_name: pd-mh-qwen3-vl-8b-spec
     permissions:
       contents: read
       id-token: write

@@ -402,6 +402,9 @@ fi
 echo "==== launch config ===="
 echo "  model              = $MODEL"
 echo "  model_slug         = $MODEL_SLUG"
+if [[ -d /weights ]]; then
+    echo "  weights_disk       = $(ls -1 /weights 2>/dev/null | tr '\n' ' ')"
+fi
 echo "  tp_size            = $TP_SIZE"
 if [[ "$ENABLE_MULTIHOST" == "1" ]]; then
   if [[ "$USE_RAY" == "1" ]]; then
@@ -446,6 +449,13 @@ echo "  ENABLE_TORCH_COMPILE_DEBUG = $ENABLE_TORCH_COMPILE_DEBUG  ($TORCH_COMPIL
 echo "  ENABLE_PROFILER_ENDPOINT   = $ENABLE_PROFILER_ENDPOINT  ($PROFILER_DIR)"
 echo "  TORCH_LOGS         = $TORCH_LOGS"
 echo "======================="
+
+# An absolute MODEL that is not on the mounted disk reaches transformers as an
+# HF repo id and dies with an unrelated HFValidationError deep in the loader.
+if [[ "$MODEL" == /* && ! -f "$MODEL/config.json" ]]; then
+    echo "ERROR: no checkpoint at $MODEL -- see weights_disk above." >&2
+    exit 1
+fi
 
 # Build the launch_server arg list, only adding optional flags when set.
 args=(

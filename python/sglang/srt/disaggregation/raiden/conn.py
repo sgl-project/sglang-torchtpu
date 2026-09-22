@@ -222,12 +222,10 @@ class RaidenKVManager(
                     1, -(-CHUNK_ANNOUNCE_TOKENS // int(self.kv_args.page_size))
                 )
             )
-            self._uuid_seq = 0
         else:
             # Detects a prefill that stopped answering and fails its rooms.
             self._start_heartbeat_checker_thread()
             self._decode = DecodeState()
-            self._uuid_seq = 0
 
         # Native I/O tracking stays on the manager: it survives room cleanup.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
