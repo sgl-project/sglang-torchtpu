@@ -3,6 +3,9 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+    dflash_verify_bookkeeping_torch,
+)
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_dflash_verify_bookkeeping_args,
@@ -10,7 +13,6 @@ from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     make_verify_bookkeeping_args,
     make_verify_tree_greedy_args,
 )
-from sglang.srt.speculative.dflash_utils import dflash_verify_bookkeeping_torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
