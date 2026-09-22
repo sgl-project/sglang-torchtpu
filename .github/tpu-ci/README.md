@@ -635,6 +635,14 @@ output tokens. The collector rejects missing/duplicate IDs and reports the
 combined 1,730-question score. Predictions and metrics are retained in the
 `full-evaluation-results` workflow artifact.
 
+GPT-OSS-20B evaluates AIME25 four times in one shared 128-thread pool (120
+responses total), then averages the per-sample scores. GPQA runs once and MMLU
+uses one 250-question subset; all three use high reasoning and a 131,072-token
+output request capped by the remaining model context. Its single TP8/EP8 server
+admits up to 128 requests. V3.1 also retains a single 250-question MMLU subset.
+These gates use the existing pinned sgl-eval harness, not the OpenAI CLI used
+by the separate manual tpu-inference comparison.
+
 Redux generates all 5,700 rows at 65,536 output tokens, scoring only rows marked
 `ok` or with an unambiguous corrected answer key (5,431 rows in the pinned
 revision). This preserves the September experiment's protocol; it is not the

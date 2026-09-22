@@ -1,4 +1,4 @@
-"""GPT-OSS-20B nightly GPQA, AIME25 and 250-question MMLU, one pass each."""
+"""GPT-OSS-20B: four concurrent AIME25 repeats; GPQA and MMLU-250 once."""
 
 import os
 
@@ -33,22 +33,23 @@ MODEL_CONFIG = {
             "label": "gpqa_diamond_high",
             "report_only": True,
             "repeat": 1,
-            "num_threads": 16,
+            "num_threads": 128,
             "reasoning_effort": "high",
             "temperature": 1.0,
             "top_p": 1.0,
-            "max_tokens": 65536,
+            "max_tokens": 131072,
         },
         {
             "dataset": "aime25",
             "label": "aime25_high",
             "report_only": True,
-            "repeat": 1,
-            "num_threads": 16,
+            # sgl-eval submits all 30 x 4 samples to one shared worker pool.
+            "repeat": 4,
+            "num_threads": 128,
             "reasoning_effort": "high",
             "temperature": 1.0,
             "top_p": 1.0,
-            "max_tokens": 65536,
+            "max_tokens": 131072,
         },
         {
             "dataset": "mmlu",
@@ -56,11 +57,11 @@ MODEL_CONFIG = {
             "report_only": True,
             "repeat": 1,
             "num_examples": 250,
-            "num_threads": 16,
+            "num_threads": 128,
             "reasoning_effort": "high",
             "temperature": 1.0,
             "top_p": 1.0,
-            "max_tokens": 65536,
+            "max_tokens": 131072,
         },
     ],
 }
