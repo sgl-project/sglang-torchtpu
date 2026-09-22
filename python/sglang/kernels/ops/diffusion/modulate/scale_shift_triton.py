@@ -791,6 +791,7 @@ def fuse_residual_layernorm_scale_shift_gate_select01_kernel(
 
 fuse_scale_shift_kernel = select_impl(
     fuse_scale_shift_kernel,
+    tpu=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
     npu=lazy_fallback("npu", "fuse_scale_shift_native"),
     mps=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
     musa=lazy_fallback("torch", "fuse_scale_shift_kernel_native"),
