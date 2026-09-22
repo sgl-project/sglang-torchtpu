@@ -1,6 +1,5 @@
 """Tests for direct TPU compilation and artifact dispatch."""
 
-import io
 import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -104,10 +103,11 @@ class _ModelWithUnusedInputs(torch.nn.Module):
         )
 
 
-def _pruning_mlir_bytecode():
+def _pruning_mlir_artifact():
     """Model inputs 1 and 2 are unused; 3 and 4 feed only KV/callback outputs."""
     from jax._src.interpreters import mlir
     from jaxlib.mlir import ir
+    from jaxlib.mlir.dialects import stablehlo
 
     with mlir.make_ir_context():
         module = ir.Module.parse("""module {
@@ -125,9 +125,9 @@ def _pruning_mlir_bytecode():
                     : tensor<2xf32>, tensor<2xf32>, tensor<2xf32>
               }
             }""")
-        bytecode = io.BytesIO()
-        module.operation.write_bytecode(bytecode)
-        return bytecode.getvalue()
+        return stablehlo.serialize_portable_artifact(
+            module, stablehlo.get_current_version()
+        )
 
 
 class _KVPool:
@@ -483,8 +483,8 @@ class TestDirectCompile(CustomTestCase):
             patch.object(compiler, "build_mlir", return_value=object()) as lower,
             patch.object(
                 compiler,
-                "serialize_mlir_bytecode",
-                side_effect=lambda _: _pruning_mlir_bytecode(),
+                "serialize_mlir_portable_artifact",
+                side_effect=lambda _: _pruning_mlir_artifact(),
             ) as serialize,
             patch.object(
                 compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
@@ -560,8 +560,8 @@ class TestDirectCompile(CustomTestCase):
             patch.object(compiler, "build_mlir", return_value=object()),
             patch.object(
                 compiler,
-                "serialize_mlir_bytecode",
-                return_value=_pruning_mlir_bytecode(),
+                "serialize_mlir_portable_artifact",
+                return_value=_pruning_mlir_artifact(),
             ),
             self.assertRaisesRegex(RuntimeError, "expected 7, got 8"),
         ):
@@ -581,6 +581,32 @@ class TestDirectCompile(CustomTestCase):
             direct_compile._live_model_input_indices([result], [value], 1), (0,)
         )
 
+    def test_model_input_pruning_with_native_topk_export(self):
+        compiler = direct_compile.tpu_torch_compile
+        for stable in (False, True):
+            with self.subTest(stable=stable):
+                unused = compiler.placeholder([2, 8], torch.float32, False)
+                weight = compiler.placeholder([2, 8], torch.float32, False)
+                value = compiler.placeholder([2, 8], torch.float32, False)
+                with direct_compile.execution_mode.set_eager_mode(
+                    direct_compile.execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
+                ):
+                    scores = value + weight
+                    outputs = (
+                        torch.sort(scores, stable=True)
+                        if stable
+                        else torch.topk(scores, 2)
+                    )
+
+                # Exercise TorchTPU's real exporter and JAXlib's real reader:
+                # a fixture produced by JAXlib cannot catch CHLO version skew.
+                self.assertEqual(
+                    direct_compile._live_model_input_indices(
+                        list(outputs), [unused, weight, value], 2
+                    ),
+                    (1,),
+                )
+
     def test_model_input_pruning_propagates_unrelated_export_errors(self):
         compiler = direct_compile.tpu_torch_compile
         with (
@@ -591,12 +617,37 @@ class TestDirectCompile(CustomTestCase):
             ),
             patch.object(
                 compiler,
-                "serialize_mlir_bytecode",
-                return_value=_pruning_mlir_bytecode(),
+                "serialize_mlir_portable_artifact",
+                return_value=_pruning_mlir_artifact(),
             ),
             self.assertRaisesRegex(RuntimeError, "unrelated lowering failure"),
         ):
             direct_compile._live_model_input_indices([], [torch.zeros(2)] * 8, 5)
+
+    @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
+    def test_pruned_topk_model_on_tpu(self):
+        model = torch.nn.Module()
+        model.register_buffer(
+            "bias", torch.arange(8, dtype=torch.float32, device="tpu")
+        )
+        model.register_buffer("unused", torch.ones(8, device="tpu"))
+        compiled = direct_compile.direct_compile(
+            lambda value: tuple(torch.topk(value + model.bias, 2)),
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+        )
+
+        for rows in (1, 4, 1):
+            value = torch.arange(rows * 8, dtype=torch.float32).reshape(rows, 8)
+            expected = torch.topk(value + torch.arange(8), 2)
+            actual = compiled(value.to("tpu"))
+            for result, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(result.cpu(), reference)
+
+        self.assertEqual(len(compiled.cache), 2)
+        for artifact in compiled.cache.values():
+            self.assertEqual(len(artifact.model_inputs), 1)
+            self.assertIs(artifact.model_inputs[0], model.bias)
 
     @unittest.skipUnless(_TPU_AVAILABLE, "requires TPU")
     def test_constant_folded_model_input_on_tpu(self):

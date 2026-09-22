@@ -570,12 +570,17 @@ def _live_model_input_indices(
 
     from jax._src.interpreters import mlir
     from jaxlib.mlir import ir
+    from jaxlib.mlir.dialects import stablehlo
 
     lowered = tpu_torch_compile.build_mlir(result_tensors, graph_inputs)
-    bytecode = tpu_torch_compile.serialize_mlir_bytecode(lowered)
+    # TorchTPU and JAXlib can embed different MLIR/CHLO versions. Native
+    # bytecode is not a portable interchange format (e.g. top_k's is_stable
+    # property changed its encoding). TorchTPU's versioned export legalizes
+    # CHLO before serializing; deserialize it into JAXlib's own dialect version.
+    bytecode = tpu_torch_compile.serialize_mlir_portable_artifact(lowered)
     del lowered
-    with mlir.make_ir_context():
-        module = ir.Module.parse(bytecode)
+    with mlir.make_ir_context() as context:
+        module = stablehlo.deserialize_portable_artifact(context, bytecode)
         entry = ir.SymbolTable(module.operation)["main"]
         arguments = entry.regions[0].blocks[0].arguments
         if len(arguments) != len(graph_inputs):
