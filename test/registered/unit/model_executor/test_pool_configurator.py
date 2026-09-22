@@ -650,6 +650,45 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 188)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
 
+    def test_ratio_pool_holds_a_chunk_per_pipeline_slot(self):
+        # With the radix cache on, the SWA pool was sized by the ratio alone, so
+        # the chunks a pipeline keeps in flight evicted cached prefixes' SWA
+        # tails and prefix hits vanished under load (gpt-oss-120b PP8: hits at
+        # c8, none at c32). One chunk per pipeline slot now comes on top of
+        # the ratio share, out of the same memory budget.
+        available = 1_000_000
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+            chunked_prefill_size=16,
+            sliding_window_size=8,
+            page_size=4,
+            disable_overlap_schedule=True,  # one chunk per slot
+            pp_size=8,
+            pp_async_batch_depth=1,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=4)
+            constrained = cfg.calculate_pool_sizes_from_max_tokens(1000, page_size=4)
+
+        # Ratio share = half the full pool (page aligned); pipeline share =
+        # 9 slots * chunk(16) = 144.
+        full = config.full_max_total_num_tokens
+        self.assertEqual(config.swa_max_total_num_tokens, (full // 2) // 4 * 4 + 144)
+        self.assertLessEqual(_actual_memory_used(mr, config), available)
+        # An explicit token budget keeps the full pool and grows SWA instead.
+        self.assertEqual(constrained.full_max_total_num_tokens, 1000)
+        self.assertEqual(constrained.swa_max_total_num_tokens, 500 + 144)
+
     def test_chunk_cache_cap_disagg_decode_pre_alloc(self):
         # decode adds disaggregation_decode_extra_slots in-transfer slots to the
         # request count (num_reserved_decode_tokens is a full-pool concern, not SWA).
