@@ -859,12 +859,46 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(result_aux[0].shape, (3, 4))
 
     @staticmethod
-    def _policy_for(*, multimodal: bool):
-        """Policy whose owner model does / does not expose the VL image path."""
+    def _policy_for(*, multimodal: bool, enable_multimodal=None):
+        """Policy whose owner model does / does not expose the VL image path.
+
+        ``enable_multimodal`` mirrors ``model_config.is_multimodal`` (resolved
+        from --enable-multimodal); ``None`` leaves the config absent.
+        """
         model = SimpleNamespace()
         if multimodal:
             model.get_image_feature = lambda *args, **kwargs: None
-        return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
+        model_runner = SimpleNamespace(model=model)
+        if enable_multimodal is not None:
+            model_runner.model_config = SimpleNamespace(is_multimodal=enable_multimodal)
+        return Qwen3VLDecoderTpuCompilePolicy(model_runner=model_runner)
+
+    def test_allows_dp_attention_when_multimodal_serving_is_disabled(self):
+        # --no-enable-multimodal: the wrapper keeps get_image_feature but no
+        # image can reach it, so only the text convention runs.
+        policy = self._policy_for(multimodal=True, enable_multimodal=False)
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
+        ):
+            self.assertTrue(policy.install())
+
+        base_install.assert_called_once()
+        # And the VL input_embeds variants are not warmed for text-only serving.
+        target = SimpleNamespace(get_input_embeddings=lambda: None)
+        self.assertFalse(policy._uses_input_embeds(target))
+        self.assertTrue(
+            self._policy_for(
+                multimodal=True, enable_multimodal=True
+            )._uses_input_embeds(target)
+        )
 
     def test_rejects_dp_attention_at_multimodal_install(self):
         policy = self._policy_for(multimodal=True)

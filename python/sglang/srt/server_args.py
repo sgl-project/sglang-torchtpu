@@ -513,7 +513,12 @@ class ServerArgs:
     ] = False
     enable_multimodal: A[
         Optional[bool],
-        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        Arg(
+            help="Enable the multimodal functionality for the served model. If "
+            "the model being served is not multimodal, nothing will happen. "
+            "--no-enable-multimodal serves a multimodal checkpoint text-only.",
+            action=argparse.BooleanOptionalAction,
+        ),
         NS("mm"),
     ] = None
     revision: A[

@@ -1217,14 +1217,28 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
         # input_embeds path, so the DP restriction -- which is a property of that
         # path -- must be gated the same way. Raising unconditionally blocked DP
         # attention for text-only serving, where none of the VL machinery runs.
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        if is_multimodal and is_dp_attention_enabled():
+        if self._is_multimodal_serving() and is_dp_attention_enabled():
             raise NotImplementedError(
-                "Qwen3-VL TPU decoder compilation does not support DP attention; "
-                "disable --enable-torch-compile for this configuration."
+                "Qwen3-VL TPU decoder compilation does not support DP attention "
+                "with multimodal serving enabled; relaunch with "
+                "--no-enable-multimodal for text-only DP serving, or disable "
+                "--enable-torch-compile."
             )
         return super().install()
+
+    def _is_multimodal_serving(self) -> bool:
+        """Whether image inputs can reach this decoder.
+
+        A wrapper with the VL image path counts only while multimodal serving
+        is on; --no-enable-multimodal rejects image inputs upstream, so only
+        the text convention (which the plain policy's DP support covers) runs.
+        """
+        outer = getattr(self.model_runner, "model", None)
+        if not hasattr(outer, "get_image_feature"):
+            return False
+        model_config = getattr(self.model_runner, "model_config", None)
+        is_multimodal = getattr(model_config, "is_multimodal", None)
+        return True if is_multimodal is None else bool(is_multimodal)
 
     @property
     def _num_deepstack(self) -> int:
@@ -1233,9 +1247,9 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _uses_input_embeds(self, target: Any) -> bool:
         """Whether to warm ``target`` via the Qwen3-VL input_embeds path."""
-        outer = getattr(self.model_runner, "model", None)
-        is_multimodal = hasattr(outer, "get_image_feature")
-        return is_multimodal and callable(getattr(target, "get_input_embeddings", None))
+        return self._is_multimodal_serving() and callable(
+            getattr(target, "get_input_embeddings", None)
+        )
 
     def _extend_input_variants(self) -> tuple[str, ...]:
         """Split text from deepstack: deepstack adds a Dynamo-guarded kwarg."""
