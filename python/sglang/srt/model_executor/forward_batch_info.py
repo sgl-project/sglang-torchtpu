@@ -1435,11 +1435,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
                 # Fabricate a single dummy request covering num_tokens for an
-                # empty (idle) rank. Hybrid-SSM families always take this path;
-                # non-hybrid ranks reach it once MAX_LEN is forced for the
-                # prefill breakable CUDA graph (idle + prefill), which needs
-                # every DP rank to run the same captured shape. The `else`
-                # branch handles decode rows padded to a 1-token extend.
+                # empty (idle) rank; MAX_LEN needs every DP rank on the same
+                # shape. A rank holding live decode work takes the `else`
+                # branch (a 1-token extend per request); a hybrid-SSM rank
+                # does so only where the compile policy opts in and keeps the
+                # empty-rank assert elsewhere.
                 if model_runner.compile_policy.materialize_dp_idle_extend(
                     self, num_tokens
                 ):
@@ -1452,7 +1452,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     if self.num_token_non_padded is not None:
                         self.num_token_non_padded.fill_(num_tokens)
                     self.num_token_non_padded_cpu = num_tokens
-                elif hybrid_ssm or self.seq_lens.shape[0] == 0:
+                elif self.seq_lens.shape[0] == 0 or (
+                    hybrid_ssm
+                    and not model_runner.compile_policy.dp_hybrid_decode_joins_extend
+                ):
                     dev = self.seq_lens.device
                     assert (
                         self.seq_lens.shape[0] == 0

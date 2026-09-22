@@ -61,6 +61,9 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # RadixLinearAttention trims DP-padded extend rows before calling the
+    # backend unless it consumes the physical padded layout itself.
+    handles_padded_extend_rows: bool = False
     # Compute / KV-cache dtype. Only backends that need them (MLA/MHA fp8
     # fuse-rope checks) set these in __init__; declared here as None so callers
     # can read them off ANY backend — including hybrid wrappers that don't set

@@ -13,6 +13,8 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class _FakeAttentionBackend:
+    handles_padded_extend_rows = False
+
     def forward(
         self,
         *,
@@ -35,6 +37,8 @@ class _FakeAttentionBackend:
 
 
 class _FailingAttentionBackend:
+    handles_padded_extend_rows = False
+
     def forward(self, **kwargs):
         del kwargs
         raise RuntimeError("backend failure")
@@ -57,12 +61,18 @@ class _TargetVerifyMode:
 
 
 class _PhysicalAttentionBackend:
+    handles_padded_extend_rows = False
+
     def forward(self, *, layer, forward_batch, mixed_qkv, a, b):
         del layer, forward_batch
         assert mixed_qkv.shape[0] == 5
         assert a.shape[0] == 5
         assert b.shape[0] == 5
         return torch.full((1, 5, 2, 4), 9.0)
+
+
+class _PaddedLayoutAttentionBackend(_PhysicalAttentionBackend):
+    handles_padded_extend_rows = True
 
 
 class TestRadixLinearAttentionPadding(CustomTestCase):
@@ -144,6 +154,45 @@ class TestRadixLinearAttentionPadding(CustomTestCase):
 
         torch.testing.assert_close(output, torch.full((1, 5, 2, 4), 9.0))
         self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_backend_that_handles_padded_rows_gets_the_physical_layout(self):
+        # A static-shape backend (TPU) declares it consumes the padded rows;
+        # the trim would bake the real count into its graph.
+        layer = radix_linear_attention.RadixLinearAttention(
+            layer_id=0,
+            num_q_heads=1,
+            num_k_heads=1,
+            num_v_heads=2,
+            head_q_dim=4,
+            head_k_dim=4,
+            head_v_dim=4,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=_ExtendMode(),
+            num_token_non_padded_cpu=3,
+            out_cache_loc=torch.arange(5),
+        )
+
+        with (
+            patch.object(
+                radix_linear_attention,
+                "get_tc_piecewise_forward_context",
+                return_value=None,
+            ),
+            patch.object(
+                radix_linear_attention,
+                "get_attn_backend",
+                return_value=_PaddedLayoutAttentionBackend(),
+            ),
+        ):
+            output = layer.forward(
+                forward_batch=forward_batch,
+                mixed_qkv=torch.zeros((5, 8)),
+                a=torch.zeros((5, 2)),
+                b=torch.zeros((5, 2)),
+            )
+
+        torch.testing.assert_close(output, torch.full((1, 5, 2, 4), 9.0))
 
     def test_eager_backend_failure_restores_out_cache_loc(self):
         layer = radix_linear_attention.RadixLinearAttention(

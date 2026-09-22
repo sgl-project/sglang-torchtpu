@@ -279,6 +279,10 @@ class TpuGDNAttnBackend(MambaAttnBackendBase):
     is irrelevant here (state is always updated).
     """
 
+    # The Pallas kernel runs on the compiled padded shape and keeps the padded
+    # tail inert; a host-side trim would recompile per real token count.
+    handles_padded_extend_rows = True
+
     def __init__(self, model_runner: "ModelRunner"):
         super().__init__(model_runner)
         # Build (and JAX-export) the custom op eagerly at construction time so

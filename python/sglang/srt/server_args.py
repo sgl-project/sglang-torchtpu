@@ -3818,7 +3818,13 @@ class ServerArgs:
 
     # ===== END TO BE REFACTORED ====
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    # Qwen3-VL wrappers build no vision tower under language_model_only; their
+    # loaders log the unmatched vision tensors and move on.
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    )
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in

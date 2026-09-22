@@ -106,6 +106,10 @@ class DecoderCompilePolicy(CompilePolicy):
             list(global_num_tokens_for_logprob),
         )
 
+    # Whether a hybrid-SSM DP rank holding decode rows takes the generic
+    # per-request extend conversion when a peer prefills under MAX_LEN.
+    dp_hybrid_decode_joins_extend: bool = False
+
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> bool:

@@ -10,11 +10,14 @@ Pure dataclass logic — CPU only.
 """
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+import sglang.srt.model_executor.forward_batch_info as forward_batch_info
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -31,7 +34,87 @@ def _mock_model_runner(seq_len_fill_value: int = 1) -> MagicMock:
     runner.attn_backend.get_cuda_graph_seq_len_fill_value.return_value = (
         seq_len_fill_value
     )
+    runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = (
+        seq_len_fill_value
+    )
     return runner
+
+
+def _run_prepare_mlp_sync_batch(
+    fb: ForwardBatch, *, hybrid_ssm: bool, hybrid_decode_joins_extend: bool = True
+) -> None:
+    """Drive prepare_mlp_sync_batch under MAX_LEN with attention TP 1.
+
+    The compile policy never materialises a rank itself, so an empty rank
+    exercises the shared fabricated-row branch.
+    """
+    runner = _mock_model_runner()
+    runner.enable_elastic_ep = False
+    runner.is_draft_worker = False
+    runner.compile_policy.dp_hybrid_decode_joins_extend = hybrid_decode_joins_extend
+    runner.compile_policy.get_dp_padded_token_counts.side_effect = (
+        lambda _fb, _runner, counts, logprob_counts, **_: (counts, logprob_counts)
+    )
+    runner.compile_policy.materialize_dp_idle_extend.return_value = False
+    parallel = SimpleNamespace(attn_tp_size=1, attn_dp_rank=0)
+    exec_ctx = SimpleNamespace(
+        graph=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=None))
+        )
+    )
+    with ExitStack() as stack:
+        enter = stack.enter_context
+        enter(patch.object(forward_batch_info, "get_parallel", return_value=parallel))
+        enter(patch.object(forward_batch_info, "get_exec", return_value=exec_ctx))
+        enter(patch.object(forward_batch_info, "_is_cpu", True))
+        enter(
+            patch.object(
+                forward_batch_info,
+                "mambaish_config",
+                return_value=object() if hybrid_ssm else None,
+            )
+        )
+        enter(patch.object(forward_batch_info, "set_dp_buffer_len"))
+        enter(patch.object(forward_batch_info, "set_is_extend_in_batch"))
+        enter(
+            patch.object(
+                DpPaddingMode, "get_dp_padding_mode", return_value=DpPaddingMode.MAX_LEN
+            )
+        )
+        enter(
+            patch(
+                "sglang.srt.batch_overlap.two_batch_overlap.TboForwardBatchPreparer.prepare"
+            )
+        )
+        enter(patch("sglang.srt.layers.cp.utils.enable_cp_v2", return_value=False))
+        enter(
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=1,
+            )
+        )
+        fb.prepare_mlp_sync_batch(runner)
+
+
+def _decode_batch_joining_extend_step(num_reqs: int) -> ForwardBatch:
+    """A DECODE rank while another DP rank prefills 300 tokens (MAX_LEN)."""
+    seq_lens = torch.arange(7, 7 + num_reqs)
+    return ForwardBatch(
+        forward_mode=ForwardMode.DECODE if num_reqs else ForwardMode.IDLE,
+        batch_size=num_reqs,
+        input_ids=torch.arange(num_reqs),
+        req_pool_indices=torch.arange(num_reqs),
+        seq_lens=seq_lens,
+        out_cache_loc=torch.arange(num_reqs),
+        seq_lens_sum=int(seq_lens.sum()),
+        positions=seq_lens - 1,
+        seq_lens_cpu=seq_lens.clone(),
+        orig_seq_lens=seq_lens.clone(),
+        is_extend_in_batch=True,
+        global_num_tokens_cpu=[num_reqs, 300],
+        global_num_tokens_gpu=torch.zeros(2, dtype=torch.int64),
+        global_num_tokens_for_logprob_cpu=[num_reqs, 300],
+    )
 
 
 def _logits_output(num_rows: int) -> LogitsProcessorOutput:
@@ -161,6 +244,51 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(
             global_top_k_output.next_token_global_top_k_token_ids.shape[0], 3
         )
+
+    def test_hybrid_rank_with_live_decode_joins_extend_step_per_request(self):
+        """A mamba-hybrid rank holding decode work must not be treated as idle.
+
+        Under MAX_LEN a decode rank is relabelled EXTEND whenever a peer
+        prefills. Where the compile policy opts in, it keeps its requests as
+        1-token extends like every other model instead of asserting.
+        """
+        fb = _decode_batch_joining_extend_step(num_reqs=2)
+
+        _run_prepare_mlp_sync_batch(fb, hybrid_ssm=True)
+
+        self.assertIs(fb.forward_mode, ForwardMode.EXTEND)
+        self.assertIs(fb._original_forward_mode, ForwardMode.DECODE)
+        self.assertEqual(fb.batch_size, 2)
+        torch.testing.assert_close(fb.seq_lens, torch.tensor([7, 8]))
+        self.assertEqual(fb.extend_seq_lens.tolist(), [1, 1])
+        self.assertEqual(fb.extend_prefix_lens.tolist(), [6, 7])
+        self.assertEqual(fb.extend_start_loc.tolist(), [0, 1])
+        # Token-level inputs pad to the global max; the request axis does not.
+        self.assertEqual(fb.positions.shape[0], 300)
+        self.assertEqual(fb.req_pool_indices.shape[0], 2)
+
+    def test_hybrid_rank_keeps_the_empty_rank_assert_without_policy_opt_in(self):
+        # The upstream behaviour for backends whose decode bookkeeping does
+        # not run on an extend step.
+        fb = _decode_batch_joining_extend_step(num_reqs=2)
+
+        with self.assertRaisesRegex(AssertionError, "expects an empty rank"):
+            _run_prepare_mlp_sync_batch(
+                fb, hybrid_ssm=True, hybrid_decode_joins_extend=False
+            )
+
+    def test_empty_hybrid_rank_still_gets_the_fabricated_row(self):
+        # The idle-rank conversion stays: one request spanning the padded block,
+        # counted as real tokens because the recurrent state update needs them.
+        fb = _decode_batch_joining_extend_step(num_reqs=0)
+
+        _run_prepare_mlp_sync_batch(fb, hybrid_ssm=True)
+
+        self.assertIs(fb.forward_mode, ForwardMode.EXTEND)
+        self.assertEqual(fb.batch_size, 1)
+        self.assertEqual(fb.seq_lens.tolist(), [300])
+        self.assertEqual(fb.extend_seq_lens.tolist(), [300])
+        self.assertEqual(fb.num_token_non_padded_cpu, 300)
 
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(

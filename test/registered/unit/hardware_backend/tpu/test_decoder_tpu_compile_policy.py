@@ -859,11 +859,12 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         self.assertEqual(result_aux[0].shape, (3, 4))
 
     @staticmethod
-    def _policy_for(*, multimodal: bool):
+    def _policy_for(*, multimodal: bool, language_model_only: bool = False):
         """Policy whose owner model does / does not expose the VL image path."""
         model = SimpleNamespace()
         if multimodal:
             model.get_image_feature = lambda *args, **kwargs: None
+            model.language_model_only = language_model_only
         return Qwen3VLDecoderTpuCompilePolicy(model_runner=SimpleNamespace(model=model))
 
     def test_rejects_dp_attention_at_multimodal_install(self):
@@ -885,6 +886,25 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
         # This policy is also attached to the text-only backbone, where none of
         # the VL machinery the DP restriction covers is reachable.
         policy = self._policy_for(multimodal=False)
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy."
+                "is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                DecoderTpuCompilePolicy, "install", return_value=True
+            ) as base_install,
+        ):
+            self.assertTrue(policy.install())
+
+        base_install.assert_called_once()
+
+    def test_allows_dp_attention_for_language_model_only_serving(self):
+        # --language-model-only drops the vision tower and forwards like a
+        # text model, so the input_embeds path the restriction covers is gone.
+        policy = self._policy_for(multimodal=True, language_model_only=True)
 
         with (
             patch(
@@ -926,6 +946,7 @@ class TestQwen3VLDecoderPolicy(_PolicyTestCase):
     def test_direct_warmup_matches_serving_call_convention(self):
         model_runner = _model_runner()
         model_runner.model.get_image_feature = MagicMock()
+        model_runner.model.language_model_only = False
         model_runner.model.get_input_embeddings = MagicMock(
             return_value=torch.nn.Embedding(2, 4)
         )
@@ -1249,6 +1270,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         mr = _model_runner()
         self.publish_config(enable_mixed_chunk=False)
         mr.model.get_image_feature = MagicMock()
+        mr.model.language_model_only = False
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,
@@ -1310,6 +1332,7 @@ class TestPrecompileLoops(_PolicyTestCase):
     def test_qwen3_vl_warmup_crosses_logits_modes(self):
         mr = _model_runner()
         mr.model.get_image_feature = MagicMock()
+        mr.model.language_model_only = False
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
         _enable_distributed_top_k(mr)
         policy = Qwen3VLDecoderTpuCompilePolicy(
@@ -1348,6 +1371,7 @@ class TestPrecompileLoops(_PolicyTestCase):
         mr = _model_runner()
         mr.server_args = SimpleNamespace(enable_mixed_chunk=False)
         mr.model.get_image_feature = MagicMock()
+        mr.model.language_model_only = False
         mr.model.get_input_embeddings = MagicMock(return_value=torch.nn.Embedding(2, 4))
         policy = Qwen3VLDecoderTpuCompilePolicy(
             model_runner=mr,

@@ -114,7 +114,9 @@ class RadixLinearAttention(nn.Module):
         # Target verify rebuilds query_start_loc from the physical padded input,
         # unlike ordinary extend where it retains the logical sequence ends.
         should_trim_padded_extend = (
-            is_extend and not forward_batch.forward_mode.is_target_verify()
+            is_extend
+            and not forward_batch.forward_mode.is_target_verify()
+            and not get_attn_backend().handles_padded_extend_rows
         )
         real_num_tokens = (
             getattr(forward_batch, "num_token_non_padded_cpu", None)
