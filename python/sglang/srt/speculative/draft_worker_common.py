@@ -161,3 +161,16 @@ def make_draft_sampler_capture_hook(draft_sampler):
 
 def build_block_pos_offsets(*, length: int, device: torch.device) -> torch.Tensor:
     return torch.arange(int(length), device=device, dtype=torch.int64)
+
+
+def resolve_req_pool_indices_cpu(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_pool_indices_cpu: Optional[torch.Tensor | list[int]],
+) -> torch.Tensor:
+    """The batch's host req_pool_indices, copying one down if absent."""
+    if isinstance(req_pool_indices_cpu, torch.Tensor):
+        return req_pool_indices_cpu
+    if req_pool_indices_cpu is not None:
+        return torch.tensor(req_pool_indices_cpu, dtype=torch.int32, device="cpu")
+    return req_pool_indices.to("cpu", dtype=torch.int32)
