@@ -143,7 +143,7 @@ def prepare_pipeline_stage_fp8_moe_weights(
         return False
     for name in ("w13_weight", "w2_weight"):
         param = getattr(layer, name)
-        param.data = transpose_expert_chunks(param.data)
+        transpose_expert_chunks(param)
     return block_quant
 
 
@@ -188,21 +188,36 @@ def requantize_stage_experts_to_channelwise(
             weights.append(q_chunk)
             scales.append(s_chunk)
             _wait_for(q_chunk, s_chunk)
-        w_param.data = torch.cat(weights, dim=0) if len(weights) > 1 else weights[0]
+        _replace_with_expert_chunks(w_param, weights)
         copy_or_rebind_param(layer, f"{w_name}_scale", torch.cat(scales, dim=0))
         _clear_replaced_param(layer, scale_inv_name)
     layer.weight_block_size = None
 
 
-def transpose_expert_chunks(weight: torch.Tensor) -> torch.Tensor:
+def transpose_expert_chunks(param: torch.nn.Parameter) -> None:
     """Transpose each expert's matrix with bounded device intermediates."""
+    weight = param.data
     step = max(1, _TRANSPOSE_CHUNK_ELEMENTS // max(1, weight[0].numel()))
     chunks = []
     for start in range(0, weight.shape[0], step):
         chunk = weight[start : start + step].transpose(1, 2).contiguous()
         _wait_for(chunk)
         chunks.append(chunk)
-    return torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+    _replace_with_expert_chunks(param, chunks)
+
+
+def _replace_with_expert_chunks(
+    param: torch.nn.Parameter, chunks: list[torch.Tensor]
+) -> None:
+    """Free the parameter's data, then set it to the chunks joined along the
+    expert axis; the chunks must not share storage with the freed data."""
+    from sglang.srt.hardware_backend.tpu.fp8_moe import _free_replaced_storage
+
+    old = param.data
+    param.data = torch.empty(0, dtype=old.dtype, device=old.device)
+    _free_replaced_storage(old, param.data)
+    param.data = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
+    chunks.clear()
 
 
 def _wait_for(*tensors: torch.Tensor) -> None:

@@ -220,15 +220,22 @@ class SchedulerPPMixin:
     def _pp_init_wave(self: Scheduler):
         """Hand activations between TPU stages over ICI in every serving mode."""
         from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+            DecoderTpuCompilePolicy,
             max_extend_tokens,
         )
         from sglang.srt.hardware_backend.tpu.pp_wave import build_pp_wave
 
         model_runner = self.tp_worker.model_runner
+        policy = model_runner.compile_policy
+        # The buffer holds the largest batch a forward can hand on; a compiled
+        # forward pads its batch to one of the policy's buckets.
+        if isinstance(policy, DecoderTpuCompilePolicy):
+            rows = policy.max_padded_tokens()
+        else:
+            rows = max_extend_tokens(context_len=model_runner.model_config.context_len)
         return build_pp_wave(
             self.pp_group,
-            # The buffer holds the largest batch a forward can hand on.
-            rows=max_extend_tokens(context_len=model_runner.model_config.context_len),
+            rows=rows,
             hidden=int(model_runner.model_config.hidden_size),
             dtype=model_runner.dtype,
             device=torch.device(model_runner.device),

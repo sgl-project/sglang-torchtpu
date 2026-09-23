@@ -365,6 +365,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
         return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
 
+    def max_padded_tokens(self) -> int:
+        """The most token rows a forward is padded to: the last token bucket,
+        or the last batch bucket for a decode batch."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        return max(self.t_bucketer.max_val, self.b_bucketer.max_val)
+
     def _extend_compile_cases(self) -> list[tuple[int, int, ForwardMode]]:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None

@@ -17,10 +17,21 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 
 import torch  # noqa: E402
 
+from sglang.srt.compilation.support_torch_compile import (  # noqa: E402
+    NoopCompilePolicy,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
+from sglang.srt.hardware_backend.tpu import pp_wave  # noqa: E402
+from sglang.srt.hardware_backend.tpu.compilation.bucketer import (  # noqa: E402
+    Bucketer,
+)
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (  # noqa: E402
+    DecoderTpuCompilePolicy,
+)
 from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa: E402
+from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
 
@@ -147,6 +158,47 @@ class TestProxyReceive(CustomTestCase):
         scheduler.pp_group = SimpleNamespace(is_first_rank=True)
         self.assertIsNone(scheduler._pp_recv_proxy_tensors())
         scheduler._pp_recv_typed_dict.assert_not_called()
+
+
+class TestWaveRows(CustomTestCase):
+    def _rows(self, compile_policy):
+        scheduler = SchedulerPPMixin()
+        scheduler.pp_group = SimpleNamespace()
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(
+                compile_policy=compile_policy,
+                model_config=SimpleNamespace(context_len=4096, hidden_size=16),
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+        )
+        with patch.object(pp_wave, "build_pp_wave") as build:
+            scheduler._pp_init_wave()
+        return build.call_args.kwargs["rows"]
+
+    def _policy(self, token_buckets, bs_buckets):
+        return DecoderTpuCompilePolicy(
+            t_bucketer=Bucketer(name="Token", buckets=token_buckets),
+            b_bucketer=Bucketer(name="Bs", buckets=bs_buckets),
+        )
+
+    def test_buffer_holds_a_token_bucket_above_the_extend_limit(self):
+        """A batch padded to a configured token bucket above the extend limit
+        (--tpu-compile-tokens 4096 8192 16384 with 12288-token chunks) fits."""
+        with get_context().override_server_args(
+            chunked_prefill_size=12288, enable_dynamic_chunking=False
+        ):
+            rows = self._rows(self._policy([4096, 8192, 16384], [1, 32]))
+        self.assertEqual(rows, 16384)
+
+    def test_buffer_holds_the_largest_decode_batch(self):
+        self.assertEqual(self._rows(self._policy([64, 256], [1, 512])), 512)
+
+    def test_eager_buffer_holds_the_extend_limit(self):
+        with get_context().override_server_args(
+            chunked_prefill_size=12288, enable_dynamic_chunking=False
+        ):
+            self.assertEqual(self._rows(NoopCompilePolicy()), 12288)
 
 
 if __name__ == "__main__":
