@@ -368,14 +368,18 @@ class TestTpuGraphRunner(CustomTestCase):
         checker = MagicMock()
         checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
         model = self._annotate(_model_with(forward=MagicMock()))
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
-            "_shared_recompilation_checker",
-            return_value=checker,
-        ), patch(
-            "sglang.srt.hardware_backend.tpu.compilation."
-            "decoder_compile_policy.DecoderTpuCompilePolicy.set_recompilation_checker",
-            side_effect=lambda *a, **k: events.append("install"),
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker",
+                return_value=checker,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.DecoderTpuCompilePolicy.set_recompilation_checker",
+                side_effect=lambda *a, **k: events.append("install"),
+            ),
         ):
             TpuGraphRunner(self._runner_for(model))
         self.assertEqual(events, ["precompile", "install"])
@@ -383,10 +387,13 @@ class TestTpuGraphRunner(CustomTestCase):
 
     def test_checker_is_not_armed_unless_opted_in(self):
         model = self._annotate(_model_with(forward=MagicMock()))
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
-            "_shared_recompilation_checker"
-        ) as shared:
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker"
+            ) as shared,
+        ):
             TpuGraphRunner(self._runner_for(model))
         shared.assert_not_called()
 
@@ -395,10 +402,13 @@ class TestTpuGraphRunner(CustomTestCase):
         model = self._annotate(_model_with(forward=MagicMock()))
         runner_args = self._runner_for(model)
         runner_args.is_draft_worker = True
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch(
-            "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
-            "_shared_recompilation_checker"
-        ) as shared:
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker"
+            ) as shared,
+        ):
             TpuGraphRunner(runner_args)
         shared.assert_not_called()
 

@@ -336,8 +336,13 @@ class TestSharedChecker(CustomTestCase):
         cache = _FakeCache([500])
         checker = _checker(cache)
         policy = SimpleNamespace(set_recompilation_checker=MagicMock())
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch.object(
-            recompilation_checker, "_shared_recompilation_checker", return_value=checker
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch.object(
+                recompilation_checker,
+                "_shared_recompilation_checker",
+                return_value=checker,
+            ),
         ):
             install_recompilation_checker(policies=(policy,), model_label="draft M")
             policy.set_recompilation_checker.assert_called_once_with(
@@ -361,10 +366,13 @@ class TestSharedChecker(CustomTestCase):
         from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
 
         cache = _FakeCache([])
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch.object(
-            recompilation_checker,
-            "_shared_recompilation_checker",
-            return_value=_checker(cache),
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch.object(
+                recompilation_checker,
+                "_shared_recompilation_checker",
+                return_value=_checker(cache),
+            ),
         ):
             install_recompilation_checker(
                 policies=(NoopCompilePolicy(),), model_label="vision"
@@ -372,15 +380,23 @@ class TestSharedChecker(CustomTestCase):
         self.assertEqual(cache.stats_reads, 0)
 
     def test_start_is_a_noop_unless_opted_in(self):
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False), patch.object(
-            recompilation_checker, "_shared_recompilation_checker"
-        ) as shared:
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            patch.object(
+                recompilation_checker, "_shared_recompilation_checker"
+            ) as shared,
+        ):
             start_recompilation_monitoring()
         shared.assert_not_called()
 
     def test_start_is_a_noop_without_cache_stats(self):
-        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch.object(
-            recompilation_checker, "_shared_recompilation_checker", return_value=None
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch.object(
+                recompilation_checker,
+                "_shared_recompilation_checker",
+                return_value=None,
+            ),
         ):
             start_recompilation_monitoring()
 
