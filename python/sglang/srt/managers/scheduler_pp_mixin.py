@@ -79,6 +79,8 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    # The TPU ICI hand-off; init_pp_loop_state builds it on TPU only.
+    _pp_wave = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -905,7 +907,7 @@ class SchedulerPPMixin:
         return self._pp_pd_retain_control_work(work)
 
     def _pp_pd_send_consensus_to_next_stage(self: Scheduler, data, async_send=False):
-        if getattr(self, "_pp_wave", None) is not None:
+        if self._pp_wave is not None:
             # Current requests/votes travel early on the world's raw channel.
             # Tag prior-round consensus separately from both those packets and
             # the output tensor dictionaries on the pipeline CPU group.
@@ -919,7 +921,7 @@ class SchedulerPPMixin:
         return self._pp_send_pyobj_to_next_stage(data, async_send=async_send)
 
     def _pp_pd_recv_consensus_from_prev_stage(self: Scheduler):
-        if getattr(self, "_pp_wave", None) is not None:
+        if self._pp_wave is not None:
             return self.pp_group.recv_object(
                 src=(self.ps.pp_rank - 1) % self.ps.pp_size,
                 tag=_PP_PD_CONSENSUS_TAG,

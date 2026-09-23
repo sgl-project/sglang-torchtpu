@@ -77,6 +77,7 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
         return [f"request-{step[0]}"]
 
     scheduler.ingest_requests = recv_requests
+    scheduler._process_hicache_events = Mock()
     scheduler.process_pending_chunked_abort = Mock()
     scheduler.process_prefill_chunk = Mock()
     scheduler.maybe_prefetch_staging_for_batch = Mock()

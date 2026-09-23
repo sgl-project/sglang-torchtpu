@@ -203,15 +203,11 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
 
-    def test_swa_clipping_respects_existing_continuation(self):
+    def test_chunked_admission_respects_existing_continuation(self):
         for has_chunked_req in (False, True):
             with self.subTest(has_chunked_req=has_chunked_req):
-                adder = self._continuation_adder(rem_chunk_tokens=256)
-                adder.is_hybrid_swa = True
-                self.mock_tree_cache.sliding_window_size = 128
-                self.mock_token_allocator.size_swa = 512
-                self.mock_token_allocator.swa_available_size.return_value = 384
-                req = self._continuation_candidate(256)
+                adder = self._continuation_adder(rem_chunk_tokens=128)
+                req = self._continuation_candidate(512)
                 result = adder.add_one_req(req, has_chunked_req, None)
                 if has_chunked_req:
                     self.assertEqual(result, AddReqResult.OTHER)

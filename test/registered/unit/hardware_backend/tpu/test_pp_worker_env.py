@@ -12,7 +12,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.distributed import bootstrap, parallel_state
 from sglang.srt.utils.patch_torch import (
     initialize_torch_tpu_worker,
@@ -71,7 +71,7 @@ class TestWorkerEnvUnderPipelineParallelism(CustomTestCase):
 
     def test_worker_bootstrap_honors_resolution_before_publication(self):
         args = _args(device=None, tp_size=1, pp_size=1, nnodes=1)
-        declare_late_resolution(
+        declare_resolution(
             args, "test.worker_defaults", device="tpu", pp_size=8, nnodes=2
         )
         with patch("sglang.srt.platforms.current_platform.init_backend") as initialize:

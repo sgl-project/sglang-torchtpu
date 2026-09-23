@@ -32,6 +32,7 @@ from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
 
@@ -45,7 +46,9 @@ def _single_queue_scheduler(is_last_rank=False) -> SchedulerPPMixin:
     scheduler.device_module = MagicMock()
     scheduler.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=is_last_rank)
     scheduler.run_batch = MagicMock(
-        return_value=SimpleNamespace(can_run_cuda_graph=False)
+        return_value=SimpleNamespace(
+            can_run_cuda_graph=False, spec_verify_out_cache_loc=None
+        )
     )
     return scheduler
 
@@ -54,7 +57,7 @@ class TestStreamFences(CustomTestCase):
     def test_launch_batch_runs_without_schedule_stream(self):
         scheduler = _single_queue_scheduler()
         self.assertFalse(hasattr(scheduler, "schedule_stream"))
-        cur_batch = SimpleNamespace(reqs=[])
+        cur_batch = SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE)
         mb_metadata = [None, None]
         proxy = PPProxyTensors({})
 
@@ -74,7 +77,11 @@ class TestStreamFences(CustomTestCase):
         scheduler.schedule_stream = object()
 
         scheduler._pp_launch_batch(
-            0, SimpleNamespace(reqs=[]), None, [None], last_rank_comm_queue=[]
+            0,
+            SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE),
+            None,
+            [None],
+            last_rank_comm_queue=[],
         )
 
         scheduler.forward_stream.wait_stream.assert_called_once_with(
@@ -87,7 +94,8 @@ class TestStreamFences(CustomTestCase):
         )
         received = {"next_token_ids": torch.zeros(2, dtype=torch.int64)}
         scheduler._pp_recv_dict_from_prev_stage = MagicMock(return_value=received)
-        scheduler._pp_prep_batch_result = MagicMock(return_value="batch_result")
+        self.batch_result = SimpleNamespace(logits_output=None)
+        scheduler._pp_prep_batch_result = MagicMock(return_value=self.batch_result)
         scheduler._pp_send_output_to_next_stage = MagicMock(return_value=[])
         return scheduler._pp_send_recv_and_preprocess_output_tensors(
             next_first_rank_mb_id=0,
@@ -107,7 +115,7 @@ class TestStreamFences(CustomTestCase):
         )
 
         self.assertIsInstance(next_pp_outputs, PPProxyTensors)
-        self.assertEqual(batch_result, "batch_result")
+        self.assertIs(batch_result, self.batch_result)
         d2h_event.record.assert_called_once()
         self.assertEqual(send_work, [])
 

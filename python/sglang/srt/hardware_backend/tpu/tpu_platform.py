@@ -110,7 +110,7 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
     would need the stages to share a second device collective and is rejected.
     """
     from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
+        declare_resolution,
         resolving_view,
     )
 
@@ -128,7 +128,7 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             "received before each forward.",
             cfg.pp_async_batch_depth,
         )
-        declare_late_resolution(
+        declare_resolution(
             server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
         )
     if cfg.tp_size > 1:
