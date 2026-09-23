@@ -621,7 +621,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor,
         _positions: torch.Tensor,
         forward_batch: Any,
@@ -633,13 +633,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1007,6 +1009,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch = (
             kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         )
+        prepared_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
+        if prepared_batch is not forward_batch:
+            if "forward_batch" in kwargs:
+                kwargs["forward_batch"] = prepared_batch
+            else:
+                args = (*args[:2], prepared_batch, *args[3:])
+            forward_batch = prepared_batch
         if spec_info is None:
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
                 forward_batch.sampling_info = self._make_top_k_warmup_sampling_info(bs)
@@ -1296,7 +1305,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: Any,
@@ -1310,7 +1319,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
@@ -1318,6 +1327,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
@@ -1470,8 +1481,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
         logger.info(
-            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets "
-            "in %.1fs",
+            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
             time.perf_counter() - start,
         )

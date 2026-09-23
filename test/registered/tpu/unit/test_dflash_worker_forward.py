@@ -177,6 +177,9 @@ def _create_dflash_worker_for_tpu(
     worker.selector = None
     worker._selector_sample = None
     worker._draft_probs_buf = None
+    # This fixture bypasses DFlashWorkerV2.__init__; mirror its DP-attention state.
+    worker._full_embed_gpu = None
+    worker.draft_tp_context = dflash_worker_mod.empty_context
     worker.nccl_port = 0
     worker._need_mamba_verify_commit = False
     worker._warned_sampling_fallback = False
@@ -270,6 +273,7 @@ def _create_dflash_worker_for_tpu(
             vocab_size=vocab_size,
             model_is_mrope=False,
             is_matryoshka=False,
+            requires_mm_token_modalities=False,
             hidden_size=hidden_size,
         ),
         prefill_attention_backend_str="torch_native",
@@ -342,9 +346,11 @@ def _create_dflash_worker_for_tpu(
         ngram_embedding_manager=SimpleNamespace(enabled=False),
         prefill_attention_backend_str="torch_native",
         ps=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
+        tp_group=None,
         model=draft_model,
         model_config=SimpleNamespace(
             vocab_size=vocab_size,
+            requires_mm_token_modalities=False,
             hf_config=SimpleNamespace(
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
@@ -419,6 +425,7 @@ def _make_schedule_batch(
         extend_input_logprob_token_ids=None,
         orig_seq_lens=None,
         out_cache_loc_dsv4=None,
+        engram_history=None,
         mamba_track_indices=None,
         mamba_track_mask=None,
         mamba_track_seqlens=None,
@@ -443,6 +450,7 @@ def _make_schedule_batch(
         can_run_dp_breakable_cuda_graph=False,
         can_run_decode_cuda_graph=False,
         can_run_dp_prefill_cuda_graph=False,
+        dp_prefill_cuda_graph_max_prefix_len=None,
         return_hidden_states_mode=CaptureHiddenMode.NULL,
         global_forward_mode=forward_mode,
         is_prefill_only=False,

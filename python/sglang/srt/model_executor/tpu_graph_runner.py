@@ -131,9 +131,9 @@ class TpuGraphRunner:
     """Orchestrate ``torch.compile(backend='tpu')`` annotation policies."""
 
     def __init__(self, model_runner: ModelRunner) -> None:
-        assert (
-            model_runner.server_args.enable_torch_compile
-        ), "TpuGraphRunner should only be initialized when enable_torch_compile=True."
+        assert model_runner.server_args.enable_torch_compile, (
+            "TpuGraphRunner should only be initialized when enable_torch_compile=True."
+        )
 
         # Side-effectful import: registers the "tpu" dynamo backend so that
         # torch.compile(backend="tpu", ...) resolves. apply_tpu_patches does

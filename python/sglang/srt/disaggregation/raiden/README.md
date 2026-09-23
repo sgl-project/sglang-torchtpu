@@ -1,7 +1,7 @@
 # Raiden TPU disaggregation backend
 
 `--disaggregation-transfer-backend raiden` moves KV pages between TPU prefill
-and decode hosts with the [tpu-raiden](../../../../../../tpu-raiden) DMA engine —
+and decode hosts with the [tpu-sync](../../../../../../tpu-sync) DMA engine —
 the TPU analogue of the CUDA mooncake/nixl backends.
 
 ## How it works
@@ -82,8 +82,8 @@ Fused TPU KV pool (`pallas_tpu_rpa_v3`), MHA models (incl. hybrid
 sliding-window at symmetric TP and under push-resharding), decode in
 chunk-cache mode.
 Symmetric attn TP uses the pull path; `dst_tp < src_tp` uses the
-push-resharding path above. Needs `tpu_raiden` built against the same `torch_tpu`
-as this fork (tpu-raiden `build.sh`). Not covered: MLA, PP, Mamba/NSA,
+push-resharding path above. Needs `tpu_sync` built against the same `torch_tpu`
+as this fork (tpu-sync `build.sh`). Not covered: MLA, PP, Mamba/NSA,
 speculative draft KV, decode prefix-cache reuse, `dst_tp > src_tp`.
 
 ## Tunables (env)

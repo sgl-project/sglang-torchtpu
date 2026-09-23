@@ -699,7 +699,6 @@ class TpuKVManager(TpuKVManagerBase):
 
 
 class TpuKVSender(TpuKVSenderBase):
-
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -725,7 +724,6 @@ class TpuKVSender(TpuKVSenderBase):
 
 
 class TpuKVReceiver(TpuKVReceiverBase):
-
     def _clear_room_state(self) -> None:
         if getattr(self.kv_mgr, "decode_states", None) is not None:
             with self.kv_mgr.decode_states_lock:

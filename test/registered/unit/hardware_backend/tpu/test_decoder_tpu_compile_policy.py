@@ -158,6 +158,7 @@ def _model_runner(device="cpu"):
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
 
@@ -284,10 +285,110 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             CustomPolicy.model_extra_tensor_attrs,
         )
         self.assertIs(kwargs["kv_pool"], kv_pool)
+        self.assertEqual(
+            kwargs["specialization_key"], policy._direct_compile_specialization_key
+        )
         self.assertIn(
             "forward_batch.extend_input_logprob_token_ids_gpu",
             kwargs["ignored_argnames"],
         )
+
+
+class TestAttentionTileSpecialization(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.input_ids = torch.arange(8)
+        self.input_embeds = torch.empty(8, 4)
+        self.forward_batch = SimpleNamespace(
+            forward_mode="extend",
+            capture_hidden_mode="null",
+            batch_size=1,
+            logits_output_mode="full_vocab",
+        )
+
+    def test_missing_tile_preserves_existing_model_key(self):
+        for policy_cls in (DecoderTpuCompilePolicy, Qwen3VLDecoderTpuCompilePolicy):
+            policy = object.__new__(policy_cls)
+            is_vl = policy_cls is Qwen3VLDecoderTpuCompilePolicy
+            kwargs = {"input_embeds": self.input_embeds} if is_vl else {}
+            for compiles_logits in (False, True):
+                policy._compiles_logits_processor = MagicMock(
+                    return_value=compiles_logits
+                )
+                base_key = ("extend", "null", 1, 8)
+                if is_vl:
+                    base_key += (False,)
+                base_key += ("full_vocab" if compiles_logits else None,)
+                for metadata in (
+                    None,
+                    SimpleNamespace(),
+                    SimpleNamespace(prefill_kv_tile=None),
+                ):
+                    with self.subTest(
+                        policy=policy_cls.__name__,
+                        compiles_logits=compiles_logits,
+                        metadata=metadata,
+                    ):
+                        self.assertEqual(
+                            policy._direct_compile_specialization_key(
+                                metadata,
+                                None if is_vl else self.input_ids,
+                                None,
+                                self.forward_batch,
+                                **kwargs,
+                            ),
+                            base_key,
+                        )
+
+    def test_tiles_compose_with_base_specialization(self):
+        policy = object.__new__(DecoderTpuCompilePolicy)
+        policy._compiles_logits_processor = MagicMock(return_value=True)
+        keys = set()
+        for tile in (0, 1024, 2048):
+            metadata = SimpleNamespace(prefill_kv_tile=tile)
+            for logits_mode in ("full_vocab", "top_k"):
+                self.forward_batch.logits_output_mode = logits_mode
+                key = policy._direct_compile_specialization_key(
+                    metadata, self.input_ids, None, self.forward_batch
+                )
+                self.assertEqual(
+                    key,
+                    ("extend", "null", 1, 8, logits_mode, ("prefill_kv_tile", tile)),
+                )
+                keys.add(key)
+        self.assertEqual(len(keys), 6)
+
+    def test_tiles_compose_with_multimodal_specialization(self):
+        policy = object.__new__(Qwen3VLDecoderTpuCompilePolicy)
+        policy._compiles_logits_processor = MagicMock(return_value=True)
+        keys = set()
+        for tile in (None, 0, 1024, 2048):
+            metadata = SimpleNamespace(prefill_kv_tile=tile)
+            for deepstack in (None, torch.empty(8, 12)):
+                key = policy._direct_compile_specialization_key(
+                    metadata,
+                    None,
+                    None,
+                    self.forward_batch,
+                    input_embeds=self.input_embeds,
+                    input_deepstack_embeds=deepstack,
+                )
+                expected = ("extend", "null", 1, 8, deepstack is not None, "full_vocab")
+                if tile is not None:
+                    expected += (("prefill_kv_tile", tile),)
+                self.assertEqual(key, expected)
+                keys.add(key)
+        self.assertEqual(len(keys), 8)
+
+    def test_metadata_preserves_positional_decode_query_size(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
+            PallasForwardMetadata,
+        )
+
+        tensor = torch.empty(0, dtype=torch.int32)
+        metadata = PallasForwardMetadata(*([tensor] * 7), 4)
+        self.assertEqual(metadata.decode_query_size, 4)
+        self.assertIsNone(metadata.prefill_kv_tile)
 
 
 class TestEagle3DirectCompile(_SpecPolicyTestCase):
@@ -366,6 +467,29 @@ class TestEagle3DirectCompile(_SpecPolicyTestCase):
 
 
 class TestLogitsOutputMode(_PolicyTestCase):
+    def test_compiled_logits_ignore_logical_mode_after_tpu_dp_padding(self):
+        policy = _make_distributed_top_k_policy()
+        forward_batch = policy._make_dummy_forward_batch(
+            num_tokens=64, bs=64, mode=ForwardMode.EXTEND
+        )
+
+        def consume_mode(value, batch):
+            metadata = LogitsMetadata.from_forward_batch(batch)
+            return value + int(metadata.forward_mode)
+
+        with patch("sglang.srt.layers.logits_processor._is_tpu", True):
+            torch._dynamo.reset()
+            self.addCleanup(torch._dynamo.reset)
+            compiled = torch.compile(consume_mode, backend="eager", fullgraph=True)
+            value = torch.zeros(1)
+            compiled(value, forward_batch)
+
+            forward_batch._original_forward_mode = ForwardMode.IDLE
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                result = compiled(value, forward_batch)
+
+        self.assertEqual(result.item(), int(ForwardMode.EXTEND))
+
     def test_specialization_key_uses_selected_logits_mode(self):
         policy = _make_policy()
         forward_batch = SimpleNamespace(
@@ -1421,6 +1545,12 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
 
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
+
+        def mark_sequence_sharded(forward_batch):
+            forward_batch.attn_tp_sequence_sharded = True
+            return forward_batch
+
+        mr.prepare_dummy_forward_batch = MagicMock(side_effect=mark_sequence_sharded)
         policy = _make_policy(mr)
         policy._run_one(num_tokens=64, bs=4, mode=ForwardMode.EXTEND)
         # prepare_forward_batch runs first so model-specific prep hooks
@@ -1433,6 +1563,8 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(args[0].shape, (64,))
         self.assertEqual(args[1].shape, (64,))
         self.assertEqual(args[2].batch_size, 4)
+        self.assertTrue(args[2].attn_tp_sequence_sharded)
+        mr.prepare_dummy_forward_batch.assert_called_once_with(args[2])
 
     def test_run_one_uses_no_grad_not_inference_mode(self):
         mr = _model_runner()
@@ -1539,6 +1671,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
         is_draft_worker=is_draft_worker,
         pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
 
@@ -1943,6 +2076,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             is_draft_worker=is_draft_worker,
             pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
         )
         # _infer_dflash_block_size reads get_spec() at construction; publish the block size.
         self.publish_config(speculative_num_draft_tokens=draft_token_num)

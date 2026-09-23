@@ -158,8 +158,7 @@ def _blockwise_quantized_matmul_kernel(
         raise ValueError(f"{orig_k=} must be divisible by {block_size=}.")
     if w_scale.shape[0] != orig_k // block_size:
         raise ValueError(
-            f"w_scale block dim {w_scale.shape[0]} must match "
-            f"{orig_k // block_size=}."
+            f"w_scale block dim {w_scale.shape[0]} must match {orig_k // block_size=}."
         )
 
     tuned = _get_tuned_value(

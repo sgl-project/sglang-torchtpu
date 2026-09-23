@@ -161,7 +161,7 @@ def _apply_page_size_default(server_args) -> None:
     inside the Pallas trace with a shape error that reads like a kernel bug.
     """
     from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
+        declare_resolution,
         resolving_view,
     )
 
@@ -171,7 +171,7 @@ def _apply_page_size_default(server_args) -> None:
     floor = spec.min_page_size if spec is not None else None
     if cfg.page_size is None:
         default = max(_DEFAULT_PAGE_SIZE, floor or 0)
-        declare_late_resolution(
+        declare_resolution(
             server_args, "tpu.apply_server_args_defaults", page_size=default
         )
         return
@@ -197,7 +197,7 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
     dequantization scale, so defaulting it to fp8 silently degrades it.
     """
     from sglang.srt.arg_groups.overrides import (
-        declare_late_resolution,
+        declare_resolution,
         resolving_view,
     )
 
@@ -207,7 +207,7 @@ def _apply_kv_cache_dtype_default(server_args) -> None:
         return
     if _rpa_kernel_spec(cfg.attention_backend) is None:
         return
-    declare_late_resolution(
+    declare_resolution(
         server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="fp8_e4m3"
     )
 
@@ -246,7 +246,7 @@ class TpuSRTPlatform(SRTPlatform):
         # Pre-publish resolution declares rather than writes, so every read below goes
         # through the live declaration view, this hook's own declarations included.
         from sglang.srt.arg_groups.overrides import (
-            declare_late_resolution,
+            declare_resolution,
             resolving_view,
         )
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
@@ -276,25 +276,25 @@ class TpuSRTPlatform(SRTPlatform):
         )
 
         if cfg.dtype is None or cfg.dtype == "auto":
-            declare_late_resolution(
+            declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", dtype="bfloat16"
             )
 
         if cfg.attention_backend is None:
-            declare_late_resolution(
+            declare_resolution(
                 server_args,
                 "tpu.apply_server_args_defaults",
                 attention_backend=self.get_default_attention_backend(),
             )
 
         if cfg.sampling_backend is None:
-            declare_late_resolution(
+            declare_resolution(
                 server_args,
                 "tpu.apply_server_args_defaults",
                 sampling_backend="tpu",
             )
 
-        declare_late_resolution(
+        declare_resolution(
             server_args,
             "tpu.apply_server_args_defaults",
             disable_cuda_graph=True,
@@ -312,7 +312,7 @@ class TpuSRTPlatform(SRTPlatform):
         # ``--disable-overlap-schedule``.
 
         if cfg.mem_fraction_static is None:
-            declare_late_resolution(
+            declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", mem_fraction_static=0.40
             )
 
@@ -479,7 +479,7 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.runtime_context import get_memory
 
-        # raiden offloads through tpu-raiden's DMA-pinned host pool instead of the
+        # raiden offloads through tpu-sync's DMA-pinned host pool instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
         if get_memory().hicache_io_backend == "raiden":
             from sglang.srt.hardware_backend.tpu.kv_pool_host import (

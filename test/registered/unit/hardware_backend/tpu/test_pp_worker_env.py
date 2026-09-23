@@ -119,7 +119,6 @@ class TestResolveBackend(CustomTestCase):
             return bootstrap._resolve_backend(
                 device="tpu",
                 tp_size=tp_size,
-                server_args=SimpleNamespace(elastic_ep_backend=None),
                 pp_size=pp_size,
             )
 
@@ -139,7 +138,6 @@ class TestResolveBackend(CustomTestCase):
             backend = bootstrap._resolve_backend(
                 device="tpu",
                 tp_size=1,
-                server_args=SimpleNamespace(elastic_ep_backend=None),
             )
         self.assertEqual(backend, "gloo")
 

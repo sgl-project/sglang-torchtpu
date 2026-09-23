@@ -158,7 +158,6 @@ def stage(fabric, rank, mode, schedule):
     scheduler.enable_staging = False
     scheduler.process_pending_chunked_abort = Mock()
     scheduler.process_prefill_chunk = Mock()
-    scheduler.process_input_requests = Mock()
     scheduler.dp_attn_adapter = SimpleNamespace(
         maybe_prepare_mlp_sync_batch=lambda x: x
     )
@@ -199,7 +198,7 @@ def stage(fabric, rank, mode, schedule):
         assert data == ["requests", step[0]], (rank, step[0], data)
         return data
 
-    scheduler.request_receiver = SimpleNamespace(recv_requests=receive_requests)
+    scheduler.ingest_requests = receive_requests
 
     def votes(kind):
         def get(*args):
@@ -328,18 +327,23 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
                 parallel = SimpleNamespace(
                     pp_async_batch_depth=1, enable_dsa_prefill_context_parallel=False
                 )
-                with patch.object(scheduler_pp_mixin, "_is_tpu", True), patch.object(
-                    scheduler_pp_mixin, "get_parallel", return_value=parallel
-                ), patch.object(
-                    scheduler_pp_mixin,
-                    "get_disagg",
-                    return_value=SimpleNamespace(
-                        disaggregation_decode_enable_offload_kvcache=False
+                with (
+                    patch.object(scheduler_pp_mixin, "_is_tpu", True),
+                    patch.object(
+                        scheduler_pp_mixin, "get_parallel", return_value=parallel
                     ),
-                ), patch.object(
-                    scheduler_pp_mixin,
-                    "ScheduleBatch",
-                    side_effect=lambda **kw: SimpleNamespace(**kw),
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_enable_offload_kvcache=False
+                        ),
+                    ),
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "ScheduleBatch",
+                        side_effect=lambda **kw: SimpleNamespace(**kw),
+                    ),
                 ):
                     threads = [
                         threading.Thread(target=run, args=(scheduler,), daemon=True)

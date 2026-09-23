@@ -376,9 +376,9 @@ def expert_parallel_gmm_rs(
         if group_offset_input is not None
         else jnp.arange(0, num_experts, num_experts_per_shard)
     )
-    assert (
-        tp_rank_to_device_id is not None
-    ), "tp_rank_to_device_id must be explicitly provided and cannot be None"
+    assert tp_rank_to_device_id is not None, (
+        "tp_rank_to_device_id must be explicitly provided and cannot be None"
+    )
 
     # Weight tensors and group_offset are already partitioned per-rank on the PyTorch side.
     # Specify P() so shard_map does not attempt to partition local expert tensors across the mesh.
@@ -512,9 +512,9 @@ def fused_moe_func_rs(
 
     assert (num_tokens * topk) % 16 == 0
     del gating_output, global_num_experts, renormalize, scoring_fn, dtype
-    assert (
-        topk_weights is not None and topk_indices is not None
-    ), "fused_moe_func_rs requires pre-computed topk weights and indices"
+    assert topk_weights is not None and topk_indices is not None, (
+        "fused_moe_func_rs requires pre-computed topk weights and indices"
+    )
     topk_weights = jax.lax.with_sharding_constraint(
         topk_weights, NamedSharding(mesh, P(MLP_DATA, None))
     )

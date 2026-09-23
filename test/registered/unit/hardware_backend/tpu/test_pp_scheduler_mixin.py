@@ -128,7 +128,7 @@ class TestProxyReceive(CustomTestCase):
     def _scheduler(self, received):
         scheduler = SchedulerPPMixin()
         scheduler.pp_group = SimpleNamespace(is_first_rank=False)
-        scheduler.require_attn_tp_allgather = False
+        scheduler.attn_tp_group = object()
         scheduler._pp_recv_typed_dict = MagicMock(return_value=received)
         return scheduler
 
@@ -143,7 +143,7 @@ class TestProxyReceive(CustomTestCase):
         self.assertEqual(list(proxy.tensors), ["hidden_states", "residual"])
         self.assertIs(proxy["hidden_states"], hidden)
         scheduler._pp_recv_typed_dict.assert_called_once_with(
-            expected_kind="proxy", all_gather_group=None
+            expected_kind="proxy", all_gather_group=scheduler.attn_tp_group
         )
 
     def test_off_tpu_proxy_keeps_the_received_dict(self):

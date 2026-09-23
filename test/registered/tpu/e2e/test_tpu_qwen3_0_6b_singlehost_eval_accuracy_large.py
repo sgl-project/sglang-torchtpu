@@ -87,7 +87,7 @@ class TestTpuQwen306bSinglehostEvalAccuracyLarge(
                 pass
             time.sleep(5)
         raise TimeoutError(
-            f"{cls.base_url}/health did not return 200 within " f"{cls.health_timeout}s"
+            f"{cls.base_url}/health did not return 200 within {cls.health_timeout}s"
         )
 
 

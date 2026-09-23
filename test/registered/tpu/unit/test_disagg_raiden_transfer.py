@@ -199,10 +199,12 @@ class RaidenRendezvousTestCase(CustomTestCase):
         # the tests for the inbox. Handlers are driven directly instead. The
         # decode heartbeat checker is stubbed the same way -- the stubbed
         # common init carries none of the fields its thread reads.
-        with patch.object(CommonKVManager, "__init__", _fake_common_init), patch.object(
-            RaidenKVManager, "_listen", lambda self: None
-        ), patch.object(
-            CommonKVManager, "_start_heartbeat_checker_thread", lambda self: None
+        with (
+            patch.object(CommonKVManager, "__init__", _fake_common_init),
+            patch.object(RaidenKVManager, "_listen", lambda self: None),
+            patch.object(
+                CommonKVManager, "_start_heartbeat_checker_thread", lambda self: None
+            ),
         ):
             m = RaidenKVManager(kv_args, mode, server_args)
 
@@ -554,8 +556,7 @@ class TestRaidenMessageValidation(CustomTestCase):
 
     def test_decode_validates_ranges_with_message_context(self):
         payload = (
-            b'{"room":1,"decode_ip":"127.0.0.1",'
-            b'"decode_port":65536,"decode_pages":1}'
+            b'{"room":1,"decode_ip":"127.0.0.1","decode_port":65536,"decode_pages":1}'
         )
         with self.assertRaisesRegex(ValueError, "malformed PullReq payload"):
             PullReq.from_frames([MessageTag.PULL_REQ, payload])

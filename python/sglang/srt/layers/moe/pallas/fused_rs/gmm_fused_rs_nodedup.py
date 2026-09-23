@@ -294,12 +294,12 @@ def _select_fused_rs_block_sizes(
 
     # --- Step 6: Assertions ---
     assert size_k1 % tile_k1 == 0, f"tile_k1={tile_k1} must divide size_k1={size_k1}"
-    assert (
-        padded_k2 % tile_k2 == 0
-    ), f"tile_k2={tile_k2} must divide padded_k2={padded_k2}"
-    assert (
-        aligned_n1 % tile_n1 == 0
-    ), f"tile_n1={tile_n1} must divide aligned_n1={aligned_n1}"
+    assert padded_k2 % tile_k2 == 0, (
+        f"tile_k2={tile_k2} must divide padded_k2={padded_k2}"
+    )
+    assert aligned_n1 % tile_n1 == 0, (
+        f"tile_n1={tile_n1} must divide aligned_n1={aligned_n1}"
+    )
     # tile_n2 must divide original size_n2 (kernel only iterates over real N-tiles).
     assert size_n2 % tile_n2 == 0, f"tile_n2={tile_n2} must divide size_n2={size_n2}"
 
@@ -1898,9 +1898,9 @@ def gmm_v2_fused_rs(
         primary_idx_ref = lhs_indices
         secondary_idx_ref = topk_indices
 
-    assert (
-        tp_rank_to_device_id is not None
-    ), "tp_rank_to_device_id mapping is required for gmm_v2_fused_rs"
+    assert tp_rank_to_device_id is not None, (
+        "tp_rank_to_device_id mapping is required for gmm_v2_fused_rs"
+    )
 
     pallas_inputs = (
         group_sizes,

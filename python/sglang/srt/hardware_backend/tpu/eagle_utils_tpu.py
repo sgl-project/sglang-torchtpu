@@ -90,9 +90,9 @@ def prepare_verify_cache_locs_tpu(
     bs = len(batch.req_pool_indices)
     precomputed_cache_locs = verify_input.device_accept_cache_locs
     if precomputed_cache_locs is not None:
-        assert precomputed_cache_locs.shape == (
-            bs * verify_input.draft_token_num,
-        ), "precomputed cache locations must match verify tokens"
+        assert precomputed_cache_locs.shape == (bs * verify_input.draft_token_num,), (
+            "precomputed cache locations must match verify tokens"
+        )
         # FutureMap selected this window on device while host lengths lagged.
         verify_input.device_accept_cache_locs = None
         return precomputed_cache_locs
@@ -197,12 +197,12 @@ def prepare_draft_cache_locs_tpu(
     draft_width = topk * num_steps
     if not host_resident or topk != 1 or selected is None:
         return False
-    assert (
-        selected.ndim == 2 and selected.shape[0] == bs
-    ), "selected cache locations must match batch rows"
-    assert selected.shape[1] >= max(
-        draft_width, num_verify_tokens
-    ), "selected cache window must cover draft and verify tokens"
+    assert selected.ndim == 2 and selected.shape[0] == bs, (
+        "selected cache locations must match batch rows"
+    )
+    assert selected.shape[1] >= max(draft_width, num_verify_tokens), (
+        "selected cache window must cover draft and verify tokens"
+    )
     batch.out_cache_loc = selected[:, :draft_width].reshape(-1)
     return True
 
@@ -213,12 +213,12 @@ def device_accept_verify_cache_locs_tpu(
     selected = draft_input.device_accept_selected_cache_locs
     if selected is None:
         return None
-    assert (
-        selected.ndim == 2 and selected.shape[0] == bs
-    ), "selected cache locations must match verify rows"
-    assert (
-        selected.shape[1] >= num_verify_tokens
-    ), "selected cache window must cover verify tokens"
+    assert selected.ndim == 2 and selected.shape[0] == bs, (
+        "selected cache locations must match verify rows"
+    )
+    assert selected.shape[1] >= num_verify_tokens, (
+        "selected cache window must cover verify tokens"
+    )
     return selected[:, :num_verify_tokens].reshape(-1)
 
 

@@ -118,8 +118,7 @@ class RaidenReceiverMixin:
                 total = len(remote_blocks)
                 if self._decode.remote_total.get(room, total) != total:
                     logger.warning(
-                        "RaidenKVManager rank%d room %s announced %d pages but "
-                        "sent %d",
+                        "RaidenKVManager rank%d room %s announced %d pages but sent %d",
                         self.attn_tp_rank,
                         room,
                         self._decode.remote_total[room],
@@ -700,9 +699,9 @@ class RaidenReceiverMixin:
             if room not in self._decode.reshard_meta or room in self._aborted:
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
-            self._decode.reshard_swa_sources.setdefault(room, {})[
-                src_rank
-            ] = prefill_swa_blocks
+            self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (
+                prefill_swa_blocks
+            )
             aux_index = self._decode.reshard_meta[room].get("aux_index")
             src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._decode.reshard_sources[room]}

@@ -257,8 +257,7 @@ def _markdown(summary: Dict) -> str:
     lines.append(f"## {run.get('title') or 'TPU serving benchmark'}")
     lines.append("")
     lines.append(
-        f"- model: `{run['model']}`  profile: `{run['profile']}`  "
-        f"mode: `{run['mode']}`"
+        f"- model: `{run['model']}`  profile: `{run['profile']}`  mode: `{run['mode']}`"
     )
     lines.append(
         f"- commit: `{(run['git'].get('commit') or 'unknown')[:12]}`"

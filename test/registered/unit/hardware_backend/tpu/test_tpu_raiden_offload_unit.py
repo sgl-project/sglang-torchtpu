@@ -126,6 +126,40 @@ class TestDecodeReqToTokenPool(CustomTestCase):
 
 
 class TestRaidenHostPoolPaging(CustomTestCase):
+    def test_smaller_host_pool_warns_instead_of_failing(self):
+        device_pool = SimpleNamespace(
+            size=32,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=1,
+            layer_num=1,
+            get_fused_kv_buffer=Mock(
+                return_value=torch.empty((8, 4), dtype=torch.bfloat16)
+            ),
+        )
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.raiden_transfer.RaidenKVTransfer"
+            ) as transfer_cls,
+            self.assertLogs(
+                "sglang.srt.hardware_backend.tpu.kv_pool_host", level="WARNING"
+            ) as logs,
+        ):
+            pool = TpuRaidenHostKVCache(
+                device_pool,
+                host_to_device_ratio=0.5,
+                host_size=0,
+                page_size=4,
+                layout="page_first_fused",
+            )
+
+        self.assertEqual(pool.size, 20)
+        self.assertLess(pool.size, device_pool.size)
+        self.assertIn("L2 cache effectiveness is reduced", logs.output[0])
+        device_pool.get_fused_kv_buffer.assert_called_once_with(0)
+        transfer_cls.assert_called_once_with(device_pool, 5)
+
     def test_decode_kv_args_include_raiden_metadata(self):
         captured = {}
 

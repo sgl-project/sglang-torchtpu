@@ -28,7 +28,7 @@ SPEC_ACCEPT_LENGTH_THRESHOLD = float(
 LAUNCH_ENV = {
     "MODEL": "/weights/Qwen3-Coder-480B-A35B-Instruct-FP8",
     "DRAFT_MODEL": (
-        "/weights/" "SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI"
+        "/weights/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI"
     ),
     "ISL": "4096",
     "OSL": "512",

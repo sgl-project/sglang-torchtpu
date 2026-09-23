@@ -257,8 +257,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
             with torch.no_grad():
                 for index, patch_count in enumerate(patch_counts):
                     logger.info(
-                        "VisionTpuCompilePolicy.precompile: [%d/%d] "
-                        "patch_count=%d ...",
+                        "VisionTpuCompilePolicy.precompile: [%d/%d] patch_count=%d ...",
                         index + 1,
                         len(patch_counts),
                         patch_count,

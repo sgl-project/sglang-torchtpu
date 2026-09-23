@@ -73,6 +73,12 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    BORROW_CUDA_IPC_FEATURE_KEY,
+    CUDA_IPC_FEATURE_COPY_EVENT_KEY,
+    RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
+    CudaIpcTensorTransportProxy,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
@@ -135,7 +141,6 @@ def _resolve_vision_tp(
 
 
 class Qwen3_VisionMLP(nn.Module):
-
     def __init__(
         self,
         in_features: int,
@@ -215,7 +220,6 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
 
 class Qwen3_VisionBlock(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -293,7 +297,6 @@ class Qwen3_VisionBlock(nn.Module):
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
-
     def __init__(
         self,
         dim: int,
@@ -307,43 +310,46 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         use_data_parallel: bool = False,
         tp_size: Optional[int] = None,
         tp_rank: Optional[int] = None,
+        disable_merger_proj: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
+        self.disable_merger_proj = disable_merger_proj
 
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size, self.tp_rank = _resolve_vision_tp(
-            use_data_parallel=use_data_parallel,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-        )
-        self.linear_fc1 = ColumnParallelLinear(
-            self.hidden_size,
-            self.padded_context_dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc1", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = RowParallelLinear(
-            self.padded_context_dim,
-            dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("linear_fc2", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
-        )
+        if not disable_merger_proj:
+            self.tp_size, self.tp_rank = _resolve_vision_tp(
+                use_data_parallel=use_data_parallel,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+            self.linear_fc1 = ColumnParallelLinear(
+                self.hidden_size,
+                self.padded_context_dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc1", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
+            self.act_fn = nn.GELU()
+            self.linear_fc2 = RowParallelLinear(
+                self.padded_context_dim,
+                dim,
+                bias=True,
+                quant_config=quant_config,
+                prefix=add_prefix("linear_fc2", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+                use_dp_attention_reduce=is_dp_attention_enabled(),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_postshuffle_norm:
@@ -351,14 +357,14 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         else:
             x = self.norm(x).view(-1, self.hidden_size)
 
-        x_parallel, _ = self.linear_fc1(x)
-        x_parallel = self.act_fn(x_parallel)
-        out, _ = self.linear_fc2(x_parallel)
-        return out
+        if not self.disable_merger_proj:
+            x_parallel, _ = self.linear_fc1(x)
+            x_parallel = self.act_fn(x_parallel)
+            x, _ = self.linear_fc2(x_parallel)
+        return x
 
 
 class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
-
     def __init__(
         self,
         vision_config: Qwen3VLVisionConfig,
@@ -382,9 +388,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_hidden_size = vision_config.out_hidden_size * (
-            1 + len(self.deepstack_visual_indexes)
+        self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
+        merger_out_dim = (
+            self.hidden_size * self.spatial_merge_unit
+            if self.disable_merger_proj
+            else vision_config.out_hidden_size
         )
+        self.out_hidden_size = merger_out_dim * (1 + len(self.deepstack_visual_indexes))
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         if self.pp_group.is_first_rank:
             self.pos_embed = VocabParallelEmbedding(
@@ -454,6 +464,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             quant_config=quant_config,
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
+            disable_merger_proj=self.disable_merger_proj,
         )
 
         self.deepstack_merger_list = nn.ModuleList(
@@ -468,6 +479,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                     quant_config=quant_config,
                     prefix=add_prefix(f"deepstack_merger_list.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
+                    disable_merger_proj=self.disable_merger_proj,
                 )
                 for layer_idx in range(len(self.deepstack_visual_indexes))
             ]
@@ -1050,6 +1062,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
 
+        attention_layout_key = (tuple(cu_seqlens.tolist()), None)
         cu_seqlens = cu_seqlens.to("cpu")
         return self.graph_runners.run(
             x=x,
@@ -1057,6 +1070,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             cu_seqlens=cu_seqlens,
             output_indices=None,
+            attention_layout_key=attention_layout_key,
         )
 
     def forward_with_cuda_graph(
@@ -1115,7 +1129,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             loaded_params.add(name)
         return loaded_params
 
-    def _prepare_graph_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor) -> tuple[
+    def _prepare_graph_inputs(
+        self, x: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -1232,7 +1248,6 @@ cached_get_processor = lru_cache(get_processor)
 
 
 class Qwen3LLMModel(Qwen3Model):
-
     def __init__(
         self,
         *,
@@ -1244,7 +1259,9 @@ class Qwen3LLMModel(Qwen3Model):
         if not self.pp_group.is_first_rank:
             assert self.start_layer >= len(
                 config.vision_config.deepstack_visual_indexes
-            ), "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            ), (
+                "start_layer should be greater than or equal to len(deepstack_visual_indexes)"
+            )
 
         self.hidden_size = config.hidden_size
         self.deepstack_embed_to_decoder_layer = range(
@@ -1479,7 +1496,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 config.vision_config.deepstack_visual_indexes
             )
             self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
-            self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
+            # Only enable deepstack when the checkpoint declares deepstack
+            # capture layers (Qwen4-Exp ships an empty list).
+            self.use_deepstack = (
+                {Modality.IMAGE: True, Modality.VIDEO: True}
+                if self.num_deepstack_embeddings > 0
+                else {}
+            )
         else:
             self.deepstack_visual_indexes = []
             self.num_deepstack_embeddings = 0
@@ -1489,9 +1512,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.capture_aux_hidden_states = False
 
     def separate_deepstack_embeds(self, embedding):
-        assert (
-            embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
-        ), f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        assert embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0, (
+            f"hidden_state of {embedding.shape} should be divisible by ({1 + self.num_deepstack_embeddings})"
+        )
 
         separate_index = self.config.hidden_size
         input_embeds = embedding[:, :separate_index]
@@ -1551,16 +1574,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # Assemble on the host at bucket length so the encoder prologue sees
             # a static shape; forward_with_tpu_graph does the single transfer.
             total_patches = int(grid_thw.prod(dim=1).sum())
-            pixel_values = self._materialize_visual_items(
+            pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
                 items,
                 range(len(items)),
                 device=torch.device("cpu"),
                 pad_to=self.visual.graph_runners.bucket_for_patches(total_patches),
+                preserve_for_reprefill=True,
             )
         else:
-            pixel_values = self._materialize_visual_items(items, range(len(items)))
+            pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
+                items, range(len(items)), preserve_for_reprefill=True
+            )
         assert pixel_values.dim() == 2, pixel_values.dim()
-        return self.visual(pixel_values, grid_thw=grid_thw)
+        visual_features = self.visual(pixel_values, grid_thw=grid_thw)
+        if borrowed_items:
+            self._offload_packed_visual_inputs(
+                pixel_values, borrowed_items, packed_ready
+            )
+        return visual_features
 
     def _materialize_visual_items(
         self,
@@ -1569,8 +1600,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         *,
         device: torch.device | None = None,
         pad_to: int | None = None,
-    ) -> torch.Tensor:
+        preserve_for_reprefill: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
         visual_device = self.visual.device
+        target_device = visual_device if device is None else device
         device_index = visual_device.index
         if visual_device.type == "cuda" and device_index is None:
             device_index = torch.cuda.current_device()
@@ -1579,17 +1612,117 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             consumer_count = max(parallel.tp_size, 1)
 
         features = []
+        borrowed_items = []
+        feature_offset = 0
         for index in indices:
             item = items[index]
             if visual_device.type == "cuda":
-                item.reconstruct(device_index, ipc_consumer_count=consumer_count)
+                proxy = item.feature
+                model_specific_data = getattr(item, "model_specific_data", {})
+                pending_copy = model_specific_data.pop(
+                    CUDA_IPC_FEATURE_COPY_EVENT_KEY, None
+                )
+                if pending_copy is not None:
+                    torch.cuda.current_stream(device_index).wait_event(pending_copy)
+                borrow_requested = model_specific_data.pop(
+                    BORROW_CUDA_IPC_FEATURE_KEY, False
+                )
+                can_borrow = (
+                    preserve_for_reprefill
+                    and consumer_count == 1
+                    and isinstance(proxy, CudaIpcTensorTransportProxy)
+                    and borrow_requested
+                )
+                borrowed = (
+                    proxy.borrow_on_target_device(device_index) if can_borrow else None
+                )
+                if borrowed is not None:
+                    item.feature = borrowed
+                    model_specific_data[RETAINED_CUDA_IPC_FEATURE_PROXY_KEY] = proxy
+                    borrowed_items.append(
+                        (item, proxy, feature_offset, borrowed.shape[0])
+                    )
+                elif RETAINED_CUDA_IPC_FEATURE_PROXY_KEY not in model_specific_data:
+                    item.reconstruct(device_index, ipc_consumer_count=consumer_count)
             features.append(item.feature)
-        return materialize_multimodal_features(
-            features,
-            device=visual_device if device is None else device,
-            dtype=self.visual.dtype,
-            pad_to=pad_to,
-        )
+            feature_offset += item.feature.shape[0]
+        try:
+            materialized = materialize_multimodal_features(
+                features,
+                device=target_device,
+                dtype=self.visual.dtype,
+                pad_to=pad_to,
+            )
+        except Exception:
+            for item, proxy, _, _ in borrowed_items:
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a borrowed CUDA IPC feature after "
+                        "materialization failed",
+                        exc_info=True,
+                    )
+                item.feature = None
+            raise
+        packed_ready = None
+        if borrowed_items:
+            source_stream = torch.cuda.current_stream(device_index)
+            packed_ready = torch.cuda.Event()
+            packed_ready.record(source_stream)
+            for item, proxy, offset, length in borrowed_items:
+                item.feature = materialized.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = packed_ready
+                try:
+                    proxy.release_borrowed_on_current_stream()
+                    item.model_specific_data.pop(
+                        RETAINED_CUDA_IPC_FEATURE_PROXY_KEY, None
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to release a copied CUDA IPC feature; retaining "
+                        "its lease until request cleanup",
+                        exc_info=True,
+                    )
+        if preserve_for_reprefill:
+            return materialized, borrowed_items, packed_ready
+        return materialized
+
+    def _offload_packed_visual_inputs(
+        self, materialized: torch.Tensor, borrowed_items: list, packed_ready
+    ) -> None:
+        """Preserve inputs for re-prefill without delaying the ViT launch."""
+        try:
+            host_features = torch.empty(
+                materialized.shape,
+                dtype=materialized.dtype,
+                device="cpu",
+                pin_memory=torch.cuda.is_available(),
+            )
+            copy_stream = getattr(self, "_mm_feature_copy_stream", None)
+            if copy_stream is None:
+                copy_stream = torch.cuda.Stream(device=self.visual.device)
+                self._mm_feature_copy_stream = copy_stream
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_event(packed_ready)
+                host_features.copy_(materialized, non_blocking=True)
+                host_ready = torch.cuda.Event()
+                host_ready.record(copy_stream)
+            if materialized.is_cuda:
+                materialized.record_stream(copy_stream)
+            for item, _, offset, length in borrowed_items:
+                item.feature = host_features.narrow(0, offset, length)
+                item.model_specific_data[CUDA_IPC_FEATURE_COPY_EVENT_KEY] = host_ready
+        except Exception:
+            # The generic multimodal path will offload the owned CUDA slices.
+            logger.warning(
+                "Failed to preserve CUDA IPC features on the copy stream; "
+                "falling back to the generic offload path",
+                exc_info=True,
+            )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1757,10 +1890,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # Skip loading visual/language model weights
-                if (
-                    self.config.encoder_only or self.config.language_only
-                ) and name not in params_dict:
+                # Skip unexpected stacked names (e.g. ModelOpt quantizer buffers
+                # that were remapped gate_proj -> gate_up_proj but are not params).
+                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader

@@ -623,16 +623,14 @@ def run_accuracy_test(
     """
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Running ACCURACY test for {model.model_path}")
     print(f"  Eval: {params.name}")
     if params.floor is not None:
         print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
     if params.spec_accept_length_threshold is not None:
-        print(
-            "  Spec accept-length threshold: " f"{params.spec_accept_length_threshold}"
-        )
-    print(f"{'='*60}\n")
+        print(f"  Spec accept-length threshold: {params.spec_accept_length_threshold}")
+    print(f"{'=' * 60}\n")
 
     spec_accept_lengths = None
     spec_accept_length_error = None

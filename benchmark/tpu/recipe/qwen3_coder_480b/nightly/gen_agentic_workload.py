@@ -370,8 +370,7 @@ def main() -> int:
 
     if args.num_long > args.num_sessions:
         print(
-            f"ERROR: --num-long {args.num_long} > --num-sessions "
-            f"{args.num_sessions}",
+            f"ERROR: --num-long {args.num_long} > --num-sessions {args.num_sessions}",
             file=sys.stderr,
         )
         return 2
