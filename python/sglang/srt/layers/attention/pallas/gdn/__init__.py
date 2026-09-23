@@ -18,9 +18,7 @@ The single public entry point ``fused_conv1d_gdn`` runs conv1d and the gated
 delta rule in one Pallas kernel, handling ragged (mixed prefill + decode)
 batches via a per-tile metadata plan.
 
-Adapted from vllm-project/tpu-inference ``tpu_inference.kernels.gdn.v3``
-(Apache-2.0). Pure JAX/Pallas; call it from torch through
-``torch_tpu._internal.pallas``.
+Pure JAX/Pallas; call it from torch through ``torch_tpu._internal.pallas``.
 """
 
 from sglang.srt.layers.attention.pallas.gdn.wrapper import fused_conv1d_gdn

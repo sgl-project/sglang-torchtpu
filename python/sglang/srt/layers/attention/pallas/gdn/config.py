@@ -11,11 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Adapted for SGLang-TorchTPU from vllm-project/tpu-inference
-# `tpu_inference.kernels.gdn.v3.config` (Apache-2.0).
-# Changes: no functional changes and no sibling imports to rebase; reformatted
-# to the repo's black/isort style.
 
 import dataclasses
 import enum
@@ -28,18 +23,11 @@ from jax.experimental.pallas import tpu as pltpu
 
 
 class GDNMode(enum.StrEnum):
+    # Multiple sequences per tile, one tile per sequence. Each sequence
+    # carries `window_size` tokens: a single decoded token, or a speculative
+    # verify window. See `GDNConfig.window_size`.
     BATCHED = enum.auto()
     PER_SEQ = enum.auto()
-
-    def get_seq_tile_size(self, tile_size: int) -> int:
-        if self == GDNMode.BATCHED:
-            return tile_size
-        return 1
-
-    def get_chunk_size(self, tile_size: int) -> int:
-        if self == GDNMode.BATCHED:
-            return 1
-        return tile_size
 
 
 @jax.tree_util.register_dataclass
@@ -50,6 +38,50 @@ class Dtypes:
     compute: jnp.dtype
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
+
+
+@dataclasses.dataclass(frozen=True)
+class StateRegion:
+    """Copy-plan for one state region of an indexed external state source.
+
+    A slot's region spans ``nblocks`` consecutive source blocks starting
+    ``kb0`` blocks into the slot's window, rows ``[row0, row0 + nrows)``
+    of each — one contiguous DMA per slot. The raw bytes are accessed
+    through a typed view (``view_dtype`` elements, ``lane_split``-way
+    128-lane split); the leading ``rows_used`` typed rows carry the
+    state, the rest is zero padding.
+    """
+
+    kb0: int
+    nblocks: int
+    row0: int
+    nrows: int
+    view_dtype: jnp.dtype
+    lane_split: int
+    rows_used: int
+    # Optional static typed-row permutation between the pool's stored row
+    # order and the kernel's logical row order: logical_rows[i] is stored
+    # at typed row rows_perm[i].  None or the identity means the stored
+    # order IS the logical order.  Used by the QK pair-blocked conv layout,
+    # where full-width states interleave Q and K row-pairs per tap so that
+    # one whole pool token holds one head-pair's Q and K rows.
+    rows_perm: tuple[int, ...] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class StateSourcePlan:
+    """States live in an indexed external source instead of dense per-slot
+    tensors: each state index owns a window of ``stride`` consecutive
+    source blocks holding both state regions.
+
+    The plan describes one checkpoint's geometry. With speculative
+    decoding every checkpoint is an independent source block named by
+    ``MetadataRef.s_idx_to_ckpt_indices`` and reuses this same geometry,
+    so nothing here varies with the verify window."""
+
+    stride: int
+    conv: StateRegion
+    recurrent: StateRegion
 
 
 @jax.tree_util.register_dataclass
@@ -66,18 +98,44 @@ class GDNConfig:
     kq_head_dim: int
     v_head_dim: int
     num_buffers: int = 2
+    state_plan: StateSourcePlan | None = None
+    # Max tokens per speculative verify window (= num_speculative_tokens + 1),
+    # which is also the number of state checkpoints kept per sequence. The
+    # kernel reads a sequence's initial state from
+    # `state_indices[s] + read_offset[s]` and writes one checkpoint per window
+    # position to `state_indices[s] + t`, which is how rejected draft tokens
+    # are rolled back (by checkpoint selection). It is 1 without speculative
+    # decoding, where only the state after the last real token is kept, so
+    # shapes and loops can be sized off it unconditionally and the extra axis
+    # / iterations fold away in the non-speculative paths.
+    window_size: int = 1
 
     @property
     def chunk_size(self) -> int:
-        return self.mode.get_chunk_size(self.tile_size)
+        if self.mode == GDNMode.PER_SEQ:
+            return self.tile_size
+        # One tile per sequence, holding its whole verify window. BATCHED is
+        # the single-token case of that (window_size == 1).
+        return self.window_size
 
     @property
     def seq_tile_size(self) -> int:
-        return self.mode.get_seq_tile_size(self.tile_size)
+        if self.mode == GDNMode.PER_SEQ:
+            return 1
+        return self.tile_size
 
     @property
     def prev_kernel_size(self) -> int:
         return self.kernel_size - 1
+
+    @property
+    def use_recurrent(self) -> bool:
+        """Whether GDN runs the token-recurrent scan instead of the chunked one.
+
+        Keeping more than one state checkpoint mandates the recurrent scan,
+        since the chunked path only ever produces the final state.
+        """
+        return self.chunk_size == 1 or self.window_size > 1
 
     @property
     def v_dim_size(self) -> int:
@@ -98,8 +156,10 @@ class GDNConfig:
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
     def get_kernel_name(self) -> str:
-        prefix = f"fused_conv1d_gdn_{self.mode.value}"
-        return prefix
+        # Windows of different sizes compile to different kernels; keep them
+        # distinguishable in profiles.
+        suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        return f"fused_conv1d_gdn_{self.mode.value}{suffix}"
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -117,9 +177,21 @@ class GDNConfig:
             self.dtypes.act_out,
         )
 
+    # Fraction of VMEM the kernel may use. A multi-token window holds one
+    # state checkpoint per position in VMEM, so for large-head models the
+    # default 0.7 budget is not enough; those get a higher limit and the
+    # wrapper sizes the tile against the same factor.
+    DEFAULT_VMEM_FRACTION = 0.7
+    WINDOWED_VMEM_FRACTION = 0.9
+
     def get_vmem_limit_bytes(self) -> int:
         tpu_info = pltpu.get_tpu_info()
-        return int(0.7 * tpu_info.vmem_capacity_bytes)
+        fraction = (
+            self.WINDOWED_VMEM_FRACTION
+            if self.window_size > 1
+            else self.DEFAULT_VMEM_FRACTION
+        )
+        return int(fraction * tpu_info.vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)
@@ -131,9 +203,9 @@ class GDNConfig:
         )
 
         carry_conv_scratch = carry_recurrent_scratch = None
-        # NOTE: Currently, batched mode only supports case where 1 seq = 1 tile.
-        # Therefore, inter tile carry is not needed.
-        if self.mode != GDNMode.BATCHED:
+        # NOTE: In batched mode 1 seq = 1 tile, so inter-tile carry is not
+        # needed.
+        if self.mode == GDNMode.PER_SEQ:
             carry_conv_scratch = pltpu.VMEM(conv_shape, jnp.float32)
             carry_recurrent_scratch = pltpu.VMEM(recurrent_shape, jnp.float32)
 
