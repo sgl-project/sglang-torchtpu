@@ -34,7 +34,7 @@ launched further ahead than the trailing stages can issue before its next
 device wait would block for good.
 
 Every launch runs the same compiled program: one buffer padded to the largest
-extend batch.
+batch a forward can hand on.
 """
 
 import logging

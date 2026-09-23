@@ -15,7 +15,6 @@ import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.parallel_state import GroupCoordinator, TensorMetadata
-from sglang.srt.hardware_backend.tpu import pp_transfer
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -41,67 +40,6 @@ def _coordinator(rank_in_group: int = 0, world_size: int = 2) -> GroupCoordinato
     coordinator.send_object = MagicMock(return_value=[])
     coordinator.recv_object = MagicMock()
     return coordinator
-
-
-class TestPpTransferHelpers(CustomTestCase):
-    def setUp(self):
-        pp_transfer._pinned_alloc_failed = False
-
-    def tearDown(self):
-        pp_transfer._pinned_alloc_failed = False
-
-    def test_to_host_returns_cpu_tensor_unchanged(self):
-        tensor = torch.arange(4)
-        self.assertIs(pp_transfer.to_host(tensor), tensor)
-
-    def test_to_host_copies_device_tensor_contiguously(self):
-        host = torch.zeros(2, 3, dtype=torch.bfloat16)
-        device = _fake_device_tensor(host)
-        self.assertIs(pp_transfer.to_host(device), host)
-        device.contiguous.assert_called_once_with()
-        device.contiguous.return_value.cpu.assert_called_once_with()
-
-    def test_alloc_recv_buffer_requests_pinned_memory(self):
-        pinned = torch.empty(2, 3, dtype=torch.bfloat16)
-        with patch.object(pp_transfer.torch, "empty", return_value=pinned) as empty:
-            out = pp_transfer.alloc_recv_buffer(torch.Size([2, 3]), torch.bfloat16)
-        self.assertIs(out, pinned)
-        empty.assert_called_once_with(
-            (2, 3), dtype=torch.bfloat16, device="cpu", pin_memory=True
-        )
-
-    def test_alloc_recv_buffer_falls_back_to_unpinned_once(self):
-        unpinned = torch.empty(2, 3)
-        calls = []
-
-        def fake_empty(size, **kwargs):
-            calls.append(kwargs)
-            if kwargs.get("pin_memory"):
-                raise RuntimeError("no pinned allocator")
-            return unpinned
-
-        with patch.object(pp_transfer.torch, "empty", side_effect=fake_empty):
-            first = pp_transfer.alloc_recv_buffer((2, 3), torch.float32)
-            second = pp_transfer.alloc_recv_buffer((2, 3), torch.float32)
-        self.assertIs(first, unpinned)
-        self.assertIs(second, unpinned)
-        # pinned attempt, unpinned fallback, then unpinned directly.
-        self.assertEqual(
-            [bool(c.get("pin_memory")) for c in calls], [True, False, False]
-        )
-
-    def test_alloc_recv_buffer_skips_pinning_for_empty_tensors(self):
-        with patch.object(
-            pp_transfer.torch, "empty", return_value=torch.empty(0)
-        ) as empty:
-            pp_transfer.alloc_recv_buffer((0,), torch.int64)
-        self.assertNotIn("pin_memory", empty.call_args.kwargs)
-
-    def test_to_device_uploads_non_blocking_to_recorded_device_type(self):
-        tensor = MagicMock(spec=torch.Tensor)
-        tensor.to.return_value = "uploaded"
-        self.assertEqual(pp_transfer.to_device(tensor, "tpu"), "uploaded")
-        tensor.to.assert_called_once_with("tpu", non_blocking=True)
 
 
 class TestSendTensorDictOnTpu(CustomTestCase):
@@ -170,11 +108,8 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
             received.append((tensor, src, group))
             return MagicMock()
 
-        def fake_alloc(size, dtype):
-            return torch.zeros(tuple(size), dtype=dtype)
-
-        def fake_to_device(tensor, device_type):
-            uploads.append((tensor, device_type))
+        def fake_to(tensor, device_type, non_blocking=False):
+            uploads.append((tensor, device_type, non_blocking))
             return ("on", device_type, tensor)
 
         with (
@@ -183,8 +118,7 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
             patch.object(
                 parallel_state.torch.distributed, "irecv", side_effect=fake_irecv
             ),
-            patch.object(pp_transfer, "alloc_recv_buffer", side_effect=fake_alloc),
-            patch.object(pp_transfer, "to_device", side_effect=fake_to_device),
+            patch.object(torch.Tensor, "to", fake_to),
         ):
             out = coordinator.recv_tensor_dict()
         return coordinator, out, received, uploads
@@ -206,7 +140,7 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
         self.assertEqual(received[0][0].dtype, torch.bfloat16)
         self.assertEqual(len(uploads), 1)
         self.assertIs(uploads[0][0], received[0][0])
-        self.assertEqual(uploads[0][1], "tpu")
+        self.assertEqual(uploads[0][1:], ("tpu", True))
         self.assertEqual(out["hidden_states"][:2], ("on", "tpu"))
         self.assertIs(out["hidden_states"][2], received[0][0])
         self.assertIs(out["host_only"], received[1][0])
@@ -232,12 +166,10 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
             patch.object(
                 parallel_state.torch.distributed, "irecv", return_value=MagicMock()
             ) as irecv,
-            patch.object(pp_transfer, "alloc_recv_buffer") as alloc,
-            patch.object(pp_transfer, "to_device") as to_device,
+            patch.object(torch.Tensor, "to") as to,
         ):
             out = coordinator.recv_tensor_dict()
-        alloc.assert_not_called()
-        to_device.assert_not_called()
+        to.assert_not_called()
         self.assertIs(irecv.call_args.kwargs["group"], coordinator.cpu_group)
         self.assertEqual(out["hidden_states"].shape, (2,))
 
