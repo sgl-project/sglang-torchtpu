@@ -91,11 +91,14 @@ class TestAttentionPallasRpaV3(unittest.TestCase):
             is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         )
-        with patch(
-            "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base."
-            "_build_pallas_kernel_op",
-            return_value=None,
-        ), envs.SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE.override(cache_metadata):
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base."
+                "_build_pallas_kernel_op",
+                return_value=None,
+            ),
+            envs.SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE.override(cache_metadata),
+        ):
             return TpuPallasRpaV3AttnBackend(
                 model_runner, speculative_step_id=speculative_step_id
             )

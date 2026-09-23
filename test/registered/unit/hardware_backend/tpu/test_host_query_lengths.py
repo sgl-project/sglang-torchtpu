@@ -128,10 +128,13 @@ def test_query_mirror_survives_padding_before_metadata(
         ),
     )
     backend = _bare_backend()
-    with patch.object(
-        envs.SGLANG_TPU_ENABLE_HOST_QUERY_LENS, "get", return_value=enabled
-    ), patch(
-        "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
+    with (
+        patch.object(
+            envs.SGLANG_TPU_ENABLE_HOST_QUERY_LENS, "get", return_value=enabled
+        ),
+        patch(
+            "sglang.srt.layers.dp_attention.is_dp_attention_enabled", return_value=False
+        ),
     ):
         if padding == "general":
             _pad_forward_batch_inputs(
@@ -284,9 +287,10 @@ def test_eagle_query_producer_precedes_idle_normalization(idle):
         ),
         attn_backend=SimpleNamespace(init_forward_metadata=Mock()),
     )
-    with patch.object(
-        common.ForwardBatch, "init_new", return_value=forward
-    ), patch.object(common, "maybe_detect_oob"):
+    with (
+        patch.object(common.ForwardBatch, "init_new", return_value=forward),
+        patch.object(common, "maybe_detect_oob"),
+    ):
         result = common.prepare_for_draft_extend(
             SimpleNamespace(num_front_tokens=0),
             batch,
