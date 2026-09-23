@@ -10,6 +10,7 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import secrets
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -664,9 +665,9 @@ class RaidenReceiverMixin:
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
         dst = local_blocks[window.local_offset : window.local_offset + window.length]
-        with self._state_lock:
-            self._uuid_seq += 1
-            uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+        # Independent decoders share a prefill. Use positive IDs that
+        # fit the reshard RPC's signed int64 field.
+        uuid = secrets.randbelow((1 << 63) - 1) + 1
         req_id = f"{room}#{index}"
         req = build_receiver_request(
             pb2,

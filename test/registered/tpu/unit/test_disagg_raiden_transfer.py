@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.raiden.conn import RaidenKVManager
@@ -243,6 +244,41 @@ class RaidenRendezvousTestCase(CustomTestCase):
 
 
 class TestRaidenPullHandshake(RaidenRendezvousTestCase):
+    def test_chunk_transfer_id_fits_positive_int64(self):
+        for upper_bound in (False, True):
+            with self.subTest(upper_bound=upper_bound):
+                prefill, decode = self._prefill(), self._decode()
+                prefill._on_pull_req(self._pull_req_frames(decode, 7000, 2))
+                with patch(
+                    "secrets.randbelow",
+                    side_effect=lambda bound: bound - 1 if upper_bound else 0,
+                ):
+                    prefill._announce_chunk(7000, 0, [1], total_pages=2)
+
+                chunk = Chunk.from_frames(
+                    self.inboxes[decode.endpoint].take(MessageTag.CHUNK)
+                )
+                self.assertGreater(chunk.uuid, 0)
+                self.assertEqual(Int64Value(value=chunk.uuid).value, chunk.uuid)
+
+    def test_chunks_from_different_prefills_have_distinct_transfer_ids(self):
+        decode = self._decode()
+        transfer_ids = []
+        for room in (7000, 7001):
+            prefill = self._prefill(attn_tp_rank=0)
+            prefill._on_pull_req(self._pull_req_frames(decode, room, 2))
+            prefill._announce_chunk(room, 0, [1], total_pages=2)
+
+            chunk = Chunk.from_frames(
+                self.inboxes[decode.endpoint].take(MessageTag.CHUNK)
+            )
+            self.assertEqual(chunk.req_id, f"{room}#0")
+            self.assertEqual(prefill._engine.reads, [(chunk.req_id, chunk.uuid, [1])])
+            transfer_ids.append(chunk.uuid)
+
+        # The receiving native engine keys all peers' reads by UUID alone.
+        self.assertNotEqual(*transfer_ids)
+
     def test_decode_request_emits_a_well_formed_pull_req(self):
         """The decode names itself and its page count so the prefill can size
         the reply; the typed message schema is the wire contract."""

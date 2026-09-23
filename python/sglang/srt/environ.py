@@ -1629,6 +1629,10 @@ class Envs:
     SGLANG_TPU_FP8_MOE_COMPACT_W1_SCALES = EnvBool(False)
     SGLANG_TPU_FP8_MOE_COMPACT_W2_SCALES = EnvBool(False)
     SGLANG_TPU_REQ_TO_TOKEN_ON_HOST = EnvBool(True)
+    # Reuse uploaded attention metadata across forwards; applies to all TPU batches.
+    SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE = EnvBool(True)
+    # Read extend query lengths from a complete host mirror instead of the device.
+    SGLANG_TPU_ENABLE_HOST_QUERY_LENS = EnvBool(True)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.
@@ -1653,6 +1657,8 @@ class Envs:
     # xprof scope per task. Values <= 0 trace all chips or SparseCores.
     SGLANG_TPU_PROFILE_NUM_CHIPS = EnvInt(1)
     SGLANG_TPU_PROFILE_NUM_SPARSE_CORES = EnvInt(1)
+    # xprof python tracer. Off by default: it dominates host busy time.
+    SGLANG_TPU_PROFILE_PYTHON_TRACER = EnvBool(False)
     # raiden KV-offload backend
     SGLANG_TPU_RAIDEN_DMA_TIMEOUT_S = EnvFloat(60.0)
     # Workaround for a TPU v7 warmup crash; disable to debug the root cause.

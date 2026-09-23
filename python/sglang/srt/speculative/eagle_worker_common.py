@@ -130,8 +130,9 @@ def prepare_for_draft_extend(
     front_offset = num_front_tokens if widen else 0
     num_window_tokens = num_draft_tokens + front_offset
     extend_num_tokens = bs * num_window_tokens
-    # When seq_lens_cpu is absent, stay on GPU-only path -- no .tolist()/.cpu().
-    gpu_only = batch.seq_lens_cpu is None
+    # If seq_lens has no host copy, keep length arithmetic on the device
+    # to avoid a device-to-host sync, regardless of accelerator type.
+    device_lens_only = batch.seq_lens_cpu is None
 
     batch.spec_info = draft_extend_input
     # Do NOT cast predict dtype here. The caller (e.g., _draft_extend_for_decode)
@@ -163,9 +164,8 @@ def prepare_for_draft_extend(
         batch.model_config.vocab_size,
         "v2 prepare_for_draft_extend input_ids",
     )
-    # init_new requires both list or both Tensor;
-    # gpu_only emits device tensors to skip H2D.
-    if gpu_only:
+    # init_new requires prefix_lens and extend_lens to be both lists or both tensors.
+    if device_lens_only:
         batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
@@ -192,18 +192,18 @@ def prepare_for_draft_extend(
         capture_hidden_mode=capture_mode,
         return_hidden_states_before_norm=return_hidden_states_before_norm,
     )
+    if device_lens_only and not forward_batch.forward_mode.is_idle():
+        # The query width is known without reading seq_lens back from the device.
+        # Set active-rank counts here; normalization below supplies idle-rank counts.
+        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     # Normalize idle DP ranks before the shared sequence-length update.
     draft_model_runner.compile_policy.normalize_spec_forward_batch(forward_batch)
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
     forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
-    if not gpu_only:
+    if not device_lens_only:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
-    else:
-        # Supply CPU mirror (extend_seq_lens are all num_window_tokens) so
-        # backend max() reads from list without a per-iter D2H sync.
-        forward_batch.extend_seq_lens_cpu = [num_window_tokens] * bs
     draft_model_runner.compile_policy.prepare_spec_forward_batch(forward_batch)
     can_run_decode_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run_graph(
         forward_batch
