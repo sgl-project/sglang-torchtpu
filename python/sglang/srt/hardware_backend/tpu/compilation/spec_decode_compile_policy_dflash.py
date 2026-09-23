@@ -13,7 +13,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-    arm_recompilation_checker,
+    install_recompilation_checker,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
@@ -363,9 +363,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             "[spec compile policy] DFLASH DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
-        # Every precompile in the process is done here, the target's ran at
-        # graph-runner init.
-        arm_recompilation_checker(
+        # Attach the draft checker now; the scheduler baselines after the
+        # remaining speculative-op and KV-offload warmup.
+        install_recompilation_checker(
             policies=(self,),
             model_label=f"draft {type(self.model_runner.model).__name__}",
         )

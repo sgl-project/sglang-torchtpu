@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
     DecoderCompilePolicy,
     get_torch_compile_policy,
 )
@@ -37,7 +38,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
 from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-    arm_recompilation_checker,
+    install_recompilation_checker,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
@@ -208,7 +209,7 @@ class TpuGraphRunner:
             else (self.model,)
         )
         installed_any = False
-        installed_policies: list[Any] = []
+        installed_policies: list[CompilePolicy] = []
         for module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
@@ -283,13 +284,13 @@ class TpuGraphRunner:
         if not installed_any:
             return
 
-        # Arm here and nowhere earlier: every graph this model precompiles
-        # exists by now, so the baseline separates precompile from serving.
+        # Attach after model warmup. The scheduler starts monitoring once
+        # speculative-op and KV-offload precompilation have also completed.
         if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
-            # A draft model precompiles later, from precompile_draft, and arms
+            # A draft model precompiles later, from precompile_draft, and installs
             # the checker itself once that is done.
             if not model_runner.is_draft_worker:
-                arm_recompilation_checker(
+                install_recompilation_checker(
                     policies=installed_policies,
                     model_label=type(self.model).__name__,
                 )

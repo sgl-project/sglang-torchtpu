@@ -14,7 +14,8 @@ from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
     _build_event,
     _format_event,
     _shared_recompilation_checker,
-    arm_recompilation_checker,
+    install_recompilation_checker,
+    start_recompilation_monitoring,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -325,30 +326,63 @@ class TestSharedChecker(CustomTestCase):
         with patch.object(recompilation_checker, "torch", fake_torch):
             self.assertIsNone(_shared_recompilation_checker())
 
-    def test_arm_is_a_noop_unless_opted_in(self):
+    def test_install_is_a_noop_unless_opted_in(self):
         policy = MagicMock()
         with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False):
-            arm_recompilation_checker(policies=(policy,), model_label="M")
+            install_recompilation_checker(policies=(policy,), model_label="M")
         policy.set_recompilation_checker.assert_not_called()
 
-    def test_arm_baselines_before_handing_the_checker_out(self):
-        """Compiles before the arm are precompile, not serving-time events."""
+    def test_install_defers_baseline_until_scheduler_warmup_finishes(self):
         cache = _FakeCache([500])
         checker = _checker(cache)
-        policy = MagicMock()
-        events = []
-        checker.snapshot_baseline = lambda: events.append("snapshot")
-        policy.set_recompilation_checker.side_effect = lambda *a, **k: events.append(
-            "install"
-        )
+        policy = SimpleNamespace(set_recompilation_checker=MagicMock())
         with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch.object(
             recompilation_checker, "_shared_recompilation_checker", return_value=checker
         ):
-            arm_recompilation_checker(policies=(policy,), model_label="draft M")
-        self.assertEqual(events, ["snapshot", "install"])
-        policy.set_recompilation_checker.assert_called_once_with(
-            checker, model_label="draft M"
-        )
+            install_recompilation_checker(policies=(policy,), model_label="draft M")
+            policy.set_recompilation_checker.assert_called_once_with(
+                checker, model_label="draft M"
+            )
+            # The checker may see forwards during subsequent startup work.
+            cache.compile(30000)  # Deferred draft/model warmup.
+            self.assertIsNone(checker.check(context_fn=_context))
+            cache.compile(200, 400)  # Speculative ops and KV offload.
+            self.assertEqual(cache.stats_reads, 0)
+            self.assertEqual(cache.syncs, 0)
+            start_recompilation_monitoring()
+            self.assertIsNone(checker.check(context_fn=_context))
+            self.assertEqual(checker.serving_compiles, 0)
+            cache.compile(50)
+            event = checker.check(context_fn=_context)
+            self.assertEqual(event.durations_ms, (50,))
+            self.assertEqual(checker.serving_compiles, 1)
+
+    def test_install_skips_policies_without_monitoring_support(self):
+        from sglang.srt.compilation.support_torch_compile import NoopCompilePolicy
+
+        cache = _FakeCache([])
+        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch.object(
+            recompilation_checker,
+            "_shared_recompilation_checker",
+            return_value=_checker(cache),
+        ):
+            install_recompilation_checker(
+                policies=(NoopCompilePolicy(),), model_label="vision"
+            )
+        self.assertEqual(cache.stats_reads, 0)
+
+    def test_start_is_a_noop_unless_opted_in(self):
+        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False), patch.object(
+            recompilation_checker, "_shared_recompilation_checker"
+        ) as shared:
+            start_recompilation_monitoring()
+        shared.assert_not_called()
+
+    def test_start_is_a_noop_without_cache_stats(self):
+        with envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True), patch.object(
+            recompilation_checker, "_shared_recompilation_checker", return_value=None
+        ):
+            start_recompilation_monitoring()
 
     def test_target_and_draft_share_one_checker(self):
         """Two checkers over the one process cache report every compile twice."""
@@ -361,9 +395,13 @@ class TestSharedChecker(CustomTestCase):
             )
         )
         with patch.object(recompilation_checker, "torch", fake_torch):
-            self.assertIs(
-                _shared_recompilation_checker(), _shared_recompilation_checker()
-            )
+            checker = _shared_recompilation_checker()
+            self.assertIs(checker, _shared_recompilation_checker())
+            checker.snapshot_baseline()
+            cache.compile(25)
+            event = _shared_recompilation_checker().check(context_fn=_context)
+            self.assertEqual(event.durations_ms, (25,))
+            self.assertIsNone(checker.check(context_fn=_context))
 
 
 if __name__ == "__main__":

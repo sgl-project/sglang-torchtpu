@@ -588,13 +588,15 @@ class TestCompiledForwardShim(CustomTestCase):
 
     def test_recompilation_check_runs_when_forward_raises(self):
         """A compile that raises mid-forward must still be reported."""
-        compiled = MagicMock(side_effect=RuntimeError("boom"))
+        error = torch._dynamo.exc.RecompileError("fail_on_recompile")
+        compiled = MagicMock(side_effect=error)
         shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
         checker = MagicMock()
         shim.set_recompilation_checker(checker, model_label="M")
         fb = self._forward_batch(input_ids=torch.arange(8, dtype=torch.int32))
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(torch._dynamo.exc.RecompileError) as raised:
             shim(None, None, fb)
+        self.assertIs(raised.exception, error)
         checker.check.assert_called_once()
 
     def test_tracing_never_reaches_the_recompilation_checker(self):

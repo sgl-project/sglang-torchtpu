@@ -361,8 +361,8 @@ class TestTpuGraphRunner(CustomTestCase):
             DecoderTpuCompilePolicy,
         )
 
-    def test_checker_arms_after_precompile(self):
-        """Arming earlier would report precompile graphs as serving compiles."""
+    def test_checker_installs_without_baselining(self):
+        """Scheduler startup, including cache warmup, owns the baseline."""
         events = []
         self.mock_precompile.side_effect = lambda *a, **k: events.append("precompile")
         checker = MagicMock()
@@ -378,7 +378,8 @@ class TestTpuGraphRunner(CustomTestCase):
             side_effect=lambda *a, **k: events.append("install"),
         ):
             TpuGraphRunner(self._runner_for(model))
-        self.assertEqual(events, ["precompile", "snapshot", "install"])
+        self.assertEqual(events, ["precompile", "install"])
+        checker.snapshot_baseline.assert_not_called()
 
     def test_checker_is_not_armed_unless_opted_in(self):
         model = self._annotate(_model_with(forward=MagicMock()))

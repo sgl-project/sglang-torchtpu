@@ -16,11 +16,12 @@ import collections
 import datetime
 import functools
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 import msgspec
 import torch
 
+from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 
@@ -142,7 +143,7 @@ class RecompilationChecker:
         self._window_events = 0
         self._window_compile_ms = 0
         # Lifetime totals. A later snapshot_baseline() resets the window, not
-        # these, so they span the target and draft arms of one process.
+        # these, so they span the lifetime of the process.
         self.serving_compiles: int = 0
         self.serving_compile_ms: int = 0
         self.worst_compile_ms: int = 0
@@ -245,13 +246,19 @@ def _shared_recompilation_checker() -> RecompilationChecker | None:
     )
 
 
-def arm_recompilation_checker(*, policies: Iterable[Any], model_label: str) -> None:
-    """Baseline the shared checker and hand it to ``policies``.
+@runtime_checkable
+class _RecompilationCheckPolicy(Protocol):
+    """Optional monitoring interface implemented by TPU decoder policies."""
 
-    Call this once the caller's precompile is complete: everything compiled
-    before the snapshot is expected, everything after it is a serving-time
-    compile. A later caller (the deferred draft precompile) re-baselines.
-    """
+    def set_recompilation_checker(
+        self, checker: RecompilationChecker, model_label: str = ""
+    ) -> None: ...
+
+
+def install_recompilation_checker(
+    *, policies: Iterable[CompilePolicy], model_label: str
+) -> None:
+    """Attach the shared checker; monitoring starts after scheduler warmup."""
     if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
         return
     checker = _shared_recompilation_checker()
@@ -261,8 +268,15 @@ def arm_recompilation_checker(*, policies: Iterable[Any], model_label: str) -> N
             "serving-time recompilation checks disabled."
         )
         return
-    checker.snapshot_baseline()
     for policy in policies:
-        set_checker = getattr(policy, "set_recompilation_checker", None)
-        if callable(set_checker):
-            set_checker(checker, model_label=model_label)
+        if isinstance(policy, _RecompilationCheckPolicy):
+            policy.set_recompilation_checker(checker, model_label=model_label)
+
+
+def start_recompilation_monitoring() -> None:
+    """Baseline once all scheduler startup work, including cache warmup, is done."""
+    if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+        return
+    checker = _shared_recompilation_checker()
+    if checker is not None:
+        checker.snapshot_baseline()
