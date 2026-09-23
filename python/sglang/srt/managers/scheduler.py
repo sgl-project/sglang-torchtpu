@@ -3620,9 +3620,6 @@ class Scheduler(
             prefill_max_requests=get_schedule().prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            # A TPU pipeline can schedule a micro-batch without the in-flight
-            # partial prefill's next chunk; keep a second one from starting then.
-            one_partial_prefill=current_platform.is_tpu() and self.ps.pp_size > 1,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )

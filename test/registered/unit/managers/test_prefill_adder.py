@@ -132,7 +132,6 @@ class TestPrefillAdder(CustomTestCase):
             self.create_running_batch(),
             page_size=128,
             rem_chunk_tokens=rem_chunk_tokens,
-            one_partial_prefill=True,
         )
 
     def _continuation_candidate(self, tokens, rid="waiting", ignore_eos=False):

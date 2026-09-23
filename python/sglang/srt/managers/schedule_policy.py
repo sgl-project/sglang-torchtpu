@@ -529,7 +529,6 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        one_partial_prefill: bool = False,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -540,10 +539,6 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
-        # Start a new partial prefill only when none is in flight: a pipeline
-        # keeps the in-flight one in another micro-batch, whose continuation
-        # this batch does not carry.
-        self.one_partial_prefill = one_partial_prefill
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -1209,7 +1204,8 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
-            if has_chunked_req and self.one_partial_prefill:
+            # The scheduler tracks one partially prefilled request at a time.
+            if has_chunked_req:
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -1413,7 +1409,8 @@ class PrefillAdder:
                     storage_hit_len=req.storage_hit_length,
                 )
             else:
-                if has_chunked_req and self.one_partial_prefill:
+                # The scheduler tracks one partially prefilled request at a time.
+                if has_chunked_req:
                     return AddReqResult.OTHER
 
                 # Make sure at least one page is available
