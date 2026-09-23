@@ -631,7 +631,10 @@ template + `_tpu-build`/`_tpu-test`.
 The scheduled accuracy suite includes R1-0528 (GPQA, AIME25, full MMLU-Redux
 2.0), V3.1, GPT-OSS-20B, and two Kimi MMMU-Pro shards. Each Kimi shard uses its
 own two-host 2x2x2 slice and evaluates 865 distinct questions, one pass at 98,304
-output tokens. The collector rejects missing/duplicate IDs and reports the
+output tokens. The two independent TP16/EP16 servers provide data parallelism
+by splitting requests; each uses DP size 1 with DP attention disabled, 128
+client threads, and a 4,096-token prefill budget. The collector rejects
+missing/duplicate IDs and reports the
 combined 1,730-question score. Predictions and metrics are retained in the
 `full-evaluation-results` workflow artifact.
 

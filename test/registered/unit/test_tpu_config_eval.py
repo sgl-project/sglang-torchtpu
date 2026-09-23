@@ -131,7 +131,7 @@ class TestAccuracyRecipe(unittest.TestCase):
         self.assertEqual(args, ["bash", str(ROOT / "benchmark/tpu/launch_server.sh")])
         self.assertEqual(env["QUANTIZATION"], "")
         self.assertEqual(
-            (env["TP_SIZE"], env["EP_SIZE"], env["DP_SIZE"]), ("16", "16", "4")
+            (env["TP_SIZE"], env["EP_SIZE"], env["DP_SIZE"]), ("16", "16", "1")
         )
 
 

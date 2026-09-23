@@ -122,7 +122,7 @@ def main():
             "/weights/Kimi-K2.6",
             "--thinking",
             "--num-threads",
-            "256",
+            "128",
             "--temperature",
             "1",
             "--top-p",

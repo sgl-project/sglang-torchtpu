@@ -26,7 +26,7 @@ MODEL_CONFIG = {
     "dashboard_model": "kimi-k26-mmmu-shard0",
     "model": "/weights/Kimi-K2.6",
     "test_name": "Kimi-K2.6-MMMU-shard0",
-    "variant": "TP16-EP16-DPA4",
+    "variant": "TP16-EP16-DP1",
     "launch": {"external": True, "health_timeout": 3600},
     "skip_unless": (
         os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
