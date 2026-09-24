@@ -658,6 +658,7 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
+        device="cpu",
     )
 
     tensors = Scheduler._pp_prepare_tensor_dict(
@@ -699,6 +700,7 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
         input_ids=torch.tensor([5]),
+        device="cpu",
     )
     tensors = Scheduler._pp_prepare_tensor_dict(
         object.__new__(Scheduler), result, batch
