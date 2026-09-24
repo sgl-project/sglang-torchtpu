@@ -1,3 +1,7 @@
+import sys
+
+import pytest
+
 from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.observability.startup_time import (
     aggregate_scheduler_startup_times,
@@ -129,3 +133,7 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
         4.0,
         5.0,
     ]
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
