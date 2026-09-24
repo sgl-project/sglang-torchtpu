@@ -34,7 +34,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/qwen3_coder_480b_agentic_spec_mh.sh",
-    "weights_pvc": "model-weights-rox",
+    "weights_pvc": "model-weights-filestore",
 }
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))

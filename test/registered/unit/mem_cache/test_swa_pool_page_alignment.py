@@ -33,6 +33,7 @@ def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
     """Run _derive_pool_sizes over a hybrid-SWA config and report the SWA size."""
     from sglang.srt import runtime_context as rc
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
     fake = SimpleNamespace(
         device=device,
@@ -42,15 +43,11 @@ def _swa_pool_tokens(swa_tokens, *, device="tpu", page_size=PAGE_SIZE):
         pool_page_size=page_size,
         model_config=SimpleNamespace(hf_config=SimpleNamespace()),
     )
-    config = SimpleNamespace(
+    config = MemoryPoolConfig(
         max_total_num_tokens=32768,
         max_running_requests=64,
         full_max_total_num_tokens=32768,
         swa_max_total_num_tokens=swa_tokens,
-        c4_max_total_num_tokens=0,
-        c128_max_total_num_tokens=0,
-        c4_state_pool_size=0,
-        c128_state_pool_size=0,
     )
     with rc.get_context().override_server_args(page_size=page_size):
         sizes = KVCacheConfigurator._derive_pool_sizes(fake, config=config)
