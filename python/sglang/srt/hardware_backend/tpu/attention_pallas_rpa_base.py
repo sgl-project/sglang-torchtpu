@@ -204,14 +204,6 @@ class RpaKernelSpec:
     # per sequence, so fixed-width target verification and decode-phase draft
     # extension run as decode.
     supports_decode_query_size: bool = False
-    # HiCache io backends (--hicache-io-backend) validated to offload this
-    # backend's device KV pool to host. raiden copies whole pages by their
-    # dim-0 block id, so it can serve any block-major pool that exposes
-    # get_fused_kv_buffer (an out-of-tree backend must also route
-    # get_mha_kv_pool_cls to such a pool); torch_tpu copies v3's 5-D page row
-    # verbatim. A backend lists only what has been validated on it end to end
-    # (batched has not been).
-    kv_offload_io_backends: frozenset[str] = frozenset()
 
 
 # torch custom ops are process-global; cache one per op_name so repeated backend

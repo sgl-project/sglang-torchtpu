@@ -96,6 +96,36 @@ def _uses_seq_along_lane_kv() -> bool:
     return uses_seq_along_lane_kv()
 
 
+def _mha_kv_pool_cls(backend: str | None) -> type:
+    """The MHA KV pool class ``backend`` allocates.
+
+    A function of the backend name alone, so server-args validation can ask
+    before the runtime context exists; ``get_mha_kv_pool_cls`` delegates here
+    so the two cannot disagree. A plugin that routes its backend to its own
+    pool patches this function.
+    """
+    if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
+        # SEQ_ALONG_LANE puts the token index on the lane axis, so the
+        # buffer shape differs from the fused one the other backends read.
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuSeqAlongLaneKVPool
+
+        return TpuSeqAlongLaneKVPool
+
+    # RPA v3 and batched use the fused 5D KV layout; pallas_tpu_flash and
+    # torch_native read the generic MHA pool.
+    if backend in (
+        "pallas_tpu_rpa_v3",
+        "pallas_tpu_rpa_batched",
+    ):
+        from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+
+        return TpuFusedMHATokenToKVPool
+
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    return MHATokenToKVPool
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -373,33 +403,10 @@ class TpuSRTPlatform(SRTPlatform):
         return None
 
     def get_mha_kv_pool_cls(self) -> type:
-        # RPA v3 uses the fused 5D KV layout; pallas_tpu_flash and torch_native
         # Pick per the resolved backend: the raw field is None when --attention-backend is omitted.
         from sglang.srt.runtime_context import get_exec
 
-        backend = get_exec().kernel.attention_backend
-        if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
-            # SEQ_ALONG_LANE puts the token index on the lane axis, so the
-            # buffer shape differs from the fused one the other backends read.
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
-                TpuSeqAlongLaneKVPool,
-            )
-
-            return TpuSeqAlongLaneKVPool
-
-        if backend in (
-            "pallas_tpu_rpa_v3",
-            "pallas_tpu_rpa_batched",
-        ):
-            from sglang.srt.hardware_backend.tpu.kv_pool import (
-                TpuFusedMHATokenToKVPool,
-            )
-
-            return TpuFusedMHATokenToKVPool
-
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
-        return MHATokenToKVPool
+        return _mha_kv_pool_cls(get_exec().kernel.attention_backend)
 
     def get_mamba_pool_cls(self) -> type:
         # Hybrid GDN models (Qwen3.5 / Qwen3-Next) store their recurrent state

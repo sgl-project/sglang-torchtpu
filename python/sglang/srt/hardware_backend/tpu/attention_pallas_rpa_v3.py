@@ -89,7 +89,6 @@ RPA_V3_SPEC = RpaKernelSpec(
     uses_draft_extend_v2=True,
     min_page_size=None,
     supports_decode_query_size=True,
-    kv_offload_io_backends=frozenset({"torch_tpu", "raiden"}),
 )
 
 

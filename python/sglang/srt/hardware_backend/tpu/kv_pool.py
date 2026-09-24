@@ -78,6 +78,11 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     """
 
     HEAD_DIM_ALIGNMENT = 128
+    # HiCache io backends (--hicache-io-backend) that can offload this pool to
+    # host; hicache_hook refuses the rest at startup. raiden copies whole pages
+    # by their dim-0 block id, so it serves any block-major pool exposing
+    # get_fused_kv_buffer; torch_tpu's host pool stores this 5D row verbatim.
+    kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
     def __init__(
         self,
@@ -482,6 +487,10 @@ class TpuSeqAlongLaneKVPool(TpuFusedMHATokenToKVPool):
     to ``kv_packing``. Host copies retain this native packing while translating
     between token indices and their page/lane coordinates.
     """
+
+    # raiden's page copy is layout-agnostic, but torch_tpu's host pool is
+    # shaped for the fused 5D row, not this one.
+    kv_offload_io_backends: frozenset[str] = frozenset({"raiden"})
 
     def _head_dim_lanes(self) -> int:
         # Under TorchTPU, JAX is initialised CPU-only so Pallas can export

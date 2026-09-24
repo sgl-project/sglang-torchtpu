@@ -70,9 +70,9 @@ LAUNCH_ENV = {
     "CHUNK": "512",
     "TPU_COMPILE_TOKENS": "512",
     "TPU_COMPILE_BS": "1 2 4 8",
-    # The recipe serves this model on pallas_tpu_rpa_batched, which raiden rejects:
-    # its kernel spec does not declare raiden KV offload (in-tree, only RPA v3's does).
-    # Overridden here, together with the layout it forces.
+    # The recipe serves this model on pallas_tpu_rpa_batched, which has not been
+    # validated with raiden KV offload; RPA v3 has. Overridden here, together with
+    # the layout offload requires.
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
     "HICACHE_MEM_LAYOUT": "page_first_fused",
     # Prefix caching is the substrate HiCache is built on, and launch_server.sh

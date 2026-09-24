@@ -148,27 +148,38 @@ def resolve_layout_io_compatibility(server_args: Any):
                 "the TPU KV-offload io backend."
             )
 
-        # Ask the kernel spec rather than naming backends, so a backend
-        # registered out of tree declares its own offload support. Every backend
-        # that serves the pool must declare it: each one has to reach the
-        # reload-commit hook. Read the spec through the module, because plugins
-        # patch tpu_platform._rpa_kernel_spec.
+        # Offload copies the device KV pool, so its class declares the io
+        # backends that can copy its layout. Map backend -> pool statically
+        # (the runtime context does not exist yet), and read both helpers
+        # through the module, because plugins patch them to register their
+        # own backends and pools.
         from sglang.srt.hardware_backend.tpu import tpu_platform
 
+        pool_cls = tpu_platform._mha_kv_pool_cls(cfg.attention_backend)
+        if cfg.hicache_io_backend not in getattr(
+            pool_cls, "kv_offload_io_backends", ()
+        ):
+            raise ValueError(
+                f"{cfg.hicache_io_backend} KV offloading does not support the "
+                f"{pool_cls.__name__} KV pool of attention backend "
+                f"{cfg.attention_backend!r}: the pool does not list this io "
+                "backend in kv_offload_io_backends. Re-run with an attention "
+                "backend whose pool does (in-tree: pallas_tpu_rpa_v3 or "
+                "pallas_tpu_rpa_batched), or disable KV offload."
+            )
+
+        # Reloaded KV lands through the reload-commit hook in the shared RPA
+        # backend base, so every backend that reads the pool must be an RPA
+        # backend.
         for backend in dict.fromkeys(
             (cfg.attention_backend, *attention_backends_of(cfg))
         ):
-            spec = tpu_platform._rpa_kernel_spec(backend)
-            if (
-                spec is None
-                or cfg.hicache_io_backend not in spec.kv_offload_io_backends
-            ):
+            if tpu_platform._rpa_kernel_spec(backend) is None:
                 raise ValueError(
                     f"{cfg.hicache_io_backend} KV offloading does not support "
-                    f"attention backend {backend!r}: its kernel spec does not "
-                    "list this io backend in kv_offload_io_backends. Re-run "
-                    "with attention backends that do (in-tree: "
-                    "pallas_tpu_rpa_v3), or disable KV offload."
+                    f"attention backend {backend!r}: it is not a Pallas RPA "
+                    "backend, so it never runs the HiCache reload-commit hook. "
+                    "Re-run with RPA attention backends, or disable KV offload."
                 )
 
         if cfg.kv_cache_dtype == "mxint8":

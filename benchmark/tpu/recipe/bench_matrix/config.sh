@@ -182,7 +182,7 @@ case "$BENCH_MODEL" in
         QUANTIZATION=unquant
         KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
         # rpa_v3: the only TPU backend with attention sinks (GPT-OSS needs
-        # them) AND the only in-tree spec that declares KV offload support.
+        # them).
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-64}
         CONTEXT_LEN=${CONTEXT_LEN:-131072}
