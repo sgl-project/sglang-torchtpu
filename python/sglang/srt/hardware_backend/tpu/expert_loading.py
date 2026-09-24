@@ -147,6 +147,8 @@ def prepare_pipeline_stage_fp8_moe_weights(
     return block_quant
 
 
+# TODO(yinlin09): Convert TP/EP weights here as well,
+# replacing fp8_moe._requantize_tpu_fp8_moe_block_to_channelwise.
 def requantize_stage_experts_to_channelwise(
     layer: torch.nn.Module,
     block_size,
