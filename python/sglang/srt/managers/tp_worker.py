@@ -53,6 +53,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.observability.compile_timing import merge_compile_timing_reports
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -128,6 +129,13 @@ class BaseTpWorker(ABC):
     def graph_time_usage(self) -> dict[str, float]:
         runners = self.model_runner_list or [self.model_runner]
         return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
+
+    @property
+    def compile_timing(self) -> dict | None:
+        runners = self.model_runner_list or [self.model_runner]
+        return merge_compile_timing_reports(
+            *(runner.compile_timing.snapshot() for runner in runners)
+        )
 
     @property
     def weight_load_time(self) -> float:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import time
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -262,7 +263,16 @@ class VisionTpuCompilePolicy(CompilePolicy):
                         len(patch_counts),
                         patch_count,
                     )
+                    start = time.perf_counter()
                     self.warmup_once(patch_count)
+                    assert self.model_runner is not None
+                    self.model_runner.compile_timing.record(
+                        component="vision",
+                        phase="vision_encode",
+                        policy=type(self).__name__,
+                        duration_seconds=time.perf_counter() - start,
+                        num_tokens=patch_count,
+                    )
         finally:
             torch.set_default_dtype(init_dtype)
 

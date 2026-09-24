@@ -755,6 +755,10 @@ class Scheduler(
                 if self.draft_worker is None
                 else self.draft_worker.graph_time_usage
             ),
+            target_compile=self.tp_worker.compile_timing,
+            draft_compile=(
+                None if self.draft_worker is None else self.draft_worker.compile_timing
+            ),
         )
 
     def maybe_init_hccl_dp_prewarm(self) -> None:

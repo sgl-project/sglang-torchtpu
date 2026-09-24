@@ -6,6 +6,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     empty_graph_time_usage,
     merge_graph_time_usage,
 )
+from sglang.srt.observability.compile_timing import merge_compile_timing_reports
 
 
 def build_scheduler_startup_time(
@@ -16,8 +17,10 @@ def build_scheduler_startup_time(
     scheduler_e2e: float,
     target_cuda_graph: Mapping[str, float] | None,
     draft_cuda_graph: Mapping[str, float] | None,
+    target_compile: Mapping | None = None,
+    draft_compile: Mapping | None = None,
 ) -> dict:
-    return {
+    result = {
         "load_weight": target_load_weight + draft_load_weight,
         "kv_cache_allocation": kv_cache_allocation,
         "scheduler_e2e": scheduler_e2e,
@@ -26,6 +29,10 @@ def build_scheduler_startup_time(
             draft_cuda_graph,
         ),
     }
+    compile_timing = merge_compile_timing_reports(target_compile, draft_compile)
+    if compile_timing is not None:
+        result["compile"] = compile_timing
+    return result
 
 
 def aggregate_scheduler_startup_times(
@@ -56,6 +63,11 @@ def aggregate_scheduler_startup_times(
             result["cuda_graph"][phase] = max(
                 result["cuda_graph"].get(phase, 0.0), float(duration)
             )
+        compile_timing = merge_compile_timing_reports(
+            result.get("compile"), startup_time.get("compile")
+        )
+        if compile_timing is not None:
+            result["compile"] = compile_timing
     return result
 
 
