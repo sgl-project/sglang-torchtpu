@@ -9,6 +9,7 @@ register_tpu_ci(
     est_time=3600,
     suite="nightly-tpu-4-v7",
     nightly=True,
+    disabled="Manual validation only; excluded from CI",
     labels=["singlehost", "qwen3-coder-480b", "spec", "batched-rpa"],
 )
 
@@ -32,6 +33,7 @@ LAUNCH_ENV = {
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": "8192",
     "ATTENTION_BACKEND": "pallas_tpu_rpa_batched",
+    "ENABLE_TORCH_COMPILE": "1",
     "SGLANG_SIMULATE_ACC_LEN": "-1",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "TPU_COMPILE_BS": "1 2 4 16",
@@ -39,8 +41,6 @@ LAUNCH_ENV = {
     "ENABLE_PROFILER_ENDPOINT": "0",
     "EXTRA_ARGS": (
         f"--served-model-name {SERVED_MODEL_NAME} "
-        "--cuda-graph-backend-prefill disabled "
-        "--cuda-graph-backend-decode disabled "
         "--speculative-algorithm EAGLE3 "
         "--speculative-draft-model-path "
         "/weights/"
