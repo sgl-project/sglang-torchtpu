@@ -24,6 +24,9 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
@@ -733,6 +736,7 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
         max_blocks,
         time.perf_counter() - start,
     )
+    snapshot_recompilation_baseline()
 
 
 class CompiledForwardShim:
@@ -840,6 +844,44 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        # The fused draft loop inlines this call into its own Dynamo graph.
+        # Reading the checker there would put it in that graph's guards, so
+        # attaching it later would recompile the graph this very tool exists to
+        # protect. Compiles from inside it surface on the next eager forward.
+        if torch.compiler.is_compiling():
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+
+        checker = self._recompilation_checker
+        if checker is None:
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+        # Read at entry: the padded shapes are what the graph compiled for.
+        pad_q = int(forward_batch.input_ids.shape[0])
+        pad_b = int(forward_batch.seq_lens.shape[0])
+        try:
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+        finally:
+            checker.check(
+                context_fn=lambda: self._describe_forward(
+                    forward_batch, pad_q=pad_q, pad_b=pad_b
+                )
+            )
+
+    def _describe_forward(self, forward_batch: Any, *, pad_q: int, pad_b: int) -> str:
+        # Dynamic keys, unset on eagle3 draft extend (as in _unpad_decoder_outputs).
+        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        real_b = getattr(forward_batch, _REAL_B_KEY, None)
+        real = f" real=q{real_q},b{real_b}" if real_q is not None else ""
+        mode = forward_batch.forward_mode.name
+        return f"{self._model_label} {mode}{real} pad=q{pad_q},b{pad_b}"
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
         if (
@@ -924,14 +966,6 @@ class CompiledForwardShim:
                 logits_output=out,
                 forward_batch=forward_batch,
                 model=self.policy.model_runner.model,
-            )
-
-        # Check for serving-time XLA recompilation (once per forward call).
-        # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
-        if self._recompilation_checker is not None:
-            fm = getattr(forward_batch, "forward_mode", "N/A")
-            self._recompilation_checker.check(
-                f"{self._model_label} {fm.name if hasattr(fm, 'name') else fm}"
             )
 
         return out

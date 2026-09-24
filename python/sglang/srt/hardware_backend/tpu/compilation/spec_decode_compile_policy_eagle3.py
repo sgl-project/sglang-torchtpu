@@ -26,6 +26,9 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _hbm_delta_str,
     _materialize_out,
 )
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
+)
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
     _pad_first_dim,
@@ -780,10 +783,12 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             "[spec compile policy] DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
-        # The checker snapped its baseline at graph-runner init, before this
-        # deferred precompile; re-snapshot so the graphs compiled here aren't
-        # reported as serving-time recompiles on the first draft forward.
-        self.snapshot_recompilation_baseline()
+        # Include draft warmup in the shared target/draft baseline. Later TPU
+        # speculative-op and KV-offload warmup refresh it when they finish.
+        install_recompilation_checker(
+            policies=(self,),
+            model_label=f"draft {type(self.model_runner.model).__name__}",
+        )
 
     def _precompile_shapes(
         self, desc: str, items: list[Any], run: Callable[[Any], str]
