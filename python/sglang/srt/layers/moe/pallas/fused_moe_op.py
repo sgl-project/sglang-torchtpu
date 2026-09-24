@@ -415,11 +415,6 @@ def _fused_moe_jax(
         )
 
         n_sorted = sorted_token_ids.shape[0]
-        # Always gather the full expert-sorted range. Restricting the
-        # SparseCore output to an interior expert-parallel window can halt
-        # TPU7x slices, with the error surfacing only in the next program.
-        # gmm_v2 and the un-permute still use the local row window, so this
-        # changes only the permute coverage.
         gather_start = jnp.array([0], dtype=jnp.int32)
         gather_end = jnp.array([n_sorted], dtype=jnp.int32)
         x_sorted = ragged_gather_v2(
