@@ -1758,6 +1758,9 @@ class Envs:
     # Restore device MM scatter instead of host placement.
     # https://github.com/sgl-project/sglang-torchtpu/issues/741
     SGLANG_TPU_MM_EMBED_ON_DEVICE = EnvBool(False)
+    # Opt in to host padding for small prefill metadata tensors to avoid
+    # per-length XLA compilations.
+    SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
