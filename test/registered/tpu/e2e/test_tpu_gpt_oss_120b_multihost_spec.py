@@ -16,7 +16,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/gpt_120b_spec_mh.sh",
-    "weights_pvc": "model-weights-rox",
+    "weights_pvc": "model-weights-filestore",
 }
 
 SERVED_MODEL_NAME = "gpt-oss-120b"

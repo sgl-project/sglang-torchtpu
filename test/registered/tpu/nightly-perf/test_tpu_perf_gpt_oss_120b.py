@@ -70,7 +70,7 @@ HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "1800"))
 WORKLOAD = "8k1k"
 ISL, OSL, CONCUR = 8192, 1024, 16
 
-# Serves from the shared ROX PVC (model-weights-rox at /weights), but the
+# Serves from the shared read-only Filestore PVC (model-weights-filestore at /weights), but the
 # canonical HF id is what the server is told to serve as and what the dashboard
 # keys the series on -- a mount path would be a poor key, since remounting
 # elsewhere would silently split the trend in two.
@@ -92,7 +92,7 @@ MODEL_CONFIG = {
         # server.sh's own sample usage is `ISL=8192 OSL=1024 CONCUR=N ./server.sh`
         # -- it derives context, prefill chunk, KV pool and compile buckets from
         # exactly those three. Delta on top of the recipe:
-        #   MODEL         the ROX PVC mount; server.sh defaults to the HF id.
+        #   MODEL         the Filestore PVC mount; server.sh defaults to the HF id.
         #   EXTRA_ARGS    serve under the canonical HF name (see MODEL).
         #   ISL/OSL/CONCUR  the shape. These give CONTEXT_LEN = 9280, an
         #                 8192-token prefill chunk (a cold 8k prompt is one

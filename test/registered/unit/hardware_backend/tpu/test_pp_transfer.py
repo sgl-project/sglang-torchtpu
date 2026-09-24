@@ -98,7 +98,7 @@ class TestSendTensorDictOnTpu(CustomTestCase):
 
 
 class TestRecvTensorDictOnTpu(CustomTestCase):
-    def _recv(self, metadata_list, is_tpu=True):
+    def _recv(self, metadata_list, is_tpu=True, keep_on_host=False):
         coordinator = _coordinator(rank_in_group=1)
         coordinator.recv_object.return_value = metadata_list
         received = []
@@ -120,7 +120,7 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
             ),
             patch.object(torch.Tensor, "to", fake_to),
         ):
-            out = coordinator.recv_tensor_dict()
+            out = coordinator.recv_tensor_dict(keep_on_host=keep_on_host)
         return coordinator, out, received, uploads
 
     def test_device_entry_is_received_on_host_and_uploaded(self):
@@ -145,6 +145,21 @@ class TestRecvTensorDictOnTpu(CustomTestCase):
         self.assertIs(out["hidden_states"][2], received[0][0])
         self.assertIs(out["host_only"], received[1][0])
         self.assertEqual(out["__msg_type__"], "proxy")
+
+    def test_kept_on_host_device_entry_is_received_on_host(self):
+        """A device entry the caller keeps on the host still arrives over the
+        cpu_group into a host buffer; receiving into a device buffer would
+        take the device group, which the host-copy send never matches."""
+        coordinator, out, received, uploads = self._recv(
+            [("next_token_ids", TensorMetadata("tpu", torch.int64, (3,)))],
+            keep_on_host=True,
+        )
+        self.assertEqual(len(received), 1)
+        tensor, _, group = received[0]
+        self.assertTrue(tensor.is_cpu)
+        self.assertIs(group, coordinator.cpu_group)
+        self.assertEqual(uploads, [])
+        self.assertIs(out["next_token_ids"], tensor)
 
     def test_empty_device_entry_is_uploaded_without_receive(self):
         _, out, received, uploads = self._recv(

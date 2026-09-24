@@ -1818,6 +1818,7 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        keep_on_host: bool = False,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1844,12 +1845,13 @@ class GroupCoordinator:
             if isinstance(value, TensorMetadata):
                 # On TPU a device tensor arrives as a host copy on the gloo
                 # cpu_group and is uploaded to the sender's device type after
-                # the receive.
-                upload = _is_tpu and value.device != "cpu"
+                # the receive, unless the caller keeps it on the host.
+                via_host = _is_tpu and value.device != "cpu"
+                upload = via_host and not keep_on_host
                 tensor = torch.empty(
                     value.size,
                     dtype=value.dtype,
-                    device="cpu" if upload else value.device,
+                    device="cpu" if via_host else value.device,
                 )
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
