@@ -9,8 +9,8 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import attention_backends, get_spec
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import attention_backends, get_platform, get_spec
+from sglang.srt.server_args import DRAFT_ATTENTION_BACKEND_CHOICES, ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 
@@ -22,23 +22,6 @@ if TYPE_CHECKING:
 from sglang.srt.utils import is_tpu
 
 logger = logging.getLogger(__name__)
-
-# trtllm_mha: decode-only dense-MQA drafts (dspark). DFLASH excludes it
-# earlier, at arg resolution (speculative_hook.py) -- its draft path needs
-# per-layer DFlash attention -- so it never reaches this gate with it.
-_SUPPORTED_DRAFT_BACKENDS = (
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "triton",
-    "ascend",
-    "trtllm_mha",
-    "pallas_tpu_rpa_v3",
-    "pallas_tpu_rpa_batched",
-    "pallas_tpu_flash",
-    "pallas_tpu_mla",
-    "torch_native",
-)
 
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
@@ -55,26 +38,26 @@ def _resolve_draft_attention_backend_fallback(*, algo_label: str) -> str:
     otherwise the process's prefill backend. Both are resolution's answers, so
     they come from the bags.
     """
+    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+    platform_fallback = (
+        "pallas_tpu_rpa_v3"
+        if is_tpu()
+        else (
+            "triton" if (get_platform().is_xpu or torch.version.hip) else "flashinfer"
+        )
+    )
     draft_backend = get_spec().speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends()
     if draft_backend is None:
-        return (
-            "pallas_tpu_rpa_v3"
-            if is_tpu()
-            else ("triton" if torch.version.hip else "flashinfer")
-        )
-    if draft_backend not in _SUPPORTED_DRAFT_BACKENDS:
-        fallback = (
-            "pallas_tpu_rpa_v3"
-            if is_tpu()
-            else ("triton" if torch.version.hip else "flashinfer")
-        )
+        return platform_fallback
+    if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
+        fallback = platform_fallback
         logger.warning(
             "%s draft worker only supports attention_backend in %s for now, "
             "but got %r. Falling back to '%s'.",
             algo_label,
-            _SUPPORTED_DRAFT_BACKENDS,
+            DRAFT_ATTENTION_BACKEND_CHOICES,
             draft_backend,
             fallback,
         )

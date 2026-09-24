@@ -308,9 +308,9 @@ def test_extend_spans_reconstruct_slots() -> None:
             f"{len(span_lens)} spans, {int(span_lens.sum())} written"
         )
         assert dsts == slots, f"reqs={reqs} pad={pad}: spans address the wrong slots"
-        assert srcs == list(
-            range(num_real)
-        ), f"reqs={reqs} pad={pad}: spans skip or repeat sources"
+        assert srcs == list(range(num_real)), (
+            f"reqs={reqs} pad={pad}: spans skip or repeat sources"
+        )
 
 
 def test_verify_spans_reconstruct_slots() -> None:
@@ -346,9 +346,9 @@ def test_verify_spans_reconstruct_slots() -> None:
         want_dsts.extend(row[:commit])
         want_srcs.extend(range(i * block, i * block + commit))
     print(f"  reqs={len(reqs)} commits={commits}: {len(span_lens)} spans")
-    assert sorted(zip(srcs, dsts)) == sorted(
-        zip(want_srcs, want_dsts)
-    ), "verify spans address the wrong slots"
+    assert sorted(zip(srcs, dsts)) == sorted(zip(want_srcs, want_dsts)), (
+        "verify spans address the wrong slots"
+    )
 
 
 def _real_rope(device: str) -> YaRNScalingRotaryEmbedding:
@@ -376,9 +376,9 @@ def _real_rope(device: str) -> YaRNScalingRotaryEmbedding:
         rope_scaling=ROPE_SCALING,
         is_neox_style=True,
     )
-    assert isinstance(
-        rope, YaRNScalingRotaryEmbedding
-    ), f"expected yarn scaling from the draft config, got {type(rope).__name__}"
+    assert isinstance(rope, YaRNScalingRotaryEmbedding), (
+        f"expected yarn scaling from the draft config, got {type(rope).__name__}"
+    )
     rope.cos_sin_cache = rope.cos_sin_cache.to(device)
     return rope
 

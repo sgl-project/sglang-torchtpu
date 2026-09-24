@@ -49,6 +49,7 @@ on:
           - pd-mh-gpt-120b-pc-offload-spec-reshard
           - pd-mh-gpt-120b-kvoff-reshard
           - pd-mh-qwen3-480b-kvoff-reshard
+          - pd-mh-qwen3-vl-8b-spec
           - pd-sh-gpt-120b
           - pd-sh-gpt-120b-spec
           - pd-sh-gpt-120b-decode-radix

@@ -65,9 +65,9 @@ def main_kernel_v2(
     packing = 32 // dtype_bits
     col_size = calculate_col_size(hidden_size, packing)
 
-    assert isinstance(
-        hidden_size, int
-    ), f"hidden_size must be int, got {type(hidden_size)}"
+    assert isinstance(hidden_size, int), (
+        f"hidden_size must be int, got {type(hidden_size)}"
+    )
     num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks

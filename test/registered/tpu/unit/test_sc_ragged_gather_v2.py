@@ -28,7 +28,6 @@ from sglang.srt.layers.moe.pallas.sparse_core.ragged_gather_v2 import ragged_gat
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class GatherTest(jtu.JaxTestCase):
-
     @parameterized.product(
         in_out_size=[(512, 400), (512, 1024)],
         start_end=[(3, 338), (10, 422)],
@@ -80,7 +79,6 @@ class GatherTest(jtu.JaxTestCase):
             return (end - start) / n_repeats
 
         for in_size, out_size, hidden_size in benchmark_shapes:
-
             print(
                 f"\n=== Running shape: in={in_size}, out={out_size},"
                 f" hidden={hidden_size} ==="
@@ -111,14 +109,14 @@ class GatherTest(jtu.JaxTestCase):
             res_jax = run_jax(x, indices)
             res_jax_sliced = res_jax[start:end]
 
-            print(f"JAX:       {t_jax*1000:.3f} ms")
+            print(f"JAX:       {t_jax * 1000:.3f} ms")
 
             # V2 Kernel
             t_v2_str = "FAILED"
             err_v2_str = "FAILED"
             try:
                 t_v2 = _time_function(run_v2, x, indices, start_arr, end_arr)
-                t_v2_str = f"{t_v2*1000:.3f} ms"
+                t_v2_str = f"{t_v2 * 1000:.3f} ms"
                 res_v2 = run_v2(x, indices, start_arr, end_arr)
                 res_v2_sliced = res_v2[start:end]
                 err_v2 = jnp.max(jnp.abs(res_v2_sliced - res_jax_sliced))

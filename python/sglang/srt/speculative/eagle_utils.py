@@ -25,7 +25,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
     get_alloc_reserve_per_decode,
     page_aligned_decode_alloc_lens,
 )
-from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.spec_utils import fill_bonus_tokens_func
 from sglang.srt.utils import (
@@ -180,9 +179,9 @@ def _build_tree_kernel_efficient_torch(
     retrieve_next_token: torch.Tensor,
 ):
     """TPU-specific tree construction for EAGLE (topk=1 only)."""
-    assert (
-        topk == 1
-    ), f"TPU EAGLE tree construction currently supports topk=1, got {topk=}."
+    assert topk == 1, (
+        f"TPU EAGLE tree construction currently supports topk=1, got {topk=}."
+    )
     assert tree_mask_mode == TreeMaskMode.FULL_MASK
     token_offsets = torch.arange(num_verify_tokens, device=device, dtype=torch.long)
     positions.copy_((seq_lens[:, None] + token_offsets[None, :]).flatten())
@@ -377,9 +376,9 @@ def _verify_tree_greedy_torch_inplace(
     topk: int,
 ):
     """TPU-specific greedy tree verification for EAGLE (topk=1 only)."""
-    assert (
-        topk == 1
-    ), f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
+    assert topk == 1, (
+        f"TPU EAGLE greedy verification currently supports topk=1, got {topk=}."
+    )
 
     bs, num_verify_tokens = candidates.shape
     predicts[: bs * num_verify_tokens] = target_predict.flatten().to(predicts.dtype)
@@ -728,23 +727,43 @@ def get_draft_recurrent_hidden_state_spec(
     )
 
 
+_PREPARE_FOR_VERIFY_DEPS = None
+
+
 def eagle_prepare_for_verify(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
 ):
-    from sglang.kernels.ops.speculative.cache_locs import (
+    # Imports must stay lazy (import-cycle safety) but only need to resolve
+    # once, not on every decode cycle of this hot path.
+    global _PREPARE_FOR_VERIFY_DEPS
+    if _PREPARE_FOR_VERIFY_DEPS is None:
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_uniform_func,
+        )
+        from sglang.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+        )
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        _PREPARE_FOR_VERIFY_DEPS = (
+            assign_extend_cache_locs_uniform_func,
+            CaptureHiddenMode,
+            ForwardBatch,
+            ForwardMode,
+            prepare_mamba_track_for_verify,
+        )
+    (
         assign_extend_cache_locs_uniform_func,
-    )
-    from sglang.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardBatch,
         ForwardMode,
-    )
-    from sglang.srt.speculative.spec_utils import (
         prepare_mamba_track_for_verify,
-    )
+    ) = _PREPARE_FOR_VERIFY_DEPS
 
     if not batch.forward_mode.is_idle():
         # Assign cache locations
@@ -891,11 +910,48 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _verify_uses_greedy(
+    *,
+    is_all_greedy: bool,
+    is_cpu: bool,
+    is_hip: bool,
+    is_xpu: bool,
+    use_rejection_sampling: bool,
+) -> bool:
+    """Whether EAGLE verify must commit argmax instead of taking the sampling path.
+
+    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
+    unconditionally. Rejection sampling routes it through the pure-Triton chain
+    sampler instead, so only a HIP run without that still has to go greedy. Every
+    other platform reduces to the original predicate.
+    """
+    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+
+
+def _can_use_sparse_uno_tree_target_sampling(
+    max_top_k: Optional[int],
+    sampling_info: SamplingBatchInfo,
+) -> bool:
+    if max_top_k is None:
+        return False
+
+    from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
+
+    return bool(
+        _is_cuda
+        and max_top_k <= _SPARSE_TOP_K_LIMIT
+        and sampling_info.sampling_seed is None
+        and not sampling_info.need_min_p_sampling
+        and not get_spec().speculative_use_rejection_sampling
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
+    uno_target_max_top_k: Optional[int] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -969,7 +1025,14 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    if _verify_uses_greedy(
+        is_all_greedy=sampling_info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=use_rejection_sampling,
+    ):
         if not _is_tpu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -1000,115 +1063,155 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif _can_use_sparse_uno_tree_target_sampling(
+        uno_target_max_top_k,
+        sampling_info,
+    ):
+        from sglang.srt.speculative.uno_utils import (
+            sample_uno_tree_target_tokens,
+        )
+
+        target_predict = sample_uno_tree_target_tokens(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            batch_size=bs,
+            verify_width=verify_input.draft_token_num,
+            max_top_k=uno_target_max_top_k,
+        )
+        predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=num_correct_drafts,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            target_predict=target_predict,
+            topk=verify_input.tree_topk,
+        )
+
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         if _is_tpu:
             top_k_renorm_prob = top_k_renorm_prob_func
             top_p_renorm_prob = top_p_renorm_prob_func
-            tree_speculative_sampling_target_only = (
-                tree_speculative_sampling_target_only_func
-            )
-        else:
-            from sgl_kernel import (
+            sampling_fn = tree_speculative_sampling_target_only_func
+        elif _is_npu:
+            from sgl_kernel_npu.sample import (
+                chain_speculative_sampling_triton,
                 top_k_renorm_prob,
                 top_p_renorm_prob,
                 tree_speculative_sampling_target_only,
             )
 
-            from sglang.kernels.ops.speculative.reject_sampling import (
-                chain_speculative_sampling_triton,
-            )
-
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-
-        if _is_tpu:
-            sampling_fn = tree_speculative_sampling_target_only
-        else:
             sampling_fn = (
                 chain_speculative_sampling_triton
                 if use_rejection_sampling
                 else tree_speculative_sampling_target_only
             )
-
-        # These full-vocabulary matrices are consumed by the sampling kernel
-        # within this step. Returned tensors were allocated before the scope,
-        # so the next CUDA graph replay may safely reclaim these borrowed bytes.
-        with borrow_graph_pool(user="EAGLE probability borrow"):
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, verify_input.draft_token_num, dim=0
-            )  # (bs * num_draft_tokens, 1)
-
-            target_probs = F.softmax(
-                next_token_logits / expanded_temperature, dim=-1
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
-            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-            draft_probs = (
-                verify_input.draft_probs
-                if use_rejection_sampling
-                else torch.zeros_like(target_probs)
+        else:
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
             )
-            # Defense-in-depth behind the spec_hook startup allowlist: validate
-            # the actual kernel inputs before the Triton kernel.
-            if use_rejection_sampling and (
-                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-            ):
-                raise ValueError(
-                    "Rejection sampling requires a target-vocab draft proposal "
-                    "distribution; the current speculative algorithm/draft worker "
-                    "does not produce one (draft_probs missing or vocab-mismatched)."
-                )
 
-            coins, coins_for_final_sampling = _verify_coins(
-                sampling_info=sampling_info,
-                seq_lens=batch.seq_lens,
-                draft_token_num=verify_input.draft_token_num,
-                candidates=candidates,
-                device=device,
-            )
-            sampling_fn(
-                predicts=predict,  # mutable
-                accept_index=accept_index,  # mutable
-                accept_token_num=num_correct_drafts,  # mutable
-                candidates=candidates,
-                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-                retrive_index=verify_input.retrieve_index,
-                retrive_next_token=verify_input.retrieve_next_token,
-                retrive_next_sibling=verify_input.retrieve_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=get_spec().speculative_accept_threshold_single,
-                threshold_acc=get_spec().speculative_accept_threshold_acc,
-                deterministic=True,
-            )
-            del (
-                expanded_temperature,
+            if use_rejection_sampling:
+                sampling_fn = chain_speculative_sampling_triton
+            else:
+                from sgl_kernel import tree_speculative_sampling_target_only
+
+                sampling_fn = tree_speculative_sampling_target_only
+
+            if _is_hip:
+                # Same names, same contract: dflash_utils.py aliases these too.
+                from sglang.kernels.ops.sampling.renorm_triton import (
+                    top_k_renorm_probs_triton as top_k_renorm_prob,
+                )
+                from sglang.kernels.ops.sampling.renorm_triton import (
+                    top_p_renorm_probs_triton as top_p_renorm_prob,
+                )
+            else:
+                from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
+
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, verify_input.draft_token_num, dim=0
+        )  # (bs * num_draft_tokens, 1)
+
+        target_probs = F.softmax(
+            next_token_logits / expanded_temperature, dim=-1
+        )  # (bs * num_draft_tokens, vocab_size)
+        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
                 target_probs,
-                draft_probs,
-                coins,
-                coins_for_final_sampling,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                ),
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
+        if sampling_info.need_top_p_sampling:
+            target_probs = top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                ),
             )
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
+        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+        draft_probs = (
+            verify_input.draft_probs
+            if use_rejection_sampling
+            else torch.zeros_like(target_probs)
+        )
+        # Defense-in-depth behind the spec_hook startup allowlist: validate
+        # the actual kernel inputs before the Triton kernel.
+        if use_rejection_sampling and (
+            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+        ):
+            raise ValueError(
+                "Rejection sampling requires a target-vocab draft proposal "
+                "distribution; the current speculative algorithm/draft worker "
+                "does not produce one (draft_probs missing or vocab-mismatched)."
+            )
+
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+        sampling_fn(
+            predicts=predict,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=num_correct_drafts,  # mutable
+            candidates=candidates,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=verify_input.retrieve_index,
+            retrive_next_token=verify_input.retrieve_next_token,
+            retrive_next_sibling=verify_input.retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
+            deterministic=True,
+        )
+        del (
+            expanded_temperature,
+            target_probs,
+            draft_probs,
+            coins,
+            coins_for_final_sampling,
+        )
 
         # Sync sampling results across TP ranks: different GPUs may
         # produce slightly different target_probs due to floating-point

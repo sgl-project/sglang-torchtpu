@@ -302,8 +302,7 @@ def static_validate_inputs(
                 raise ValueError(f"{num_queries_per_block=} must be positive.")
         if num_queries_per_blocks[2] % mixed_q_split != 0:
             raise ValueError(
-                f"{num_queries_per_blocks[2]=} must be divisible by"
-                f" {mixed_q_split=}"
+                f"{num_queries_per_blocks[2]=} must be divisible by {mixed_q_split=}"
             )
     if vmem_limit_bytes is not None and vmem_limit_bytes <= 0:
         raise ValueError(f"{vmem_limit_bytes=} must be positive.")
@@ -781,7 +780,6 @@ def _mla_ragged_paged_attention_kernel(
             debug_print(f"[RPA debug] bkvpe_vmem_ref.shape: {bkvpe_vmem_ref.shape}")
 
             if not wait:
-
                 # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
                 # utilize static for loop instead of dynamic for loop.
                 # Loop through all pages in a block
@@ -1007,7 +1005,6 @@ def _mla_ragged_paged_attention_kernel(
             debug_print(f"[RPA debug] bkvpe_vmem_ref.shape: {bkvpe_vmem_ref.shape}")
 
             if not wait:
-
                 # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
                 # utilize static for loop instead of dynamic for loop.
                 # Loop through all pages in a block
@@ -1148,7 +1145,7 @@ def _mla_ragged_paged_attention_kernel(
             new KVs begin for a batch.
           update_szs: A list of the number of new tokens to be packed for a batch.
         """
-        debug_print("[RPA debug]" " -----------_pack_new_transposed_kv-----------")
+        debug_print("[RPA debug] -----------_pack_new_transposed_kv-----------")
         for b in range(batch_size):
             update_sz = update_szs[b]
 
@@ -1298,7 +1295,7 @@ def _mla_ragged_paged_attention_kernel(
             new KVs begin for a batch.
           update_szs: A list of the number of new tokens to be packed for a batch.
         """
-        debug_print("[RPA debug]" " -----------_pack_new_kv-----------")
+        debug_print("[RPA debug] -----------_pack_new_kv-----------")
         for b in range(batch_size):
             offset = offsets[b]
             update_sz = update_szs[b]
@@ -1333,7 +1330,7 @@ def _mla_ragged_paged_attention_kernel(
         *,
         wait=False,
     ):
-        debug_print("[RPA debug]" " -----------_update_transposed_kv_cache-----------")
+        debug_print("[RPA debug] -----------_update_transposed_kv_cache-----------")
         seq_idx = batch_start_seq_idx + b
         sem = sems.at[3, b, bkv_sem_idx]
 

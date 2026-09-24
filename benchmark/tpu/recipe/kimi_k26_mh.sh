@@ -27,7 +27,6 @@
 # outside the precompiled buckets takes the recompile path that crashes
 # torch_tpu.
 #
-# Weights: /weights/Kimi-K2.6 on the shared model-weights-rox ROX Hyperdisk.
 set -uo pipefail
 
 export MODEL=${MODEL:-/weights/Kimi-K2.6}
@@ -38,8 +37,10 @@ export TP_SIZE=${TP_SIZE:-16}
 export EP_SIZE=${EP_SIZE:-16}
 
 # --- precision ---
-# Native int4 (compressed-tensors pack-quantized). Both MUST be empty; see above.
-export QUANTIZATION=
+# Native int4 (compressed-tensors pack-quantized). "unquant" asks for no online
+# quantization; the checkpoint's own quant_method still wins in
+# _verify_quantization. KV_CACHE_DTYPE MUST stay empty; see above.
+export QUANTIZATION=unquant
 export KV_CACHE_DTYPE=
 
 # --- attention ---

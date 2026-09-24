@@ -56,7 +56,7 @@ def _forward_batch(*, batch_size=1, **info_overrides):
         logit_bias=None,
         grammars=None,
         return_sampling_masks=None,
-        sampling_mask_max_top_k=0,
+        sampling_mask_batch_indices=None,
         acc_additive_penalties=None,
         acc_scaling_penalties=None,
         penalizer_orchestrator=SimpleNamespace(is_required=False),
@@ -383,7 +383,7 @@ class TestDistributedTopKEligibility(CustomTestCase):
             "custom processor": {"has_custom_logit_processor": True},
             "logit bias": {"logit_bias": torch.zeros(1, 8)},
             "grammar": {"grammars": [object()]},
-            "sampling mask": {"sampling_mask_max_top_k": 50},
+            "sampling mask": {"sampling_mask_batch_indices": torch.tensor([0])},
             "additive penalty": {"acc_additive_penalties": torch.zeros(1, 8)},
             "scaling penalty": {"acc_scaling_penalties": torch.ones(1, 8)},
             "live penalizer": {
@@ -599,11 +599,12 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             "top_k_top_p_min_p_sampling_from_probs_torch",
             return_value=expected,
         ) as generic_sampler:
-            actual = TpuSampler._sample_from_probs(
+            actual, capture = TpuSampler._sample_from_probs(
                 sampler, probs, info, positions, simple_sampling_case=False
             )
 
         self.assertIs(actual, expected)
+        self.assertIsNone(capture)
         generic_sampler.assert_called_once_with(
             probs,
             info.top_ks,
@@ -612,7 +613,72 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
             False,
             None,
             positions,
+            return_filtered_probs=False,
         )
+
+    def test_simple_sampling_preserves_base_return_contract(self):
+        """A stochastic TPU request must return tokens plus optional mask state.
+
+        The upstream sampler began unpacking this pair, while the TPU override
+        still returned only tokens and crashed ordinary temperature sampling.
+        """
+        sampler = SimpleNamespace()
+        probs = torch.rand(1, 128)
+        positions = torch.tensor([7])
+        info = _forward_batch(uniform_top_k=None).sampling_info
+        expected = torch.tensor([17], dtype=torch.int32)
+
+        with patch.object(
+            tpu_sampler_module,
+            "sampling_from_probs_torch",
+            return_value=expected,
+        ):
+            actual, capture = TpuSampler._sample_from_probs(
+                sampler, probs, info, positions, simple_sampling_case=True
+            )
+
+        self.assertIs(actual, expected)
+        self.assertIsNone(capture)
+
+    def test_native_top_k_captures_requested_sampling_mask_rows(self):
+        sampler = SimpleNamespace()
+        probs = torch.rand(2, 128)
+        positions = torch.tensor([7, 8])
+        info = _forward_batch(
+            batch_size=2,
+            uniform_top_k=2,
+            sampling_mask_batch_indices=torch.tensor([1]),
+            top_ks=torch.tensor([2, 2], dtype=torch.int32),
+            top_ps=torch.ones(2),
+            min_ps=torch.zeros(2),
+            temperatures=torch.ones(2, 1),
+        ).sampling_info
+        global_top_k_probs = torch.tensor([[0.7, 0.3], [0.6, 0.4]])
+        global_top_k_token_ids = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.top_k.tpu_top_k",
+                return_value=(global_top_k_probs, global_top_k_token_ids),
+            ),
+            patch.object(
+                tpu_sampler_module,
+                "sampling_from_probs_torch",
+                return_value=torch.tensor([1, 0], dtype=torch.int32),
+            ),
+        ):
+            actual, capture = TpuSampler._sample_from_probs(
+                sampler, probs, info, positions, simple_sampling_case=False
+            )
+
+        torch.testing.assert_close(actual, torch.tensor([11, 20], dtype=torch.int32))
+        self.assertIsNotNone(capture)
+        torch.testing.assert_close(capture.weights, torch.tensor([[0.6, 0.4]]))
+        torch.testing.assert_close(
+            capture.token_ids, torch.tensor([[20, 21]], dtype=torch.int32)
+        )
+        torch.testing.assert_close(capture.selected_weight, torch.tensor([0.6]))
+        torch.testing.assert_close(capture.batch_rows, torch.tensor([1]))
 
     def test_filtered_sampling_uses_bsearch_mask_on_tpu(self):
         """On TPU tensors, filtered sampling routes through the sort-free
@@ -643,11 +709,12 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 "top_k_top_p_min_p_sampling_from_probs_torch",
             ) as generic_sampler,
         ):
-            actual = TpuSampler._sample_from_probs(
+            actual, capture = TpuSampler._sample_from_probs(
                 sampler, probs, info, positions, simple_sampling_case=False
             )
 
         self.assertIs(actual, expected)
+        self.assertIsNone(capture)
         generic_sampler.assert_not_called()
         filter_probs.assert_called_once_with(
             probs,
@@ -691,11 +758,12 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 return_value=torch.tensor([0], dtype=torch.int32),
             ) as sample,
         ):
-            actual = TpuSampler._sample_from_probs(
+            actual, capture = TpuSampler._sample_from_probs(
                 sampler, probs, info, positions, simple_sampling_case=False
             )
 
         torch.testing.assert_close(actual, torch.tensor([91], dtype=torch.int32))
+        self.assertIsNone(capture)
         top_k.assert_called_once_with(probs, 50)
         filter_probs.assert_called_once_with(
             global_top_k_probs,
@@ -733,11 +801,12 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 return_value=expected,
             ) as generic_sampler,
         ):
-            actual = TpuSampler._sample_from_probs(
+            actual, capture = TpuSampler._sample_from_probs(
                 sampler, probs, info, positions, simple_sampling_case=False
             )
 
         self.assertIs(actual, expected)
+        self.assertIsNone(capture)
         top_k.assert_not_called()
         generic_sampler.assert_called_once()
 
@@ -760,11 +829,12 @@ class TestTpuSamplerGlobalTopK(CustomTestCase):
                 return_value=torch.tensor([1], dtype=torch.int32),
             ) as sample,
         ):
-            actual = TpuSampler._sample_from_probs(
+            actual, capture = TpuSampler._sample_from_probs(
                 sampler, probs, info, positions, simple_sampling_case=False
             )
 
         torch.testing.assert_close(actual, torch.tensor([17], dtype=torch.int32))
+        self.assertIsNone(capture)
         top_k.assert_called_once_with(probs, 50)
         sample.assert_called_once_with(
             global_top_k_probs,

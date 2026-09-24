@@ -523,7 +523,7 @@ def run_integration() -> int:
 def render_jobset_yaml(
     image: str = "us-central1-docker.pkg.dev/sgl-project/tpu-ci/sglang:latest",
     lane: str = "nightly",
-    weights_pvc: str = "model-weights-rox",
+    weights_pvc: str = "model-weights-filestore",
     run_name: str = RUN_NAME,
 ) -> str:
     """Render one full prefill host plus one full decode host."""

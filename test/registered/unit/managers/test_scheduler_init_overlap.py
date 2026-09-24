@@ -58,12 +58,12 @@ def _run_init_overlap(s: Scheduler, *, use_mlx: bool, supports_streams: bool):
     mock_platform = MagicMock()
     mock_platform.supports_overlap_streams.return_value = supports_streams
     mock_device_module = MagicMock()
-    with patch(f"{_SCHED_MOD}.use_mlx", return_value=use_mlx), patch(
-        f"{_SCHED_MOD}.current_platform", mock_platform
-    ), patch(f"{_SCHED_MOD}.decide_needs_cpu_seq_lens", return_value=True), patch(
-        f"{_SCHED_MOD}.decide_needs_confidence_relay", return_value=False
-    ), patch(
-        "torch.get_device_module", return_value=mock_device_module
+    with (
+        patch(f"{_SCHED_MOD}.use_mlx", return_value=use_mlx),
+        patch(f"{_SCHED_MOD}.current_platform", mock_platform),
+        patch(f"{_SCHED_MOD}.decide_needs_cpu_seq_lens", return_value=True),
+        patch(f"{_SCHED_MOD}.decide_needs_confidence_relay", return_value=False),
+        patch("torch.get_device_module", return_value=mock_device_module),
     ):
         Scheduler.init_overlap(s)
     return mock_device_module

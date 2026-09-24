@@ -98,9 +98,7 @@ jobs:
       suite: ${{ matrix.entry.suite }}
       run_name: ${{ matrix.entry.run_name }}
       nightly: true
-      # gpt-oss-120b serves from the shared ROX disk at /weights; harmless for the
-      # model that pulls from HF instead.
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights-filestore
       timeout_per_file: ${{ matrix.entry.timeout }}
     permissions:
       contents: read

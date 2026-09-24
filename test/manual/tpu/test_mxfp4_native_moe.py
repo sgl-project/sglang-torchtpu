@@ -52,9 +52,9 @@ def _quantize_to_hf_mxfp4(
     * ``packed_blocks``: ``(*leading, num_blocks, 16)`` uint8 — 2 FP4 per byte
     * ``scales_e8m0``  : ``(*leading, num_blocks)``     uint8 — e8m0 (biased exp + 127)
     """
-    assert (
-        x_float.shape[-1] % block_size == 0
-    ), f"last axis {x_float.shape[-1]} not multiple of block_size {block_size}"
+    assert x_float.shape[-1] % block_size == 0, (
+        f"last axis {x_float.shape[-1]} not multiple of block_size {block_size}"
+    )
     *leading, K = x_float.shape
     num_blocks = K // block_size
 
@@ -101,13 +101,13 @@ def _dequant_hf_mxfp4(
     """
     *leading, K_packed = packed_blocks.shape
     num_blocks = scales_e8m0.shape[-1]
-    assert scales_e8m0.shape[:-1] == tuple(
-        leading
-    ), f"scale leading dims {scales_e8m0.shape[:-1]} != packed {tuple(leading)}"
+    assert scales_e8m0.shape[:-1] == tuple(leading), (
+        f"scale leading dims {scales_e8m0.shape[:-1]} != packed {tuple(leading)}"
+    )
     block_size = (K_packed * 2) // num_blocks  # = MXFP4_BLOCK_SIZE = 32
-    assert (
-        block_size == MXFP4_BLOCK_SIZE
-    ), f"derived block_size={block_size}, expected {MXFP4_BLOCK_SIZE}"
+    assert block_size == MXFP4_BLOCK_SIZE, (
+        f"derived block_size={block_size}, expected {MXFP4_BLOCK_SIZE}"
+    )
     block_bytes = block_size // 2  # = 16
 
     # Reshape to expose blocks: (*leading, num_blocks, block_bytes)
@@ -129,9 +129,7 @@ def _dequant_hf_mxfp4(
     # Apply e8m0 scale.
     scale_fp32 = torch.exp2(
         scales_e8m0.to(torch.int32).to(torch.float32) - 127.0
-    ).unsqueeze(
-        -1
-    )  # (..., num_blocks, 1)
+    ).unsqueeze(-1)  # (..., num_blocks, 1)
     dequant = signed_vals * scale_fp32  # (..., num_blocks, block_size) fp32
     return dequant.reshape(*leading, num_blocks * block_size).to(dtype)
 

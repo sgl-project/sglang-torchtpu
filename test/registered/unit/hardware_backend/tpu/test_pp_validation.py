@@ -11,7 +11,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution, resolution_result
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.test.test_utils import CustomTestCase
 
@@ -82,8 +82,8 @@ class TestPipelineParallelValidation(CustomTestCase):
         self.assertEqual(args.pp_async_batch_depth, 0)
 
     def test_pipeline_validation_honors_prior_resolution(self):
-        args = _args()
-        declare_late_resolution(args, "test.pipeline", pp_size=8)
+        args = _args(enable_torch_compile=True)
+        declare_resolution(args, "test.pipeline", pp_size=8)
         prepare_tpu_env = _apply(args)
         prepare_tpu_env.assert_called_once_with(8, setup_slicebuilder=True)
         self.assertEqual(args.pp_size, 1)
@@ -92,7 +92,7 @@ class TestPipelineParallelValidation(CustomTestCase):
 
     def test_resolved_unsupported_depth_is_rejected_before_environment_setup(self):
         args = _args(pp_size=8)
-        declare_late_resolution(args, "test.pipeline", pp_async_batch_depth=2)
+        declare_resolution(args, "test.pipeline", pp_async_batch_depth=2)
         with patch(
             "sglang.srt.hardware_backend.tpu.patches._prepare_tpu_env"
         ) as prepare:
@@ -120,6 +120,12 @@ class TestPipelineParallelValidation(CustomTestCase):
             NotImplementedError, r"--enable-dynamic-chunking.*pipeline"
         ):
             _apply(_args(pp_size=2, enable_dynamic_chunking=True))
+
+    def test_rejects_eager_forward(self):
+        """An eager forward gets the received activations at the hand-off
+        buffer's row count, not the batch's token count."""
+        with self.assertRaisesRegex(NotImplementedError, "--enable-torch-compile"):
+            _apply(_args(pp_size=2))
 
     def test_rejection_happens_before_the_slice_env_is_prepared(self):
         with patch(

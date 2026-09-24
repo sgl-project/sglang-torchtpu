@@ -32,9 +32,9 @@ export EP_SIZE=8
 # Qwen3.5-397B A/B (decode TPOT -11.7% with the gather off; it only helps TTFT).
 export SGLANG_TPU_FUSED_MOE_SC_GATHER=${SGLANG_TPU_FUSED_MOE_SC_GATHER:-0}
 
-# GPT-OSS ships its own quantization_config (quant_method=mxfp4), so leave
-# --quantization unset: forcing fp8 here would try to re-quantize MXFP4 weights.
-export QUANTIZATION=
+# GPT-OSS ships its own quantization_config (quant_method=mxfp4), so ask for no
+# online quantization: forcing fp8 here would re-quantize the MXFP4 weights.
+export QUANTIZATION=unquant
 export KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
 
 # Only pallas_tpu_rpa_v3 implements attention sinks, which GPT-OSS needs

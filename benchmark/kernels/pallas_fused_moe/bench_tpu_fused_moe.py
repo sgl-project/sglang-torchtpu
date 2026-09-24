@@ -190,8 +190,8 @@ def main():
         moe_f = _bench(moe_fused, moe_args, args.iters)
 
         print(
-            f"{m:>7} | {g1_u:>11.3f}ms {g1_f:>9.3f}ms {g1_u/g1_f:>7.2f}x"
-            f" | {moe_u:>10.3f}ms {moe_f:>8.3f}ms {moe_u/moe_f:>7.2f}x"
+            f"{m:>7} | {g1_u:>11.3f}ms {g1_f:>9.3f}ms {g1_u / g1_f:>7.2f}x"
+            f" | {moe_u:>10.3f}ms {moe_f:>8.3f}ms {moe_u / moe_f:>7.2f}x"
             f" | {diff:>8.1e}"
         )
 

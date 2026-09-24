@@ -146,9 +146,73 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
         **kwargs: Any,
     ) -> None:
         super().__init__(encoder, name=name, **kwargs)
+        self._warned_oversize: set[int] = set()
 
     def _runner_ready_for_compile(self, runner: Any) -> bool:
         return getattr(runner, "supports_segment_ids", False)
+
+    def run(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the compiled encoder once per image.
+
+        ``x`` holds every image of the batch packed along the patch axis, with
+        ``cu_seqlens`` marking the boundaries. Compiled graphs exist only for
+        the precompiled patch-count buckets and the packed total rarely matches
+        one, so each image is sliced out and run at its own bucket. Attention
+        does not cross image boundaries, so the result is unchanged.
+
+        The slices are cloned because torch_tpu passes a compiled function the
+        full backing buffer of a view rather than the view itself.
+        """
+        bounds = cu_seqlens.tolist()
+        if len(bounds) <= 2:
+            return self._run_one(x, cos, sin, cu_seqlens)
+        outs = []
+        for start, end in zip(bounds[:-1], bounds[1:]):
+            single = torch.tensor([0, end - start], dtype=torch.int32)
+            outs.append(
+                self._run_one(
+                    x[start:end].clone(),
+                    cos[start:end].clone(),
+                    sin[start:end].clone(),
+                    single,
+                )
+            )
+        # Each output is [1, S_i, D]; concatenate along the patch axis.
+        return torch.cat(outs, dim=outs[0].ndim - 2)
+
+    def _run_one(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        seq_len = x.shape[0]
+        if self._bucket_for(seq_len) is None and self.eager_fn is not None:
+            # No precompiled bucket fits this image, and recompiling is not
+            # allowed once warmup has finished (fail_on_recompile), so run the
+            # uncompiled encoder for it.
+            if seq_len not in self._warned_oversize:
+                self._warned_oversize.add(seq_len)
+                buckets = self.resolve_patch_buckets()
+                logger.warning(
+                    "MoonVitTpuCompilePolicy: patch count %d exceeds largest "
+                    "precompiled bucket %s; running this image eagerly. Add a "
+                    "bucket to SGLANG_TPU_VIT_PRECOMPILE_SIZES or raise "
+                    "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
+                    seq_len,
+                    buckets[-1] if buckets else None,
+                )
+            segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x.device)
+            with torch.no_grad():
+                return self.eager_fn(x, cos, sin, segment_ids)
+        return super().run(x, cos, sin, cu_seqlens)
 
     def _install_run_adapter(self, runner: Any) -> None:
         def _run(
@@ -218,16 +282,8 @@ class MoonVitTpuCompilePolicy(VisionTpuCompilePolicy):
             )
             segment_ids = torch.cat([segment_ids, pad_segment], dim=1)
         else:
-            if bucket_len is None and seq_len not in self._warned_oversize:
-                self._warned_oversize.add(seq_len)
-                buckets = self.resolve_patch_buckets()
-                logger.warning(
-                    "MoonVitTpuCompilePolicy: patch count %d exceeds largest "
-                    "precompiled bucket %s; one-time recompile. Raise "
-                    "SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.",
-                    seq_len,
-                    buckets[-1] if buckets else None,
-                )
+            # seq_len matches a bucket exactly, so no padding is needed.
+            # Oversized images never reach this point; _run_one handles them.
             segment_ids = _cu_seqlens_to_segment_ids(cu_seqlens, seq_len, x.device)
 
         ctx = VisionPaddingContext(

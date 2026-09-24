@@ -55,8 +55,7 @@ def wait_for_health(
             response = requests.get(base_url.rstrip("/") + endpoint, timeout=10)
             if response.status_code == 200:
                 print(
-                    f"[{tag}] server healthy after "
-                    f"{time.perf_counter() - start:.0f}s",
+                    f"[{tag}] server healthy after {time.perf_counter() - start:.0f}s",
                     flush=True,
                 )
                 return

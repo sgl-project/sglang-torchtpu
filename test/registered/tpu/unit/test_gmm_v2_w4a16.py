@@ -115,9 +115,7 @@ class TestGmmV2W4A16(CustomTestCase):
             packed = jnp.asarray(getattr(layer, f"{name}_weight_packed").numpy())
             scale = jnp.asarray(
                 getattr(layer, f"{name}_weight_scale").float().numpy()
-            ).astype(
-                jnp.bfloat16
-            )  # exact: bf16 -> f32 -> bf16
+            ).astype(jnp.bfloat16)  # exact: bf16 -> f32 -> bf16
             out.append((packed, scale))
         return out
 

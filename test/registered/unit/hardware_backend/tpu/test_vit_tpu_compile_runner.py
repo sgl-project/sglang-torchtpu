@@ -154,8 +154,9 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         # Set but empty disables precompile.
         with sizes.override(""):
             self.assertEqual(policy.compute_patch_buckets(), [])
-        with sizes.override("200"), self.assertRaisesRegex(
-            ValueError, "perfect squares"
+        with (
+            sizes.override("200"),
+            self.assertRaisesRegex(ValueError, "perfect squares"),
         ):
             policy.compute_patch_buckets()
 
@@ -167,9 +168,10 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_env_cap_bounds_the_ladder_but_is_not_its_top_bucket(self):
         policy = Qwen3VLVisionTpuCompilePolicy(SimpleNamespace(spatial_merge_size=2))
-        with _unset(
-            envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
-        ), envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000):
+        with (
+            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(5000),
+        ):
             ladder = policy.compute_patch_buckets()
         # 72^2 = 5184 overshoots the cap, so the real ceiling stays 70^2. Callers
         # sizing a batch must read the warmed value rather than the cap.
@@ -179,9 +181,10 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         policy = _FakeVisionPolicy()
         policy.owner = SimpleNamespace()
         policy.compiled_fn = MagicMock(return_value=torch.zeros(1))
-        with patch.object(
-            vit_runner, "_precompiled_max_patch_count", None
-        ), patch.object(vit_runner, "tpu_sync"):
+        with (
+            patch.object(vit_runner, "_precompiled_max_patch_count", None),
+            patch.object(vit_runner, "tpu_sync"),
+        ):
             policy.precompile(patch_counts=[196, 324, 4900])
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 4900)
 
@@ -228,9 +231,11 @@ class TestViTTpuCompileRunner(unittest.TestCase):
 
     def test_batching_budget_falls_back_to_env_before_precompile_runs(self):
         unwarmed = patch.object(vit_runner, "_precompiled_max_patch_count", None)
-        with unwarmed, _unset(
-            envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES
-        ), envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600):
+        with (
+            unwarmed,
+            _unset(envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES),
+            envs.SGLANG_TPU_VIT_MAX_PRECOMPILE_PATCHES.override(1600),
+        ):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1600)
         with unwarmed, envs.SGLANG_TPU_VIT_PRECOMPILE_SIZES.override("196, 1024"):
             self.assertEqual(vit_runner.precompiled_max_patch_count(), 1024)

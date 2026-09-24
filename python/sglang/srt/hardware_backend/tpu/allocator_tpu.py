@@ -125,21 +125,20 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int32, device="cpu"
         )
-        self.release_pages = torch.empty((0,), dtype=torch.int32, device="cpu")
         # None outside a free_group_begin()/free_group_end() pair, as in the parent.
         self.free_group = None
-        self.free_page_reps_group = []
+        self.free_page_ids_group = []
+        self.staged_pages: list[torch.Tensor] = []
+        self.num_staged_pages = 0
 
     def alloc(self, need_size: int):
         # Page-aligned bulk allocation, returns contiguous device indices.
-        assert (
-            need_size % self.page_size == 0
-        ), "The allocation size should be page-aligned"
+        assert need_size % self.page_size == 0, (
+            "The allocation size should be page-aligned"
+        )
         num_pages = need_size // self.page_size
         if self.need_sort and num_pages > len(self.free_pages):
-            # Pools are host-resident; keep release_pages on CPU (the parent
-            # defaults to self.device, which is the accelerator here).
-            self.merge_and_sort_free(device="cpu")
+            self.merge_and_sort_free()
         if num_pages > len(self.free_pages):
             return None
 
@@ -179,9 +178,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             num_new_pages_item = num_new_pages
 
         if self.need_sort and num_new_pages_item > len(self.free_pages):
-            # Pools are host-resident; keep release_pages on CPU (the parent
-            # defaults to self.device, which is the accelerator here).
-            self.merge_and_sort_free(device="cpu")
+            self.merge_and_sort_free()
 
         if num_new_pages_item > len(self.free_pages):
             return None
@@ -236,9 +233,7 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         num_new_pages = int(need_new_pages.sum())
 
         if num_new_pages > len(self.free_pages):
-            # Pools are host-resident; keep release_pages on CPU (the parent
-            # defaults to self.device, which is the accelerator here).
-            self.merge_and_sort_free(device="cpu")
+            self.merge_and_sort_free()
         if num_new_pages > len(self.free_pages):
             return None
 
@@ -275,6 +270,13 @@ class TpuPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         return out_indices.int()
+
+    def _release_page_ids(self, *page_ids: torch.Tensor) -> None:
+        """Keep every page-id release path on the host pool's int32 dtype."""
+        normalized = tuple(
+            page_id.to(device="cpu", dtype=torch.int32) for page_id in page_ids
+        )
+        super()._release_page_ids(*normalized)
 
     def free(self, free_index: torch.Tensor) -> None:
         # Page pools are host-resident int32 tensors. Scheduler locations can

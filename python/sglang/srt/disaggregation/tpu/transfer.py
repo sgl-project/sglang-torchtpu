@@ -384,9 +384,9 @@ class PendingChunk:
             # 2*src_heads < kv_packing, which with the fp8 kv_packing=4 forces
             # src_heads==1. Guard so a future kv_packing>4 fails loud instead of
             # silently dropping heads (the fix is slicing :src_heads*_SLOTS_PER_HEAD).
-            assert (
-                info.src_heads == 1
-            ), f"FAN-IN reassembly assumes 1 head/source, got src_heads={info.src_heads}"
+            assert info.src_heads == 1, (
+                f"FAN-IN reassembly assumes 1 head/source, got src_heads={info.src_heads}"
+            )
             for layer_idx in range(num_layers):
                 # Each source carries its real head in the lane's first slot pair
                 # (slots [0:2]); concatenate the sources on the kv_packing axis to

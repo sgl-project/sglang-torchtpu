@@ -12,7 +12,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from sglang.srt.arg_groups.overrides import declare_late_resolution
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.distributed import bootstrap, parallel_state
 from sglang.srt.utils.patch_torch import (
     initialize_torch_tpu_worker,
@@ -71,7 +71,7 @@ class TestWorkerEnvUnderPipelineParallelism(CustomTestCase):
 
     def test_worker_bootstrap_honors_resolution_before_publication(self):
         args = _args(device=None, tp_size=1, pp_size=1, nnodes=1)
-        declare_late_resolution(
+        declare_resolution(
             args, "test.worker_defaults", device="tpu", pp_size=8, nnodes=2
         )
         with patch("sglang.srt.platforms.current_platform.init_backend") as initialize:
@@ -119,7 +119,6 @@ class TestResolveBackend(CustomTestCase):
             return bootstrap._resolve_backend(
                 device="tpu",
                 tp_size=tp_size,
-                server_args=SimpleNamespace(elastic_ep_backend=None),
                 pp_size=pp_size,
             )
 
@@ -139,13 +138,12 @@ class TestResolveBackend(CustomTestCase):
             backend = bootstrap._resolve_backend(
                 device="tpu",
                 tp_size=1,
-                server_args=SimpleNamespace(elastic_ep_backend=None),
             )
         self.assertEqual(backend, "gloo")
 
 
 class TestPipelineGroupCommunicators(CustomTestCase):
-    def _pp_group_kwargs(self, is_tpu: bool):
+    def _pp_group_kwargs(self):
         captured = {}
 
         def fake_init_model_parallel_group(group_ranks, local_rank, backend, **kw):
@@ -158,7 +156,7 @@ class TestPipelineGroupCommunicators(CustomTestCase):
         world.device_group = Mock()
         world.local_rank = 0
         with (
-            patch.object(parallel_state, "_is_tpu", is_tpu),
+            patch.object(parallel_state, "_is_tpu", True),
             patch.object(parallel_state, "_WORLD", None),
             patch.object(parallel_state, "_TP", None),
             patch.object(parallel_state, "_ATTN_CP", None),
@@ -183,14 +181,9 @@ class TestPipelineGroupCommunicators(CustomTestCase):
         return captured["pp"]
 
     def test_pp8_tp1_builds_one_pipeline_group_over_all_ranks(self):
-        group_ranks, kwargs = self._pp_group_kwargs(is_tpu=True)
+        group_ranks, kwargs = self._pp_group_kwargs()
         self.assertEqual(group_ranks, [list(range(8))])
-        self.assertIs(kwargs["use_pynccl"], False)
         self.assertIs(kwargs["use_custom_allreduce"], False)
-
-    def test_off_tpu_pipeline_group_leaves_pynccl_to_the_backend_default(self):
-        _, kwargs = self._pp_group_kwargs(is_tpu=False)
-        self.assertIsNone(kwargs["use_pynccl"])
 
 
 if __name__ == "__main__":

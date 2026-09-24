@@ -638,9 +638,9 @@ def ragged_gather_reduce(
         hidden_size, input_size, num_cores, num_lanes, num_simd_lanes
     )
     num_row_partitions = num_cores // num_column_partitions
-    assert (
-        num_row_partitions <= num_simd_lanes
-    ), f"{num_row_partitions=} must be <= {num_simd_lanes=}"
+    assert num_row_partitions <= num_simd_lanes, (
+        f"{num_row_partitions=} must be <= {num_simd_lanes=}"
+    )
     num_row_subchunks, row_chunk_size = _calculate_row_tiling(
         input_size, num_simd_lanes, num_row_partitions
     )

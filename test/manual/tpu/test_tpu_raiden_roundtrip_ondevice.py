@@ -3,7 +3,7 @@
 Requires a TPU + a built tpu_sync extension + torch_tpu. NOT a CI unit test
 (see test_tpu_raiden_offload_unit.py for the host-only logic). Run with:
 
-    PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-raiden \
+    PYTHONPATH=/path/to/sglang-torchtpu/python:/path/to/tpu-sync \
         python3 test/manual/tpu/test_tpu_raiden_roundtrip_ondevice.py
 
 IMPORTANT — why this test never writes the KV buffer with eager ops:
@@ -71,9 +71,9 @@ def test_raiden_dma_roundtrip():
 
     got4 = float(data[4, 0, 0, 0, 0].cpu())
     got5 = float(data[5, 0, 0, 0, 0].cpu())
-    assert (
-        abs(got4 - 101.0) < 1e-2 and abs(got5 - 102.0) < 1e-2
-    ), f"round-trip mismatch: pages 4,5 = {got4},{got5} (expected 101,102)"
+    assert abs(got4 - 101.0) < 1e-2 and abs(got5 - 102.0) < 1e-2, (
+        f"round-trip mismatch: pages 4,5 = {got4},{got5} (expected 101,102)"
+    )
     print(f"  pages 4,5 after D2h->H2d = {got4},{got5} OK")
 
 

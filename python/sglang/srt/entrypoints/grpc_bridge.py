@@ -411,6 +411,9 @@ class RuntimeHandle:
             "load_format": self.tokenizer_manager.config_value("load_format"),
             "reasoning_parser": self.tokenizer_manager.config_value("reasoning_parser"),
             "tool_call_parser": self.tokenizer_manager.config_value("tool_call_parser"),
+            "disaggregation_mode": self.tokenizer_manager.config_value(
+                "disaggregation_mode"
+            ),
             "model_type": getattr(model_config.hf_config, "model_type", None),
             "architectures": getattr(model_config.hf_config, "architectures", None),
         }
@@ -425,6 +428,11 @@ class RuntimeHandle:
 
     def get_server_info(self) -> str:
         result: Dict[str, Any] = self.tokenizer_manager.server_args.resolved_dict()
+        # `resolved_dict` answers with what resolution decided; the launch
+        # command answers with what was asked for, and the two are not
+        # derivable from each other. The HTTP and in-process readbacks both
+        # carry it, so this one does too.
+        result["launch_command"] = self.tokenizer_manager.server_args.launch_command
         result.update(self.scheduler_info)
         result["kv_events"] = describe_kv_events_publisher(
             self.tokenizer_manager.server_args
@@ -440,6 +448,9 @@ class RuntimeHandle:
             ServerStatus.Starting,
             ServerStatus.UnHealthy,
         )
+
+    def get_is_ready(self) -> bool:
+        return self.tokenizer_manager.is_ready()
 
     def tokenize(self, text: str, add_special_tokens: bool = True) -> str:
         tokenizer = self.tokenizer_manager.tokenizer
@@ -545,9 +556,11 @@ class RuntimeHandle:
             obj = UpdateWeightFromDiskReqInput(
                 model_path=model_path, load_format=load_format
             )
-            success, message, num_paused = (
-                await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
-            )
+            (
+                success,
+                message,
+                num_paused,
+            ) = await self.tokenizer_manager.update_weights_from_disk(obj, request=None)
             return {
                 "success": success,
                 "message": message,

@@ -78,6 +78,7 @@ def _model_runner(pp_group=None):
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
         server_args=SimpleNamespace(page_size=1, dp_size=1, disaggregation_mode="null"),
+        prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
     runner.pp_group = pp_group
     return runner

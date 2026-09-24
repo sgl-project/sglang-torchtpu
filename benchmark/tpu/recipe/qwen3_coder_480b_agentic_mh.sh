@@ -11,17 +11,12 @@
 # This is a thin shim on purpose: every server knob lives in the benchmark's
 # config.sh, so the CI server and a hand-run server are the same server. It only
 # supplies what the CI environment owns:
-#   * MODEL defaults to the ReadOnlyMany Hyperdisk mount (MULTIHOST_LAUNCH's
+#   * MODEL defaults to the read-only Filestore mount (MULTIHOST_LAUNCH's
 #     weights_pvc), not the HF repo id -- a 480 GB pull per run is not viable.
 #   * PROFILE=ci sizes the sweep to the JobSet's deadline (see config.sh).
 # HOST / PORT / ENABLE_PROFILER_ENDPOINT / ENABLE_COMPILE_CACHE come from the
 # JobSet template.
 #
-# WEIGHTS: /weights/Qwen3-Coder-480B-A35B-Instruct-FP8 is already on the shared
-# model-weights-rox PVC (verified on the live disk: 449GiB, 49 safetensors
-# shards, config + tokenizer + index), alongside the EAGLE3 draft the combo test
-# uses. No hydration pass is needed. The disk's contents list lives in
-# .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl.
 set -uo pipefail
 cd "$(dirname "$0")/.."   # recipe/ -> benchmark/tpu
 

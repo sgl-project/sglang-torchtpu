@@ -44,9 +44,12 @@ class TestUnquantGlobalRouting(CustomTestCase):
             return (values * route_weights.unsqueeze(-1)).sum(1)
 
         for sparsecore in (False, True):
-            with self.subTest(sparsecore=sparsecore), patch(
-                "sglang.srt.layers.quantization.unquant.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
-                return_value=sparsecore,
+            with (
+                self.subTest(sparsecore=sparsecore),
+                patch(
+                    "sglang.srt.layers.quantization.unquant.envs.SGLANG_TPU_FUSED_MOE_SC_GATHER.get",
+                    return_value=sparsecore,
+                ),
             ):
                 self.check_routing(x, ids, weights, expected, kernel)
         torch.testing.assert_close(ids, original_ids)
@@ -83,12 +86,15 @@ class TestUnquantGlobalRouting(CustomTestCase):
                         module_name = "sglang.srt.layers.moe.pallas.fused_moe_op"
                         bridge = ModuleType(module_name)
                         call = bridge.fused_moe_call = Mock(side_effect=kernel)
-                        with patch(
-                            "sglang.srt.layers.quantization.unquant.get_parallel",
-                            return_value=SimpleNamespace(
-                                moe_ep_size=ep_size, moe_ep_rank=rank
+                        with (
+                            patch(
+                                "sglang.srt.layers.quantization.unquant.get_parallel",
+                                return_value=SimpleNamespace(
+                                    moe_ep_size=ep_size, moe_ep_rank=rank
+                                ),
                             ),
-                        ), patch.dict(sys.modules, {module_name: bridge}):
+                            patch.dict(sys.modules, {module_name: bridge}),
+                        ):
                             output = UnquantizedFusedMoEMethod.forward_tpu(
                                 method, layer, dispatch
                             ).hidden_states

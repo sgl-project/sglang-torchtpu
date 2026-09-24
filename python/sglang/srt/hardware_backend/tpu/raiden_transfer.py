@@ -1,7 +1,7 @@
 """Raiden-backed TPU<->host KV transfer substrate for HiCache.
 
 torch_tpu has no real streams and no pinned host memory, so the CUDA HiCache
-transfer path can't be ported. This module drives tpu-raiden's
+transfer path can't be ported. This module drives tpu-sync's
 ``KVCacheManager``: ``D2h`` / ``H2d`` do direct PJRT raw-buffer DMA between the
 fused device KV buffer and raiden's DMA-pinned host pool, returning a pollable
 ``RaidenFuture``. A raiden "block" is one page of the fused buffer, and a single

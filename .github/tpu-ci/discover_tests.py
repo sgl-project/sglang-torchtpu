@@ -34,7 +34,14 @@ def discover(suite: str, nightly: bool, root: str) -> list[dict]:
         ):
             continue
         path = os.path.relpath(test.filename, REPO_ROOT)
-        rows.append({"suite": suite, "file": path, **names_from_path(path)})
+        rows.append(
+            {
+                "suite": suite,
+                "file": path,
+                "weights_pvc": test.weights_pvc or "",
+                **names_from_path(path),
+            }
+        )
     return sorted(rows, key=lambda row: row["name"])
 
 

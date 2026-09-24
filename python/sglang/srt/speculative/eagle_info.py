@@ -464,9 +464,7 @@ class EagleVerifyInput(SpecInput):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.update_finish_state()
                 if req.finished():
@@ -916,8 +914,8 @@ class EagleDraftExtendInput(SpecInput):
 
     # Flat per-req index of each request's last accepted window row
     # (i * window + front + num_correct_drafts[i]). When set, the logits
-    # processor runs lm_head only on these rows. None under gathered-buffer
-    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    # processor runs lm_head and LAST hidden capture only on these rows; FULL
+    # hidden capture remains unpruned.
     select_index: Optional[torch.Tensor] = None
 
     # None for draft-extend's idle batch; attention backends fall back to

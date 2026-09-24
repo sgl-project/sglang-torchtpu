@@ -51,7 +51,9 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputChecker,
 )
 from sglang.srt.layers.moe.utils import (
+    DispatcherOutputDtype,
     RoutingMethodType,
+    get_deepep_v2_dispatcher_output_dtype,
     has_per_rank_fused_shared_slots,
     uses_per_rank_fused_shared_slots,
 )
@@ -84,7 +86,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_tpu,
-    print_info_once,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -160,18 +161,24 @@ def _get_deepep_comm_group(a2a_backend):
     return group
 
 
-def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
+def create_moe_dispatcher(
+    moe_runner_config: MoeRunnerConfig,
+    quant_method: FusedMoEMethodBase,
+) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none() and is_npu():
         return AscendTPDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_none()
         or a2a_backend.is_megamoe()
+        or a2a_backend.is_flashinfer_megamoe()
         or a2a_backend.is_ascend_fuseep()
     ):
         # ascend_fuseep bypasses the dispatcher abstraction (see
         # forward_fuseep in hardware_backend/npu/moe/fuseep.py); a
         # StandardDispatcher is created but never invoked.
+        # flashinfer_megamoe does its EP all-to-all inside the kernel, so the
+        # dispatcher stays a pure noop passthrough.
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()
@@ -193,6 +200,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             return_recv_hook=True,
         )
     elif a2a_backend.is_deepep_v2():
+        output_dtype = get_deepep_v2_dispatcher_output_dtype(
+            _deepep_v2_experts_are_fp8(quant_method)
+        )
         return DeepEPv2Dispatcher(
             group=get_tp_group().device_group,
             router_topk=moe_runner_config.top_k,
@@ -200,6 +210,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+            use_fp8_dispatch=output_dtype is DispatcherOutputDtype.FP8,
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -239,9 +250,17 @@ def _validate_hpc_ops_quant_method(quant_method) -> None:
         )
 
 
+def _deepep_v2_experts_are_fp8(quant_method) -> bool:
+    # All other supported quantization methods are blockwise FP8.
+    return not isinstance(quant_method, UnquantizedFusedMoEMethod)
+
+
 def _validate_deepep_v2_quant_method(quant_method) -> None:
-    """Validate the FP8 contract consumed by the DeepEP v2 adapter."""
+    """Validate the expert formats the DeepEP v2 adapter can feed."""
     if not get_moe_a2a_backend().is_deepep_v2():
+        return
+
+    if isinstance(quant_method, UnquantizedFusedMoEMethod):
         return
 
     config = (
@@ -261,9 +280,10 @@ def _validate_deepep_v2_quant_method(quant_method) -> None:
 
     if reason is not None:
         raise ValueError(
-            "--moe-a2a-backend deepep_v2 requires 128x128 blockwise FP8 "
-            f"experts with dynamic activation scaling, but this layer {reason}. "
-            "Use a compatible checkpoint or --moe-a2a-backend deepep."
+            "--moe-a2a-backend deepep_v2 requires either 128x128 blockwise FP8 "
+            "experts with dynamic activation scaling or unquantized BF16 "
+            f"experts, but this layer {reason}. Use a compatible checkpoint or "
+            "--moe-a2a-backend deepep."
         )
 
 
@@ -404,6 +424,11 @@ class FusedMoE(torch.nn.Module):
         self.quant_config = quant_config
         self.use_flashinfer_mxfp4_moe = get_moe_runner_backend().is_flashinfer_mxfp4()
         # TODO maybe we should remove this `if`, since `Mxfp4MoEMethod` does another round-up logic
+        # Keep the pre-round value: the mxfp4 SM90 CUTLASS post-load processor
+        # needs to know which trailing K columns are padding, because the
+        # loader never writes them and their scale entries keep the buffer's
+        # _UE8M0_ONE fill.
+        self.hidden_size_unpadded = hidden_size
         if (
             self.quant_config is not None
             and self.quant_config.get_name() == "mxfp4"
@@ -472,7 +497,7 @@ class FusedMoE(torch.nn.Module):
         global _deferred_finalize_info_logged
         if not _deferred_finalize_info_logged:
             _deferred_finalize_info_logged = True
-            logging.getLogger(__name__).info(
+            logging.getLogger(__name__).debug(
                 "FlashInfer TRTLLM MoE deferred finalize is "
                 f"{'enabled' if self.supports_deferred_finalize else 'disabled'} "
                 f"(moe_runner_backend={get_exec().moe.moe_runner_backend}, "
@@ -504,7 +529,9 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self.dispatcher = create_moe_dispatcher(
+            self.moe_runner_config, quant_method=self.quant_method
+        )
         # Dispatchers are not nn.Modules, so they cannot register their own
         # buffers; the AITER expert mask would not survive a memory-saver resume.
         expert_mask = getattr(self.dispatcher, "expert_mask_gpu", None)
@@ -523,10 +550,6 @@ class FusedMoE(torch.nn.Module):
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             or get_moe_runner_backend().is_flashinfer_trtllm()
         ):
-            if self.moe_runner_config.inplace:
-                print_info_once(
-                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
-                )
             self.moe_runner_config.inplace = False
 
         self.should_fuse_routed_scaling_factor_in_topk = (

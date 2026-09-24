@@ -76,8 +76,8 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
             raise EndSchedule
         return [f"request-{step[0]}"]
 
-    scheduler.request_receiver = SimpleNamespace(recv_requests=recv_requests)
-    scheduler.process_input_requests = Mock()
+    scheduler.ingest_requests = recv_requests
+    scheduler._process_hicache_events = Mock()
     scheduler.process_pending_chunked_abort = Mock()
     scheduler.process_prefill_chunk = Mock()
     scheduler.maybe_prefetch_staging_for_batch = Mock()

@@ -38,9 +38,10 @@ class TestSchedulerRecompileStance(unittest.TestCase):
     def test_spec_freezes_recompiles_by_default(self):
         scheduler = self._make_scheduler(speculative_algorithm="EAGLE3")
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with (
+            envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False),
+            patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance,
+        ):
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_called_once_with("fail_on_recompile")
@@ -48,9 +49,10 @@ class TestSchedulerRecompileStance(unittest.TestCase):
     def test_env_allows_spec_recompiles(self):
         scheduler = self._make_scheduler(speculative_algorithm="EAGLE3")
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with (
+            envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True),
+            patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance,
+        ):
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_not_called()
@@ -60,9 +62,10 @@ class TestSchedulerRecompileStance(unittest.TestCase):
             speculative_algorithm="EAGLE3", enable_dp_attention=True
         )
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with (
+            envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(False),
+            patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance,
+        ):
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_called_once_with("fail_on_recompile")
@@ -70,9 +73,10 @@ class TestSchedulerRecompileStance(unittest.TestCase):
     def test_env_does_not_affect_non_spec(self):
         scheduler = self._make_scheduler(speculative_algorithm=None)
 
-        with envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True), patch(
-            f"{_SCHED_MOD}.torch.compiler.set_stance"
-        ) as set_stance:
+        with (
+            envs.SGLANG_TPU_ALLOW_SPEC_RECOMPILE.override(True),
+            patch(f"{_SCHED_MOD}.torch.compiler.set_stance") as set_stance,
+        ):
             scheduler._maybe_arm_fail_on_recompile()
 
         set_stance.assert_called_once_with("fail_on_recompile")

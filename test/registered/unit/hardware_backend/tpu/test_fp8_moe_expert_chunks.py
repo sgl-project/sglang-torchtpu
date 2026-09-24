@@ -15,10 +15,31 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class TestExpertChunks(CustomTestCase):
     def test_transpose_preserves_expert_order_with_an_uneven_final_chunk(self):
         weight = torch.arange(5 * 4 * 6).reshape(5, 4, 6)
+        param = torch.nn.Parameter(weight.clone(), requires_grad=False)
         with patch.object(expert_loading, "_TRANSPOSE_CHUNK_ELEMENTS", 2 * 4 * 6):
-            actual = expert_loading.transpose_expert_chunks(weight)
-        torch.testing.assert_close(actual, weight.transpose(1, 2).contiguous())
-        self.assertTrue(actual.is_contiguous())
+            expert_loading.transpose_expert_chunks(param)
+        torch.testing.assert_close(param.data, weight.transpose(1, 2).contiguous())
+        self.assertTrue(param.data.is_contiguous())
+
+    def test_old_weight_is_freed_before_the_chunks_are_joined(self):
+        """Joining the converted chunks must not also hold the old weight."""
+        param = torch.nn.Parameter(
+            torch.arange(5 * 4 * 6).reshape(5, 4, 6), requires_grad=False
+        )
+        old = param.data
+        freed_at_join = []
+        cat = torch.cat
+
+        def recording_cat(tensors, dim=0):
+            freed_at_join.append(old.untyped_storage().nbytes() == 0)
+            return cat(tensors, dim=dim)
+
+        with (
+            patch.object(expert_loading, "_TRANSPOSE_CHUNK_ELEMENTS", 2 * 4 * 6),
+            patch.object(torch, "cat", recording_cat),
+        ):
+            expert_loading.transpose_expert_chunks(param)
+        self.assertEqual(freed_at_join, [True])
 
     def test_requantized_chunks_match_whole_experts_in_both_layouts(self):
         for transpose in (False, True):
