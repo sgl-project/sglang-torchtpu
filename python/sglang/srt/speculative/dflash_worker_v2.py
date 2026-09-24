@@ -728,13 +728,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
 
-    def _pad_draft_bs(self, bs: int) -> int:
+    def _maybe_pad_draft_bs(self, bs: int) -> int:
         """Round bs up to the TPU compile bucket; identity on other backends."""
-        if not _is_tpu:
-            return int(bs)
-        b_bucketer = self.model_runner.compile_policy.b_bucketer
-        assert b_bucketer is not None
-        return int(b_bucketer.next_bucket(int(bs)))
+        if _is_tpu:
+            b_bucketer = self.model_runner.compile_policy.b_bucketer
+            return int(b_bucketer.next_bucket(int(bs)))
+        return int(bs)
 
     def ensure_embed_module(self) -> torch.nn.Module:
         """Resolve and cache the embedding module used to embed drafted blocks."""
@@ -767,11 +766,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if cap >= int(bs):
             return
 
-        # On TPU the capacity must itself be a bucket, so that _pad_draft_bs(bs) <= cap
-        # holds for every later bs <= cap and buf[:pad_bs] never overruns; the bucket
-        # ladder bounds regrowth. Elsewhere double to amortize it.
+        # On TPU the capacity must itself be a bucket, so _maybe_pad_draft_bs(bs)
+        # stays <= cap for every later bs <= cap and buf[:pad_bs] never overruns;
+        # the ladder bounds regrowth. Elsewhere double to amortize it.
         new_cap = (
-            self._pad_draft_bs(int(bs))
+            self._maybe_pad_draft_bs(int(bs))
             if _is_tpu
             else max(int(bs), cap * 2 if cap > 0 else int(bs))
         )
@@ -787,8 +786,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
-        self._draft_block_tokens_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
+        # Ghost rows reach the bucket-wide accept before the trim; an uninitialized
+        # id makes their outputs differ per TP rank, since only target_predict syncs.
+        self._draft_block_tokens_buf = torch.full(
+            (new_cap, block_size),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
@@ -2268,7 +2272,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Feed the bucket-padded buffer so the compiled artifact stays on a
             # static shape, then trim the ghost rows back off.
             input_embeds = self.embed_draft_block_ids(
-                block_ids=self._draft_block_ids_buf[: self._pad_draft_bs(bs)]
+                block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
             )[: bs * block_size]
         else:
             input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
@@ -2493,7 +2497,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Penalties, logit bias and grammar stay logical: both apply in place, so a
         # prefix view writes through to the real rows. Must run before
         # prepare_spec_verify, which widens sampling_info and so len(sampling_info).
-        logical_logits = logits_output.next_token_logits[: bs * block_size]
+        # Only TPU pads the verify outputs; elsewhere the rows are already logical.
+        logical_logits = (
+            logits_output.next_token_logits[: bs * block_size]
+            if _is_tpu
+            else logits_output.next_token_logits
+        )
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logical_logits,

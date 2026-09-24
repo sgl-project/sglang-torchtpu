@@ -184,8 +184,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         """Keep target verify outputs padded so accept runs on bucket shapes."""
         # IDLE never reaches verify: DFlashWorkerV2.forward_batch_generation
         # short-circuits it, so there is no DP-peer case to cover here.
-        verify_input.keep_outputs_padded = not batch.forward_mode.is_idle()
-        return verify_input.keep_outputs_padded
+        return not batch.forward_mode.is_idle()
 
     def prepare_spec_verify(
         self, batch: Any, verify_input: Any, next_token_logits: torch.Tensor

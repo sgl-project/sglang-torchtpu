@@ -14,7 +14,6 @@ from torch import nn
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import argmax_draft_tokens_tpu
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -691,6 +690,10 @@ class DFlashDraftModel(nn.Module):
         Extension hook: DSpark overrides it with its markov chain, whose first
         step conditions on the anchor token in input_ids.
         """
+        from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+            argmax_draft_tokens_tpu,
+        )
+
         del input_ids
         if self.lm_head is None:
             raise ValueError("DFlash draft on TPU requires lm_head.")

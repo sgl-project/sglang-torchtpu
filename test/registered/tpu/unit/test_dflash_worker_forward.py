@@ -817,6 +817,32 @@ class TestDFlashDeferredVerifyUnpadding(CustomTestCase):
         self.assertIsNone(trimmed[5])
         self.assertFalse(verify_input.keep_outputs_padded)
 
+    def test_rows_matching_neither_shape_raise(self):
+        """Logits matching neither recorded shape must raise, not trim blindly.
+
+        Trimming against a stale padding record would hand accept a silently
+        wrong row count instead of failing.
+        """
+        block_size, logical_bs, physical_bs = 6, 2, 8
+        verify_input = SimpleNamespace(
+            keep_outputs_padded=True,
+            padding_state=SpecPaddingState(
+                logical_batch_size=logical_bs,
+                physical_batch_size=physical_bs,
+                logical_num_tokens=logical_bs * block_size,
+                physical_num_tokens=physical_bs * block_size,
+            ),
+        )
+        stale_logits = torch.zeros((physical_bs * block_size - 1, 32))
+
+        with self.assertRaises(ValueError):
+            DFlashSpecDecodeCompilePolicyMixin.prepare_spec_verify(
+                _MockCompilePolicy(b_bucketer=None),
+                SimpleNamespace(sampling_info=None),
+                verify_input,
+                stale_logits,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
