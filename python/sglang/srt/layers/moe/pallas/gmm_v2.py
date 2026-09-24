@@ -1299,7 +1299,7 @@ def make_gmm_configs(
     lhs_quant_block_size = 512
     if packed_fp4 and block_size != lhs_quant_block_size:
         raise NotImplementedError(
-            "Packed FP4 GMM requires quantization block size 512, " f"got {block_size}."
+            f"Packed FP4 GMM requires quantization block size 512, got {block_size}."
         )
 
     lhs_q_dtype = None

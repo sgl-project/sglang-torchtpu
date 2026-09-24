@@ -13,6 +13,8 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.top_k import PallasDistributedTopKConfig
 from sglang.srt.layers.sampler import (
     Sampler,
+    _SamplingMaskCapture,
+    _select_sampling_mask_rows,
     sampling_from_probs_torch,
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
@@ -274,7 +276,7 @@ def distributed_top_k_for_batch(
         return None
     if info.has_custom_logit_processor or info.logit_bias is not None:
         return None
-    if any(info.grammars or ()) or getattr(info, "sampling_mask_max_top_k", 0) > 0:
+    if any(info.grammars or ()) or info.sampling_mask_batch_indices is not None:
         return None
     if (
         info.acc_additive_penalties is not None
@@ -336,6 +338,41 @@ def sample_exponential_race(probs: torch.Tensor) -> torch.Tensor:
     return torch.argmax(probs / e, dim=-1).to(torch.int32)
 
 
+def _capture_sampling_mask(
+    weights: torch.Tensor,
+    batch_next_token_ids: torch.Tensor,
+    batch_indices: torch.Tensor,
+    token_ids: Optional[torch.Tensor] = None,
+) -> _SamplingMaskCapture:
+    """Capture filtered support for the rows requested by the base sampler."""
+    capture_weights = _select_sampling_mask_rows(weights, batch_indices)
+    capture_tokens = _select_sampling_mask_rows(batch_next_token_ids, batch_indices)
+    capture_token_ids = (
+        None
+        if token_ids is None
+        else _select_sampling_mask_rows(token_ids, batch_indices)
+    )
+    if capture_token_ids is None:
+        selected_weight = torch.gather(
+            capture_weights,
+            1,
+            capture_tokens.long().view(-1, 1),
+        ).squeeze(1)
+    else:
+        selected_weight = (
+            capture_weights
+            * (capture_token_ids == capture_tokens.view(-1, 1)).to(
+                capture_weights.dtype
+            )
+        ).sum(dim=1)
+    return _SamplingMaskCapture(
+        weights=capture_weights,
+        token_ids=capture_token_ids,
+        selected_weight=selected_weight,
+        batch_rows=batch_indices,
+    )
+
+
 class TpuSampler(Sampler):
     """Consume a pre-gather global TopK for eligible TPU sampling batches.
     Every other batch delegates to the full-vocabulary sampler implementation."""
@@ -385,16 +422,28 @@ class TpuSampler(Sampler):
         sampling_info: SamplingBatchInfo,
         positions: torch.Tensor,
         simple_sampling_case: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, Optional[_SamplingMaskCapture]]:
         """Use native XLA TopK after gathering uniform small-k probability rows.
-        This avoids a full sort when pre-gather reduction is not selected."""
+        This avoids a full sort when pre-gather reduction is not selected.
+
+        Keep the base sampler's ``(token_ids, sampling_mask_capture)`` return
+        contract. Sampling-mask requests need the filtered support as well as
+        the sampled token, even though distributed TopK is disabled for them.
+        """
+
+        capture_rows = sampling_info.sampling_mask_batch_indices
 
         if simple_sampling_case:
-            return sampling_from_probs_torch(
+            batch_next_token_ids = sampling_from_probs_torch(
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
                 unseeded_sampling_fn=sample_exponential_race,
+            )
+            return batch_next_token_ids, (
+                None
+                if capture_rows is None
+                else _capture_sampling_mask(probs, batch_next_token_ids, capture_rows)
             )
         top_k = sampling_info.uniform_top_k
         needs_top_p_or_min_p = (
@@ -419,11 +468,21 @@ class TpuSampler(Sampler):
             sampled_top_k_position = sampling_from_probs_torch(
                 global_top_k_probs, unseeded_sampling_fn=sample_exponential_race
             )
-            return torch.gather(
+            batch_next_token_ids = torch.gather(
                 global_top_k_token_ids,
                 dim=1,
                 index=sampled_top_k_position.to(torch.int64).view(-1, 1),
             ).view(-1)
+            return batch_next_token_ids, (
+                None
+                if capture_rows is None
+                else _capture_sampling_mask(
+                    global_top_k_probs,
+                    batch_next_token_ids,
+                    capture_rows,
+                    global_top_k_token_ids,
+                )
+            )
 
         if sampling_info.sampling_seed is None and _use_bsearch_filtering(probs):
             # Sort-free path: the torch fallback below needs a full-vocab sort
@@ -440,10 +499,17 @@ class TpuSampler(Sampler):
                 need_top_p=sampling_info.need_top_p_sampling,
                 need_min_p=sampling_info.need_min_p_sampling,
             )
-            return sample_exponential_race(filtered_probs)
+            batch_next_token_ids = sample_exponential_race(filtered_probs)
+            return batch_next_token_ids, (
+                None
+                if capture_rows is None
+                else _capture_sampling_mask(
+                    filtered_probs, batch_next_token_ids, capture_rows
+                )
+            )
 
         # Seeded (deterministic) sampling keeps the sort-based reference path.
-        return top_k_top_p_min_p_sampling_from_probs_torch(
+        sample_result = top_k_top_p_min_p_sampling_from_probs_torch(
             probs,
             sampling_info.top_ks,
             sampling_info.top_ps,
@@ -451,4 +517,12 @@ class TpuSampler(Sampler):
             sampling_info.need_min_p_sampling,
             sampling_info.sampling_seed,
             positions,
+            return_filtered_probs=capture_rows is not None,
+        )
+        if capture_rows is None:
+            return sample_result, None
+
+        batch_next_token_ids, filtered_probs, token_ids, _ = sample_result
+        return batch_next_token_ids, _capture_sampling_mask(
+            filtered_probs, batch_next_token_ids, capture_rows, token_ids
         )

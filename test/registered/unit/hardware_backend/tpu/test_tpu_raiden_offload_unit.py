@@ -30,6 +30,7 @@ from unittest.mock import Mock, patch
 
 import torch
 import zmq
+from google.protobuf.wrappers_pb2 import Int64Value
 
 from sglang.srt.disaggregation.base.conn import BaseKVSender, KVArgs, StateType
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeReqToTokenPool
@@ -125,6 +126,40 @@ class TestDecodeReqToTokenPool(CustomTestCase):
 
 
 class TestRaidenHostPoolPaging(CustomTestCase):
+    def test_smaller_host_pool_warns_instead_of_failing(self):
+        device_pool = SimpleNamespace(
+            size=32,
+            store_dtype=torch.bfloat16,
+            start_layer=0,
+            end_layer=1,
+            layer_num=1,
+            get_fused_kv_buffer=Mock(
+                return_value=torch.empty((8, 4), dtype=torch.bfloat16)
+            ),
+        )
+
+        with (
+            patch(
+                "sglang.srt.hardware_backend.tpu.raiden_transfer.RaidenKVTransfer"
+            ) as transfer_cls,
+            self.assertLogs(
+                "sglang.srt.hardware_backend.tpu.kv_pool_host", level="WARNING"
+            ) as logs,
+        ):
+            pool = TpuRaidenHostKVCache(
+                device_pool,
+                host_to_device_ratio=0.5,
+                host_size=0,
+                page_size=4,
+                layout="page_first_fused",
+            )
+
+        self.assertEqual(pool.size, 20)
+        self.assertLess(pool.size, device_pool.size)
+        self.assertIn("L2 cache effectiveness is reduced", logs.output[0])
+        device_pool.get_fused_kv_buffer.assert_called_once_with(0)
+        transfer_cls.assert_called_once_with(device_pool, 5)
+
     def test_decode_kv_args_include_raiden_metadata(self):
         captured = {}
 
@@ -1955,6 +1990,20 @@ class TestRaidenChunkedResharding(CustomTestCase):
         uuid = mgr._engine.register_active_plan.call_args.args[0]
         self.assertEqual(mgr._reshard_plans, {self.ROOM: {"41#0": uuid}})
         return mgr, uuid
+
+    def test_chunk_plan_id_fits_positive_int64(self):
+        for upper_bound in (False, True):
+            with self.subTest(upper_bound=upper_bound):
+                with patch(
+                    "secrets.randbelow",
+                    side_effect=lambda bound: bound - 1 if upper_bound else 0,
+                ):
+                    mgr, uuid = self._decode_with_chunk_plan()
+
+                _, req = mgr._engine.register_active_plan.call_args.args
+                self.assertGreater(uuid, 0)
+                # StartTransferRequest.uuid uses protobuf's signed int64 range.
+                self.assertEqual(Int64Value(value=uuid).value, req.uuid)
 
     def test_aborted_room_keeps_its_chunk_plan_until_the_push_settles(self):
         mgr, uuid = self._decode_with_chunk_plan()

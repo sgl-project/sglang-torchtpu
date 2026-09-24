@@ -201,9 +201,7 @@ def main():
             raise RuntimeError("no nodes returned")
         found = discover(nodes, a.lane, a.hosts)
     except Exception as e:  # noqa: BLE001 -- discovery must never block a test
-        log(
-            f"⚠️  pool discovery skipped ({type(e).__name__}: {e}); using topology.yaml"
-        )
+        log(f"⚠️  pool discovery skipped ({type(e).__name__}: {e}); using topology.yaml")
         print(" ".join(static))
         return
 

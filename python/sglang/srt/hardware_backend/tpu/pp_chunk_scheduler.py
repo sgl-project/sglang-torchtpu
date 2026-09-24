@@ -65,11 +65,9 @@ class TpuPipelinePrefillAdder(PrefillAdder):
         self.step_pairs = 0.0
         self.step_squares = 0.0
         self.step_schedule = 0
-        if self.running_batch is not None and self.rem_total_token_offset:
+        mixed = kwargs.get("num_mixed_decode_tokens", args[7] if len(args) > 7 else 0)
+        if self.running_batch is not None and mixed:
             # Mixed decode tokens have already been reserved in rem_input_tokens.
-            mixed = kwargs.get(
-                "num_mixed_decode_tokens", args[7] if len(args) > 7 else 0
-            )
             for req in self.running_batch.reqs[:mixed]:
                 self._account(1, len(req.origin_input_ids) + len(req.output_ids) - 1)
 

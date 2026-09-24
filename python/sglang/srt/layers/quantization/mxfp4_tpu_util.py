@@ -331,9 +331,9 @@ def process_mxfp4_moe_weights_native(
     pad_k_num_blocks = pad_k_elements // MXFP4_BLOCK_SIZE  # padded scale blocks
     # (For align_to=128 and MXFP4_BLOCK_SIZE=32, pad_n is a multiple of 32 iff
     #  align_to is. 128 % 32 == 0, so this holds.)
-    assert (
-        pad_k_elements % MXFP4_BLOCK_SIZE == 0
-    ), f"align_to={align_to} must be a multiple of MXFP4_BLOCK_SIZE={MXFP4_BLOCK_SIZE}"
+    assert pad_k_elements % MXFP4_BLOCK_SIZE == 0, (
+        f"align_to={align_to} must be a multiple of MXFP4_BLOCK_SIZE={MXFP4_BLOCK_SIZE}"
+    )
     num_blocks_inter_padded = num_blocks_inter + pad_k_num_blocks
 
     # --- Weights ---

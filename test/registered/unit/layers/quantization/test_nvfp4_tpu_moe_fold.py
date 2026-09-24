@@ -878,6 +878,7 @@ class TestNvfp4ModelOptTpuGuard(CustomTestCase):
         model_config = types.SimpleNamespace(
             quantization="fp8",
             is_fp4_experts=False,
+            hf_config=types.SimpleNamespace(architectures=[]),
             nvfp4_moe_meta={
                 "group_size": BLOCK_SIZE,
                 "exclude_modules": ["vision"],

@@ -10,6 +10,7 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import secrets
 import threading
 import time
 from typing import TYPE_CHECKING, Any, List, Optional
@@ -197,8 +198,9 @@ class RaidenSenderMixin:
                 ]
                 index = self._prefill.chunk_seq.get(room, 0)
                 self._prefill.chunk_seq[room] = index + 1
-                self._uuid_seq += 1
-                uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+                # Independent prefills share a decoder's native UUID map.
+                # Zero means no transfer; reshard RPCs require signed int64.
+                uuid = secrets.randbelow((1 << 63) - 1) + 1
                 addr = self._prefill.decode_addr[room]
             req_id = f"{room}#{index}"
             self._register_sender_read(

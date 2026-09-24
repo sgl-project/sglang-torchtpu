@@ -106,23 +106,23 @@ class TestTpuPlatformSurface(unittest.TestCase):
     def test_supporting_platforms_get_plain_pickle(self):
         import pickle
 
-        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+        from sglang.multimodal_gen.runtime.distributed import utils as dist_utils
 
         platform = MagicMock()
         platform.supports_device_tensor_pickle.return_value = True
         payload = [torch.arange(4, dtype=torch.float32), {"k": 1}]
-        with patch.object(dist_utils, "current_platform", platform):
+        with patch.object(dist_utils.platforms, "current_platform", platform):
             self.assertEqual(dist_utils._dumps(payload), pickle.dumps(payload))
 
     def test_cpu_tensors_are_pickled_untouched(self):
         import pickle
 
-        from sglang.multimodal_gen.runtime.utils import distributed as dist_utils
+        from sglang.multimodal_gen.runtime.distributed import utils as dist_utils
 
         platform = MagicMock()
         platform.supports_device_tensor_pickle.return_value = False
         payload = [torch.arange(6, dtype=torch.float32), "text", 7]
-        with patch.object(dist_utils, "current_platform", platform):
+        with patch.object(dist_utils.platforms, "current_platform", platform):
             restored = pickle.loads(dist_utils._dumps(payload))
         self.assertTrue(torch.equal(restored[0], payload[0]))
         self.assertEqual(restored[1:], ["text", 7])

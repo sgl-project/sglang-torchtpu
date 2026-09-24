@@ -77,7 +77,7 @@ LAUNCH_ENV = {
     "ENABLE_CACHE_REPORT": "1",
     "ENABLE_PROFILER_ENDPOINT": "0",
     "EXTRA_ARGS": (
-        "--reasoning-parser gpt-oss " f"--served-model-name {SERVED_MODEL_NAME}"
+        f"--reasoning-parser gpt-oss --served-model-name {SERVED_MODEL_NAME}"
     ),
 }
 

@@ -31,7 +31,7 @@ from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_patte
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +581,11 @@ class TestAttachAdditionalStopTokenIds(unittest.TestCase):
         attach_additional_stop_token_ids(tok)
         self.assertEqual(tok.additional_stop_token_ids, {128008})
 
+    def test_k2_horizon_im_end_registers_as_stop(self):
+        tok = self._tokenizer({"<|ifm|im_end|>": 64019})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {64019})
+
     def test_no_known_marker_yields_none(self):
         tok = self._tokenizer({"<|other|>": 7})
         attach_additional_stop_token_ids(tok)
@@ -781,8 +786,11 @@ class TestDynamicModuleCacheLock(unittest.TestCase):
         other_holder = filelock.FileLock(
             hf_transformers_patches._dynamic_module_cache_lock().lock_file
         )
-        with other_holder, patch.object(
-            hf_transformers_patches, "_DYNAMIC_MODULE_LOCK_TIMEOUT_S", 0.1
+        with (
+            other_holder,
+            patch.object(
+                hf_transformers_patches, "_DYNAMIC_MODULE_LOCK_TIMEOUT_S", 0.1
+            ),
         ):
             hf_transformers_patches._dynamic_module_locks.clear()
             with self.assertRaises(filelock.Timeout):

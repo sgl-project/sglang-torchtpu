@@ -115,7 +115,6 @@ class MetadataRef:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BaseBufferedRef(pltpu.BufferedRef):
-
     cfg: config.GDNConfig = dataclasses.field(metadata=dict(static=True))
     # NOTE: Despite being ref, metadata_ref should be set to static. This is
     # because the memory will be allocated outside of kernel and metadata_ref
@@ -154,7 +153,6 @@ class BaseBufferedRef(pltpu.BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class InBufferedRef(BaseBufferedRef):
-
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -194,7 +192,6 @@ class InBufferedRef(BaseBufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
-
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -234,7 +231,6 @@ class OutBufferedRef(BaseBufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class StateBufferedRef(BaseBufferedRef):
-
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -244,7 +240,6 @@ class StateBufferedRef(BaseBufferedRef):
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
-
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]

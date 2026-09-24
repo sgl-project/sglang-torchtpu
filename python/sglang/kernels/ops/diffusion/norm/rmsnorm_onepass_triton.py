@@ -71,6 +71,7 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
 
 triton_one_pass_rms_norm = select_impl(
     triton_one_pass_rms_norm,
+    tpu=lazy_fallback("torch", "triton_one_pass_rms_norm_native"),
     # MPS keeps the api-logging wrapper the Triton entry point carries.
     mps=debug_kernel_api(lazy_fallback("torch", "triton_one_pass_rms_norm_native")),
     cpu=lazy_fallback("torch", "triton_one_pass_rms_norm_native"),

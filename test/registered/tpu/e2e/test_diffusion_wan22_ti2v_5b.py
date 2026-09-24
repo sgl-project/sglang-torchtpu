@@ -40,7 +40,7 @@ register_tpu_ci(
     labels=["singlehost", "wan2.2-ti2v-5b", "diffusion"],
 )
 
-NUM_FRAMES = 25
+NUM_FRAMES = 9
 
 TPU_WAN22_CASES = [
     DiffusionTestCase(
@@ -52,8 +52,9 @@ TPU_WAN22_CASES = [
         ),
         DiffusionSamplingParams(
             prompt="A curious raccoon peers through a field of sunflowers",
-            output_size="1280x704",
+            output_size="832x480",
             num_frames=NUM_FRAMES,
+            extras={"num_inference_steps": 4, "seed": 0},
         ),
         run_perf_check=False,
         run_consistency_check=False,

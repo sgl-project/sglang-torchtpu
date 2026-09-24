@@ -95,10 +95,16 @@ class TpuRaidenHostKVCache(HostKVCache):
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
 
-        assert self.size > device_pool.size, (
-            "Host KV pool must be larger than the device pool "
-            f"(host={self.size} <= device={device_pool.size})."
-        )
+        if self.size <= device_pool.size:
+            logger.warning(
+                "HiCache %s host pool (%d tokens) is smaller than the device "
+                "pool (%d tokens); L2 cache effectiveness is reduced. "
+                "Consider increasing --hicache-ratio (or --hicache-size) for "
+                "higher L2 cache hit rate.",
+                pool_label,
+                self.size,
+                device_pool.size,
+            )
 
         from sglang.srt.hardware_backend.tpu.raiden_transfer import RaidenKVTransfer
 
@@ -145,9 +151,9 @@ class TpuRaidenHostKVCache(HostKVCache):
         Returns page-aligned token indices (int64) so ``// page_size`` yields
         exact raiden page ids, or ``None`` if the pool is full.
         """
-        assert (
-            need_size % self.page_size == 0
-        ), "host alloc size must be a multiple of page_size"
+        assert need_size % self.page_size == 0, (
+            "host alloc size must be a multiple of page_size"
+        )
         num_pages = need_size // self.page_size
         with self.lock:
             if num_pages > len(self.free_pages):

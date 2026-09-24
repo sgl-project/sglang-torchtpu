@@ -16,8 +16,9 @@ class TestKVCacheDtype(unittest.TestCase):
             (None, "auto", torch.bfloat16),
             ("FP8", "fp8_e4m3", torch.float8_e4m3fn),
         ):
-            with self.subTest(quant_algo=quant_algo), patch(
-                "sglang.srt.mem_cache.kv_cache_dtype._is_hip", False
+            with (
+                self.subTest(quant_algo=quant_algo),
+                patch("sglang.srt.mem_cache.kv_cache_dtype._is_hip", False),
             ):
                 resolved = configure_kv_cache_dtype(
                     server_args_kv_cache_dtype="mxint8",
@@ -46,8 +47,11 @@ class TestKVCacheDtype(unittest.TestCase):
 
     def test_mxint8_requires_bfloat16_model(self):
         for model_dtype in (torch.float16, torch.float32):
-            with self.subTest(model_dtype=model_dtype), self.assertRaisesRegex(
-                ValueError, "MXINT8 KV cache requires a BF16 model"
+            with (
+                self.subTest(model_dtype=model_dtype),
+                self.assertRaisesRegex(
+                    ValueError, "MXINT8 KV cache requires a BF16 model"
+                ),
             ):
                 configure_kv_cache_dtype(
                     server_args_kv_cache_dtype="mxint8",

@@ -67,7 +67,6 @@ def _has_torch_tpu() -> bool:
 
 @unittest.skipUnless(_has_torch_tpu(), _SKIP_REASON)
 class TestGDNAttentionOp(CustomTestCase):
-
     N_KQ = 2
     N_V = 8
     D_K = 128

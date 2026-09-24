@@ -142,7 +142,6 @@ def apply_rope(
 
 
 class MoonViTEncoderLayer(nn.Module):
-
     def __init__(
         self,
         num_heads: int,
@@ -358,7 +357,6 @@ def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
 
 
 class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
-
     def __init__(
         self,
         height: int,
@@ -513,7 +511,6 @@ class Rope2DPosEmbRepeated(nn.Module):
 
 
 class MoonVision3dPatchEmbed(nn.Module):
-
     def __init__(
         self,
         out_dim: int,
@@ -525,14 +522,14 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_type: str = "divided_fixed",
     ):
         super().__init__()
-        assert isinstance(
-            patch_size, int | Sequence
-        ), f"Invalid patch_size type: {type(patch_size)}"
+        assert isinstance(patch_size, int | Sequence), (
+            f"Invalid patch_size type: {type(patch_size)}"
+        )
         if isinstance(patch_size, int):
             patch_size = (patch_size, patch_size)
-        assert (
-            len(patch_size) == 2
-        ), f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        assert len(patch_size) == 2, (
+            f"Expected patch_size to be a tuple of 2, got {patch_size}"
+        )
         self.patch_size = patch_size
 
         self.proj = Conv2dLayer(
@@ -580,9 +577,9 @@ class MoonViT3dEncoder(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert (
-            video_attn_type == "spatial_temporal"
-        ), f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        assert video_attn_type == "spatial_temporal", (
+            f'video_attn_type must be "spatial_temporal", got {video_attn_type}'
+        )
         self.video_attn_type = video_attn_type
         self.rope_2d = Rope2DPosEmbRepeated(
             block_cfg["hidden_dim"] // block_cfg["num_heads"], 512, 512
@@ -822,9 +819,12 @@ def mm_projection_auto(
 class KimiK25ForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
-    # Decode goes through general_mm_embed_routine's precomputed input_embeds;
-    # the TPU decoder compile policy reads this to trace the same call shape.
-    decode_embeds_in_language_model: bool = False
+    # On TPU, decode hands the compiled language model raw input_ids so the
+    # token embedding runs inside the graph instead of as eager programs in
+    # front of every step. Prefill keeps general_mm_embed_routine, which is
+    # where image embeddings are spliced. The TPU decoder compile policy reads
+    # this to warm the input_ids decode variant.
+    decode_embeds_in_language_model: bool = _is_tpu
 
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
@@ -1042,6 +1042,18 @@ class KimiK25ForConditionalGeneration(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        if (
+            self.decode_embeds_in_language_model
+            and forward_batch.forward_mode.is_decode()
+        ):
+            # One new token per sequence, never an image: embed in-graph.
+            return self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

@@ -98,9 +98,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
 
         num_q_heads = num_q_heads if num_q_heads is not None else self.NUM_Q_HEADS
         num_kv_heads = num_kv_heads if num_kv_heads is not None else self.NUM_KV_HEADS
-        assert (
-            num_q_heads % num_kv_heads == 0
-        ), "num_q_heads must be a multiple of num_kv_heads for GQA tests"
+        assert num_q_heads % num_kv_heads == 0, (
+            "num_q_heads must be a multiple of num_kv_heads for GQA tests"
+        )
 
         for kv_len, q_len in seqs:
             assert kv_len >= q_len, "kv_len must include the new q_len tokens"
@@ -109,9 +109,9 @@ class TestRaggedPagedAttentionV3(unittest.TestCase):
                 f"({self.PAGES_PER_SEQ * self.PAGE_SIZE})"
             )
         num_seqs = len(seqs)
-        assert (
-            num_seqs * self.PAGES_PER_SEQ <= self.TOTAL_NUM_PAGES
-        ), "too many sequences for the configured page table"
+        assert num_seqs * self.PAGES_PER_SEQ <= self.TOTAL_NUM_PAGES, (
+            "too many sequences for the configured page table"
+        )
 
         dtype = jnp.bfloat16
         # KV storage dtype: bf16 by default, or fp8 (e4m3 / e5m2) to exercise

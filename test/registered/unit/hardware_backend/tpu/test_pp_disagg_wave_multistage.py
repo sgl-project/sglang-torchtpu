@@ -24,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -158,7 +159,6 @@ def stage(fabric, rank, mode, schedule):
     scheduler.enable_staging = False
     scheduler.process_pending_chunked_abort = Mock()
     scheduler.process_prefill_chunk = Mock()
-    scheduler.process_input_requests = Mock()
     scheduler.dp_attn_adapter = SimpleNamespace(
         maybe_prepare_mlp_sync_batch=lambda x: x
     )
@@ -199,7 +199,8 @@ def stage(fabric, rank, mode, schedule):
         assert data == ["requests", step[0]], (rank, step[0], data)
         return data
 
-    scheduler.request_receiver = SimpleNamespace(recv_requests=receive_requests)
+    scheduler.ingest_requests = receive_requests
+    scheduler._process_hicache_events = Mock()
 
     def votes(kind):
         def get(*args):
@@ -234,7 +235,11 @@ def stage(fabric, rank, mode, schedule):
             None
             if item is None
             else SimpleNamespace(
-                forward_mode=item, reqs=[], return_logprob=False, ordinal=step[0]
+                forward_mode=item,
+                reqs=[],
+                return_logprob=False,
+                ordinal=step[0],
+                spec_algorithm=SpeculativeAlgorithm.NONE,
             )
         )
         return SimpleNamespace(batch_to_run=current, running_batch=running_batch)
@@ -267,10 +272,12 @@ def stage(fabric, rank, mode, schedule):
         rank, "output", data
     )
     scheduler._pp_recv_dict_from_prev_stage = lambda: fabric.receive(rank, "output")
-    scheduler._pp_prep_batch_result = lambda target, metadata, outputs: outputs
+    scheduler._pp_prep_batch_result = lambda target, metadata, outputs: SimpleNamespace(
+        logits_output=None, next_token_ids=outputs["next_token_ids"]
+    )
 
-    def process_batch(target, outputs):
-        assert int(outputs["next_token_ids"][0]) == target.ordinal
+    def process_batch(target, result):
+        assert int(result.next_token_ids[0]) == target.ordinal
         processed.append(target.ordinal)
 
     scheduler._pp_process_batch_result = process_batch
@@ -328,18 +335,23 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
                 parallel = SimpleNamespace(
                     pp_async_batch_depth=1, enable_dsa_prefill_context_parallel=False
                 )
-                with patch.object(scheduler_pp_mixin, "_is_tpu", True), patch.object(
-                    scheduler_pp_mixin, "get_parallel", return_value=parallel
-                ), patch.object(
-                    scheduler_pp_mixin,
-                    "get_disagg",
-                    return_value=SimpleNamespace(
-                        disaggregation_decode_enable_offload_kvcache=False
+                with (
+                    patch.object(scheduler_pp_mixin, "_is_tpu", True),
+                    patch.object(
+                        scheduler_pp_mixin, "get_parallel", return_value=parallel
                     ),
-                ), patch.object(
-                    scheduler_pp_mixin,
-                    "ScheduleBatch",
-                    side_effect=lambda **kw: SimpleNamespace(**kw),
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "get_disagg",
+                        return_value=SimpleNamespace(
+                            disaggregation_decode_enable_offload_kvcache=False
+                        ),
+                    ),
+                    patch.object(
+                        scheduler_pp_mixin,
+                        "ScheduleBatch",
+                        side_effect=lambda **kw: SimpleNamespace(**kw),
+                    ),
                 ):
                     threads = [
                         threading.Thread(target=run, args=(scheduler,), daemon=True)

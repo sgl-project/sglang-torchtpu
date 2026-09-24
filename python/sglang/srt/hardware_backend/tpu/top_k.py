@@ -433,8 +433,7 @@ def distributed_tpu_top_k(
         )
     if local_logits.ndim != 2:
         raise ValueError(
-            "distributed_tpu_top_k expects a 2D tensor, "
-            f"got shape {local_logits.shape}"
+            f"distributed_tpu_top_k expects a 2D tensor, got shape {local_logits.shape}"
         )
     if local_logits.shape[-1] != shard.width:
         raise RuntimeError(

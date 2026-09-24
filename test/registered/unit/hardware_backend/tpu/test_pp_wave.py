@@ -219,6 +219,19 @@ class TestWaveGuards(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "above the wave"):
             wave.end_iteration({"hidden_states": big, "residual": big})
 
+    def test_rejects_a_hand_off_the_sum_would_change(self):
+        """Only hidden states plus residual in the buffer's dtype pass: another
+        key would be dropped, and a wider sum does not fit the buffer."""
+        wave = _wave(0, 2)
+        wave.begin_iteration(True)
+        rows = torch.zeros(ROWS, HIDDEN)
+        with self.assertRaisesRegex(ValueError, "hands on exactly"):
+            wave.end_iteration(
+                {"hidden_states": rows, "residual": rows, "topk_indices": rows}
+            )
+        with self.assertRaisesRegex(ValueError, "carries torch.float32"):
+            wave.end_iteration({"hidden_states": rows, "residual": rows.double()})
+
     def test_receive_needs_an_iteration_with_a_batch(self):
         wave = _wave(1, 3)
         wave.begin_iteration(False)

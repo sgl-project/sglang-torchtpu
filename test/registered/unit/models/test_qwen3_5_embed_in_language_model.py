@@ -98,8 +98,8 @@ def _make(lm, *, embeds_in_lm, **kw):
         logits_processor=lambda *args: ("logits", args),
         pooler=lambda hidden, fb: ("pooled", hidden),
     )
-    stub._embeds_in_language_model = (
-        lambda fb: Qwen3VLForConditionalGeneration._embeds_in_language_model(stub, fb)
+    stub._embeds_in_language_model = lambda fb: (
+        Qwen3VLForConditionalGeneration._embeds_in_language_model(stub, fb)
     )
     return stub
 

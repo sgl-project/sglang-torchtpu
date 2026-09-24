@@ -365,6 +365,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         assert self.b_bucketer is not None
         return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
 
+    def max_padded_tokens(self) -> int:
+        """The most token rows a forward is padded to: the last token bucket,
+        or the last batch bucket for a decode batch."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        return max(self.t_bucketer.max_val, self.b_bucketer.max_val)
+
     def _extend_compile_cases(self) -> list[tuple[int, int, ForwardMode]]:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
@@ -614,7 +621,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor,
         _positions: torch.Tensor,
         forward_batch: Any,
@@ -626,13 +633,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
             input_ids.shape[0],
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1001,6 +1010,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         forward_batch = (
             kwargs["forward_batch"] if "forward_batch" in kwargs else args[2]
         )
+        prepared_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
+        if prepared_batch is not forward_batch:
+            if "forward_batch" in kwargs:
+                kwargs["forward_batch"] = prepared_batch
+            else:
+                args = (*args[:2], prepared_batch, *args[3:])
+            forward_batch = prepared_batch
         if profile_prefix is not None:
             from sglang.srt.hardware_backend.tpu.pp_profile import set_profile_inputs
 
@@ -1307,7 +1323,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
     def _direct_compile_specialization_key(
         self,
-        _attention_metadata: Any,
+        attention_metadata: Any,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: Any,
@@ -1321,7 +1337,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             if self._compiles_logits_processor()
             else None
         )
-        return (
+        key = (
             forward_batch.forward_mode,
             forward_batch.capture_hidden_mode,
             forward_batch.batch_size,
@@ -1329,6 +1345,8 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
+        tile = getattr(attention_metadata, "prefill_kv_tile", None)
+        return key if tile is None else (*key, ("prefill_kv_tile", tile))
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
@@ -1481,8 +1499,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
         logger.info(
-            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets "
-            "in %.1fs",
+            "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
             time.perf_counter() - start,
         )

@@ -79,7 +79,7 @@ class TestStreamedWeightLoading(CustomTestCase):
 
     def test_materialize_is_identity_for_ordinary_tensors(self):
         t = torch.zeros(2)
-        self.assertIs(gpt_oss._materialize_streamed(t), t)
+        self.assertIs(gpt_oss._own_if_runai_streamed(t), t)
 
 
 if __name__ == "__main__":

@@ -143,7 +143,7 @@ def main():
         _warm_serial(args.base_url, args.model, PREFILL_BUCKETS)
     if not args.skip_phase_2:
         _warm_concurrent(args.base_url, args.model, K_BUCKETS, isl=64, osl=2)
-    print(f"TPU warmup done in {time.perf_counter()-t0:.1f} s.", flush=True)
+    print(f"TPU warmup done in {time.perf_counter() - t0:.1f} s.", flush=True)
 
 
 if __name__ == "__main__":

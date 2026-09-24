@@ -10,6 +10,7 @@ not instantiated on its own and deliberately defines no ``__init__``.
 
 from __future__ import annotations
 
+import secrets
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -117,8 +118,7 @@ class RaidenReceiverMixin:
                 total = len(remote_blocks)
                 if self._decode.remote_total.get(room, total) != total:
                     logger.warning(
-                        "RaidenKVManager rank%d room %s announced %d pages but "
-                        "sent %d",
+                        "RaidenKVManager rank%d room %s announced %d pages but sent %d",
                         self.attn_tp_rank,
                         room,
                         self._decode.remote_total[room],
@@ -664,9 +664,9 @@ class RaidenReceiverMixin:
             (p_rank, sources_map[p_rank][1][lo:hi]) for p_rank in sorted(sources_map)
         ]
         dst = local_blocks[window.local_offset : window.local_offset + window.length]
-        with self._state_lock:
-            self._uuid_seq += 1
-            uuid = (self._uuid_seq << 20) | (self._local_rank & 0xFFFFF)
+        # Independent decoders share a prefill. Use positive IDs that
+        # fit the reshard RPC's signed int64 field.
+        uuid = secrets.randbelow((1 << 63) - 1) + 1
         req_id = f"{room}#{index}"
         req = build_receiver_request(
             pb2,
@@ -699,9 +699,9 @@ class RaidenReceiverMixin:
             if room not in self._decode.reshard_meta or room in self._aborted:
                 return
             self._decode.reshard_sources[room][src_rank] = prefill_blocks
-            self._decode.reshard_swa_sources.setdefault(room, {})[
-                src_rank
-            ] = prefill_swa_blocks
+            self._decode.reshard_swa_sources.setdefault(room, {})[src_rank] = (
+                prefill_swa_blocks
+            )
             aux_index = self._decode.reshard_meta[room].get("aux_index")
             src_attn_tp = self._decode.reshard_meta[room]["src_attn_tp"]
             have = {nid % src_attn_tp for nid in self._decode.reshard_sources[room]}

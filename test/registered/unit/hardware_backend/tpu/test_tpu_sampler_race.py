@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.sampler import sample_exponential_race
 from sglang.srt.layers.sampler import sampling_from_probs_torch
 from sglang.test.ci.ci_register import register_tpu_ci
@@ -15,14 +16,15 @@ class TestExponentialRaceSampler(unittest.TestCase):
         probs = torch.tensor([[0.25, 0.75], [0.6, 0.4]])
         expected = torch.tensor([[1], [0]], dtype=torch.int64)
         callback = Mock(return_value=expected)
-        with patch(
-            "sglang.srt.layers.sampler.torch.multinomial", return_value=expected
-        ) as default:
-            result = sampling_from_probs_torch(probs)
-            default.assert_called_once_with(probs, num_samples=1)
-            self.assertEqual(result.tolist(), [1, 0])
-            self.assertEqual(result.dtype, torch.int32)
-            default.reset_mock()
+        with envs.SGLANG_OPT_USE_GUMBEL_SAMPLE.override(False):
+            with patch(
+                "sglang.srt.layers.sampler.torch.multinomial", return_value=expected
+            ) as default:
+                result = sampling_from_probs_torch(probs)
+                default.assert_called_once_with(probs, num_samples=1)
+                self.assertEqual(result.tolist(), [1, 0])
+                self.assertEqual(result.dtype, torch.int32)
+        with patch("sglang.srt.layers.sampler.torch.multinomial") as default:
             result = sampling_from_probs_torch(probs, unseeded_sampling_fn=callback)
             callback.assert_called_once_with(probs)
             default.assert_not_called()

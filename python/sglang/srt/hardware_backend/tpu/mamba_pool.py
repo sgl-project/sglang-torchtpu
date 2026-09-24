@@ -98,8 +98,7 @@ class TpuMambaPool(MambaPool):
         # TPU GDN path needs.
         if speculative_num_draft_tokens is not None:
             raise NotImplementedError(
-                "Speculative decoding is not supported for the TPU GDN state "
-                "pool yet."
+                "Speculative decoding is not supported for the TPU GDN state pool yet."
             )
         if enable_linear_replayssm:
             raise NotImplementedError(
@@ -108,8 +107,7 @@ class TpuMambaPool(MambaPool):
             )
         if envelope_layout:
             raise NotImplementedError(
-                "Page-major envelope mamba layout is CUDA-only; not supported "
-                "on TPU."
+                "Page-major envelope mamba layout is CUDA-only; not supported on TPU."
             )
 
         conv_state_shapes = cache_params.shape.conv  # list of (conv_dim, K-1)
@@ -137,6 +135,7 @@ class TpuMambaPool(MambaPool):
         self.linear_replayssm_cache_len = linear_replayssm_cache_len
         self.replayssm_is_kda = False
         self.replayssm_write_pos = None
+        self.replayssm_spec_write_pos = None
         self.replayssm_spec_fold = False
         self.replayssm_cache_base = None
         self.replayssm_is_flush = None

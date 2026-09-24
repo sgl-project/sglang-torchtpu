@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from types import SimpleNamespace as NS
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,7 +13,14 @@ from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
     profile_and_install_cost_model,
 )
 from sglang.srt.hardware_backend.tpu.pp_chunks import StepCostModel
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    DecLockRefResult,
+    IncLockRefResult,
+)
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.runtime_context import get_context
 
 
@@ -178,23 +186,28 @@ def test_existing_partial_request_cannot_be_replaced(monkeypatch):
 
 @pytest.mark.parametrize("tokens", [5, 129, 4095])
 @pytest.mark.parametrize("has_chunked_req", [False, True])
-def test_real_admission_finishes_unaligned_prompt(monkeypatch, tokens, has_chunked_req):
-    import sglang.srt.managers.schedule_policy as policy
-
-    monkeypatch.setattr(policy, "is_dsa_prefill_cp_in_seq_split", lambda: False)
-    monkeypatch.setattr(policy, "is_prefill_context_parallel_enabled", lambda: False)
-    cache = NS(
-        disable=False,
-        supports_mamba=lambda: False,
-        evictable_size=lambda: 0,
-        is_tree_cache=lambda: False,
-        inc_lock_ref=lambda node: None,
-        dec_lock_ref=lambda node: None,
+def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
+    cache = MagicMock()
+    cache.disable = False
+    cache.supports_mamba.return_value = False
+    cache.is_tree_cache.return_value = False
+    cache.evictable_size.return_value = 0
+    cache.full_evictable_size.return_value = 0
+    cache.inc_lock_ref.return_value = IncLockRefResult()
+    cache.dec_lock_ref.return_value = DecLockRefResult()
+    cache.buffer_pipeline = None
+    allocator = MagicMock()
+    allocator.page_size = 128
+    allocator.available_size.return_value = 65536
+    allocator.full_available_size.return_value = 65536
+    allocator.swa_req_ring = False
+    allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+        PrefillBudget(allocator, tree_cache, **kwargs)
     )
     obj = TpuPipelinePrefillAdder(
         page_size=128,
         tree_cache=cache,
-        token_to_kv_pool_allocator=NS(available_size=lambda: 65536),
+        token_to_kv_pool_allocator=allocator,
         running_batch=None,
         new_token_ratio=1.0,
         rem_input_tokens=16384,
@@ -202,12 +215,23 @@ def test_real_admission_finishes_unaligned_prompt(monkeypatch, tokens, has_chunk
         cost=cost(),
         step_limit=16384,
     )
-    request = req(tokens)
+    request = MagicMock(spec=Req)
+    request.kv = ReqKvInfo()
+    request.rid = "r"
+    request.cache_request_handle = CacheRequestHandle(request.rid, 0)
+    request.origin_input_ids = [0] * tokens
+    request.output_ids = []
+    request.prefix_indices = []
+    request.full_untruncated_fill_ids = [0] * tokens
     request.sampling_params = NS(ignore_eos=False, max_new_tokens=16)
-    request.host_hit_length = request.storage_hit_length = 0
     request.retracted_stain = False
+    request.host_hit_length = request.swa_host_hit_length = 0
+    request.storage_hit_length = request.host_loaded_length = 0
+    request.materialized_host_hit_len.return_value = 0
+    request.fulfilled_storage_hit_len.return_value = 0
+    request.needs_host_load_back.return_value = False
     request.last_node = None
-    request.set_extend_range = lambda start, end: setattr(
+    request.set_extend_range.side_effect = lambda start, end: setattr(
         request, "extend_range", NS(length=end - start)
     )
     assert obj.add_one_req(request, has_chunked_req, None) == AddReqResult.CONTINUE

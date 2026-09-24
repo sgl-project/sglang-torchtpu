@@ -24,7 +24,6 @@ WORKDIR /sgl-workspace/sglang
 # resolution succeeds without invalidating on SGLang source changes.
 COPY README.md LICENSE ./
 COPY python/pyproject_tpu.toml ./python/pyproject.toml
-COPY scripts/ci/utils/sgl_eval_ref.sh ./scripts/ci/utils/sgl_eval_ref.sh
 COPY scripts/ci/tpu/warm_mmlu_cache.py ./scripts/ci/tpu/warm_mmlu_cache.py
 
 # Install the pinned TPU stack (dev_tpu extra = all_tpu + test + ray) without sglang itself.
@@ -40,7 +39,7 @@ RUN --mount=type=secret,id=gcp_token \
       ".[dev_tpu,diffusion_tpu]" && \
     pip uninstall -y sglang && \
     rm -rf sglang && \
-    . ../scripts/ci/utils/sgl_eval_ref.sh && pip install "$SGL_EVAL_SPEC"
+    pip install "antlr4-python3-runtime==4.9.3" "sgl-eval==0.1.0"
 
 # Fill sgl-eval's mmlu cache so the accuracy suite runs the eval offline.
 RUN python scripts/ci/tpu/warm_mmlu_cache.py

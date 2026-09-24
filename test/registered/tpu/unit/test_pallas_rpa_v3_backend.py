@@ -34,6 +34,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
     _resolve_decode_query_size,
 )
@@ -42,8 +43,10 @@ from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_v3 import (
     TpuPallasRpaV3AttnBackend,
     _invoke_v3_kernel,
 )
+from sglang.srt.hardware_backend.tpu.host_metadata_cache import HostMetadataCache
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -73,6 +76,7 @@ class _BackendUnderTest(TpuPallasRpaV3AttnBackend):
         self.forward_metadata = None
         self._op = None
         self._distribution_cache = {}
+        self._host_metadata_cache = HostMetadataCache()
         # Non-SWA: skips the hybrid-SWA page remap in _build_metadata(_host).
         self._is_hybrid_swa = False
 
@@ -366,6 +370,145 @@ class TestPallasRpaV3MetadataExtend(CustomTestCase):
             _build_meta(self.backend, fb_bad)
 
 
+class TestPallasRpaHostLensReuse(CustomTestCase):
+    def setUp(self):
+        self.enterContext(envs.SGLANG_TPU_ENABLE_HOST_QUERY_LENS.override(True))
+
+    def test_missing_or_wrong_size_host_mirror_falls_back_to_current_lengths(self):
+        backend = _BackendUnderTest(16, _build_req_to_token(3, 128))
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([20, 30]),
+            req_pool_indices=torch.arange(2),
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            extend_seq_lens=torch.tensor([3, 2], dtype=torch.int32),
+        )
+        for mirror in (None, [99], [99, 99, 99]):
+            with self.subTest(mirror=mirror):
+                fb.extend_seq_lens_cpu = mirror
+                meta = _build_meta(backend, fb)
+                self.assertEqual(meta.cu_q_lens.tolist(), [0, 3, 5])
+                self.assertEqual(meta.active_num_tokens.item(), 5)
+
+    def test_variable_cache_is_bounded_and_does_not_mutate_old_buffers(self):
+        backend = _BackendUnderTest(16, _build_req_to_token(3, 128))
+        original = backend._get_query_metadata(
+            bs=2, kv_stride=128, non_empty_bs=2, device="cpu", query_lens=(3, 2)
+        )
+        changed = backend._get_query_metadata(
+            bs=2, kv_stride=128, non_empty_bs=2, device="cpu", query_lens=(1, 4)
+        )
+        self.assertEqual(original[0].tolist(), [0, 3, 5])
+        self.assertEqual(changed[0].tolist(), [0, 1, 5])
+        self.assertIs(
+            backend._host_metadata_cache._by_value["cu_q_lens"][2], changed[0]
+        )
+        again = backend._get_query_metadata(
+            bs=2, kv_stride=128, non_empty_bs=2, device="cpu", query_lens=(3, 2)
+        )
+        self.assertIsNot(original[0], again[0])
+        self.assertEqual(original[0].tolist(), again[0].tolist())
+
+    def test_fixed_layout_survives_alternating_decode_verify_and_extend(self):
+        backend = _BackendUnderTest(16, _build_req_to_token(3, 128))
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([20, 30]),
+            req_pool_indices=torch.tensor([0, 1]),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=types.SimpleNamespace(spec_input_type=None, num_tokens_per_req=4),
+        )
+        verify = _build_meta(backend, fb)
+        fb.forward_mode = ForwardMode.DECODE
+        decode = _build_meta(backend, fb)
+        self.assertEqual(decode.cu_q_lens.tolist(), [0, 1, 2])
+        fb.forward_mode = ForwardMode.DRAFT_EXTEND_V2
+        fb.extend_seq_lens = torch.empty(2, dtype=torch.int32, device="meta")
+        fb.extend_seq_lens_cpu = [3, 2]
+        extend = _build_meta(backend, fb)
+        self.assertEqual(extend.cu_q_lens.tolist(), [0, 3, 5])
+        fb.forward_mode = ForwardMode.TARGET_VERIFY
+        again = _build_meta(backend, fb)
+        self.assertIs(verify.cu_q_lens, again.cu_q_lens)
+        self.assertIs(verify.cu_kv_lens, again.cu_kv_lens)
+        self.assertIs(verify.active_num_tokens, again.active_num_tokens)
+
+    def test_draft_host_lengths_avoid_device_read_and_preserve_padding(self):
+        backend = _BackendUnderTest(16, _build_req_to_token(3, 128))
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([20, 30, 0]),
+            req_pool_indices=torch.arange(3),
+            forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+            # A meta tensor cannot be copied to CPU: metadata must use the
+            # padded host mirror supplied by the draft compile policy.
+            extend_seq_lens=torch.empty(3, dtype=torch.int32, device="meta"),
+        )
+        fb.extend_seq_lens_cpu = [4, 4, 0]
+        first = _build_meta(backend, fb)
+        second = _build_meta(backend, fb)
+        self.assertTrue(torch.equal(first.cu_q_lens, torch.tensor([0, 4, 8, 8])))
+        self.assertEqual(first.active_num_tokens.item(), 8)
+        self.assertIs(first.cu_q_lens, second.cu_q_lens)
+        self.assertIs(first.cu_kv_lens, second.cu_kv_lens)
+        self.assertIs(first.active_num_tokens, second.active_num_tokens)
+        self.assertEqual(first.active_num_tokens.untyped_storage().nbytes(), 4)
+
+        # Identical physical width can have fewer active rows on the next
+        # cycle. Neither the old scalar nor its backing storage may change.
+        fb.seq_lens = torch.tensor([20, 0, 0])
+        third = _build_meta(backend, fb)
+        self.assertEqual(third.active_num_tokens.item(), 4)
+        self.assertEqual(first.active_num_tokens.item(), 8)
+
+        fb.extend_seq_lens_cpu = torch.tensor([2, 0, 0])
+        fourth = _build_meta(backend, fb)
+        self.assertTrue(torch.equal(fourth.cu_q_lens, torch.tensor([0, 2, 2, 2])))
+        self.assertEqual(fourth.active_num_tokens.item(), 2)
+
+    def test_reused_lens_do_not_cache_request_pages_or_kv_lengths(self):
+        table = _build_req_to_token(3, 128)
+        backend = _BackendUnderTest(16, table)
+        fb = _make_forward_batch(
+            seq_lens=torch.tensor([20, 30]),
+            req_pool_indices=torch.tensor([0, 1]),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=types.SimpleNamespace(spec_input_type=None, num_tokens_per_req=4),
+        )
+        first = _build_meta(backend, fb)
+        fb.seq_lens = torch.tensor([23, 33])
+        fb.req_pool_indices_cpu = torch.tensor([2, 0])
+        table[2, 0] = 1024
+        second = _build_meta(backend, fb)
+        self.assertIs(first.cu_q_lens, second.cu_q_lens)
+        self.assertEqual(second.page_indices[0].item(), 64)
+        self.assertEqual(first.page_indices[0].item(), 0)
+        self.assertTrue(torch.equal(second.kv_lens, torch.tensor([27, 37])))
+
+    def test_layout_changes_and_empty_batch(self):
+        backend = _BackendUnderTest(16, _build_req_to_token(3, 128))
+        for lengths, stride, active in [
+            ((1, 1), 128, 2),
+            ((4, 4), 128, 2),
+            ((4, 4, 0), 128, 2),
+            ((4, 4, 0), 256, 0),
+            ((), 256, 0),
+        ]:
+            with self.subTest(lengths=lengths, stride=stride, active=active):
+                q, kv, count = backend._get_query_metadata(
+                    bs=len(lengths),
+                    kv_stride=stride,
+                    non_empty_bs=active,
+                    device=torch.device("cpu"),
+                    query_lens=lengths,
+                )
+                self.assertEqual(
+                    q.tolist(), [sum(lengths[:i]) for i in range(len(lengths) + 1)]
+                )
+                self.assertEqual(
+                    kv.tolist(), [i * stride for i in range(len(lengths) + 1)]
+                )
+                self.assertEqual(count.item(), sum(lengths[:active]))
+                self.assertEqual(count.untyped_storage().nbytes(), 4)
+
+
 class TestPallasRpaV3MetadataLayoutCorners(CustomTestCase):
     """Layout invariants that are easy to break under refactors."""
 
@@ -412,6 +555,7 @@ class TestPallasRpaV3MetadataSpec(CustomTestCase):
         self.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
         self.seq_lens = torch.tensor([10, 24, 33], dtype=torch.int32)
         self.spec_info = types.SimpleNamespace(
+            spec_input_type=None,
             draft_token_num=self.DRAFT_TOKEN_NUM,
             num_tokens_per_req=self.DRAFT_TOKEN_NUM,
         )
@@ -566,7 +710,10 @@ class TestFixedWidthAsDecode(CustomTestCase):
             req_pool_indices=torch.tensor([5, 2, 7], dtype=torch.int64),
             forward_mode=mode,
             extend_seq_lens=extend,
-            spec_info=types.SimpleNamespace(num_tokens_per_req=num_tokens_per_req),
+            spec_info=types.SimpleNamespace(
+                num_tokens_per_req=num_tokens_per_req,
+                spec_input_type=SpecInputType.EAGLE_DRAFT_EXTEND,
+            ),
             extend_seq_lens_cpu=extend_lens,
         )
         fb.capture_hidden_mode = None

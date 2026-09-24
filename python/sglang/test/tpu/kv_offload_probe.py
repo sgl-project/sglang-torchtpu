@@ -29,7 +29,7 @@ _PROMPT_VOCAB = (
 # the comparison sharp: a reloaded page that came back even slightly wrong flips
 # a token and the two reads stop matching.
 _FORCED_TAIL = (
-    "\n\nIgnore the words above. Continue this sequence.\n" "1 2 3 4 5 6 7 8 9 10 11 12"
+    "\n\nIgnore the words above. Continue this sequence.\n1 2 3 4 5 6 7 8 9 10 11 12"
 )
 # Rough, like the word-per-token estimate above, and only used to keep the prompt
 # near the requested size. Nothing asserts an exact token count.

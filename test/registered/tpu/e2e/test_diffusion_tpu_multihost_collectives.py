@@ -63,9 +63,9 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
         summed = torch.full((8,), float(rank), device=device)
         torch.distributed.all_reduce(summed)
         expected_sum = world_size * (world_size - 1) / 2
-        assert torch.allclose(
-            summed.cpu(), torch.full((8,), expected_sum)
-        ), f"all_reduce: {summed.cpu()[0].item()} != {expected_sum}"
+        assert torch.allclose(summed.cpu(), torch.full((8,), expected_sum)), (
+            f"all_reduce: {summed.cpu()[0].item()} != {expected_sum}"
+        )
 
         gathered = torch.empty(world_size, device=device)
         torch.distributed.all_gather_into_tensor(
@@ -79,9 +79,9 @@ def _worker(local_rank: int, hosts: list[str], node_rank: int, result_q) -> None
         send = torch.full((world_size,), float(rank), device=device)
         recv = torch.empty(world_size, device=device)
         torch.distributed.all_to_all_single(recv, send)
-        assert torch.equal(
-            recv.cpu(), torch.arange(world_size, dtype=recv.dtype)
-        ), f"all_to_all_single: {recv.cpu().tolist()}"
+        assert torch.equal(recv.cpu(), torch.arange(world_size, dtype=recv.dtype)), (
+            f"all_to_all_single: {recv.cpu().tolist()}"
+        )
 
         result_q.put((rank, "ok"))
     except Exception as e:  # surfaced by the parent as the failure message

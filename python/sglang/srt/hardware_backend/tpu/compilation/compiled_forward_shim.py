@@ -492,9 +492,9 @@ def _pad_forward_batch_inputs(
     elif is_draft_extend_v2 and forward_batch.spec_info is not None:
         pad_b = b_bucketer.next_bucket(real_b)
         num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-        assert (
-            num_tokens_per_req > 0
-        ), f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        assert num_tokens_per_req > 0, (
+            f"DRAFT_EXTEND_V2 requires num_tokens_per_req > 0, got {num_tokens_per_req}"
+        )
         pad_t = pad_b * num_tokens_per_req
         real_q_out, real_b_out = real_q, real_b
     else:
@@ -537,6 +537,14 @@ def _pad_forward_batch_inputs(
     # to extend). Non-extend batches keep the upstream None.
     for field in _BS_CPU_LIST_FIELDS:
         val = getattr(forward_batch, field, None)
+        if field == "extend_seq_lens_cpu" and (val is None or len(val) < real_b):
+            # The attention backend prefers this mirror over the device query
+            # lengths whenever it covers the batch, so padding a missing or
+            # stale one out to pad_b would hand the draft/extend path zeros or
+            # an earlier batch's counts for real requests. Clearing it keeps
+            # _extend_query_lens on the device lengths instead.
+            forward_batch.extend_seq_lens_cpu = None
+            continue
         if val is None:
             if not (forward_batch.forward_mode.is_extend() or is_draft_extend_v2):
                 continue
