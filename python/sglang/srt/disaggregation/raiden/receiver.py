@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import secrets
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -289,6 +289,39 @@ class RaidenReceiverMixin:
             self._failed.add(str(room))
         logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
 
+    def _start_read_or_fail(
+        self,
+        *,
+        room: int,
+        engine: Any,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        unissued: Tuple[str, ...] = (),
+    ) -> bool:
+        """Issue one admitted read; if the engine raises, fail the room.
+
+        Runs inside the scheduler's poll, so an escaping exception would take
+        down every request on this decode worker. Raiden raises from
+        ``start_read`` only before it registers the read, so it will never
+        report ``req_id`` -- nor the reads in ``unissued``, which this failure
+        keeps from being issued. They are settled here so the admission is
+        released, and the room concludes once its other reads settle.
+        """
+        try:
+            engine.start_read(req_id, uuid, endpoint, remote, local)
+            return True
+        except Exception as e:
+            reason = f"Raiden receive failed: start_read {req_id} raised: {e}"
+            logger.error("RaidenKVManager rank%d %s", self.attn_tp_rank, reason)
+            with self._state_lock:
+                self._native_failed.update((req_id, *unissued))
+                self._fail_room_locked(room, reason)
+                self._release_pull_slots_locked()
+            return False
+
     def _announcement_expired_locked(self, room: int, req_id: str) -> bool:
         """Fails ``room`` when its read ``req_id`` waited for a staging slot
         longer than the transfer deadline.
@@ -405,11 +438,28 @@ class RaidenReceiverMixin:
                 remote_slice = [blk for blk, _ in pairs]
                 local_slice = [loc for _, loc in pairs]
                 self._decode.chunk_reads.setdefault(room, []).append(req_id)
-            engine.start_read(req_id, uuid, endpoint, remote_slice, local_slice)
-            if closing:
-                self._swa_engine.start_read(
-                    self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
-                )
+            swa_rid = self._swa_req_id(room) if closing else None
+            if not self._start_read_or_fail(
+                room=room,
+                engine=engine,
+                req_id=req_id,
+                uuid=uuid,
+                endpoint=endpoint,
+                remote=remote_slice,
+                local=local_slice,
+                unissued=(swa_rid,) if swa_rid is not None else (),
+            ):
+                return False
+            if swa_rid is not None and not self._start_read_or_fail(
+                room=room,
+                engine=self._swa_engine,
+                req_id=swa_rid,
+                uuid=room,
+                endpoint=swa_endpoint,
+                remote=remote_swa,
+                local=local_swa,
+            ):
+                return False
         self._reject_oversized_pull(room, *oversized)
         return False
 
@@ -500,11 +550,28 @@ class RaidenReceiverMixin:
             # Status moves with the admission, under the same lock an abort
             # takes: a Transferring write can never follow the abort's Failed.
             self.update_status(room, KVPoll.Transferring)
-        engine.start_read(str(room), room, endpoint, remote, local)
-        if self._swa_engine is not None:
-            self._swa_engine.start_read(
-                self._swa_req_id(room), room, swa_endpoint, remote_swa, local_swa
-            )
+        swa_rid = self._swa_req_id(room) if self._swa_engine is not None else None
+        if not self._start_read_or_fail(
+            room=room,
+            engine=engine,
+            req_id=str(room),
+            uuid=room,
+            endpoint=endpoint,
+            remote=remote,
+            local=local,
+            unissued=(swa_rid,) if swa_rid is not None else (),
+        ):
+            return False
+        if swa_rid is not None and not self._start_read_or_fail(
+            room=room,
+            engine=self._swa_engine,
+            req_id=swa_rid,
+            uuid=room,
+            endpoint=swa_endpoint,
+            remote=remote_swa,
+            local=local_swa,
+        ):
+            return False
         return True
 
     # ----- asymmetric-TP resharding (producer-push) -------------------------
