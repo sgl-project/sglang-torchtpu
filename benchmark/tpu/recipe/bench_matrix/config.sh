@@ -204,8 +204,8 @@ case "$BENCH_MODEL" in
         DRAFT_MODEL=${DRAFT_MODEL:-$GCS_WEIGHTS_ROOT/SGLang-EAGLE3-Qwen3-Coder-480B-A35B-Instruct-SpecForge-EigenAI}
         QUANTIZATION=fp8
         KV_CACHE_DTYPE=${KV_CACHE_DTYPE-fp8_e4m3}
-        # rpa_v3 for KV-offload compatibility and because rpa_batched
-        # mis-computes non-first segments of packed EXTEND batches.
+        # rpa_v3 because rpa_batched mis-computes non-first segments of packed
+        # EXTEND batches.
         ATTENTION_BACKEND=pallas_tpu_rpa_v3
         PAGE_SIZE=${PAGE_SIZE:-128}
         # The full native window (no YaRN at 262144); the agentic long

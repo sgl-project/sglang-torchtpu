@@ -182,12 +182,13 @@ def resolve_layout_io_compatibility(server_args: Any):
                     "backend, so it never runs the HiCache reload-commit hook. "
                     "Re-run with RPA attention backends, or disable KV offload."
                 )
-            if tpu_platform._mha_kv_pool_cls(backend) is not pool_cls:
+            backend_pool_cls = tpu_platform._mha_kv_pool_cls(backend)
+            if backend_pool_cls is not pool_cls:
                 raise ValueError(
                     f"{cfg.hicache_io_backend} KV offloading does not support "
                     f"attention backend {backend!r} with --attention-backend "
                     f"{cfg.attention_backend!r}: it reads "
-                    f"{tpu_platform._mha_kv_pool_cls(backend).__name__}, but "
+                    f"{backend_pool_cls.__name__}, but "
                     f"the shared KV pool is {pool_cls.__name__}. Re-run with "
                     "backends that use the same KV pool, or disable KV offload."
                 )
