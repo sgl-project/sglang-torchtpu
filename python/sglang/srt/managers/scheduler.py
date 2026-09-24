@@ -6195,7 +6195,7 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
-    initialize_torch_tpu_worker(server_args, tp_rank)
+    initialize_torch_tpu_worker(server_args, tp_rank, dp_rank=dp_rank)
 
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
