@@ -1305,6 +1305,10 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+        if _is_tpu:
+            # The relayed outputs stay on the host; decode reads its input IDs
+            # from a device buffer.
+            next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
 
         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
         # processor sees the same object on every rank.
@@ -1352,7 +1356,7 @@ class SchedulerPPMixin:
             self.future_map.stash(
                 batch.req_pool_indices,
                 RelayPayload(
-                    bonus_tokens=next_token_ids.to(batch.device, non_blocking=True),
+                    bonus_tokens=next_token_ids,
                     topk_p=(
                         None if next_draft_input is None else next_draft_input.topk_p
                     ),
