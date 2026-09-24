@@ -49,6 +49,7 @@ def _decode_manager(*, hybrid, chunked):
     mgr._send_reads = {}
     mgr._cleared_plans = {}
     mgr._stale_plans = []
+    mgr._poll_failing_since = {}
     mgr._timeout_s = 120.0
     mgr._decode.local_blocks[ROOM] = [21, 22, 23]
     mgr._decode.local_swa_blocks[ROOM] = [24] if hybrid else []
