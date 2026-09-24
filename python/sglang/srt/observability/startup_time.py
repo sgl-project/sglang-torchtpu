@@ -6,7 +6,6 @@ from sglang.srt.model_executor.graph_memory_usage import (
     empty_graph_time_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.observability.compile_timing import merge_compile_timing_reports
 
 
 def build_scheduler_startup_time(
@@ -17,8 +16,8 @@ def build_scheduler_startup_time(
     scheduler_e2e: float,
     target_cuda_graph: Mapping[str, float] | None,
     draft_cuda_graph: Mapping[str, float] | None,
-    target_compile: Mapping | None = None,
-    draft_compile: Mapping | None = None,
+    target_compile_steps: Iterable[Mapping] | None = None,
+    draft_compile_steps: Iterable[Mapping] | None = None,
 ) -> dict:
     result = {
         "load_weight": target_load_weight + draft_load_weight,
@@ -29,9 +28,19 @@ def build_scheduler_startup_time(
             draft_cuda_graph,
         ),
     }
-    compile_timing = merge_compile_timing_reports(target_compile, draft_compile)
-    if compile_timing is not None:
-        result["compile"] = compile_timing
+    compile_steps = [
+        dict(step)
+        for steps in (target_compile_steps, draft_compile_steps)
+        for step in steps or ()
+    ]
+    if compile_steps:
+        result["compile"] = {
+            "schema_version": 1,
+            "total_seconds": sum(
+                float(step["duration_seconds"]) for step in compile_steps
+            ),
+            "steps": compile_steps,
+        }
     return result
 
 
@@ -45,6 +54,7 @@ def aggregate_scheduler_startup_times(
         "scheduler_e2e": 0.0,
         "cuda_graph": empty_graph_time_usage(),
     }
+    rank_critical_compile_steps: dict[tuple[str, int], dict] = {}
     for startup_time in startup_times:
         if not startup_time:
             continue
@@ -63,11 +73,34 @@ def aggregate_scheduler_startup_times(
             result["cuda_graph"][phase] = max(
                 result["cuda_graph"].get(phase, 0.0), float(duration)
             )
-        compile_timing = merge_compile_timing_reports(
-            result.get("compile"), startup_time.get("compile")
-        )
-        if compile_timing is not None:
-            result["compile"] = compile_timing
+        compile_timing = startup_time.get("compile")
+        if compile_timing is None:
+            continue
+        step_occurrences: dict[str, int] = {}
+        for raw_step in compile_timing.get("steps", []):
+            step = dict(raw_step)
+            step_key = str(step["step_key"])
+            occurrence = step_occurrences.get(step_key, 0)
+            step_occurrences[step_key] = occurrence + 1
+            aggregate_key = (step_key, occurrence)
+            previous = rank_critical_compile_steps.get(aggregate_key)
+            if previous is None:
+                rank_critical_compile_steps[aggregate_key] = step
+            else:
+                rank_critical_compile_steps[aggregate_key] = max(
+                    previous,
+                    step,
+                    key=lambda candidate: float(candidate["duration_seconds"]),
+                )
+    if rank_critical_compile_steps:
+        compile_steps = list(rank_critical_compile_steps.values())
+        result["compile"] = {
+            "schema_version": 1,
+            "total_seconds": sum(
+                float(step["duration_seconds"]) for step in compile_steps
+            ),
+            "steps": compile_steps,
+        }
     return result
 
 

@@ -11,7 +11,6 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.observability.compile_timing import merge_compile_timing_reports
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
@@ -214,13 +213,12 @@ class BaseSpecWorker(ABC):
         )
 
     @property
-    def compile_timing(self) -> dict | None:
-        return merge_compile_timing_reports(
-            *(
-                runner.compile_timing.snapshot()
-                for runner in self._draft_model_runners()
-            )
-        )
+    def compile_timing_steps(self) -> list[dict]:
+        return [
+            step
+            for runner in self._draft_model_runners()
+            for step in runner.compile_timing.snapshot()
+        ]
 
     @property
     def weight_load_time(self) -> float:
