@@ -112,10 +112,10 @@ class RecompilationChecker:
     """Diffs torch_tpu cache-stats snapshots to find serving-time compiles.
 
     The cache is process-wide, so one checker serves every compiled forward
-    in the process (target and draft models alike). Once every precompile is
-    done, call ``snapshot_baseline()``, then ``check()`` on every forward. The full
-    stats scan only runs when the tier-1 miss counter moved, so the
-    steady-state cost per forward is one pybind int read.
+    in the process (target and draft models alike). Each TPU warmup phase
+    refreshes the baseline when it finishes; installed eager forwards call
+    ``check()``. The full stats scan only runs when the tier-1 miss counter
+    moves; cache-hit checks read that counter and check the summary clock.
 
     torch_tpu compiles on a background thread and fills in the duration when
     it finishes, so both snapshots first wait for the device. That charges a
@@ -258,8 +258,16 @@ class _RecompilationCheckPolicy(Protocol):
 def install_recompilation_checker(
     *, policies: Iterable[CompilePolicy], model_label: str
 ) -> None:
-    """Attach the shared checker; monitoring starts after scheduler warmup."""
+    """Baseline after model warmup and attach the shared checker.
+
+    Later TPU warmup phases refresh the same baseline when they finish.
+    """
     if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+        return
+    monitored_policies = [
+        policy for policy in policies if isinstance(policy, _RecompilationCheckPolicy)
+    ]
+    if not monitored_policies:
         return
     checker = _shared_recompilation_checker()
     if checker is None:
@@ -268,13 +276,18 @@ def install_recompilation_checker(
             "serving-time recompilation checks disabled."
         )
         return
-    for policy in policies:
-        if isinstance(policy, _RecompilationCheckPolicy):
-            policy.set_recompilation_checker(checker, model_label=model_label)
+    checker.snapshot_baseline()
+    for policy in monitored_policies:
+        policy.set_recompilation_checker(checker, model_label=model_label)
 
 
-def start_recompilation_monitoring() -> None:
-    """Baseline once all scheduler startup work, including cache warmup, is done."""
+def snapshot_recompilation_baseline() -> None:
+    """Exclude completed TPU warmup from subsequent serving-time checks.
+
+    Speculative-op and KV-offload warmup run after model precompilation.
+    Refresh the process-wide baseline at each phase's completion so their
+    programs are excluded for both the target and draft checkers.
+    """
     if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
         return
     checker = _shared_recompilation_checker()

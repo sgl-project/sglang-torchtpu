@@ -735,18 +735,8 @@ class Scheduler(
 
         self.init_rank_consensus_checker()
 
-        self.maybe_init_tpu_recompilation_monitoring()
-
         self.is_initializing = False
         self.init_startup_timing_summary()
-
-    def maybe_init_tpu_recompilation_monitoring(self) -> None:
-        if current_platform.is_tpu():
-            from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-                start_recompilation_monitoring,
-            )
-
-            start_recompilation_monitoring()
 
     def init_startup_timing_begin(self) -> None:
         self.scheduler_startup_begin = time.perf_counter()

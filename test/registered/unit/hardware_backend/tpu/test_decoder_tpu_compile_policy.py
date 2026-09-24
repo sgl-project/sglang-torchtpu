@@ -1896,7 +1896,7 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         )
 
     def test_draft_precompile_installs_the_checker_after_its_last_forward(self):
-        """Install the draft checker; scheduler startup owns its baseline."""
+        """Draft warmup finishes before installing and baselining its checker."""
         mr = _spec_model_runner(is_draft_worker=True)
         self.publish_config(page_size=8)
         policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))

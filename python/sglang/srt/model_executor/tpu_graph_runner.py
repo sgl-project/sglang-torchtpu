@@ -284,8 +284,8 @@ class TpuGraphRunner:
         if not installed_any:
             return
 
-        # Attach after model warmup. The scheduler starts monitoring once
-        # speculative-op and KV-offload precompilation have also completed.
+        # Baseline after model warmup. Later TPU speculative-op and KV-offload
+        # warmup refresh the shared baseline in their own completion paths.
         if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
             # A draft model precompiles later, from precompile_draft, and installs
             # the checker itself once that is done.

@@ -24,6 +24,9 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
@@ -680,6 +683,7 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
         max_blocks,
         time.perf_counter() - start,
     )
+    snapshot_recompilation_baseline()
 
 
 class CompiledForwardShim:

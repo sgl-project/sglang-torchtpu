@@ -783,8 +783,8 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             "[spec compile policy] DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
-        # Attach the draft checker now; the scheduler baselines after the
-        # remaining speculative-op and KV-offload warmup.
+        # Include draft warmup in the shared target/draft baseline. Later TPU
+        # speculative-op and KV-offload warmup refresh it when they finish.
         install_recompilation_checker(
             policies=(self,),
             model_label=f"draft {type(self.model_runner.model).__name__}",
