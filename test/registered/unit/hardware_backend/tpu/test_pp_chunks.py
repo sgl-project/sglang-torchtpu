@@ -9,6 +9,7 @@ from sglang.srt.hardware_backend.tpu.pp_chunks import (
     chunk_buckets,
     chunk_granularity,
     chunk_pairs,
+    longest_prompt,
     profile_points,
     uses_dynamic_chunks,
 )
@@ -226,6 +227,14 @@ def test_the_schedule_capacity_bounds_a_chunk_deep_in_a_prompt():
     assert less < got and model.pairs(less, 49152) <= 4000
     # A first chunk with a short prefix is not bounded.
     assert model.chunk(0, 16384, 0, 0.0, 0.0) == 16384
+
+
+def test_longest_prompt_is_the_last_whose_final_chunk_fits():
+    schedule = (400, 256, 256)
+    longest = longest_prompt(schedule, 2048, 1 << 20)
+    assert chunk_pairs(schedule, 2048, longest - 2048) <= 400
+    assert chunk_pairs(schedule, 2048, longest + 1 - 2048) > 400
+    assert longest_prompt(schedule, 2048, longest) == longest
 
 
 def test_fit_keeps_the_schedule_capacity():

@@ -45,6 +45,19 @@ def chunk_pairs(schedule: tuple[int, int, int] | None, chunk: int, prefix: int) 
     return total
 
 
+def longest_prompt(schedule: tuple[int, int, int], chunk: int, context_len: int) -> int:
+    """Longest prompt, up to ``context_len``, whose last ``chunk`` tokens fit
+    the ``schedule`` capacity; a chunk at the start of a prompt must fit."""
+    low, high = chunk, context_len
+    while low < high:
+        mid = (low + high + 1) // 2
+        if chunk_pairs(schedule, chunk, mid - chunk) <= schedule[0]:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
 def profile_points(
     buckets: list[int],
     max_tokens: int,

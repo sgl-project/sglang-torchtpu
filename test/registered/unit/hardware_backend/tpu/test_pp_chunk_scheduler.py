@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
 )
 from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 
 
@@ -71,8 +72,8 @@ def scheduler(waiting, chunked=None, mbs=(), last_mbs=()):
     )
 
 
-def batch(tokens):
-    return NS(extend_num_tokens=tokens)
+def batch(tokens, mode=ForwardMode.EXTEND, decoding_reqs=None):
+    return NS(extend_num_tokens=tokens, forward_mode=mode, decoding_reqs=decoding_reqs)
 
 
 def test_pending_work_splits_lone_prompt_and_preserves_busy_steps():
@@ -99,12 +100,24 @@ def test_chunks_in_flight_grow_the_next_chunk():
 
 def test_processed_and_empty_slots_are_not_in_flight():
     request = req(16384)
-    processed, flying, decode = batch(16384), batch(16384), NS(extend_num_tokens=None)
+    processed, flying = batch(16384), batch(16384)
+    decode = batch(None, mode=ForwardMode.DECODE)
     sched = scheduler(
         [request],
         mbs=[processed, flying, None, decode],
         last_mbs=[processed, None, None, None],
     )
+    assert pending_step_limit(sched) == 4096
+
+
+def test_decode_rows_are_not_pending_prefill():
+    """A decode batch keeps the token count of the prefill it was built from,
+    and a mixed batch counts its decode rows; neither is prefill still in
+    flight, so it must not grow the next chunk."""
+    request = req(16384)
+    stale = batch(16384, mode=ForwardMode.DECODE)
+    mixed = batch(4096 + 64, mode=ForwardMode.MIXED, decoding_reqs=[None] * 64)
+    sched = scheduler([request], mbs=[stale] * 7 + [mixed], last_mbs=[None] * 8)
     assert pending_step_limit(sched) == 4096
 
 

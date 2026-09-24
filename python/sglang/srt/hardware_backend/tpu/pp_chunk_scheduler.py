@@ -13,6 +13,7 @@ from sglang.srt.hardware_backend.tpu.pp_attention_capacity import (
 from sglang.srt.hardware_backend.tpu.pp_chunks import (
     StepCostModel,
     chunk_granularity,
+    longest_prompt,
     profile_points,
     uses_dynamic_chunks,
 )
@@ -48,10 +49,19 @@ def pending_step_limit(scheduler):
     # the same batch is recorded as the slot's last batch.
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
         if batch is not None and batch is not done:
-            pending += batch.extend_num_tokens or 0
+            pending += _prefill_tokens(batch)
     granule = cost.granularity
     share = -(-pending // scheduler.ps.pp_size)
     return min(cost.buckets[-1], max(granule, -(-share // granule) * granule))
+
+
+def _prefill_tokens(batch):
+    """Prefill tokens of a launched batch. A decode batch keeps the token
+    count of the prefill it was built from, and a mixed batch counts one
+    token per decode row."""
+    if not batch.forward_mode.is_extend():
+        return 0
+    return (batch.extend_num_tokens or 0) - len(batch.decoding_reqs or ())
 
 
 class TpuPipelinePrefillAdder(PrefillAdder):
@@ -194,5 +204,16 @@ def profile_and_install_cost_model(scheduler):
         granularity,
         min(schedules) if schedules else None,
     )
+    context_len = runner.model_config.context_len
+    if cost.schedule is not None:
+        # The smallest chunk behind the longest prefix must fit, so that no
+        # prompt within the context length is refused inside the scheduler.
+        longest = longest_prompt(cost.schedule, granularity, context_len)
+        if longest < context_len:
+            raise ValueError(
+                f"The batched attention kernel can schedule the last "
+                f"{granularity}-token chunk of prompts up to {longest} tokens; "
+                f"lower --context-length from {context_len} to {longest}."
+            )
     scheduler._tpu_pp_chunk_cost = cost
     logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)
