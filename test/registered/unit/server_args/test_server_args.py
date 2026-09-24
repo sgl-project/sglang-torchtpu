@@ -78,6 +78,7 @@ from sglang.srt.entrypoints.sidecar import (
     start_sidecar,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu import tpu_platform
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
@@ -1802,13 +1803,18 @@ class TestHiCacheArgs(unittest.TestCase):
                 )
 
     def _make_tpu_offload_args(
-        self, io_backend: str, is_hybrid_swa: bool
+        self,
+        io_backend: str,
+        is_hybrid_swa: bool,
+        attention_backend: str = "pallas_tpu_rpa_v3",
+        **kwargs,
     ) -> ServerArgs:
         args = self._make_args(
             enable_hierarchical_cache=True,
             hicache_io_backend=io_backend,
             hicache_mem_layout="page_first_fused",
-            attention_backend="pallas_tpu_rpa_v3",
+            attention_backend=attention_backend,
+            **kwargs,
         )
         # Short-circuit model_config_of(): the TPU io-backend guards only read
         # attention_arch (use_mla_backend) and is_hybrid_swa.
@@ -1837,6 +1843,63 @@ class TestHiCacheArgs(unittest.TestCase):
         args = self._make_tpu_offload_args("raiden", is_hybrid_swa=False)
         handle_hicache(args)
         self.assertEqual(args.hicache_io_backend, "raiden")
+
+    def test_tpu_io_backend_follows_kernel_spec(self):
+        # Offload support is read from the kernel spec of every backend that
+        # serves the pool, so an out-of-tree backend that declares raiden is
+        # admitted without a core change, torch_tpu is not widened by it, a
+        # prefill or decode backend that does not declare it is refused, and
+        # mxint8 KV is refused because neither io backend copies the scale
+        # buffers.
+        raiden_only = SimpleNamespace(kv_offload_io_backends=frozenset({"raiden"}))
+        real_spec = tpu_platform._rpa_kernel_spec
+        with patch.object(
+            tpu_platform,
+            "_rpa_kernel_spec",
+            lambda backend: (
+                raiden_only if backend == "oot_backend" else real_spec(backend)
+            ),
+        ):
+            handle_hicache(
+                self._make_tpu_offload_args(
+                    "raiden",
+                    is_hybrid_swa=True,
+                    attention_backend="oot_backend",
+                )
+            )
+            for io_backend, backend, kwargs, message in (
+                ("raiden", "unknown_backend", {}, "unknown_backend"),
+                ("raiden", "pallas_tpu_rpa_batched", {}, "pallas_tpu_rpa_batched"),
+                ("torch_tpu", "oot_backend", {}, "oot_backend"),
+                (
+                    "raiden",
+                    "oot_backend",
+                    {"prefill_attention_backend": "pallas_tpu_rpa_batched"},
+                    "pallas_tpu_rpa_batched",
+                ),
+                (
+                    "raiden",
+                    "oot_backend",
+                    {"decode_attention_backend": "pallas_tpu_rpa_batched"},
+                    "pallas_tpu_rpa_batched",
+                ),
+                ("raiden", "oot_backend", {"kv_cache_dtype": "mxint8"}, "mxint8"),
+                (
+                    "torch_tpu",
+                    "pallas_tpu_rpa_v3",
+                    {"kv_cache_dtype": "mxint8"},
+                    "mxint8",
+                ),
+            ):
+                with self.subTest(io_backend=io_backend, backend=backend, **kwargs):
+                    args = self._make_tpu_offload_args(
+                        io_backend,
+                        is_hybrid_swa=False,
+                        attention_backend=backend,
+                        **kwargs,
+                    )
+                    with self.assertRaisesRegex(ValueError, message):
+                        handle_hicache(args)
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(

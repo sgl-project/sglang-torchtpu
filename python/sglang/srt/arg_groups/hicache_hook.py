@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
+    attention_backends_of,
     declare_resolution,
     model_config_of,
     resolving_view,
@@ -147,13 +148,34 @@ def resolve_layout_io_compatibility(server_args: Any):
                 "the TPU KV-offload io backend."
             )
 
-        if cfg.attention_backend != "pallas_tpu_rpa_v3":
+        # Ask the kernel spec rather than naming backends, so a backend
+        # registered out of tree declares its own offload support. Every backend
+        # that serves the pool must declare it: each one has to reach the
+        # reload-commit hook. Read the spec through the module, because plugins
+        # patch tpu_platform._rpa_kernel_spec.
+        from sglang.srt.hardware_backend.tpu import tpu_platform
+
+        for backend in dict.fromkeys(
+            (cfg.attention_backend, *attention_backends_of(cfg))
+        ):
+            spec = tpu_platform._rpa_kernel_spec(backend)
+            if (
+                spec is None
+                or cfg.hicache_io_backend not in spec.kv_offload_io_backends
+            ):
+                raise ValueError(
+                    f"{cfg.hicache_io_backend} KV offloading does not support "
+                    f"attention backend {backend!r}: its kernel spec does not "
+                    "list this io backend in kv_offload_io_backends. Re-run "
+                    "with attention backends that do (in-tree: "
+                    "pallas_tpu_rpa_v3), or disable KV offload."
+                )
+
+        if cfg.kv_cache_dtype == "mxint8":
             raise ValueError(
-                f"{cfg.hicache_io_backend} KV offloading requires "
-                "--attention-backend pallas_tpu_rpa_v3 (the only TPU backend "
-                "with the HiCache reload-commit hook and fused KV pool), but "
-                f"got {cfg.attention_backend!r}. Re-run with "
-                "--attention-backend pallas_tpu_rpa_v3, or disable KV offload."
+                f"{cfg.hicache_io_backend} KV offloading does not support "
+                "--kv-cache-dtype mxint8: it copies only the KV pages, not the "
+                "separate MXINT8 scale buffers, so reloaded KV would be corrupt."
             )
 
         if (

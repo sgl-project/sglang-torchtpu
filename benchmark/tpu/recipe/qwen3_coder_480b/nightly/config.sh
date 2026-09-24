@@ -187,11 +187,11 @@ EP_SIZE_COLOCATED=${EP_SIZE_COLOCATED:-$COLOCATED_TP}
 EP_SIZE_PD=${EP_SIZE_PD:-$PD_TP}
 
 # Attention backend. pallas_tpu_rpa_v3 is not a free choice here: it is the only
-# TPU backend with the HiCache reload-commit hook and the fused KV pool, so
-# --hicache-io-backend torch_tpu rejects anything else (server_args.py
-# _resolve_layout_io_compatibility). The faster pallas_tpu_rpa_batched kernel is
-# therefore unavailable while KV offload is part of the contract -- revisit if
-# the reload hook lands there.
+# in-tree kernel whose spec declares torch_tpu offload
+# (RpaKernelSpec.kv_offload_io_backends), so --hicache-io-backend torch_tpu
+# rejects anything else (hicache_hook.py resolve_layout_io_compatibility). The
+# faster pallas_tpu_rpa_batched kernel is therefore unavailable while KV offload
+# is part of the contract -- revisit once batched is validated and declares it.
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_rpa_v3}
 
 # Page size. 128 is the rpa_v3 default in these scripts. Even a 1M-token request

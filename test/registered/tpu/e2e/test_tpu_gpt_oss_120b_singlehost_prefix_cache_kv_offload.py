@@ -57,10 +57,10 @@ LAUNCH_ENV = {
     "PAGE_SIZE": str(PAGE_SIZE),
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "TPU_COMPILE_BS": "1 2 4 8 16 32 64",
-    # raiden requires the RPA v3 backend (the only TPU backend with the HiCache
-    # reload-commit hook) and the fused page-first layout, and server_args rejects any
-    # other combination. Both are already the recipe's default -- pinned here so a
-    # recipe change cannot silently take the offload path away from this gate.
+    # gpt-oss needs RPA v3 (attention sinks), and raiden needs the fused
+    # page-first layout; server_args rejects other offload combinations. Both
+    # are already the recipe's default -- pinned here so a recipe change cannot
+    # silently take the offload path away from this gate.
     "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
     "HICACHE_MEM_LAYOUT": "page_first_fused",
     # Prefix caching is the substrate HiCache is built on, and launch_server.sh
