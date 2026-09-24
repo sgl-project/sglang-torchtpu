@@ -6,10 +6,13 @@ slice's devices only runs when every device launches it in the same order.
 So every hand-off is one collective-permute over all pipeline stages at once,
 around one closed cycle: stage r hands the sum of its hidden states and
 residual to stage r+1 and receives stage r-1's, and the last stage's block
-lands on stage 0, which ignores it. The stage after a boundary adds hidden
-states and residual before its first norm anyway, so the sum with a zero
-residual is the same input at half the bytes, and the closed cycle lets XLA
-lower the permute to a full-bandwidth ring transfer. A batch's activations
+lands on stage 0, which ignores it. The stage after a boundary must add
+hidden states and residual before its first norm, as a pre-norm decoder's
+fused add-norm does, so the sum with a zero residual carries the same
+residual stream at half the bytes. That norm reads the sum rounded to the
+model dtype instead of the float32 sum, a small difference at every stage
+boundary. The closed cycle lets XLA lower the permute to a full-bandwidth
+ring transfer. A batch's activations
 leave stage 0 at some launch k and reach stage r at launch k+r-1, so every
 stage issues launches by one count:
 
@@ -179,6 +182,19 @@ class PPWave:
             )
         return torch.cat([t, self.zero[n:]])
 
+    def _merge(self, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+        """The padded sum of a forward's outgoing hidden states and residual."""
+        if set(tensors) != set(self.KEYS):
+            raise ValueError(
+                f"the pipeline wave hands on exactly {self.KEYS}, got {sorted(tensors)}"
+            )
+        merged = tensors[self.KEYS[0]] + tensors[self.KEYS[1]]
+        if merged.dtype != self.dtype:
+            raise ValueError(
+                f"the pipeline wave carries {self.dtype}, got a {merged.dtype} sum"
+            )
+        return self._pad(merged)
+
     # -- protocol -------------------------------------------------------------
     def begin_iteration(self, has_batch: bool) -> None:
         """Called once per scheduler iteration, before any hand-off of it."""
@@ -244,7 +260,7 @@ class PPWave:
             return
         padded = None
         if tensors is not None:
-            padded = self._pad(tensors[self.KEYS[0]] + tensors[self.KEYS[1]])
+            padded = self._merge(tensors)
         if self.rank == 0:
             if self.launches < self._target():
                 self._launch(padded if padded is not None else self.zero)

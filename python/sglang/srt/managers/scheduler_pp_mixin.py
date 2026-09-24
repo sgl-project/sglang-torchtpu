@@ -185,8 +185,8 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
-                    # Over the wave the ring delivers host tensors, so there
-                    # is no copy of this batch's outputs to wait for.
+                    # Over the wave, result reads block on their own tensors or
+                    # wait on copy_done; the event waits on every pending copy.
                     if self._pp_wave is None:
                         d2h_event.synchronize()
                     process_target = self.mbs[next_mb_id]
@@ -236,7 +236,6 @@ class SchedulerPPMixin:
         """Hand activations between TPU stages over ICI in every serving mode."""
         from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
             DecoderTpuCompilePolicy,
-            max_extend_tokens,
         )
         from sglang.srt.hardware_backend.tpu.pp_wave import build_pp_wave
 
@@ -244,13 +243,10 @@ class SchedulerPPMixin:
         policy = model_runner.compile_policy
         # The buffer holds the largest batch a forward can hand on; a compiled
         # forward pads its batch to one of the policy's buckets.
-        if isinstance(policy, DecoderTpuCompilePolicy):
-            rows = policy.max_padded_tokens()
-        else:
-            rows = max_extend_tokens(context_len=model_runner.model_config.context_len)
+        assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
         return build_pp_wave(
             self.pp_group,
-            rows=rows,
+            rows=policy.max_padded_tokens(),
             hidden=int(model_runner.model_config.hidden_size),
             dtype=model_runner.dtype,
             device=torch.device(model_runner.device),

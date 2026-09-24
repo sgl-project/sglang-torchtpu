@@ -17,9 +17,6 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 
 import torch  # noqa: E402
 
-from sglang.srt.compilation.support_torch_compile import (  # noqa: E402
-    NoopCompilePolicy,
-)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
 from sglang.srt.hardware_backend.tpu import pp_wave  # noqa: E402
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (  # noqa: E402
@@ -201,12 +198,6 @@ class TestWaveRows(CustomTestCase):
 
     def test_buffer_holds_the_largest_decode_batch(self):
         self.assertEqual(self._rows(self._policy([64, 256], [1, 512])), 512)
-
-    def test_eager_buffer_holds_the_extend_limit(self):
-        with get_context().override_server_args(
-            chunked_prefill_size=12288, enable_dynamic_chunking=False
-        ):
-            self.assertEqual(self._rows(NoopCompilePolicy()), 12288)
 
 
 if __name__ == "__main__":

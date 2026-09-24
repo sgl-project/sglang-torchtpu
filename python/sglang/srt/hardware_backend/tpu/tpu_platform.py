@@ -150,6 +150,12 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             "relies on a device synchronize that does not wait for TPU "
             "execution."
         )
+    if not cfg.enable_torch_compile:
+        raise NotImplementedError(
+            "Pipeline parallelism on TPU requires --enable-torch-compile "
+            f"(--pp-size {pp}): only the compiled forward trims the received "
+            "activations to the batch's padded token count."
+        )
 
 
 def _apply_page_size_default(server_args) -> None:
