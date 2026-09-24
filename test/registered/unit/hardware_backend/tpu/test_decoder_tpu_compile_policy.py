@@ -1904,6 +1904,32 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
             [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
         )
 
+    def test_draft_precompile_installs_the_checker_after_its_last_forward(self):
+        """Draft warmup finishes before installing and baselining its checker."""
+        mr = _spec_model_runner(is_draft_worker=True)
+        self.publish_config(page_size=8)
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        draft_backend = SimpleNamespace(attn_backends=[_FakeAttnBackend()] * 2)
+        forwards_at_install = []
+
+        def install(**kwargs):
+            forwards_at_install.append(mr.model.forward.call_count)
+            self.assertEqual(kwargs["policies"], (policy,))
+            self.assertTrue(kwargs["model_label"].startswith("draft "))
+
+        with (
+            get_parallel().override(tp_rank=1),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3.install_recompilation_checker",
+                side_effect=install,
+            ),
+        ):
+            policy.precompile_draft(draft_backend, _FakeAttnBackend())
+
+        self.assertEqual(forwards_at_install, [mr.model.forward.call_count])
+        self.assertGreater(mr.model.forward.call_count, 0)
+
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
         mr = _spec_model_runner(is_draft_worker=True)
         mr.req_to_token_pool.size = 4

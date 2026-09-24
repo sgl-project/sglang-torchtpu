@@ -12,6 +12,9 @@ from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
+)
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
 )
@@ -360,9 +363,12 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             "[spec compile policy] DFLASH DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
         )
-        # Snapshot only once every warmup graph exists, else they are reported
-        # as serving-time recompiles on the first draft forward.
-        self.snapshot_recompilation_baseline()
+        # Include draft warmup in the shared target/draft baseline. Later TPU
+        # speculative-op and KV-offload warmup refresh it when they finish.
+        install_recompilation_checker(
+            policies=(self,),
+            model_label=f"draft {type(self.model_runner.model).__name__}",
+        )
 
     def _precompile_append_target_hidden_to_draft_kv_by_loc_tpu(
         self, dflash_worker: DFlashWorkerV2
