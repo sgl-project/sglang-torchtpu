@@ -1850,8 +1850,9 @@ class TestHiCacheArgs(unittest.TestCase):
         # admitted without a core change and torch_tpu is not widened by it;
         # batched is admitted on the fused pool, and on the seq-along-lane pool
         # for raiden only. Every prefill/decode backend must still be an RPA
-        # backend (the reload-commit hook lives there), and mxint8 KV is refused
-        # because neither io backend copies the scale buffers.
+        # backend (the reload-commit hook lives there) that reads the base
+        # backend's pool, and mxint8 KV is refused because neither io backend
+        # copies the scale buffers.
         class RaidenOnlyPool:
             kv_offload_io_backends = frozenset({"raiden"})
 
@@ -1917,6 +1918,24 @@ class TestHiCacheArgs(unittest.TestCase):
                 "pallas_tpu_rpa_v3",
                 message="torch_native",
                 decode_attention_backend="torch_native",
+            )
+            check(
+                "raiden",
+                "pallas_tpu_rpa_v3",
+                decode_attention_backend="pallas_tpu_rpa_batched",
+            )
+            check(
+                "raiden",
+                "pallas_tpu_rpa_batched",
+                seq_along_lane=True,
+                message="TpuFusedMHATokenToKVPool",
+                decode_attention_backend="pallas_tpu_rpa_v3",
+            )
+            check(
+                "raiden",
+                "oot_backend",
+                message="TpuFusedMHATokenToKVPool",
+                prefill_attention_backend="pallas_tpu_rpa_v3",
             )
             check("raiden", "oot_backend", message="mxint8", kv_cache_dtype="mxint8")
             check(

@@ -33,10 +33,11 @@ its mean.
 
 Read these before comparing two runs. The full *why* for each sits next to the code.
 
-- **`pallas_tpu_rpa_v3` is pinned, not chosen.** It is the only kernel validated end
-  to end with `--hicache-io-backend torch_tpu`. The faster `pallas_tpu_rpa_batched`
-  passes the startup check on the fused KV pool but has not been validated with KV
-  offload, so it stays off while KV offload is in the contract.
+- **`pallas_tpu_rpa_v3` is the attention backend.** It is the kernel these runs have
+  been validated on with `--hicache-io-backend torch_tpu`. The faster
+  `pallas_tpu_rpa_batched` also supports KV offload on the fused KV pool (not with
+  `SGLANG_TPU_USE_SEQ_ALONG_LANE_KV`) but has no baseline here yet, so switching to
+  it breaks comparability with earlier runs.
 - **Server context length is always 1M**, independent of the workload target, so no
   two results can differ by a server setting. This keeps YaRN on.
 - **`--chunked-prefill-size` is pre-multiplied by `dp_size`**, because sglang divides

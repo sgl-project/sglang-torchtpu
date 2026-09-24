@@ -82,6 +82,7 @@ class TpuFusedMHATokenToKVPool(MHATokenToKVPool):
     # host; hicache_hook refuses the rest at startup. raiden copies whole pages
     # by their dim-0 block id, so it serves any block-major pool exposing
     # get_fused_kv_buffer; torch_tpu's host pool stores this 5D row verbatim.
+    # A subclass that changes the buffer layout must restate this.
     kv_offload_io_backends: frozenset[str] = frozenset({"torch_tpu", "raiden"})
 
     def __init__(

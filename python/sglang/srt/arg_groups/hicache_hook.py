@@ -170,7 +170,8 @@ def resolve_layout_io_compatibility(server_args: Any):
 
         # Reloaded KV lands through the reload-commit hook in the shared RPA
         # backend base, so every backend that reads the pool must be an RPA
-        # backend.
+        # backend. It must also read the pool's layout: the pool is built for
+        # the base backend only, and split prefill/decode backends share it.
         for backend in dict.fromkeys(
             (cfg.attention_backend, *attention_backends_of(cfg))
         ):
@@ -180,6 +181,15 @@ def resolve_layout_io_compatibility(server_args: Any):
                     f"attention backend {backend!r}: it is not a Pallas RPA "
                     "backend, so it never runs the HiCache reload-commit hook. "
                     "Re-run with RPA attention backends, or disable KV offload."
+                )
+            if tpu_platform._mha_kv_pool_cls(backend) is not pool_cls:
+                raise ValueError(
+                    f"{cfg.hicache_io_backend} KV offloading does not support "
+                    f"attention backend {backend!r} with --attention-backend "
+                    f"{cfg.attention_backend!r}: it reads "
+                    f"{tpu_platform._mha_kv_pool_cls(backend).__name__}, but "
+                    f"the shared KV pool is {pool_cls.__name__}. Re-run with "
+                    "backends that use the same KV pool, or disable KV offload."
                 )
 
         if cfg.kv_cache_dtype == "mxint8":

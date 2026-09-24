@@ -384,10 +384,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     """Shared SGLang attention backend for the Pallas ragged-paged-attention kernels.
 
     Subclasses set :attr:`kernel_spec` to a :class:`RpaKernelSpec` and inherit
-    everything else. Requires the fused KV layout supplied by
-    :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`,
-    which ``TpuSRTPlatform.get_mha_kv_pool_cls`` returns for these backends and
-    the model_runner passes as ``token_to_kv_pool_class``.
+    everything else. Requires a KV pool in the layout its kernel reads:
+    :class:`sglang.srt.hardware_backend.tpu.kv_pool.TpuFusedMHATokenToKVPool`
+    or a subclass (batched's SEQ_ALONG_LANE layout uses
+    ``TpuSeqAlongLaneKVPool``). ``tpu_platform._mha_kv_pool_cls`` maps each
+    backend to its pool, and the model_runner passes it as
+    ``token_to_kv_pool_class``.
     """
 
     # Set by each subclass to select the kernel variant; None on the base only.

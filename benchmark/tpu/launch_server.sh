@@ -100,10 +100,10 @@
 #   KV_OFFLOAD=0                   # 1 → --enable-hierarchical-cache (+ knobs below)
 #   HICACHE_RATIO=2.0              # host pool size / device pool size
 #   HICACHE_SIZE=                  # absolute host pool GB; overrides HICACHE_RATIO
-#   HICACHE_IO_BACKEND=torch_tpu   # TPU host<->HBM transfer path. torch_tpu
-#                                  # REQUIRES ATTENTION_BACKEND=pallas_tpu_rpa_v3
-#                                  # and mem-layout page_first_fused (server_args
-#                                  # rejects other combinations).
+#   HICACHE_IO_BACKEND=torch_tpu   # TPU host<->HBM transfer path (torch_tpu or
+#                                  # raiden). Needs mem-layout page_first_fused
+#                                  # and a Pallas RPA backend whose KV pool
+#                                  # supports it (server_args rejects the rest).
 #   HICACHE_MEM_LAYOUT=page_first_fused
 #   HICACHE_WRITE_POLICY=          # write_through | write_through_selective |
 #                                  # write_back; unset → sglang default
@@ -376,8 +376,8 @@ ENABLE_METRICS=${ENABLE_METRICS:-0}
 ENABLE_CACHE_REPORT=${ENABLE_CACHE_REPORT:-0}
 # ===== KV offload (HiCache) =====
 # The device KV pool is mirrored into host RAM, so evicted prefixes reload over
-# DMA instead of being recomputed. torch_tpu is the TPU io backend; server_args
-# requires it to pair with page_first_fused + pallas_tpu_rpa_v3.
+# DMA instead of being recomputed. torch_tpu and raiden are the TPU io backends;
+# server_args checks them against the layout and the attention backend's KV pool.
 KV_OFFLOAD=${KV_OFFLOAD:-0}
 HICACHE_RATIO=${HICACHE_RATIO:-2.0}
 HICACHE_SIZE=${HICACHE_SIZE:-}
@@ -385,13 +385,6 @@ HICACHE_IO_BACKEND=${HICACHE_IO_BACKEND:-torch_tpu}
 HICACHE_MEM_LAYOUT=${HICACHE_MEM_LAYOUT:-page_first_fused}
 HICACHE_WRITE_POLICY=${HICACHE_WRITE_POLICY:-}
 if [[ "$KV_OFFLOAD" == "1" ]]; then
-    # Fail here rather than 10 minutes into weight loading: the server_args
-    # validator raises the same error, but only after the engine has started.
-    if [[ "$HICACHE_IO_BACKEND" == "torch_tpu" && "$ATTENTION_BACKEND" != "pallas_tpu_rpa_v3" ]]; then
-        echo "ERROR: KV_OFFLOAD=1 with HICACHE_IO_BACKEND=torch_tpu requires" \
-             "ATTENTION_BACKEND=pallas_tpu_rpa_v3, got '$ATTENTION_BACKEND'." >&2
-        exit 2
-    fi
     if [[ "$DISABLE_RADIX_CACHE" == "1" ]]; then
         echo "WARN: KV_OFFLOAD=1 with DISABLE_RADIX_CACHE=1 — HiCache is built on" \
              "the radix tree, so nothing will ever be offloaded. Set" \
