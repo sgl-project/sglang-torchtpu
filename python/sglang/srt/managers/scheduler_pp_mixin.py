@@ -1134,6 +1134,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        keep_on_host: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -1147,7 +1148,7 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
+                all_gather_group=all_gather_group, keep_on_host=keep_on_host
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
@@ -1184,9 +1185,12 @@ class SchedulerPPMixin:
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
+        # On TPU the outputs stay on the host: every stage reads them there
+        # and relays them on without another copy off the device.
         return self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(self.attn_tp_group),
+            keep_on_host=_is_tpu,
         )
 
     def _pp_make_skip_output_result(
@@ -1348,7 +1352,7 @@ class SchedulerPPMixin:
             self.future_map.stash(
                 batch.req_pool_indices,
                 RelayPayload(
-                    bonus_tokens=next_token_ids,
+                    bonus_tokens=next_token_ids.to(batch.device, non_blocking=True),
                     topk_p=(
                         None if next_draft_input is None else next_draft_input.topk_p
                     ),
