@@ -141,9 +141,14 @@ def monkey_patch_torch_tpu_env(
 
     base_inductor_cache = os.environ.get("SGLANG_BASE_TORCHINDUCTOR_CACHE_DIR")
     if not base_inductor_cache:
+        default_cache_dir = (
+            f"/dev/shm/torchinductor_{os.environ.get('USER', 'root')}"
+            if os.path.isdir("/dev/shm")
+            else f"/tmp/torchinductor_{os.environ.get('USER', 'root')}"
+        )
         base_inductor_cache = os.environ.get(
             "TORCHINDUCTOR_CACHE_DIR",
-            f"/tmp/torchinductor_{os.environ.get('USER', 'root')}",
+            default_cache_dir,
         )
         os.environ["SGLANG_BASE_TORCHINDUCTOR_CACHE_DIR"] = base_inductor_cache
     dp_scope = f"dp{dp_size}_dprank{effective_dp_rank}_tp{server_args.tp_size}"
