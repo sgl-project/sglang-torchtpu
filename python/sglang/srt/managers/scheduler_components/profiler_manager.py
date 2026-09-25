@@ -215,7 +215,7 @@ class SchedulerProfilerManager:
         if "TPU" in activities:
             # TorchTPU xprof: capture TPU device activity (and host CPU only if
             # "CPU" was also requested).
-            if _is_tpu and self._is_global_primary_rank():
+            if _is_tpu:
                 from sglang.srt.hardware_backend.tpu.profiler import start_tpu_profile
 
                 subdir_parts = [self.profile_prefix or "profile"]
@@ -223,6 +223,9 @@ class SchedulerProfilerManager:
                     subdir_parts.append(str(self.profile_id))
                 if stage is not None:
                     subdir_parts.append(stage.name)
+                # xprof names the trace file after the host, so ranks sharing a
+                # host need separate directories or they overwrite each other.
+                subdir_parts.extend(self._rank_parts())
                 # "TPU" -> TPU-only. "TPU"+"CPU" -> CPU and TPU.
                 self.tpu_profiler = start_tpu_profile(
                     output_dir=self.torch_profiler_output_dir / "-".join(subdir_parts),
@@ -307,16 +310,17 @@ class SchedulerProfilerManager:
         self._apply_detailed_annotations(self.detailed_annotations)
         return ProfileReqOutput(success=True, message="Succeeded")
 
-    def _is_global_primary_rank(self) -> bool:
-        if self.ps.tp_rank != 0:
-            return False
-        if self.ps.dp_size > 1 and self.ps.dp_rank != 0:
-            return False
-        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
-            return False
-        if self.ps.moe_ep_size > 1 and self.ps.moe_ep_rank != 0:
-            return False
-        return True
+    def _rank_parts(self) -> List[str]:
+        # TP is always present for backward compatibility; the rest only when
+        # that parallelism is actually enabled.
+        parts = [f"TP-{self.ps.tp_rank}"]
+        if self.ps.dp_size > 1:
+            parts.append(f"DP-{self.ps.dp_rank}")
+        if self.ps.pp_size > 1:
+            parts.append(f"PP-{self.ps.pp_rank}")
+        if self.ps.moe_ep_size > 1:
+            parts.append(f"EP-{self.ps.moe_ep_rank}")
+        return parts
 
     def _merge_profile_traces(self) -> str:
         if not self.merge_profiles:
@@ -375,17 +379,7 @@ class SchedulerProfilerManager:
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
             if not _is_npu:
-                # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
-
-                # Only add other ranks if parallelism is enabled (size > 1)
-                if self.ps.dp_size > 1:
-                    filename_parts.append(f"DP-{self.ps.dp_rank}")
-                if self.ps.pp_size > 1:
-                    filename_parts.append(f"PP-{self.ps.pp_rank}")
-                if self.ps.moe_ep_size > 1:
-                    filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
-
+                filename_parts = [self.profile_id, *self._rank_parts()]
                 filename = (
                     stage_prefix
                     + "-".join(filename_parts)
