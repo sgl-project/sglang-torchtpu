@@ -4,7 +4,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -140,11 +140,11 @@ class VocabParallelEmbeddingShardIndices:
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu or _is_tpu)
 def get_masked_input_and_mask(
     input_: torch.Tensor,
-    org_vocab_start_index: Union[int, torch.Tensor],
-    org_vocab_end_index: Union[int, torch.Tensor],
-    num_org_vocab_padding: Union[int, torch.Tensor],
-    added_vocab_start_index: Union[int, torch.Tensor],
-    added_vocab_end_index: Union[int, torch.Tensor],
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # torch.compile will fuse all of the pointwise ops below
     # into a single kernel, making it very fast
@@ -297,7 +297,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             tp_rank,
             self.tp_size,
         )
-        self._sync_shard_indices_buffers()
         self.embedding_dim = embedding_dim
 
         quant_method = None
@@ -349,26 +348,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
-        device = (
-            self.weight.device
-            if hasattr(self, "weight") and isinstance(self.weight, torch.Tensor)
-            else None
-        )
-        self._sync_shard_indices_buffers(device=device)
-
-    def _sync_shard_indices_buffers(self, device: Optional[torch.device] = None):
-        for name, val in [
-            ("_org_vocab_start_index", self.shard_indices.org_vocab_start_index),
-            ("_org_vocab_end_index", self.shard_indices.org_vocab_end_index),
-            ("_num_org_vocab_padding", self.shard_indices.num_org_vocab_padding),
-            ("_added_vocab_start_index", self.shard_indices.added_vocab_start_index),
-            ("_added_vocab_end_index", self.shard_indices.added_vocab_end_index),
-        ]:
-            self.register_buffer(
-                name,
-                torch.tensor(val, dtype=torch.int64, device=device),
-                persistent=False,
-            )
 
     @classmethod
     def _get_indices(
@@ -474,12 +453,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         return ret
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        if (
-            hasattr(self, "_org_vocab_start_index")
-            and self._org_vocab_start_index.device != param.device
-        ):
-            self._sync_shard_indices_buffers(device=param.device)
-
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
 
@@ -589,26 +562,14 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
-        if _is_tpu:
-            if self._org_vocab_start_index.device != input_.device:
-                self._sync_shard_indices_buffers(device=input_.device)
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_,
-                self._org_vocab_start_index,
-                self._org_vocab_end_index,
-                self._num_org_vocab_padding,
-                self._added_vocab_start_index,
-                self._added_vocab_end_index,
-            )
-        else:
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
-            )
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.output_dtype is not None:
