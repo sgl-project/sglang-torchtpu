@@ -26,7 +26,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 def tpu_future_map():
     """Install the TPU FutureMap patch on a CPU host, restoring it on exit."""
     with ExitStack() as stack:
-        for name in ("stash", "publish"):
+        for name in (
+            "stash",
+            "publish",
+            "stash_bonus_tokens",
+            "resolve_mixed_spec_tails",
+        ):
             stack.enter_context(patch.object(FutureMap, name, getattr(FutureMap, name)))
         for name in ("tpu_direct_handoff", "tpu_published_seq_lens"):
             stack.enter_context(patch.object(FutureMap, name, None, create=True))
@@ -227,6 +232,34 @@ class TestDirectHandoff(CustomTestCase):
                 torch.testing.assert_close(
                     fm.output_tokens_buf[indices], payload.bonus_tokens
                 )
+
+    def test_mixed_batch_resolve_flushes_pending_rows_first(self):
+        # A spec mixed batch reads decode-tail tokens straight from the buffer.
+        fm, batch, indices, payload, seq_lens = make_case()
+        self.assertTrue(stash(fm, indices, payload, seq_lens))
+        seen = []
+
+        def read_tails(self, batch):
+            seen.append(self.output_tokens_buf[batch.mix_running_indices].clone())
+
+        with patch.object(FutureMap, "resolve_mixed_spec_tails", read_tails):
+            with tpu_future_map():
+                fm.resolve_mixed_spec_tails(
+                    SimpleNamespace(mix_running_indices=indices)
+                )
+        torch.testing.assert_close(seen[0], payload.bonus_tokens)
+        self.assertIsNone(fm.tpu_direct_handoff)
+
+    def test_bonus_token_stash_flushes_pending_rows_first(self):
+        fm, batch, indices, payload, seq_lens = make_case()
+        self.assertTrue(stash(fm, indices, payload, seq_lens))
+        with tpu_future_map():
+            fm.stash_bonus_tokens(indices[:1], torch.tensor([77]))
+        # The flush lands first, so the newer bonus-token write wins.
+        torch.testing.assert_close(
+            fm.output_tokens_buf[indices], torch.tensor([77, 12])
+        )
+        self.assertIsNone(fm.tpu_direct_handoff)
 
 
 if __name__ == "__main__":

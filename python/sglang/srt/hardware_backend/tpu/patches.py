@@ -729,6 +729,7 @@ def _patch_future_map_direct_handoff() -> None:
     _future_map_direct_handoff_patched = True
 
     from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
+        flush_direct_handoff_tpu,
         publish_tpu,
         stash_tpu,
     )
@@ -736,6 +737,8 @@ def _patch_future_map_direct_handoff() -> None:
 
     orig_stash = FutureMap.stash
     orig_publish = FutureMap.publish
+    orig_stash_bonus_tokens = FutureMap.stash_bonus_tokens
+    orig_resolve_mixed_spec_tails = FutureMap.resolve_mixed_spec_tails
     FutureMap.tpu_direct_handoff = None
     FutureMap.tpu_published_seq_lens = None
 
@@ -747,8 +750,20 @@ def _patch_future_map_direct_handoff() -> None:
         orig_publish(self, future_indices, new_seq_lens, confidence)
         publish_tpu(self, future_indices, new_seq_lens)
 
+    # Every other buffer reader or writer must see the pending rows stored first.
+    def stash_bonus_tokens(self, indices, bonus_tokens):
+        flush_direct_handoff_tpu(self)
+        orig_stash_bonus_tokens(self, indices, bonus_tokens)
+
+    def resolve_mixed_spec_tails(self, batch):
+        # The mixed input resolve reads output_tokens_buf right after this.
+        flush_direct_handoff_tpu(self)
+        orig_resolve_mixed_spec_tails(self, batch)
+
     FutureMap.stash = stash
     FutureMap.publish = publish
+    FutureMap.stash_bonus_tokens = stash_bonus_tokens
+    FutureMap.resolve_mixed_spec_tails = resolve_mixed_spec_tails
 
 
 def apply_tpu_patches() -> None:
