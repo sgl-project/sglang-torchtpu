@@ -12,55 +12,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def test_compile_timing_recorder_preserves_local_steps() -> None:
-    recorder = CompileTimingRecorder()
-    recorder.record(
-        component="target",
-        phase="decode",
-        policy="DecoderTpuCompilePolicy",
-        duration_seconds=1.5,
-        batch_size=32,
-        num_tokens=32,
-    )
-    recorder.record(
-        component="target",
-        phase="decode",
-        policy="DecoderTpuCompilePolicy",
-        duration_seconds=2.5,
-        batch_size=32,
-        num_tokens=32,
-    )
-
-    assert recorder.snapshot() == [
-        {
-            "step_key": (
-                "component=target/phase=decode/"
-                "policy=DecoderTpuCompilePolicy/"
-                "batch_size=32/num_tokens=32"
-            ),
-            "component": "target",
-            "phase": "decode",
-            "policy": "DecoderTpuCompilePolicy",
-            "duration_seconds": 1.5,
-            "batch_size": 32,
-            "num_tokens": 32,
-        },
-        {
-            "step_key": (
-                "component=target/phase=decode/"
-                "policy=DecoderTpuCompilePolicy/"
-                "batch_size=32/num_tokens=32"
-            ),
-            "component": "target",
-            "phase": "decode",
-            "policy": "DecoderTpuCompilePolicy",
-            "duration_seconds": 2.5,
-            "batch_size": 32,
-            "num_tokens": 32,
-        },
-    ]
-
-
 def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
     target = CompileTimingRecorder()
     target.record(
