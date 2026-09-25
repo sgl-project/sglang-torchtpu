@@ -391,7 +391,6 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         sampling_info=SimpleNamespace(is_all_greedy=False),
         draft_input=object(),
         prefix_lens=torch.tensor([3]),
-        bs=1,
     )
 
     accept_len, commit_lens, bonus, out_tokens, _, target_predict = result

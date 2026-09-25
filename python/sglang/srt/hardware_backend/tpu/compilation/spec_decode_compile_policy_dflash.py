@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from typing import Any
 
+import msgspec
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
+    _REAL_B_KEY,
+    _REAL_Q_KEY,
+    _restore_forward_batch_inputs,
+)
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -29,8 +37,32 @@ from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.spec_info import SpecInput, SpecPaddingState
 
 logger = get_logger(__name__)
+
+# Neutral values for the padded sampling rows; their outputs are discarded.
+_TEMPERATURE_FILL = 1.0
+_TOP_K_FILL = 1
+_TOP_P_FILL = 1.0
+
+
+class _DFlashVerifyPadding(msgspec.Struct, frozen=True):
+    """Logical tensors saved while a verify batch runs on padded rows."""
+
+    state: SpecPaddingState
+    batch: Any
+    verify_input: SpecInput
+    seq_lens: torch.Tensor
+    temperatures: torch.Tensor | None
+    top_ks: torch.Tensor | None
+    top_ps: torch.Tensor | None
+
+
+def _pad_rows(tensor: torch.Tensor, pad_rows: int, fill: float) -> torch.Tensor:
+    """Append filler requests to a per-request tensor."""
+    pad_spec = [0, 0] * (tensor.dim() - 1) + [0, pad_rows]
+    return F.pad(tensor, pad_spec, value=fill)
 
 
 def _kv_appender_specialization_key(
@@ -48,8 +80,18 @@ def _kv_appender_specialization_key(
     )
 
 
+def _block_embedder_specialization_key(
+    *, block_ids: torch.Tensor
+) -> tuple[object, ...]:
+    """Key block-embedder artifacts on the padded [bs, block_size] input shape."""
+    return (tuple(block_ids.shape), block_ids.dtype)
+
+
 class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
     """DFlash speculative decoding compile policy mixin."""
+
+    # Prefixes the draft precompile progress labels; DSpark reuses these stages.
+    algo_label = "DFLASH"
 
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
@@ -59,6 +101,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         self.dflash_target_hidden_size = self._infer_dflash_target_hidden_size()
         self._dflash_worker: DFlashWorkerV2 | None = None
         self._compiled_kv_appender: Callable[..., None] | None = None
+        self._compiled_block_embedder: Callable[..., torch.Tensor] | None = None
 
     def _infer_dflash_block_size(self) -> int:
         """Infer DFlash block size from the spec config or the draft config."""
@@ -131,6 +174,154 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
                 model=self.model_runner.model,
                 model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
                 kv_pool=self.model_runner.token_to_kv_pool,
+            )
+        return torch.compile(
+            fn,
+            backend=self.backend or current_platform.get_compile_backend(),
+            dynamic=self.dynamic,
+        )
+
+    def should_defer_verify_output_unpadding(
+        self, batch: Any, verify_input: Any
+    ) -> bool:
+        """Keep target verify outputs padded so accept runs on bucket shapes."""
+        # IDLE never reaches verify: DFlashWorkerV2.forward_batch_generation
+        # short-circuits it, so there is no DP-peer case to cover here.
+        return not batch.forward_mode.is_idle()
+
+    def prepare_spec_verify(
+        self, batch: Any, verify_input: Any, next_token_logits: torch.Tensor
+    ) -> _DFlashVerifyPadding | None:
+        """Widen the per-request verify inputs to match the padded logits."""
+        state = verify_input.padding_state
+        if state is None or not verify_input.keep_outputs_padded:
+            return None
+        if state.physical_num_tokens == state.logical_num_tokens:
+            return None
+        rows = int(next_token_logits.shape[0])
+        if rows == state.logical_num_tokens:
+            # Something already restored the outputs before we got here.
+            verify_input.keep_outputs_padded = False
+            return None
+        if rows != state.physical_num_tokens:
+            raise ValueError(
+                "Deferred DFLASH verify logits do not match the recorded padding: "
+                f"state={state}, logits rows={rows}."
+            )
+
+        sampling_info = batch.sampling_info
+        padding = _DFlashVerifyPadding(
+            state=state,
+            batch=batch,
+            verify_input=verify_input,
+            seq_lens=batch.seq_lens,
+            temperatures=None if sampling_info is None else sampling_info.temperatures,
+            top_ks=None if sampling_info is None else sampling_info.top_ks,
+            top_ps=None if sampling_info is None else sampling_info.top_ps,
+        )
+        pad_rows = state.physical_batch_size - state.logical_batch_size
+        # draft_token is not read after the forward, so it stays logical.
+        batch.seq_lens = _pad_rows(batch.seq_lens, pad_rows, 0)
+        if sampling_info is not None:
+            sampling_info.temperatures = _pad_rows(
+                sampling_info.temperatures, pad_rows, _TEMPERATURE_FILL
+            )
+            sampling_info.top_ks = _pad_rows(
+                sampling_info.top_ks, pad_rows, _TOP_K_FILL
+            )
+            sampling_info.top_ps = _pad_rows(
+                sampling_info.top_ps, pad_rows, _TOP_P_FILL
+            )
+        return padding
+
+    def finalize_dflash_verify(
+        self,
+        padding: _DFlashVerifyPadding,
+        results: tuple[Any, ...],
+        logits_output: Any,
+    ) -> tuple[Any, ...]:
+        """Restore the logical verify inputs and trim every deferred output.
+
+        The token-dim trim is done here off padding_state rather than left to
+        finalize_forward_batch: that path keys off the _tpu_real_q stamp, which
+        only exists when prepare_forward_batch ran, and the padded rows are fatal
+        downstream (a later view folds them into the feature dim).
+        """
+        batch = padding.batch
+        batch.seq_lens = padding.seq_lens
+        sampling_info = batch.sampling_info
+        if sampling_info is not None:
+            sampling_info.temperatures = padding.temperatures
+            sampling_info.top_ks = padding.top_ks
+            sampling_info.top_ps = padding.top_ps
+        padding.verify_input.keep_outputs_padded = False
+
+        num_tokens = padding.state.logical_num_tokens
+        for field in ("next_token_logits", "hidden_states"):
+            value = getattr(logits_output, field, None)
+            if isinstance(value, torch.Tensor) and value.shape[0] > num_tokens:
+                setattr(logits_output, field, value[:num_tokens])
+
+        logical_bs = padding.state.logical_batch_size
+        return tuple(t[:logical_bs] if t is not None else None for t in results)
+
+    def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
+        """Skip the output trim while a deferred verify still needs padded rows."""
+        spec_info = forward_batch.spec_info
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and spec_info is not None
+            and spec_info.keep_outputs_padded
+        ):
+            # Inputs are restored even when outputs stay padded; the worker calls
+            # back here once accept is done.
+            real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+            real_b = getattr(forward_batch, _REAL_B_KEY, None)
+            if real_q is not None and real_b is not None:
+                _restore_forward_batch_inputs(forward_batch, real_q, real_b)
+            return outputs
+        return super().finalize_forward_batch(outputs, forward_batch)
+
+    def _ensure_block_embedder(
+        self, dflash_worker: DFlashWorkerV2 | None = None
+    ) -> None:
+        """Compile and install the drafted-block embedder on the worker.
+
+        Run eager, the vocab-parallel mask fans out into a dozen separately
+        dispatched kernels plus a standalone all-reduce; compiling collapses them
+        into one launch. The seam is an attribute on the worker, never on the
+        embedding module itself -- the target's own forward traces that module
+        inline, and a CompiledFunction there would launch mid-trace.
+        """
+        if dflash_worker is None:
+            raise ValueError("DFlash worker cannot be None")
+        self._dflash_worker = dflash_worker
+        if self._compiled_block_embedder is None:
+            self._compiled_block_embedder = self._compile_block_embedder(
+                dflash_worker.embed_draft_block_ids,
+                embed_module=dflash_worker.ensure_embed_module(),
+            )
+        dflash_worker.embed_draft_block_ids = self._compiled_block_embedder
+
+    def _compile_block_embedder(
+        self, fn: Callable[..., torch.Tensor], *, embed_module: torch.nn.Module
+    ) -> Callable[..., torch.Tensor]:
+        """Compile the block embedder against the embedding module's own weight."""
+        if not isinstance(embed_module.weight, torch.nn.Parameter):
+            raise TypeError(
+                "DFLASH block embedder requires embed_module.weight to be a Parameter "
+                f"so direct_compile can lift it; got {type(embed_module.weight)}."
+            )
+        fn = torch.no_grad()(fn)
+        if self.tracer == "direct":
+            from sglang.srt.hardware_backend.tpu.compilation.direct_compile import (
+                direct_compile,
+            )
+
+            return direct_compile(
+                fn,
+                specialization_key=_block_embedder_specialization_key,
+                model=embed_module,
             )
         return torch.compile(
             fn,
@@ -359,6 +550,7 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if get_disagg().disaggregation_mode != "prefill":
             self._precompile_draft_verify(draft_attn_backend)
         self._precompile_append_target_hidden_to_draft_kv_by_loc_tpu(dflash_worker)
+        self._precompile_embed_draft_block_ids(dflash_worker)
         logger.info(
             "[spec compile policy] DFLASH DRAFT precompile done in %.1fs.",
             time.perf_counter() - overall,
@@ -381,6 +573,34 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if disagg_mode != "decode":
             self._precompile_draft_append_kv_extend()
 
+    def _precompile_embed_draft_block_ids(self, dflash_worker: DFlashWorkerV2) -> None:
+        """Compile the drafted-block embedder across batch size buckets."""
+        self._ensure_block_embedder(dflash_worker)
+        if self.b_bucketer is None:
+            raise ValueError(
+                "b_bucketer must be initialized before precompiling block embed."
+            )
+        bs_buckets = list(self.b_bucketer.buckets)
+        draft_token_num = self.draft_token_num
+        device = self.model_runner.device
+        logger.info(
+            "[spec compile policy] DFLASH DRAFT BLOCK EMBED: %d shapes (bs=%s, draft_token_num=%d)",
+            len(bs_buckets),
+            bs_buckets,
+            draft_token_num,
+        )
+
+        def run(bs: int) -> str:
+            # direct_compile does not normalize call structure, so this must match
+            # the serving call exactly: keyword arg, long dtype, [bs, block_size].
+            block_ids = torch.zeros(
+                (bs, draft_token_num), dtype=torch.long, device=device
+            )
+            dflash_worker.embed_draft_block_ids(block_ids=block_ids)
+            return f"bs={bs}"
+
+        self._precompile_shapes("DFLASH DRAFT BLOCK EMBED", bs_buckets, run)
+
     def _precompile_draft_append_kv_verify(self) -> None:
         """Compile DFLASH draft KV append across batch size buckets (verify/decode)."""
         if self.b_bucketer is None:
@@ -394,7 +614,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         dtype = self.model_runner.dtype
         cache_loc_dtype = self._dummy_out_cache_loc_dtype(ForwardMode.TARGET_VERIFY)
         logger.info(
-            "[spec compile policy] DFLASH DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, draft_token_num=%d)",
+            "[spec compile policy] %s DRAFT APPEND KV (VERIFY): %d shapes (bs=%s, draft_token_num=%d)",
+            self.algo_label,
             len(bs_buckets),
             bs_buckets,
             draft_token_num,
@@ -420,7 +641,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
             return f"bs={bs}, tokens={num_tokens}"
 
-        self._precompile_shapes("DFLASH DRAFT APPEND KV (VERIFY)", bs_buckets, run)
+        self._precompile_shapes(
+            f"{self.algo_label} DRAFT APPEND KV (VERIFY)", bs_buckets, run
+        )
 
     def _precompile_draft_append_kv_extend(self) -> None:
         """Compile DFLASH draft KV append across token buckets (extend/prefill)."""
@@ -430,7 +653,8 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
         token_buckets = list(self.t_bucketer.buckets)
         logger.info(
-            "[spec compile policy] DFLASH DRAFT APPEND KV (EXTEND): %d shapes (token_buckets=%s)",
+            "[spec compile policy] %s DRAFT APPEND KV (EXTEND): %d shapes (token_buckets=%s)",
+            self.algo_label,
             len(token_buckets),
             token_buckets,
         )
@@ -453,7 +677,9 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
             )
             return f"tokens={num_tokens}"
 
-        self._precompile_shapes("DFLASH DRAFT APPEND KV (EXTEND)", token_buckets, run)
+        self._precompile_shapes(
+            f"{self.algo_label} DRAFT APPEND KV (EXTEND)", token_buckets, run
+        )
 
     def _precompile_draft_verify(
         self, draft_attn_backend: AttentionBackend | None = None
