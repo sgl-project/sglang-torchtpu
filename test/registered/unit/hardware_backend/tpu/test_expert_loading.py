@@ -1,7 +1,8 @@
 """Host staging for TPU pipeline expert loading."""
 
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -47,6 +48,52 @@ class TestExpertWriteTracker(CustomTestCase):
             self.assertFalse(tracker.record(second, expert, "w2"))
         self.assertTrue(tracker.record(second, 2, "w2"))
         self.assertTrue(tracker.record(first, 2, "w2"))
+
+
+class TestStagedWeightLoader(CustomTestCase):
+    def test_context_routes_staged_expert_writes_to_the_host_buffer(self):
+        """While a stage loads, FusedMoE's expert loader writes a device
+        parameter's shard to its host buffer and reports the write; scales
+        that are never staged, and every write after the context, load as
+        before."""
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        original = FusedMoE._weight_loader_impl
+        load_impl = Mock()
+        moe = object()
+        device_param = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+        host_param = object()
+        with patch.object(FusedMoE, "_weight_loader_impl", load_impl):
+            with expert_loading.expert_loading_context() as stager:
+                stager.staging = Mock(return_value=True)
+                stager.host_param = Mock(return_value=host_param)
+                stager.written = Mock()
+                FusedMoE._weight_loader_impl(
+                    moe, device_param, "w", "w13_weight", "w1", 3
+                )
+                load_impl.assert_called_once_with(
+                    moe,
+                    param=host_param,
+                    loaded_weight="w",
+                    weight_name="w13_weight",
+                    shard_id="w1",
+                    expert_id=3,
+                )
+                stager.written.assert_called_once_with(device_param, 3, "w1")
+                load_impl.reset_mock()
+                FusedMoE._weight_loader_impl(
+                    moe, device_param, "s", "w13_input_scale", "w1", 3
+                )
+                load_impl.assert_called_once_with(
+                    moe,
+                    param=device_param,
+                    loaded_weight="s",
+                    weight_name="w13_input_scale",
+                    shard_id="w1",
+                    expert_id=3,
+                )
+            self.assertIs(FusedMoE._weight_loader_impl, load_impl)
+        self.assertIs(FusedMoE._weight_loader_impl, original)
 
 
 class TestExpertParamStager(CustomTestCase):

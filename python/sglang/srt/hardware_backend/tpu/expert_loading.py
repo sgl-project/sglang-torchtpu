@@ -4,6 +4,7 @@ and convert a stage's FP8 experts to the runtime layout a few at a time."""
 
 from __future__ import annotations
 
+import functools
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -100,15 +101,58 @@ def get_expert_stager() -> ExpertParamStager | None:
     return _active_stager.get()
 
 
+def _stage_expert_writes(load_impl):
+    """``FusedMoE._weight_loader_impl`` that writes a staged expert shard to
+    the parameter's host buffer instead of the device."""
+
+    @functools.wraps(load_impl)
+    def _weight_loader_impl(
+        self, param, loaded_weight, weight_name, shard_id, expert_id
+    ):
+        stager = _active_stager.get()
+        if (
+            stager is not None
+            and param.device.type == "tpu"
+            and "input_scale" not in weight_name
+            and stager.staging(param)
+        ):
+            load_impl(
+                self,
+                param=stager.host_param(param),
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            stager.written(param, expert_id, shard_id)
+            return
+        load_impl(
+            self,
+            param=param,
+            loaded_weight=loaded_weight,
+            weight_name=weight_name,
+            shard_id=shard_id,
+            expert_id=expert_id,
+        )
+
+    return _weight_loader_impl
+
+
 @contextmanager
 def expert_loading_context():
-    """Upload remaining staged parameters before weight post-processing."""
+    """Stage expert shards on the host while a pipeline stage loads, and
+    upload the remaining staged parameters before weight post-processing."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
     stager = ExpertParamStager()
     token = _active_stager.set(stager)
+    load_impl = FusedMoE._weight_loader_impl
+    FusedMoE._weight_loader_impl = _stage_expert_writes(load_impl)
     try:
         yield stager
         stager.flush_all()
     finally:
+        FusedMoE._weight_loader_impl = load_impl
         _active_stager.reset(token)
 
 

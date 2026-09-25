@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -41,6 +41,7 @@ _is_tpu = is_tpu()
 _PP_PD_CONSENSUS_TAG = 0x5050
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.tpu.pp_scheduler import PPDecodeTransferStatus
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -65,13 +66,6 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
-
-
-class PPDecodeTransferStatus(NamedTuple):
-    """Transfer terminals shared by every stage and failures seen by any stage."""
-
-    terminal_rids: List[str]
-    failed_rids: List[str]
 
 
 class SchedulerPPMixin:
@@ -133,21 +127,13 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
-                if self._pp_wave is not None:
-                    self._pp_wave.begin_iteration(cur_batch is not None)
+                self._pp_begin_iteration(cur_batch is not None)
                 if cur_batch:
                     server_is_idle = False
-                    if self._pp_wave is not None:
-                        pp_proxy_tensors = self._pp_wave_receive()
-                    else:
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                # Over the wave the last stage sends the previous outputs after
-                # it has queued this forward: the send copies them off the
-                # device, and the copy then overlaps the forward.
-                defer_send = self._pp_wave is not None and self.pp_group.is_last_rank
                 # With zero async depth, non-last speculative ranks must
                 # exchange the previous outputs before launching the next batch.
                 # Tree planning synchronizes CUDA on the host; sending alone
@@ -163,7 +149,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
-                            defer_send=defer_send,
+                            before_forward=True,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -175,7 +161,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if defer_send and exchange_outputs_before_forward:
+                if exchange_outputs_before_forward:
                     self._pp_send_deferred_output(next_first_rank_mb_id)
                 if not exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -185,10 +171,7 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
-                    # Over the wave, result reads block on their own tensors or
-                    # wait on copy_done; the event waits on every pending copy.
-                    if self._pp_wave is None:
-                        d2h_event.synchronize()
+                    d2h_event.synchronize()
                     process_target = self.mbs[next_mb_id]
                     next_md = self.mb_metadata[next_mb_id]
                     if next_md is not None and next_md.fwd_batch is not None:
@@ -201,23 +184,7 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if self._pp_wave is not None:
-                    with torch.profiler.record_function("pp_wave_send"):
-                        self._pp_wave.end_iteration(
-                            result.pp_hidden_states_proxy_tensors.tensors
-                            if cur_batch and not self.pp_group.is_last_rank
-                            else None
-                        )
-                elif cur_batch and not self.pp_group.is_last_rank:
-                    self.device_module.current_stream().wait_event(self.launch_event)
-                    with torch.profiler.record_function(
-                        "send_proxy_dict_to_next_stage"
-                    ):
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
+                self._pp_send_proxy(result if cur_batch else None)
 
                 self.pp_outputs = next_pp_outputs
 
@@ -225,32 +192,57 @@ class SchedulerPPMixin:
             if server_is_idle:
                 self.on_idle()
 
-    def _pp_wave_receive(self: Scheduler) -> Optional[PPProxyTensors]:
-        """This iteration's incoming activations over the ICI wave (None on
-        the first stage). They arrive at the wave's row count; the compiled
-        forward shim trims them to the batch's token bucket."""
+    # Stage hand-off: over the TPU ICI wave when init_pp_loop_state built one,
+    # otherwise over the host channel. Each helper dispatches once; the wait
+    # on the output copy event is the same on both.
+    def _pp_init_wave(self: Scheduler):
+        from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+            build_scheduler_pp_wave,
+        )
+
+        return build_scheduler_pp_wave(self)
+
+    def _pp_begin_iteration(self: Scheduler, has_forward: bool) -> None:
+        if self._pp_wave is not None:
+            self._pp_wave.begin_iteration(has_forward)
+
+    def _pp_recv_proxy(self: Scheduler) -> Optional[PPProxyTensors]:
+        """This iteration's activations from the previous stage (None on the
+        first stage). Over the wave they arrive at its row count; the
+        compiled forward shim trims them to the batch's token bucket."""
+        if self._pp_wave is None:
+            return self._pp_recv_proxy_tensors()
         tensors = self._pp_wave.receive()
         return None if tensors is None else PPProxyTensors(tensors)
 
-    def _pp_init_wave(self: Scheduler):
-        """Hand activations between TPU stages over ICI in every serving mode."""
-        from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
-            DecoderTpuCompilePolicy,
-        )
-        from sglang.srt.hardware_backend.tpu.pp_wave import build_pp_wave
+    def _pp_send_proxy(
+        self: Scheduler, result: Optional[GenerationBatchResult]
+    ) -> None:
+        """Hand this iteration's forward output (None without a forward) to
+        the next stage."""
+        if self._pp_wave is not None:
+            with torch.profiler.record_function("pp_wave_send"):
+                self._pp_wave.end_iteration(
+                    result.pp_hidden_states_proxy_tensors.tensors
+                    if result is not None and not self.pp_group.is_last_rank
+                    else None
+                )
+            return
+        if result is None or self.pp_group.is_last_rank:
+            return
+        self.device_module.current_stream().wait_event(self.launch_event)
+        with torch.profiler.record_function("send_proxy_dict_to_next_stage"):
+            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                result.pp_hidden_states_proxy_tensors.tensors,
+                async_send=True,
+                msg_type="proxy",
+            )
 
-        model_runner = self.tp_worker.model_runner
-        policy = model_runner.compile_policy
-        # The buffer holds the largest batch a forward can hand on; a compiled
-        # forward pads its batch to one of the policy's buckets.
-        assert isinstance(policy, DecoderTpuCompilePolicy), type(policy)
-        return build_pp_wave(
-            self.pp_group,
-            rows=policy.max_padded_tokens(),
-            hidden=int(model_runner.model_config.hidden_size),
-            dtype=model_runner.dtype,
-            device=torch.device(model_runner.device),
-        )
+    def _pp_output_send_deferred(self: Scheduler) -> bool:
+        """Over the wave the last stage sends the previous outputs after it
+        has queued this forward: the send copies them off the device, and the
+        copy then overlaps the forward."""
+        return self._pp_wave is not None and self.pp_group.is_last_rank
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -317,8 +309,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                if self._pp_wave is not None:
-                    self._pp_pd_begin_control_step(mb_id)
+                self._pp_pd_begin_control_step(mb_id)
 
                 recv_reqs = self.ingest_requests()
                 # This PP-specialized loop bypasses both batch getters that
@@ -338,24 +329,15 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                # Every downstream stage must enter this iteration before a
-                # device wait can depend on its collective-permute launch.
-                # Consensus uses a separate tagged channel on TPU, since a
-                # downstream stage may still be receiving the preceding round.
-                if self._pp_wave is not None and not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_pd_send_control_to_next_stage(
-                        recv_reqs, async_send=True
+                control = self._pp_pd_send_control(
+                    [recv_reqs, bootstrapped_rids, transferred_rids],
+                    before_forward=True,
+                )
+                if control is not None:
+                    self.send_req_work, send_bootstrapped_work, send_transfer_work = (
+                        control
                     )
-                    send_bootstrapped_work = self._pp_pd_send_control_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_pd_send_control_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-
-                # Prior-round consensus releases downstream stages from
-                # their preceding iteration before this forward waits on ICI.
-                if self._pp_wave is not None:
+                if self._pp_pd_consensus_turn(before_forward=True):
                     send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                         self._pp_pd_send_consensus_bootstrapped_ids(
                             bmbs,
@@ -383,23 +365,17 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
-                if self._pp_wave is not None:
-                    self._pp_wave.begin_iteration(cur_batch is not None)
+                self._pp_begin_iteration(cur_batch is not None)
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = (
-                        self._pp_wave_receive()
-                        if self._pp_wave is not None
-                        else self._pp_recv_proxy_tensors()
-                    )
+                    pp_proxy_tensors = self._pp_recv_proxy()
 
-                defer_send = self._pp_wave is not None and self.pp_group.is_last_rank
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
-                            defer_send=defer_send,
+                            before_forward=True,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -413,7 +389,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if defer_send and get_parallel().pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     self._pp_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -422,7 +398,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                if self._pp_wave is None:
+                if self._pp_pd_consensus_turn(before_forward=False):
                     send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                         self._pp_pd_send_consensus_bootstrapped_ids(
                             bmbs,
@@ -450,8 +426,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
-                    if self._pp_wave is None:
-                        d2h_event.synchronize()
+                    d2h_event.synchronize()
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -460,32 +435,15 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
-                if self._pp_wave is None and not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                control = self._pp_pd_send_control(
+                    [recv_reqs, bootstrapped_rids, transferred_rids],
+                    before_forward=False,
+                )
+                if control is not None:
+                    self.send_req_work, send_bootstrapped_work, send_transfer_work = (
+                        control
                     )
-                    send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if self._pp_wave is None and cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
-
-                if self._pp_wave is not None:
-                    self._pp_wave.end_iteration(
-                        result.pp_hidden_states_proxy_tensors.tensors
-                        if cur_batch and not self.pp_group.is_last_rank
-                        else None
-                    )
+                self._pp_send_proxy(result if cur_batch else None)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -530,8 +488,7 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                if self._pp_wave is not None:
-                    self._pp_pd_begin_control_step(mb_id)
+                self._pp_pd_begin_control_step(mb_id)
 
                 recv_reqs = self.ingest_requests()
 
@@ -551,23 +508,18 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
-                if self._pp_wave is not None and not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_pd_send_control_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_retract_work = self._pp_pd_send_control_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_pd_send_control_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_pd_send_control_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-
-                # Preallocation and transfer releases also unblock a stage
-                # that has not reached this iteration's ICI launch yet.
-                if self._pp_wave is not None:
+                control = self._pp_pd_send_control(
+                    [recv_reqs, retract_rids, prealloc_rids, transferred_rids],
+                    before_forward=True,
+                )
+                if control is not None:
+                    (
+                        self.send_req_work,
+                        send_retract_work,
+                        send_prealloc_work,
+                        send_transfer_work,
+                    ) = control
+                if self._pp_pd_consensus_turn(before_forward=True):
                     send_consensus_retract_work, consensus_retract_rids = (
                         self._pp_pd_send_consensus_bootstrapped_ids(
                             rmbs,
@@ -609,26 +561,20 @@ class SchedulerPPMixin:
                 has_forward = (
                     cur_batch is not None and not cur_batch.forward_mode.is_prebuilt()
                 )
-                if self._pp_wave is not None:
-                    self._pp_wave.begin_iteration(has_forward)
+                self._pp_begin_iteration(has_forward)
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if has_forward:
-                        pp_proxy_tensors = (
-                            self._pp_wave_receive()
-                            if self._pp_wave is not None
-                            else self._pp_recv_proxy_tensors()
-                        )
+                        pp_proxy_tensors = self._pp_recv_proxy()
 
-                defer_send = self._pp_wave is not None and self.pp_group.is_last_rank
                 # early send output if possible
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
-                            defer_send=defer_send,
+                            before_forward=True,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -642,7 +588,7 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
 
-                if defer_send and get_parallel().pp_async_batch_depth > 0:
+                if get_parallel().pp_async_batch_depth > 0:
                     self._pp_send_deferred_output(next_first_rank_mb_id)
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -652,7 +598,7 @@ class SchedulerPPMixin:
                         )
                     )
 
-                if self._pp_wave is None:
+                if self._pp_pd_consensus_turn(before_forward=False):
                     send_consensus_retract_work, consensus_retract_rids = (
                         self._pp_pd_send_consensus_bootstrapped_ids(
                             rmbs,
@@ -708,43 +654,25 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
-                        if self._pp_wave is None:
-                            d2h_event.synchronize()
+                        d2h_event.synchronize()
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if self._pp_wave is None and not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
-                    send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=True
-                    )
-                    send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=True
-                    )
-                    send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=True
-                    )
-                    if self._pp_wave is None and has_forward:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
-
-                if self._pp_wave is not None:
-                    self._pp_wave.end_iteration(
-                        result.pp_hidden_states_proxy_tensors.tensors
-                        if has_forward and not self.pp_group.is_last_rank
-                        else None
-                    )
+                control = self._pp_pd_send_control(
+                    [recv_reqs, retract_rids, prealloc_rids, transferred_rids],
+                    before_forward=False,
+                )
+                if control is not None:
+                    (
+                        self.send_req_work,
+                        send_retract_work,
+                        send_prealloc_work,
+                        send_transfer_work,
+                    ) = control
+                self._pp_send_proxy(result if has_forward else None)
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
@@ -793,9 +721,7 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
-        self._pp_wave = None
-        if _is_tpu:
-            self._pp_wave = self._pp_init_wave()
+        self._pp_wave = self._pp_init_wave() if _is_tpu else None
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
@@ -885,9 +811,41 @@ class SchedulerPPMixin:
         return transferred_rids
 
     def _pp_pd_begin_control_step(self: Scheduler, mb_id: int) -> None:
-        """Retire control sends only when their microbatch slot is reused."""
+        """Retire the wave's control sends only when their microbatch slot is
+        reused; no-op over the host channel."""
+        if self._pp_wave is None:
+            return
         self._pp_commit_comm_work(self._pp_pd_control_work[mb_id])
         self._pp_pd_control_slot = mb_id
+
+    def _pp_pd_send_control(
+        self: Scheduler, payloads: List, *, before_forward: bool
+    ) -> Optional[List[List[P2PWork]]]:
+        """Send this iteration's requests and votes to the next stage; None
+        when it is not this call's turn. Over the wave they go before the
+        forward: every downstream stage must enter this iteration before a
+        device wait can depend on its collective-permute launch."""
+        if self.pp_group.is_last_rank:
+            return None
+        if self._pp_wave is None:
+            if before_forward:
+                return None
+            return [
+                self._pp_send_pyobj_to_next_stage(data, async_send=True)
+                for data in payloads
+            ]
+        if not before_forward:
+            return None
+        return [
+            self._pp_pd_send_control_to_next_stage(data, async_send=True)
+            for data in payloads
+        ]
+
+    def _pp_pd_consensus_turn(self: Scheduler, *, before_forward: bool) -> bool:
+        """Whether this call sends the prior-round consensus. Over the wave
+        it goes before the forward, releasing downstream stages from their
+        preceding iteration before this forward waits on ICI."""
+        return (self._pp_wave is not None) == before_forward
 
     def _pp_pd_retain_control_work(self: Scheduler, work: List[P2PWork]):
         # The ring owns the serialized buffers until their real sends complete.
@@ -983,7 +941,7 @@ class SchedulerPPMixin:
         next_first_rank_mb_id: int,
         next_mb_id: int,
         *,
-        defer_send: bool = False,
+        before_forward: bool = False,
     ) -> Tuple[
         Optional[PPProxyTensors],
         Optional[GenerationBatchResult],
@@ -1002,14 +960,14 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
-            defer_send=defer_send,
+            defer_send=before_forward and self._pp_output_send_deferred(),
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
     def _pp_send_deferred_output(self: Scheduler, next_first_rank_mb_id: int) -> None:
-        """The ring send skipped by ``defer_send``, issued after the forward
-        launch so the copy of the previous outputs off the device overlaps
-        the forward just queued."""
+        """The ring send skipped before the forward, issued after its launch."""
+        if not self._pp_output_send_deferred():
+            return
         self.send_output_work = self._pp_send_output_to_next_stage(
             next_first_rank_mb_id,
             self.mbs,
@@ -1167,30 +1125,23 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            tensor_dict = self._pp_recv_typed_dict(
-                expected_kind="proxy",
-                all_gather_group=(self.attn_tp_group),
+            pp_proxy_tensors = PPProxyTensors(
+                self._pp_recv_typed_dict(
+                    expected_kind="proxy",
+                    all_gather_group=(self.attn_tp_group),
+                )
             )
-            if _is_tpu:
-                # The compiled forward takes tensors only; the message-type
-                # tag stays out of the proxy.
-                tensor_dict = {
-                    key: value
-                    for key, value in tensor_dict.items()
-                    if isinstance(value, torch.Tensor)
-                }
-            pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
-        # On TPU the outputs stay on the host: every stage reads them there
-        # and relays them on without another copy off the device.
+        # Over the wave the outputs stay on the host: every stage reads them
+        # there and relays them on without another copy off the device.
         return self._pp_recv_typed_dict(
             expected_kind="output",
             all_gather_group=(self.attn_tp_group),
-            keep_on_host=_is_tpu,
+            keep_on_host=self._pp_wave is not None,
         )
 
     def _pp_make_skip_output_result(
@@ -1305,7 +1256,7 @@ class SchedulerPPMixin:
             return output_result
 
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        if _is_tpu:
+        if self._pp_wave is not None:
             # The relayed outputs stay on the host; decode reads its input IDs
             # from a device buffer.
             next_token_ids = next_token_ids.to(batch.device, non_blocking=True)
@@ -2010,58 +1961,44 @@ class SchedulerPPMixin:
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
-        if not _is_tpu:
-            # get the current stage transfer success
-            if self.pp_group.is_first_rank:
-                transferred_rids = self.get_rids(
-                    self.disagg_decode_transfer_queue.queue,
-                    False,
-                    [KVPoll.Success, KVPoll.Failed],
-                )
-            # if other ranks, do intersection with the previous rank's transferred rids
-            else:
-                # 2 (Release): Receive the transferred rids from the previous rank
-                # 1. recv previous stage's transferred reqs info
-                prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
-                # 2. get the current stage's transferred reqs info
-                curr_transferred_rids = self.get_rids(
-                    self.disagg_decode_transfer_queue.queue,
-                    False,
-                    [KVPoll.Success, KVPoll.Failed],
-                )
-                # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
-                transferred_rids = list(
-                    set(prev_transferred_rids) & set(curr_transferred_rids)
-                )
-            return transferred_rids
+        if self._pp_wave is not None:
+            # Over the wave every stage polls its own receivers and the status
+            # carries the failures seen by any stage.
+            from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+                decode_transfer_status,
+            )
 
-        # Over the TPU wave every stage polls its own receivers; terminals are
-        # shared by every stage and a failure seen by any stage is a failure.
-        previous = (
-            None
-            if self.pp_group.is_first_rank
-            else self._pp_recv_pyobj_from_prev_stage()
-        )
-        queue = self.disagg_decode_transfer_queue
-        polls = (
-            queue._poll_with_staging()
-            if queue.enable_staging
-            else queue._poll_with_metadata_gate()
-        )
-        terminal_rids = [
-            item.req.rid
-            for item, poll in zip(queue.queue, polls)
-            if poll in (KVPoll.Success, KVPoll.Failed)
-        ]
-        failed_rids = [
-            item.req.rid
-            for item, poll in zip(queue.queue, polls)
-            if poll == KVPoll.Failed
-        ]
-        if previous is not None:
-            terminal_rids = sorted(set(previous.terminal_rids) & set(terminal_rids))
-            failed_rids = sorted(set(previous.failed_rids) | set(failed_rids))
-        return PPDecodeTransferStatus(terminal_rids, failed_rids)
+            return decode_transfer_status(
+                self.disagg_decode_transfer_queue,
+                (
+                    None
+                    if self.pp_group.is_first_rank
+                    else self._pp_recv_pyobj_from_prev_stage()
+                ),
+            )
+        # get the current stage transfer success
+        if self.pp_group.is_first_rank:
+            transferred_rids = self.get_rids(
+                self.disagg_decode_transfer_queue.queue,
+                False,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+        # if other ranks, do intersection with the previous rank's transferred rids
+        else:
+            # 2 (Release): Receive the transferred rids from the previous rank
+            # 1. recv previous stage's transferred reqs info
+            prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            # 2. get the current stage's transferred reqs info
+            curr_transferred_rids = self.get_rids(
+                self.disagg_decode_transfer_queue.queue,
+                False,
+                [KVPoll.Success, KVPoll.Failed],
+            )
+            # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
+            transferred_rids = list(
+                set(prev_transferred_rids) & set(curr_transferred_rids)
+            )
+        return transferred_rids
 
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
@@ -2101,33 +2038,26 @@ class SchedulerPPMixin:
         # Resolve held deferred releases every call, independent of release_rids,
         # so ack/timeout-driven releases still fire when no rids are being polled.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
-        if not _is_tpu:
-            if release_rids is not None:
-                released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                    release_rids
-                )
-                if self.enable_hisparse:
-                    for req in released_reqs:
-                        self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(released_reqs)
-                return [req.rid for req in released_reqs]
-            return None
         if release_rids is not None:
-            failed_rids = set(release_rids.failed_rids)
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if decode_req.req.rid not in failed_rids:
-                    continue
-                receiver = decode_req.kv_receiver
-                if getattr(receiver, "group_failure_requires_drain", False):
-                    receiver.quiesce_group_failure()
-                else:
-                    receiver.abort()
+            terminal_rids = release_rids
+            if self._pp_wave is not None:
+                from sglang.srt.hardware_backend.tpu.pp_scheduler import (
+                    abort_failed_receivers,
+                )
+
+                abort_failed_receivers(
+                    self.disagg_decode_transfer_queue, release_rids.failed_rids
+                )
+                terminal_rids = release_rids.terminal_rids
             released_reqs = self.disagg_decode_transfer_queue.pop_transferred(
-                release_rids.terminal_rids
+                terminal_rids
             )
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(released_reqs)
-            return release_rids
+            if self._pp_wave is not None:
+                # The status travels on: every stage fails the copies itself.
+                return release_rids
+            return [req.rid for req in released_reqs]
         return None

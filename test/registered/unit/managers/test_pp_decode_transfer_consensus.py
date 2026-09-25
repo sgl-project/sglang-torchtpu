@@ -10,12 +10,11 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-import sglang.srt.managers.scheduler_pp_mixin as pp_mixin  # noqa: E402
 from sglang.srt.disaggregation.base.conn import KVPoll  # noqa: E402
-from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+from sglang.srt.hardware_backend.tpu.pp_scheduler import (  # noqa: E402
     PPDecodeTransferStatus,
-    SchedulerPPMixin,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.utils.common import point_to_point_pyobj  # noqa: E402
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -84,9 +83,17 @@ class TransferQueue:
 
 def scheduler(rank, receivers, size=3):
     result = SchedulerPPMixin()
+    # The per-stage poll and the failure union are the TPU wave's path; its
+    # consensus travels on the pipeline group's tagged channel.
+    result._pp_wave = object()
+    result.ps = SimpleNamespace(pp_rank=rank, pp_size=size)
     result.pp_group = SimpleNamespace(
-        is_first_rank=rank == 0, is_last_rank=rank == size - 1
+        is_first_rank=rank == 0,
+        is_last_rank=rank == size - 1,
+        send_object=Mock(return_value=[]),
     )
+    result._pp_pd_control_work = [[]]
+    result._pp_pd_control_slot = 0
     result.attn_cp_cpu_group = object()
     result.attn_tp_cpu_group = object()
     result.disagg_decode_transfer_queue = TransferQueue(receivers)
@@ -106,12 +113,6 @@ def consensus(stages):
 
 
 class TestDecodeTransferConsensus(unittest.TestCase):
-    def setUp(self):
-        # The per-stage poll and the failure union are the TPU pipeline's path.
-        patcher = patch.object(pp_mixin, "_is_tpu", True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def release(self, stages, payload):
         forwarded = payload
         for stage in stages:
@@ -122,9 +123,7 @@ class TestDecodeTransferConsensus(unittest.TestCase):
                     [payload], 0, forwarded, payload
                 )
                 self.assertIs(sent, payload)
-                stage._pp_send_pyobj_to_next_stage.assert_called_with(
-                    payload, async_send=True
-                )
+                self.assertIs(stage.pp_group.send_object.call_args.args[0], payload)
 
     def test_failure_at_any_stage_aborts_every_copy_and_preserves_other_requests(self):
         for failing_rank in range(3):
