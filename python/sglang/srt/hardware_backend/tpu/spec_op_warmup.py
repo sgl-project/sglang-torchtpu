@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -77,6 +78,19 @@ def make_draft_extend_select_args(
             device=context.device,
         ),
         select_index,
+    )
+
+
+def make_dflash_verify_argmax_args(
+    context: SpecOpWarmupContext,
+) -> tuple[Any, ...]:
+    return (
+        torch.zeros(
+            (context.physical_bs * context.num_verify_tokens, context.vocab_size),
+            dtype=torch.float32,
+            device=context.device,
+        ),
+        context.num_verify_tokens,
     )
 
 

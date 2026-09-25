@@ -45,6 +45,12 @@ DFLASH_BLOCK_SIZE = 3
 # Output text is meaningless under this knob -- never set it on an accuracy gate.
 SIMULATE_ACC_LEN = 2.5
 
+# DFlash is the only algorithm whose scheduler auto-enables min-free-slots-delay
+# (4 slots at max-running 64). It holds decode rows empty that the TPU batch
+# bucket pays for regardless, and the prefill batching it buys is worth nothing
+# at ISL 8192 against an 8192 token bucket. 1 disables.
+MIN_FREE_SLOTS_DELAY = 1
+
 
 MODEL_CONFIG = {
     "model": MODEL,
@@ -76,7 +82,8 @@ MODEL_CONFIG = {
                 f"--served-model-name {MODEL} "
                 "--speculative-algorithm DFLASH "
                 f"--speculative-draft-model-path {DRAFT_MODEL} "
-                f"--speculative-dflash-block-size {DFLASH_BLOCK_SIZE}"
+                f"--speculative-dflash-block-size {DFLASH_BLOCK_SIZE} "
+                f"--min-free-slots-delay {MIN_FREE_SLOTS_DELAY}"
             ),
         },
         "health_timeout": HEALTH_TIMEOUT,
