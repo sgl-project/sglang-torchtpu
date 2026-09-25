@@ -171,7 +171,7 @@ jobs:
       test_file: ${{ matrix.test.file }}
       nightly: true
       run_name: ${{ matrix.test.run_name }}
-      weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights-filestore' }}
+      weights_pvc: ${{ matrix.test.weights_pvc || 'model-weights' }}
     permissions:
       contents: read
       id-token: write
@@ -210,7 +210,7 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_pc_offload)[0].run_name }}
     permissions:
       contents: read
@@ -235,7 +235,7 @@ jobs:
       exec_cmd: env MODEL_PROFILE=gpt_oss_120b python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_kv_offload_resharding.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard)[0].run_name }}
     permissions:
       contents: read
@@ -262,7 +262,7 @@ jobs:
       exec_cmd: env MODEL_PROFILE=qwen3_coder_480b python3 test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_qwen3_coder_480b_pd_multihost_kv_offload_resharding.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_kvoff_reshard_qwen)[0].run_name }}
     permissions:
       contents: read
@@ -289,7 +289,7 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
       # Names the dashboard row and the TIMINGS record; required in P/D mode.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost)[0].run_name }}
     permissions:
       contents: read
@@ -315,7 +315,7 @@ jobs:
       pd_decode_hosts: 1
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_spec.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_spec)[0].run_name }}
     permissions:
       contents: read
@@ -340,7 +340,7 @@ jobs:
       pd_decode_hosts: 1
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost_decode_radix.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_singlehost_decode_radix)[0].run_name }}
     permissions:
       contents: read
@@ -366,7 +366,7 @@ jobs:
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py integration
       # Used for dashboard and timing records.
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: ${{ fromJSON(needs.discover-tests.outputs.pd_multihost)[0].run_name }}
     permissions:
       contents: read
@@ -391,7 +391,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_spec_gsm8k.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-spec
     permissions:
       contents: read
@@ -417,8 +417,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py integration
       files: test/registered/tpu/e2e/test_tpu_qwen3_vl_8b_pd_multihost_eagle3.py
-      # Qwen3-VL-8B is not on model-weights-filestore; it has its own ROX disk.
-      weights_pvc: qwen3-spec-vl-rox
+      weights_pvc: model-weights
       run_name: pd-mh-qwen3-vl-8b-spec
     permissions:
       contents: read
@@ -443,7 +442,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-pc-offload-spec
     permissions:
       contents: read
@@ -499,7 +498,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec_reshard.py
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-pcoff-spec-rs
     permissions:
       contents: read

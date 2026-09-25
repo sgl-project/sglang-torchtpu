@@ -9,7 +9,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.hardware_backend.tpu import pallas_export
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
@@ -43,6 +43,130 @@ class TestPallasExportEnvironment(CustomTestCase):
                 self.assertEqual(
                     pallas_export.get_pallas_tpu_device_kind(), pallas_device_kind
                 )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_cpu_export_custom_op_uses_process_stable_trace_identity(self):
+        from sglang.srt.hardware_backend.tpu import pallas_jax_op
+
+        def identity(value: pallas_jax_op.jax.Array) -> pallas_jax_op.jax.Array:
+            return value
+
+        fake_custom_op = MagicMock()
+        with (
+            patch.object(pallas_jax_op.jax, "jit", side_effect=lambda fn, **_: fn),
+            patch.object(
+                pallas_jax_op.pallas_impl,
+                "_get_kernel_invocation_key",
+                return_value="stable-key",
+            ) as get_key,
+            patch.object(pallas_jax_op, "_CpuExportJaxCallable"),
+            patch.object(
+                pallas_jax_op.torch.library,
+                "custom_op",
+                return_value=fake_custom_op,
+            ),
+        ):
+            pallas_jax_op.cpu_export_jax_op(
+                "sglang_tpu_test::stable_identity", identity
+            )
+
+        get_key.assert_called_once_with(
+            "sglang_tpu_test::stable_identity",
+            [],
+            {
+                "static_argnums": (),
+                "donate_argnums": (),
+                "output_partition_specs": (),
+            },
+        )
+        fake_custom_op.register_fake.assert_called_once()
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_native_cache_key_tracks_invocation_and_pallas_body_and_reuses_export(self):
+        import jax
+        import torch
+        from jax.experimental import pallas as pl
+
+        from sglang.srt.hardware_backend.tpu import pallas_jax_op
+
+        registered = set()
+        fingerprints = []
+        native_keys = []
+        value = torch.ones((8, 128), dtype=torch.float32)
+        native = pallas_jax_op.pallas_impl.tpu_torch_pallas
+        with (
+            patch.object(
+                pallas_export, "get_pallas_tpu_device_kind", return_value="TPU7x"
+            ),
+            patch.object(pallas_jax_op, "_torch_placeholder", return_value=value),
+            patch.object(
+                native,
+                "lookup_custom_kernel",
+                side_effect=lambda name, key: (name, key) in registered,
+            ) as lookup,
+            patch.object(
+                native,
+                "register_custom_kernel",
+                side_effect=lambda name, key, **_: registered.add((name, key)),
+            ) as register,
+            patch.object(native, "call_custom_kernel", return_value=[value]) as call,
+        ):
+            for increment, trace_key in (
+                (1, "signature-a"),
+                (1, "signature-a"),
+                (2, "signature-a"),
+                (2, "signature-a"),
+                (2, "signature-b"),
+            ):
+
+                def kernel(value_ref, output_ref):
+                    output_ref[...] = value_ref[...] + increment
+
+                def add(value: jax.Array) -> jax.Array:
+                    return pl.pallas_call(
+                        kernel,
+                        out_shape=jax.ShapeDtypeStruct(value.shape, value.dtype),
+                    )(value)
+
+                wrapped = pallas_jax_op._CpuExportJaxCallable(
+                    name="sglang_tpu_test::body_identity",
+                    jit_fn=jax.jit(add),
+                    trace_key=trace_key,
+                )
+                wrapped.sglang_output_shardings = ()
+                with patch.object(
+                    wrapped, "exported", wraps=wrapped.exported
+                ) as export:
+                    wrapped(value)
+                    kernel_key = pallas_jax_op.pallas_impl._get_kernel_invocation_key(
+                        trace_key, (value,), {}, ()
+                    )
+                    fingerprint = wrapped.kernel_key_to_mlir_fingerprint[kernel_key]
+                    native_key = f"{kernel_key};mlir={fingerprint}"
+                    self.assertEqual(register.call_args.args[1], native_key)
+                    self.assertEqual(call.call_args.args[1], native_key)
+                    wrapped(value)
+                    lookup.assert_called_with(wrapped.name, native_key)
+                    self.assertEqual(call.call_args.args[1], native_key)
+                    export.assert_called_once()
+                fingerprints.append(fingerprint)
+                native_keys.append(native_key)
+
+        self.assertEqual(fingerprints[0], fingerprints[1])
+        self.assertNotEqual(fingerprints[1], fingerprints[2])
+        self.assertEqual(fingerprints[2], fingerprints[3])
+        self.assertEqual(fingerprints[3], fingerprints[4])
+        self.assertEqual(native_keys[0], native_keys[1])
+        self.assertNotEqual(native_keys[1], native_keys[2])
+        self.assertEqual(native_keys[2], native_keys[3])
+        self.assertNotEqual(native_keys[3], native_keys[4])
+        self.assertEqual(len(registered), 3)
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_cpu_export_context_reports_and_restores_tpu_target(self):

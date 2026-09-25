@@ -18,13 +18,10 @@ register_tpu_ci(
     suite="nightly-tpu-4-v7",
     nightly=True,
     labels=["singlehost", "qwen3-vl-8b", "spec", "eagle3", "multimodal"],
-    # Not on model-weights-filestore, which the lane mounts by default.
-    weights_pvc="qwen3-spec-vl-rox",
 )
 
 SERVED_MODEL_NAME = "qwen3-vl-8b"
 MODEL = "/weights/Qwen3-VL-8B-Instruct"
-# On qwen3-spec-vl-rox alongside the target, not on model-weights-filestore.
 DRAFT_MODEL = "/weights/qwen3_8b_eagle3"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 # Budget: the ViT and verify-graph captures. 2400s timed out mid-capture.

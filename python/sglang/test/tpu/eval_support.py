@@ -4,8 +4,8 @@ Plugs into the two extension points on the shared accuracy runner:
 
 * ``ModelLaunchSettings.launcher`` -- a TPU server cannot be started from a bare
   argv, because chiplet visibility, the torch_tpu compile cache and the multi-host
-  topology must all be exported before exec, and only ``launch_server.sh`` (plus its
-  recipe wrappers) knows how.
+  topology must all be exported before exec. Shell recipes or the unified Python
+  launcher configure these before starting the server.
 * ``AccuracyTestParams.runner`` -- scores a gate with a harness the shared runner has
   no dependency on: lm-eval, and OpenAI's own gpt_oss.evals package.
 """
@@ -14,17 +14,23 @@ import atexit
 import contextlib
 import json
 import os
+import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.lm_eval_kit import LMEvalMixin
-from sglang.test.test_utils import ModelLaunchSettings, dump_metric
+from sglang.test.test_utils import (
+    ModelLaunchSettings,
+    dump_metric,
+    terminate_and_kill_process_tree,
+)
 
 DEFAULT_HEALTH_TIMEOUT = 1800.0
 
@@ -32,7 +38,7 @@ DEFAULT_HEALTH_TIMEOUT = 1800.0
 def wait_for_health(
     base_url: str,
     timeout: float = DEFAULT_HEALTH_TIMEOUT,
-    process: Optional[subprocess.Popen] = None,
+    process: subprocess.Popen | None = None,
     endpoint: str = "/health_generate",
     tag: str = "tpu-e2e",
 ) -> None:
@@ -77,94 +83,180 @@ def wait_for_health(
 
 # One server per base_url. Teardown is deferred to keep gates cheap, so a second
 # launch config wanting the same URL must evict the incumbent or find the port taken.
-_HOLDERS: Dict[str, "RecipeLauncher"] = {}
+_HOLDERS: dict[str, "RecipeLauncher"] = {}
+
+
+def _tee_log(pipe, log):
+    with pipe, log:
+        for line in pipe:
+            log.write(line)
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass  # Keep file logging if the caller's stdout has closed.
 
 
 class RecipeLauncher:
-    """Launch a TPU server from a shell recipe, and keep it up across evals.
+    """Manage a shell recipe or an explicit launcher command.
 
-    The shared runner brings the server up once per evaluation, but a TPU boot costs
-    tens of minutes (weight load plus per-shape compile). This boots on first entry,
-    attaches on later ones, and tears down at process exit, so N gates cost one boot.
+    Class fixtures use start(), wait(), and shutdown() to own the process lifetime.
+    start() does not wait for health or register deferred cleanup.
 
-    When several variants of a model run in sequence, each has its own launcher and
-    they share a base_url; booting one evicts whoever currently holds that URL.
+    The callable context-manager interface retains servers between evaluations,
+    checks readiness on first entry, and shuts down at process exit. Starting
+    another callable launcher on the same base_url evicts the previous one.
     """
 
     def __init__(
         self,
-        script: str,
-        env: Optional[Dict[str, str]] = None,
-        cwd: Optional[str] = None,
+        script: str | None = None,
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
         health_timeout: float = DEFAULT_HEALTH_TIMEOUT,
         tag: str = "tpu-e2e",
+        command: list[str] | None = None,
+        log_path: str | None = None,
+        start_new_session: bool = False,
+        terminate_timeout: float | None = None,
     ):
-        self.script = os.path.abspath(script)
-        if not os.path.exists(self.script):
+        if (script is None) == (command is None):
+            raise ValueError("Provide exactly one of script or command")
+        self.script = os.path.abspath(script) if script is not None else None
+        if self.script is not None and not os.path.exists(self.script):
             raise FileNotFoundError(f"launch recipe not found: {self.script}")
+        self.command = ["bash", self.script] if self.script else list(command)
+        if not self.command:
+            raise ValueError("command must not be empty")
         self.env = dict(env or {})
-        self.cwd = cwd or os.path.dirname(self.script)
+        self.cwd = cwd or (os.path.dirname(self.script) if self.script else None)
         self.health_timeout = health_timeout
         self.tag = tag
-        self._process: Optional[subprocess.Popen] = None
-        self._base_url: Optional[str] = None
+        self.log_path = log_path
+        self.start_new_session = start_new_session
+        self.terminate_timeout = terminate_timeout
+        self._process: subprocess.Popen | None = None
+        self._log_reader: threading.Thread | None = None
+        self._base_url: str | None = None
 
-    @contextlib.contextmanager
-    def __call__(self, base_url: str):
-        if self._process is None:
-            incumbent = _HOLDERS.get(base_url)
-            if incumbent is not None and incumbent is not self:
-                print(
-                    f"[{self.tag}] evicting the previous server on {base_url} "
-                    f"({os.path.basename(incumbent.script)})",
-                    flush=True,
-                )
-                incumbent.shutdown()
+    @property
+    def process(self) -> subprocess.Popen | None:
+        return self._process
 
-            env = os.environ.copy()
-            env.update(self.env)
-            # Default shell recipes to this interpreter; explicit PYTHON wins.
-            if sys.executable:
-                env.setdefault("PYTHON", sys.executable)
-            # The whole invocation, env included: this line is what a reader reproduces
-            # a red nightly with.
-            overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))
-            print(
-                f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
-                f"bash {self.script} (cwd={self.cwd})",
-                flush=True,
-            )
-            self._process = subprocess.Popen(
-                ["bash", self.script], cwd=self.cwd, env=env
-            )
-            # The recipe and launch_server.sh both `exec`, so this pid IS the
-            # server process -- kill_process_tree on it does the right thing.
-            _HOLDERS[base_url] = self
-            self._base_url = base_url
-            atexit.register(self.shutdown)
-            wait_for_health(
-                base_url,
-                timeout=self.health_timeout,
-                process=self._process,
-                tag=self.tag,
-            )
-        else:
+    def start(self) -> subprocess.Popen:
+        """Start once without a health check; reject reuse of an exited process."""
+        if self._process is not None:
             if self._process.poll() is not None:
                 raise RuntimeError(
                     f"server died between evals (code {self._process.returncode})"
                 )
+            return self._process
+
+        env = os.environ.copy()
+        env.update(self.env)
+        # Default shell recipes to this interpreter; explicit PYTHON wins.
+        if self.script and sys.executable:
+            env.setdefault("PYTHON", sys.executable)
+        overrides = " ".join(f"{k}={v!r}" for k, v in sorted(self.env.items()))
+        print(
+            f"[{self.tag}] boot: {overrides + ' ' if overrides else ''}"
+            f"{shlex.join(self.command)} (cwd={self.cwd})",
+            flush=True,
+        )
+        with contextlib.ExitStack() as stack:
+            log = (
+                stack.enter_context(
+                    open(self.log_path, "a", encoding="utf-8", buffering=1)
+                )
+                if self.log_path
+                else None
+            )
+            self._process = subprocess.Popen(
+                self.command,
+                cwd=self.cwd,
+                env=env,
+                start_new_session=self.start_new_session,
+                stdout=subprocess.PIPE if log else None,
+                stderr=subprocess.STDOUT if log else None,
+                text=bool(log),
+                encoding="utf-8" if log else None,
+                errors="replace" if log else None,
+            )
+            if log is not None:
+                reader = threading.Thread(
+                    target=_tee_log, args=(self._process.stdout, log), daemon=True
+                )
+                try:
+                    reader.start()
+                except BaseException:
+                    self._process.stdout.close()
+                    self.shutdown()
+                    raise
+                self._log_reader = reader
+                stack.pop_all()  # The reader thread now owns the log file.
+        return self._process
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for exit and drain captured output before the caller reads logs."""
+        if self._process is None:
+            raise RuntimeError("launcher has not been started")
+        code = self._process.wait(timeout=timeout)
+        if self._log_reader is not None:
+            self._log_reader.join(timeout=5)
+        return code
+
+    @contextlib.contextmanager
+    def __call__(self, base_url: str):
+        if self._base_url is None:
+            incumbent = _HOLDERS.get(base_url)
+            if incumbent is not None and incumbent is not self:
+                print(
+                    f"[{self.tag}] evicting the previous server on {base_url} "
+                    f"({shlex.join(incumbent.command)})",
+                    flush=True,
+                )
+                incumbent.shutdown()
+
+            self.start()
+            _HOLDERS[base_url] = self
+            self._base_url = base_url
+            atexit.register(self.shutdown)
+            try:
+                wait_for_health(
+                    base_url,
+                    timeout=self.health_timeout,
+                    process=self._process,
+                    tag=self.tag,
+                )
+            except BaseException:
+                self.shutdown()
+                raise
+        else:
+            self.start()  # Check that the retained process is still alive.
             print(f"[{self.tag}] reusing live server at {base_url}", flush=True)
         yield self._process
-        # Not torn down here -- see the class docstring.
+        # Deferred teardown applies only to this evaluation context interface.
 
     def shutdown(self) -> None:
-        if self._process is not None and self._process.poll() is None:
-            print(f"[{self.tag}] shutting down server", flush=True)
-            kill_process_tree(self._process.pid, wait_timeout=60)
-        self._process = None
-        if self._base_url is not None and _HOLDERS.get(self._base_url) is self:
-            del _HOLDERS[self._base_url]
-        self._base_url = None
+        try:
+            if self._process is not None and self._process.poll() is None:
+                print(f"[{self.tag}] shutting down server", flush=True)
+                if self.terminate_timeout is None:
+                    kill_process_tree(self._process.pid, wait_timeout=60)
+                else:
+                    terminate_and_kill_process_tree(
+                        self._process, terminate_timeout=self.terminate_timeout
+                    )
+        finally:
+            if self._log_reader is not None:
+                self._log_reader.join(timeout=5)
+                self._log_reader = None
+            self._process = None
+            if self._base_url is not None and _HOLDERS.get(self._base_url) is self:
+                del _HOLDERS[self._base_url]
+            self._base_url = None
+            atexit.unregister(self.shutdown)
 
 
 class ExternalServerLauncher:
@@ -225,7 +317,7 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
     unless ``report_only`` is set, in which case the runner returns the raw score.
     """
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         import yaml
 
         cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
@@ -242,8 +334,8 @@ def lm_eval_runner(config_path: str, report_only: bool = False):
         rtol = cfg.get("rtol", LMEvalMixin.default_rtol)
         atol = cfg.get("atol", 0.0)
         passed = True
-        failures: List[str] = []
-        primary: Optional[float] = None
+        failures: list[str] = []
+        primary: float | None = None
 
         for task in cfg["tasks"]:
             for metric in task["metrics"]:
@@ -369,7 +461,7 @@ def gpqa_openai_runner(
     report under a name the server was never asked for.
     """
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         # Pure-python eval code; --no-deps so its pins never touch the pinned
         # TPU torch stack. openai/pandas/blobfile are image deps (test extra).
         subprocess.run(
@@ -434,7 +526,7 @@ def aime25_openai_runner(
 ):
     """Score AIME 2025 with OpenAI's GPT-OSS reference harness."""
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "gpt-oss"],
             check=True,
@@ -488,7 +580,7 @@ def bench_point_tag(concurrency: int, isl: int, osl: int) -> str:
     return f"c{concurrency}-isl{isl}-osl{osl}"
 
 
-def bench_sweep_arg(points: List[Dict[str, Any]]) -> str:
+def bench_sweep_arg(points: list[dict[str, Any]]) -> str:
     """The SWEEP string for bench_serving.sh: "c:isl:osl:workload" per point.
 
     ``workload`` is the name the perf dashboard's Workload dropdown shows, so the
@@ -524,7 +616,7 @@ def bench_output_dir(test_name: str) -> str:
     return os.path.join(root, test_name) if root else ""
 
 
-def read_bench_point(out_dir: str, point: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def read_bench_point(out_dir: str, point: dict[str, Any]) -> dict[str, Any] | None:
     """The last JSONL record a sweep point wrote, or None if it never landed.
 
     Searched recursively: with OUTPUT_DIR unset the file is under a generated
@@ -634,14 +726,14 @@ _HEADLINE_METRIC = "total_throughput"
 
 
 def bench_serving_runner(
-    sweep: List[Dict[str, Any]],
+    sweep: list[dict[str, Any]],
     test_name: str,
     model: str = "",
-    bench_env: Optional[Dict[str, str]] = None,
+    bench_env: dict[str, str] | None = None,
     prompts_per_concurrency: int = 10,
     series_id: str = "",
     display_name: str = "",
-    smoke_state: Optional[Dict[str, Any]] = None,
+    smoke_state: dict[str, Any] | None = None,
 ):
     """Build an ``AccuracyTestParams.runner`` that measures throughput.
 
@@ -668,7 +760,7 @@ def bench_serving_runner(
     .github/tpu-ci/dashboard_aliases.json), ``display_name`` is cosmetic.
     """
 
-    def dashboard_labels(point: Dict[str, Any]) -> Dict[str, Any]:
+    def dashboard_labels(point: dict[str, Any]) -> dict[str, Any]:
         # kind/model/workload route the record to the right Performance chart;
         # id joins the series across nights, display_name is what it is called.
         labels = {
@@ -682,14 +774,14 @@ def bench_serving_runner(
             labels["display_name"] = display_name
         return labels
 
-    def dump_cross(point: Dict[str, Any], reason: str) -> None:
+    def dump_cross(point: dict[str, Any], reason: str) -> None:
         # The ✕ record: same routing labels as the numbers it replaces, so the
         # server/bench config panels stay attached to the failed night too.
         dump_metric(
             "smoke_failed", 1, labels={**dashboard_labels(point), "reason": reason}
         )
 
-    def run(base_url: str) -> Dict[str, Any]:
+    def run(base_url: str) -> dict[str, Any]:
         smoke_failures = (smoke_state or {}).get("failures") or []
         if smoke_failures:
             # A smoke leg already failed: the measurement would be garbage, so no

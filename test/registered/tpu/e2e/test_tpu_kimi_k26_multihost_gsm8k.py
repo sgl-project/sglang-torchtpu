@@ -36,7 +36,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/kimi_k26_mh.sh",
-    "weights_pvc": "model-weights-filestore",
+    "weights_pvc": "model-weights",
 }
 
 MODEL_PATH = os.environ.get("MODEL", "/weights/Kimi-K2.6")

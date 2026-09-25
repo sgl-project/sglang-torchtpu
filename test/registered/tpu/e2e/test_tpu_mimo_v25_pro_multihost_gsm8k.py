@@ -40,7 +40,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/mimo_v25_pro_mh.sh",
-    "weights_pvc": "model-weights-filestore",
+    "weights_pvc": "model-weights",
 }
 
 MODEL_PATH = "XiaomiMiMo/MiMo-V2.5-Pro"

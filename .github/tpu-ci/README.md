@@ -85,8 +85,20 @@ own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "model-weights-filestore"}   # weights_pvc optional
+                    "weights_pvc": "model-weights"}   # weights_pvc optional
 ```
+
+The shared PVC name is defined in `.github/tpu-ci/weights.yaml`:
+`model-weights` selects the shared model weights. Use this literal key in
+`register_tpu_ci(weights_pvc="model-weights")`, `MULTIHOST_LAUNCH`, standalone
+launcher defaults, and workflow inputs. CI discovery reads ordinary literals;
+the JobSet renderer resolves the key for both ordinary and P/D jobs.
+
+`render_jobset.py --weights-pvc` also accepts a literal PVC name for custom
+claims; an empty value mounts no weights. The container mount remains `/weights`
+(test-side lookup can be overridden with `SGLANG_TPU_WEIGHTS_ROOT`). Provisioning
+manifests must still name the actual cluster resources; changing `weights.yaml`
+selects a claim, it does not create one.
 
 `launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
 and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a

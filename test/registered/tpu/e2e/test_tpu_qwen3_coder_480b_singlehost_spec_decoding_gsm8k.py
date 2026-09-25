@@ -1,8 +1,4 @@
-"""Qwen3-Coder-480B EAGLE3 single-host GSM8K quality gate.
-
-The quality lane launches the same speculative-decoding configuration as the
-functional integration test, then scores 200 GSM8K examples through run_eval.
-"""
+"""Qwen3-Coder-480B EAGLE3 batched-RPA GSM8K and real-acceptance gate."""
 
 import os
 
@@ -35,7 +31,9 @@ LAUNCH_ENV = {
     "CONCUR": "16",
     "CONTEXT_LEN": "8192",
     "MAX_TOTAL_TOKENS": "8192",
-    "ATTENTION_BACKEND": "pallas_tpu_rpa_v3",
+    "ATTENTION_BACKEND": "pallas_tpu_rpa_batched",
+    "ENABLE_TORCH_COMPILE": "1",
+    "SGLANG_SIMULATE_ACC_LEN": "-1",
     "TPU_COMPILE_TOKENS": "512 2048 4096",
     "TPU_COMPILE_BS": "1 2 4 16",
     "DISABLE_RADIX_CACHE": "0",
@@ -55,7 +53,7 @@ LAUNCH_ENV = {
 MODEL_CONFIG = {
     "model": SERVED_MODEL_NAME,
     "test_name": "qwen3-coder-480b-spec-decoding-gsm8k",
-    "variant": "TP8+EP8+EAGLE3",
+    "variant": "TP8+EP8+EAGLE3+batched-RPA",
     "launch": {
         "recipe": "recipe/qwen3_coder_480b/server.sh",
         "env": LAUNCH_ENV,

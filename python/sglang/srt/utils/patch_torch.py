@@ -11,13 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-from typing import Callable, Union
+import logging
+import os
+from typing import Callable, Optional, Union
 
 import torch
 from torch.multiprocessing import reductions
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import is_musa, is_npu, torch_release
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_musa = is_musa()
@@ -104,7 +108,9 @@ def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
-def monkey_patch_torch_tpu_env(server_args, tp_rank: int, pp_rank: int = 0):
+def monkey_patch_torch_tpu_env(
+    server_args, tp_rank: int, pp_rank: int = 0, dp_rank: Optional[int] = None
+):
     """Set TorchTPU's per-worker distributed environment.
 
     Sets torchrun-style env vars for torch_tpu's PJRT slicebuilder
@@ -125,8 +131,6 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int, pp_rank: int = 0):
     if cfg.device != "tpu":
         return
 
-    import os
-
     world_size = cfg.tp_size * cfg.pp_size
     rank = pp_rank * cfg.tp_size + tp_rank
     local_world_size = max(world_size // cfg.nnodes, 1)
@@ -135,6 +139,31 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int, pp_rank: int = 0):
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["LOCAL_WORLD_SIZE"] = str(local_world_size)
+
+    dp_size = getattr(server_args, "dp_size", 1) or 1
+    if dp_rank is not None:
+        effective_dp_rank = dp_rank
+    elif getattr(server_args, "enable_dp_attention", False) and dp_size > 1:
+        attn_tp_size = max(1, server_args.tp_size // dp_size)
+        effective_dp_rank = tp_rank // attn_tp_size
+    else:
+        effective_dp_rank = int(os.environ.get("SGLANG_DP_RANK", "0"))
+
+    base_inductor_cache = os.environ.get("SGLANG_BASE_TORCHINDUCTOR_CACHE_DIR")
+    if not base_inductor_cache:
+        default_cache_dir = (
+            f"/dev/shm/torchinductor_{os.environ.get('USER', 'root')}"
+            if os.path.isdir("/dev/shm")
+            else f"/tmp/torchinductor_{os.environ.get('USER', 'root')}"
+        )
+        base_inductor_cache = os.environ.get(
+            "TORCHINDUCTOR_CACHE_DIR",
+            default_cache_dir,
+        )
+        os.environ["SGLANG_BASE_TORCHINDUCTOR_CACHE_DIR"] = base_inductor_cache
+    dp_scope = f"dp{dp_size}_dprank{effective_dp_rank}_tp{server_args.tp_size}"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = f"{base_inductor_cache}_{dp_scope}"
+    os.environ["SGLANG_TPU_CACHE_DP_SCOPE"] = dp_scope
 
     if envs.SGLANG_TPU_PD_COLOCATED.get():
         assert not cfg.use_ray, "TPU P/D co-location does not support Ray"
@@ -158,9 +187,11 @@ def monkey_patch_torch_tpu_env(server_args, tp_rank: int, pp_rank: int = 0):
     os.environ.setdefault("MASTER_PORT", "29500")
 
 
-def initialize_torch_tpu_worker(server_args, tp_rank: int, pp_rank: int = 0):
+def initialize_torch_tpu_worker(
+    server_args, tp_rank: int, pp_rank: int = 0, dp_rank: Optional[int] = None
+):
     """Configure and initialize TorchTPU in a scheduler worker."""
-    monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank)
+    monkey_patch_torch_tpu_env(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
     from sglang.srt.arg_groups.model_override_base import resolving_view
 
     cfg = resolving_view(server_args)
@@ -170,6 +201,27 @@ def initialize_torch_tpu_worker(server_args, tp_rank: int, pp_rank: int = 0):
     from sglang.srt.platforms import current_platform
 
     current_platform.init_backend()
+
+    try:
+        import torch_tpu._internal.compile._backend as _tpu_compile_backend
+
+        _orig_cache_info = getattr(_tpu_compile_backend, "AOTAutogradCacheInfo", None)
+        if _orig_cache_info is not None and not getattr(
+            _orig_cache_info, "_sglang_dp_scoped", False
+        ):
+
+            def _scoped_aot_cache_info(cache_key, *args, **kwargs):
+                scope = os.environ.get("SGLANG_TPU_CACHE_DP_SCOPE", "")
+                if scope and not str(cache_key).startswith(f"{scope}_"):
+                    cache_key = f"{scope}_{cache_key}"
+                return _orig_cache_info(cache_key, *args, **kwargs)
+
+            _scoped_aot_cache_info._sglang_dp_scoped = True
+            _tpu_compile_backend.AOTAutogradCacheInfo = _scoped_aot_cache_info
+    except Exception as e:
+        logger.warning(
+            f"Failed to scope torch_tpu AOTAutogradCacheInfo by DP rank: {e}"
+        )
 
 
 def monkey_patch_torch_compile():
