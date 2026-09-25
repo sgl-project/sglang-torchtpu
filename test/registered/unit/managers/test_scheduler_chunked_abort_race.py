@@ -32,6 +32,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
+    sched._deferred_chunked_sender_aborts = []
     sched.waiting_queue = []
     sched.dllm_config = None
     sched.grammar_manager = Mock()

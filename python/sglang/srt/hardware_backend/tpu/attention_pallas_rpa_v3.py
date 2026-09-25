@@ -85,9 +85,8 @@ RPA_V3_SPEC = RpaKernelSpec(
     import_kernel=_import_v3_kernel,
     invoke_kernel=_invoke_v3_kernel,
     supports_attention_sink=True,
+    uses_cu_kv_lens=True,
     extend_distribution_mask=(0, 1, 1),  # [0, n, n]
-    uses_draft_extend_v2=True,
-    min_page_size=None,
     supports_decode_query_size=True,
 )
 

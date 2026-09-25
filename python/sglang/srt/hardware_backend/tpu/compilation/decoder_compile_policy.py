@@ -575,7 +575,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             specialization_key=self._direct_compile_specialization_key,
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
-            kv_pool=self.model_runner.token_to_kv_pool,
+            kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
         )
 
@@ -589,6 +589,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def get_direct_compile_kv_pool(self):
+        return self.model_runner.token_to_kv_pool
 
     def _ignored_argnames(self) -> tuple[str, ...]:
         return (
@@ -640,8 +643,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
         )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        return key if tile is None else (*key, ("prefill_kv_tile", tile))
+        return key
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
@@ -1339,8 +1341,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        return key if tile is None else (*key, ("prefill_kv_tile", tile))
+        return key
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.

@@ -110,6 +110,9 @@ class DraftBackendFactory:
             "nsa": self._create_dsa_decode_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_decode_backend,
             "pallas_tpu_rpa_v3": self._create_tpu_pallas_rpa_v3_decode_backend,
+            "pallas_tpu_rpa_batched": (
+                self._create_tpu_pallas_rpa_batched_decode_backend
+            ),
             "fa4": self._create_fa4_decode_backend,
             "dsv4": self._create_dsv4_decode_backend,
         }
@@ -143,6 +146,9 @@ class DraftBackendFactory:
             "nsa": self._create_dsa_prefill_backend,  # Deprecated alias for "dsa"
             "ascend": self._create_ascend_prefill_backend,
             "pallas_tpu_rpa_v3": self._create_tpu_pallas_rpa_v3_prefill_backend,
+            "pallas_tpu_rpa_batched": (
+                self._create_tpu_pallas_rpa_batched_prefill_backend
+            ),
             "fa4": self._create_fa4_prefill_backend,
             "dsv4": self._create_dsv4_prefill_backend,
         }
@@ -585,6 +591,28 @@ class DraftBackendFactory:
         return (
             "tpu_pallas_rpa_v3",
             TpuPallasRpaV3AttnBackend(self.draft_model_runner),
+        )
+
+    def _create_tpu_pallas_rpa_batched_decode_backend(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedMultiStepDraftBackend,
+        )
+
+        return (
+            "tpu_pallas_rpa_batched",
+            TpuPallasRpaBatchedMultiStepDraftBackend(
+                self.draft_model_runner, self.topk, self.speculative_num_steps
+            ),
+        )
+
+    def _create_tpu_pallas_rpa_batched_prefill_backend(self):
+        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
+            TpuPallasRpaBatchedAttnBackend,
+        )
+
+        return (
+            "tpu_pallas_rpa_batched",
+            TpuPallasRpaBatchedAttnBackend(self.draft_model_runner),
         )
 
     def _create_flashmla_prefill_backend(self):

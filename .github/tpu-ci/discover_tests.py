@@ -3,19 +3,13 @@
 
 import argparse
 import glob
-import importlib.util
 import json
 import os
 
+from ci_register_loader import ci_register as _ci_register
 from test_names import names_from_path
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-_CI_REGISTER_PATH = os.path.join(
-    REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-)
-_spec = importlib.util.spec_from_file_location("tpu_ci_register", _CI_REGISTER_PATH)
-_ci_register = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_ci_register)
 
 
 def discover(suite: str, nightly: bool, root: str) -> list[dict]:

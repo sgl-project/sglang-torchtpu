@@ -415,18 +415,8 @@ def _fused_moe_jax(
         )
 
         n_sorted = sorted_token_ids.shape[0]
-        if use_group_offset:
-            # ``start``/``end`` bound only the Pallas grid; rows outside stay
-            # uninitialized and the GMM never reads them (it skips groups before
-            # ``group_offset``, and gmm_v2 masks its store with a select, so an
-            # unwritten row cannot poison a sum). At EP8 this is ~8x less HBM
-            # traffic in the permute. Matches tpu-inference, which passes the
-            # same shard window to this same kernel.
-            gather_start = row_start.reshape(1)
-            gather_end = row_end.reshape(1)
-        else:
-            gather_start = jnp.array([0], dtype=jnp.int32)
-            gather_end = jnp.array([n_sorted], dtype=jnp.int32)
+        gather_start = jnp.array([0], dtype=jnp.int32)
+        gather_end = jnp.array([n_sorted], dtype=jnp.int32)
         x_sorted = ragged_gather_v2(
             hidden_states,
             sorted_token_ids,

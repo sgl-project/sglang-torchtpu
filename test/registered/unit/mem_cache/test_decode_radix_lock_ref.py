@@ -158,26 +158,30 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # 192 reclaimable tokens minus 64 reserved for active-request growth.
         self.assertEqual(budget, 128)
 
-    def test_reclaim_swa_tail_capacity_page_rounds(self):
+    def test_reclaim_prealloc_capacity_swa_page_rounds(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 192]
         queue.tree_cache = MagicMock()
 
-        error = queue._reclaim_swa_tail_capacity(129, "req-1")
+        error = queue._reclaim_prealloc_capacity(
+            full_alloc_tokens=129, swa_tail_len=129, req_id="req-1"
+        )
 
         self.assertIsNone(error)
         params = queue.tree_cache.evict_for_alloc.call_args.args[0]
         self.assertEqual(params.num_tokens, 0)
         self.assertEqual(params.swa_num_tokens, 128)
 
-    def test_reclaim_swa_tail_capacity_fails_before_allocation(self):
+    def test_reclaim_prealloc_capacity_swa_fails_before_allocation(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
         queue.token_to_kv_pool_allocator.swa_available_size.side_effect = [64, 128]
         queue.tree_cache = MagicMock()
 
-        error = queue._reclaim_swa_tail_capacity(129, "req-1")
+        error = queue._reclaim_prealloc_capacity(
+            full_alloc_tokens=129, swa_tail_len=129, req_id="req-1"
+        )
 
         self.assertEqual(
             error,

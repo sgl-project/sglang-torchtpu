@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -114,6 +114,7 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.tree_cache = tree_cache
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    s._deferred_chunked_sender_aborts = []
     return s
 
 
@@ -191,6 +192,7 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.chunked_req = req
         scheduler._pending_chunked_abort_req = req
+        scheduler._deferred_chunked_sender_aborts = []
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
         scheduler.enable_hicache_storage = False
@@ -227,23 +229,135 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         release_kv.assert_not_called()
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
 
+    def _idle_prefill_scheduler(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tree_cache = MagicMock()
+        scheduler.running_batch = SimpleNamespace(
+            reqs=[], is_empty=lambda: True, batch_is_full=False
+        )
+        scheduler.chunked_req = None
+        scheduler._pending_chunked_abort_req = None
+        scheduler.dllm_manager = SimpleNamespace(any_staging_reqs=lambda: False)
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler.ps = SimpleNamespace(pp_size=1)
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[], clear=MagicMock())
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+            queue=[], pop_bootstrapped=MagicMock(return_value=[])
+        )
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+        scheduler._engine_paused = False
+        scheduler._deferred_chunked_sender_aborts = []
+        scheduler.req_to_token_pool = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.metrics_reporter = MagicMock()
+        scheduler.draft_worker = None
+        return scheduler
+
     @patch("sglang.srt.managers.scheduler.release_kv_cache")
-    def test_deferred_pages_release_only_after_sender_drains(self, release_kv):
+    def test_sender_drain_keeps_prefill_non_idle_until_pages_release(self, release_kv):
         sender = MagicMock()
         sender.drained.side_effect = [False, True]
         req = SimpleNamespace(disagg_kv_sender=sender)
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.tree_cache = MagicMock()
+        ready_sender = MagicMock()
+        ready_sender.drained.return_value = True
+        ready_req = SimpleNamespace(disagg_kv_sender=ready_sender)
+        scheduler = self._idle_prefill_scheduler()
+        self.assertTrue(scheduler.is_fully_idle())
+
+        scheduler._deferred_chunked_sender_aborts.extend([req, ready_req])
+        scheduler._drain_deferred_chunked_sender_aborts()
+        self.assertEqual(sender.mock_calls[:2], [call.poll(), call.drained()])
+        sender.poll.assert_called_once_with()
+        sender.clear.assert_not_called()
+        ready_sender.clear.assert_called_once_with()
+        release_kv.assert_called_once_with(
+            ready_req, scheduler.tree_cache, is_insert=False
+        )
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+        self.assertFalse(scheduler.is_fully_idle())
+        self.assertTrue(scheduler.is_fully_idle(for_health_check=True))
+        self.assertFalse(scheduler.flush_cache(empty_cache=False))
+        scheduler.tree_cache.reset.assert_not_called()
+        scheduler.token_to_kv_pool_allocator.clear.assert_not_called()
+
+        scheduler._drain_deferred_chunked_sender_aborts()
+        self.assertEqual(sender.poll.call_count, 2)
+        sender.clear.assert_called_once_with()
+        self.assertEqual(
+            release_kv.call_args_list,
+            [
+                call(ready_req, scheduler.tree_cache, is_insert=False),
+                call(req, scheduler.tree_cache, is_insert=False),
+            ],
+        )
+        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
+        self.assertTrue(scheduler.is_fully_idle())
+        self.assertTrue(scheduler.flush_cache(empty_cache=False))
+        scheduler.tree_cache.reset.assert_called_once_with()
+        scheduler.token_to_kv_pool_allocator.clear.assert_called_once_with()
+
+    def test_prefill_event_loops_poll_deferred_aborts(self):
+        for loop_name in (
+            "event_loop_normal_disagg_prefill",
+            "event_loop_overlap_disagg_prefill",
+        ):
+            with self.subTest(loop=loop_name):
+                self._check_prefill_loop_drain(loop_name)
+
+    def _check_prefill_loop_drain(self, loop_name):
+        class StopLoop(Exception):
+            pass
+
+        scheduler = self._idle_prefill_scheduler()
+        scheduler.scheduler_stage_metrics = None
+        scheduler.enable_overlap = "overlap" in loop_name
+        scheduler.result_queue = []
+        scheduler._process_hicache_events = MagicMock()
+        scheduler.resolve_waiting_queue_bootstrap = MagicMock()
+        scheduler.process_prefill_chunk = MagicMock()
+        scheduler.get_new_batch_prefill = MagicMock(
+            return_value=NextBatchPlan(None, scheduler.running_batch)
+        )
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda batch: batch
+        )
+        scheduler.ngram_embedding_manager = SimpleNamespace(
+            prepare_for_forward=lambda batch, **_: batch
+        )
+        scheduler.process_disagg_prefill_inflight_queue = MagicMock()
+        scheduler.launch_batch_sample_if_needed = MagicMock()
+        scheduler.on_idle = MagicMock()
+        scheduler.run_batch = MagicMock()
+        scheduler.process_batch_result = MagicMock()
+        idle_states = []
+
+        def ingest():
+            idle_states.append(scheduler.is_fully_idle())
+            if len(idle_states) == 4:
+                raise StopLoop
+
+        scheduler.ingest_requests = MagicMock(side_effect=ingest)
+        sender = MagicMock()
+        sender.drained.side_effect = [False, True]
+        req = SimpleNamespace(disagg_kv_sender=sender)
         scheduler._deferred_chunked_sender_aborts = [req]
 
-        scheduler._drain_deferred_chunked_sender_aborts()
-        release_kv.assert_not_called()
-        self.assertEqual(scheduler._deferred_chunked_sender_aborts, [req])
+        with patch("sglang.srt.managers.scheduler.release_kv_cache") as release_kv:
+            with self.assertRaises(StopLoop):
+                getattr(scheduler, loop_name)()
 
-        scheduler._drain_deferred_chunked_sender_aborts()
+        self.assertEqual(idle_states, [False, False, True, True])
+        self.assertEqual(sender.poll.call_count, 2)
         sender.clear.assert_called_once_with()
         release_kv.assert_called_once_with(req, scheduler.tree_cache, is_insert=False)
         self.assertEqual(scheduler._deferred_chunked_sender_aborts, [])
+        scheduler.run_batch.assert_not_called()
+        scheduler.process_batch_result.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1359,6 +1359,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._deferred_chunked_sender_aborts: list[Req] = []
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
@@ -3690,9 +3691,7 @@ class Scheduler(
             defer_page_release = False
         self._release_aborted_request(req)
         if defer_page_release:
-            pending = getattr(self, "_deferred_chunked_sender_aborts", None)
-            if pending is None:
-                pending = self._deferred_chunked_sender_aborts = []
+            pending = self._deferred_chunked_sender_aborts
             if all(held is not req for held in pending):
                 pending.append(req)
         else:
@@ -3705,7 +3704,7 @@ class Scheduler(
 
     def _drain_deferred_chunked_sender_aborts(self) -> None:
         """Release locally-aborted prefill pages after raiden relinquishes them."""
-        pending = getattr(self, "_deferred_chunked_sender_aborts", None)
+        pending = self._deferred_chunked_sender_aborts
         if not pending:
             return
         still_held = []
@@ -5192,6 +5191,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                # Aborted senders may still own KV pages. Keep polling them
+                # before idle pool checks, sleep, or cache flush.
+                idle &= len(self._deferred_chunked_sender_aborts) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -6218,7 +6220,7 @@ def run_scheduler_process(
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
 ):
-    initialize_torch_tpu_worker(server_args, tp_rank, pp_rank)
+    initialize_torch_tpu_worker(server_args, tp_rank, pp_rank, dp_rank=dp_rank)
 
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
