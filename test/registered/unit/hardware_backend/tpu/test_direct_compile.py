@@ -2,7 +2,7 @@
 
 import unittest
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,7 +11,11 @@ from jax import tree_util
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -387,6 +391,56 @@ class TestDirectCompile(CustomTestCase):
         )
         with self.assertRaisesRegex(TypeError, "not Tensor"):
             compiled(torch.ones(2))
+
+    def test_forward_batch_routing_values_reuse_compilation(self):
+        routing_inputs = [
+            torch.full((1, 2, 2), variant, dtype=torch.int32) for variant in range(32)
+        ]
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=2,
+            input_ids=torch.zeros(2, dtype=torch.int64),
+            req_pool_indices=torch.zeros(2, dtype=torch.int64),
+            seq_lens=torch.ones(2, dtype=torch.int64),
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            seq_lens_sum=2,
+        )
+        compiled = direct_compile.direct_compile(
+            lambda forward_batch: forward_batch.forced_routing_ids,
+            specialization_key=lambda forward_batch: forward_batch.batch_size,
+        )
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            patch.object(
+                direct_compile,
+                "_is_tpu_tensor",
+                side_effect=lambda item: isinstance(item, torch.Tensor),
+            ),
+            patch.object(
+                direct_compile.execution_mode,
+                "set_eager_mode",
+                return_value=nullcontext(),
+            ),
+            patch.object(
+                compiler, "placeholder_like", side_effect=lambda tensor: tensor.clone()
+            ),
+            patch.object(
+                compiler, "traverse_and_compile", return_value=_COMPILE_RESULT
+            ) as compile_fn,
+            patch.object(
+                compiler,
+                "execute",
+                side_effect=lambda _executable, inputs: [inputs[-1]],
+            ) as execute,
+            torch.compiler.set_stance("fail_on_recompile"),
+        ):
+            for routing in routing_inputs:
+                output = compiled(replace(batch, forced_routing_ids=routing))
+                self.assertIs(output, routing)
+                self.assertIs(execute.call_args.args[1][-1], routing)
+
+        compile_fn.assert_called_once()
+        self.assertEqual(execute.call_count, len(routing_inputs))
 
     def test_registered_tensor_aliases_are_traced(self):
         model = _ModelWithRegisteredAlias()
