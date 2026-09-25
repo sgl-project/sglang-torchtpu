@@ -119,8 +119,10 @@ def cpu_export_jax_op(
         keep_unused=True,
         **jit_kwargs,
     )
+    # The qualified custom-op name is unique within the process and stable
+    # across distributed ranks and server restarts.
     trace_key = pallas_impl._get_kernel_invocation_key(
-        f"{name}_{id(function)}",
+        name,
         [],
         {
             "static_argnums": static_argnums,

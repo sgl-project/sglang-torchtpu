@@ -9,7 +9,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.hardware_backend.tpu import pallas_export
 from sglang.test.ci.ci_register import register_cpu_ci, register_tpu_ci
@@ -43,6 +43,46 @@ class TestPallasExportEnvironment(CustomTestCase):
                 self.assertEqual(
                     pallas_export.get_pallas_tpu_device_kind(), pallas_device_kind
                 )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_cpu_export_custom_op_uses_process_stable_trace_identity(self):
+        from sglang.srt.hardware_backend.tpu import pallas_jax_op
+
+        def identity(value: pallas_jax_op.jax.Array) -> pallas_jax_op.jax.Array:
+            return value
+
+        fake_custom_op = MagicMock()
+        with (
+            patch.object(pallas_jax_op.jax, "jit", side_effect=lambda fn, **_: fn),
+            patch.object(
+                pallas_jax_op.pallas_impl,
+                "_get_kernel_invocation_key",
+                return_value="stable-key",
+            ) as get_key,
+            patch.object(pallas_jax_op, "_CpuExportJaxCallable"),
+            patch.object(
+                pallas_jax_op.torch.library,
+                "custom_op",
+                return_value=fake_custom_op,
+            ),
+        ):
+            pallas_jax_op.cpu_export_jax_op(
+                "sglang_tpu_test::stable_identity", identity
+            )
+
+        get_key.assert_called_once_with(
+            "sglang_tpu_test::stable_identity",
+            [],
+            {
+                "static_argnums": (),
+                "donate_argnums": (),
+                "output_partition_specs": (),
+            },
+        )
+        fake_custom_op.register_fake.assert_called_once()
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_cpu_export_context_reports_and_restores_tpu_target(self):
