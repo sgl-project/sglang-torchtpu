@@ -6,8 +6,7 @@
 #   EXTRA_ARGS="--speculative-algorithm EAGLE3 ..." ./server.sh  # + spec decoding
 set -uo pipefail
 
-# HF id by default: this checkpoint uses the separate qwen3-spec-vl-rox claim
-# in CI; callers mounting that claim supply its /weights path explicitly.
+# HF id by default; CI tests supply the /weights path explicitly.
 export MODEL=${MODEL:-Qwen/Qwen3-VL-8B-Instruct}
 export TP_SIZE=8
 

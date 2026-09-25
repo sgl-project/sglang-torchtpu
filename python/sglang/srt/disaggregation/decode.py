@@ -480,23 +480,48 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         else:
             self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
 
-    def _reclaim_swa_tail_capacity(
-        self, swa_tail_len: int, req_id: str
+    def _reclaim_prealloc_capacity(
+        self, *, full_alloc_tokens: int, swa_tail_len: Optional[int], req_id: str
     ) -> Optional[str]:
+        # Admission includes evictable pages; allocation needs them physically
+        # free before acquiring a request slot or changing retraction state.
         page_size = self.token_to_kv_pool_allocator.page_size
-        required = ceil_align(swa_tail_len, page_size)
-        available = self.token_to_kv_pool_allocator.swa_available_size()
-        if available < required:
-            self.tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=required - available)
-            )
-            available = self.token_to_kv_pool_allocator.swa_available_size()
+        full_required = 0
+        full_shortfall = 0
+        if (
+            get_disagg().disaggregation_decode_enable_radix_cache
+            and not self.scheduler.enable_hisparse
+        ):
+            full_required = ceil_align(full_alloc_tokens, page_size)
+            full_shortfall = max(0, full_required - self._radix_full_available())
 
-        if available < required:
-            return (
-                f"SWA eviction insufficient: needed={required}, "
-                f"available={available}, req={req_id}"
+        swa_required = 0
+        swa_shortfall = 0
+        if swa_tail_len is not None:
+            swa_required = ceil_align(swa_tail_len, page_size)
+            swa_shortfall = max(
+                0, swa_required - self.token_to_kv_pool_allocator.swa_available_size()
             )
+
+        if full_shortfall or swa_shortfall:
+            self.tree_cache.evict_for_alloc(
+                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+            )
+
+        if full_required:
+            available = self._radix_full_available()
+            if available < full_required:
+                return (
+                    f"Full-attention eviction insufficient: needed={full_required}, "
+                    f"available={available}, req={req_id}"
+                )
+        if swa_required:
+            available = self.token_to_kv_pool_allocator.swa_available_size()
+            if available < swa_required:
+                return (
+                    f"SWA eviction insufficient: needed={swa_required}, "
+                    f"available={available}, req={req_id}"
+                )
 
         return None
 
@@ -920,6 +945,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if full_required > full_allocatable_tokens:
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
+                break
+
+            full_len, swa_len = self._prealloc_kv_lens(req)
+            reclaim_error = self._reclaim_prealloc_capacity(
+                full_alloc_tokens=full_len,
+                swa_tail_len=swa_len if uses_swa_tail_prealloc else None,
+                req_id=req.rid,
+            )
+            if reclaim_error is not None:
                 break
 
             resumed_reqs.append(req)
@@ -1394,6 +1428,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     self._release_matched_prefix_lock(decode_req.req)
                 break
 
+            swa_len = None
             if uses_swa_tail_prealloc:
                 _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
@@ -1412,26 +1447,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self._release_matched_prefix_lock(decode_req.req)
                     break
 
-                reclaim_error = self._reclaim_swa_tail_capacity(
-                    swa_len, decode_req.req.rid
+            reclaim_error = self._reclaim_prealloc_capacity(
+                full_alloc_tokens=required_alloc_tokens,
+                swa_tail_len=swa_len,
+                req_id=decode_req.req.rid,
+            )
+            if reclaim_error is not None:
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                # Prefix matching can reserve a Mamba COW slot before KV allocation.
+                if decode_req.req.kv.holds_mamba:
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                logger.error(reclaim_error)
+                prepare_abort(
+                    decode_req.req,
+                    reclaim_error,
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
-                if reclaim_error is not None:
-                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                        self._release_matched_prefix_lock(decode_req.req)
-                    logger.error(reclaim_error)
-                    prepare_abort(
-                        decode_req.req,
-                        reclaim_error,
-                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                    )
-                    self.scheduler.output_streamer.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    decode_req.kv_receiver.clear()
-                    decode_req.kv_receiver = None
-                    failed_reqs.append(decode_req)
-                    indices_to_remove.add(i)
-                    continue
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                decode_req.kv_receiver.abort()
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                failed_reqs.append(decode_req)
+                indices_to_remove.add(i)
+                continue
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1920,27 +1961,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             fill_len=fill_len, prefix_len=prefix_len
         )
 
-        # Evict cached entries if the pool doesn't have enough free pages.
-        if (
-            get_disagg().disaggregation_decode_enable_radix_cache
-            and self._radix_full_available() < required_alloc_tokens
-        ):
-            num_to_evict = required_alloc_tokens - self._radix_full_available()
-            result = self.tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=num_to_evict)
-            )
-            if self._radix_full_available() < required_alloc_tokens:
-                logger.warning(
-                    f"Eviction insufficient: needed {required_alloc_tokens} tokens, "
-                    f"available {self._radix_full_available()} "
-                    f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
-                    f"evictable_size={self._radix_full_evictable()}, "
-                    f"protected_size={self._radix_full_protected()}, "
-                    f"fill_len={fill_len}, prefix_len={prefix_len}, "
-                    f"total_prefix_len={total_prefix_len}, delta_len={delta_len}, "
-                    f"page_size={self.token_to_kv_pool_allocator.page_size}, "
-                    f"req={req.rid}"
-                )
+        # Request-slot allocation can consume shared full/Mamba bytes after
+        # preflight. Preserve late reclamation for that capacity change.
+        if get_disagg().disaggregation_decode_enable_radix_cache:
+            shortfall = required_alloc_tokens - self._radix_full_available()
+            if shortfall > 0:
+                self.tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
 
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()

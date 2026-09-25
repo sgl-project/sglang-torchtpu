@@ -145,7 +145,7 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       image: ${{ needs.build.outputs.digest }}
       suite: stage-b-test-tpu-4-v7
-      weights_pvc: model-weights-filestore
+      weights_pvc: model-weights
     permissions:
       contents: read
       id-token: write

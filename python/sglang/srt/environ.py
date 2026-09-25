@@ -1788,6 +1788,9 @@ class Envs:
     SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE = EnvBool(True)
     # Read extend query lengths from a complete host mirror instead of the device.
     SGLANG_TPU_ENABLE_HOST_QUERY_LENS = EnvBool(True)
+    # Opt-in runtime KV-tile promotion for compatible prefill backends.
+    # Backends snapshot this flag at initialization; tile hints are tensor inputs.
+    SGLANG_TPU_WORKLOAD_AWARE_KV_TILES = EnvBool(False)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.

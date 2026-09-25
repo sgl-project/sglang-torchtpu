@@ -20,7 +20,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-    "weights_pvc": "model-weights-filestore",
+    "weights_pvc": "model-weights",
 }
 
 BASE_URL = os.environ.get("BASE_URL", DEFAULT_URL_FOR_TEST)

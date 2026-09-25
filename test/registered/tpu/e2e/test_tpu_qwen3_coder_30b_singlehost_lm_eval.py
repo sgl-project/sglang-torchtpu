@@ -5,13 +5,17 @@ mmlu_llama / mmlu_pro ground truths and tolerances. The gate runs on lm-eval bec
 mmlu_pro has no simple-evals equivalent, and mmlu_llama's few-shot protocol is what
 the reference values were measured with.
 
-Serving config lives in recipe/qwen3_coder_30b_a3b_fp8.sh, which CI runs verbatim.
+Serving config lives in recipe/configs/qwen3_coder_30b_a3b_fp8.py, which CI runs verbatim.
 """
 
 import os
+import unittest
+from typing import ClassVar
+from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang.test.tpu import run_model_config
+from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=3600,
@@ -30,11 +34,6 @@ MODEL_CONFIG = {
     "model": MODEL_PATH,
     "test_name": "Qwen3-Coder-30B-A3B-Instruct-FP8",
     "variant": "TP8+EP8",
-    "launch": {
-        "recipe": "recipe/qwen3_coder_30b_a3b_fp8.sh",
-        "health_timeout": HEALTH_TIMEOUT,
-        "tag": "qwen3-coder-e2e",
-    },
     "gates": [
         {
             "dataset": "mmlu_llama+mmlu_pro",
@@ -45,5 +44,21 @@ MODEL_CONFIG = {
 }
 
 
+class TestQwenCoderSingleHostLmEval(TPULauncherTestCase):
+    config_module = "recipe/configs/qwen3_coder_30b_a3b_fp8.py"
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    tag = "qwen3-coder-e2e"
+    runtime_envs: ClassVar[dict[str, str | None]] = {
+        "MODEL": None,
+        "HOST": urlsplit(BASE_URL).hostname,
+        "PORT": str(urlsplit(BASE_URL).port),
+    }
+
+    def test_accuracy(self):
+        run_model_config(MODEL_CONFIG, base_url=self.base_url)
+
+
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    unittest.main()

@@ -1,7 +1,19 @@
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//bazel:defs.bzl", "sglang_tpu_e2e_test")
 
 package(default_visibility = ["//visibility:public"])
+
+# These files select their host-side configuration checks by default. Their
+# existing `integration` argument starts the P/D fixture in the assigned pod.
+[py_test(
+    name = "test_tpu_gpt_oss_120b_pd_singlehost" + suffix + "_config",
+    size = "small",
+    srcs = ["test_tpu_gpt_oss_120b_pd_singlehost" + suffix + ".py"],
+    data = ["//benchmark/tpu:runtime"],
+    main = "test_tpu_gpt_oss_120b_pd_singlehost" + suffix + ".py",
+    python_version = "3.12",
+    deps = ["//python:tpu_launcher_test_support"],
+) for suffix in ["", "_decode_radix", "_spec"]]
 
 sglang_tpu_e2e_test(
     name = "test_tpu_gpt_oss_120b_singlehost_spec",
@@ -16,7 +28,7 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
-        "//python:sglang",
+        "//python:tpu_launcher_test_support",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )
@@ -51,7 +63,7 @@ sglang_tpu_e2e_test(
         "requires-tpu-v7x",
     ],
     deps = [
-        "//python:sglang",
+        "//python:tpu_launcher_test_support",
         "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
     ],
 )
