@@ -88,7 +88,7 @@ class TestPallasExportEnvironment(CustomTestCase):
         importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
         "requires JAX and TorchTPU",
     )
-    def test_native_cache_key_tracks_pallas_body_and_reuses_export(self):
+    def test_native_cache_key_tracks_invocation_and_pallas_body_and_reuses_export(self):
         import jax
         import torch
         from jax.experimental import pallas as pl
@@ -97,6 +97,7 @@ class TestPallasExportEnvironment(CustomTestCase):
 
         registered = set()
         fingerprints = []
+        native_keys = []
         value = torch.ones((8, 128), dtype=torch.float32)
         native = pallas_jax_op.pallas_impl.tpu_torch_pallas
         with (
@@ -108,7 +109,7 @@ class TestPallasExportEnvironment(CustomTestCase):
                 native,
                 "lookup_custom_kernel",
                 side_effect=lambda name, key: (name, key) in registered,
-            ),
+            ) as lookup,
             patch.object(
                 native,
                 "register_custom_kernel",
@@ -116,7 +117,13 @@ class TestPallasExportEnvironment(CustomTestCase):
             ) as register,
             patch.object(native, "call_custom_kernel", return_value=[value]) as call,
         ):
-            for increment in (1, 1, 2, 2):
+            for increment, trace_key in (
+                (1, "signature-a"),
+                (1, "signature-a"),
+                (2, "signature-a"),
+                (2, "signature-a"),
+                (2, "signature-b"),
+            ):
 
                 def kernel(value_ref, output_ref):
                     output_ref[...] = value_ref[...] + increment
@@ -130,24 +137,36 @@ class TestPallasExportEnvironment(CustomTestCase):
                 wrapped = pallas_jax_op._CpuExportJaxCallable(
                     name="sglang_tpu_test::body_identity",
                     jit_fn=jax.jit(add),
-                    trace_key="same-invocation-signature",
+                    trace_key=trace_key,
                 )
                 wrapped.sglang_output_shardings = ()
                 with patch.object(
                     wrapped, "exported", wraps=wrapped.exported
                 ) as export:
                     wrapped(value)
-                    fingerprint = call.call_args.args[1]
-                    self.assertEqual(register.call_args.args[1], fingerprint)
+                    kernel_key = pallas_jax_op.pallas_impl._get_kernel_invocation_key(
+                        trace_key, (value,), {}, ()
+                    )
+                    fingerprint = wrapped.kernel_key_to_mlir_fingerprint[kernel_key]
+                    native_key = f"{kernel_key};mlir={fingerprint}"
+                    self.assertEqual(register.call_args.args[1], native_key)
+                    self.assertEqual(call.call_args.args[1], native_key)
                     wrapped(value)
-                    self.assertEqual(call.call_args.args[1], fingerprint)
+                    lookup.assert_called_with(wrapped.name, native_key)
+                    self.assertEqual(call.call_args.args[1], native_key)
                     export.assert_called_once()
                 fingerprints.append(fingerprint)
+                native_keys.append(native_key)
 
         self.assertEqual(fingerprints[0], fingerprints[1])
         self.assertNotEqual(fingerprints[1], fingerprints[2])
         self.assertEqual(fingerprints[2], fingerprints[3])
-        self.assertEqual(len(registered), 2)
+        self.assertEqual(fingerprints[3], fingerprints[4])
+        self.assertEqual(native_keys[0], native_keys[1])
+        self.assertNotEqual(native_keys[1], native_keys[2])
+        self.assertEqual(native_keys[2], native_keys[3])
+        self.assertNotEqual(native_keys[3], native_keys[4])
+        self.assertEqual(len(registered), 3)
 
     @unittest.skipUnless(importlib.util.find_spec("jax"), "requires JAX")
     def test_cpu_export_context_reports_and_restores_tpu_target(self):

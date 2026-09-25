@@ -47,10 +47,15 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
         )
         output_shapes, out_tree = self.output_shapes.get(kernel_key, (None, None))
         mlir_fingerprint = self.kernel_key_to_mlir_fingerprint.get(kernel_key)
+        native_kernel_key = (
+            f"{kernel_key};mlir={mlir_fingerprint}"
+            if mlir_fingerprint is not None
+            else None
+        )
         kernel_exists = (
-            mlir_fingerprint is not None
+            native_kernel_key is not None
             and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-                self.name, mlir_fingerprint
+                self.name, native_kernel_key
             )
         )
         if not output_shapes or not kernel_exists:
@@ -73,9 +78,10 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
                 normalized_mlir.encode("utf-8"), digest_size=16
             ).hexdigest()
             self.kernel_key_to_mlir_fingerprint[kernel_key] = mlir_fingerprint
+            native_kernel_key = f"{kernel_key};mlir={mlir_fingerprint}"
             pallas_impl.tpu_torch_pallas.register_custom_kernel(
                 self.name,
-                mlir_fingerprint,
+                native_kernel_key,
                 serialized_mlir_module=lowered.mlir_module_serialized,
             )
             shardings = self.sglang_output_shardings or (None,) * len(lowered.out_avals)
@@ -93,7 +99,7 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
         ]
         results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
             self.name,
-            mlir_fingerprint,
+            native_kernel_key,
             inputs=tensor_args,
             output_shapes=output_shapes,
             donate_argnums=self.donate_argnums,
