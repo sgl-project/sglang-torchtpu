@@ -36,9 +36,6 @@ def build_scheduler_startup_time(
     if compile_steps:
         result["compile"] = {
             "schema_version": 1,
-            "total_seconds": sum(
-                float(step["duration_seconds"]) for step in compile_steps
-            ),
             "steps": compile_steps,
         }
     return result
@@ -96,9 +93,6 @@ def aggregate_scheduler_startup_times(
         compile_steps = list(rank_critical_compile_steps.values())
         result["compile"] = {
             "schema_version": 1,
-            "total_seconds": sum(
-                float(step["duration_seconds"]) for step in compile_steps
-            ),
             "steps": compile_steps,
         }
     return result

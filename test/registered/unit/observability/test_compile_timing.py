@@ -90,7 +90,7 @@ def test_compile_timing_is_added_to_scheduler_startup_time() -> None:
         draft_compile_steps=draft.snapshot(),
     )
 
-    assert startup_time["compile"]["total_seconds"] == 5.0
+    assert "total_seconds" not in startup_time["compile"]
     assert [step["component"] for step in startup_time["compile"]["steps"]] == [
         "target",
         "draft",
@@ -114,21 +114,19 @@ def test_compile_timing_aggregation_uses_rank_critical_path() -> None:
             {
                 "compile": {
                     "schema_version": 1,
-                    "total_seconds": 3.0,
                     "steps": [step, second_step],
                 }
             },
             {
                 "compile": {
                     "schema_version": 1,
-                    "total_seconds": 9.0,
                     "steps": [slower_step, slower_second_step],
                 }
             },
         ]
     )
 
-    assert result["compile"]["total_seconds"] == 9.0
+    assert "total_seconds" not in result["compile"]
     assert [step["duration_seconds"] for step in result["compile"]["steps"]] == [
         4.0,
         5.0,
