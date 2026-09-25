@@ -21,6 +21,10 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+    dflash_verify_argmax_torch,
+    dflash_verify_bookkeeping_torch,
+)
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -59,7 +63,6 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
-    dflash_verify_bookkeeping_torch,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -88,14 +91,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
 )
-from sglang.srt.utils import (
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_tpu,
-    is_xpu,
-    next_power_of_2,
-)
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_tpu, is_xpu
 from sglang.srt.utils.common import empty_context
 
 _is_npu = is_npu()
@@ -574,6 +570,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_extend_seq_lens_buf: torch.Tensor | None = None  # [cap_bs]
         self._selector_sample: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._draft_seq_lens_cpu_buf: torch.Tensor | None = None  # [cap_bs] on CPU
+        self._embed_module: torch.nn.Module | None = None
         self._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=int(self.block_size), device=self.device
         )
@@ -1035,6 +1032,42 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._use_fused_kv_materialize = False
             self._fused_kv_helper = None
 
+    def _maybe_pad_draft_bs(self, bs: int) -> int:
+        """Round bs up to the TPU compile bucket; identity on other backends."""
+        if _is_tpu:
+            b_bucketer = self.model_runner.compile_policy.b_bucketer
+            return int(b_bucketer.next_bucket(int(bs)))
+        return int(bs)
+
+    def ensure_embed_module(self) -> torch.nn.Module:
+        """Resolve and cache the embedding module used to embed drafted blocks."""
+        if self._embed_module is None:
+            self._embed_module = unwrap_lora_layer(
+                _resolve_dflash_embedding_module(
+                    self.draft_model, self.target_worker.model_runner.model
+                )
+            )
+        return self._embed_module
+
+    def embed_draft_block_ids(self, *, block_ids: torch.Tensor) -> torch.Tensor:
+        """Embed drafted block ids [n, block_size] into [n * block_size, hidden].
+
+        Kept as a standalone tensor-in/tensor-out method so the TPU compile policy
+        can swap in a direct_compile'd version; running it eager fans the vocab
+        mask out into a dozen separately dispatched kernels.
+        """
+        if self._full_embed_gpu is not None:
+            # Replicated lookup avoids the mismatched attn-TP all_reduce
+            # inside VocabParallelEmbedding under dp attention.
+            noise_embedding = torch.nn.functional.embedding(
+                block_ids, self._full_embed_gpu
+            )
+        else:
+            noise_embedding = self.ensure_embed_module()(block_ids)
+        if self._noise_embed_scale != 1.0:
+            noise_embedding = noise_embedding * self._noise_embed_scale
+        return noise_embedding.view(-1, noise_embedding.shape[-1])
+
     def _ensure_draft_block_buffers(self, bs: int) -> None:
         cap = (
             0
@@ -1044,17 +1077,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         if cap >= int(bs):
             return
 
-        new_cap = max(int(bs), cap * 2 if cap > 0 else int(bs))
+        # On TPU the capacity must itself be a bucket, so _maybe_pad_draft_bs(bs)
+        # stays <= cap for every later bs <= cap and buf[:pad_bs] never overruns;
+        # the ladder bounds regrowth. Elsewhere double to amortize it.
+        new_cap = (
+            self._maybe_pad_draft_bs(int(bs))
+            if _is_tpu
+            else max(int(bs), cap * 2 if cap > 0 else int(bs))
+        )
         device = self.device
         block_size = int(self.block_size)
-        self._draft_block_ids_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
+        # Padded rows are embedded too; a garbage id is an OOB gather at tp_size == 1.
+        self._draft_block_ids_buf = torch.full(
+            (new_cap, block_size),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
-        self._draft_block_tokens_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
+        # Ghost rows reach the bucket-wide accept before the trim; an uninitialized
+        # id makes their outputs differ per TP rank, since only target_predict syncs.
+        self._draft_block_tokens_buf = torch.full(
+            (new_cap, block_size),
+            int(self._mask_token_id),
+            dtype=torch.long,
+            device=device,
         )
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
@@ -2301,6 +2350,77 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def _accept_block_on_bucket(
+        self,
+        *,
+        compile_policy,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        verify_forward_batch: ForwardBatch,
+        logits_output,
+        draft_tokens: torch.Tensor,
+        sampling_info,
+        draft_input: DFlashDraftInputV2,
+        block_size: int,
+    ):
+        """Run accept on the TPU bucket shape, then trim back to the logical batch.
+
+        Args:
+          compile_policy: The model runner's TPU spec-decode compile policy.
+          batch: Active schedule batch; prepare_spec_verify rebinds its seq_lens.
+          verify_input: Verify-side spec info for this step.
+          verify_forward_batch: The forward batch the verify pass ran on.
+          logits_output: Target verify outputs, padded to the bucket when the
+            shim deferred unpadding.
+          draft_tokens: Logical draft block ids, [bs, block_size].
+          sampling_info: Sampling state, widened by prepare_spec_verify.
+          draft_input: Draft-side spec info for this step.
+          block_size: Draft rows per request.
+
+        Returns:
+          Tuple of the accept result, the unpadded logits_output to keep reading
+          from, and the candidates the accept actually ran on, which are bucket
+          rows when padding applied.
+        """
+        # Only IDLE would have left the outputs unpadded, and it returns early in
+        # forward_batch_generation, so the shim always owes finalize here. Read it
+        # before prepare_spec_verify, which may clear the flag.
+        assert verify_forward_batch.spec_info.keep_outputs_padded
+        verify_padding = compile_policy.prepare_spec_verify(
+            batch, verify_input, logits_output.next_token_logits
+        )
+        if verify_padding is None:
+            candidates = draft_tokens
+        else:
+            physical_bs = verify_padding.state.physical_batch_size
+            if physical_bs * block_size != verify_padding.state.physical_num_tokens:
+                raise ValueError(
+                    "DFLASH verify padding is not block-aligned: "
+                    f"{verify_padding.state}, block_size={block_size}."
+                )
+            candidates = self._draft_block_tokens_buf[:physical_bs]
+
+        accept_result = self._accept_block(
+            candidates=candidates,
+            next_token_logits=logits_output.next_token_logits,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            # Re-read: prepare_spec_verify rebinds seq_lens, so the alias captured
+            # before the forward would still be the logical tensor.
+            prefix_lens=batch.seq_lens,
+        )
+        if verify_padding is not None:
+            accept_result = compile_policy.finalize_dflash_verify(
+                verify_padding, accept_result, logits_output
+            )
+        # The only place the forward batch inputs get restored, even when
+        # prepare_spec_verify found nothing to widen.
+        verify_forward_batch.spec_info.keep_outputs_padded = False
+        logits_output = compile_policy.finalize_forward_batch(
+            logits_output, verify_forward_batch
+        )
+        return accept_result, logits_output, candidates
+
     def _accept_block(
         self,
         *,
@@ -2309,8 +2429,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
         prefix_lens: torch.Tensor,
-        bs: int,
     ):
+        # Physical (bucket) rows whenever the verify outputs stayed padded.
+        bs = int(candidates.shape[0])
         new_seq_lens = None
         target_predict = None
         if self._selector_sample is not None:
@@ -2343,27 +2464,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             # argmax straight to 2-D: a .view() of the 1-D result is an as_strided
             # whose src-rank broadcast collapses to the flat base, so rank 0 enters
             # this collective as s64[bs*block_size] and the rest as s64[bs,block_size].
-            target_predict = torch.argmax(
-                next_token_logits.view(bs, int(self.block_size), -1), dim=-1
+            target_predict = dflash_verify_argmax_torch(
+                next_token_logits, int(self.block_size)
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if _is_tpu:
-                compile_policy = self.model_runner.compile_policy
-                b_bucketer = compile_policy.b_bucketer
-                pad_bs = (
-                    b_bucketer.next_bucket(bs)
-                    if b_bucketer is not None
-                    else next_power_of_2(bs)
-                )
-                p_pad = prefix_lens.to(torch.int64)
-                if pad_bs > bs:
-                    c_pad = torch.nn.functional.pad(candidates, (0, 0, 0, pad_bs - bs))
-                    t_pad = torch.nn.functional.pad(
-                        target_predict, (0, 0, 0, pad_bs - bs)
-                    )
-                    p_pad = torch.nn.functional.pad(p_pad, (0, pad_bs - bs))
-                else:
-                    c_pad, t_pad = candidates, target_predict
+                # Callers hand us bucket-width rows, which is what the bookkeeping
+                # op is warmed on; the caller trims the outputs back.
                 (
                     accept_len,
                     commit_lens,
@@ -2371,16 +2478,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     out_tokens,
                     new_seq_lens,
                 ) = dflash_verify_bookkeeping_torch(
-                    candidates=c_pad,
-                    target_predict=t_pad,
-                    prefix_lens=p_pad,
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    prefix_lens=prefix_lens.to(torch.int64),
                 )
-                if pad_bs > bs:
-                    accept_len = accept_len[:bs]
-                    commit_lens = commit_lens[:bs]
-                    bonus = bonus[:bs]
-                    out_tokens = out_tokens[:bs]
-                    new_seq_lens = new_seq_lens[:bs]
             elif self._use_triton_accept_bonus:
                 try:
                     (
@@ -2615,9 +2716,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = unwrap_lora_layer(
-            _resolve_dflash_embedding_module(self.draft_model, target_model)
-        )
         lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
         if lm_head is None or not (
             hasattr(lm_head, "weight")
@@ -2697,17 +2795,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        if self._full_embed_gpu is not None:
-            # Replicated lookup avoids the mismatched attn-TP all_reduce
-            # inside VocabParallelEmbedding under dp attention.
-            noise_embedding = torch.nn.functional.embedding(
-                block_ids, self._full_embed_gpu
-            )
+        if _is_tpu:
+            # Feed the bucket-padded buffer so the compiled artifact stays on a
+            # static shape, then trim the ghost rows back off.
+            input_embeds = self.embed_draft_block_ids(
+                block_ids=self._draft_block_ids_buf[: self._maybe_pad_draft_bs(bs)]
+            )[: bs * block_size]
         else:
-            noise_embedding = embed_module(block_ids)
-        if self._noise_embed_scale != 1.0:
-            noise_embedding = noise_embedding * self._noise_embed_scale
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            input_embeds = self.embed_draft_block_ids(block_ids=block_ids)
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -2855,7 +2950,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = domino_greedy_rollout(
                 draft_hidden=draft_hidden,
                 bonus_tokens=block_ids[:, 0],
-                target_embedding=embed_module,
+                target_embedding=self.ensure_embed_module(),
                 lm_head_weight=lm_head.weight,
                 prefix_gru=prefix_gru,
                 embed_proj=embed_proj,
@@ -2947,8 +3042,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
+        compile_policy = self.model_runner.compile_policy
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
+        )
+        # The shim reads this on the way out of the forward; _accept_block_on_bucket
+        # reads it back to learn whether unpadding was left to it.
+        verify_forward_batch.spec_info.keep_outputs_padded = (
+            compile_policy.should_defer_verify_output_unpadding(batch, verify_input)
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
@@ -2989,18 +3090,47 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
+        # Penalties, logit bias and grammar stay logical: both apply in place, so a
+        # prefix view writes through to the real rows. Must run before
+        # prepare_spec_verify, which widens sampling_info and so len(sampling_info).
+        # Only TPU pads the verify outputs; elsewhere the rows are already logical.
+        logical_logits = (
+            logits_output.next_token_logits[: bs * block_size]
+            if _is_tpu
+            else logits_output.next_token_logits
+        )
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=logical_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
 
         # Constrain every chain position before accept picks from it.
         if grammar_mask is not None:
-            grammar_mask.apply(logits_output.next_token_logits)
+            grammar_mask.apply(logical_logits)
 
-        candidates = draft_tokens
+        if _is_tpu:
+            accept_result, logits_output, candidates = self._accept_block_on_bucket(
+                compile_policy=compile_policy,
+                batch=batch,
+                verify_input=verify_input,
+                verify_forward_batch=verify_forward_batch,
+                logits_output=logits_output,
+                draft_tokens=draft_tokens,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                block_size=block_size,
+            )
+        else:
+            candidates = draft_tokens
+            accept_result = self._accept_block(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+                prefix_lens=batch.seq_lens,
+            )
         (
             accept_len,
             commit_lens,
@@ -3008,14 +3138,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens,
             new_seq_lens,
             target_predict,
-        ) = self._accept_block(
-            candidates=candidates,
-            next_token_logits=logits_output.next_token_logits,
-            sampling_info=sampling_info,
-            draft_input=draft_input,
-            prefix_lens=prefix_lens,
-            bs=bs,
-        )
+        ) = accept_result
 
         if SIMULATE_ACC_LEN > 0:
             if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):

@@ -13,10 +13,6 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed import (
-    get_tp_group,
-    model_parallel_is_initialized,
-)
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -731,53 +727,26 @@ class DFlashDraftModel(nn.Module):
             projected = projected[0]
         return self.hidden_norm(projected)
 
-    def _sample_draft_tokens_tpu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Sample draft tokens on TPU using target lm_head."""
+    def sample_draft_tokens_tpu(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Sample draft tokens on TPU using target lm_head.
+
+        Extension hook: DSpark overrides it with its markov chain, whose first
+        step conditions on the anchor token in input_ids.
+        """
+        from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+            argmax_draft_tokens_tpu,
+        )
+
+        del input_ids
         if self.lm_head is None:
             raise ValueError("DFlash draft on TPU requires lm_head.")
-        hs_3d = hidden_states.view(-1, self.block_size, hidden_states.shape[-1])
-        bs = hs_3d.shape[0]
-        hs_1d = hs_3d[:, 1:, :].reshape(-1, hs_3d.shape[-1])
-        hs = (
-            hs_1d
-            if hs_1d.dtype == self.lm_head.weight.dtype
-            else hs_1d.to(self.lm_head.weight.dtype)
+        return argmax_draft_tokens_tpu(
+            lm_head=self.lm_head,
+            hidden_states=hidden_states,
+            block_size=self.block_size,
         )
-
-        tp_size = (
-            int(get_tp_group().world_size) if model_parallel_is_initialized() else 1
-        )
-
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            TpuVocabShard,
-            distributed_tpu_top_k,
-            supports_distributed_tpu_top_k,
-        )
-
-        if tp_size > 1 and supports_distributed_tpu_top_k(self.lm_head, top_k=1):
-            local_logits = torch.matmul(hs, self.lm_head.weight.T)
-            _, global_token_ids = distributed_tpu_top_k(
-                local_logits,
-                TpuVocabShard.from_lm_head(self.lm_head),
-                k=1,
-                group=get_tp_group(),
-                lm_head=self.lm_head,
-            )
-            tokens = global_token_ids.squeeze(-1).to(torch.long)
-            return tokens.view(bs, self.block_size - 1)
-
-        shard = getattr(self.lm_head, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard is not None else 0
-        org_vocab_start = int(shard.org_vocab_start_index) if shard is not None else 0
-        if num_org > 0:
-            local_logits = torch.matmul(hs, self.lm_head.weight[:num_org].T)
-        else:
-            local_logits = torch.matmul(hs, self.lm_head.weight.T)
-
-        tokens = torch.argmax(local_logits, dim=-1).to(torch.long)
-        if org_vocab_start > 0:
-            tokens.add_(org_vocab_start)
-        return tokens.view(bs, self.block_size - 1)
 
     @torch.no_grad()
     def forward(
@@ -829,7 +798,7 @@ class DFlashDraftModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
 
         if _is_tpu and hidden_states.numel() != 0:
-            next_draft_tokens = self._sample_draft_tokens_tpu(hidden_states)
+            next_draft_tokens = self.sample_draft_tokens_tpu(hidden_states, input_ids)
         else:
             next_draft_tokens = None
 
