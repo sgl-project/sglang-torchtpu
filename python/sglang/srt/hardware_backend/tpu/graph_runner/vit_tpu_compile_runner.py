@@ -18,6 +18,7 @@ from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import CompilePolicy
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.patches import _register_tpu_compile_backend
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
         method: Any | None = None,
         name: str | None = None,
         label: str | None = None,
+        compile_timing_recorder: CompileTimingRecorder | None = None,
     ) -> None:
         super().__init__(
             model_runner=model_runner,
@@ -142,6 +144,7 @@ class VisionTpuCompilePolicy(CompilePolicy):
             method=method,
             name=name,
             label=label,
+            compile_timing_recorder=compile_timing_recorder,
         )
         if vit is None and owner is not None:
             vit = getattr(owner, "vit", owner)
@@ -265,14 +268,14 @@ class VisionTpuCompilePolicy(CompilePolicy):
                     )
                     start = time.perf_counter()
                     self.warmup_once(patch_count)
-                    assert self.model_runner is not None
-                    self.model_runner.compile_timing.record(
-                        component="vision",
-                        phase="vision_encode",
-                        policy=type(self).__name__,
-                        duration_seconds=time.perf_counter() - start,
-                        num_tokens=patch_count,
-                    )
+                    if self.compile_timing_recorder is not None:
+                        self.compile_timing_recorder.record(
+                            component="vision",
+                            phase="vision_encode",
+                            policy=type(self).__name__,
+                            duration_seconds=time.perf_counter() - start,
+                            num_tokens=patch_count,
+                        )
         finally:
             torch.set_default_dtype(init_dtype)
 

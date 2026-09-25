@@ -210,6 +210,7 @@ class TpuGraphRunner:
         )
         installed_any = False
         installed_policies: list[CompilePolicy] = []
+        compile_timing_recorder = getattr(model_runner, "compile_timing", None)
         for module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
@@ -249,6 +250,7 @@ class TpuGraphRunner:
                 method_name=method_name,
                 method=method,
                 label=type(module).__name__,
+                compile_timing_recorder=compile_timing_recorder,
             )
             if issubclass(policy_cls, DecoderTpuCompilePolicy):
                 policy_kwargs["tracer"] = model_runner.server_args.tpu_compile_tracer
@@ -275,6 +277,7 @@ class TpuGraphRunner:
                 method=getattr(self.model, "forward", None),
                 label=type(self.model).__name__,
                 tracer=server_args.tpu_compile_tracer,
+                compile_timing_recorder=compile_timing_recorder,
             )
             if fallback_policy.install():
                 installed_any = True

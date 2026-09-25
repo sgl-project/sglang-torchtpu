@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -328,6 +329,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         name: str | None = None,
         label: str | None = None,
         tracer: Literal["dynamo", "direct"] = "dynamo",
+        compile_timing_recorder: CompileTimingRecorder | None = None,
     ) -> None:
         super().__init__(
             model_runner=model_runner,
@@ -336,6 +338,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             method=method,
             name=name,
             label=label,
+            compile_timing_recorder=compile_timing_recorder,
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
@@ -358,8 +361,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         capture_hidden_mode: str | None = None,
         has_spec_info: bool | None = None,
     ) -> None:
+        if self.compile_timing_recorder is None:
+            return
         assert self.model_runner is not None
-        self.model_runner.compile_timing.record(
+        self.compile_timing_recorder.record(
             component="draft" if self.model_runner.is_draft_worker else "target",
             phase=phase,
             policy=type(self).__name__,
