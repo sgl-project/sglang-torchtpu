@@ -556,7 +556,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             specialization_key=self._direct_compile_specialization_key,
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
-            kv_pool=self.model_runner.token_to_kv_pool,
+            kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
         )
 
@@ -570,6 +570,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def get_direct_compile_kv_pool(self):
+        return self.model_runner.token_to_kv_pool
 
     def _ignored_argnames(self) -> tuple[str, ...]:
         return (

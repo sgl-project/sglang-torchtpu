@@ -243,6 +243,31 @@ def _run_cases(policy, mode):
 
 
 class TestDirectCompileExtraModelState(CustomTestCase):
+    def test_custom_policy_forwards_kv_pool_without_replacing_runner_pool(self):
+        compile_kv_pool = object()
+
+        class CustomPolicy(DecoderTpuCompilePolicy):
+            def get_direct_compile_kv_pool(self):
+                return compile_kv_pool
+
+        model_runner = _model_runner()
+        runner_kv_pool = model_runner.token_to_kv_pool
+        policy = CustomPolicy(model_runner=model_runner, owner=model_runner.model)
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
+            policy._direct_compile(model_runner.model.forward)
+
+        compile_module.direct_compile.assert_called_once()
+        self.assertIs(
+            compile_module.direct_compile.call_args.kwargs["kv_pool"], compile_kv_pool
+        )
+        self.assertIs(model_runner.token_to_kv_pool, runner_kv_pool)
+
     def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
         class CustomPolicy(DecoderTpuCompilePolicy):
             model_extra_tensor_attrs = (
