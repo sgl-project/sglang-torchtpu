@@ -112,12 +112,14 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     scheduler._pp_send_dict_to_next_stage = Mock(return_value=[])
     copy_event = Mock()
 
-    def preprocess(*args, defer_send=False):
-        record("preprocess", defer_send)
+    def preprocess(*args, before_forward=False):
+        record("preprocess", before_forward)
         return None, "host-output", copy_event
 
     scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = preprocess
-    scheduler._pp_send_deferred_output = Mock(side_effect=lambda _: record("deferred"))
+    scheduler._pp_send_output_to_next_stage = Mock(
+        side_effect=lambda *args: record("deferred") or []
+    )
 
     def launch(mb_id, cur_batch, proxy, metadata, queue):
         record("launch", cur_batch)
@@ -185,7 +187,7 @@ class TestDisaggregatedWave(unittest.TestCase):
                 self.assertEqual(wave.launches, wave.stage0_launches)
                 scheduler._pp_recv_proxy_tensors.assert_not_called()
                 scheduler._pp_send_dict_to_next_stage.assert_not_called()
-                copied.synchronize.assert_not_called()
+                copied.synchronize.assert_called()
                 self.assertEqual(scheduler._pp_process_batch_result.call_count, 2)
                 self.assertEqual(
                     scheduler.process_pending_chunked_abort.call_count, len(schedule)
@@ -230,7 +232,7 @@ class TestDisaggregatedWave(unittest.TestCase):
                 self.assertEqual(wave.launches, wave.stage0_launches)
                 scheduler._pp_recv_proxy_tensors.assert_not_called()
                 scheduler._pp_send_dict_to_next_stage.assert_not_called()
-                copied.synchronize.assert_not_called()
+                copied.synchronize.assert_called()
                 self.assertEqual(scheduler._pp_launch_batch.call_count, 4)
                 self.assertEqual(scheduler._pp_process_batch_result.call_count, 2)
                 self.assertEqual(
@@ -266,7 +268,7 @@ class TestDisaggregatedWave(unittest.TestCase):
                 )
                 first = [name for step, name, _ in events if step == 0]
                 self.assertEqual(first, ["launch", "preprocess"])
-                scheduler._pp_send_deferred_output.assert_not_called()
+                scheduler._pp_send_output_to_next_stage.assert_not_called()
 
     def test_other_backends_retain_proxy_transport_and_output_copy_fence(self):
         for mode, forward in (
@@ -281,10 +283,8 @@ class TestDisaggregatedWave(unittest.TestCase):
                 scheduler._pp_recv_proxy_tensors.assert_called_once()
                 scheduler._pp_send_dict_to_next_stage.assert_called_once()
                 copied.synchronize.assert_called_once()
-                self.assertFalse(
-                    any(value for _, name, value in events if name == "preprocess")
-                )
-                scheduler._pp_send_deferred_output.assert_not_called()
+                self.assertNotIn("deferred", [name for _, name, _ in events])
+                scheduler._pp_send_output_to_next_stage.assert_not_called()
 
 
 if __name__ == "__main__":

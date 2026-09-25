@@ -118,7 +118,12 @@ class TestMXINT8Configurator(CustomTestCase):
             is_hybrid_swa_compress=False,
             use_mla_backend=False,
             layer_info=SimpleNamespace(
-                start_layer=0, end_layer=2, num_effective_layers=2
+                start_layer=0,
+                end_layer=2,
+                num_effective_layers=2,
+                swa_attention_layer_ids=[1],
+                full_attention_layer_ids=[0],
+                is_hybrid_swa_mtp_draft=False,
             ),
             forward_stream=None,
             req_to_token_pool=None,

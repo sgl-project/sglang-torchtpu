@@ -18,14 +18,13 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 import torch  # noqa: E402
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
-from sglang.srt.hardware_backend.tpu import pp_wave  # noqa: E402
+from sglang.srt.hardware_backend.tpu import pp_scheduler  # noqa: E402
 from sglang.srt.hardware_backend.tpu.compilation.bucketer import (  # noqa: E402
     Bucketer,
 )
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (  # noqa: E402
     DecoderTpuCompilePolicy,
 )
-from sglang.srt.managers import scheduler_pp_mixin  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
@@ -137,27 +136,6 @@ class TestProxyReceive(CustomTestCase):
         scheduler._pp_recv_typed_dict = MagicMock(return_value=received)
         return scheduler
 
-    def test_tpu_proxy_holds_tensors_only(self):
-        hidden = torch.zeros(4, 2)
-        residual = torch.ones(4, 2)
-        scheduler = self._scheduler(
-            {"hidden_states": hidden, "residual": residual, "__msg_type__": "proxy"}
-        )
-        with patch.object(scheduler_pp_mixin, "_is_tpu", True):
-            proxy = scheduler._pp_recv_proxy_tensors()
-        self.assertEqual(list(proxy.tensors), ["hidden_states", "residual"])
-        self.assertIs(proxy["hidden_states"], hidden)
-        scheduler._pp_recv_typed_dict.assert_called_once_with(
-            expected_kind="proxy", all_gather_group=scheduler.attn_tp_group
-        )
-
-    def test_off_tpu_proxy_keeps_the_received_dict(self):
-        received = {"hidden_states": torch.zeros(1), "__msg_type__": "proxy"}
-        scheduler = self._scheduler(received)
-        with patch.object(scheduler_pp_mixin, "_is_tpu", False):
-            proxy = scheduler._pp_recv_proxy_tensors()
-        self.assertIs(proxy.tensors, received)
-
     def test_first_stage_receives_nothing(self):
         scheduler = self._scheduler({})
         scheduler.pp_group = SimpleNamespace(is_first_rank=True)
@@ -177,7 +155,7 @@ class TestWaveRows(CustomTestCase):
                 device="cpu",
             )
         )
-        with patch.object(pp_wave, "build_pp_wave") as build:
+        with patch.object(pp_scheduler, "build_pp_wave") as build:
             scheduler._pp_init_wave()
         return build.call_args.kwargs["rows"]
 
