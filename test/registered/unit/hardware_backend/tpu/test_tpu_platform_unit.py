@@ -15,6 +15,10 @@ from unittest.mock import patch
 import torch.compiler.config as compiler_config
 
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    default_cuda_graph_config,
+)
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -221,7 +225,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             attention_backend=None,
             sampling_backend=None,
             disable_cuda_graph=False,
-            disable_piecewise_cuda_graph=False,
+            cuda_graph_config=default_cuda_graph_config(),
             enable_torch_compile=False,
             disable_overlap_schedule=False,
             mem_fraction_static=None,
@@ -260,13 +264,31 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         self.assertEqual(self._resolved(args, "attention_backend"), "pallas_tpu_rpa_v3")
         self.assertEqual(self._resolved(args, "sampling_backend"), "tpu")
         self.assertTrue(self._resolved(args, "disable_cuda_graph"))
-        self.assertTrue(self._resolved(args, "disable_piecewise_cuda_graph"))
+        graph_config = self._resolved(args, "cuda_graph_config")
+        self.assertEqual(graph_config.decode.backend, Backend.DISABLED)
+        self.assertEqual(graph_config.prefill.backend, Backend.DISABLED)
         # enable_torch_compile is opt-in on TPU and must not be forced off.
         self.assertFalse(self._resolved(args, "enable_torch_compile"))
         # Overlap is enabled on TPU via the thread-based path in
         # scheduler_overlap_mixin; the platform must NOT force-disable it.
         self.assertFalse(self._resolved(args, "disable_overlap_schedule"))
         self.assertEqual(self._resolved(args, "mem_fraction_static"), 0.40)
+
+    def test_resolved_cuda_graphs_disabled_without_disabling_tpu_compile(self):
+        graph_config = default_cuda_graph_config()
+        graph_config.decode.backend = Backend.FULL
+        graph_config.prefill.backend = Backend.BREAKABLE
+        graph_config.decode.bs = [1, 4]
+        args = self._args(cuda_graph_config=graph_config, enable_torch_compile=True)
+        self._apply(args)
+
+        resolved = self._resolved(args, "cuda_graph_config")
+        self.assertEqual(resolved.decode.backend, Backend.DISABLED)
+        self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
+        self.assertEqual(resolved.decode.bs, [1, 4])
+        self.assertTrue(self._resolved(args, "enable_torch_compile"))
+        self.assertEqual(graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(graph_config.prefill.backend, Backend.BREAKABLE)
 
     def test_rpa_backends_default_to_fp8_kv_cache(self):
         for backend in ("pallas_tpu_rpa_v3", "pallas_tpu_rpa_batched"):

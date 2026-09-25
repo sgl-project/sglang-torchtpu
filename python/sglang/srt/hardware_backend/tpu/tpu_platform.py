@@ -194,6 +194,11 @@ class TpuSRTPlatform(SRTPlatform):
             resolving_view,
         )
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
+        from sglang.srt.model_executor.cuda_graph_config import (
+            Backend,
+            Phase,
+            with_phase,
+        )
 
         cfg = resolving_view(server_args)
 
@@ -235,11 +240,16 @@ class TpuSRTPlatform(SRTPlatform):
                 sampling_backend="tpu",
             )
 
+        # Graph configuration is resolved before platform defaults. Updating the
+        # legacy flag alone cannot disable the already-resolved phase runners.
+        graph_config = cfg.cuda_graph_config
+        for phase in Phase.ALL:
+            graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
         declare_resolution(
             server_args,
             "tpu.apply_server_args_defaults",
             disable_cuda_graph=True,
-            disable_piecewise_cuda_graph=True,
+            cuda_graph_config=graph_config,
         )
         # ``enable_torch_compile`` is honored on TPU and wired up by
         # ``TpuGraphRunner`` (see ``ModelRunner.init_device_graphs``). Off by
