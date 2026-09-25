@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TorchTPU JAX custom-op adapter for CPU-only StableHLO export."""
 
+import hashlib
 import inspect
 from collections.abc import Callable, Sequence
 
@@ -45,8 +46,12 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
             self.trace_key, args, kwargs, self.static_argnums
         )
         output_shapes, out_tree = self.output_shapes.get(kernel_key, (None, None))
-        kernel_exists = pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
-            self.name, kernel_key
+        mlir_fingerprint = self.kernel_key_to_mlir_fingerprint.get(kernel_key)
+        kernel_exists = (
+            mlir_fingerprint is not None
+            and pallas_impl.tpu_torch_pallas.lookup_custom_kernel(
+                self.name, mlir_fingerprint
+            )
         )
         if not output_shapes or not kernel_exists:
             jax_args = pallas_impl.jax_placeholders(
@@ -59,9 +64,18 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
                 jax._src.config.export_ignore_forward_compatibility(True),
             ):
                 lowered = self.exported(*jax_args, **kwargs)
+            # Match TorchTPU's content identity: ignore outer caller locations,
+            # but retain the embedded Mosaic kernel body and its debug info.
+            with jax.interpreters.mlir.make_ir_context():
+                module = jax.interpreters.mlir.ir.Module.parse(lowered.mlir_module())
+                normalized_mlir = module.operation.get_asm(enable_debug_info=False)
+            mlir_fingerprint = hashlib.blake2b(
+                normalized_mlir.encode("utf-8"), digest_size=16
+            ).hexdigest()
+            self.kernel_key_to_mlir_fingerprint[kernel_key] = mlir_fingerprint
             pallas_impl.tpu_torch_pallas.register_custom_kernel(
                 self.name,
-                kernel_key,
+                mlir_fingerprint,
                 serialized_mlir_module=lowered.mlir_module_serialized,
             )
             shardings = self.sglang_output_shardings or (None,) * len(lowered.out_avals)
@@ -79,7 +93,7 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
         ]
         results = pallas_impl.tpu_torch_pallas.call_custom_kernel(
             self.name,
-            kernel_key,
+            mlir_fingerprint,
             inputs=tensor_args,
             output_shapes=output_shapes,
             donate_argnums=self.donate_argnums,

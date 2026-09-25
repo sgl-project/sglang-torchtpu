@@ -14,7 +14,7 @@ from pathlib import Path
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_tpu_ci(est_time=90, suite="stage-a-test-tpu-unit")
+register_tpu_ci(est_time=180, suite="stage-a-test-tpu-unit")
 
 _CACHE_LOGGING = (
     "compilation_cache=2,tier2_compilation_cache=2,tier3_compilation_cache=2"
@@ -47,13 +47,21 @@ _WORKER = textwrap.dedent("""
 
     import jax
     import jax.numpy as jnp
+    from jax.experimental import pallas as pl
 
     from sglang.srt.hardware_backend.tpu.pallas_jax_op import cpu_export_jax_op
+
+    def add_kernel(value_ref, output_ref):
+        output_ref[...] = value_ref[...] + KERNEL_INCREMENT
 
     def linear(
         value: jax.Array, weight: jax.Array, bias: jax.Array
     ) -> jax.Array:
-        return jnp.maximum(value @ weight.T + bias, 0)
+        result = jnp.maximum(value @ weight.T + bias, 0)
+        return pl.pallas_call(
+            add_kernel,
+            out_shape=jax.ShapeDtypeStruct(result.shape, result.dtype),
+        )(result)
 
     pallas_op = cpu_export_jax_op("pallas_tier3_test::linear", linear)
 
@@ -68,7 +76,7 @@ _WORKER = textwrap.dedent("""
     value = torch.ones((32, 128), dtype=torch.float32, device="tpu")
     torch.tpu.synchronize()
     result = compiled(value).cpu()
-    expected = torch.ones((32, 128), dtype=torch.float32)
+    expected = torch.full((32, 128), 1 + int(sys.argv[2]), dtype=torch.float32)
     if not torch.equal(result, expected):
         raise AssertionError(f"rank {rank} produced {result}, expected {expected}")
 
@@ -112,7 +120,7 @@ def _cache_files(root: Path) -> dict[str, int]:
 
 
 class TestPallasTier3Cache(CustomTestCase):
-    def test_fresh_process_reuses_persistent_cache(self):
+    def test_fresh_process_reuses_cache_and_invalidates_changed_kernel(self):
         distributed_environment = _singlehost_environment()
         world_size = int(distributed_environment["WORLD_SIZE"])
         tier2_root = Path("/dev/shm/torch_tpu_cache")
@@ -121,20 +129,19 @@ class TestPallasTier3Cache(CustomTestCase):
         with (
             tempfile.TemporaryDirectory(prefix="pallas-tier3-") as work_directory,
             tempfile.TemporaryDirectory(
-                prefix="pallas-tier3-seed-", dir=tier2_root
-            ) as seed_tier2_directory,
-            tempfile.TemporaryDirectory(
-                prefix="pallas-tier3-restore-", dir=tier2_root
-            ) as restore_tier2_directory,
+                prefix="pallas-tier3-", dir=tier2_root
+            ) as tier2_directory,
         ):
             work_root = Path(work_directory)
             tier3_root = work_root / "cache"
             tier3_root.mkdir()
             outputs = {}
             cache_snapshots = {}
-            for stage, tier2_directory in (
-                ("seed", seed_tier2_directory),
-                ("restore", restore_tier2_directory),
+            for stage, increment in (
+                ("seed", 1),
+                ("restore", 1),
+                ("changed", 2),
+                ("changed_restore", 2),
             ):
                 environment = os.environ.copy()
                 environment.update(distributed_environment)
@@ -144,7 +151,7 @@ class TestPallasTier3Cache(CustomTestCase):
                         "PYTHONHASHSEED": "0",
                         "TF_CPP_VMODULE": _CACHE_LOGGING,
                         "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK": "1",
-                        "TORCH_TPU_TIER2_COMPILATION_CACHE": Path(tier2_directory).name,
+                        "TORCH_TPU_TIER2_COMPILATION_CACHE": f"{Path(tier2_directory).name}/{stage}",
                         "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": str(tier3_root),
                     }
                 )
@@ -165,8 +172,9 @@ class TestPallasTier3Cache(CustomTestCase):
                         "3",
                         sys.executable,
                         "-c",
-                        _WORKER,
+                        _WORKER.replace("KERNEL_INCREMENT", str(increment)),
                         stage,
+                        str(increment),
                     ],
                     capture_output=True,
                     check=False,
@@ -206,6 +214,27 @@ class TestPallasTier3Cache(CustomTestCase):
             )
             self.assertTrue(cache_snapshots["seed"])
             self.assertEqual(cache_snapshots["restore"], cache_snapshots["seed"])
+            self.assertGreater(
+                outputs["changed"].count("Tier-3 cache MISS"),
+                0,
+                outputs["changed"],
+            )
+            self.assertGreater(
+                cache_snapshots["changed"].keys(), cache_snapshots["seed"].keys()
+            )
+            self.assertGreater(
+                outputs["changed_restore"].count("Tier-3 cache HIT"),
+                0,
+                outputs["changed_restore"],
+            )
+            self.assertEqual(
+                outputs["changed_restore"].count("Tier-3 cache MISS"),
+                0,
+                outputs["changed_restore"],
+            )
+            self.assertEqual(
+                cache_snapshots["changed_restore"], cache_snapshots["changed"]
+            )
 
 
 if __name__ == "__main__":
