@@ -34,7 +34,7 @@ class TestAttnResidual(unittest.TestCase):
         with torch.no_grad():
             score_proj.weight.normal_()
         prefix_sum, bank = torch.randn(T, H), torch.randn(T, nvb + 1, H)
-        with patch.object(attn_residual, "is_tpu", return_value=True):
+        with patch.object(attn_residual, "_is_tpu", True):
             out = _aggregate(prefix_sum, bank, nvb, score_proj, score_norm, out_norm)
         expected = out_norm(
             aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
