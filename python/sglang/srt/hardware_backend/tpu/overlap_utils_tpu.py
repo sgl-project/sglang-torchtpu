@@ -97,10 +97,24 @@ def resolve_spec_extras_tpu(future_map: FutureMap, batch: ScheduleBatch) -> bool
 
 
 class DirectHandoff(msgspec.Struct, frozen=True):
-    draft_input: Any
     indices: torch.Tensor
     payload: Any
     seq_lens: torch.Tensor
+
+
+class PublishedSeqLens(msgspec.Struct, frozen=True):
+    indices: torch.Tensor
+    seq_lens: torch.Tensor
+
+
+def publish_tpu(
+    future_map: FutureMap, indices: torch.Tensor, new_seq_lens: torch.Tensor
+) -> None:
+    # The overlap forward publishes, then stashes the same indices object;
+    # stash_tpu pairs the two so the next step can skip the seq_lens gather.
+    future_map.tpu_published_seq_lens = PublishedSeqLens(
+        indices=indices, seq_lens=new_seq_lens
+    )
 
 
 def flush_direct_handoff_tpu(future_map: FutureMap) -> None:
@@ -112,31 +126,27 @@ def flush_direct_handoff_tpu(future_map: FutureMap) -> None:
     future_map.stash(pending.indices, pending.payload)
 
 
-def stash_tpu(
-    future_map: FutureMap,
-    indices: torch.Tensor,
-    payload: Any,
-    batch: ScheduleBatch | None,
-    result: Any,
-) -> bool:
+def stash_tpu(future_map: FutureMap, indices: torch.Tensor, payload: Any) -> bool:
     """Flush any pending handoff, then defer this store when the next step can
     consume the payload directly. Returns True when the store was deferred.
 
-    Only owned finalizer outputs in the top-k-1 decode path qualify.
+    Only EAGLE3 top-k-1 payloads stashed right after a publish qualify.
     """
+    # Take the publish before flushing: the flush re-enters stash and must fall
+    # through to the normal store.
+    published = future_map.tpu_published_seq_lens
+    future_map.tpu_published_seq_lens = None
     # A different batch may still need rows from the previous pending result.
     flush_direct_handoff_tpu(future_map)
-    draft = result.next_draft_input if result is not None else None
     # Only gate what the resolve step itself relies on. Anything about the next
-    # batch (overlap, logprob, grammar, filtering) is re-checked there, and a
+    # batch (device acceptance, filtering, merging) is re-checked there, and a
     # mismatch just flushes the pending payload into the normal store.
     if (
-        # Plain stash call: nothing to hand off.
-        batch is None
-        or draft is None
+        # No paired publish (prefill seed, beam tail slice): nothing to hand off.
+        published is None
+        or published.indices is not indices
         # Only the EAGLE3 topk-1 decode path keeps acceptance on device.
         or not future_map.spec_algo.is_eagle3()
-        or draft.accept_lens_device is None
         or payload.topk_index is None
         or payload.topk_index.shape[1] != 1
         # DP idle stub: an empty payload has nothing to relay.
@@ -149,10 +159,7 @@ def stash_tpu(
         return False
     future_map._maybe_init_forward_bufs(payload)
     future_map.tpu_direct_handoff = DirectHandoff(
-        draft_input=draft,
-        indices=indices,
-        payload=payload,
-        seq_lens=result.new_seq_lens,
+        indices=indices, payload=payload, seq_lens=published.seq_lens
     )
     return True
 
@@ -162,11 +169,12 @@ def resolve_direct_handoff_tpu(future_map: FutureMap, batch: ScheduleBatch) -> b
     if pending is None:
         return False
     draft = batch.spec_info
-    # filter_batch and merge_batch rebind future_indices. Never compare device
-    # values on the host. The draft object also identifies this generation.
+    # filter_batch and merge_batch rebind future_indices and the draft tensors.
+    # Never compare device values on the host; the payload tensors are the
+    # draft's own, so identity also pins this generation.
     if (
-        draft is not pending.draft_input
-        or draft.future_indices is not pending.indices
+        draft.future_indices is not pending.indices
+        or draft.bonus_tokens is not pending.payload.bonus_tokens
         or draft.device_accept_candidate_locs is None
         or draft.accept_lens_device is None
         or draft.device_accept_candidate_locs.shape[0] != pending.indices.shape[0]

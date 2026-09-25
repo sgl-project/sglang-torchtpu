@@ -12,35 +12,40 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.hardware_backend.tpu import overlap_utils_tpu
+from sglang.srt.hardware_backend.tpu import patches
 from sglang.srt.hardware_backend.tpu.overlap_utils_tpu import (
     flush_direct_handoff_tpu,
     resolve_direct_handoff_tpu,
 )
-from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 @contextmanager
-def tpu_stash():
-    """Route FutureMap.stash through the TPU-only branch on a CPU host."""
+def tpu_future_map():
+    """Install the TPU FutureMap patch on a CPU host, restoring it on exit."""
     with ExitStack() as stack:
-        stack.enter_context(patch.object(overlap_utils, "_is_tpu", True))
+        for name in ("stash", "publish"):
+            stack.enter_context(patch.object(FutureMap, name, getattr(FutureMap, name)))
+        for name in ("tpu_direct_handoff", "tpu_published_seq_lens"):
+            stack.enter_context(patch.object(FutureMap, name, None, create=True))
         stack.enter_context(
-            patch.object(
-                overlap_utils, "stash_tpu", overlap_utils_tpu.stash_tpu, create=True
-            )
+            patch.object(patches, "_future_map_direct_handoff_patched", False)
         )
+        patches._patch_future_map_direct_handoff()
         yield
 
 
-def stash(fm, batch, indices, payload, result) -> bool:
-    """Stash through FutureMap and report whether the store was deferred."""
-    with tpu_stash():
-        fm.stash(indices, payload, batch=batch, result=result)
-    return fm.tpu_direct_handoff is not None
+def stash(fm, indices, payload, seq_lens, published=True) -> bool:
+    """Publish then stash like the overlap forward; report whether deferred."""
+    with tpu_future_map():
+        if published is True:
+            published = indices
+        if published is not None:
+            fm.publish(published, seq_lens)
+        fm.stash(indices, payload)
+        return fm.tpu_direct_handoff is not None
 
 
 def make_case():
@@ -77,18 +82,23 @@ def make_case():
         future_dsa_topk_indices_available=False,
     )
     batch = SimpleNamespace(spec_info=draft)
-    result = SimpleNamespace(
-        next_draft_input=draft, new_seq_lens=torch.tensor([101, 203])
-    )
-    return fm, batch, indices, payload, result
+    draft.bonus_tokens = payload.bonus_tokens
+    return fm, batch, indices, payload, torch.tensor([101, 203])
 
 
 class TestDirectHandoff(CustomTestCase):
     def test_exact_generation_consumes_without_store_and_pins_values(self):
-        fm, batch, indices, payload, result = make_case()
+        fm, batch, indices, payload, seq_lens = make_case()
         expected = payload.hidden_states
-        with patch.object(fm, "_store", side_effect=AssertionError("unexpected store")):
-            self.assertTrue(stash(fm, batch, indices, payload, result))
+        real_store = fm._store
+
+        def store_seq_lens_only(buf, indices, values):
+            # Publish still writes seq_lens; only the payload store is skipped.
+            assert buf is fm.new_seq_lens_buf, "unexpected payload store"
+            real_store(buf, indices, values)
+
+        with patch.object(fm, "_store", side_effect=store_seq_lens_only):
+            self.assertTrue(stash(fm, indices, payload, seq_lens))
             self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
             self.assertIs(batch.spec_info.hidden_states, expected)
             torch.testing.assert_close(
@@ -99,19 +109,27 @@ class TestDirectHandoff(CustomTestCase):
             self.assertFalse(resolve_direct_handoff_tpu(fm, batch))
         payload.hidden_states = torch.full((2, 3), -10.0)
         self.assertIs(batch.spec_info.hidden_states, expected)
-        torch.testing.assert_close(batch.seq_lens, result.new_seq_lens)
+        torch.testing.assert_close(batch.seq_lens, seq_lens)
 
     def test_filter_reorder_or_generation_change_flushes_before_fallback(self):
-        for change in ["filter", "reorder", "generation", "no_candidates"]:
+        for change in [
+            "filter",
+            "reorder",
+            "generation",
+            "no_candidates",
+            "no_accept_lens",
+        ]:
             with self.subTest(change=change):
-                fm, batch, indices, payload, result = make_case()
-                self.assertTrue(stash(fm, batch, indices, payload, result))
+                fm, batch, indices, payload, seq_lens = make_case()
+                self.assertTrue(stash(fm, indices, payload, seq_lens))
                 if change == "filter":
                     batch.spec_info.future_indices = indices[:1]
                 elif change == "reorder":
                     batch.spec_info.future_indices = indices.flip(0)
                 elif change == "generation":
-                    batch.spec_info = SimpleNamespace(**vars(batch.spec_info))
+                    batch.spec_info.bonus_tokens = payload.bonus_tokens.clone()
+                elif change == "no_accept_lens":
+                    batch.spec_info.accept_lens_device = None
                 else:
                     batch.spec_info.device_accept_candidate_locs = None
                 self.assertFalse(resolve_direct_handoff_tpu(fm, batch))
@@ -128,29 +146,28 @@ class TestDirectHandoff(CustomTestCase):
                 self.assertIsNone(fm.tpu_direct_handoff)
 
     def test_unconsumed_replacement_preserves_old_rows(self):
-        fm, batch, indices, payload, result = make_case()
-        stash(fm, batch, indices, payload, result)
+        fm, batch, indices, payload, seq_lens = make_case()
+        stash(fm, indices, payload, seq_lens)
         other = RelayPayload(
             bonus_tokens=torch.tensor([31, 32]),
             topk_p=payload.topk_p,
             topk_index=payload.topk_index,
             hidden_states=payload.hidden_states + 100,
         )
-        stash(fm, batch, torch.tensor([3, 4]), other, result)
+        stash(fm, torch.tensor([3, 4]), other, seq_lens)
         torch.testing.assert_close(fm.output_tokens_buf[indices], payload.bonus_tokens)
-        with tpu_stash():
+        with tpu_future_map():
             flush_direct_handoff_tpu(fm)
         torch.testing.assert_close(
             fm.output_tokens_buf[torch.tensor([3, 4])], other.bonus_tokens
         )
 
     def test_consumed_generation_then_filtered_successor_uses_new_values(self):
-        fm, batch, indices, payload, result = make_case()
-        stash(fm, batch, indices, payload, result)
+        fm, batch, indices, payload, seq_lens = make_case()
+        stash(fm, indices, payload, seq_lens)
         self.assertTrue(resolve_direct_handoff_tpu(fm, batch))
-        successor = SimpleNamespace(**vars(result.next_draft_input))
+        successor = SimpleNamespace(**vars(batch.spec_info))
         successor.device_accept_selected_cache_locs = None
-        result.next_draft_input = successor
         batch.spec_info = successor
         newer = RelayPayload(
             bonus_tokens=payload.bonus_tokens + 50,
@@ -158,7 +175,8 @@ class TestDirectHandoff(CustomTestCase):
             topk_index=payload.topk_index + 50,
             hidden_states=payload.hidden_states + 50,
         )
-        stash(fm, batch, indices, newer, result)
+        stash(fm, indices, newer, seq_lens)
+        successor.bonus_tokens = newer.bonus_tokens
         successor.future_indices = indices[:1]
         self.assertFalse(resolve_direct_handoff_tpu(fm, batch))
         torch.testing.assert_close(
@@ -170,25 +188,22 @@ class TestDirectHandoff(CustomTestCase):
 
     def test_unsupported_paths_do_not_defer(self):
         for change in [
-            "no_batch",
-            "no_draft",
+            "no_publish",
+            "other_indices",
             "not_eagle3",
-            "no_accept_lens",
             "wide_topk",
             "no_hidden",
             "probabilities",
         ]:
             with self.subTest(change=change):
-                fm, batch, indices, payload, result = make_case()
+                fm, batch, indices, payload, seq_lens = make_case()
                 fallback = nullcontext()
-                if change == "no_batch":
-                    batch = None
-                elif change == "no_draft":
-                    result.next_draft_input = None
+                published = None if change == "no_publish" else indices
+                if change == "other_indices":
+                    # Beam tail slices the stash indices after publish.
+                    indices = indices[:]
                 elif change == "not_eagle3":
                     fm.spec_algo.is_eagle3 = lambda: False
-                elif change == "no_accept_lens":
-                    batch.spec_info.accept_lens_device = None
                 elif change == "wide_topk":
                     fm.topk_p_buf = torch.zeros(8, 2)
                     fm.topk_index_buf = torch.zeros(8, 2, dtype=torch.int64)
@@ -206,7 +221,9 @@ class TestDirectHandoff(CustomTestCase):
                 else:
                     payload.draft_probs = torch.ones(2, 5)
                 with fallback:
-                    self.assertFalse(stash(fm, batch, indices, payload, result))
+                    self.assertFalse(
+                        stash(fm, indices, payload, seq_lens, published=published)
+                    )
                 torch.testing.assert_close(
                     fm.output_tokens_buf[indices], payload.bonus_tokens
                 )
