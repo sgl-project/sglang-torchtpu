@@ -13,10 +13,12 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_npu,
+    is_tpu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
 
 # Maximum rows per Triton block for layernorm gated kernel
@@ -396,15 +398,63 @@ class FusedRMSNormGated(nn.Module):
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, g, self.eps
             )
-        else:
-            return rms_norm_gated(
+        if _is_tpu:
+            return self.forward_native(
                 x,
                 g,
-                self.weight,
-                self.bias,
-                self.activation,
                 residual=residual,
-                eps=self.eps,
                 prenorm=prenorm,
                 residual_in_fp32=residual_in_fp32,
             )
+        return rms_norm_gated(
+            x,
+            g,
+            self.weight,
+            self.bias,
+            self.activation,
+            residual=residual,
+            eps=self.eps,
+            prenorm=prenorm,
+            residual_in_fp32=residual_in_fp32,
+        )
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        g: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        prenorm: bool = False,
+        residual_in_fp32: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Eager path for TPU, which has no Triton.
+
+        Computes rmsnorm(x + residual) * weight + bias, then applies the gate:
+        silu/swish multiplies by g * sigmoid(g), sigmoid by sigmoid(g).
+        Returns the output in x's dtype; with prenorm, also returns the
+        pre-norm residual stream (x + residual), as the Triton path does.
+        """
+        orig_dtype = x.dtype
+        x_f = x.float()
+        if residual is not None:
+            x_f = x_f + residual.float()
+        rstd = torch.rsqrt(x_f.square().mean(dim=-1, keepdim=True) + self.eps)
+        y = x_f * rstd
+        if self.weight is not None:
+            y = y * self.weight.float()
+        if self.bias is not None:
+            y = y + self.bias.float()
+        g_f = g.float()
+        if self.activation in ("swish", "silu"):
+            y = y * g_f * torch.sigmoid(g_f)
+        elif self.activation == "sigmoid":
+            y = y * torch.sigmoid(g_f)
+        out = y.to(orig_dtype)
+        if not prenorm:
+            return out
+        # residual_out dtype follows layer_norm_gated_fwd: residual's dtype,
+        # else fp32 when residual_in_fp32, else the untouched input.
+        if residual is not None:
+            return out, x_f.to(residual.dtype)
+        if residual_in_fp32 and orig_dtype != torch.float32:
+            return out, x_f
+        return out, x
