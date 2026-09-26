@@ -172,6 +172,9 @@ class RaidenKVTransfer:
         """
         n = len(device_page_ids)
         assert n == len(host_page_ids)
+        # raiden reads an empty page list as the whole layer buffer.
+        if n == 0:
+            return NOOP_EVENT
         fut = self._mgr.d2h(device_page_ids, host_page_ids, [1] * n)
         return RaidenFutureEvent(fut)
 
@@ -181,5 +184,7 @@ class RaidenKVTransfer:
         """Host->device (H2D): load host pages back into the fused KV buffer."""
         n = len(host_page_ids)
         assert n == len(device_page_ids)
+        if n == 0:
+            return NOOP_EVENT
         fut = self._mgr.h2d(host_page_ids, device_page_ids, [1] * n)
         return RaidenFutureEvent(fut)

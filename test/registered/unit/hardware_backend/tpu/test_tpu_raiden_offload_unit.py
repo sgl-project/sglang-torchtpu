@@ -66,6 +66,7 @@ from sglang.srt.hardware_backend.tpu.raiden_transfer import (
     NOOP_EVENT,
     CombinedFutureEvent,
     RaidenFutureEvent,
+    RaidenKVTransfer,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
@@ -2428,6 +2429,23 @@ class _FakeFuture:
 
     def error_message(self):
         return self._error or ""
+
+
+class TestRaidenKVTransferEmptyPageList(CustomTestCase):
+    def test_empty_page_list_issues_no_dma(self):
+        """A hybrid write can carry SWA pages but no Full pages. raiden reads an
+        empty page list as the whole layer buffer, so none may reach it."""
+        transfer = object.__new__(RaidenKVTransfer)
+        transfer._mgr = Mock()
+        for method, mgr_call in (
+            (transfer.backup, transfer._mgr.d2h),
+            (transfer.load, transfer._mgr.h2d),
+        ):
+            with self.subTest(method=method.__name__):
+                self.assertIs(method([], []), NOOP_EVENT)
+                mgr_call.assert_not_called()
+                method([3], [5])
+                mgr_call.assert_called_once_with([3], [5], [1])
 
 
 class TestRaidenFutureEvent(CustomTestCase):
