@@ -13,7 +13,7 @@
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
 #           everywhere the fast kernel does not apply.
-# aggregate_stream_torch is the eager reference (tests and the
+# aggregate_stream_torch is the eager reference (tests, TPU and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
 from typing import Optional
@@ -24,7 +24,9 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu, is_tpu
+
+_is_tpu = is_tpu()
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -43,7 +45,7 @@ def _use_fast(hidden_size: int) -> bool:
     """The TMA kernel needs SM100+ except SM12x (tcgen05, cp.async.bulk)
     and its H=7168 template; everything else takes the triton pipeline."""
     global _FAST_SUPPORTED
-    if is_npu():
+    if is_npu() or _is_tpu:
         return False
     if _FAST_SUPPORTED is None:
         _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
@@ -217,6 +219,8 @@ def _mix_fused(
     T, H = prefix_sum.shape
     if T == 0:
         return prefix_sum
+    if _is_tpu:
+        return aggregate_stream_torch(prefix_sum, bank, nvb, score_proj, score_norm)
     cw = get_cw(score_proj, score_norm)
     if is_npu():
         from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused

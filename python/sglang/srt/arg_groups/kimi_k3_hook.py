@@ -22,6 +22,13 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     if cfg.speculative_algorithm is None:
         return
 
+    # No KDA target-verify path on TPU to populate intermediate_ssm.
+    if get_platform().is_tpu:
+        raise ValueError(
+            "Speculative decoding is not supported for Kimi hybrid (KDA) models "
+            "on TPU yet; drop --speculative-algorithm."
+        )
+
     # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
     # target only verifies under spec); the verify backend is pinned directly.
