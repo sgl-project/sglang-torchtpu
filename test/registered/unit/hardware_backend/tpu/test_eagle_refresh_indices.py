@@ -11,7 +11,6 @@ from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_draft_extend_select_args,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -23,22 +22,22 @@ def _select_argmax(*args):
 
 
 @pytest.mark.parametrize("width", [1, 4, 8])
-def test_row_indices_match_draft_extend_input(width):
+def test_row_indices_land_on_last_accepted_rows(width):
     # Includes the zero count the compile policy pads with, a partial accept,
     # and a request that filled the whole window.
     counts = torch.tensor([0, 1, width, max(1, width - 1)], dtype=torch.int32)
-    draft_extend_input = EagleDraftExtendInput(
-        num_accept_tokens=counts, num_tokens_per_req=width
-    )
-    assert torch.equal(
-        last_accepted_row_indices(counts, width),
-        draft_extend_input.last_accepted_indices(),
-    )
-    # Zero-count padding selects its request's first (inert) row, and every
-    # index stays inside the request's own window.
     rows = last_accepted_row_indices(counts, width)
+    # Hand-derived: request i starts at i * width; its last accepted row is
+    # count - 1, except the zero-count padding row, which clamps to row 0.
+    expected = [
+        0 * width + 0,
+        1 * width + 0,
+        2 * width + (width - 1),
+        3 * width + (max(1, width - 1) - 1),
+    ]
+    assert rows.tolist() == expected
     assert rows.dtype == torch.int64
-    assert rows[0].item() == 0
+    # Every index stays inside the request's own window.
     starts = torch.arange(len(counts), dtype=torch.int64) * width
     assert torch.all((rows >= starts) & (rows < starts + width))
 
@@ -64,9 +63,7 @@ def test_select_argmax_uses_last_accepted_rows(width, with_hidden):
         if with_hidden
         else None
     )
-    expected_rows = EagleDraftExtendInput(
-        num_accept_tokens=counts, num_tokens_per_req=width
-    ).last_accepted_indices()
+    expected_rows = last_accepted_row_indices(counts, width)
 
     selected_logits, selected_hidden, topk_p, topk_index = _select_argmax(
         logits, hidden, counts

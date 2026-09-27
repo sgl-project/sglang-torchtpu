@@ -925,18 +925,6 @@ class EagleDraftExtendInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
 
-    def last_accepted_indices(self) -> torch.Tensor:
-        """Return the final accepted row for every request in this batch shape."""
-        # Lazy import: the helper lives with the TPU draft-extend op, but
-        # this method also runs off-TPU in the CPU unit tests.
-        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
-            last_accepted_row_indices,
-        )
-
-        return last_accepted_row_indices(
-            self.num_accept_tokens, self.num_tokens_per_req
-        )
-
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:
         """Extend-phase `hidden_states` width: target's `spec_hidden_size`,

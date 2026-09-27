@@ -561,19 +561,16 @@ class TestDraftExtendSelectFused(unittest.TestCase):
         self.assertEqual(sel_l.shape, (2, 16))
         self.assertTrue(torch.equal(sel_l, logits[torch.tensor([0, 7])]))
 
-    def test_draft_extend_input_builds_a_safe_bucketed_selector(self):
-        from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-
-        draft_extend_input = EagleDraftExtendInput(
-            num_accept_tokens=torch.tensor([2, 3, 2, 0], dtype=torch.int32),
-            num_tokens_per_req=4,
+    def test_zero_count_padding_selects_a_safe_row(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            last_accepted_row_indices,
         )
+
+        counts = torch.tensor([2, 3, 2, 0], dtype=torch.int32)
 
         # The compile policy pads accept counts with zero. Its inert request
         # selects the first row in that request rather than an invalid -1 row.
-        self.assertEqual(
-            draft_extend_input.last_accepted_indices().tolist(), [1, 6, 9, 12]
-        )
+        self.assertEqual(last_accepted_row_indices(counts, 4).tolist(), [1, 6, 9, 12])
 
 
 if __name__ == "__main__":

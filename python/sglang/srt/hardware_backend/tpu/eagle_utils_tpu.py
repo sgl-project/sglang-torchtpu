@@ -277,9 +277,8 @@ def last_accepted_row_indices(
     one selects those requests' first (inert) row, which keeps every index in
     bounds; `finalize_spec_forward_batch` drops the padded outputs afterwards.
 
-    Single source of truth for this formula: `EagleDraftExtendInput
-    .last_accepted_indices` and `fused_draft_extend_select_argmax_func` both
-    route through it, so the clamp rule cannot drift between them.
+    `fused_draft_extend_select_argmax_func` builds its selection through this
+    helper so the clamp rule has exactly one definition.
     """
     assert num_tokens_per_req > 0
     row_starts = (
