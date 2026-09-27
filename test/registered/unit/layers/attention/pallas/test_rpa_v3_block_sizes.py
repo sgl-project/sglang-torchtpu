@@ -21,8 +21,17 @@ MIB = 1024 * 1024
 TPU7X_VMEM = 64 * MIB
 
 
-def _block_sizes(*, num_q_heads, num_kv_heads, head_dim, kv_dtype, vmem_limit):
-    """Mixed-case blocks for a 16k-token, 32k-context prefill at page 128."""
+def _block_sizes(
+    *,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    kv_dtype,
+    vmem_limit,
+    sliding_window=None,
+    page_size=128,
+):
+    """Mixed-case blocks for a 16k-token, 32k-context prefill."""
     with mock.patch.object(rpa, "get_tpu_version", return_value=7):
         return rpa.get_default_block_sizes(
             jnp.bfloat16,
@@ -30,12 +39,13 @@ def _block_sizes(*, num_q_heads, num_kv_heads, head_dim, kv_dtype, vmem_limit):
             num_q_heads,
             num_kv_heads,
             head_dim,
-            128,
+            page_size,
             16384,
             64,
-            258,
+            32768 // page_size + 2,
             case=rpa.RpaCase.MIXED,
             vmem_limit_bytes=vmem_limit,
+            sliding_window=sliding_window,
         )
 
 
@@ -82,6 +92,69 @@ class TestTpu7xPrefillBlocks(CustomTestCase):
             vmem_limit=TPU7X_VMEM,
         )
         self.assertEqual((blocks["bq_sz"], blocks["bkv_sz"]), (64, 2048))
+
+
+def _as_tuple(blocks):
+    return (blocks["bq_sz"], blocks["bkv_sz"], blocks["bq_csz"], blocks["bkv_csz"])
+
+
+class TestTpu7xSlidingWindowPrefillBlocks(CustomTestCase):
+    """A window much shorter than the KV compute chunk sizes the blocks so the
+    kernel's skip of keys left of the window removes nearly all masked work."""
+
+    def test_gpt_oss_sliding_layers_get_window_sized_compute_chunks(self):
+        """gpt-oss's 128-token window with 8 query heads per KV head, at every
+        TP degree and KV dtype: 128-row query blocks, 512-key KV blocks and
+        128-key compute chunks. Measured on tpu7x at TP1, TP2 and TP8,
+        16K-token prefills: 1.18 to 1.36x faster than the full-attention
+        blocks, and at most 3% behind the best of the blocks measured around
+        them."""
+        for num_q_heads, num_kv_heads in ((64, 8), (32, 4), (16, 2), (8, 1)):
+            for kv_dtype in (jnp.float8_e4m3fn, jnp.bfloat16):
+                with self.subTest(heads=(num_q_heads, num_kv_heads), kv=kv_dtype):
+                    blocks = _block_sizes(
+                        num_q_heads=num_q_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=64,
+                        kv_dtype=kv_dtype,
+                        vmem_limit=TPU7X_VMEM,
+                        sliding_window=128,
+                    )
+                    self.assertEqual(_as_tuple(blocks), (128, 512, 128, 128))
+
+    def test_compute_chunks_do_not_split_a_page(self):
+        """At page 256 the window-sized compute chunk rounds up to a page."""
+        blocks = _block_sizes(
+            num_q_heads=64,
+            num_kv_heads=8,
+            head_dim=64,
+            kv_dtype=jnp.float8_e4m3fn,
+            vmem_limit=TPU7X_VMEM,
+            sliding_window=128,
+            page_size=256,
+        )
+        self.assertEqual(_as_tuple(blocks), (128, 512, 128, 256))
+
+    def test_the_rule_needs_a_query_chunk_and_its_window_in_one_kv_chunk(self):
+        """128 query rows see 128 + window - 1 keys: up to 512 (window 385)
+        the rule applies; one more key and the full-attention blocks stay."""
+        kwargs = dict(
+            num_q_heads=64,
+            num_kv_heads=8,
+            head_dim=64,
+            kv_dtype=jnp.float8_e4m3fn,
+            vmem_limit=TPU7X_VMEM,
+        )
+        self.assertEqual(
+            _as_tuple(_block_sizes(sliding_window=385, **kwargs)),
+            (128, 512, 128, 512),
+        )
+        full = _as_tuple(_block_sizes(**kwargs))
+        for window in (386, 4096):
+            with self.subTest(window=window):
+                self.assertEqual(
+                    _as_tuple(_block_sizes(sliding_window=window, **kwargs)), full
+                )
 
 
 def _decode_block_sizes(*, num_q_heads, num_kv_heads, head_dim, kv_dtype, vmem_limit):
