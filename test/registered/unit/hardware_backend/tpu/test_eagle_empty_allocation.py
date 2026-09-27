@@ -1,5 +1,6 @@
 """EAGLE page reserves must skip empty allocation without skipping bookkeeping."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -40,15 +41,19 @@ def test_page_reserve_boundary(committed, expected_new):
     )
     # prepare_device_accept_tpu is imported under `if _is_tpu`, so it is absent
     # on a CPU host; create=True installs the stub the forced flag will reach.
-    with patch.object(eagle_utils, "_is_tpu", True), patch.object(
-        eagle_utils, "prepare_device_accept_tpu", Mock(), create=True
-    ) as prepare_device_accept, patch.object(
-        eagle_utils, "get_alloc_reserve_per_decode", return_value=8
-    ), patch.object(
-        eagle_utils, "get_spec", return_value=SimpleNamespace(speculative_eagle_topk=1)
-    ), patch.object(
-        spec_utils, "allocate_and_assign_decode_cache"
-    ) as allocate:
+    with (
+        patch.object(eagle_utils, "_is_tpu", True),
+        patch.object(
+            eagle_utils, "prepare_device_accept_tpu", Mock(), create=True
+        ) as prepare_device_accept,
+        patch.object(eagle_utils, "get_alloc_reserve_per_decode", return_value=8),
+        patch.object(
+            eagle_utils,
+            "get_spec",
+            return_value=SimpleNamespace(speculative_eagle_topk=1),
+        ),
+        patch.object(spec_utils, "allocate_and_assign_decode_cache") as allocate,
+    ):
         eagle_utils.eagle_prepare_for_decode(batch)
     batch.maybe_evict_swa.assert_called_once()
     batch.cumulate_penalty_output_tokens.assert_called_once()
@@ -60,3 +65,7 @@ def test_page_reserve_boundary(committed, expected_new):
         assert allocate.call_args.kwargs["num_needed_tokens"] == expected_new
     else:
         allocate.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
