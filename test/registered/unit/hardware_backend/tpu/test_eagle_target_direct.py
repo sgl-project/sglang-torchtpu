@@ -1,5 +1,6 @@
 """The target tracer override must not change draft or ordinary policies."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,3 +37,7 @@ def test_target_override_preserves_other_tracers(enabled, tracer, algorithm, dra
 def test_runnerless_policy_keeps_default():
     with patch.object(envs.SGLANG_TPU_EAGLE_TARGET_DIRECT, "get", return_value=True):
         assert DecoderTpuCompilePolicy().tracer == "dynamo"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
