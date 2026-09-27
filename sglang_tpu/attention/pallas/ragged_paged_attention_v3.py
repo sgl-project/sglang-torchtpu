@@ -1642,6 +1642,30 @@ def get_default_block_sizes(
     bq_csz = max(1, bq_csz)
     bkv_csz = align_to(bkv_csz, bkv_alignment)
 
+    # A sliding window much shorter than a KV compute chunk: one chunk of
+    # query rows needs only bq_csz + sliding_window - 1 keys. The kernel skips
+    # KV blocks and compute chunks left of the window of a query block's
+    # first row, so size the blocks to let that skip remove nearly all masked
+    # work:
+    #   - one query compute chunk per query block: with more, the later
+    #     chunks also compute the keys only the first row still sees;
+    #   - a window-sized KV compute chunk, the skip's granularity;
+    #   - the default KV compute chunk as the KV block, to fetch few keys
+    #     left of the window without paying per-block overhead on tiny blocks.
+    # Measured on tpu7x for gpt-oss (window 128, 8 query heads per KV head,
+    # 1 to 8 KV heads): sliding-window layers run 1.18-1.36x faster than with
+    # the full-attention blocks, and 256-row query blocks take up to 22%
+    # longer than 128-row ones. Gated on v7 until v5/v6 are measured.
+    if (
+        tpu_version == 7
+        and case != RpaCase.DECODE
+        and sliding_window is not None
+        and bq_csz + sliding_window - 1 <= bkv_csz
+    ):
+        bq_sz = bq_csz
+        bkv_sz = min(bkv_sz, bkv_csz)
+        bkv_csz = min(align_to(next_power_of_2(sliding_window), bkv_alignment), bkv_sz)
+
     # Reduce block sizes if VMEM estimate exceeds limit.
     # Use a fraction of vmem_limit as margin for shapes the estimate has not
     # been checked against.
