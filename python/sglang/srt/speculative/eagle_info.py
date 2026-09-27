@@ -22,7 +22,6 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import (
-    last_accepted_row_indices,
     top_k_renorm_prob_func,
     top_p_renorm_prob_func,
     tree_speculative_sampling_target_only_func,
@@ -928,6 +927,12 @@ class EagleDraftExtendInput(SpecInput):
 
     def last_accepted_indices(self) -> torch.Tensor:
         """Return the final accepted row for every request in this batch shape."""
+        # Lazy import: the helper lives with the TPU draft-extend op, but
+        # this method also runs off-TPU in the CPU unit tests.
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            last_accepted_row_indices,
+        )
+
         return last_accepted_row_indices(
             self.num_accept_tokens, self.num_tokens_per_req
         )

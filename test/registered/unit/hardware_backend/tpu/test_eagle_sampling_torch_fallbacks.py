@@ -519,7 +519,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
     """Fused draft-extend select must match the eager gather + argmax."""
 
     def test_matches_eager_select_and_argmax(self):
-        from sglang.srt.speculative.eagle_utils import (
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
             fused_draft_extend_select_argmax_func,
         )
 
@@ -549,7 +549,7 @@ class TestDraftExtendSelectFused(unittest.TestCase):
                 self.assertEqual(tp.shape, want_ti.shape)
 
     def test_none_hidden_states_passes_through(self):
-        from sglang.srt.speculative.eagle_utils import (
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
             fused_draft_extend_select_argmax_func,
         )
 

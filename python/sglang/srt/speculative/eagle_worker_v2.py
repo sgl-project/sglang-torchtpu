@@ -89,7 +89,6 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
-    fused_draft_extend_select_argmax_func,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -144,6 +143,7 @@ _is_xpu = is_xpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_chain_torch,
+        fused_draft_extend_select_argmax_func,
     )
 
 

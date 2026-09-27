@@ -16,7 +16,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
-    make_draft_extend_select_args,
     make_verify_bookkeeping_args,
     make_verify_tree_greedy_args,
 )
@@ -646,60 +645,6 @@ def verify_bookkeeping_func(seq_lens, accept_lens, predict, accept_index):
         accept_tokens, accept_lens, bonus_tokens, accept_index.shape[1]
     )
     return new_seq_lens, bonus_tokens
-
-
-def last_accepted_row_indices(
-    num_accept_tokens: torch.Tensor, num_tokens_per_req: int
-) -> torch.Tensor:
-    """Flat row of each request's last accepted token in a fixed-width window.
-
-    Draft-extend packs every request into `num_tokens_per_req` rows, so request
-    `i`'s last accepted row is `i * num_tokens_per_req + num_accept_tokens[i] - 1`.
-
-    Compile-policy padding appends rows with a zero accept count. Clamping to
-    one selects those requests' first (inert) row, which keeps every index in
-    bounds; `finalize_spec_forward_batch` drops the padded outputs afterwards.
-
-    Single source of truth for this formula: `EagleDraftExtendInput
-    .last_accepted_indices` and `fused_draft_extend_select_argmax_func` both
-    route through it, so the clamp rule cannot drift between them.
-    """
-    assert num_tokens_per_req > 0
-    row_starts = (
-        torch.arange(
-            num_accept_tokens.shape[0],
-            device=num_accept_tokens.device,
-            dtype=torch.int64,
-        )
-        * num_tokens_per_req
-    )
-    return row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
-
-
-@compiled_op(warmup=make_draft_extend_select_args)
-def fused_draft_extend_select_argmax_func(
-    next_token_logits: torch.Tensor,
-    hidden_states: Optional[torch.Tensor],
-    num_accept_tokens: torch.Tensor,
-):
-    """Select draft-extend rows and compute their greedy next-draft tokens.
-
-    Index construction stays inside this executable: passing the acceptance
-    counts instead of pre-built indices keeps one more op inside the compiled
-    graph. The window width is read off the logits rather than passed in, so it
-    never becomes a second compile-time specialization key beyond the row count
-    that already keys this graph.
-    """
-    # An idle draft-extend batch selects nothing, and its window width is not
-    # observable from the logits; any positive width gives the same empty result.
-    num_reqs = num_accept_tokens.shape[0]
-    num_tokens_per_req = next_token_logits.shape[0] // num_reqs if num_reqs else 1
-    select_index = last_accepted_row_indices(num_accept_tokens, num_tokens_per_req)
-    selected_logits = next_token_logits[select_index]
-    selected_hidden = hidden_states[select_index] if hidden_states is not None else None
-    topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
-    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
-    return selected_logits, selected_hidden, topk_p, topk_index
 
 
 def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
