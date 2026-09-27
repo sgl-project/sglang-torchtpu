@@ -9,9 +9,13 @@ observable, including the two tracer conventions for the hidden-state update.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+    build_topk1_verify_chain_torch,
+)
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -61,16 +65,23 @@ class TestFusedDraftLengths(unittest.TestCase):
         )
         slots = torch.arange(steps * 2).reshape(steps, 2) + 101
 
-        result = worker._fused_draft_steps(
-            batch,
-            torch.ones(2, 1),
-            torch.zeros(2, 1, dtype=torch.int64),
-            torch.zeros(2, 8),
-            slots,
-            None,
-            torch.tensor([99, 98]),
-            seq,
-        )
+        # eagle_worker_v2 imports the verify-chain builder only on TPU, so bind
+        # it here to run the loop's final chain build off-device.
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.build_topk1_verify_chain_torch",
+            new=build_topk1_verify_chain_torch,
+            create=True,
+        ):
+            result = worker._fused_draft_steps(
+                batch,
+                torch.ones(2, 1),
+                torch.zeros(2, 1, dtype=torch.int64),
+                torch.zeros(2, 8),
+                slots,
+                None,
+                torch.tensor([99, 98]),
+                seq,
+            )
 
         self.assertEqual(len(result), 6)
         # The loop breaks before the last step's model call.

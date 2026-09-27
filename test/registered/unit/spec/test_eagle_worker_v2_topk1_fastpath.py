@@ -252,7 +252,6 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 rpa_draft_kv_lens=None,
             ),
         )
-        kv_lens = torch.tensor([[10], [11]], device=DEVICE)
         out_cache_loc = torch.tensor([[20], [21]], device=DEVICE)
 
         def select_step(i, topk_p, topk_index, hidden_states, scores, topk):
@@ -276,7 +275,6 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
                 torch.ones((1, 1), device=DEVICE),
                 torch.zeros((1, 1), dtype=torch.long, device=DEVICE),
                 torch.zeros((1, 2), device=DEVICE),
-                kv_lens,
                 out_cache_loc,
                 None,
                 torch.tensor([99], dtype=torch.long, device=DEVICE),
@@ -287,8 +285,9 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].tolist(), calls[0][1].tolist())
         self.assertEqual(calls[1][0].tolist(), calls[1][1].tolist())
-        self.assertEqual(calls[0][2].item(), 10)
-        self.assertEqual(calls[1][2].item(), 11)
+        # KV lengths are derived in-graph as seq_lens + step + 1.
+        self.assertEqual(calls[0][2].item(), 6)
+        self.assertEqual(calls[1][2].item(), 7)
         self.assertEqual(calls[0][3].tolist(), [[1.0, 1.0]])
         self.assertEqual(calls[1][3].tolist(), [[12.0, 12.0]])
         self.assertEqual(calls[0][4].item(), 20)
@@ -331,15 +330,10 @@ class TestEagleWorkerV2FusedDraft(CustomTestCase):
         )
         worker._compiled_fused_steps = None
         worker.draft_runner = SimpleNamespace(compile_policy=compile_policy)
+        # The fused loop derives each step's KV lengths in-graph; the backends
+        # only need to carry the step id the loop asserts against.
         worker.draft_attn_backend = SimpleNamespace(
-            attn_backends=[
-                SimpleNamespace(
-                    forward_metadata=SimpleNamespace(
-                        kv_lens=torch.tensor([10 + i], device=DEVICE)
-                    )
-                )
-                for i in range(2)
-            ]
+            attn_backends=[SimpleNamespace(speculative_step_id=i) for i in range(2)]
         )
         spec_info = SimpleNamespace(
             topk_p=torch.ones((2, 1), device=DEVICE),
