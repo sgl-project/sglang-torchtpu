@@ -37,6 +37,7 @@ def _decode_manager(engine, chunked=False):
     mgr._pulling_cleared = set()
     mgr._cleared_plans = {}
     mgr._stale_plans = []
+    mgr._engine_poll_failing_since = {}
     mgr._swa_engine = None
     mgr._decode.local_blocks = {ROOM: [21, 22]}
     mgr._decode.remote_blocks = {ROOM: [11, 12]}

@@ -80,7 +80,7 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    backend = _resolve_backend(device=device, tp_size=ps.tp_size)
+    backend = _resolve_backend(device=device, tp_size=ps.tp_size, pp_size=ps.pp_size)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not get_parallel().enable_p2p_check:
@@ -172,12 +172,14 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, tp_size: int) -> str:
+def _resolve_backend(*, device: str, tp_size: int, pp_size: int = 1) -> str:
     backend = get_default_distributed_backend(device)
     # tpu_dist bootstrap requires exactly one TPU device per process.
     # On multi-chip hosts with world_size==1, PJRT sees multiple chips
-    # and raises. Match torchtpu-vllm: use gloo for single-rank TPU.
-    if device == "tpu" and tp_size == 1:
+    # and raises. Match torchtpu-vllm: use gloo for a single-process TPU
+    # world. A pipeline-parallel world (tp_size * pp_size > 1) is a real
+    # slice with one device per process and keeps tpu_dist.
+    if device == "tpu" and tp_size * pp_size == 1:
         backend = "gloo"
     if device == "cuda" and get_exec().moe.elastic_ep_backend == "mooncake":
         backend = "mooncake"

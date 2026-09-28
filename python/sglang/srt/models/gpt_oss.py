@@ -993,12 +993,25 @@ class GptOssForCausalLM(nn.Module):
                     normal_weights.append((name, _own_if_runai_streamed(weight)))
 
         mxfp4_loaded_params = self._load_mxfp4_experts_weights(experts(weights))
-        self._load_normal_weights(
+        normal_loaded_params = self._load_normal_weights(
             normal_weights,
             is_nextn=is_nextn,
             weight_name_mapping=weight_name_mapping,
             other_loaded_param_names=mxfp4_loaded_params,
         )
+        if normal_loaded_params is not None and get_parallel().pp_size > 1:
+            # A stage skips the other stages' layers by name; a parameter of
+            # this stage that no checkpoint weight reached would otherwise
+            # keep its uninitialized memory silently.
+            missing = (
+                set(dict(self.named_parameters()))
+                - normal_loaded_params
+                - set(mxfp4_loaded_params)
+            )
+            assert not missing, (
+                f"pipeline stage layers [{self.start_layer}, {self.end_layer}) "
+                f"have parameters no checkpoint weight loaded: {sorted(missing)}"
+            )
 
     def _load_mxfp4_experts_weights(self, weights):
 
@@ -1042,6 +1055,12 @@ class GptOssForCausalLM(nn.Module):
         weight_device = next(iter(params_dict.values())).device
 
         for name, weight in weights:
+            layer_id = get_layer_id(name)
+            if layer_id is not None and not (
+                self.start_layer <= layer_id < self.end_layer
+            ):
+                # Another pipeline stage holds this layer.
+                continue
             weight = weight.to(weight_device)
 
             if "gate_up_proj_blocks" in name:
@@ -1186,7 +1205,8 @@ class GptOssForCausalLM(nn.Module):
             logging.warning(
                 "Loading weights for nextn is currently not supported in GptOssForCausalLM. "
             )
-            return
+            return None
+        loaded_params: set[str] = set()
         weights = _canonicalize_weights(self.config, weights)
         weights = sorted(weights, key=lambda x: x[0])  # Sort by name for consistency
 
@@ -1291,6 +1311,7 @@ class GptOssForCausalLM(nn.Module):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
                 for mapping in expert_params_mapping:
@@ -1313,6 +1334,7 @@ class GptOssForCausalLM(nn.Module):
                         name,
                         shard_id=shard_id,
                     )
+                    loaded_params.add(name)
                     break
                 else:
                     if name.endswith(".bias") and name not in params_dict:
@@ -1347,8 +1369,10 @@ class GptOssForCausalLM(nn.Module):
                                 param, "weight_loader", default_weight_loader
                             )
                             weight_loader(param, loaded_weight)
+                        loaded_params.add(name)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+        return loaded_params
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

@@ -85,8 +85,20 @@ own launch in a module-level `MULTIHOST_LAUNCH` dict:
 
 ```python
 MULTIHOST_LAUNCH = {"hosts": 2, "launch_script": "recipe/qwen3_30b_a3b_fp8_mh.sh",
-                    "weights_pvc": "model-weights-rox"}   # weights_pvc optional
+                    "weights_pvc": "model-weights"}   # weights_pvc optional
 ```
+
+The shared PVC name is defined in `.github/tpu-ci/weights.yaml`:
+`model-weights` selects the shared model weights. Use this literal key in
+`register_tpu_ci(weights_pvc="model-weights")`, `MULTIHOST_LAUNCH`, standalone
+launcher defaults, and workflow inputs. CI discovery reads ordinary literals;
+the JobSet renderer resolves the key for both ordinary and P/D jobs.
+
+`render_jobset.py --weights-pvc` also accepts a literal PVC name for custom
+claims; an empty value mounts no weights. The container mount remains `/weights`
+(test-side lookup can be overridden with `SGLANG_TPU_WEIGHTS_ROOT`). Provisioning
+manifests must still name the actual cluster resources; changing `weights.yaml`
+selects a claim, it does not create one.
 
 `launch_script` is a recipe under `benchmark/tpu/recipe/` that sets `MODEL`/`EP_SIZE`/…
 and execs `launch_server.sh`. `discover_multihost.py` scans the files registered to a
@@ -445,13 +457,24 @@ Topology-Aware Scheduling instead.
 
 - **PR gate (single-host, run_suite)** — validated GREEN on the 2x2x1 slice.
 - **Multi-host (2x2x2, tp=16)** — validated GREEN: Qwen3-30B-A3B-FP8 MoE (EP=8) serving
-  from the **ReadOnlyMany** Hyperdisk (now the shared `model-weights-rox`; both hosts mount concurrently),
+  from the original **ReadOnlyMany** Hyperdisk (both hosts mount concurrently),
   rank-0 asserting on real inference.
-- **Hyperdisk ML weights** — `model-weights-rox` is a hydrated RWO disk (all models on one 5Ti disk) converted to
-  `READ_ONLY_MANY` (GKE ≥1.30.2 auto-converts on first ROX mount; cluster is 1.35.x).
-  Lifecycle (hydrate → convert → append-later) is documented in
-  `pvc-model-weights-rox.yaml.tmpl`; note ROX conversion is one-way, so adding a model
-  goes through a snapshot → new RWO disk → re-convert cycle.
+- **Filestore weights** — `model-weights-filestore` mounts the existing 10Ti
+  NFSv3 share `10.93.193.130:/weights` read-only at `/weights`.
+
+Apply the claim before running CI from this revision:
+
+```bash
+gcloud container clusters get-credentials tpu-cluster \
+  --project sglang-torchtpu --zone us-central1-c
+kubectl apply -f .github/tpu-ci/pvc-model-weights-filestore.yaml
+kubectl -n tpu-ci wait pvc/model-weights-filestore \
+  --for=jsonpath='{.status.phase}'=Bound --timeout=60s
+```
+
+Keep `model-weights-rox` until existing jobs finish and the new CI runs pass.
+Resize through Filestore, then update the PV capacity; this static NFS claim
+cannot resize the instance through PVC expansion.
 
 ### ⚠️ Model note: Qwen3-0.6B is single-host only
 

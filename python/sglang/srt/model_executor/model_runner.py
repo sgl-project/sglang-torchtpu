@@ -129,7 +129,6 @@ from sglang.srt.model_executor.model_runner_components.kv_pool_runtime import (
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     AttentionAndMoeLayers,
     ModelLayerInfo,
-    adjust_hybrid_swa_layer_ids,
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
@@ -172,6 +171,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -501,6 +501,7 @@ class ModelRunner:
         self.weight_load_time = 0.0
         self.graph_memory_usage: dict[str, float] = {}
         self.graph_time_usage: dict[str, float] = {}
+        self.compile_timing = CompileTimingRecorder()
 
     def _initialize_elastic_ep_joiner(self) -> None:
         if not (
@@ -692,12 +693,7 @@ class ModelRunner:
             model_config=self.model_config,
             is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
-        )
-        adjust_hybrid_swa_layer_ids(
-            model_config=self.model_config,
-            start_layer=self.layer_info.start_layer,
-            end_layer=self.layer_info.end_layer,
-            is_hybrid_swa=self.is_hybrid_swa,
+            draft_model_idx=self.draft_model_idx,
         )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()

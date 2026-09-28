@@ -213,6 +213,14 @@ class BaseSpecWorker(ABC):
         )
 
     @property
+    def compile_timing_steps(self) -> list[dict]:
+        return [
+            step
+            for runner in self._draft_model_runners()
+            for step in runner.compile_timing.snapshot()
+        ]
+
+    @property
     def weight_load_time(self) -> float:
         if self.draft_worker is None:
             return 0.0

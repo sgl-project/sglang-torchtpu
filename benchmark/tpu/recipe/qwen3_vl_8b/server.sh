@@ -6,8 +6,7 @@
 #   EXTRA_ARGS="--speculative-algorithm EAGLE3 ..." ./server.sh  # + spec decoding
 set -uo pipefail
 
-# HF id, not a /weights path: the model-weights-rox PVC does not carry this
-# checkpoint and its ROX conversion is one-way (see pvc-model-weights-rox.yaml.tmpl).
+# HF id by default; CI tests supply the /weights path explicitly.
 export MODEL=${MODEL:-Qwen/Qwen3-VL-8B-Instruct}
 export TP_SIZE=8
 

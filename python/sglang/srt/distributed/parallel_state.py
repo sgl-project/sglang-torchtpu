@@ -1799,6 +1799,11 @@ class GroupCoordinator:
                 # Skip sending empty tensors.
                 continue
 
+            if _is_tpu:
+                # TPU has no device send/recv: ship a host copy on the gloo
+                # cpu_group (the copy also waits for the producing program).
+                tensor = tensor.contiguous().cpu()
+
             # send-allgather: send only a slice, then do allgather.
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
@@ -1813,6 +1818,7 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        keep_on_host: bool = False,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1837,9 +1843,20 @@ class GroupCoordinator:
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                # On TPU a device tensor arrives as a host copy on the gloo
+                # cpu_group and is uploaded to the sender's device type after
+                # the receive, unless the caller keeps it on the host.
+                via_host = _is_tpu and value.device != "cpu"
+                upload = via_host and not keep_on_host
+                tensor = torch.empty(
+                    value.size,
+                    dtype=value.dtype,
+                    device="cpu" if via_host else value.device,
+                )
                 if tensor.numel() == 0:
                     # Skip broadcasting empty tensors.
+                    if upload:
+                        tensor = tensor.to(value.device, non_blocking=True)
                     tensor_dict[key] = tensor
                     continue
 
@@ -1864,6 +1881,8 @@ class GroupCoordinator:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
                     tensor = tensor.reshape(orig_shape)
 
+                if upload:
+                    tensor = tensor.to(value.device, non_blocking=True)
                 tensor_dict[key] = tensor
             else:
                 tensor_dict[key] = value

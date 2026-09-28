@@ -1079,6 +1079,7 @@ class TestRaidenChunkedTransfer(CustomTestCase):
         mgr._pulling_cleared = set()
         mgr._cleared_plans = {}
         mgr._stale_plans = []
+        mgr._engine_poll_failing_since = {}
         # clear_room sweeps the reshard bookkeeping too.
         mgr._reshard_slot_of = {}
         mgr._reshard_slot_rooms = [None]
@@ -1792,6 +1793,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._pulling_cleared = set()
         mgr._cleared_plans = {}
         mgr._stale_plans = []
+        mgr._engine_poll_failing_since = {}
         mgr._socket = Mock()
         mgr._socket_send_locks = collections.defaultdict(threading.Lock)
         mgr._socket_lock = threading.Lock()
@@ -1954,6 +1956,7 @@ class TestRaidenChunkedResharding(CustomTestCase):
         mgr._reshard_plans = {}
         mgr._cleared_plans = {}
         mgr._stale_plans = []
+        mgr._engine_poll_failing_since = {}
         mgr._pulling = None
         mgr._aborted = {}
         mgr._send_reads = {}

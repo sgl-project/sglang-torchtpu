@@ -75,7 +75,6 @@ SERVED_MODEL_NAME = "qwen3-vl-8b"
 DEFAULT_MODEL_PATH = "/weights/Qwen3-VL-8B-Instruct"
 MODEL_ENV = "QWEN3_VL_MODEL"
 DRAFT_MODEL_ENV = "QWEN3_VL_DRAFT_MODEL"
-# On qwen3-spec-vl-rox alongside the target, not on model-weights-rox.
 DEFAULT_DRAFT_MODEL_PATH = "/weights/qwen3_8b_eagle3"
 
 PAGE_SIZE = 64

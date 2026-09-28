@@ -3,7 +3,7 @@
 import inspect
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -64,6 +64,7 @@ class _ForwardModeMock:
 
     def __init__(self, mode):
         self._mode = mode
+        self.name = mode.upper()
 
     def is_decode(self):
         return self._mode == "decode"
@@ -585,6 +586,60 @@ class TestCompiledForwardShim(CustomTestCase):
         defaults.update(kwargs)
         return SimpleNamespace(**defaults)
 
+    def test_recompilation_check_runs_when_forward_raises(self):
+        """A compile that raises mid-forward must still be reported."""
+        error = torch._dynamo.exc.RecompileError("fail_on_recompile")
+        compiled = MagicMock(side_effect=error)
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        checker = MagicMock()
+        shim.set_recompilation_checker(checker, model_label="M")
+        fb = self._forward_batch(input_ids=torch.arange(8, dtype=torch.int32))
+        with self.assertRaises(torch._dynamo.exc.RecompileError) as raised:
+            shim(None, None, fb)
+        self.assertIs(raised.exception, error)
+        checker.check.assert_called_once()
+
+    def test_tracing_never_reaches_the_recompilation_checker(self):
+        """The fused draft loop traces this call, so the checker must stay out
+        of that graph's guards."""
+        compiled = MagicMock(return_value="out")
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        checker = MagicMock()
+        shim.set_recompilation_checker(checker, model_label="M")
+        fb = self._forward_batch(input_ids=torch.arange(8, dtype=torch.int32))
+        with patch(
+            "sglang.srt.hardware_backend.tpu.compilation."
+            "compiled_forward_shim.torch.compiler.is_compiling",
+            return_value=True,
+        ):
+            shim(None, None, fb)
+        checker.check.assert_not_called()
+        compiled.assert_called_once()
+
+    def test_recompilation_context_reports_real_and_padded_shapes(self):
+        """The padded shapes are read at entry, before output trimming."""
+        compiled = MagicMock(
+            return_value=LogitsProcessorOutput(
+                next_token_logits=torch.zeros(64, 10),
+                hidden_states=torch.zeros(1024, 5),
+            )
+        )
+        shim = CompiledForwardShim(compiled, policy=DecoderTpuCompilePolicy())
+        checker = MagicMock()
+        shim.set_recompilation_checker(checker, model_label="M")
+        fb = self._forward_batch(
+            forward_mode=_ForwardModeMock("extend"),
+            input_ids=torch.arange(1024, dtype=torch.int32),
+            seq_lens=torch.zeros(64, dtype=torch.int32),
+            extend_seq_lens_cpu=[952],
+            extend_logprob_start_lens_cpu=[0],
+            _tpu_real_q=952,
+            _tpu_real_b=1,
+        )
+        shim(None, None, fb)
+        context_fn = checker.check.call_args.kwargs["context_fn"]
+        self.assertEqual(context_fn(), "M EXTEND real=q952,b1 pad=q1024,b64")
+
     def test_slices_logits_and_hidden_states(self):
         padded_logits = torch.arange(4 * 10, dtype=torch.float32).reshape(4, 10)
         padded_hidden = torch.arange(8 * 5, dtype=torch.float32).reshape(8, 5)
@@ -756,6 +811,25 @@ class TestBuildBucketers(CustomTestCase):
     def _server_args(tpu_compile_tokens=None):
         # Only what production still reads off the handed record.
         return SimpleNamespace(tpu_compile_tokens=tpu_compile_tokens)
+
+    def test_dynamic_chunk_ladder_uses_resolved_page_size(self):
+        with (
+            patch.dict("os.environ", {"SGLANG_TPU_PP_DYNAMIC_CHUNKS": "1"}),
+            get_context().override_server_args(
+                device="tpu",
+                pp_size=8,
+                disaggregation_mode="null",
+                chunked_prefill_size=16384,
+                page_size=256,
+                tpu_compile_bs=[1, 8],
+            ) as raw,
+        ):
+            self.assertIsNone(raw.page_size)
+            self.assertIsNone(raw.device)
+            self.assertIsNone(raw.chunked_prefill_size)
+            token, batch = build_bucketers(raw, max_t=16384, max_b=8)
+            self.assertTrue(set(range(2048, 16385, 2048)).issubset(token.buckets))
+            self.assertEqual(batch.buckets, [1, 8])
 
     def test_clipping_keeps_smallest_configured_bucket_covering_scheduler_limit(self):
         # Keep the next configured shape even when the real token limit is
@@ -1145,6 +1219,7 @@ def _policy(model):
         model=model,
         # Read by the HiCache reload gate on every eager call.
         token_to_kv_pool=SimpleNamespace(layer_transfer_counter=None),
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     return policy
 

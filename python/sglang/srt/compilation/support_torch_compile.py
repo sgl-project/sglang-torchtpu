@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, TypeVar
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.observability.compile_timing import CompileTimingRecorder
     from sglang.srt.speculative.spec_info import SpecInput
 
 __all__ = [
@@ -46,6 +47,7 @@ class CompilePolicy(ABC):
         method: Callable[..., Any] | None = None,
         name: str | None = None,
         label: str | None = None,
+        compile_timing_recorder: CompileTimingRecorder | None = None,
     ) -> None:
         self.model_runner = model_runner
         self.owner = owner
@@ -53,6 +55,7 @@ class CompilePolicy(ABC):
         self.method = method
         self.name = name or type(self).__name__
         self.label = label
+        self.compile_timing_recorder = compile_timing_recorder
 
     @abstractmethod
     def install(self) -> bool:

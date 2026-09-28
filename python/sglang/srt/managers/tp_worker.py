@@ -130,6 +130,11 @@ class BaseTpWorker(ABC):
         return merge_graph_time_usage(*(runner.graph_time_usage for runner in runners))
 
     @property
+    def compile_timing_steps(self) -> list[dict]:
+        runners = self.model_runner_list or [self.model_runner]
+        return [step for runner in runners for step in runner.compile_timing.snapshot()]
+
+    @property
     def weight_load_time(self) -> float:
         runners = self.model_runner_list or [self.model_runner]
         return sum(runner.weight_load_time for runner in runners)

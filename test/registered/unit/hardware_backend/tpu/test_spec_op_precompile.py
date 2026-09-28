@@ -3,6 +3,9 @@ import sys
 import pytest
 import torch
 
+from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+    dflash_verify_bookkeeping_torch,
+)
 from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     SpecOpWarmupContext,
     make_dflash_verify_bookkeeping_args,
@@ -10,7 +13,6 @@ from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
     make_verify_bookkeeping_args,
     make_verify_tree_greedy_args,
 )
-from sglang.srt.speculative.dflash_utils import dflash_verify_bookkeeping_torch
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -37,12 +39,15 @@ def test_warmup_inputs_match_physical_helper_shapes():
     assert predict.shape == (12,)
     assert accept_index.shape == (4, 3)
 
-    draft_logits, hidden_states, select_index = make_draft_extend_select_args(context)
+    draft_logits, hidden_states, num_accept_tokens = make_draft_extend_select_args(
+        context
+    )
     assert draft_logits.shape == (12, 5)
     assert draft_logits.dtype == torch.float32
     assert hidden_states.shape == (12, 6)
     assert hidden_states.dtype == torch.bfloat16
-    assert select_index.tolist() == [2, 5, 8, 11]
+    assert num_accept_tokens.tolist() == [3, 3, 3, 3]
+    assert num_accept_tokens.dtype == torch.int32
 
     dflash_cands, dflash_target_top1, dflash_prefix_lens = (
         make_dflash_verify_bookkeeping_args(context)

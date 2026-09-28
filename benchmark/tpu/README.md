@@ -16,6 +16,20 @@ warmup_buckets.py    # request-sender used by warmup.sh
 
 ## Usage
 
+The Python launcher (`python -m benchmark.tpu.launch_server --config ...`)
+preserves hardware metadata such as `TPU_TOPOLOGY`. For one-host-per-engine P/D,
+it removes cross-host rendezvous settings so each engine initializes locally.
+The shared serving recipes include the shell launcher's diagnostic, telemetry,
+recompilation logging, and online Hugging Face defaults. Override them with
+`--runtime-envs`, for example `'{"HF_HUB_OFFLINE":"1","TRANSFORMERS_OFFLINE":"1"}'`.
+
+When `enable_torch_compile` is enabled, the Python launcher defaults the tier-2
+cache to `torchtpu_<model-slug>` and tier-3 to
+`$HOME/.cache/torch_tpu_compile_cache`, with local backup enabled. Explicit
+`TORCH_TPU_INTERNAL_TIER*` settings take precedence; `runtime_envs` entries set
+to `null` remove those variables. `ENABLE_COMPILE_CACHE=0` suppresses the cache
+defaults. Cache directories are created only for a real launch, not a dry-run.
+
 Run launch and bench in separate shells; set `MODEL` for both.
 
 ```bash
@@ -135,12 +149,63 @@ PROFILE=smoke MODE=colocated ./run_nightly.sh     # plumbing check
 SGLANG_USE_RAY=1 NNODES=2 MODE=colocated ./run_nightly.sh
 ```
 
+## Pipeline parallelism (PP8 x TP1)
+
+`--pp-size N --tp-size 1` runs N pipeline stages, one chiplet per stage, on
+one host. Each stage owns `num_hidden_layers / N` layers and its own KV pool
+for those layers; the stages hand their activations (hidden states and
+residual summed into one buffer, padded to the largest token bucket under
+`--enable-torch-compile`) to the next stage over ICI, as one `jax.lax.ppermute`
+collective-permute ring per iteration (`pp_wave.py`), and the last stage
+samples. Each stage logs `pipeline wave stage r/N: hand-off cycle over devices
+[...]` once at startup; the gloo `cpu_group` carries only the last stage's
+output dict and control traffic.
+Set `--pp-max-micro-batch-size` so that `max_running_requests /
+pp_max_micro_batch_size >= pp_size`: the pipeline is full only when at least
+one microbatch per stage is in flight (the default is `max_running_requests /
+pp_size`, i.e. half the stages idle at 4-request microbatches). Long prompts
+are still split by `--chunked-prefill-size`.
+
+```bash
+MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+TP_SIZE=1 PP_SIZE=8 PP_MAX_MICRO_BATCH_SIZE=4 \
+PAGE_SIZE=128 CONTEXT_LEN=32768 CONC=32 \
+CHUNKED_PREFILL_SIZE=16384 MAX_PREFILL_TOKENS=16384 \
+MAX_TOTAL_TOKENS=1048576 MEM_FRACTION_STATIC=0.30 \
+TORCH_COMPILE_MAX_BS=32 \
+EXTRA_ARGS="--sampling-backend pytorch --watchdog-timeout 3600" \
+./launch_server.sh
+```
+
+Supported: chunked prefill, `--kv-cache-dtype fp8_e4m3`, `--max-total-tokens`
+(every stage sizes its pool to the smallest stage; a hybrid model's SWA pool
+holds one prefill chunk per pipeline slot on top of `--swa-full-tokens-ratio`).
+Rejected at launch with `--pp-size > 1` on TPU: eager mode (without
+`--enable-torch-compile`),
+`--tp-size > 1` (a pipeline stage is one device), speculative decoding, and
+`--enable-dynamic-chunking`. Input (prompt) logprobs are rejected per request.
+`--ep-size` and `--dp-size` have not been run with pipeline parallelism on
+TPU. Overlap scheduling is switched off by pipeline parallelism itself. A
+stage waiting for the previous stage looks idle to the watchdog, so pass
+`--watchdog-timeout` at least `pp_size` times the longest microbatch.
+
 Optional warmup — run between launch and bench *only* while the in-server
 torch.compile warmup doesn't yet cover all compile-shape buckets:
 
 ```bash
 MODEL=Qwen/Qwen3-32B ./warmup.sh
 ```
+
+### Prefill chunk sizing
+
+With a positive `--chunked-prefill-size`, the stages profile their forward
+costs at startup and size each prefill step from the slowest stage: the step
+is bounded by the pending prompt tokens divided by the stage count, by a
+fixed compute-time budget, and by the batched attention kernel's schedule
+capacity, so few requests get small steps and later chunks of a long prompt
+shrink with their attention cost. `SGLANG_TPU_PP_DYNAMIC_CHUNKS=0` keeps
+fixed token budgets; `SGLANG_TPU_PP_CHUNK_SLACK` (default `0.1`) is the slack
+above the profiled full-step time.
 
 ## Notes
 

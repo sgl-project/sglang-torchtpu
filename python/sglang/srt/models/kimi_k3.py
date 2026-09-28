@@ -125,7 +125,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import is_hip, is_npu, make_layers
+from sglang.srt.utils import is_hip, is_npu, is_tpu, make_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
@@ -138,6 +138,7 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_tpu = is_tpu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 
@@ -702,7 +703,7 @@ class KimiK3MoE(nn.Module):
         # regular parameters on other devices avoids a large transient copy
         # during post-load processing and leaves their native kernels in
         # control of weight layout.
-        if _is_npu:
+        if _is_npu or _is_tpu:
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
             mods = [
@@ -1735,7 +1736,7 @@ class KimiK3DeltaAttention(nn.Module):
         the BF16 tiny-GEMM buffers here."""
         if not self.use_full_rank_gate:
             return
-        if _is_npu:
+        if _is_npu or _is_tpu:
             return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
@@ -1868,7 +1869,7 @@ class KimiK3DeltaAttention(nn.Module):
             return
         layer = self.attn
         w = layer.conv_weights
-        if _is_npu:
+        if _is_npu or _is_tpu:
             return
         seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
         if (
@@ -2811,8 +2812,10 @@ class KimiK3LinearModel(nn.Module):
         #   [2] MLA output-gate GEMM, overlaps the attention core
         # (The attn-res bank write no longer needs a stream: it is fused
         # into the agg1 fast kernel, see AttnResidual.forward(write=True).)
-        # Disable on HIP code path.
-        self.alt_streams = None if _is_hip else [torch.cuda.Stream() for _ in range(3)]
+        # Disable on HIP and TPU code paths.
+        self.alt_streams = (
+            None if _is_hip or _is_tpu else [torch.cuda.Stream() for _ in range(3)]
+        )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -3376,7 +3379,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn, KimiK3DeltaAttention
             ):
                 continue
-            if _is_npu:
+            if _is_npu or _is_tpu:
                 continue
             from sglang.kernels.ops.attention.fla.kda import (
                 precompile_k3_recompute_w_u_kernel,

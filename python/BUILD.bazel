@@ -22,6 +22,17 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files(["pyproject_tpu.toml"])
 
+# Class fixtures are part of sglang; this target also supplies the launcher
+# executable they start through runfiles, without importing benchmark modules.
+py_library(
+    name = "tpu_launcher_test_support",
+    data = ["//benchmark/tpu:launch_server"],
+    deps = [
+        ":sglang",
+        "@rules_python//python/runfiles",
+    ],
+)
+
 # Keep these values aligned with [project.entry-points], [project.scripts],
 # and [tool.setuptools_scm].fallback_version in pyproject_tpu.toml.
 # The TPU plugin is discovered through importlib.metadata even for in-tree code.

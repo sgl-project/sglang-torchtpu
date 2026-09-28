@@ -4,8 +4,8 @@
 # repro of a CI failure is `./qwen3_coder_30b_a3b_fp8.sh` and nothing else.
 #
 # MODEL is an HF repo id rather than a /weights path: this config predates the shared
-# model-weights-rox disk and pulls from the HF cache. Point MODEL at /weights/<dir>
-# once the checkpoint is on the disk.
+# model-weights-filestore share and pulls from the HF cache. Point MODEL at /weights/<dir>
+# once the checkpoint is on the share.
 #
 # CONTEXT_LEN 8192 with a 262144-token KV pool sizes the server for the lm-eval MMLU
 # sweep (test/lm_eval_configs/Qwen3-Coder-30B-A3B-Instruct-FP8-TPU.yaml) at

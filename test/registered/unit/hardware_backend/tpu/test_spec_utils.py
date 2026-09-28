@@ -44,7 +44,9 @@ def test_gather_spec_extras_matches_row_indexing():
 
 
 def test_draft_cache_gather_randomized_and_empty():
-    torch.manual_seed(7)
+    # Seed only CPU tensors: torch.manual_seed also calls the TPU RNG hook
+    # when torch_tpu is installed, needlessly initializing its runtime.
+    torch.random.default_generator.manual_seed(7)
     table = torch.randint(0, 10000, (16, 128), dtype=torch.int32)
     for bs in (0, 1, 4, 8):
         rows = torch.arange(bs, dtype=torch.int32)
@@ -99,7 +101,7 @@ def test_draft_cache_uses_host_shadows():
 
 
 def test_assign_req_to_token_pool_randomized_and_empty():
-    torch.manual_seed(11)
+    torch.random.default_generator.manual_seed(11)
     for dtype in (torch.int32, torch.int64):
         for bs in (0, 1, 4, 8):
             table = torch.full((16, 32), -7, dtype=dtype)
@@ -759,6 +761,7 @@ def test_device_accept_gather_routes_seq_lens_and_reuses_state(with_hidden):
     )
     future_map = SimpleNamespace(
         publish_ready=None,
+        tpu_direct_handoff=None,
         new_seq_lens_buf=torch.arange(8) + 20,
         need_topk=True,
         need_hidden_states=with_hidden,
@@ -932,6 +935,63 @@ def test_decode_reservation_matches_allocator_at_page_boundary(
     if algorithm != "EAGLE3":
         _, _, actual = page_aligned_decode_alloc_lens(reqs, reserve=32, page_size=16)
         assert estimate == actual
+
+
+def _ragged_reference(table, rows, starts, width):
+    """The generic ragged gather this TPU window replaces, as the oracle."""
+    out = torch.zeros(rows.numel() * width, dtype=torch.int64)
+    with _ForceTpu():
+        kernels.assign_extend_cache_locs_kernel_func(
+            rows, table, starts, starts + width, out
+        )
+    return out
+
+
+def test_verify_window_matches_ragged_reference_and_owns_output():
+    torch.random.default_generator.manual_seed(23)
+    table = torch.randint(0, 10000, (8, 129), dtype=torch.int32)
+    for bs in (0, 1, 4, 8):
+        for width in (1, 2, 4, 7):
+            # Reversed rows catch a gather that assumes request order, and the
+            # negative and past-the-row starts exercise the column clamp.
+            rows = torch.arange(bs - 1, -1, -1, dtype=torch.int64)
+            starts = torch.arange(bs, dtype=torch.int64) * 17 - 2
+            if bs:
+                starts[-1] = 128
+            expected = _ragged_reference(table, rows, starts, width)
+            actual = eagle_utils_tpu.prepare_verify_cache_locs_tpu(
+                SimpleNamespace(device_accept_cache_locs=None, draft_token_num=width),
+                SimpleNamespace(req_to_token=table),
+                SimpleNamespace(
+                    req_pool_indices=rows,
+                    seq_lens=starts,
+                    device=torch.device("cpu"),
+                    req_pool_indices_cpu=rows,
+                    seq_lens_cpu=starts,
+                ),
+            )
+            assert actual.dtype == torch.int64
+            assert actual.shape == (bs * width,)
+            assert torch.equal(actual, expected)
+            # The window must own its storage: the page table keeps changing
+            # under the verify that consumes it.
+            saved = actual.clone()
+            table.add_(1)
+            assert torch.equal(actual, saved)
+
+
+def test_token_window_only_clamps_when_asked():
+    table = torch.arange(4 * 8).reshape(4, 8)
+    rows = torch.tensor([1, 2], dtype=torch.int64)
+    starts = torch.tensor([6, 6], dtype=torch.int64)
+    clamped = eagle_utils_tpu._gather_token_window(
+        table, rows, starts, 4, clamp_columns=True
+    )
+    assert torch.equal(clamped, torch.tensor([[14, 15, 15, 15], [22, 23, 23, 23]]))
+    # prepare_device_accept_tpu relies on an unclamped window raising instead of
+    # silently folding a bad start onto the row edge.
+    with pytest.raises(IndexError):
+        eagle_utils_tpu._gather_token_window(table, rows, starts, 4)
 
 
 if __name__ == "__main__":

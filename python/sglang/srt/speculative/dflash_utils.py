@@ -11,9 +11,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.compilation.compiled_op import compiled_op
-from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
-    make_dflash_verify_bookkeeping_args,
+from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
+    correct_drafts_and_bonus_tpu,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
@@ -936,23 +935,9 @@ def compute_dflash_correct_drafts_and_bonus(
         return num_correct_drafts, bonus_tokens
 
     if _is_tpu:
-        if block_size > 1:
-            matches = candidates[:, 1:] == target_predict[:, :-1]
-            all_match = matches.all(dim=1)
-            first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
-            correct_len = torch.where(all_match, block_size - 1, first_mismatch)
-        else:
-            correct_len = torch.zeros(
-                (bs,), dtype=torch.int32, device=candidates.device
-            )
-
-        col_idx = torch.arange(block_size, device=candidates.device).unsqueeze(0)
-        bonus_mask = col_idx == correct_len.to(torch.int64).unsqueeze(1)
-        bonus = torch.where(
-            bonus_mask,
-            target_predict,
-            torch.zeros_like(target_predict),
-        ).sum(dim=1)
+        correct_len, bonus = correct_drafts_and_bonus_tpu(
+            candidates=candidates, target_predict=target_predict
+        )
     else:
         matches = candidates[:, 1:] == target_predict[:, :-1]
         correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
@@ -960,65 +945,6 @@ def compute_dflash_correct_drafts_and_bonus(
             torch.arange(bs, device=target_predict.device), correct_len
         ]
     return correct_len.to(torch.int32), bonus.to(torch.int64)
-
-
-@compiled_op(warmup=make_dflash_verify_bookkeeping_args)
-def dflash_verify_bookkeeping_torch(
-    candidates: torch.Tensor,
-    target_predict: torch.Tensor,
-    prefix_lens: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused DFlash accept/bonus/out_tokens bookkeeping on TPU.
-
-    Args:
-      candidates: Proposed token IDs of shape [bs, block_size].
-      target_predict: Target model predicted token IDs of shape [bs, block_size].
-      prefix_lens: Prefix sequence lengths of shape [bs].
-
-    Returns:
-      Tuple of accept_len, commit_lens, bonus, out_tokens, new_seq_lens.
-    """
-    bs, block_size = candidates.shape
-    device = candidates.device
-
-    if block_size > 1:
-        matches = candidates[:, 1:] == target_predict[:, :-1]
-        all_match = matches.all(dim=1)
-        first_mismatch = (~matches).to(torch.int32).argmax(dim=1)
-        # argmax yields int64; int32 keeps commit_lens matching the eager/Triton
-        # paths, whose dtype the compiled draft KV appender guards on.
-        accept_len = torch.where(all_match, block_size - 1, first_mismatch).to(
-            torch.int32
-        )
-    else:
-        accept_len = torch.zeros((bs,), dtype=torch.int32, device=device)
-
-    commit_lens = accept_len + 1
-    new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
-
-    col_idx = torch.arange(block_size, device=device).unsqueeze(0)
-    accept_len_2d = accept_len.to(torch.int64).unsqueeze(1)
-    bonus_mask = col_idx == accept_len_2d
-    bonus = torch.where(
-        bonus_mask,
-        target_predict,
-        torch.zeros_like(target_predict),
-    ).sum(dim=1)
-
-    draft_tokens = torch.zeros_like(candidates)
-    if block_size > 1:
-        draft_tokens[:, :-1] = candidates[:, 1:]
-    out_tokens = torch.where(
-        col_idx < accept_len_2d,
-        draft_tokens,
-        torch.where(
-            col_idx == accept_len_2d,
-            target_predict,
-            torch.zeros_like(candidates),
-        ),
-    ).to(torch.int64)
-
-    return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
 
 def apply_dflash_simulated_acceptance(

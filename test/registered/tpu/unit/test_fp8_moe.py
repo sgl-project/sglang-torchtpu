@@ -121,10 +121,17 @@ class TestTpuFp8MoE(CustomTestCase):
             w2_weight_scale=torch.nn.Parameter(torch.tensor([3.0, 4.0])),
         )
 
-        with patch.object(
-            tpu_fp8_moe,
-            "_replace_tpu_param_from_cpu",
-            side_effect=AssertionError("unexpected host roundtrip"),
+        with (
+            patch.object(
+                tpu_fp8_moe,
+                "_replace_tpu_param_from_cpu",
+                side_effect=AssertionError("unexpected host roundtrip"),
+            ),
+            patch.object(
+                tpu_fp8_moe,
+                "get_parallel",
+                return_value=SimpleNamespace(pp_size=1),
+            ),
         ):
             tpu_fp8_moe.prepare_tpu_fp8_moe_weights(
                 layer,

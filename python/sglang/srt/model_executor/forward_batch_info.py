@@ -662,6 +662,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attn_tp_sequence_sharded: bool = False
 
     # === Runtime-filled (set during the forward pass / cuda graph / managers; not at construction) ===
+    # TPU replay routing, selected after padding: [layers, tokens, top_k].
+    forced_routing_ids: Optional[torch.Tensor] = None
+
     # Preallocated piecewise-graph attention output, set by RadixAttention.
     _attn_output: Optional[torch.Tensor] = None
 

@@ -359,6 +359,39 @@ def process_mxfp4_moe_weights_native(
     return w13_w, w13_s, w13_b, w2_w, w2_s, w2_b
 
 
+# torch_tpu returns wrong values from the MXFP4 dequantization once its
+# float32 intermediates (one element per 4-bit value, two per packed byte)
+# pass 2**30 elements, i.e. 4 GiB; measured correct at 1.06e9, wrong at
+# 1.08e9. A layer above that is converted a few experts at a time.
+_MAX_DEQUANT_ELEMENTS = 2**30
+_EXPERTS_PER_CHUNK = 16
+
+
+def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved: bool):
+    """``process_mxfp4_moe_weights_bf16`` over expert chunks, concatenated one
+    output at a time so the chunks of a finished output are freed before the
+    next one is assembled."""
+    num_experts = layer.w13_weight.data.shape[0]
+    outputs = ([], [], [], [])
+    for i in range(0, num_experts, _EXPERTS_PER_CHUNK):
+        chunk = process_mxfp4_moe_weights_bf16(
+            layer.w13_weight.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w13_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w13_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w2_weight.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w2_weight_scale.data[i : i + _EXPERTS_PER_CHUNK],
+            layer.w2_weight_bias.data[i : i + _EXPERTS_PER_CHUNK],
+            w13_interleaved=w13_interleaved,
+        )
+        for parts, part in zip(outputs, chunk):
+            parts.append(part)
+    results = []
+    for parts in outputs:
+        results.append(torch.cat(parts, dim=0))
+        parts.clear()
+    return tuple(results)
+
+
 def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     """Format GPT-OSS MXFP4 MoE weights for the TPU Pallas gmm_v2 backend.
 
@@ -377,15 +410,22 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
     # ``w13_interleave = layer.activation == MoEActivation.SWIGLUOAI`` — sglang
     # carries the activation as a string on the MoE runner config.
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
-    w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
-        layer.w13_weight.data,
-        layer.w13_weight_scale.data,
-        layer.w13_weight_bias.data,
-        layer.w2_weight.data,
-        layer.w2_weight_scale.data,
-        layer.w2_weight_bias.data,
-        w13_interleaved=w13_interleaved,
-    )
+    if 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
+        # All 128 experts of gpt-oss-120b on one device (a pipeline stage:
+        # 2.1e9 values before padding) are processed a few at a time.
+        w13, w13_bias, w2, w2_bias = _process_mxfp4_moe_weights_in_chunks(
+            layer, w13_interleaved
+        )
+    else:
+        w13, w13_bias, w2, w2_bias = process_mxfp4_moe_weights_bf16(
+            layer.w13_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w13_weight_bias.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale.data,
+            layer.w2_weight_bias.data,
+            w13_interleaved=w13_interleaved,
+        )
     layer.w13_weight = Parameter(w13, requires_grad=False)
     layer.w13_weight_scale = None
     layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)

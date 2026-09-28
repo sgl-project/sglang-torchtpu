@@ -58,7 +58,6 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -90,7 +89,6 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
-    fused_draft_extend_select_argmax_func,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -145,6 +143,7 @@ _is_xpu = is_xpu()
 if _is_tpu:
     from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
         build_topk1_verify_chain_torch,
+        fused_draft_extend_select_argmax_func,
     )
 
 
@@ -871,7 +870,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_index = self.hot_token_id[topk_index]
 
         attn_backends = self.draft_attn_backend.attn_backends
-        kv_lens_stack = torch.stack([b.forward_metadata.kv_lens for b in attn_backends])
+        # The loop derives step i's KV length as seq_lens + i + 1 in-graph
+        # instead of stacking each step backend's eagerly built metadata. That
+        # holds only while step i's backend carries speculative_step_id == i,
+        # which is how BaseTpuPallasRpaMultiStepDraftBackend constructs them.
+        assert all(b.speculative_step_id == i for i, b in enumerate(attn_backends))
         out_cache_loc = per_step_draft_out_cache_loc(
             forward_batch.out_cache_loc,
             forward_batch.batch_size,
@@ -907,7 +910,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     topk_p,
                     topk_index,
                     hidden_states,
-                    kv_lens_stack,
                     out_cache_loc,
                     self.hot_token_id,
                     spec_info.bonus_tokens,
@@ -928,7 +930,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         topk_p: torch.Tensor,
         topk_index: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_lens_stack: torch.Tensor,
         out_cache_loc: torch.Tensor,
         hot_token_id: torch.Tensor | None,
         bonus_tokens: torch.Tensor,
@@ -937,7 +938,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Run the compiled draft loop."""
         num_steps = self.speculative_num_steps
         model = self.draft_runner.model
+        # The draft policy compiles this loop, so its tracer -- not the global
+        # server arg -- decides whether hidden states may be rebound. The two
+        # agree while tracer selection is global; a per-worker split would
+        # silently desync them and drop the mutation below.
+        draft_tracer = getattr(self.draft_runner.compile_policy, "tracer", "dynamo")
         base_positions = forward_batch.positions
+        base_kv_lens = seq_lens.to(torch.int32)
         tokens: tuple = ()
         scores = None
         for i in range(num_steps):
@@ -948,8 +955,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if i == num_steps - 1:
                 break
 
-            forward_batch.spec_info.rpa_draft_kv_lens = kv_lens_stack[i]
-            if self.server_args.tpu_compile_tracer == "direct":
+            forward_batch.spec_info.rpa_draft_kv_lens = base_kv_lens + i + 1
+            if draft_tracer == "direct":
                 # direct_compile treats explicit inputs as immutable graph
                 # arguments. Rebind the traced ForwardBatch field instead of
                 # turning its hidden-state input into a deferred in-place op.
@@ -1336,16 +1343,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+        # TPU builds the selection index inside the compiled select/argmax
+        # executable from the acceptance counts, so the eager index is needed
+        # only by the non-TPU selection below and by the DSA seed gather.
+        select_index = None
+        if not _is_tpu or self.seed_dsa_topk_from_draft_extend:
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
-        )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
@@ -1422,8 +1434,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        if current_platform.is_tpu():
-            execution_select_index = forward_batch.spec_info.last_accepted_indices()
+        if _is_tpu:
             (
                 draft_logits_output.next_token_logits,
                 draft_logits_output.hidden_states,
@@ -1433,7 +1444,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 outputs=fused_draft_extend_select_argmax_func(
                     draft_logits_output.next_token_logits,
                     draft_logits_output.hidden_states,
-                    execution_select_index,
+                    forward_batch.spec_info.num_accept_tokens,
                 ),
                 forward_batch=forward_batch,
             )
@@ -1449,7 +1460,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
                 ]
-        if current_platform.is_tpu():
+        # The draft-extend graph only anchors full logits; selected-row topk is
+        # owned by the worker for both graph and eager paths.
+        if _is_tpu:
             pass
         elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(

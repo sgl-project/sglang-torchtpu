@@ -39,7 +39,7 @@ jobs:
       pd_decode_hosts: 2
       exec_cmd: python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py integration
       files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_multihost_prefix_cache_kv_offload_spec.py
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       run_name: pd-mh-gpt-120b-pc-offload-spec
     permissions:
       contents: read

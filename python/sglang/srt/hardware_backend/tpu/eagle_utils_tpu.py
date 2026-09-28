@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.compilation.compiled_op import compiled_op
+from sglang.srt.hardware_backend.tpu.spec_op_warmup import (
+    make_draft_extend_select_args,
+)
 from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
 
 if TYPE_CHECKING:
@@ -82,6 +86,31 @@ def build_topk1_verify_tree_tpu(
     )
 
 
+def _gather_token_window(
+    req_to_token: torch.Tensor,
+    rows: torch.Tensor,
+    starts: torch.Tensor,
+    width: int,
+    *,
+    clamp_columns: bool = False,
+) -> torch.Tensor:
+    """Gather `width` consecutive page-table slots per row, as [len(rows), width].
+
+    The window is a dense rectangle, so the columns are one broadcast add and
+    the read is a single advanced index: no ragged segmentation, no cumsum, and
+    no zero-initialized output to mask into. Set `clamp_columns` where the
+    consumer ignores the slots past the row (the verify window reads only the
+    reserved prefix); leave it off where an out-of-range start is a bug that
+    should raise instead of silently folding onto the row edge.
+    """
+    device = req_to_token.device
+    offsets = torch.arange(width, device=device, dtype=torch.int64)
+    columns = starts.to(device, torch.int64)[:, None] + offsets[None, :]
+    if clamp_columns:
+        columns = columns.clamp(min=0, max=req_to_token.shape[1] - 1)
+    return req_to_token[rows.to(device, torch.int64)[:, None], columns]
+
+
 def prepare_verify_cache_locs_tpu(
     verify_input: EagleVerifyInput,
     req_to_token_pool: ReqToTokenPool,
@@ -97,19 +126,27 @@ def prepare_verify_cache_locs_tpu(
         verify_input.device_accept_cache_locs = None
         return precomputed_cache_locs
 
-    from sglang.srt.speculative.spec_utils import assign_extend_cache_locs_func
-
-    return assign_extend_cache_locs_func(
-        req_pool_indices=batch.req_pool_indices,
-        req_to_token=req_to_token_pool.req_to_token,
-        start_offset=batch.seq_lens,
-        end_offset=batch.seq_lens + verify_input.draft_token_num,
-        batch_size=bs,
-        draft_token_num=verify_input.draft_token_num,
-        device=batch.device,
-        host_req_pool_indices=batch.req_pool_indices_cpu,
-        host_seq_lens=batch.seq_lens_cpu,
+    # Verification reserves exactly draft_token_num slots per request, so the
+    # window is a fixed-width rectangle rather than a ragged range. Read it
+    # where the page table lives: host-resident tables use the host mirrors of
+    # the row and length tensors so the gather never touches the device.
+    req_to_token = req_to_token_pool.req_to_token
+    host_table = req_to_token.device.type == "cpu"
+    rows = batch.req_pool_indices
+    starts = batch.seq_lens
+    if host_table:
+        if batch.req_pool_indices_cpu is not None:
+            rows = batch.req_pool_indices_cpu
+        if batch.seq_lens_cpu is not None:
+            starts = batch.seq_lens_cpu
+    window = _gather_token_window(
+        req_to_token,
+        rows[:bs],
+        starts[:bs],
+        verify_input.draft_token_num,
+        clamp_columns=True,
     )
+    return window.reshape(-1).to(batch.device, dtype=torch.int64)
 
 
 def prepare_device_accept_tpu(
@@ -154,10 +191,12 @@ def prepare_device_accept_tpu(
         # verify whose acceptance selects the window.
         num_draft_tokens = max_speculative_num_draft_tokens()
         candidate_width = 2 * num_draft_tokens - 1
-        offsets = torch.arange(candidate_width, dtype=torch.int64)
-        rows = batch.req_pool_indices_cpu.to(dtype=torch.int64)[:, None]
-        cols = host_base[:, None] + 1 + offsets[None, :]
-        candidates = batch.req_to_token_pool.req_to_token[rows, cols]
+        candidates = _gather_token_window(
+            batch.req_to_token_pool.req_to_token,
+            batch.req_pool_indices_cpu,
+            host_base + 1,
+            candidate_width,
+        )
         draft_input.device_accept_candidate_locs = candidates.to(
             batch.device, dtype=torch.int64, non_blocking=True
         )
@@ -259,3 +298,56 @@ def merge_device_accept_tpu(
         draft_input.accept_lens_device = None
         draft_input.device_accept_candidate_locs = None
     draft_input.device_accept_selected_cache_locs = None
+
+
+def last_accepted_row_indices(
+    num_accept_tokens: torch.Tensor, num_tokens_per_req: int
+) -> torch.Tensor:
+    """Flat row of each request's last accepted token in a fixed-width window.
+
+    Draft-extend packs every request into `num_tokens_per_req` rows, so request
+    `i`'s last accepted row is `i * num_tokens_per_req + num_accept_tokens[i] - 1`.
+
+    Compile-policy padding appends rows with a zero accept count. Clamping to
+    one selects those requests' first (inert) row, which keeps every index in
+    bounds; `finalize_spec_forward_batch` drops the padded outputs afterwards.
+
+    `fused_draft_extend_select_argmax_func` builds its selection through this
+    helper so the clamp rule has exactly one definition.
+    """
+    assert num_tokens_per_req > 0
+    row_starts = (
+        torch.arange(
+            num_accept_tokens.shape[0],
+            device=num_accept_tokens.device,
+            dtype=torch.int64,
+        )
+        * num_tokens_per_req
+    )
+    return row_starts + num_accept_tokens.to(torch.int64).clamp_min(1) - 1
+
+
+@compiled_op(warmup=make_draft_extend_select_args)
+def fused_draft_extend_select_argmax_func(
+    next_token_logits: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    num_accept_tokens: torch.Tensor,
+):
+    """Select draft-extend rows and compute their greedy next-draft tokens.
+
+    Index construction stays inside this executable: passing the acceptance
+    counts instead of pre-built indices keeps one more op inside the compiled
+    graph. The window width is read off the logits rather than passed in, so it
+    never becomes a second compile-time specialization key beyond the row count
+    that already keys this graph.
+    """
+    # An idle draft-extend batch selects nothing, and its window width is not
+    # observable from the logits; any positive width gives the same empty result.
+    num_reqs = num_accept_tokens.shape[0]
+    num_tokens_per_req = next_token_logits.shape[0] // num_reqs if num_reqs else 1
+    select_index = last_accepted_row_indices(num_accept_tokens, num_tokens_per_req)
+    selected_logits = next_token_logits[select_index]
+    selected_hidden = hidden_states[select_index] if hidden_states is not None else None
+    topk_index = torch.argmax(selected_logits, dim=-1, keepdim=True)
+    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+    return selected_logits, selected_hidden, topk_p, topk_index

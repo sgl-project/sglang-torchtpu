@@ -126,6 +126,68 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     return MHATokenToKVPool
 
 
+def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
+    """Reject server configurations pipeline parallelism on TPU cannot run,
+    and pin the scheduler order the stage hand-off needs.
+
+    Every pipeline stage is one process on one device. Activations move over
+    ICI as one collective-permute launched by every stage in lockstep, so a
+    stage's forward waits on launches the other stages issue at the top of
+    their next iteration. The scheduler must therefore receive and forward
+    the last stage's outputs before it launches a forward, not after: that is
+    the async-batch-depth 1 order (depth 0 does the ring exchange after the
+    forward and the two waits form a cycle). Tensor parallelism inside a stage
+    would need the stages to share a second device collective and is rejected.
+    """
+    from sglang.srt.arg_groups.overrides import (
+        declare_resolution,
+        resolving_view,
+    )
+
+    cfg = resolving_view(server_args)
+    pp = cfg.pp_size
+    if cfg.pp_async_batch_depth > 1:
+        raise NotImplementedError(
+            "Pipeline parallelism on TPU requires --pp-async-batch-depth 1 "
+            "so output delivery and activation hand-offs keep the same pace."
+        )
+    if cfg.pp_async_batch_depth < 1:
+        logger.info(
+            "Pipeline parallelism on TPU runs with --pp-async-batch-depth 1 "
+            "(got %d): the ICI hand-off needs the last stage's outputs "
+            "received before each forward.",
+            cfg.pp_async_batch_depth,
+        )
+        declare_resolution(
+            server_args, "tpu.apply_server_args_defaults", pp_async_batch_depth=1
+        )
+    if cfg.tp_size > 1:
+        raise NotImplementedError(
+            "Pipeline parallelism on TPU requires --tp-size 1 "
+            f"(got --tp-size {cfg.tp_size} with --pp-size {pp}): "
+            "tensor parallelism inside a pipeline stage is not supported."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError(
+            "Speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm}) "
+            f"is not supported with pipeline parallelism on TPU (--pp-size {pp})."
+        )
+    if cfg.enable_dynamic_chunking:
+        raise NotImplementedError(
+            "--enable-dynamic-chunking is not supported with pipeline "
+            f"parallelism on TPU (--pp-size {pp}): its chunk-latency profiling "
+            "relies on a device synchronize that does not wait for TPU "
+            "execution."
+        )
+    if not cfg.enable_torch_compile:
+        raise NotImplementedError(
+            "Pipeline parallelism on TPU requires --enable-torch-compile "
+            f"(--pp-size {pp}): only the compiled forward trims the received "
+            "activations to the batch's padded token count."
+        )
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -226,6 +288,8 @@ class TpuSRTPlatform(SRTPlatform):
         from sglang.srt.hardware_backend.tpu.patches import _prepare_tpu_env
 
         cfg = resolving_view(server_args)
+        if cfg.pp_size > 1:
+            _validate_pipeline_parallel_args(server_args)
 
         # Under Ray the slicebuilder/topology env is built per-rank after the
         # cluster's real node IPs are discovered (multihost: per-actor from Ray
@@ -235,7 +299,8 @@ class TpuSRTPlatform(SRTPlatform):
         # (localhost) env that never applies to the actual ranks. Still apply
         # the libtpu/env overrides now so actors inherit them before importing
         # torch_tpu.
-        _prepare_tpu_env(cfg.tp_size, setup_slicebuilder=not cfg.use_ray)
+        # One device per scheduler process across all pipeline stages.
+        _prepare_tpu_env(cfg.tp_size * cfg.pp_size, setup_slicebuilder=not cfg.use_ray)
 
         from sglang.srt.hardware_backend.tpu.env_override import (
             apply_small_kv_pool_vmem_prefetch_override,
@@ -310,16 +375,6 @@ class TpuSRTPlatform(SRTPlatform):
         # Registered algorithms own their validation and backend integration.
         spec_algo = cfg.speculative_algorithm
         if spec_algo is not None:
-            if cfg.attention_backend == "pallas_tpu_rpa_batched":
-                # It has no draft-backend wiring in speculative.draft_utils,
-                # so reject here with a clear message rather than failing later
-                # during draft-backend creation.
-                raise NotImplementedError(
-                    "Speculative decoding is not supported with "
-                    "--attention-backend pallas_tpu_rpa_batched yet. "
-                    "Use --attention-backend pallas_tpu_rpa_v3 for speculative "
-                    "decoding."
-                )
             if spec_algo == "EAGLE3":
                 if cfg.speculative_use_rejection_sampling:
                     raise NotImplementedError(
@@ -368,7 +423,8 @@ class TpuSRTPlatform(SRTPlatform):
         #   - "pallas_tpu_rpa_batched": the batched RPA kernel in
         #     `pallas/batched_rpa`, a thin subclass of the same shared base as
         #     v3 (see `attention_pallas_rpa_base`). Same fused KV cache, batches
-        #     sequences for higher throughput. No speculative decoding.
+        #     sequences for higher throughput. Supports EAGLE3 speculative
+        #     decoding through the shared RPA draft-backend implementation.
         #   - "pallas_tpu_flash": flash_attention for prefill/extend +
         #     `jax.experimental.pallas.ops.tpu.paged_attention` for decode.
         #     Original implementation from PR #5, works against the flat
@@ -613,6 +669,16 @@ class TpuSRTPlatform(SRTPlatform):
 
     @contextmanager
     def weight_loading_context(self, weights):
+        from sglang.srt.hardware_backend.tpu.expert_loading import (
+            expert_loading_context,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        if get_parallel().pp_size > 1:
+            with expert_loading_context():
+                yield _sync_weight_stream(weights)
+            return
+
         # No eager drain at load exit: torch.tpu.synchronize() here deadlocks
         # EAGLE3 draft init under TP>1 -- rank 0 blocks on an async buffer while
         # peers reach the post-load barrier. Let it resolve at the first aligned

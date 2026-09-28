@@ -122,8 +122,8 @@ RPA_BATCHED_SPEC = RpaKernelSpec(
     import_kernel=_import_batched_kernel,
     invoke_kernel=_invoke_batched_kernel,
     supports_attention_sink=False,
+    uses_cu_kv_lens=False,
     extend_distribution_mask=(0, 0, 1),  # [0, 0, n] (MIXED-only)
-    uses_draft_extend_v2=False,
     min_page_size=_MIN_PAGE_SIZE,
 )
 
@@ -132,6 +132,21 @@ class TpuPallasRpaBatchedAttnBackend(BaseTpuPallasRpaAttnBackend):
     """Batched RPA attention backend (``--attention-backend pallas_tpu_rpa_batched``)."""
 
     kernel_spec = RPA_BATCHED_SPEC
+
+    def __init__(self, model_runner, speculative_step_id=0):
+        super().__init__(model_runner, speculative_step_id)
+        from sglang.srt.runtime_context import get_parallel
+
+        self._pp_schedule_runner = model_runner if get_parallel().pp_size > 1 else None
+
+    def init_forward_metadata(self, forward_batch):
+        if self._pp_schedule_runner is not None:
+            from sglang.srt.hardware_backend.tpu.pp_attention_capacity import (
+                check_batch_schedule,
+            )
+
+            check_batch_schedule(self._pp_schedule_runner, self, forward_batch)
+        super().init_forward_metadata(forward_batch)
 
 
 class TpuPallasRpaBatchedMultiStepDraftBackend(BaseTpuPallasRpaMultiStepDraftBackend):

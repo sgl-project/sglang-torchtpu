@@ -73,7 +73,7 @@ class SchedulerActor:
         # WORLD_SIZE/MASTER_* for torch_tpu's PJRT slicebuilder), then initialize
         # the backend before importing Scheduler. Ray actors skip the mp entry
         # point that normally performs this work. No-op for non-TPU.
-        initialize_torch_tpu_worker(server_args, tp_rank)
+        initialize_torch_tpu_worker(server_args, tp_rank, pp_rank)
 
         from sglang.srt.managers.scheduler import (
             Scheduler,

@@ -1015,7 +1015,7 @@ class PrefillAdder:
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool = False):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
@@ -1130,6 +1130,10 @@ class PrefillAdder:
             if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+            # The scheduler tracks one partially prefilled request at a time.
+            if has_chunked_req:
+                return AddReqResult.OTHER
+
             # Chunked prefill
             trunc_len = self.rem_chunk_tokens
 
@@ -1160,7 +1164,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, has_chunked_req)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1192,6 +1196,9 @@ class PrefillAdder:
             )
             if isinstance(admission, AddReqResult):
                 return admission
+            # The scheduler tracks one partially prefilled request at a time.
+            if has_chunked_req and admission.is_chunked:
+                return AddReqResult.OTHER
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (
@@ -1255,6 +1262,8 @@ class PrefillAdder:
                     )
                     if isinstance(admission, AddReqResult):
                         return admission
+                    if has_chunked_req and admission.is_chunked:
+                        return AddReqResult.OTHER
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.kv.cache_protected_len = len(req.prefix_indices)
 

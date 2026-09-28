@@ -85,6 +85,8 @@ def _make_model_runner(
     speculative_eagle_topk=None,
     disaggregation_mode="null",
     max_running_requests=None,
+    pp_size=1,
+    pp_async_batch_depth=0,
     disaggregation_decode_extra_slots=0,
     enable_unified_memory=False,
     kv_lora_rank=512,
@@ -155,6 +157,8 @@ def _make_model_runner(
         speculative_eagle_topk=speculative_eagle_topk,
         disaggregation_mode=disaggregation_mode,
         max_running_requests=max_running_requests,
+        pp_size=pp_size,
+        pp_async_batch_depth=pp_async_batch_depth,
         disaggregation_decode_extra_slots=disaggregation_decode_extra_slots,
         enable_unified_memory=enable_unified_memory,
         enable_hisparse=False,
@@ -172,8 +176,14 @@ def _make_model_runner(
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
+    # Single stage: the runner's local hybrid-SWA view is the whole model's split.
     mr.layer_info = SimpleNamespace(
-        start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
+        start_layer=0,
+        end_layer=num_layers,
+        num_effective_layers=num_layers,
+        swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
+        full_attention_layer_ids=list(mc.full_attention_layer_ids),
+        is_hybrid_swa_mtp_draft=False,
     )
     mr.ps = ParallelState.trivial()
     mr.pp_group = SimpleNamespace(rank_in_group=0)
@@ -707,6 +717,82 @@ class TestHybridSWAConfigurator(CustomTestCase):
         # cap = 20 * max_running_requests(2) + 36 = 76.
         self.assertEqual(config.swa_max_total_num_tokens, 76)
         self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+    def test_chunk_cache_cap_holds_a_chunk_per_pipeline_slot(self):
+        # Under pipeline parallelism a stage's scheduler has one micro-batch per
+        # pipeline slot (pp_size + async depth) in flight, each holding a
+        # prefill chunk in the SWA pool until it leaves the pipeline; with the
+        # single-engine budget of one or two chunks, eight stages admitted only
+        # three 16k prefills at a time (gpt-oss-120b PP8, 16k prompts).
+        available = 1_000_000
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+            disable_radix_cache=True,
+            chunked_prefill_size=16,
+            sliding_window_size=8,
+            page_size=4,
+            max_running_requests=2,
+            disaggregation_mode="prefill",
+            disable_overlap_schedule=True,  # one chunk per slot
+            pp_size=8,
+            pp_async_batch_depth=1,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=4)
+
+        # per req = 20 as above. Global prefill = 9 slots * chunk(16) + page(4)
+        # = 148. cap = 20 * 2 + 148 = 188.
+        self.assertEqual(config.swa_max_total_num_tokens, 188)
+        self.assertLessEqual(_actual_memory_used(mr, config), available)
+
+    def test_ratio_pool_holds_a_chunk_per_pipeline_slot(self):
+        # With the radix cache on, the SWA pool was sized by the ratio alone, so
+        # the chunks a pipeline keeps in flight evicted cached prefixes' SWA
+        # tails and prefix hits vanished under load (gpt-oss-120b PP8: hits at
+        # c8, none at c32). One chunk per pipeline slot now comes on top of
+        # the ratio share, out of the same memory budget.
+        available = 1_000_000
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
+            swa_num_kv_heads=4,
+            swa_full_tokens_ratio=0.5,
+            chunked_prefill_size=16,
+            sliding_window_size=8,
+            page_size=4,
+            disable_overlap_schedule=True,  # one chunk per slot
+            pp_size=8,
+            pp_async_batch_depth=1,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=4)
+            constrained = cfg.calculate_pool_sizes_from_max_tokens(1000, page_size=4)
+
+        # Ratio share = half the full pool (page aligned); pipeline share =
+        # 9 slots * chunk(16) = 144.
+        full = config.full_max_total_num_tokens
+        self.assertEqual(config.swa_max_total_num_tokens, (full // 2) // 4 * 4 + 144)
+        self.assertLessEqual(_actual_memory_used(mr, config), available)
+        # An explicit token budget keeps the full pool and grows SWA instead.
+        self.assertEqual(constrained.full_max_total_num_tokens, 1000)
+        self.assertEqual(constrained.swa_max_total_num_tokens, 500 + 144)
 
     def test_chunk_cache_cap_disagg_decode_pre_alloc(self):
         # decode adds disaggregation_decode_extra_slots in-transfer slots to the

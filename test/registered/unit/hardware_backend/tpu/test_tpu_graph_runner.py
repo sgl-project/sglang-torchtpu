@@ -18,6 +18,7 @@ from sglang.srt.compilation.support_torch_compile import (
     CompilePolicy,
     support_torch_compile,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -190,6 +191,7 @@ class TestTpuGraphRunner(CustomTestCase):
             is_draft_worker=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
             server_args=server_args,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
     def _annotate(self, model: Any) -> Any:
@@ -359,6 +361,56 @@ class TestTpuGraphRunner(CustomTestCase):
             _augment_spec_policy(DecoderTpuCompilePolicy, ngram),
             DecoderTpuCompilePolicy,
         )
+
+    def test_checker_baselines_after_model_precompile(self):
+        """Model warmup is excluded before the checker is attached."""
+        events = []
+        self.mock_precompile.side_effect = lambda *a, **k: events.append("precompile")
+        checker = MagicMock()
+        checker.snapshot_baseline.side_effect = lambda: events.append("snapshot")
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker",
+                return_value=checker,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.DecoderTpuCompilePolicy.set_recompilation_checker",
+                side_effect=lambda *a, **k: events.append("install"),
+            ),
+        ):
+            TpuGraphRunner(self._runner_for(model))
+        self.assertEqual(events, ["precompile", "snapshot", "install"])
+
+    def test_checker_is_not_armed_unless_opted_in(self):
+        model = self._annotate(_model_with(forward=MagicMock()))
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(False),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker"
+            ) as shared,
+        ):
+            TpuGraphRunner(self._runner_for(model))
+        shared.assert_not_called()
+
+    def test_draft_runner_leaves_arming_to_its_deferred_precompile(self):
+        """The draft precompiles after init, so arming here would report it."""
+        model = self._annotate(_model_with(forward=MagicMock()))
+        runner_args = self._runner_for(model)
+        runner_args.is_draft_worker = True
+        with (
+            envs.SGLANG_TPU_CHECK_RECOMPILATION.override(True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation.recompilation_checker."
+                "_shared_recompilation_checker"
+            ) as shared,
+        ):
+            TpuGraphRunner(runner_args)
+        shared.assert_not_called()
 
     def test_precompile_called_for_installed_policy(self):
         model = self._annotate(_model_with(forward=MagicMock()))

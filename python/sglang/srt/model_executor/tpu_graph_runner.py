@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.compilation.support_torch_compile import (
+    CompilePolicy,
     DecoderCompilePolicy,
     get_torch_compile_policy,
 )
@@ -35,6 +36,9 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu._logging import get_logger
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
+)
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    install_recompilation_checker,
 )
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy import (
     BaseSpecDecodeCompilePolicyMixin,
@@ -205,7 +209,8 @@ class TpuGraphRunner:
             else (self.model,)
         )
         installed_any = False
-        installed_policies: list[Any] = []
+        installed_policies: list[CompilePolicy] = []
+        compile_timing_recorder = getattr(model_runner, "compile_timing", None)
         for module in modules:
             policy_cls = get_torch_compile_policy(module)
             if policy_cls is None:
@@ -245,6 +250,7 @@ class TpuGraphRunner:
                 method_name=method_name,
                 method=method,
                 label=type(module).__name__,
+                compile_timing_recorder=compile_timing_recorder,
             )
             if issubclass(policy_cls, DecoderTpuCompilePolicy):
                 policy_kwargs["tracer"] = model_runner.server_args.tpu_compile_tracer
@@ -271,6 +277,7 @@ class TpuGraphRunner:
                 method=getattr(self.model, "forward", None),
                 label=type(self.model).__name__,
                 tracer=server_args.tpu_compile_tracer,
+                compile_timing_recorder=compile_timing_recorder,
             )
             if fallback_policy.install():
                 installed_any = True
@@ -280,24 +287,16 @@ class TpuGraphRunner:
         if not installed_any:
             return
 
-        # Wire serving-time recompilation detection into installed shims
-        # after warmup establishes the expected compile baseline.
-        if not envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
-            return
-
-        from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
-            RecompilationChecker,
-        )
-
-        checker = RecompilationChecker()
-        checker.snapshot_baseline()
-        model_name = type(self.model).__name__
-        is_draft = getattr(model_runner, "is_draft_worker", False)
-        label = f"{'draft ' if is_draft else ''}{model_name}"
-        for policy in installed_policies:
-            set_checker = getattr(policy, "set_recompilation_checker", None)
-            if callable(set_checker):
-                set_checker(checker, model_label=label)
+        # Baseline after model warmup. Later TPU speculative-op and KV-offload
+        # warmup refresh the shared baseline in their own completion paths.
+        if envs.SGLANG_TPU_CHECK_RECOMPILATION.get():
+            # A draft model precompiles later, from precompile_draft, and installs
+            # the checker itself once that is done.
+            if not model_runner.is_draft_worker:
+                install_recompilation_checker(
+                    policies=installed_policies,
+                    model_label=type(self.model).__name__,
+                )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         """Always False — no captured graph to replay.

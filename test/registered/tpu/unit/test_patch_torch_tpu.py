@@ -47,7 +47,7 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_skips_when_device_not_tpu(self):
         args = SimpleNamespace(
-            device="cuda", tp_size=8, nnodes=1, node_rank=0, use_ray=False
+            device="cuda", tp_size=8, pp_size=1, nnodes=1, node_rank=0, use_ray=False
         )
         initialize_torch_tpu_worker(args, tp_rank=3)
         for k in _TORCHRUN_ENV_VARS:
@@ -56,7 +56,7 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_sets_torchrun_vars_for_tpu(self):
         args = SimpleNamespace(
-            device="tpu", tp_size=4, nnodes=2, node_rank=1, use_ray=False
+            device="tpu", tp_size=4, pp_size=1, nnodes=2, node_rank=1, use_ray=False
         )
 
         def assert_worker_env_is_ready():
@@ -75,18 +75,37 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
 
     def test_single_node_rank0(self):
         args = SimpleNamespace(
-            device="tpu", tp_size=8, nnodes=1, node_rank=0, use_ray=False
+            device="tpu", tp_size=8, pp_size=1, nnodes=1, node_rank=0, use_ray=False
         )
         initialize_torch_tpu_worker(args, tp_rank=0)
         self.assertEqual(os.environ["RANK"], "0")
         self.assertEqual(os.environ["WORLD_SIZE"], "8")
         self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "8")
 
+    def test_pipeline_stages_share_one_slice(self):
+        args = SimpleNamespace(
+            device="tpu", tp_size=1, pp_size=8, nnodes=1, node_rank=0, use_ray=False
+        )
+        initialize_torch_tpu_worker(args, tp_rank=0, pp_rank=5)
+        self.assertEqual(os.environ["RANK"], "5")
+        self.assertEqual(os.environ["LOCAL_RANK"], "5")
+        self.assertEqual(os.environ["WORLD_SIZE"], "8")
+        self.assertEqual(os.environ["LOCAL_WORLD_SIZE"], "8")
+        self.init_backend.assert_called_once_with()
+
+    def test_pipeline_rank_is_pp_major(self):
+        args = SimpleNamespace(
+            device="tpu", tp_size=2, pp_size=2, nnodes=1, node_rank=0, use_ray=False
+        )
+        initialize_torch_tpu_worker(args, tp_rank=1, pp_rank=1)
+        self.assertEqual(os.environ["RANK"], "3")
+        self.assertEqual(os.environ["WORLD_SIZE"], "4")
+
     def test_master_addr_port_respect_existing(self):
         os.environ["MASTER_ADDR"] = "10.0.0.1"
         os.environ["MASTER_PORT"] = "12345"
         args = SimpleNamespace(
-            device="tpu", tp_size=1, nnodes=1, node_rank=0, use_ray=False
+            device="tpu", tp_size=1, pp_size=1, nnodes=1, node_rank=0, use_ray=False
         )
         initialize_torch_tpu_worker(args, tp_rank=0)
         self.assertEqual(os.environ["MASTER_ADDR"], "10.0.0.1")
@@ -96,6 +115,7 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
         args = SimpleNamespace(
             device="tpu",
             tp_size=4,
+            pp_size=1,
             nnodes=1,
             node_rank=0,
             use_ray=False,
@@ -110,6 +130,7 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
         args = SimpleNamespace(
             device="tpu",
             tp_size=4,
+            pp_size=1,
             nnodes=1,
             node_rank=0,
             use_ray=False,
@@ -124,6 +145,7 @@ class TestInitializeTorchTpuWorker(CustomTestCase):
         args = SimpleNamespace(
             device="tpu",
             tp_size=4,
+            pp_size=1,
             nnodes=1,
             node_rank=0,
             use_ray=True,

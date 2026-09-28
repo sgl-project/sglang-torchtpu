@@ -38,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -64,6 +65,16 @@ _COMPILE_BAR_FORMAT = (
 _DISTRIBUTED_TOP_K_WARMUP_K = 50
 
 
+def max_extend_tokens(*, context_len: int) -> int:
+    """The largest flattened EXTEND token dimension one scheduled batch can
+    reach: the prefill-buffer ceiling, else the larger of max_prefill_tokens
+    and the context length (tokens sum across requests, so a per-request
+    context length must not cap it)."""
+    return max_prefill_buffer_tokens() or max(
+        get_schedule().max_prefill_tokens or 0, context_len
+    )
+
+
 def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None:
     """Sync returned tensors and backend-marked KV side effects.
 
@@ -83,6 +94,12 @@ def _materialize_out(out: Any, attn_backend: Any, token_to_kv_pool: Any) -> None
         value = getattr(out, field, None)
         if isinstance(value, torch.Tensor):
             tensors.append(value)
+
+    if isinstance(out, PPProxyTensors):
+        # A non-final pipeline stage returns its hidden states and residual.
+        tensors.extend(
+            value for value in out.tensors.values() if isinstance(value, torch.Tensor)
+        )
 
     if getattr(attn_backend, "requires_kv_sync_after_compile", False):
         pool = token_to_kv_pool
@@ -328,6 +345,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         name: str | None = None,
         label: str | None = None,
         tracer: Literal["dynamo", "direct"] = "dynamo",
+        compile_timing_recorder: CompileTimingRecorder | None = None,
     ) -> None:
         super().__init__(
             model_runner=model_runner,
@@ -336,6 +354,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             method=method,
             name=name,
             label=label,
+            compile_timing_recorder=compile_timing_recorder,
         )
         self.t_bucketer = t_bucketer
         self.b_bucketer = b_bucketer
@@ -344,10 +363,50 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         self.compiled_forward_shim: CompiledForwardShim | None = None
         self._logged_vl_warmup_variants: set[str] = set()
 
+    def _record_compile_step(
+        self,
+        *,
+        phase: str,
+        duration_seconds: float,
+        batch_size: int | None = None,
+        num_tokens: int | None = None,
+        num_draft_tokens: int | None = None,
+        draft_step: int | None = None,
+        input_variant: str | None = None,
+        logits_output_mode: str | None = None,
+        capture_hidden_mode: str | None = None,
+        has_spec_info: bool | None = None,
+    ) -> None:
+        if self.compile_timing_recorder is None:
+            return
+        assert self.model_runner is not None
+        self.compile_timing_recorder.record(
+            component="draft" if self.model_runner.is_draft_worker else "target",
+            phase=phase,
+            policy=type(self).__name__,
+            duration_seconds=duration_seconds,
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            num_draft_tokens=num_draft_tokens,
+            draft_step=draft_step,
+            model_index=self.model_runner.draft_model_idx,
+            input_variant=input_variant,
+            logits_output_mode=logits_output_mode,
+            capture_hidden_mode=capture_hidden_mode,
+            has_spec_info=has_spec_info,
+        )
+
     def _extend_compile_cap(self) -> int:
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
         return _extend_batch_cap(self.t_bucketer, self.b_bucketer, self.extend_bs)
+
+    def max_padded_tokens(self) -> int:
+        """The most token rows a forward is padded to: the last token bucket,
+        or the last batch bucket for a decode batch."""
+        assert self.t_bucketer is not None
+        assert self.b_bucketer is not None
+        return max(self.t_bucketer.max_val, self.b_bucketer.max_val)
 
     def _extend_compile_cases(self) -> list[tuple[int, int, ForwardMode]]:
         assert self.t_bucketer is not None
@@ -432,12 +491,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
             compiled_logits.__signature__ = inspect.signature(logits_fn)
             self.owner.logits_processor.forward = compiled_logits
-        # max_t is the largest flattened EXTEND token dimension compiled for one
-        # scheduled batch. It sums tokens across requests, so a per-request
-        # context length must not cap it.
-        max_t = max_prefill_buffer_tokens() or max(
-            get_schedule().max_prefill_tokens or 0,
-            self.model_runner.model_config.context_len,
+        max_t = max_extend_tokens(
+            context_len=self.model_runner.model_config.context_len
         )
         # max_b is the reconciled compile-batch ceiling, already grown to cover
         # scheduler concurrency in ServerArgs.__post_init__ via
@@ -451,7 +506,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             self.extend_bs = b_bucketer.max_val
         else:
             self.extend_bs = min(
-                server_args.prefill_max_requests or b_bucketer.max_val,
+                get_schedule().prefill_max_requests or b_bucketer.max_val,
                 b_bucketer.max_val,
             )
 
@@ -556,7 +611,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             specialization_key=self._direct_compile_specialization_key,
             model=model,
             model_extra_tensor_attrs=self.get_model_extra_tensor_attrs(),
-            kv_pool=self.model_runner.token_to_kv_pool,
+            kv_pool=self.get_direct_compile_kv_pool(),
             ignored_argnames=self._ignored_argnames(),
         )
 
@@ -570,6 +625,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         return call
+
+    def get_direct_compile_kv_pool(self):
+        return self.model_runner.token_to_kv_pool
 
     def _ignored_argnames(self) -> tuple[str, ...]:
         return (
@@ -621,15 +679,41 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             input_ids.shape[0],
             logits_output_mode,
         )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        return key if tile is None else (*key, ("prefill_kv_tile", tile))
+        return key
 
     def _compiles_logits_processor(self) -> bool:
         """Whether this compiled callable includes target-model logits processing."""
 
+        pp_group = self.model_runner.pp_group
+        if pp_group is not None and not pp_group.is_last_rank:
+            # Only the final pipeline stage runs the logits processor.
+            return False
         return self.owner is self.model_runner.model and not bool(
             getattr(self.model_runner, "is_draft_worker", False)
         )
+
+    def _pp_warmup_kwargs(self, num_tokens: int) -> dict[str, Any]:
+        """The ``pp_proxy_tensors`` kwarg a non-first pipeline stage warms up with.
+
+        The proxy carries the previous stage's hidden states and residual at the
+        padded token bucket, in the model dtype, on the device; the first stage
+        (and a non-pipelined model) gets no proxy.
+        """
+        pp_group = self.model_runner.pp_group
+        if pp_group is None or pp_group.is_first_rank:
+            return {}
+        hidden_size = self.model_runner.model_config.hidden_size
+        zeros = functools.partial(
+            torch.zeros,
+            (num_tokens, hidden_size),
+            dtype=self.model_runner.dtype,
+            device=self.model_runner.device,
+        )
+        return {
+            "pp_proxy_tensors": PPProxyTensors(
+                {"hidden_states": zeros(), "residual": zeros()}
+            )
+        }
 
     def _distributed_top_k_width(self) -> int | None:
         if not self._compiles_logits_processor():
@@ -788,12 +872,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             checker, model_label=model_label
         )
 
-    def snapshot_recompilation_baseline(self) -> None:
-        """Re-baseline the recompilation checker; no-op unless it is enabled."""
-        checker = self.compiled_forward_shim._recompilation_checker
-        if checker is not None:
-            checker.snapshot_baseline()
-
     def precompile(self) -> None:
         """Warm decoder graphs for this policy's bucket grid."""
         overall = time.perf_counter()
@@ -865,8 +943,16 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 logits_output_mode=logits_output_mode,
                 capture_hidden_mode=extend_capture_hidden_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase=mode.name.lower(),
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=num_tokens,
+                logits_output_mode=logits_output_mode.name.lower(),
+                capture_hidden_mode=extend_capture_hidden_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -907,8 +993,15 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 mode=ForwardMode.DECODE,
                 logits_output_mode=logits_output_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase="decode",
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=bs,
+                logits_output_mode=logits_output_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -934,7 +1027,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             capture_hidden_mode=capture_hidden_mode,
             spec_info=spec_info,
         )
-        return (forward_batch.input_ids, forward_batch.positions, forward_batch), {}
+        return (
+            (forward_batch.input_ids, forward_batch.positions, forward_batch),
+            self._pp_warmup_kwargs(num_tokens),
+        )
 
     def _run_one(
         self,
@@ -947,7 +1043,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
         spec_info: SpecInput | None = None,
         attn_backend: Any | None = None,
-    ) -> None:
+        profile_prefix: int | None = None,
+    ) -> float | None:
         """Build and execute one dummy forward pass for compilation."""
         args, kwargs = self._make_warmup_inputs(
             num_tokens=num_tokens,
@@ -967,6 +1064,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             else:
                 args = (*args[:2], prepared_batch, *args[3:])
             forward_batch = prepared_batch
+        if profile_prefix is not None:
+            from sglang.srt.hardware_backend.tpu.pp_profile import set_profile_inputs
+
+            args, kwargs = set_profile_inputs(
+                self, forward_batch, args, kwargs, num_tokens, profile_prefix
+            )
+
         if spec_info is None:
             if logits_output_mode is LogitsOutputMode.DISTRIBUTED_TOP_K:
                 forward_batch.sampling_info = self._make_top_k_warmup_sampling_info(bs)
@@ -999,18 +1103,28 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             forward_context,
         )
 
+        # Profiling enters at the outer model: only that wrapper passes
+        # input_embeds and the proxy positionally, and direct_compile resolves
+        # its recorded tensor paths against that exact call structure.
+        entry = model if profile_prefix is not None else self.owner
+
         # Match TpuGraphRunner's no_grad wrapper for Dynamo cache reuse.
         with (
             forward_context(ForwardContext(attn_backend=forward_attn_backend)),
             torch.no_grad(),
         ):
-            out = self.owner.forward(*args, **kwargs)
+            started = time.perf_counter()
+            out = entry.forward(*args, **kwargs)
             # Materialize lazy outputs and backend-marked side effects.
             _materialize_out(
                 out,
                 forward_attn_backend,
                 self.model_runner.token_to_kv_pool,
             )
+
+        if profile_prefix is not None:
+            return (time.perf_counter() - started) * 1000
+        return None
 
     def finalize_forward_batch(self, outputs: Any, forward_batch: ForwardBatch) -> Any:
         return _unpad_decoder_outputs(outputs, forward_batch)
@@ -1278,8 +1392,7 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
             input_deepstack_embeds is not None,
             logits_output_mode,
         )
-        tile = getattr(attention_metadata, "prefill_kv_tile", None)
-        return key if tile is None else (*key, ("prefill_kv_tile", tile))
+        return key
 
     def _decode_uses_input_ids(self) -> bool:
         """Whether the wrapper hands decode raw ``input_ids``, skipping embed.
@@ -1392,8 +1505,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 variant=variant,
                 logits_output_mode=logits_output_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase=mode.name.lower(),
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=num_tokens,
+                input_variant=variant,
+                logits_output_mode=logits_output_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -1431,10 +1552,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                     host_src=torch.zeros((num_tokens, hidden), dtype=dtype),
                     host_mask=torch.zeros((num_tokens, 1), dtype=torch.bool),
                 )
+        elapsed = time.perf_counter() - start
         logger.info(
             "[decoder compile policy] VL MM EMBED PLACEMENT: %d token buckets in %.1fs",
             len(buckets),
-            time.perf_counter() - start,
+            elapsed,
+        )
+        self._record_compile_step(
+            phase="mm_embed_placement",
+            duration_seconds=elapsed,
+            input_variant="host_placement",
         )
 
     def _precompile_decode(self) -> None:
@@ -1477,8 +1604,16 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
                 variant=variant,
                 logits_output_mode=logits_output_mode,
             )
+            elapsed = time.perf_counter() - start
+            self._record_compile_step(
+                phase="decode",
+                duration_seconds=elapsed,
+                batch_size=bs,
+                num_tokens=bs,
+                input_variant=variant,
+                logits_output_mode=logits_output_mode.name.lower(),
+            )
             if get_parallel().tp_rank == 0:
-                elapsed = time.perf_counter() - start
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
@@ -1522,12 +1657,15 @@ class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
 
         if mode.is_decode() and self._decode_uses_input_ids():
             # Positions stay mrope-shaped; only the embedding moves into the graph.
-            return (forward_batch.input_ids, positions, forward_batch), {}
+            return (
+                (forward_batch.input_ids, positions, forward_batch),
+                self._pp_warmup_kwargs(num_tokens),
+            )
 
         embed_tokens = self.owner.get_input_embeddings()
         input_embeds = embed_tokens(forward_batch.input_ids)
 
-        call_kwargs: dict[str, Any] = {}
+        call_kwargs: dict[str, Any] = self._pp_warmup_kwargs(num_tokens)
         num_deepstack = self._num_deepstack
         if variant == "deepstack" and mode == ForwardMode.EXTEND and num_deepstack > 0:
             call_kwargs["input_deepstack_embeds"] = torch.zeros(

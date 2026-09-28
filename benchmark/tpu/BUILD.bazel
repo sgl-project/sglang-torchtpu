@@ -1,11 +1,79 @@
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 package(default_visibility = ["//visibility:public"])
+
+exports_files(["launch_server.py"])
+
+py_test(
+    name = "test_launch_server",
+    size = "small",
+    srcs = ["test_launch_server.py"],
+    python_version = "3.12",
+    deps = [":launcher"],
+)
+
+# Bazel supplies the telemetry workaround as a hermetically built dependency.
+cc_binary(
+    name = "libtpu_telemetry_stub.so",
+    srcs = ["libtpu_telemetry_stub.c"],
+    linkshared = True,
+)
+
+py_library(
+    name = "launcher",
+    srcs = ["launch_server.py"],
+    data = [
+        "dump_meta.py",
+        ":libtpu_telemetry_stub.so",
+    ],
+    imports = ["../.."],
+    deps = [
+        ":python_configs",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+# The same runtime closure serves the generic binary and recipe presets.
+py_library(
+    name = "launcher_runtime",
+    data = [
+        ":sglang_router",
+        ":sglang_server",
+    ],
+    deps = [":launcher"],
+)
+
+py_binary(
+    name = "sglang_server",
+    main_module = "sglang.launch_server",
+    python_version = "3.12",
+    deps = [
+        "//python:sglang",
+        "@torch_tpu//torch_tpu/csrc/common:pywrap_torch_tpu",
+    ],
+)
+
+py_binary(
+    name = "sglang_router",
+    main_module = "sglang_router.launch_router",
+    python_version = "3.12",
+    deps = ["@sglang_pypi//sglang_router"],
+)
+
+# One implementation for recipes, JSON configs and P/D orchestration.
+py_binary(
+    name = "launch_server",
+    srcs = ["launch_server.py"],
+    main = "launch_server.py",
+    python_version = "3.12",
+    deps = [":launcher_runtime"],
+)
 
 # Expose Python recipe configs to Bazel's hermetic Python interpreter.
 py_library(
     name = "python_configs",
-    srcs = glob(["recipe/configs/*.py"]),
+    srcs = glob(["recipe/configs/**/*.py"]),
     imports = ["../.."],
 )
 
@@ -13,5 +81,12 @@ py_library(
 # sglang.test.tpu. Executable bits are preserved in Bazel runfiles.
 filegroup(
     name = "runtime",
-    srcs = glob(["**"], exclude = ["BUILD.bazel"]),
+    srcs = glob(
+        ["**"],
+        exclude = [
+            "BUILD.bazel",
+            "**/__pycache__/**",
+            "**/.pytest_cache/**",
+        ],
+    ),
 )

@@ -16,7 +16,7 @@ dashboard. The sweep harness stays this recipe's own run_nightly.sh; only the
 test machinery is shared. Metric names are bare leg tags (no namespace) --
 this file's dashboard trend predates the matrix and must not split.
 
-The weights are already on the shared model-weights-rox PVC, so no hydration
+The weights are already on the shared model-weights-filestore PVC, so no hydration
 step is needed.
 """
 
@@ -38,7 +38,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/qwen3_coder_480b_agentic_mh.sh",
-    "weights_pvc": "model-weights-rox",
+    "weights_pvc": "model-weights",
 }
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 4))

@@ -32,22 +32,12 @@ Usage: render_jobset.py --image <ref> --suite <name> [--nightly] > job.yaml
 
 import argparse
 import glob
-import importlib.util
 import os
 import re
 import sys
 
 import yaml
-
-_REPO_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-_CI_REGISTER_PATH = os.path.join(
-    _REPO_ROOT, "python", "sglang", "test", "ci", "ci_register.py"
-)
-_spec = importlib.util.spec_from_file_location("tpu_ci_register", _CI_REGISTER_PATH)
-_ci_register = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_ci_register)
+from ci_register_loader import ci_register as _ci_register
 
 _WAIT_MARGIN = 1.5
 _WAIT_FLOOR_SECONDS = 360
@@ -160,7 +150,11 @@ def main():
     # (with --exec); --hosts is ignored in this mode.
     ap.add_argument("--pd-prefill-hosts", type=int, default=0)
     ap.add_argument("--pd-decode-hosts", type=int, default=0)
-    ap.add_argument("--weights-pvc", default="")
+    ap.add_argument(
+        "--weights-pvc",
+        default="",
+        help="Key from weights.yaml or literal PVC name; empty disables the mount.",
+    )
     ap.add_argument("--timeout-per-file", type=int, default=3600)
     ap.add_argument(
         "--service-account",
@@ -203,6 +197,11 @@ def main():
 
     if not a.image:
         ap.error("--image is required when rendering")
+
+    # Resolve shared storage names once, before either JobSet rendering mode.
+    with open(f"{a.dir}/weights.yaml") as f:
+        weights_pvcs = yaml.safe_load(f)
+    a.weights_pvc = weights_pvcs.get(a.weights_pvc, a.weights_pvc)
 
     lanes = yaml.safe_load(open(f"{a.dir}/topology.yaml"))["lanes"]
     if a.lane not in lanes:

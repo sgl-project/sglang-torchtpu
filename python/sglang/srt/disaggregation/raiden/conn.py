@@ -201,6 +201,9 @@ class RaidenKVManager(
         # staging under the copy -- and the room's pages are what the copy
         # reads -- so both are kept until the future settles.
         self._stale_plans: List[Tuple[int, int, Any]] = []
+        # Engine name ("full" / "swa") -> monotonic time its poll_stats began
+        # raising on every poll; an engine is absent while its polls succeed.
+        self._engine_poll_failing_since: Dict[str, float] = {}
         self._full_engine_max_blocks = 0
         self._swa_engine_max_blocks = 0
         self._engine_lock = threading.Lock()
@@ -481,10 +484,13 @@ class RaidenKVManager(
     def _drain_engine(self) -> None:
         if self._engine is None and self._swa_engine is None:
             return
-        for engine in (self._engine, self._swa_engine):
+        for name, engine in (("full", self._engine), ("swa", self._swa_engine)):
             if engine is None:
                 continue
-            done_send, done_recv, failed = engine.poll_stats()
+            status = self._poll_engine_status(name=name, engine=engine)
+            if status is None:
+                continue
+            done_send, done_recv, failed = status
             if done_send or done_recv or failed:
                 with self._state_lock:
                     self._completed_send.update(self._norm_req_id(r) for r in done_send)
@@ -507,6 +513,47 @@ class RaidenKVManager(
                 self._stale_plans.remove(entry)
         for uuid, _room, _fut in settled_stale:
             self._unregister_plan(uuid)
+
+    def _poll_engine_status(
+        self, *, name: str, engine: Any
+    ) -> Tuple[List[str], List[str], List[str]] | None:
+        """One engine's completions, or None when its poll raised.
+
+        Runs inside the scheduler's poll, so an escaping exception would take
+        down every request on this worker. Raiden raises from ``poll_stats``
+        only before it takes any completion, so a failed poll loses nothing
+        and the next one reports it. Raiden's transfer deadlines are reported
+        through ``poll_stats`` too: once polls have failed for longer than one
+        deadline no transfer can settle, and that is raised rather than left
+        to hang every request with its pages held.
+        """
+        try:
+            status = engine.poll_stats()
+        except Exception as e:
+            now = self._monotonic()
+            since = self._engine_poll_failing_since.setdefault(name, now)
+            if now - since > self._timeout_s:
+                raise RuntimeError(
+                    f"Raiden {name} engine poll_stats has raised on every poll "
+                    f"for {now - since:.0f}s, past the {self._timeout_s:.0f}s "
+                    "transfer deadline; no transfer can settle"
+                ) from e
+            if since == now:
+                logger.error(
+                    "RaidenKVManager rank%d %s engine poll_stats raised, "
+                    "retrying on later polls: %s",
+                    self.attn_tp_rank,
+                    name,
+                    e,
+                )
+            return None
+        if self._engine_poll_failing_since.pop(name, None) is not None:
+            logger.info(
+                "RaidenKVManager rank%d %s engine poll_stats recovered",
+                self.attn_tp_rank,
+                name,
+            )
+        return status
 
     def _unregister_plan(self, uuid: int) -> None:
         """Drops a receiver plan whose push has settled.

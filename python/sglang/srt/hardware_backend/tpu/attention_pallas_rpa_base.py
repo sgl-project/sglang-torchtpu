@@ -103,9 +103,9 @@ class PallasForwardMetadata:
     # Static query rows per DECODE sequence for this forward (1 = ordinary
     # decode); above 1 the active rows take the kernel's DECODE range.
     decode_query_size: int = 1
-    # Finite host-selected specialization: 0=automatic, 1024 or 2048 tokens.
-    # None leaves unrelated backends' direct-compile keys unchanged.
-    prefill_kv_tile: int | None = None
+    # Owned scalar i32: -1=native fallback, 0=static base, 1024/2048=promotion.
+    # Backends without runtime tile selection leave this unset.
+    prefill_kv_tile_hint: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
@@ -189,16 +189,16 @@ class RpaKernelSpec:
     # Whether the kernel consumes ``attention_sink``. When False the base raises
     # rather than silently dropping a passed sink.
     supports_attention_sink: bool
+    # Whether the JAX kernel consumes ``cu_kv_lens``. Keep unused operands out
+    # of the exported JAX function: StableHLO drops them, while torch_tpu still
+    # tries to refine every declared dynamic operand.
+    uses_cu_kv_lens: bool
     # Per-slot on/off mask selecting which of the three extend/prefill
     # ``distribution`` slots get the active-sequence count: v3 = (0, 1, 1)
     # ([0, n, n]); batched = (0, 0, 1) ([0, 0, n], MIXED-only — the batched
     # kernel never runs the pure-prefill range). Decode is always [n, n, n].
     extend_distribution_mask: tuple[int, int, int]
-    # Which draft-extend forward-mode variant this backend recognizes: v3 uses
-    # the ``*_v2`` modes; batched uses the plain ones.
-    uses_draft_extend_v2: bool
-    # Minimum KV page/block size the kernel needs (None = no floor). Consumed by
-    # the TPU platform's page-size defaulting, not by this module.
+    # Minimum KV page size required by the backend.
     min_page_size: int | None = None
     # Whether the kernel's DECODE range accepts ``decode_query_size`` query rows
     # per sequence, so fixed-width target verification and decode-phase draft
@@ -272,7 +272,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         kv_lens: jax.Array,
         page_indices: jax.Array,
         cu_q_lens: jax.Array,
-        cu_kv_lens: jax.Array,
+        cu_kv_lens: jax.Array | None,
         distribution: jax.Array,
         attention_sink: jax.Array | None = None,
         sm_scale: float = 1.0,
@@ -281,6 +281,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: float | None = None,
         v_scale: float | None = None,
         decode_query_size: int = 1,
+        prefill_kv_tile_hint: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if not spec.supports_attention_sink and attention_sink is not None:
             raise NotImplementedError(f"{op_name} does not support attention sinks")
@@ -288,6 +289,11 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         # kernel dequantizes on read by multiplying the attention scores /
         # output by these per-tensor scales. ``q_scale`` is left unset so
         # queries stay bf16 — only K/V are quantized, matching the GPU backends.
+        hint_options = (
+            {}
+            if prefill_kv_tile_hint is None
+            else {"prefill_kv_tile_hint": prefill_kv_tile_hint}
+        )
         return spec.invoke_kernel(
             _jax_rpa,
             queries=queries,
@@ -306,6 +312,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
             k_scale=k_scale,
             v_scale=v_scale,
             decode_query_size=decode_query_size,
+            **hint_options,
         )
 
     jax_kernel = _torch_pallas.custom_jax_kernel(
@@ -342,6 +349,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
         k_scale: float | None = None,
         v_scale: float | None = None,
         decode_query_size: int = 1,
+        prefill_kv_tile_hint: torch.Tensor | None = None,
     ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
             output, _updated_kv = jax_kernel(
@@ -352,7 +360,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 kv_lens,
                 page_indices,
                 cu_q_lens,
-                cu_kv_lens,
+                cu_kv_lens if spec.uses_cu_kv_lens else None,
                 distribution,
                 attention_sink,
                 sm_scale,
@@ -361,6 +369,7 @@ def _build_pallas_kernel_op(spec: RpaKernelSpec):
                 k_scale,
                 v_scale,
                 decode_query_size,
+                prefill_kv_tile_hint,
             )
         return output
 
@@ -498,16 +507,12 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------ #
 
     def _is_draft_extend(self, forward_mode) -> bool:
-        """Draft-extend check for this variant (v3: ``*_v2``; batched: plain)."""
-        if self.kernel_spec.uses_draft_extend_v2:
-            return forward_mode.is_draft_extend_v2()
-        return forward_mode.is_draft_extend()
+        """Return whether this is the backend's Spec V2 draft-extend mode."""
+        return forward_mode.is_draft_extend_v2()
 
     def _is_extend_including_draft(self, forward_mode) -> bool:
-        """Extend (incl. this variant's draft-extend) — for the host path."""
-        if self.kernel_spec.uses_draft_extend_v2:
-            return forward_mode.is_extend(include_draft_extend_v2=True)
-        return forward_mode.is_extend()
+        """Extend (including Spec V2 draft-extend) — for the host path."""
+        return forward_mode.is_extend(include_draft_extend_v2=True)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Land deferred HiCache reload commits into the KV buffers before any

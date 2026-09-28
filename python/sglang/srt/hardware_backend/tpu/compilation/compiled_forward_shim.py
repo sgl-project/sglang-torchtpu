@@ -24,8 +24,14 @@ from sglang.srt.hardware_backend.tpu.compilation.bucketer import (
     Bucketer,
     PowerBucketer,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.hardware_backend.tpu.compilation.recompilation_checker import (
+    snapshot_recompilation_baseline,
+)
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    PPProxyTensors,
+)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.utils.common import next_power_of_2
 
@@ -126,6 +132,56 @@ def _matches_default(value: Any, default: Any) -> bool:
     if default is None:
         return value is None
     return type(value) is type(default) and value == default
+
+
+def _fit_pp_proxy_rows(proxy: Any, input_ids: Any, forward_batch: Any) -> Any:
+    """Bring a pipeline proxy to the padded batch's token axis.
+
+    The ICI wave delivers the previous stage's activations at its fixed buffer
+    size (the largest token bucket), so a longer proxy is trimmed to this
+    stage's padded token count; a shorter one means the two stages padded to
+    different buckets and is rejected.
+    """
+    reference = input_ids if input_ids is not None else forward_batch.input_ids
+    if reference is None:
+        return proxy
+    expected = int(reference.shape[0])
+    tensors = {}
+    trimmed = False
+    for name, tensor in proxy.tensors.items():
+        if isinstance(tensor, torch.Tensor):
+            rows = int(tensor.shape[0])
+            if rows < expected:
+                raise ValueError(
+                    f"pp_proxy_tensors[{name!r}] has {rows} rows but the padded "
+                    f"batch has {expected} input tokens; the previous pipeline "
+                    "stage and this one padded to different token buckets."
+                )
+            if rows > expected:
+                tensor = tensor[:expected]
+                trimmed = True
+        tensors[name] = tensor
+    return type(proxy)(tensors) if trimmed else proxy
+
+
+def _fit_pp_proxy_in_args(
+    args: tuple[Any, ...], input_ids: Any, forward_batch: Any
+) -> tuple[Any, ...]:
+    """Trim a pipeline proxy that arrived as a positional argument.
+
+    Most models hand the proxy to the compiled decoder as the
+    ``pp_proxy_tensors`` keyword, which the kwarg lookup above covers; several
+    (glm4_moe, kimi_k3, minimax_m3, sarvam_moe, ...) pass it positionally. A
+    proxy that slips past the lookup reaches direct_compile at the wave's full
+    row count, which the specialization key does not cover.
+    """
+    for index, value in enumerate(args):
+        if isinstance(value, PPProxyTensors):
+            fitted = _fit_pp_proxy_rows(value, input_ids, forward_batch)
+            if fitted is not value:
+                return args[:index] + (fitted,) + args[index + 1 :]
+            break
+    return args
 
 
 def _zero_pad_dim0(t: torch.Tensor, target_size: int) -> torch.Tensor:
@@ -680,6 +736,7 @@ def precompile_kv_offload(host_pool: TpuFusedMHATokenToKVPoolHost) -> None:
         max_blocks,
         time.perf_counter() - start,
     )
+    snapshot_recompilation_baseline()
 
 
 class CompiledForwardShim:
@@ -749,6 +806,10 @@ class CompiledForwardShim:
         self._recompilation_checker = checker
         self._model_label = model_label
 
+    def _is_first_pp_stage(self) -> bool:
+        pp_group = self.policy.model_runner.pp_group
+        return pp_group is not None and bool(pp_group.is_first_rank)
+
     def wait_for_hicache_reload(self) -> None:
         """Wait for the current HiCache reload outside compiled regions."""
         model_runner = self.policy.model_runner
@@ -783,6 +844,44 @@ class CompiledForwardShim:
                     and _matches_default(v, self._default_kwargs[k])
                 )
             }
+        # The fused draft loop inlines this call into its own Dynamo graph.
+        # Reading the checker there would put it in that graph's guards, so
+        # attaching it later would recompile the graph this very tool exists to
+        # protect. Compiles from inside it surface on the next eager forward.
+        if torch.compiler.is_compiling():
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+
+        checker = self._recompilation_checker
+        if checker is None:
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+        # Read at entry: the padded shapes are what the graph compiled for.
+        pad_q = int(forward_batch.input_ids.shape[0])
+        pad_b = int(forward_batch.seq_lens.shape[0])
+        try:
+            return self._forward(input_ids, positions, forward_batch, *args, **kwargs)
+        finally:
+            checker.check(
+                context_fn=lambda: self._describe_forward(
+                    forward_batch, pad_q=pad_q, pad_b=pad_b
+                )
+            )
+
+    def _describe_forward(self, forward_batch: Any, *, pad_q: int, pad_b: int) -> str:
+        # Dynamic keys, unset on eagle3 draft extend (as in _unpad_decoder_outputs).
+        real_q = getattr(forward_batch, _REAL_Q_KEY, None)
+        real_b = getattr(forward_batch, _REAL_B_KEY, None)
+        real = f" real=q{real_q},b{real_b}" if real_q is not None else ""
+        mode = forward_batch.forward_mode.name
+        return f"{self._model_label} {mode}{real} pad=q{pad_q},b{pad_b}"
+
+    def _forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        forward_batch: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         # EAGLE3 draft extend: EagleDraftExtendInput also rides DRAFT_EXTEND_V2,
         # which is_extend() excludes.
         if (
@@ -801,6 +900,18 @@ class CompiledForwardShim:
             )
         if forward_batch.input_embeds is not None:
             kwargs["input_embeds"] = forward_batch.input_embeds
+        pp_proxy_tensors = kwargs.get("pp_proxy_tensors")
+        if pp_proxy_tensors is not None:
+            if self._is_first_pp_stage():
+                # The first stage embeds its own input; its graph takes no proxy.
+                kwargs.pop("pp_proxy_tensors")
+            else:
+                kwargs["pp_proxy_tensors"] = _fit_pp_proxy_rows(
+                    pp_proxy_tensors, input_ids, forward_batch
+                )
+        elif any(isinstance(value, PPProxyTensors) for value in args):
+            if not self._is_first_pp_stage():
+                args = _fit_pp_proxy_in_args(args, input_ids, forward_batch)
         # Pin is_prefill_only for the compiled forward. An idle batch computes
         # it as True (all() over zero requests) while real batches are False;
         # the compiled forward reads the value, so it must be identical across
@@ -855,14 +966,6 @@ class CompiledForwardShim:
                 logits_output=out,
                 forward_batch=forward_batch,
                 model=self.policy.model_runner.model,
-            )
-
-        # Check for serving-time XLA recompilation (once per forward call).
-        # Gated by SGLANG_TPU_CHECK_RECOMPILATION=1 (off by default).
-        if self._recompilation_checker is not None:
-            fm = getattr(forward_batch, "forward_mode", "N/A")
-            self._recompilation_checker.check(
-                f"{self._model_label} {fm.name if hasattr(fm, 'name') else fm}"
             )
 
         return out
@@ -939,6 +1042,24 @@ def build_bucketers(
     else:
         token_bucketer = PowerBucketer(
             name="TokenBucketer", min_val=64, max_val=max_t, power=2
+        )
+
+    from sglang.srt.hardware_backend.tpu.pp_chunks import uses_dynamic_chunks
+
+    if uses_dynamic_chunks():
+        from sglang.srt.hardware_backend.tpu.pp_chunks import (
+            chunk_buckets,
+            chunk_granularity,
+        )
+
+        granularity = chunk_granularity(get_schedule().page_size, max_t, True)
+        token_bucketer = Bucketer(
+            name="TokenBucketer",
+            buckets=sorted(
+                set(
+                    token_bucketer.buckets + chunk_buckets(max_t, granularity) + [max_t]
+                )
+            ),
         )
 
     # tpu_compile_bs is reconciled in resolution; read the resolved leaf.

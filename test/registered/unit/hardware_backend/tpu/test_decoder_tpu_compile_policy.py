@@ -157,6 +157,7 @@ def _model_runner(device="cpu"):
         model_config=SimpleNamespace(model_is_mrope=False),
         is_draft_worker=False,
         spec_algorithm=SpeculativeAlgorithm.NONE,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
 
@@ -243,6 +244,31 @@ def _run_cases(policy, mode):
 
 
 class TestDirectCompileExtraModelState(CustomTestCase):
+    def test_custom_policy_forwards_kv_pool_without_replacing_runner_pool(self):
+        compile_kv_pool = object()
+
+        class CustomPolicy(DecoderTpuCompilePolicy):
+            def get_direct_compile_kv_pool(self):
+                return compile_kv_pool
+
+        model_runner = _model_runner()
+        runner_kv_pool = model_runner.token_to_kv_pool
+        policy = CustomPolicy(model_runner=model_runner, owner=model_runner.model)
+        compile_module_name = (
+            "sglang.srt.hardware_backend.tpu.compilation.direct_compile"
+        )
+        compile_module = ModuleType(compile_module_name)
+        compile_module.direct_compile = MagicMock(return_value=MagicMock())
+
+        with patch.dict(sys.modules, {compile_module_name: compile_module}):
+            policy._direct_compile(model_runner.model.forward)
+
+        compile_module.direct_compile.assert_called_once()
+        self.assertIs(
+            compile_module.direct_compile.call_args.kwargs["kv_pool"], compile_kv_pool
+        )
+        self.assertIs(model_runner.token_to_kv_pool, runner_kv_pool)
+
     def test_custom_annotated_policy_forwards_extra_tensor_attrs(self):
         class CustomPolicy(DecoderTpuCompilePolicy):
             model_extra_tensor_attrs = (
@@ -260,6 +286,7 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             model=model,
             token_to_kv_pool=kv_pool,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
         policy = policy_cls(
             model_runner=model_runner,
@@ -290,103 +317,6 @@ class TestDirectCompileExtraModelState(CustomTestCase):
             "forward_batch.extend_input_logprob_token_ids_gpu",
             kwargs["ignored_argnames"],
         )
-
-
-class TestAttentionTileSpecialization(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.input_ids = torch.arange(8)
-        self.input_embeds = torch.empty(8, 4)
-        self.forward_batch = SimpleNamespace(
-            forward_mode="extend",
-            capture_hidden_mode="null",
-            batch_size=1,
-            logits_output_mode="full_vocab",
-        )
-
-    def test_missing_tile_preserves_existing_model_key(self):
-        for policy_cls in (DecoderTpuCompilePolicy, Qwen3VLDecoderTpuCompilePolicy):
-            policy = object.__new__(policy_cls)
-            is_vl = policy_cls is Qwen3VLDecoderTpuCompilePolicy
-            kwargs = {"input_embeds": self.input_embeds} if is_vl else {}
-            for compiles_logits in (False, True):
-                policy._compiles_logits_processor = MagicMock(
-                    return_value=compiles_logits
-                )
-                base_key = ("extend", "null", 1, 8)
-                if is_vl:
-                    base_key += (False,)
-                base_key += ("full_vocab" if compiles_logits else None,)
-                for metadata in (
-                    None,
-                    SimpleNamespace(),
-                    SimpleNamespace(prefill_kv_tile=None),
-                ):
-                    with self.subTest(
-                        policy=policy_cls.__name__,
-                        compiles_logits=compiles_logits,
-                        metadata=metadata,
-                    ):
-                        self.assertEqual(
-                            policy._direct_compile_specialization_key(
-                                metadata,
-                                None if is_vl else self.input_ids,
-                                None,
-                                self.forward_batch,
-                                **kwargs,
-                            ),
-                            base_key,
-                        )
-
-    def test_tiles_compose_with_base_specialization(self):
-        policy = object.__new__(DecoderTpuCompilePolicy)
-        policy._compiles_logits_processor = MagicMock(return_value=True)
-        keys = set()
-        for tile in (0, 1024, 2048):
-            metadata = SimpleNamespace(prefill_kv_tile=tile)
-            for logits_mode in ("full_vocab", "top_k"):
-                self.forward_batch.logits_output_mode = logits_mode
-                key = policy._direct_compile_specialization_key(
-                    metadata, self.input_ids, None, self.forward_batch
-                )
-                self.assertEqual(
-                    key,
-                    ("extend", "null", 1, 8, logits_mode, ("prefill_kv_tile", tile)),
-                )
-                keys.add(key)
-        self.assertEqual(len(keys), 6)
-
-    def test_tiles_compose_with_multimodal_specialization(self):
-        policy = object.__new__(Qwen3VLDecoderTpuCompilePolicy)
-        policy._compiles_logits_processor = MagicMock(return_value=True)
-        keys = set()
-        for tile in (None, 0, 1024, 2048):
-            metadata = SimpleNamespace(prefill_kv_tile=tile)
-            for deepstack in (None, torch.empty(8, 12)):
-                key = policy._direct_compile_specialization_key(
-                    metadata,
-                    None,
-                    None,
-                    self.forward_batch,
-                    input_embeds=self.input_embeds,
-                    input_deepstack_embeds=deepstack,
-                )
-                expected = ("extend", "null", 1, 8, deepstack is not None, "full_vocab")
-                if tile is not None:
-                    expected += (("prefill_kv_tile", tile),)
-                self.assertEqual(key, expected)
-                keys.add(key)
-        self.assertEqual(len(keys), 8)
-
-    def test_metadata_preserves_positional_decode_query_size(self):
-        from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_base import (
-            PallasForwardMetadata,
-        )
-
-        tensor = torch.empty(0, dtype=torch.int32)
-        metadata = PallasForwardMetadata(*([tensor] * 7), 4)
-        self.assertEqual(metadata.decode_query_size, 4)
-        self.assertIsNone(metadata.prefill_kv_tile)
 
 
 class TestEagle3DirectCompile(_SpecPolicyTestCase):
@@ -643,16 +573,18 @@ class TestInstallExtendCap(_PolicyTestCase):
             forward=MagicMock(),
             prepare_forward_batch=MagicMock(),
         )
-        # install() takes the compile grid from the bags; prefill_max_requests stays on the instance.
+        # install() reads the compile grid and prefill cap from the published config.
         self.publish_config(
             chunked_prefill_size=None,
             max_prefill_tokens=2048,
             torch_compile_max_bs=64,
+            prefill_max_requests=prefill_max_requests,
         )
         model_runner = SimpleNamespace(
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=prefill_max_requests,
@@ -708,6 +640,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             # The context limit applies to each request, while the flattened
             # token dimension covers the aggregate prefill batch.
             model_config=SimpleNamespace(context_len=4096),
@@ -759,6 +692,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -819,6 +753,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=True,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -876,6 +811,7 @@ class TestInstallExtendCap(_PolicyTestCase):
             model=model,
             forward=MagicMock(),
             is_draft_worker=True,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             model_config=SimpleNamespace(context_len=4096),
             server_args=SimpleNamespace(
                 prefill_max_requests=16,
@@ -1661,6 +1597,7 @@ def _spec_model_runner(device="cpu", is_draft_worker=False):
         ),
         dtype=torch.bfloat16,
         is_draft_worker=is_draft_worker,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
     )
@@ -1895,6 +1832,32 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
             [CaptureHiddenMode.LAST] * 6 + [CaptureHiddenMode.FULL] * 2,
         )
 
+    def test_draft_precompile_installs_the_checker_after_its_last_forward(self):
+        """Draft warmup finishes before installing and baselining its checker."""
+        mr = _spec_model_runner(is_draft_worker=True)
+        self.publish_config(page_size=8)
+        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
+        draft_backend = SimpleNamespace(attn_backends=[_FakeAttnBackend()] * 2)
+        forwards_at_install = []
+
+        def install(**kwargs):
+            forwards_at_install.append(mr.model.forward.call_count)
+            self.assertEqual(kwargs["policies"], (policy,))
+            self.assertTrue(kwargs["model_label"].startswith("draft "))
+
+        with (
+            get_parallel().override(tp_rank=1),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3.install_recompilation_checker",
+                side_effect=install,
+            ),
+        ):
+            policy.precompile_draft(draft_backend, _FakeAttnBackend())
+
+        self.assertEqual(forwards_at_install, [mr.model.forward.call_count])
+        self.assertGreater(mr.model.forward.call_count, 0)
+
     def test_draft_precompile_skips_shapes_larger_than_local_request_pool(self):
         mr = _spec_model_runner(is_draft_worker=True)
         mr.req_to_token_pool.size = 4
@@ -2042,6 +2005,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         target_hidden_size=32,
         draft_token_num=4,
         is_draft_worker=True,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         tracer="dynamo",
     ):
         model = SimpleNamespace(
@@ -2064,6 +2028,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             ),
             model_config=SimpleNamespace(hidden_size=hidden_size, model_is_mrope=False),
             is_draft_worker=is_draft_worker,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             prepare_dummy_forward_batch=lambda forward_batch: forward_batch,
         )
@@ -2300,10 +2265,13 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
+        mock_block_embedder = MagicMock()
+        policy._compiled_block_embedder = mock_block_embedder
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+            embed_draft_block_ids=MagicMock(),
         )
 
         with get_parallel().override(tp_rank=1):
@@ -2311,11 +2279,12 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
                 draft_attn_backend=_FakeAttnBackend(), dflash_worker=worker
             )
 
-        # Worker method was replaced with compiled policy method.
+        # Worker methods were replaced with the compiled seams.
         self.assertEqual(
             worker.append_target_hidden_to_draft_kv_by_loc_tpu,
             policy.append_target_hidden_to_draft_kv_by_loc_tpu,
         )
+        self.assertEqual(worker.embed_draft_block_ids, mock_block_embedder)
 
         # Extend call with 10 tokens pads to token bucket 16.
         target_hidden = torch.ones(10, 32)
@@ -2435,10 +2404,13 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
+        mock_block_embedder = MagicMock()
+        policy._compiled_block_embedder = mock_block_embedder
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+            embed_draft_block_ids=MagicMock(),
         )
 
         # precompile_draft branches on get_disagg().disaggregation_mode.
@@ -2453,6 +2425,8 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         # In prefill mode: draft model forward is skipped (0 calls), only extend KV append runs (2 token buckets).
         self.assertEqual(mr.model.forward.call_count, 0)
         self.assertEqual(mock_append_kernel.call_count, 2)
+        # Block embed warmup is not mode-gated: one call per bs bucket.
+        self.assertEqual(mock_block_embedder.call_count, 2)
 
     def test_precompile_draft_pd_decode_mode_skips_extend(self):
         policy, mr = self._make_dflash_policy(
@@ -2460,10 +2434,13 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         )
         mock_append_kernel = MagicMock()
         policy._compiled_kv_appender = mock_append_kernel
+        mock_block_embedder = MagicMock()
+        policy._compiled_block_embedder = mock_block_embedder
         worker = SimpleNamespace(
             draft_model=mr.model,
             draft_model_runner=mr,
             append_target_hidden_to_draft_kv_by_loc_tpu=MagicMock(),
+            embed_draft_block_ids=MagicMock(),
         )
 
         with (
@@ -2477,6 +2454,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         # In decode mode: draft model forward runs (2 bs buckets), only verify KV append runs (2 bs buckets).
         self.assertEqual(mr.model.forward.call_count, 2)
         self.assertEqual(mock_append_kernel.call_count, 2)
+        self.assertEqual(mock_block_embedder.call_count, 2)
 
     def test_dflash_build_disagg_draft_input(self):
         from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -2502,6 +2480,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             bs_buckets=(1, 4),
             draft_token_num=4,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
         # precompile() reads get_disagg().disaggregation_mode per call; scope each half.
@@ -2518,6 +2497,7 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
             bs_buckets=(1, 4),
             draft_token_num=4,
             is_draft_worker=False,
+            pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         )
 
         with (
@@ -3243,6 +3223,7 @@ def _policy():
     model_runner = SimpleNamespace(
         model=SimpleNamespace(forward=None, prepare_forward_batch=None),
         is_draft_worker=False,
+        pp_group=SimpleNamespace(is_first_rank=True, is_last_rank=True),
         model_config=SimpleNamespace(hidden_size=16, model_is_mrope=False),
     )
     with _target_model_config():

@@ -588,6 +588,8 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    SGLANG_TPU_PP_DYNAMIC_CHUNKS = EnvBool(True)
+    SGLANG_TPU_PP_CHUNK_SLACK = EnvFloat(0.1)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
@@ -1788,6 +1790,9 @@ class Envs:
     SGLANG_TPU_ENABLE_ATTN_METADATA_CACHE = EnvBool(True)
     # Read extend query lengths from a complete host mirror instead of the device.
     SGLANG_TPU_ENABLE_HOST_QUERY_LENS = EnvBool(True)
+    # Opt-in runtime KV-tile promotion for compatible prefill backends.
+    # Backends snapshot this flag at initialization; tile hints are tensor inputs.
+    SGLANG_TPU_WORKLOAD_AWARE_KV_TILES = EnvBool(False)
     SGLANG_TPU_EAGER_MODE = EnvStr("DEFER_NEVER")
     # Physical TPU v7 TP8 measurements favor distributed TopK from batch 64.
     # Deployments can override this cutoff after measuring their topology.

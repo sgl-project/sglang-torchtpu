@@ -8,8 +8,8 @@ Its MULTIHOST_LAUNCH forms its own launch group: recipe/mimo_v25_pro_mh.sh on 2 
 The recipe mirrors the E2E-validated DP-attention config from
 recipe/mimo/launch_mimo_25_pro_multihost.sh (PR #155): tp=16, ep=16, dp=2 ->
 attention_tp=8, mem_fraction 0.7, max_running 8 -- with prefill raised to 8192.
-Weights (~1.0TB fp8) come from the shared ReadOnlyMany Hyperdisk PVC
-model-weights-rox (see .github/tpu-ci/pvc-model-weights-rox.yaml.tmpl).
+Weights (~1.0TB fp8) come from the shared read-only Filestore PVC
+model-weights-filestore (see .github/tpu-ci/pvc-model-weights-filestore.yaml).
 The CI runs this file on rank-0 against the server the JobSet brought up; skips
 unless a live server is provided.
 
@@ -37,11 +37,10 @@ register_tpu_ci(
     labels=["multihost", "mimo-v2.5-pro"],
 )
 
-# Own launch group: MiMo-V2.5-Pro DP-attention recipe + the MiMo ROX weights volume.
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/mimo_v25_pro_mh.sh",
-    "weights_pvc": "model-weights-rox",
+    "weights_pvc": "model-weights",
 }
 
 MODEL_PATH = "XiaomiMiMo/MiMo-V2.5-Pro"

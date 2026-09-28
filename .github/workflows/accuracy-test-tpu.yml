@@ -105,8 +105,7 @@ jobs:
       suite: ${{ matrix.suite }}
       run_name: ${{ matrix.run_name }}
       nightly: true
-      # gpt-oss-120b serves from the shared ROX disk at /weights.
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       # Admission is separate; each eval file gets a 90-minute runtime budget.
       timeout_per_file: 5400
     permissions:
