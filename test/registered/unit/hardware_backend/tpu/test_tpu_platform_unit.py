@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import torch.compiler.config as compiler_config
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.tpu_platform import TpuSRTPlatform
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.runtime_context import get_context
@@ -239,6 +240,7 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
             speculative_algorithm=None,
             speculative_eagle_topk=None,
             speculative_use_rejection_sampling=False,
+            disaggregation_mode="null",
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -405,6 +407,35 @@ class TestTpuPlatformServerDefaults(CustomTestCase):
         args = self._args(sampling_backend="pytorch")
         self._apply(args)
         self.assertEqual(self._resolved(args, "sampling_backend"), "pytorch")
+
+    def test_prefill_rejects_explicit_early_send(self):
+        # The early-send read is not ordered after the in-flight TPU forward.
+        with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):
+            with self.assertRaisesRegex(
+                ValueError, "EARLY_SEND_CACHED_PREFIX is not supported on TPU"
+            ):
+                self._apply(self._args(disaggregation_mode="prefill"))
+
+    def test_prefill_pins_default_early_send_off(self):
+        flag = envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX
+        with patch.dict(os.environ):
+            flag.clear()
+            self._apply(self._args(disaggregation_mode="prefill"))
+            self.assertTrue(flag.is_set())
+            self.assertFalse(flag.get())
+
+    def test_prefill_accepts_explicit_early_send_off(self):
+        flag = envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX
+        with flag.override(False):
+            self._apply(self._args(disaggregation_mode="prefill"))
+            self.assertFalse(flag.get())
+
+    def test_non_prefill_ignores_early_send(self):
+        flag = envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX
+        for mode in ("null", "decode"):
+            with self.subTest(mode=mode), flag.override(True):
+                self._apply(self._args(disaggregation_mode=mode))
+                self.assertTrue(flag.get())
 
 
 class TestTpuPlatformFactoryMethods(CustomTestCase):

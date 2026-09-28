@@ -188,6 +188,27 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
         )
 
 
+def _reject_prefill_early_send(disaggregation_mode: str) -> None:
+    # Early send offers the cached prefix before this step's forward, and under
+    # overlap that prefix can hold pages the previous forward is still writing.
+    # CUDA fences the read with a forward-stream event. Raiden's tpu-sync DMA
+    # pulls straight from HBM, unordered after the in-flight torch_tpu program.
+    if disaggregation_mode != "prefill":
+        return
+    from sglang.srt.environ import envs
+
+    flag = envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX
+    if flag.is_set() and flag.get():
+        raise ValueError(
+            "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX is not supported on "
+            "TPU: the prefill cannot tell the prefix KV is written until its "
+            "TPU program completes, so the early transfer may read stale KV. "
+            "Unset it or set it to 0."
+        )
+    # The flag defaults on. Pin it off so the scheduler processes inherit it.
+    flag.set(False)
+
+
 def _apply_page_size_default(server_args) -> None:
     """Resolve ``page_size`` against the attention backend's declared floor.
 
@@ -365,6 +386,8 @@ class TpuSRTPlatform(SRTPlatform):
                     "req_to_token."
                 )
             os.environ["SGLANG_TPU_REQ_TO_TOKEN_ON_HOST"] = "1"
+
+        _reject_prefill_early_send(cfg.disaggregation_mode)
 
         # The default TPU backend (Pallas RPA v3) expects a paged KV cache where
         # page_size is the HBM<->VMEM DMA chunk and the fused KV buffer's page

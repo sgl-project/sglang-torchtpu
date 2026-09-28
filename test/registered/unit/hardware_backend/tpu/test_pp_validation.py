@@ -40,6 +40,7 @@ def _args(**overrides):
         speculative_algorithm=None,
         speculative_eagle_topk=None,
         speculative_use_rejection_sampling=False,
+        disaggregation_mode="null",
         pp_async_batch_depth=0,
     )
     defaults.update(overrides)
