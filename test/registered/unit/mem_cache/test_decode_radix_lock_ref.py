@@ -529,6 +529,60 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertIsNone(decode_req.hicache_restored_node)
         self.assertIsNone(decode_req.hicache_restore_lock_receipt)
 
+    def test_hicache_restore_stops_at_promised_prefix(self):
+        """A host prefix that grew after admission must not be restored past
+        the prefix promised to prefill: prefill transfers those tokens, and
+        admission reserved device tokens only for the promised host gap."""
+        q = DecodeHiCacheTransferMixin.__new__(DecodeHiCacheTransferMixin)
+        q.tree_cache = MagicMock()
+        q.tree_cache.swa_reprefill_tail_tokens.return_value = 0
+        l1_indices = torch.arange(4, dtype=torch.int64)
+
+        # The tree now holds the whole prompt: 4 tokens on device, the rest on host.
+        def match_prefix(params):
+            return SimpleNamespace(
+                device_indices=l1_indices,
+                last_device_node="device_node",
+                last_host_node="host_node",
+                best_match_node="host_node",
+                host_hit_length=len(params.key) - len(l1_indices),
+                swa_host_hit_length=0,
+                mamba_host_hit_length=0,
+                swa_branching_seqlen=None,
+                mamba_branching_seqlen=None,
+                cache_protected_len=None,
+            )
+
+        q.tree_cache.match_prefix.side_effect = match_prefix
+        q.tree_cache.init_load_back.side_effect = lambda params: (
+            torch.arange(4, 4 + params.host_hit_length, dtype=torch.int64),
+            "restored_node",
+        )
+
+        req = MagicMock()
+        req.rid = "r"
+        req.origin_input_ids = array("q", range(16))
+        req.extra_key = None
+        req.cache_salt = None
+        req._compute_max_prefix_len = lambda n: n
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.prefix_match = DecodePrefixMatch(
+            prefix_indices=l1_indices,
+            l2_host_hit_length=4,
+            l3_storage_hit_length=0,
+            last_device_node="device_node",
+        )
+
+        self.assertTrue(q._try_hicache_queue_load_back(decode_req))
+
+        key = q.tree_cache.match_prefix.call_args.args[0].key
+        self.assertEqual(len(key), 8)
+        self.assertEqual(
+            decode_req.hicache_restored_kv_indices.tolist(), list(range(4, 8))
+        )
+        self.assertEqual(req.last_node, "device_node")
+
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""
         cache, req_to_token = _make_cache_with_pools()
