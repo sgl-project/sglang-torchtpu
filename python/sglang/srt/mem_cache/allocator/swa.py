@@ -617,9 +617,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Checked at enqueue: a cache action later in this group may pair the
         # slot again, and that new peer is not this call's to judge.
+        mapping = self.full_to_swa_index_mapping
         expect(
             _SWA_PEER_RELEASED,
-            self.full_to_swa_index_mapping[free_index] == 0,
+            mapping[free_index.to(mapping.device)] == 0,
             msg="caller wants free",
         )
         self.full_attn_allocator.free(free_index)
@@ -638,9 +639,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
         if free_index.numel() == 0:
             return
+        mapping = self.full_to_swa_index_mapping
         expect(
             _SWA_PEER_RELEASED,
-            self.full_to_swa_index_mapping[free_index] == 0,
+            mapping[free_index.to(mapping.device)] == 0,
             msg="caller wants free_segment",
         )
         self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
