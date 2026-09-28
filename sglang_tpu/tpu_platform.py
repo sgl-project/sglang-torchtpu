@@ -337,11 +337,14 @@ def _validate_pipeline_parallel_args(server_args: ServerArgs) -> None:
             declare_resolution(
                 server_args, "tpu.apply_server_args_defaults", kv_cache_dtype="bfloat16"
             )
-    if cfg.speculative_algorithm is not None:
+    # PD prefill only exports the target's hidden states for the decode node;
+    # the draft loop itself never runs here, so the stage relay stays spec-free.
+    if cfg.speculative_algorithm is not None and cfg.disaggregation_mode != "prefill":
         raise NotImplementedError(
             "Speculative decoding "
             f"(--speculative-algorithm {cfg.speculative_algorithm}) "
-            f"is not supported with pipeline parallelism on TPU (--pp-size {pp})."
+            f"is not supported with pipeline parallelism on TPU (--pp-size {pp}) "
+            "outside --disaggregation-mode prefill."
         )
     if cfg.enable_dynamic_chunking:
         raise NotImplementedError(

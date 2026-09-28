@@ -7,6 +7,11 @@ the sum of its hidden states and residual to its column's device in the next
 stage, one closed cycle per column. Stage 0 launches once per iteration while
 the wave is active and owes 2 * (stages - 2) zero launches after its last send;
 stage r > 0 launches up to stage 0's count plus min(r - 1, launches owed).
+
+Every launch runs the same compiled program: one buffer padded to the largest
+batch a forward can hand on. Eagle3 widens that buffer by one hidden-wide slot
+per capture layer, since the capture layers sit on different stages and the
+draft needs all of them on the last one.
 """
 
 import logging
@@ -16,6 +21,10 @@ from typing import Any, Callable
 import torch
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
+from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+    SpecAuxHiddenStateConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +119,7 @@ class PPWave:
         size: int,
         rows: int,
         hidden: int,
+        num_aux: int = 0,
         dtype: torch.dtype,
         device: torch.device,
         launcher: Callable[[torch.Tensor], torch.Tensor],
@@ -121,9 +131,14 @@ class PPWave:
         self.last = self.size - 1
         self.rows = int(rows)
         self.hidden = int(hidden)
+        # Eagle3 capture layers sit on different stages, so their slot buffer
+        # rides the same permute: block 0 is the activation sum, then one
+        # hidden-wide slot per capture.
+        self.num_aux = int(num_aux)
+        self.width = self.hidden * (1 + self.num_aux)
         self.dtype = dtype
         self._launcher = launcher
-        self.zero = torch.zeros((self.rows, self.hidden), dtype=dtype, device=device)
+        self.zero = torch.zeros((self.rows, self.width), dtype=dtype, device=device)
         # Output of this stage's last forward, sent at its next launch.
         self.pending: torch.Tensor | None = None
         self.launches = 0
@@ -158,16 +173,31 @@ class PPWave:
             )
         return torch.cat([t, self.zero[n:]])
 
+    def _expected_keys(self) -> set[str]:
+        keys = set(self.KEYS)
+        if self.num_aux:
+            keys.add(AUX_HIDDEN_STATES_PROXY_KEY)
+        return keys
+
     def _merge(self, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
-        """The padded sum of a forward's outgoing hidden states and residual."""
-        if set(tensors) != set(self.KEYS):
+        """A forward's outgoing activation sum, the aux slots appended, padded."""
+        expected = self._expected_keys()
+        if set(tensors) != expected:
             raise ValueError(
-                f"the pipeline wave hands on exactly {self.KEYS}, got {sorted(tensors)}"
+                f"the pipeline wave hands on exactly {sorted(expected)}, "
+                f"got {sorted(tensors)}"
             )
         merged = tensors[self.KEYS[0]] + tensors[self.KEYS[1]]
         if merged.dtype != self.dtype:
             raise ValueError(
                 f"the pipeline wave carries {self.dtype}, got a {merged.dtype} sum"
+            )
+        if self.num_aux:
+            merged = torch.cat([merged, tensors[AUX_HIDDEN_STATES_PROXY_KEY]], dim=-1)
+        if int(merged.shape[-1]) != self.width:
+            raise ValueError(
+                f"the pipeline wave carries {self.width} columns, "
+                f"got {int(merged.shape[-1])}"
             )
         return self._pad(merged)
 
@@ -217,7 +247,13 @@ class PPWave:
                 "iteration with a batch"
             )
         x = self._launch(self._take_pending())
-        return {self.KEYS[0]: x, self.KEYS[1]: self.zero}
+        if not self.num_aux:
+            return {self.KEYS[0]: x, self.KEYS[1]: self.zero}
+        return {
+            self.KEYS[0]: x[:, : self.hidden],
+            self.KEYS[1]: self.zero[:, : self.hidden],
+            AUX_HIDDEN_STATES_PROXY_KEY: x[:, self.hidden :],
+        }
 
     def _check_count(self) -> None:
         expected = self._target()
@@ -264,6 +300,12 @@ class PPWave:
         receives the last stage's block and ignores it).
         Every stage's launch count is level again afterwards."""
         payload = torch.full_like(self.zero, float(self.rank * columns + column + 1))
+        sent = {
+            self.KEYS[0]: payload[:, : self.hidden],
+            self.KEYS[1]: self.zero[:, : self.hidden],
+        }
+        if self.num_aux:
+            sent[AUX_HIDDEN_STATES_PROXY_KEY] = payload[:, self.hidden :]
         got = None
         for it in range(1 + 2 * (self.size - 2)):
             has_batch = it == 0
@@ -272,13 +314,35 @@ class PPWave:
             if has_batch:
                 got = self.receive()
                 if self.rank != self.last:
-                    tensors = {self.KEYS[0]: payload, self.KEYS[1]: self.zero}
+                    tensors = sent
             self.end_iteration(tensors)
         if self.rank == 0:
             return True
         want = float((self.rank - 1) * columns + column + 1)
-        x = got[self.KEYS[0]]
-        return float(x[0, 0].item()) == want and float(x[-1, -1].item()) == want
+        blocks = [got[self.KEYS[0]]]
+        if self.num_aux:
+            blocks.append(got[AUX_HIDDEN_STATES_PROXY_KEY])
+        return all(
+            float(x[0, 0].item()) == want and float(x[-1, -1].item()) == want
+            for x in blocks
+        )
+
+
+def num_relayed_aux_slots(config: SpecAuxHiddenStateConfig) -> int:
+    """Eagle3 capture slots a pipeline stage hand-off carries; 0 when none.
+
+    The capture layers sit on different stages, so each one occupies a
+    hidden-wide slot that rides the hand-off to the stage holding the draft.
+    """
+    if not config.eagle_use_aux_hidden_state:
+        return 0
+    layer_ids = config.eagle_aux_hidden_state_layer_ids
+    if layer_ids is None:
+        raise NotImplementedError(
+            "Pipeline parallelism sizes its stage hand-off from the draft's "
+            "eagle_aux_hidden_state_layer_ids, which this draft does not declare."
+        )
+    return len(layer_ids)
 
 
 def build_pp_wave(
@@ -288,6 +352,7 @@ def build_pp_wave(
     world_group: GroupCoordinator,
     rows: int,
     hidden: int,
+    num_aux: int = 0,
     dtype: torch.dtype,
     device: torch.device,
 ) -> PPWave:
@@ -318,6 +383,7 @@ def build_pp_wave(
         size=size,
         rows=rows,
         hidden=hidden,
+        num_aux=num_aux,
         dtype=dtype,
         device=device,
         launcher=lambda x: launch_now(op, x),
@@ -333,14 +399,15 @@ def build_pp_wave(
         )
     logger.info(
         "pipeline wave stage %d/%d column %d/%d: hand-off cycles %s, "
-        "buffer [%d, %d] %s",
+        "buffer [%d, %d] %s (%d aux slot(s))",
         rank,
         size,
         column,
         columns,
         perm,
         rows,
-        hidden,
+        wave.width,
         dtype,
+        num_aux,
     )
     return wave

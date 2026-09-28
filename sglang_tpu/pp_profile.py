@@ -5,7 +5,9 @@ from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 
 @contextmanager
@@ -105,12 +107,18 @@ def set_profile_inputs(policy, batch, args, kwargs, tokens, prefix):
         # so a chunk-sized proxy here would trace a row count serving never
         # repeats.
         rows = max_extend_tokens(context_len=runner.model_config.context_len)
-        proxy = {
-            key: torch.randn(
-                (rows, hidden), generator=generator, dtype=runner.dtype
+
+        def randn(cols: int) -> torch.Tensor:
+            return torch.randn(
+                (rows, cols), generator=generator, dtype=runner.dtype
             ).to(device)
-            for key in ("hidden_states", "residual")
-        }
+
+        proxy = {"hidden_states": randn(hidden), "residual": randn(hidden)}
+        # Serving hands the Eagle3 capture slots on with the activations, so
+        # the profiled chunk must carry them too.
+        num_aux = num_relayed_aux_slots(runner.spec_aux_config)
+        if num_aux:
+            proxy[AUX_HIDDEN_STATES_PROXY_KEY] = randn(hidden * num_aux)
         kwargs["pp_proxy_tensors"] = PPProxyTensors(proxy)
         tensors.extend(proxy.values())
     from torch_tpu._internal.sync.sync import synchronize

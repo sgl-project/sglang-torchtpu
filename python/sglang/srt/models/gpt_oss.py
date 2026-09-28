@@ -30,7 +30,10 @@ from transformers import PretrainedConfig
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.aux_hidden_states import (
+    AUX_HIDDEN_STATES_PROXY_KEY,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -689,12 +692,46 @@ class GptOssModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture: list[int] = []
+        # Slot each of this stage's captures occupies in the global buffer.
+        self.local_capture_slots: list[int] = []
 
     def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]) -> None:
-        self.layers_to_capture = layers_to_capture
+        self._set_layers_to_capture(layers_to_capture)
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]) -> None:
+        self._set_layers_to_capture(layers_to_capture)
+
+    def _set_layers_to_capture(self, layers_to_capture: list[int]) -> None:
         self.layers_to_capture = layers_to_capture
+        # The final norm output (boundary end_layer) is captured on the last stage only.
+        self.local_capture_slots = [
+            slot
+            for slot, layer_id in enumerate(layers_to_capture)
+            if self.start_layer <= layer_id < self.end_layer
+            or layer_id == self.end_layer == len(self.layers)
+        ]
+
+    def _relay_aux_hidden_states(
+        self,
+        incoming: Optional[torch.Tensor],
+        captured: list[torch.Tensor],
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """The global [tokens, num_captures * hidden] slot buffer.
+
+        Under PP the Eagle3 capture layers are spread over the stages, so
+        earlier stages' captures ride through untouched while this stage's
+        land in their own slots. Slots nobody has filled yet are zero.
+        """
+        hidden = reference.shape[-1]
+        if incoming is None:
+            unfilled = reference.new_zeros((reference.shape[0], hidden))
+            slots = [unfilled] * len(self.layers_to_capture)
+        else:
+            slots = list(torch.split(incoming, hidden, dim=-1))
+        for slot, captured_hidden in zip(self.local_capture_slots, captured):
+            slots[slot] = captured_hidden
+        return torch.cat(slots, dim=-1)
 
     def forward(
         self,
@@ -710,11 +747,13 @@ class GptOssModel(nn.Module):
             else:
                 hidden_states = input_embeds
             residual_batch.start(forward_batch)
+            aux_buffer = None
         else:
             assert pp_proxy_tensors is not None
             hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
                 pp_proxy_tensors, forward_batch
             )
+            aux_buffer = pp_proxy_tensors.tensors.get(AUX_HIDDEN_STATES_PROXY_KEY)
 
         # Capture hidden-state boundaries: boundary 0 is the embedding output,
         # and boundary i + 1 is the output after transformer block i.
@@ -731,7 +770,12 @@ class GptOssModel(nn.Module):
                     else None,
                 )
         if not self.pp_group.is_last_rank:
-            return residual_batch.to_pp(hidden_states, forward_batch)
+            proxy = residual_batch.to_pp(hidden_states, forward_batch)
+            if self.layers_to_capture:
+                proxy[AUX_HIDDEN_STATES_PROXY_KEY] = self._relay_aux_hidden_states(
+                    aux_buffer, aux_hidden_states, proxy["hidden_states"]
+                )
+            return proxy
         else:
             hidden_states = residual_batch.complete_output(hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
@@ -747,10 +791,14 @@ class GptOssModel(nn.Module):
                 aux_hidden_states.append(
                     residual_batch.snapshot(hidden_states, forward_batch)
                 )
-        if len(aux_hidden_states) == 0:
+        if self.layers_to_capture:
+            aux_buffer = self._relay_aux_hidden_states(
+                aux_buffer, aux_hidden_states, hidden_states
+            )
+        if aux_buffer is None:
             return hidden_states
 
-        return hidden_states, aux_hidden_states
+        return hidden_states, aux_buffer
 
 
 class GptOssForCausalLM(nn.Module):
@@ -815,20 +863,21 @@ class GptOssForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
 
+        # Off the last stage the captures ride on inside the proxy tensors.
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids,
-                hidden_states,
-                self.lm_head,
-                forward_batch,
-                aux_hidden_states,
-            )
-        else:
-            return hidden_states
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     @property
     def start_layer(self):
@@ -1351,21 +1400,18 @@ class GptOssForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
-        if not self.pp_group.is_last_rank:
-            return
-
+        # Every stage marks the capture layers it owns and relays the buffer;
+        # only the last stage unpacks it out of the model's return.
+        self.capture_aux_hidden_states = self.pp_group.is_last_rank
         num_layers = self.config.num_hidden_layers
         if layer_ids is None:
-            self.capture_aux_hidden_states = True
             self.model.set_eagle3_layers_to_capture(
                 [2, num_layers // 2, num_layers - 3]
             )
+        elif layer_ids and max(layer_ids) == num_layers:
+            self.model.set_eagle3_layers_to_capture(list(layer_ids))
         else:
-            self.capture_aux_hidden_states = True
-            if layer_ids and max(layer_ids) == num_layers:
-                self.model.set_eagle3_layers_to_capture(list(layer_ids))
-            else:
-                self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         if not self.pp_group.is_last_rank:

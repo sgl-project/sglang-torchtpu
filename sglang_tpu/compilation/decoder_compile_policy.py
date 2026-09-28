@@ -16,6 +16,7 @@ from torch.utils._pytree import tree_leaves
 from sglang.srt.compilation import torch_compile_bundle
 from sglang.srt.compilation.support_torch_compile import DecoderCompilePolicy
 from sglang.srt.environ import envs
+from sglang.srt.layers.aux_hidden_states import AUX_HIDDEN_STATES_PROXY_KEY
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active, prepare_cp_forward
 from sglang.srt.layers.dp_attention import dp_gather_width, is_dp_attention_enabled
@@ -68,6 +69,7 @@ from sglang_tpu.cp_forward import (
     wrap_cp_embedding_forward,
 )
 from sglang_tpu.cp_layout import warmup_request_lengths
+from sglang_tpu.pp_wave import num_relayed_aux_slots
 
 logger = get_logger(__name__)
 
@@ -880,15 +882,21 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         hidden_size = self.model_runner.model_config.hidden_size
         zeros = functools.partial(
             torch.zeros,
-            (num_tokens, hidden_size),
             dtype=self.model_runner.dtype,
             device=self.model_runner.device,
         )
-        return {
-            "pp_proxy_tensors": PPProxyTensors(
-                {"hidden_states": zeros(), "residual": zeros()}
-            )
+        proxy = {
+            "hidden_states": zeros((num_tokens, hidden_size)),
+            "residual": zeros((num_tokens, hidden_size)),
         }
+        # Serving hands the Eagle3 capture slots on with the activations, so
+        # trace them too or the graph signature differs from the real one.
+        num_aux = num_relayed_aux_slots(self.model_runner.spec_aux_config)
+        if num_aux:
+            proxy[AUX_HIDDEN_STATES_PROXY_KEY] = zeros(
+                (num_tokens, hidden_size * num_aux)
+            )
+        return {"pp_proxy_tensors": PPProxyTensors(proxy)}
 
     def _distributed_top_k_width(self) -> int | None:
         if not self._compiles_logits_processor():

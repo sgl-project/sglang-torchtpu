@@ -13,6 +13,10 @@ if TYPE_CHECKING:
 # packed [tokens, K * hidden] tensor, the rest still pass a list of K tensors.
 AuxHiddenStates = Union[torch.Tensor, List[torch.Tensor]]
 
+# PPProxyTensors key carrying the packed slot buffer between pipeline stages,
+# since the capture layers are spread over the stages.
+AUX_HIDDEN_STATES_PROXY_KEY = "aux_hidden_states"
+
 
 class AuxHiddenStateList(list):
     """Retain aux snapshots independently of storage reused by later layers."""
