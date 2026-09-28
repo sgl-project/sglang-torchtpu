@@ -20,7 +20,7 @@ thread and returns poll-only future-events, which serve as the acks and feed a
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 
@@ -221,3 +221,28 @@ class TpuRaidenHybridCacheController(HybridCacheController):
             )
         )
         return producer_id
+
+    def is_load_back_event_done(
+        self, consumer_index: int, all_reduce: Callable[[torch.Tensor, Any], None]
+    ) -> bool:
+        """Return True once the load-back in ``consumer_index`` landed on all ranks.
+
+        The controller-level counterpart of the cache's
+        ``is_load_back_event_done``: it only answers the question and has no
+        side effects. The cache runs ``loading_check`` after a True answer.
+
+        Each ``BatchDoneCounter`` slot holds the load's combined future-event
+        itself, or ``None`` before the slot's first load. A raiden DMA can
+        finish at different times on different ranks, while the cache's
+        ``loading_check`` issues collectives. ``all_reduce`` combines the local
+        results over the cache's rank groups, so every rank makes the same
+        decision and enters those collectives together.
+        """
+        if consumer_index < 0:
+            return True
+        event = self.layer_done_counter.events[consumer_index]
+        done = torch.tensor(
+            int(event is None or event.query()), dtype=torch.int, device="cpu"
+        )
+        all_reduce(done, torch.distributed.ReduceOp.MIN)
+        return bool(done.item())
