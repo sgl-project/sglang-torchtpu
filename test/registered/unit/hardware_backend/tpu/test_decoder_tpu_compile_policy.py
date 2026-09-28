@@ -3603,6 +3603,12 @@ class TestSpecVerifyPaddingRecord(_SpecPolicyTestCase):
         self.assertEqual(accept_index.shape, (BS, DRAFT_TOKEN_NUM))
         self.assertEqual(new_seq_lens.shape, (BS,))
         self.assertEqual(bonus_tokens.shape, (BS,))
+        # The host copies of these run later on the result-copy thread; they
+        # must own their storage so no slice needs materializing then.
+        self.assertIsNone(predict._base)
+        self.assertIsNone(accept_lens._base)
+        self.assertEqual(predict.tolist(), list(range(LOGICAL_TOKENS)))
+        self.assertEqual(accept_lens.tolist(), list(range(BS)))
 
     def test_skips_when_the_forward_did_not_defer(self):
         batch = _make_batch(temperature=0.7)

@@ -1462,10 +1462,18 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         sampling_info.top_ps = padding.top_ps
         state = padding.state
         logical_bs = state.logical_batch_size
+        # The scheduler copies predict and accept_lens to the host from the
+        # result-copy thread, after the next step is already queued. Copying a
+        # slice first needs a device program to make it contiguous, which would
+        # then wait behind that whole step; materialize both here instead.
         return (
             (
-                predict[: state.logical_num_tokens] if predict is not None else None,
-                accept_lens[:logical_bs] if accept_lens is not None else None,
+                (
+                    predict[: state.logical_num_tokens].clone()
+                    if predict is not None
+                    else None
+                ),
+                accept_lens[:logical_bs].clone() if accept_lens is not None else None,
                 accept_index[:logical_bs] if accept_index is not None else None,
             ),
             (
