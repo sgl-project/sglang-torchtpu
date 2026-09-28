@@ -211,5 +211,57 @@ class TestGatheredBlockFilterEquivalence(CustomTestCase):
                     np.testing.assert_array_equal(row_full, row_block)
 
 
+@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+class TestEagleVerifyRenormMatchesSortFallback(CustomTestCase):
+    """EAGLE verify's sort-free renorms must keep the same support as the
+    sort-based torch fallbacks they replace, applied top-k then top-p."""
+
+    def test_chained_top_k_then_top_p_matches_sort_fallback(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            top_k_renorm_prob_tpu,
+            top_p_renorm_prob_tpu,
+        )
+        from sglang.srt.speculative.eagle_utils import (
+            _top_k_renorm_prob_torch,
+            _top_p_renorm_prob_torch,
+        )
+
+        rng = np.random.default_rng(29)
+        probs = torch.from_numpy(_random_rows(rng, batch_size=64, vocab_size=4096))
+        top_ks = torch.from_numpy(rng.choice([1, 2, 50, 64, 1 << 30], 64)).int()
+        top_ps = torch.from_numpy(rng.choice([0.5, 0.9, 1.0], 64).astype(np.float32))
+
+        expected = _top_p_renorm_prob_torch(
+            _top_k_renorm_prob_torch(probs, top_ks), top_ps
+        )
+        actual = top_p_renorm_prob_tpu(
+            top_k_renorm_prob_tpu(probs.to("tpu"), top_ks.to("tpu")), top_ps.to("tpu")
+        ).cpu()
+        # top_p == 1.0 keeps the whole row; the sort fallback can drop a tail
+        # whose float32 prefix mass rounds up to 1.0, so compare those by mass.
+        partial = top_ps < 1.0
+        np.testing.assert_array_equal(
+            (actual[partial] > 0).numpy(), (expected[partial] > 0).numpy()
+        )
+        torch.testing.assert_close(
+            actual[partial], expected[partial], rtol=1e-5, atol=1e-7
+        )
+        torch.testing.assert_close(
+            actual[~partial].sum(-1), torch.ones(int((~partial).sum()))
+        )
+        self.assertLess(
+            float((actual[~partial] - expected[~partial]).abs().sum()), 1e-4
+        )
+
+    def test_boundary_ties_are_kept_inclusively(self):
+        from sglang.srt.hardware_backend.tpu.eagle_utils_tpu import (
+            top_k_renorm_prob_tpu,
+        )
+
+        probs = torch.tensor([[0.4, 0.2, 0.2, 0.2]])
+        actual = top_k_renorm_prob_tpu(probs.to("tpu"), torch.tensor([2]).to("tpu"))
+        torch.testing.assert_close(actual.cpu(), probs)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,6 +60,8 @@ if _is_tpu:
         build_topk1_verify_tree_tpu,
         prepare_device_accept_tpu,
         prepare_verify_cache_locs_tpu,
+        top_k_renorm_prob_tpu,
+        top_p_renorm_prob_tpu,
     )
 
 logger = logging.getLogger(__name__)
@@ -1394,7 +1396,7 @@ def top_k_renorm_prob_func(
     if _is_tpu:
         if not need_top_k_sampling:
             return probs
-        return _top_k_renorm_prob_torch(probs, top_ks)
+        return top_k_renorm_prob_tpu(probs, top_ks)
     from sgl_kernel import top_k_renorm_prob
 
     return top_k_renorm_prob(probs, top_ks)
@@ -1402,7 +1404,7 @@ def top_k_renorm_prob_func(
 
 def top_p_renorm_prob_func(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
     if _is_tpu:
-        return _top_p_renorm_prob_torch(probs, top_ps)
+        return top_p_renorm_prob_tpu(probs, top_ps)
     from sgl_kernel import top_p_renorm_prob
 
     return top_p_renorm_prob(probs, top_ps)
