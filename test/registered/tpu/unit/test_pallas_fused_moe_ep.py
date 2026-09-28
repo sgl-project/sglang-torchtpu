@@ -242,8 +242,9 @@ class TestFusedMoEExpertParallel(CustomTestCase):
     def test_no_combine_zeroes_weight_masked_slots_without_group_offset(self):
         """The TPU FP4 path remaps non-local slots to expert 0 and zeros their
         kernel weights before calling the local Pallas kernel. no_combine must
-        return zeros for those weight-masked slots because Llama4x applies the
-        original router weights later during post-expert norm finalize.
+        return zeros for those weight-masked slots because a model with a
+        post-expert norm applies the original router weights later, when it
+        finalizes the per-expert outputs.
         """
         x, w1, w2, topk_weights, topk_ids = self.make_inputs(tokens=128, seed=2)
         masked_weights = topk_weights.at[:, 1::2].set(0)
