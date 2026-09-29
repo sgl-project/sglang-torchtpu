@@ -2398,6 +2398,33 @@ class TestDFlashCompilePolicy(_PolicyTestCase):
         self.assertEqual(fb.extend_prefix_lens.tolist(), [0] * 4)
         self.assertEqual(fb.extend_num_tokens, 16)
 
+    def test_block_embed_warmup_reused_under_serving_grad_mode(self):
+        torch._dynamo.reset()
+        self.addCleanup(torch._dynamo.reset)
+        policy, _ = self._make_dflash_policy(bs_buckets=(1, 4, 64), draft_token_num=6)
+        policy.backend = "eager"
+        policy.dynamic = False
+        embedding = torch.nn.Embedding(16, 8)
+
+        def embed_draft_block_ids(*, block_ids):
+            return embedding(block_ids).flatten(0, 1)
+
+        worker = SimpleNamespace(
+            embed_draft_block_ids=embed_draft_block_ids,
+            ensure_embed_module=lambda: embedding,
+        )
+        with torch.enable_grad(), get_parallel().override(tp_rank=1):
+            policy._precompile_embed_draft_block_ids(worker)
+            self.assertTrue(torch.is_grad_enabled())
+
+        # Startup runs with gradients enabled; the scheduler disables them.
+        # Every warmed bucket must remain usable once recompiles are forbidden.
+        with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
+            for bs in (1, 4, 64):
+                block_ids = torch.arange(bs * 6).reshape(bs, 6) % 16
+                actual = worker.embed_draft_block_ids(block_ids=block_ids)
+                torch.testing.assert_close(actual, embedding(block_ids).flatten(0, 1))
+
     def test_precompile_draft_pd_prefill_mode_skips_verify(self):
         policy, mr = self._make_dflash_policy(
             token_buckets=(16, 64), bs_buckets=(1, 4), draft_token_num=4

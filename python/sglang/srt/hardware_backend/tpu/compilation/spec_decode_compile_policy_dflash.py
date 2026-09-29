@@ -573,8 +573,11 @@ class DFlashSpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         if disagg_mode != "decode":
             self._precompile_draft_append_kv_extend()
 
+    @torch.no_grad()
     def _precompile_embed_draft_block_ids(self, dflash_worker: DFlashWorkerV2) -> None:
         """Compile the drafted-block embedder across batch size buckets."""
+        # Dynamo guards the caller's grad mode before entering the compiled
+        # no_grad wrapper, so warmup must match the scheduler's no_grad context.
         self._ensure_block_embedder(dflash_worker)
         if self.b_bucketer is None:
             raise ValueError(
