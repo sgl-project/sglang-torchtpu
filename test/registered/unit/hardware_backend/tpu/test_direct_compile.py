@@ -11,11 +11,16 @@ from jax import tree_util
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
+from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+    DecoderTpuCompilePolicy,
+)
+from sglang.srt.layers import dp_attention
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -1111,6 +1116,56 @@ class TestDirectCompile(CustomTestCase):
             artifact(((torch.ones(2),), {}))
 
         self.assertEqual(len(executed), 1)
+
+
+class _RankModel(torch.nn.Module):
+    def forward(self, input_ids, positions, forward_batch):
+        mask = dp_attention._dp_rank_slot_mask(2, input_ids.device)
+        scale = dp_attention.attn_rank0_scale(input_ids)
+        return torch.where(mask[:, None], input_ids[None, :] * scale, 0)
+
+
+class _RankPolicy(DecoderTpuCompilePolicy):
+    def _direct_compile_specialization_key(self, metadata, input_ids, *args, **kwargs):
+        return tuple(input_ids.shape)
+
+
+@unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+class TestDirectCompileDpRanks(unittest.TestCase):
+    def test_rank_selectors_are_runtime_inputs(self):
+        model = _RankModel()
+        policy = _RankPolicy(
+            model_runner=SimpleNamespace(
+                model=model, token_to_kv_pool=None, device="tpu"
+            ),
+            owner=model,
+            tracer="direct",
+        )
+        ranks = {
+            axis: torch.tensor(0, dtype=torch.int64, device="tpu")
+            for axis in ("attn_tp", "attn_dp")
+        }
+        cache = {
+            (axis, device): value
+            for axis, value in ranks.items()
+            for device in (torch.device("tpu"), value.device)
+        }
+        values = torch.tensor([2.0, 3.0], device="tpu")
+        backend = SimpleNamespace(forward_metadata=None)
+        with (
+            patch.object(dp_attention, "_RANK_TENSORS", cache),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            compiled = policy._direct_compile(model.forward)
+            # Reuse one executable while changing both scalar rank buffers.
+            # Constants baked during tracing would return the first rank's result.
+            for tp_rank, dp_rank in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                ranks["attn_tp"].fill_(tp_rank)
+                ranks["attn_dp"].fill_(dp_rank)
+                expected = model(values, None, None).cpu()
+                actual = compiled(values, None, None).cpu()
+                torch.testing.assert_close(actual, expected)
+                self.assertIs(dp_attention._RANK_TENSORS, cache)
 
 
 if __name__ == "__main__":
