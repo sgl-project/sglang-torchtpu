@@ -1765,6 +1765,9 @@ class Envs:
     SGLANG_TPU_HOST_PADDING = EnvBool(False)
     SGLANG_TPU_CHECK_RECOMPILATION = EnvBool(False)
     SGLANG_TPU_ALLOW_SPEC_RECOMPILE = EnvBool(False)
+    # Warn once per cpu_export_jax_op op when one input shape exports more than
+    # this many static-arg variants (e.g. one per layer). 0 disables.
+    SGLANG_TPU_PALLAS_EXPORT_STATIC_VARIANT_THRESHOLD = EnvInt(16)
     # Serve input (prompt) logprobs on the compiled backend. Opt-in because it
     # is not free for anyone else: the compiled extend must return every prefill
     # row (CaptureHiddenMode.FULL), and capture_hidden_mode is part of the

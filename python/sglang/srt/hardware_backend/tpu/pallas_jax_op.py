@@ -11,6 +11,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torch_tpu._internal.pallas import pallas as pallas_impl
 
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
+from sglang.srt.hardware_backend.tpu.pallas_export_stats import record_export_call
 
 
 def _torch_placeholder_with_sharding(
@@ -40,6 +41,9 @@ def _torch_placeholder(aval, sharding, mesh):
 
 
 class _CpuExportJaxCallable(pallas_impl.JaxCallable):
+    # Set by cpu_export_jax_op so export stats can name static args.
+    sglang_param_names: tuple[str, ...] = ()
+
     def __call__(self, *args, **kwargs):
         self._validate_args(*args)
         kernel_key = pallas_impl._get_kernel_invocation_key(
@@ -58,7 +62,8 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
                 self.name, native_kernel_key
             )
         )
-        if not output_shapes or not kernel_exists:
+        exported = not output_shapes or not kernel_exists
+        if exported:
             jax_args = pallas_impl.jax_placeholders(
                 args,
                 mesh=self.mesh,
@@ -91,6 +96,15 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
             ]
             out_tree = lowered.out_tree
             self.output_shapes[kernel_key] = (output_shapes, out_tree)
+        # Diagnostic only: the kernel key and static values stay unchanged.
+        record_export_call(
+            self.name,
+            exported=exported,
+            param_names=self.sglang_param_names,
+            static_argnums=self.static_argnums,
+            args=args,
+            kwargs=kwargs,
+        )
 
         tensor_args = [
             arg
@@ -160,6 +174,7 @@ def cpu_export_jax_op(
         donate_argnums=donate_argnums_tuple,
     )
     wrapped.sglang_output_shardings = output_shardings
+    wrapped.sglang_param_names = tuple(signature.parameters)
     custom_op = torch.library.custom_op(name, wrapped, mutates_args=())
 
     def fake_function(*args, **kwargs):
