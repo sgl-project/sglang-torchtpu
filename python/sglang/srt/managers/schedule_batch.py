@@ -140,8 +140,16 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import flatten_nested_list
+from sglang.srt.utils import flatten_nested_list, is_tpu
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
+
+_is_tpu = is_tpu()
+
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.schedule_batch_tpu import (
+        rows_on_host_tpu,
+        upload_rows_tpu,
+    )
 
 if TYPE_CHECKING:
     from typing import Any, Dict
@@ -3620,10 +3628,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.reqs = [self.reqs[i] for i in keep_indices]
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
-        self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+        rows_on_host = _is_tpu and rows_on_host_tpu(self)
+        if not rows_on_host:
+            self.req_pool_indices = self.req_pool_indices[keep_indices_device]
+            self.seq_lens = self.seq_lens[keep_indices_device]
+            self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.req_pool_indices_cpu = self.req_pool_indices_cpu[keep_indices]
-        self.seq_lens = self.seq_lens[keep_indices_device]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3633,6 +3643,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Optional under no-verify-sync; resolve_seq_lens repopulates before forward.
         if self.seq_lens_cpu is not None:
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
+        if rows_on_host:
+            self.req_pool_indices, self.seq_lens, self.orig_seq_lens = upload_rows_tpu(
+                req_pool_indices_cpu=self.req_pool_indices_cpu,
+                seq_lens_cpu=self.seq_lens_cpu,
+                device=self.device,
+            )
 
         self.mamba_track_indices = None
         self.mamba_track_buffer_indices = None
@@ -3657,7 +3673,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states_mode = get_batch_return_hidden_states_mode(self.reqs)
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
-        self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        self.sampling_info.filter_batch(
+            keep_indices, keep_indices_device, reqs=self.reqs if rows_on_host else None
+        )
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
@@ -3667,23 +3685,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)
+        rows_on_host = _is_tpu and rows_on_host_tpu(self, other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
-        self.sampling_info.merge_batch(other.sampling_info)
+        self.sampling_info.merge_batch(
+            other.sampling_info, reqs=self.reqs + other.reqs if rows_on_host else None
+        )
 
         # Encoder-decoder infos
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = torch.cat([self.encoder_lens, other.encoder_lens])
             self.encoder_lens_cpu = self.encoder_lens_cpu + other.encoder_lens_cpu
-        self.req_pool_indices = torch.cat(
-            [self.req_pool_indices, other.req_pool_indices]
-        )
+        if not rows_on_host:
+            self.req_pool_indices = torch.cat(
+                [self.req_pool_indices, other.req_pool_indices]
+            )
+            self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+            self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.req_pool_indices_cpu = torch.cat(
             [self.req_pool_indices_cpu, other.req_pool_indices_cpu]
         )
-        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -3700,6 +3722,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = None
         else:
             self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
+        if rows_on_host:
+            self.req_pool_indices, self.seq_lens, self.orig_seq_lens = upload_rows_tpu(
+                req_pool_indices_cpu=self.req_pool_indices_cpu,
+                seq_lens_cpu=self.seq_lens_cpu,
+                device=self.device,
+            )
         self.mamba_track_indices = None
         self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None

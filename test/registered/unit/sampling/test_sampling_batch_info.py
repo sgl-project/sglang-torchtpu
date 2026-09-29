@@ -44,6 +44,18 @@ def _make_info(batch_size=2, **overrides):
     return SamplingBatchInfo(**defaults)
 
 
+def _reqs(*params):
+    """Requests carrying (temperature, top_p, top_k, min_p, sampling_seed)."""
+    return [
+        SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                temperature=t, top_p=p, top_k=k, min_p=m, sampling_seed=s
+            )
+        )
+        for t, p, k, m, s in params
+    ]
+
+
 def _serial_batched_fill(entries, vocab_mask):
     for entry in entries:
         entry.grammar.fill_vocab_mask(vocab_mask, entry.row)
@@ -472,6 +484,21 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([1], keep)
         self.assertIsNone(info.sampling_seed)
 
+    def test_filter_rebuilds_rows_from_given_reqs(self):
+        """Given the kept requests, the rows come from their sampling params."""
+        info = _make_info(batch_size=3, sampling_seed=torch.tensor([1, 2, 3]))
+        info.logit_bias = torch.ones(3, VOCAB_SIZE)
+        kept = _reqs((0.5, 0.9, 40, 0.1, 7), (0.7, 0.8, 5, 0.2, None))
+        info.filter_batch([0, 2], torch.tensor([0, 2]), reqs=kept)
+        self.assertEqual(len(info), 2)
+        self.assertTrue(torch.allclose(info.temperatures, torch.tensor([[0.5], [0.7]])))
+        self.assertTrue(torch.allclose(info.top_ps, torch.tensor([0.9, 0.8])))
+        self.assertEqual(info.top_ks.dtype, torch.int32)
+        self.assertEqual(info.top_ks.tolist(), [40, 5])
+        self.assertTrue(torch.allclose(info.min_ps, torch.tensor([0.1, 0.2])))
+        self.assertEqual(info.sampling_seed.tolist(), [7, 42])
+        self.assertEqual(info.logit_bias.shape, (2, VOCAB_SIZE))
+
 
 # merge_batch
 class TestMergeBatch(CustomTestCase):
@@ -568,6 +595,23 @@ class TestMergeBatch(CustomTestCase):
         self.assertEqual(info1.sampling_seed[0].item(), 10)
         self.assertEqual(info1.sampling_seed[1].item(), 20)
         self.assertEqual(info1.sampling_seed[2].item(), 30)
+
+    def test_merge_rebuilds_rows_from_given_reqs(self):
+        """Given the merged requests, the rows come from their sampling params."""
+        info1 = _make_info(batch_size=2)
+        info1.logit_bias = torch.ones(2, VOCAB_SIZE)
+        info2 = _make_info(batch_size=1)
+        merged = _reqs(
+            (0.5, 0.9, 40, 0.1, None),
+            (0.0, 1.0, 1, 0.0, None),
+            (1.0, 0.5, TOP_K_ALL, 0.0, None),
+        )
+        info1.merge_batch(info2, reqs=merged)
+        self.assertEqual(len(info1), 3)
+        self.assertEqual(info1.top_ks.tolist(), [40, 1, TOP_K_ALL])
+        self.assertTrue(torch.allclose(info1.top_ps, torch.tensor([0.9, 1.0, 0.5])))
+        self.assertIsNone(info1.sampling_seed)
+        self.assertEqual(info1.logit_bias.shape, (3, VOCAB_SIZE))
 
 
 # copy_for_forward

@@ -19,11 +19,57 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.sampling.sampling_observer import SamplingObserver
 
 
 logger = logging.getLogger(__name__)
+
+
+def _sampling_rows(*, reqs, device, with_seed: bool) -> Tuple[torch.Tensor, ...]:
+    """Per-request temperatures, top_ps, top_ks, min_ps and sampling_seed rows."""
+    _pin = is_pin_memory_available(device)
+    temperatures = (
+        torch.tensor(
+            [r.sampling_params.temperature for r in reqs],
+            dtype=torch.float,
+            pin_memory=_pin,
+        )
+        .to(device, non_blocking=True)
+        .view(-1, 1)
+    )
+    top_ps = torch.tensor(
+        [r.sampling_params.top_p for r in reqs],
+        dtype=torch.float,
+        pin_memory=_pin,
+    ).to(device, non_blocking=True)
+    top_ks = torch.tensor(
+        [r.sampling_params.top_k for r in reqs],
+        dtype=torch.int32,
+        pin_memory=_pin,
+    ).to(device, non_blocking=True)
+    min_ps = torch.tensor(
+        [r.sampling_params.min_p for r in reqs],
+        dtype=torch.float,
+        pin_memory=_pin,
+    ).to(device, non_blocking=True)
+    sampling_seed = (
+        torch.tensor(
+            [
+                (
+                    r.sampling_params.sampling_seed
+                    if r.sampling_params.sampling_seed is not None
+                    else 42
+                )
+                for r in reqs
+            ],
+            dtype=torch.int64,
+            pin_memory=_pin,
+        ).to(device, non_blocking=True)
+        if with_seed
+        else None
+    )
+    return temperatures, top_ps, top_ks, min_ps, sampling_seed
 
 
 @dataclasses.dataclass
@@ -101,47 +147,9 @@ class SamplingBatchInfo:
 
         reqs = batch.reqs
         device = batch.device
-        _pin = is_pin_memory_available(device)
-        temperatures = (
-            torch.tensor(
-                [r.sampling_params.temperature for r in reqs],
-                dtype=torch.float,
-                pin_memory=_pin,
-            )
-            .to(device, non_blocking=True)
-            .view(-1, 1)
-        )
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs],
-            dtype=torch.float,
-            pin_memory=_pin,
-        ).to(device, non_blocking=True)
         top_k_values = [r.sampling_params.top_k for r in reqs]
-        top_ks = torch.tensor(
-            top_k_values,
-            dtype=torch.int32,
-            pin_memory=_pin,
-        ).to(device, non_blocking=True)
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs],
-            dtype=torch.float,
-            pin_memory=_pin,
-        ).to(device, non_blocking=True)
-        sampling_seed = (
-            torch.tensor(
-                [
-                    (
-                        r.sampling_params.sampling_seed
-                        if r.sampling_params.sampling_seed is not None
-                        else 42
-                    )
-                    for r in reqs
-                ],
-                dtype=torch.int64,
-                pin_memory=_pin,
-            ).to(device, non_blocking=True)
-            if enable_deterministic
-            else None
+        temperatures, top_ps, top_ks, min_ps, sampling_seed = _sampling_rows(
+            reqs=reqs, device=device, with_seed=enable_deterministic
         )
 
         logit_bias = None
@@ -356,22 +364,31 @@ class SamplingBatchInfo:
 
         return observer_state
 
-    def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
+    def filter_batch(
+        self,
+        keep_indices: List[int],
+        keep_indices_device: torch.Tensor,
+        reqs: Optional[List[Req]] = None,
+    ):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
 
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[keep_indices_device])
+        # Given the kept requests, the rows are rebuilt from them instead.
+        if reqs is not None:
+            self._rebuild_rows(reqs)
+        else:
+            for item in [
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "sampling_seed",
+            ]:
+                value = getattr(self, item, None)
+                if value is not None:
+                    setattr(self, item, value[keep_indices_device])
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -448,7 +465,7 @@ class SamplingBatchInfo:
 
         return merged_dict
 
-    def merge_batch(self, other: SamplingBatchInfo):
+    def merge_batch(self, other: SamplingBatchInfo, reqs: Optional[List[Req]] = None):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists
@@ -504,17 +521,21 @@ class SamplingBatchInfo:
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
         # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
+        # Given the merged requests, the rows are rebuilt from them instead.
+        if reqs is not None:
+            self._rebuild_rows(reqs)
+        else:
+            for item in [
+                "temperatures",
+                "top_ps",
+                "top_ks",
+                "min_ps",
+                "sampling_seed",
+            ]:
+                self_val = getattr(self, item, None)
+                other_val = getattr(other, item, None)
+                if self_val is not None and other_val is not None:
+                    setattr(self, item, torch.cat([self_val, other_val]))
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
@@ -526,6 +547,17 @@ class SamplingBatchInfo:
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
 
         self.adjusted_merge_batch(other)
+
+    def _rebuild_rows(self, reqs: List[Req]):
+        (
+            self.temperatures,
+            self.top_ps,
+            self.top_ks,
+            self.min_ps,
+            self.sampling_seed,
+        ) = _sampling_rows(
+            reqs=reqs, device=self.device, with_seed=self.sampling_seed is not None
+        )
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
