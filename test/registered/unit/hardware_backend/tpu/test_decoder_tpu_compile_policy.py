@@ -3235,6 +3235,31 @@ def _policy():
         )
 
 
+def _cpu_top_k_renorm(probs, top_ks, need_top_k_sampling=True):
+    """CPU stand-in for the TPU filter: keep values >= the k-th largest."""
+    if not need_top_k_sampling:
+        return probs
+    ks = top_ks.clamp(1, probs.shape[-1]).long().reshape(-1, 1)
+    kth = probs.sort(dim=-1, descending=True).values.gather(-1, ks - 1)
+    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _cpu_top_p_renorm(probs, top_ps):
+    """CPU stand-in for the TPU filter: keep values >= the first value whose
+    prefix mass reaches p; an unreachable p keeps the whole row."""
+    ordered = probs.sort(dim=-1, descending=True).values
+    reached = ordered.cumsum(dim=-1) >= top_ps.to(probs.dtype).reshape(-1, 1)
+    first = reached.to(torch.int64).argmax(dim=-1, keepdim=True)
+    cutoff = torch.where(
+        reached.any(dim=-1, keepdim=True),
+        ordered.gather(-1, first),
+        torch.zeros_like(first, dtype=probs.dtype),
+    )
+    kept = torch.where(probs >= cutoff, probs, torch.zeros_like(probs))
+    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
 @contextlib.contextmanager
 def _serving_stubs():
     """Select TPU-native sampling and stub serving process state.
@@ -3263,6 +3288,15 @@ def _serving_stubs():
             eager_scaling_penalties,
         ),
         patch("sglang.srt.speculative.eagle_utils._is_tpu", True),
+        # The TPU renorm filter only accepts TPU tensors.
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_k_renorm_prob_func",
+            _cpu_top_k_renorm,
+        ),
+        patch(
+            "sglang.srt.speculative.eagle_utils.top_p_renorm_prob_func",
+            _cpu_top_p_renorm,
+        ),
         patch(
             "sglang.srt.distributed.get_tp_group",
             return_value=SimpleNamespace(world_size=1),
