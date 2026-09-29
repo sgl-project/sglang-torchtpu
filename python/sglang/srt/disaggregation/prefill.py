@@ -187,6 +187,9 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.effective_max_total_num_tokens
         )
         self.transfer_backend = transfer_backend
+        self.requires_bootstrap_handshake = get_kv_class(
+            transfer_backend, KVClassType.SENDER
+        ).requires_bootstrap_handshake
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(

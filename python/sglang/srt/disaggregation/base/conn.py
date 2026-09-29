@@ -139,6 +139,10 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
+    # False when a new sender is ready at once: the prefill can admit the
+    # request without waiting for a handshake with the decode.
+    requires_bootstrap_handshake: bool = True
+
     @abstractmethod
     def __init__(
         self,

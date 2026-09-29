@@ -294,6 +294,11 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        # Every stage receives a request in the same round, so senders that need
+        # no handshake let each stage admit it then, without the consensus trip.
+        admit_on_receipt = (
+            not self.disagg_prefill_bootstrap_queue.requires_bootstrap_handshake
+        )
 
         while True:
             server_is_idle = True
@@ -321,7 +326,11 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                if admit_on_receipt:
+                    self._pp_pd_admit_on_receipt()
+                    bootstrapped_rids = None
+                else:
+                    bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
 
@@ -743,6 +752,22 @@ class SchedulerPPMixin:
             return [[req.rid for req in good_reqs], [req.rid for req in failed_reqs]]
         return None
 
+    def _pp_pd_admit_on_receipt(self: Scheduler) -> None:
+        # Aborts reach every stage in the same round as requests, so each stage
+        # flushes the same aborted requests and admits the rest.
+        queue = self.disagg_prefill_bootstrap_queue
+        aborted = [
+            req.rid
+            for req in queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
+        ]
+        good_reqs, _ = queue.pop_bootstrapped(
+            return_failed_reqs=True,
+            pp_good_rids=[req.rid for req in queue.queue if req.rid not in aborted],
+            pp_bad_rids=aborted,
+        )
+        self.waiting_queue.extend(good_reqs)
+
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
@@ -824,20 +849,29 @@ class SchedulerPPMixin:
         """Send this iteration's requests and votes to the next stage; None
         when it is not this call's turn. Over the wave they go before the
         forward: every downstream stage must enter this iteration before a
-        device wait can depend on its collective-permute launch."""
+        device wait can depend on its collective-permute launch. A None
+        payload is not sent."""
         if self.pp_group.is_last_rank:
             return None
         if self._pp_wave is None:
             if before_forward:
                 return None
             return [
-                self._pp_send_pyobj_to_next_stage(data, async_send=True)
+                (
+                    self._pp_send_pyobj_to_next_stage(data, async_send=True)
+                    if data is not None
+                    else []
+                )
                 for data in payloads
             ]
         if not before_forward:
             return None
         return [
-            self._pp_pd_send_control_to_next_stage(data, async_send=True)
+            (
+                self._pp_pd_send_control_to_next_stage(data, async_send=True)
+                if data is not None
+                else []
+            )
             for data in payloads
         ]
 

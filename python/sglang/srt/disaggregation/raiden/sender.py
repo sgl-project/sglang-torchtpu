@@ -938,6 +938,8 @@ class RaidenKVSender(CommonKVSender):
     # A group-wide Failed is delivered only after every rank drained: raiden
     # cannot cancel a transfer, so a peer's pages must not be freed under it.
     group_failure_requires_drain = True
+    # The decode pulls once the prefill registers its blocks; see __init__.
+    requires_bootstrap_handshake = False
 
     def __init__(
         self,

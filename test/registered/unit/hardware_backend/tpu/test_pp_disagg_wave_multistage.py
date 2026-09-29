@@ -139,7 +139,7 @@ class Fabric:
         return SimpleNamespace(result=result)
 
 
-def stage(fabric, rank, mode, schedule):
+def stage(fabric, rank, mode, schedule, admit_on_receipt=False):
     scheduler = SchedulerPPMixin()
     scheduler.ps = SimpleNamespace(pp_size=fabric.size, pp_rank=rank)
     scheduler.pp_group = SimpleNamespace(
@@ -148,6 +148,9 @@ def stage(fabric, rank, mode, schedule):
     step = [-1]
     processed = []
     scheduler.disaggregation_mode = mode
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+        requires_bootstrap_handshake=not admit_on_receipt
+    )
     scheduler.waiting_queue = []
     scheduler.disagg_prefill_inflight_queue = []
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
@@ -211,6 +214,13 @@ def stage(fabric, rank, mode, schedule):
         return get
 
     scheduler._pp_pd_get_bootstrapped_ids = votes("bootstrap")
+    scheduler._pp_pd_admit_on_receipt = Mock()
+    if admit_on_receipt:
+
+        def no_consensus(*args):
+            raise AssertionError("admission on receipt used the bootstrap consensus")
+
+        scheduler._pp_pd_get_bootstrapped_ids = no_consensus
     scheduler._pp_pd_get_prefill_transferred_ids = votes("transfer")
     scheduler._pp_pd_get_retract_ids = votes("retract")
     scheduler._pp_pd_get_prealloc_ids = votes("prealloc")
@@ -302,84 +312,97 @@ class TestMultiStageDisaggregatedWave(unittest.TestCase):
     def test_pp8_cold_start_lone_prompt_idle_restart_and_prebuilt(self):
         for mode in (DisaggregationMode.PREFILL, DisaggregationMode.DECODE):
             with self.subTest(mode=mode):
-                forward = (
-                    ForwardMode.EXTEND
+                self._run_pp8(mode)
+
+    def test_pp8_prefill_admits_on_receipt_without_bootstrap_consensus(self):
+        """A sender that needs no handshake admits on every stage in the round
+        it arrives, with one less control packet per step and stages in step."""
+        stages = self._run_pp8(DisaggregationMode.PREFILL, admit_on_receipt=True)
+        for scheduler, _ in stages:
+            self.assertGreater(scheduler._pp_pd_admit_on_receipt.call_count, 0)
+
+    def _run_pp8(self, mode, admit_on_receipt=False):
+        forward = (
+            ForwardMode.EXTEND
+            if mode == DisaggregationMode.PREFILL
+            else ForwardMode.DECODE
+        )
+        schedule = [forward] + [None] * 16 + [forward]
+        if mode == DisaggregationMode.DECODE:
+            schedule = (
+                [ForwardMode.PREBUILT, forward, ForwardMode.PREBUILT]
+                + [None] * 16
+                + [forward]
+            )
+        fabric = Fabric(8)
+        stages = [
+            stage(fabric, rank, mode, schedule, admit_on_receipt) for rank in range(8)
+        ]
+
+        def run(scheduler):
+            try:
+                loop = (
+                    scheduler.event_loop_pp_disagg_prefill
                     if mode == DisaggregationMode.PREFILL
-                    else ForwardMode.DECODE
+                    else scheduler.event_loop_pp_disagg_decode
                 )
-                schedule = [forward] + [None] * 16 + [forward]
-                if mode == DisaggregationMode.DECODE:
-                    schedule = (
-                        [ForwardMode.PREBUILT, forward, ForwardMode.PREBUILT]
-                        + [None] * 16
-                        + [forward]
-                    )
-                fabric = Fabric(8)
-                stages = [stage(fabric, rank, mode, schedule) for rank in range(8)]
+                loop()
+            except Stopped:
+                pass
+            except Exception as exc:
+                with fabric.lock:
+                    fabric.errors.append(exc)
+                fabric.stop.set()
 
-                def run(scheduler):
-                    try:
-                        loop = (
-                            scheduler.event_loop_pp_disagg_prefill
-                            if mode == DisaggregationMode.PREFILL
-                            else scheduler.event_loop_pp_disagg_decode
-                        )
-                        loop()
-                    except Stopped:
-                        pass
-                    except Exception as exc:
-                        with fabric.lock:
-                            fabric.errors.append(exc)
-                        fabric.stop.set()
-
-                parallel = SimpleNamespace(
-                    pp_async_batch_depth=1, enable_dsa_prefill_context_parallel=False
+        parallel = SimpleNamespace(
+            pp_async_batch_depth=1, enable_dsa_prefill_context_parallel=False
+        )
+        with (
+            patch.object(scheduler_pp_mixin, "_is_tpu", True),
+            patch.object(scheduler_pp_mixin, "get_parallel", return_value=parallel),
+            patch.object(
+                scheduler_pp_mixin,
+                "get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_decode_enable_offload_kvcache=False
+                ),
+            ),
+            patch.object(
+                scheduler_pp_mixin,
+                "ScheduleBatch",
+                side_effect=lambda **kw: SimpleNamespace(**kw),
+            ),
+        ):
+            threads = [
+                threading.Thread(target=run, args=(scheduler,), daemon=True)
+                for scheduler, _ in stages
+            ]
+            for thread in threads:
+                thread.start()
+            if not fabric.stop.wait(15):
+                fabric.errors.append(
+                    TimeoutError(f"PD loops stalled: {fabric.describe()}")
                 )
-                with (
-                    patch.object(scheduler_pp_mixin, "_is_tpu", True),
-                    patch.object(
-                        scheduler_pp_mixin, "get_parallel", return_value=parallel
-                    ),
-                    patch.object(
-                        scheduler_pp_mixin,
-                        "get_disagg",
-                        return_value=SimpleNamespace(
-                            disaggregation_decode_enable_offload_kvcache=False
-                        ),
-                    ),
-                    patch.object(
-                        scheduler_pp_mixin,
-                        "ScheduleBatch",
-                        side_effect=lambda **kw: SimpleNamespace(**kw),
-                    ),
-                ):
-                    threads = [
-                        threading.Thread(target=run, args=(scheduler,), daemon=True)
-                        for scheduler, _ in stages
-                    ]
-                    for thread in threads:
-                        thread.start()
-                    if not fabric.stop.wait(15):
-                        fabric.errors.append(
-                            TimeoutError(f"PD loops stalled: {fabric.describe()}")
-                        )
-                    fabric.stop.set()
-                    for thread in threads:
-                        thread.join(timeout=2)
-                self.assertFalse(any(thread.is_alive() for thread in threads))
-                self.assertEqual(fabric.errors, [])
-                self.assertEqual(fabric.done, set(range(8)))
-                self.assertEqual(len(set(fabric.counts)), 1)
-                packets_per_step = 5 if mode == DisaggregationMode.PREFILL else 7
-                for rank, (scheduler, _) in enumerate(stages):
-                    self.assertGreater(fabric.control_waits[rank], 0)
-                    self.assertLessEqual(
-                        fabric.max_pending_controls[rank],
-                        scheduler.pp_loop_size * packets_per_step,
-                    )
-                for _, wave in stages:
-                    self.assertEqual(wave.forwards, 2)
-                    self.assertEqual(wave.owed, 0)
+            fabric.stop.set()
+            for thread in threads:
+                thread.join(timeout=2)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(fabric.errors, [])
+        self.assertEqual(fabric.done, set(range(8)))
+        self.assertEqual(len(set(fabric.counts)), 1)
+        packets_per_step = 5 if mode == DisaggregationMode.PREFILL else 7
+        if admit_on_receipt:
+            packets_per_step -= 1
+        for rank, (scheduler, _) in enumerate(stages):
+            self.assertGreater(fabric.control_waits[rank], 0)
+            self.assertLessEqual(
+                fabric.max_pending_controls[rank],
+                scheduler.pp_loop_size * packets_per_step,
+            )
+        for _, wave in stages:
+            self.assertEqual(wave.forwards, 2)
+            self.assertEqual(wave.owed, 0)
+        return stages
 
 
 if __name__ == "__main__":

@@ -44,6 +44,9 @@ def run_loop(mode, schedule, rank, *, use_wave=True, depth=1):
     scheduler.device_module = Mock()
     scheduler.waiting_queue = []
     scheduler.disagg_prefill_inflight_queue = []
+    scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
+        requires_bootstrap_handshake=True
+    )
     scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
     scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
     scheduler.enable_staging = True
