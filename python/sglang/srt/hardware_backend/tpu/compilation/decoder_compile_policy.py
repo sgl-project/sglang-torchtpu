@@ -26,7 +26,11 @@ from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _restore_forward_batch_inputs,
     build_bucketers,
 )
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    get_attention_rank_tensors,
+    is_dp_attention_enabled,
+    use_attention_rank_tensors,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import (
@@ -595,6 +599,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             positions: torch.Tensor,
             forward_batch: Any,
             *args: Any,
+            attention_rank_tensors: tuple[torch.Tensor, ...],
             **kwargs: Any,
         ) -> Any:
             backend = get_forward_context().attn_backend
@@ -602,7 +607,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             # Attention reads metadata through the backend during tracing.
             backend.forward_metadata = attention_metadata
             try:
-                return fn(input_ids, positions, forward_batch, *args, **kwargs)
+                with use_attention_rank_tensors(attention_rank_tensors):
+                    return fn(input_ids, positions, forward_batch, *args, **kwargs)
             finally:
                 backend.forward_metadata = previous_metadata
 
@@ -621,6 +627,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             return compiled(
                 backend.forward_metadata,
                 *args,
+                attention_rank_tensors=get_attention_rank_tensors(
+                    torch.device(self.model_runner.device)
+                ),
                 **kwargs,
             )
 

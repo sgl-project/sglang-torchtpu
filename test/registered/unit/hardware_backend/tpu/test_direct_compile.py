@@ -1119,15 +1119,42 @@ class TestDirectCompile(CustomTestCase):
 
 
 class _RankModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("bias", torch.zeros((), device="tpu"))
+
     def forward(self, input_ids, positions, forward_batch):
         mask = dp_attention._dp_rank_slot_mask(2, input_ids.device)
         scale = dp_attention.attn_rank0_scale(input_ids)
-        return torch.where(mask[:, None], input_ids[None, :] * scale, 0)
+        return torch.where(mask[:, None], input_ids[None, :] * scale, self.bias)
 
 
 class _RankPolicy(DecoderTpuCompilePolicy):
     def _direct_compile_specialization_key(self, metadata, input_ids, *args, **kwargs):
         return tuple(input_ids.shape)
+
+
+class TestAttentionRankTensorScope(unittest.TestCase):
+    def test_nested_scopes_restore_rank_state_after_error(self):
+        original = {("attn_tp", torch.device("cpu")): torch.tensor(7)}
+        outer = (torch.tensor(0), torch.tensor(1))
+        inner = (torch.tensor(2), torch.tensor(3))
+        with patch.object(dp_attention, "_RANK_TENSORS", original):
+            with dp_attention.use_attention_rank_tensors(outer):
+                self.assertIs(
+                    dp_attention._rank_tensor("attn_dp", torch.device("cpu")), outer[1]
+                )
+                with self.assertRaisesRegex(RuntimeError, "trace failed"):
+                    with dp_attention.use_attention_rank_tensors(inner):
+                        self.assertIs(
+                            dp_attention._rank_tensor("attn_tp", torch.device("cpu")),
+                            inner[0],
+                        )
+                        raise RuntimeError("trace failed")
+                self.assertIs(
+                    dp_attention._rank_tensor("attn_dp", torch.device("cpu")), outer[1]
+                )
+            self.assertIs(dp_attention._RANK_TENSORS, original)
 
 
 @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
