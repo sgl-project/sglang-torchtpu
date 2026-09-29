@@ -35,7 +35,7 @@ LAUNCH_ENV = {
     "EXTRA_ARGS": (
         "--reasoning-parser gpt-oss "
         f"--served-model-name {SERVED_MODEL_NAME} "
-        "--tpu-compile-tracer dynamo"
+        "--tpu-compile-tracer direct"
     ),
 }
 
