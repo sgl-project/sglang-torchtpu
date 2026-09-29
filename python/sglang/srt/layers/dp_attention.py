@@ -1179,33 +1179,6 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
 _RANK_TENSORS: dict = {}
 
 
-def get_attention_rank_tensors(device: torch.device) -> tuple[torch.Tensor, ...]:
-    """Expose initialized rank state as explicit direct-compiler inputs."""
-    if not _RANK_TENSORS:
-        return ()
-    return tuple(_rank_tensor(axis, device) for axis in ("attn_tp", "attn_dp"))
-
-
-@contextmanager
-def use_attention_rank_tensors(tensors: tuple[torch.Tensor, ...]):
-    """Bind traced placeholders for rank selectors, restoring eager state on exit.
-
-    Dynamo lifts the global rank tensors automatically; direct tracing needs
-    explicit inputs and must make the selectors read their placeholders.
-    Like attention metadata, this scope runs synchronously in a worker.
-    """
-    global _RANK_TENSORS
-    previous = _RANK_TENSORS
-    _RANK_TENSORS = previous.copy()
-    try:
-        for axis, tensor in zip(("attn_tp", "attn_dp"), tensors):
-            _RANK_TENSORS[(axis, tensor.device)] = tensor
-            _RANK_TENSORS[(axis, torch.device(tensor.device.type))] = tensor
-        yield
-    finally:
-        _RANK_TENSORS = previous
-
-
 def _init_rank_tensors(device: torch.device) -> None:
     """Create the attn_tp and attn_dp rank tensors for a device.
 

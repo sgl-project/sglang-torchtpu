@@ -11,6 +11,9 @@ from jax import tree_util
 from torch_tpu._internal.device_utils.annotations import LayoutContext, TpuLayout
 
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    use_attention_rank_tensors,
+)
 from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     DecoderTpuCompilePolicy,
 )
@@ -1140,12 +1143,12 @@ class TestAttentionRankTensorScope(unittest.TestCase):
         outer = (torch.tensor(0), torch.tensor(1))
         inner = (torch.tensor(2), torch.tensor(3))
         with patch.object(dp_attention, "_RANK_TENSORS", original):
-            with dp_attention.use_attention_rank_tensors(outer):
+            with use_attention_rank_tensors(outer):
                 self.assertIs(
                     dp_attention._rank_tensor("attn_dp", torch.device("cpu")), outer[1]
                 )
                 with self.assertRaisesRegex(RuntimeError, "trace failed"):
-                    with dp_attention.use_attention_rank_tensors(inner):
+                    with use_attention_rank_tensors(inner):
                         self.assertIs(
                             dp_attention._rank_tensor("attn_tp", torch.device("cpu")),
                             inner[0],

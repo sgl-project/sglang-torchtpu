@@ -13,6 +13,10 @@ import torch.nn.functional as F
 import tqdm
 
 from sglang.srt.hardware_backend.tpu._logging import get_logger
+from sglang.srt.hardware_backend.tpu.compilation.attention_rank_inputs import (
+    get_attention_rank_tensors,
+    use_attention_rank_tensors,
+)
 from sglang.srt.hardware_backend.tpu.compilation.compiled_forward_shim import (
     _REAL_B_KEY,
     _REAL_Q_KEY,
@@ -33,11 +37,7 @@ from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy impo
     BaseSpecDecodeCompilePolicyMixin,
     _pad_first_dim,
 )
-from sglang.srt.layers.dp_attention import (
-    get_attention_rank_tensors,
-    is_dp_attention_enabled,
-    use_attention_rank_tensors,
-)
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
