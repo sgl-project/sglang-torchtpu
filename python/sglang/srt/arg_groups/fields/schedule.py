@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Config fields of the ``schedule`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
@@ -6,6 +7,9 @@ spells it exactly as before. ``ServerArgs`` composes these classes, so the
 record stays one flat object -- the split moves where declarations live, not
 how config is shaped at runtime.
 """
+=======
+"""Config fields of the ``schedule`` namespace."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 
@@ -99,6 +103,10 @@ class Schedule(msgspec.Struct):
                 "priority",
                 "routing-key",
                 "hrrn",
+<<<<<<< HEAD
+=======
+                "shortest-prefill-first",
+>>>>>>> upstream/main
             ],
         ),
     ] = "fcfs"
@@ -162,6 +170,26 @@ class Schedule(msgspec.Struct):
             fallback=0.8,
         ),
     ] = None
+<<<<<<< HEAD
+=======
+    # Recorded by the cache hook; the effective field answers the fallback when unset.
+    _swa_full_tokens_ratio_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
+    swa_prefix_tails: A[
+        Optional[int],
+        Arg(
+            help=(
+                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+                "family), how many radix-cached prefix tails it keeps room for. "
+                "Each tail is one sliding window plus one page. Default: 4 x "
+                "max_running_requests per attention-DP rank, 0 when the radix "
+                "cache is disabled."
+            ),
+        ),
+    ] = None
+>>>>>>> upstream/main
     disable_hybrid_swa_memory: A[
         bool, Arg(help="Disable the hybrid SWA memory pool.", resolvable=True)
     ] = False

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from typing import List, Literal, Optional, Union
 
 from xgrammar.structural_tag import (
@@ -13,6 +14,10 @@ from xgrammar.structural_tag import (
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import StructuralTag
+=======
+from typing import Optional
+
+>>>>>>> upstream/main
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 
 
@@ -25,6 +30,10 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     tool_calls_block_name = " calls"
     invoke_tag_name = " invoke"
     parameter_tag_name = " parameter"
+<<<<<<< HEAD
+=======
+    strip_string_param_value: bool = False
+>>>>>>> upstream/main
 
     # The encoder joins an assistant turn's content and its calls block with a
     # blank line, and renders it even when there is no content.
@@ -32,6 +41,7 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
     think_end_token = "</think>"
 
     def get_structural_tag_name(self) -> Optional[str]:
+<<<<<<< HEAD
         # xgrammar's builtin "deepseek_v4" tag hardcodes the unspaced names,
         # so the V4.1 tag is assembled in get_structural_tag instead.
         return None
@@ -101,3 +111,6 @@ class DeepSeekV41Detector(DeepSeekV32Detector):
             begin="", content=AnyTextFormat(), end=self.think_end_token
         )
         return StructuralTag(format=SequenceFormat(elements=[reasoning, body]))
+=======
+        return "deepseek_v4_1"
+>>>>>>> upstream/main

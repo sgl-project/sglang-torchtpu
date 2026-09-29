@@ -5,16 +5,26 @@
 
 use crate::config::{AffinityConfig, SessionAffinityMode};
 use crate::discovery::WorkerId;
+<<<<<<< HEAD
 use crate::policies::active_load::{spawn_sweeper, Clock, JanitorHandle, SystemTimeClock};
 use crate::policies::admission::compare_prefill_pressure;
 use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
 use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
 use crate::workers::Worker;
 use dashmap::DashMap;
+=======
+use crate::policies::admission::compare_prefill_pressure;
+use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+use crate::policies::{GuardHints, Policy, ProposalKind, SelectionContext, SelectionProposal};
+use crate::state::load_monitor::router_inflight_load::JanitorHandle;
+use crate::state::AffinityStore;
+use crate::workers::Worker;
+>>>>>>> upstream/main
 use rand::Rng;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+<<<<<<< HEAD
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -47,12 +57,19 @@ impl SessionState {
 
 pub struct SessionAwarePolicy {
     state: Arc<SessionState>,
+=======
+use std::time::Duration;
+
+pub struct SessionAwarePolicy {
+    store: Arc<AffinityStore>,
+>>>>>>> upstream/main
     config: AffinityConfig,
     _janitor: Option<JanitorHandle>,
 }
 
 impl SessionAwarePolicy {
     pub fn new(config: AffinityConfig) -> Self {
+<<<<<<< HEAD
         let state = Arc::new(SessionState {
             assignments: DashMap::new(),
             clock: Arc::new(SystemTimeClock),
@@ -73,12 +90,20 @@ impl SessionAwarePolicy {
         };
         Self {
             state,
+=======
+        let store = AffinityStore::new(Duration::from_secs(config.session_idle_secs));
+        let _janitor =
+            store.spawn_sweeper(Duration::from_secs(config.session_eviction_interval_secs));
+        Self {
+            store,
+>>>>>>> upstream/main
             config,
             _janitor,
         }
     }
 
     #[cfg(test)]
+<<<<<<< HEAD
     fn with_clock(config: AffinityConfig, clock: Arc<dyn Clock>) -> Self {
         Self {
             state: Arc::new(SessionState {
@@ -86,6 +111,14 @@ impl SessionAwarePolicy {
                 clock,
                 idle: Duration::from_secs(config.session_idle_secs),
             }),
+=======
+    fn with_clock(
+        config: AffinityConfig,
+        clock: Arc<dyn crate::state::load_monitor::router_inflight_load::Clock>,
+    ) -> Self {
+        Self {
+            store: AffinityStore::with_clock(Duration::from_secs(config.session_idle_secs), clock),
+>>>>>>> upstream/main
             config,
             _janitor: None,
         }
@@ -93,12 +126,20 @@ impl SessionAwarePolicy {
 
     #[cfg(test)]
     fn sweep_expired(&self) -> usize {
+<<<<<<< HEAD
         self.state.sweep_expired()
+=======
+        self.store.sweep_expired()
+>>>>>>> upstream/main
     }
 
     #[cfg(test)]
     fn assignment_count(&self) -> usize {
+<<<<<<< HEAD
         self.state.assignments.len()
+=======
+        self.store.len()
+>>>>>>> upstream/main
     }
 
     fn assignment_key(&self, session_id: &str, ctx: &SelectionContext<'_>) -> String {
@@ -173,6 +214,7 @@ impl Policy for SessionAwarePolicy {
         };
 
         let assignment_key = self.assignment_key(session_id, ctx);
+<<<<<<< HEAD
         let assigned = self
             .state
             .assignments
@@ -185,6 +227,10 @@ impl Policy for SessionAwarePolicy {
             if let Some(primary) = workers.iter().find(|worker| worker.id == assigned).cloned() {
                 return Some(self.affinity_proposal(primary, workers, ctx, session_id));
             }
+=======
+        if let Some(primary) = self.store.bound(&assignment_key, workers) {
+            return Some(self.affinity_proposal(Arc::clone(primary), workers, ctx, session_id));
+>>>>>>> upstream/main
         }
 
         // Persist new assignments only after selecting the final prefill worker.
@@ -203,12 +249,20 @@ impl Policy for SessionAwarePolicy {
         let Some(session_id) = ctx.session_id().filter(|id| !id.is_empty()) else {
             return;
         };
+<<<<<<< HEAD
         self.state.assignments.insert(
             self.assignment_key(session_id, ctx),
             Assignment {
                 worker_id: selected.id.clone(),
                 last_seen: self.state.clock.now(),
             },
+=======
+        // Overwrites any previous binding for the key.
+        self.store.bind(
+            self.assignment_key(session_id, ctx),
+            selected,
+            std::slice::from_ref(selected),
+>>>>>>> upstream/main
         );
     }
 
@@ -225,7 +279,11 @@ impl std::fmt::Debug for SessionAwarePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionAwarePolicy")
             .field("config", &self.config)
+<<<<<<< HEAD
             .field("assignments", &self.state.assignments.len())
+=======
+            .field("assignments", &self.store.len())
+>>>>>>> upstream/main
             .finish_non_exhaustive()
     }
 }
@@ -308,7 +366,11 @@ fn stable_backup(
 mod lifecycle_tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerMode, WorkerSpec};
+<<<<<<< HEAD
     use crate::policies::active_load::MockClock;
+=======
+    use crate::state::load_monitor::router_inflight_load::MockClock;
+>>>>>>> upstream/main
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 

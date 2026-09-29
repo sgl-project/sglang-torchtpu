@@ -72,14 +72,16 @@ class Arg(msgspec.Struct, frozen=True):
     action: Any | None = None
     action_kwargs: dict | None = None
     const: Any | None = None
+<<<<<<< HEAD
     # When True, this field is skipped by add_cli_args_from_dataclass.
     # Use for fields that have no CLI surface (e.g. injected via Python only).
+=======
+    # Skip automatic CLI registration.
+>>>>>>> upstream/main
     no_cli: bool = False
-    # When True, config resolution (model overrides and post-process passes)
-    # may decide this field: the declaration stash accepts the name, and
-    # `resolution_result` and the config bags answer with the decision. The
-    # field keeps what the operator passed.
+    # Allow resolution passes to declare a value for this field.
     resolvable: bool = False
+<<<<<<< HEAD
     # What the field means when nobody said anything -- the bottom of the read
     # chain: override, decision, input, then this. Not the dataclass default,
     # which stays `None` because that is how the record spells "not typed".
@@ -122,22 +124,54 @@ class Derived(msgspec.Struct, frozen=True):
 class NS(msgspec.Struct, frozen=True):
     """Namespace-path marker for a ServerArgs field, attached alongside the
     field's metadata in ``Annotated``:
+=======
+    # Scalar fallback when neither resolution nor input supplies a value.
+    # Machine- or config-dependent defaults belong in resolution hooks.
+    fallback: Any = None
 
-        field: A[int, "help", NS("parallel")] = 1
-        field: A[str, Arg(help="…"), NS("exec.moe")] = "auto"
 
+_NO_DEFAULT = object()
+>>>>>>> upstream/main
+
+
+<<<<<<< HEAD
     ``ServerArgs`` no longer uses it: its fields are declared in the
     ``arg_groups/fields/`` classes, each of which carries the ``_NS_PATH`` it
     stands for, so the module a declaration lives in *is* its namespace. What
     is left for this marker is the case a class cannot express -- one ad-hoc
     dataclass whose fields span several namespaces, which is what the
     config-bag tests build."""
+=======
+class Derived(msgspec.Struct, frozen=True):
+    """Metadata for namespace fields that are not CLI inputs or record fields.
+
+    ``fn`` is a lazily resolved dotted function path. It computes a value from
+    resolved configuration once at publication. Fields without ``fn``, such as
+    ranks and group handles, are set at runtime. Parallel overrides take
+    precedence over published values.
+    """
+
+    doc: str = ""
+    fn: str = ""
+    # Default for runtime-only fields, e.g. ``gpu_id=None`` without a device.
+    # Fields without a default raise if read before initialization.
+    default: Any = _NO_DEFAULT
+
+
+class NS(msgspec.Struct, frozen=True):
+    """Per-field namespace marker for records spanning multiple namespaces.
+
+    Example: ``field: A[int, "help", NS("parallel")] = 1``.
+    ServerArgs instead collects each namespace class's ``_NS_PATH``.
+    """
+>>>>>>> upstream/main
 
     path: str
 
 
 @functools.cache
 def namespace_of(cls) -> dict:
+<<<<<<< HEAD
     """``{field_name: dotted namespace path}``, read from the declaring class.
 
     A field's namespace is where it is declared: each class in
@@ -158,6 +192,16 @@ def namespace_of(cls) -> dict:
     out = dict(getattr(cls, "_NS_BY_FIELD", None) or {})
     # A class that still inherits its namespaces: nearest declaration wins, so
     # walk the MRO front to back and keep the first answer.
+=======
+    """Return ``{field: namespace}`` from collected metadata, class paths, or NS markers.
+
+    Unmarked fields are omitted; non-record types yield an empty map.
+    """
+    if not is_record(cls):
+        return {}
+    out = dict(getattr(cls, "_NS_BY_FIELD", None) or {})
+    # Nearest namespace declaration wins.
+>>>>>>> upstream/main
     for base in cls.__mro__:
         path = base.__dict__.get("_NS_PATH")
         if path is None:
@@ -207,12 +251,16 @@ def resolvable_fields(cls) -> frozenset:
 
 @functools.cache
 def fallbacks_of(cls) -> dict:
+<<<<<<< HEAD
     """``{field_name: value}`` for every field of ``cls`` that declares one.
 
     Read the same way `resolvable_fields` reads its flag, so a fallback lives
     beside the help text of the field it belongs to rather than in whatever
     hook used to fill it in.
     """
+=======
+    """Return declared scalar fallbacks for fields whose input default is None."""
+>>>>>>> upstream/main
     if not is_record(cls):
         return {}
     hints = get_type_hints(cls, include_extras=True)
@@ -220,11 +268,15 @@ def fallbacks_of(cls) -> dict:
     for field in record_fields(cls):
         _, arg = _unwrap_annotated(hints.get(field.name, field.type))
         if arg is not None and arg.fallback is not None:
+<<<<<<< HEAD
             # Two things `with_fallback` relies on and cannot check itself,
             # asserted where a new declaration passes through. This function is
             # cached, so a mutable fallback would hand one shared object to
             # every reader; and a field whose dataclass default is not `None`
             # can never reach the fallback, which makes the declaration dead.
+=======
+            # Reject shared mutable fallbacks and defaults that make the fallback unreachable.
+>>>>>>> upstream/main
             assert not isinstance(arg.fallback, (list, dict, set)), (
                 f"{cls.__name__}.{field.name}: a mutable fallback would be "
                 "shared by every reader -- use a scalar"
@@ -238,6 +290,7 @@ def fallbacks_of(cls) -> dict:
 
 
 def with_fallback(cls, name: str, value: Any) -> Any:
+<<<<<<< HEAD
     """``value``, or the declared fallback when nothing has answered.
 
     `resolution_result` calls this as its last step -- the effective surface,
@@ -248,6 +301,12 @@ def with_fallback(cls, name: str, value: Any) -> Any:
 
     A mutable fallback would need copying per read, for the reason a dataclass
     spells this `default_factory`. Every declared one is a scalar.
+=======
+    """Apply a declared fallback when ``value`` is None.
+
+    Used by ``resolution_result``, but not mid-resolution views: handlers must
+    still distinguish unset inputs. Fallbacks must be immutable scalars.
+>>>>>>> upstream/main
     """
     if value is not None:
         return value
@@ -255,12 +314,16 @@ def with_fallback(cls, name: str, value: Any) -> Any:
 
 
 def record_fields(cls):
+<<<<<<< HEAD
     """The declared fields of a record, Struct or dataclass.
 
     `ServerArgs` and the namespace classes are `msgspec.Struct`; the config-bag
     tests build ad-hoc dataclasses spanning namespaces, and the helpers here are
     driven with both. Anything else yields nothing.
     """
+=======
+    """Return Struct or dataclass fields, or an empty tuple for other types."""
+>>>>>>> upstream/main
     if isinstance(cls, type) and issubclass(cls, msgspec.Struct):
         return msgspec.structs.fields(cls)
     if dataclasses.is_dataclass(cls):
@@ -334,12 +397,16 @@ def _infer_type_func(tp):
 
 
 def _field_default(field):
+<<<<<<< HEAD
     """Return the default value for a field, or `_MISSING`.
 
     The two record shapes spell "no default" differently -- a Struct field says
     `msgspec.NODEFAULT`, a dataclass field `dataclasses.MISSING` -- so both are
     normalized here and every caller below tests against `_MISSING` alone.
     """
+=======
+    """Return a field default, normalizing Struct and dataclass missing sentinels."""
+>>>>>>> upstream/main
     absent = (_MISSING, msgspec.NODEFAULT)
     if field.default not in absent:
         return field.default

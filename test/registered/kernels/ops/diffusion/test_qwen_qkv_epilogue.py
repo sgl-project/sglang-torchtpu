@@ -152,6 +152,7 @@ def test_qwen_qkv_epilogue_is_bit_exact(img_tokens, txt_tokens, heads):
         )
 
 
+<<<<<<< HEAD
 def test_qwen_qkv_epilogue_rejects_compile():
     tensor = torch.empty(1, 1, 1, 128, device="cuda", dtype=torch.bfloat16)
     row = torch.empty(128, device="cuda", dtype=torch.bfloat16)
@@ -169,6 +170,20 @@ def test_qwen_qkv_epilogue_rejects_compile():
                 row,
                 row,
                 row,
+=======
+@pytest.mark.parametrize(
+    "head_dim,compiling", [(128, True), (64, False)], ids=["compile", "head-dim"]
+)
+def test_qwen_qkv_epilogue_rejects_unsupported_execution(head_dim, compiling):
+    tensor = torch.empty(1, 1, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    row = torch.empty(head_dim, device="cuda", dtype=torch.bfloat16)
+    cache = torch.empty(1, head_dim, device="cuda", dtype=torch.float32)
+    with patch("torch.compiler.is_compiling", return_value=compiling):
+        assert (
+            try_fused_qwen_qkv_epilogue(
+                *([tensor] * 6),
+                *([row] * 4),
+>>>>>>> upstream/main
                 cache,
                 cache,
                 1e-6,
@@ -178,6 +193,7 @@ def test_qwen_qkv_epilogue_rejects_compile():
         )
 
 
+<<<<<<< HEAD
 def test_qwen_qkv_epilogue_rejects_unsupported_head_dim():
     tensor = torch.empty(1, 1, 1, 64, device="cuda", dtype=torch.bfloat16)
     row = torch.empty(64, device="cuda", dtype=torch.bfloat16)
@@ -203,6 +219,8 @@ def test_qwen_qkv_epilogue_rejects_unsupported_head_dim():
     )
 
 
+=======
+>>>>>>> upstream/main
 @pytest.mark.parametrize("mode", ["dense", "attention_mask", "text_mask", "sharded"])
 def test_qwen_attention_preserves_normalized_segments(mode):
     heads, head_dim, img_tokens, txt_tokens = 4, 128, 17, 7

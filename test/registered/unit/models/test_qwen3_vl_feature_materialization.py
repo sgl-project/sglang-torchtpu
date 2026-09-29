@@ -335,7 +335,10 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
                         "sglang.srt.models.qwen3_vl.get_parallel",
                         return_value=SimpleNamespace(tp_size=8),
                     ),
+<<<<<<< HEAD
                     patch("sglang.srt.models.qwen3_vl._is_tpu", False),
+=======
+>>>>>>> upstream/main
                 ):
                     output = feature_method(items)
 

@@ -39,7 +39,10 @@ from typing import Optional
 
 import torch
 
+<<<<<<< HEAD
 from sglang.srt.distributed import get_tp_group
+=======
+>>>>>>> upstream/main
 from sglang.srt.runtime_context import (
     get_flags,
     get_forward,
@@ -112,7 +115,11 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """
     num_tokens = hidden_states.shape[0]
     set_sp_num_tokens(num_tokens)
+<<<<<<< HEAD
     tp_group = get_tp_group()
+=======
+    tp_group = get_parallel().tp_group
+>>>>>>> upstream/main
     tp_size = tp_group.world_size
     if tp_size == 1:
         return hidden_states
@@ -127,7 +134,11 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
 def sp_exit_gather(hidden_states: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """g: all-gather the per-rank shards back to the full sequence along dim 0,
     then narrow to ``num_tokens`` (dropping the entry-scatter padding)."""
+<<<<<<< HEAD
     tp_group = get_tp_group()
+=======
+    tp_group = get_parallel().tp_group
+>>>>>>> upstream/main
     tp_size = tp_group.world_size
     if tp_size == 1:
         return hidden_states[:num_tokens]
@@ -207,7 +218,11 @@ def column_parallel_g_matmul(
     """
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
+<<<<<<< HEAD
         group_name = get_tp_group().device_group.group_name
+=======
+        group_name = get_parallel().tp_group.device_group.group_name
+>>>>>>> upstream/main
         _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
             input_parallel.contiguous(),
             [linear.weight.t()],
@@ -235,7 +250,11 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     if padded != num_tokens:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
+<<<<<<< HEAD
         group_name = get_tp_group().device_group.group_name
+=======
+        group_name = get_parallel().tp_group.device_group.group_name
+>>>>>>> upstream/main
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(
             x,
             linear.weight.t(),
@@ -245,5 +264,9 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
         )
     full = linear.quant_method.apply(linear, x, bias)
     output = full.new_empty((padded // tp_size, *full.shape[1:]))
+<<<<<<< HEAD
     get_tp_group().reduce_scatter_tensor(output, full)
+=======
+    get_parallel().tp_group.reduce_scatter_tensor(output, full)
+>>>>>>> upstream/main
     return output

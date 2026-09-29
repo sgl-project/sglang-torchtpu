@@ -93,6 +93,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.92)
 
 
+<<<<<<< HEAD
 class TestDummyWithSBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -182,5 +183,7 @@ class TestDummyWithSBO(CustomTestCase):
         print(f"Eval accuracy of GSM8K: {metrics=}")
 
 
+=======
+>>>>>>> upstream/main
 if __name__ == "__main__":
     unittest.main()

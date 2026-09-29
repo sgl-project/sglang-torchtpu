@@ -7,7 +7,10 @@ use crate::config::{
 use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware::CacheAwarePolicy,
+<<<<<<< HEAD
     kv_events::{BlockSizeOracle, HashTree},
+=======
+>>>>>>> upstream/main
     load_based::LoadBasedPolicy,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
@@ -20,6 +23,10 @@ use crate::policies::{
     sticky::StickyPolicy,
     Policy, PolicyRegistry,
 };
+<<<<<<< HEAD
+=======
+use crate::state::kv_events::{BlockSizeOracle, HashTree};
+>>>>>>> upstream/main
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -237,7 +244,7 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
+        Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ProxyConfig, ServerConfig,
         StaticUrlsDiscoveryConfig,
     };
 
@@ -348,12 +355,16 @@ mod tests {
                 fused: None,
                 eligibility: None,
                 sampling_overrides: Default::default(),
+<<<<<<< HEAD
+=======
+                default_chat_template_kwargs: Default::default(),
+>>>>>>> upstream/main
             },
             discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
             }),
             proxy: ProxyConfig::default(),
-            active_load: ActiveLoadConfig::default(),
+            router_inflight_load: InflightLoadConfig::default(),
         }
     }
 

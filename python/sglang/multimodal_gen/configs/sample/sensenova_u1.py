@@ -33,6 +33,13 @@ _PUBLIC_OVERRIDE_FIELDS = {
     "output_quality",
     "output_compression",
     "quality",
+<<<<<<< HEAD
+=======
+    "profile",
+    "profile_all_stages",
+    "num_profiled_timesteps",
+    "perf_dump_path",
+>>>>>>> upstream/main
 }
 
 

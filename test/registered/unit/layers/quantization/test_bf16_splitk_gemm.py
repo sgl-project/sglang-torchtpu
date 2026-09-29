@@ -2,7 +2,10 @@ import pytest
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import (
+<<<<<<< HEAD
     _BF16_SPLITK_TUNED_TACTICS,
+=======
+>>>>>>> upstream/main
     Bf16GemmBackend,
     should_enable_bf16_splitk_gemm,
     use_bf16_splitk_gemm,
@@ -12,11 +15,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+<<<<<<< HEAD
 @pytest.mark.parametrize("m,n,k", _BF16_SPLITK_TUNED_TACTICS)
 def test_splitk_selects_tuned_oakhaven_shape(m: int, n: int, k: int):
     assert use_bf16_splitk_gemm(m, n, k)
 
 
+=======
+>>>>>>> upstream/main
 @pytest.mark.parametrize("m", [0, 33, 64])
 @pytest.mark.parametrize("n,k", [(256, 8192), (512, 8192), (2304, 8192), (2560, 8192)])
 def test_splitk_keeps_large_m_on_existing_path(m: int, n: int, k: int):
@@ -36,12 +42,15 @@ def test_splitk_rejects_unmeasured_shapes(shape: tuple[int, int, int]):
     assert not use_bf16_splitk_gemm(*shape)
 
 
+<<<<<<< HEAD
 def test_bf16_splitk_is_enabled_by_default():
     assert envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.default is True
     with envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.override(True):
         assert should_enable_bf16_splitk_gemm(Bf16GemmBackend.CUTEDSL)
 
 
+=======
+>>>>>>> upstream/main
 def test_bf16_splitk_env_kill_switch():
     with envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.override(False):
         assert not should_enable_bf16_splitk_gemm(Bf16GemmBackend.CUTEDSL)

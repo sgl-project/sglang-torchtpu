@@ -644,6 +644,7 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
+<<<<<<< HEAD
     # Match scheduler inputs to any padded target logits.
     verify_padding = target_compile_policy.prepare_spec_verify(
         batch, verify_input, logits_output.next_token_logits
@@ -681,6 +682,20 @@ def run_eagle_verify(
             )
     predict, accept_lens, accept_index = verify_result
     new_seq_lens, bonus_tokens = verify_bookkeeping_result
+=======
+    (
+        predict,
+        accept_lens,
+        accept_index,
+    ) = eagle_sample(
+        verify_input,
+        batch,
+        logits_output,
+        grammar_mask,
+        uno_target_max_top_k=uno_target_max_top_k,
+    )
+    new_seq_lens = batch.seq_lens + accept_lens
+>>>>>>> upstream/main
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",

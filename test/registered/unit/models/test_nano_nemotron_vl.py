@@ -39,6 +39,7 @@ class TestNemotronHOmniModel(CustomTestCase):
         self.assertIs(model_class, NemotronH_Omni_Reasoning_V3)
         self.assertEqual(architecture, "NemotronH_Omni_Reasoning_V3")
 
+<<<<<<< HEAD
     def test_exposes_language_embed_and_head(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)
@@ -64,6 +65,8 @@ class TestNemotronHOmniModel(CustomTestCase):
 
         self.assertEqual(captured_layer_ids, [1, 22, 43, 64, 85])
 
+=======
+>>>>>>> upstream/main
     def test_vision_final_layernorm_is_loaded_and_applied(self):
         model = object.__new__(NemotronH_Omni_Reasoning_V3)
         nn.Module.__init__(model)

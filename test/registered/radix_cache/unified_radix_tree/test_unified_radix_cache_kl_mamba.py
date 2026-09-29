@@ -65,7 +65,10 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+<<<<<<< HEAD
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+=======
+>>>>>>> upstream/main
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
@@ -127,7 +130,10 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+<<<<<<< HEAD
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+=======
+>>>>>>> upstream/main
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
@@ -197,7 +203,10 @@ class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+<<<<<<< HEAD
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+=======
+>>>>>>> upstream/main
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )

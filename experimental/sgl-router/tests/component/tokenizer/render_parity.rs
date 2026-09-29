@@ -6,7 +6,11 @@
 
 use serde::Deserialize;
 use sgl_router::config::{
+<<<<<<< HEAD
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
+=======
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
+>>>>>>> upstream/main
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::ModelId;
@@ -123,12 +127,20 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+<<<<<<< HEAD
+=======
+            default_chat_template_kwargs: Default::default(),
+>>>>>>> upstream/main
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+<<<<<<< HEAD
         active_load: ActiveLoadConfig::default(),
+=======
+        router_inflight_load: InflightLoadConfig::default(),
+>>>>>>> upstream/main
     };
     TokenizerRegistry::load_from_config(&cfg).unwrap()
 }

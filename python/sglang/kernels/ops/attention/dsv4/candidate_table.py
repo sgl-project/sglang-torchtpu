@@ -1,5 +1,10 @@
+<<<<<<< HEAD
 """Candidate-table kernels of the two-level indexer: level-one block keys and
 the sorted, page-transformed block table."""
+=======
+"""The sparse table of the two-level indexer from a row's selected blocks: the
+sorted, page-transformed block table and DeepGEMM's schedule for it."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ from .utils import make_name
 if TYPE_CHECKING:
     pass
 
+<<<<<<< HEAD
 
 @cache_once
 def _jit_block_amax_module():
@@ -56,6 +62,9 @@ def amax8_varlen(
         out = scores.new_empty(num_tokens, (max_seqlen + 7) // 8)
     _jit_block_amax_module().amax8_varlen(scores, seq_lens, out, topk)
     return out
+=======
+CANDIDATE_BLOCK_SIZE = 8  # positions per block; DeepGEMM accepts 8 or 16
+>>>>>>> upstream/main
 
 
 @cache_once
@@ -91,3 +100,32 @@ def sort_candidate_blocks(
         blocks, seq_lens, page_table, out_pages, page_size
     )
     return out_pages
+<<<<<<< HEAD
+=======
+
+
+def build_sparse_indexer_schedule(
+    blocks: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_size: int,
+    q_dtype: torch.dtype,
+    request_ids: torch.Tensor,
+) -> torch.Tensor:
+    """DeepGEMM's schedule for the published blocks: ``seq_lens`` ``[rows]``
+    int32, ``page_table`` ``[rows, pages]`` int32 at the index pool's page size.
+    ``request_ids`` ``[rows]`` int32 lets DeepGEMM pair two rows of a request on
+    one KV pass; each row keeps its own block list and output layout, and paired
+    rows must share their page-table row."""
+    import deep_gemm
+
+    return deep_gemm.get_paged_sparse_mqa_logits_metadata(
+        seq_lens.contiguous(),
+        page_table,
+        request_ids,
+        page_size,
+        blocks,
+        q_dtype,
+        CANDIDATE_BLOCK_SIZE,
+    )
+>>>>>>> upstream/main

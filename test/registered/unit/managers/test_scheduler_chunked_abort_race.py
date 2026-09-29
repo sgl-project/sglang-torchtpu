@@ -5,7 +5,16 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
+<<<<<<< HEAD
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+=======
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
+>>>>>>> upstream/main
 
 maybe_stub_sgl_kernel()
 
@@ -32,20 +41,32 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched = Scheduler.__new__(Scheduler)
     sched.chunked_req = chunked_req
     sched._pending_chunked_abort_req = pending_req
+<<<<<<< HEAD
     sched._deferred_chunked_sender_aborts = []
+=======
+>>>>>>> upstream/main
     sched.waiting_queue = []
     sched.dllm_config = None
     sched.grammar_manager = Mock()
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
     sched.mm_receiver = None
+<<<<<<< HEAD
     sched.ps = SimpleNamespace(pp_size=1)
+=======
+>>>>>>> upstream/main
     sched.running_batch = SimpleNamespace(reqs=running_reqs)
     sched.last_batch = None
     return sched
 
 
 class TestPendingChunkedAbortRace(CustomTestCase):
+<<<<<<< HEAD
+=======
+    def setUp(self):
+        enter_scope(self, published_topology())
+
+>>>>>>> upstream/main
     def test_req_left_chunked_slot_is_aborted(self):
         req = _FakeReq("zombie_rid")
         sched = _make_scheduler(req, chunked_req=None, running_reqs=[req])

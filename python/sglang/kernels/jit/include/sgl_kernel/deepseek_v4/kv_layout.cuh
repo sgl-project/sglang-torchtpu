@@ -5,8 +5,15 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+<<<<<<< HEAD
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 
+=======
+#include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
+#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+
+#include <bit>
+>>>>>>> upstream/main
 #include <cstdint>
 #ifndef USE_ROCM
 #include <cuda_fp4.h>
@@ -111,8 +118,11 @@ struct PagedKV {
   }
 };
 
+<<<<<<< HEAD
 #ifndef USE_ROCM
 
+=======
+>>>>>>> upstream/main
 namespace v41 {
 
 /// The row helpers below quantize one 512-wide token spread over `512 / kVecSize` threads,
@@ -152,7 +162,15 @@ SGL_DEVICE void store_row_fp8(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
     // `cvt.rn.satfinite.e4m3x2` directly: |x / scale| <= 448 needs no clamp.
+<<<<<<< HEAD
     out[i] = fp8x2_e4m3_t{fp32x2_t{v[2 * i] * inv_scale, v[2 * i + 1] * inv_scale}};
+=======
+#ifdef USE_ROCM
+    out[i] = fp8::pack_fp8(v[2 * i] * inv_scale, v[2 * i + 1] * inv_scale);
+#else
+    out[i] = fp8x2_e4m3_t{fp32x2_t{v[2 * i] * inv_scale, v[2 * i + 1] * inv_scale}};
+#endif
+>>>>>>> upstream/main
   }
   out.store(data_row, tx);
   // Every lane of the tile holds the exponent; they all store the same byte.
@@ -170,18 +188,43 @@ SGL_DEVICE void store_row_fp4(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   static_assert(kVecSize % 2 == 0 && kTileLanes >= 1 && (kTileLanes & (kTileLanes - 1)) == 0);
 
   const float amax = warp::reduce_max<kTileLanes>(vec_amax(v));
+<<<<<<< HEAD
   const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
   const float scale = static_cast<float>(scale_e4m3);
+=======
+#ifdef USE_ROCM
+  const float scale = fp4::e4m3_round_rn(fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f));
+  // the low byte of the pack's 16-bit storage, whether fp8x2_e4m3_t is an integer or HIP's fp8 pair
+  const auto scale_bits = static_cast<uint8_t>(std::bit_cast<uint16_t>(fp8::pack_fp8(scale, scale)));
+#else
+  const __nv_fp8_e4m3 scale_e4m3{fminf(fmaxf(__fdiv_rn(amax, 6.0f), 0x1p-9f), 448.0f)};
+  const float scale = static_cast<float>(scale_e4m3);
+  const uint8_t scale_bits = scale_e4m3.__x;
+#endif
+>>>>>>> upstream/main
   AlignedVector<uint8_t, kVecSize / 2> out;
 #pragma unroll
   for (uint32_t i = 0; i < kVecSize / 2; ++i) {
     // IEEE division by the rounded scale, as the reference does; a reciprocal multiply could cross an e2m1 tie.
+<<<<<<< HEAD
     out[i] = static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(
         fp32x2_t{__fdiv_rn(v[2 * i], scale), __fdiv_rn(v[2 * i + 1], scale)}, __NV_E2M1, cudaRoundNearest));
   }
   out.store(data_row, tx);
   // Every lane of the tile holds the scale; they all store the same byte.
   scale_row[tx / kTileLanes] = scale_e4m3.__x;
+=======
+#ifdef USE_ROCM
+    out[i] = static_cast<uint8_t>(fp4::e2m1x2_code({__fdiv_rn(v[2 * i], scale), __fdiv_rn(v[2 * i + 1], scale)}));
+#else
+    out[i] = static_cast<uint8_t>(__nv_cvt_float2_to_fp4x2(
+        fp32x2_t{__fdiv_rn(v[2 * i], scale), __fdiv_rn(v[2 * i + 1], scale)}, __NV_E2M1, cudaRoundNearest));
+#endif
+  }
+  out.store(data_row, tx);
+  // Every lane of the tile holds the scale; they all store the same byte.
+  scale_row[tx / kTileLanes] = scale_bits;
+>>>>>>> upstream/main
 }
 
 /// Dispatch on the layout for a 512-wide row held as `kVecSize` consecutive fp32 per thread.
@@ -205,6 +248,7 @@ store_row(uint8_t* data_row, uint8_t* scale_row, uint32_t tx, const device::Alig
 
 }  // namespace v41
 
+<<<<<<< HEAD
 #else  // USE_ROCM
 
 namespace v41 {
@@ -223,6 +267,8 @@ SGL_DEVICE void store_row(uint8_t*, uint8_t*, uint32_t, Ts&&...) {
 
 #endif  // USE_ROCM
 
+=======
+>>>>>>> upstream/main
 }  // namespace deepseek_v4
 
 }  // namespace sglang

@@ -35,6 +35,12 @@ class _FakeLoRABackend:
     batch_info = object()
     skip_inactive_lora_batches = False
 
+<<<<<<< HEAD
+=======
+    def get_batch_info(self, layout=None):
+        return self.batch_info
+
+>>>>>>> upstream/main
     def run_lora_a_sgemm(self, x, weights):
         return 2 * x
 

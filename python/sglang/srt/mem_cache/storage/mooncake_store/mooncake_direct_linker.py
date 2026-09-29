@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+<<<<<<< HEAD
+=======
+import hashlib
+>>>>>>> upstream/main
 import logging
 import threading
 from concurrent.futures import Future
@@ -19,6 +23,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
+<<<<<<< HEAD
+=======
+from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+    LinkerMLADedupBroadcaster,
+)
+>>>>>>> upstream/main
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import UnifiedCacheLinker
 from sglang.srt.runtime_context import (
     get_memory,
@@ -44,8 +54,14 @@ def _storage_suffix(
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
+<<<<<<< HEAD
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
+=======
+    def __init__(self, num_layers: int, on_layer_ready=None):
+        self.num_layers = num_layers
+        self.on_layer_ready = on_layer_ready
+>>>>>>> upstream/main
         self.producer_index = -1
         self.consumer_index = -1
         self.futures: dict[int, list[Future]] = {}
@@ -73,6 +89,11 @@ class LayerWiseLoadCounter:
             return
         try:
             futures[threshold].result()
+<<<<<<< HEAD
+=======
+            if self.on_layer_ready is not None:
+                self.on_layer_ready(index, threshold)
+>>>>>>> upstream/main
         except BaseException as error:
             raise RuntimeError("Mooncake layer-wise KV load failed.") from error
         finally:
@@ -158,7 +179,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
 
         self.register_buffers()
+<<<<<<< HEAD
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+=======
+        self.mla_broadcaster = None
+        self.tp_group = tp_group
+        self.broadcast_loads = {}
+        self.broadcast_events = []
+        if server_args.enable_linker_mla_dedup and rank_replicated and tp_size > 1:
+            self.mla_broadcaster = LinkerMLADedupBroadcaster.build(
+                self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
+            )
+            logger.info(
+                "MLA linker rank-0 loading enabled: tp_rank=%d/%d", tp_rank, tp_size
+            )
+        self.layer_done_counter = LayerWiseLoadCounter(
+            self.num_layers,
+            self._broadcast_loaded_layers if self.mla_broadcaster else None,
+        )
+>>>>>>> upstream/main
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
@@ -242,6 +281,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return False
 
     def num_completed_loads(self) -> int:
+<<<<<<< HEAD
+=======
+        while self.broadcast_events and self.broadcast_events[0][0].query():
+            _, rids = self.broadcast_events.pop(0)
+            self.completed_loads.put(rids)
+>>>>>>> upstream/main
         return self.completed_loads.qsize()
 
     def pop_completed_load(self) -> list[str]:
@@ -256,6 +301,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.gc_frozen = True
 
     def start_layer_wise_loading(self) -> int:
+<<<<<<< HEAD
+=======
+        broadcaster = self.mla_broadcaster
+        if broadcaster is not None:
+            # Insert can adopt different pages on different ranks. Compare the
+            # logical load order (not local slots), including empty batches,
+            # before deciding collectively whether this batch can broadcast.
+            plan = [
+                (rid, [(t.name, list(t.keys)) for t in transfers])
+                for rid, transfers in self.pending_loads.items()
+            ]
+            digest = hashlib.sha256(repr(plan).encode()).digest()
+            digests = [None] * torch.distributed.get_world_size(self.tp_group)
+            torch.distributed.all_gather_object(digests, digest, group=self.tp_group)
+            if any(other != digest for other in digests):
+                logger.warning("MLA linker load plans differ; using all-rank reads.")
+                broadcaster = None
+>>>>>>> upstream/main
         if not self.pending_loads:
             return -1
         self.freeze_gc_once()
@@ -263,12 +326,65 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads = {}
 
         counter_index = self.layer_done_counter.update_producer()
+<<<<<<< HEAD
         ready_event = device_module.Event()
         ready_event.record()
         self.load_queue.put((counter_index, pending, ready_event))
         self.stats["load"] += len(pending)
         return counter_index
 
+=======
+        if broadcaster is not None:
+            indices = {}
+            for transfers in pending.values():
+                for transfer in transfers:
+                    indices.setdefault(transfer.name, []).append(transfer.host_indices)
+            prepared = broadcaster.prepare_broadcast(
+                {name: torch.cat(parts) for name, parts in indices.items()},
+                device_module.current_stream(),
+            )
+            if not broadcaster.is_src:
+                for layer in range(self.num_layers):
+                    self.layer_done_counter.complete(counter_index, layer)
+        ready_event = device_module.Event()
+        ready_event.record()
+        if broadcaster is not None:
+            self.broadcast_loads[counter_index] = (
+                0,
+                prepared,
+                list(pending),
+                ready_event,
+            )
+        if broadcaster is None or broadcaster.is_src:
+            self.load_queue.put((counter_index, pending, ready_event))
+        self.stats["load"] += len(pending)
+        return counter_index
+
+    def _broadcast_loaded_layers(self, index: int, threshold: int) -> None:
+        batch = self.broadcast_loads.get(index)
+        if batch is None:
+            return
+        first, prepared, rids, ready_event = batch
+        if first == 0:
+            device_module.current_stream().wait_event(ready_event)
+        # KV access may wait several times per layer, or skip sparse layers.
+        # Launch each broadcast exactly once, in order, on the forward stream.
+        for layer in range(first, threshold + 1):
+            self.mla_broadcaster.broadcast_loaded_layer(layer, prepared)
+        if threshold == self.num_layers - 1:
+            event = device_module.Event()
+            event.record()
+            self.broadcast_events.append((event, rids))
+            del self.broadcast_loads[index]
+        else:
+            self.broadcast_loads[index] = (
+                max(first, threshold + 1),
+                prepared,
+                rids,
+                ready_event,
+            )
+
+>>>>>>> upstream/main
     def load_thread_func(self) -> None:
         while True:
             task = self.load_queue.get()
@@ -276,6 +392,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 counter_index, pending, ready_event = task
+<<<<<<< HEAD
+=======
+                replicated = counter_index in self.broadcast_loads
+>>>>>>> upstream/main
                 try:
                     ready_event.synchronize()
                     self.load_layer_wise(counter_index, list(pending.values()))
@@ -283,7 +403,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load batch failed")
                 finally:
+<<<<<<< HEAD
                     self.completed_loads.put(list(pending))
+=======
+                    if not replicated:
+                        self.completed_loads.put(list(pending))
+>>>>>>> upstream/main
             finally:
                 self.load_queue.task_done()
 
@@ -397,6 +522,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads.clear()
         self.load_queue.join()
         self.offload_queue.join()
+<<<<<<< HEAD
+=======
+        for event, _ in self.broadcast_events:
+            event.synchronize()
+        self.broadcast_events.clear()
+        self.broadcast_loads.clear()
+>>>>>>> upstream/main
         while True:
             try:
                 self.offload_results.get_nowait()
@@ -417,3 +549,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_thread.join()
         logger.info("Mooncake direct linker stats: %s", self.stats)
         self.storage.close()
+<<<<<<< HEAD
+=======
+        if self.mla_broadcaster is not None:
+            self.mla_broadcaster.destroy()
+>>>>>>> upstream/main

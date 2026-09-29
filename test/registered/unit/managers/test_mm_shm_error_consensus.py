@@ -91,7 +91,11 @@ def _request(feature, rid: str = "vlm-request") -> TokenizedEmbeddingReqInput:
     )
 
 
+<<<<<<< HEAD
 def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
+=======
+def _receiver() -> SchedulerRequestReceiver:
+>>>>>>> upstream/main
     group = SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
@@ -99,6 +103,7 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
+<<<<<<< HEAD
         ps=SimpleNamespace(
             pp_rank=0,
             tp_size=tp_size,
@@ -107,6 +112,8 @@ def _receiver(tp_size: int = 1) -> SchedulerRequestReceiver:
             attn_tp_size=1,
             attn_cp_size=1,
         ),
+=======
+>>>>>>> upstream/main
         tp_group=group,
         tp_cpu_group=group,
         attn_tp_group=group,
@@ -131,8 +138,13 @@ def _run_consensus_rank(rank: int, world_size: int, init_file: str) -> None:
     )
     try:
         req = _request(_failed_pointer() if rank == 1 else _successful_pointer())
+<<<<<<< HEAD
         parallel = SimpleNamespace(enable_dp_attention=False)
         receiver = _receiver(tp_size=world_size)
+=======
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=world_size)
+        receiver = _receiver()
+>>>>>>> upstream/main
         object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
         with (
             patch(
@@ -161,7 +173,11 @@ def _run_image_receiver(rank, init_file, pipe):
         backend="gloo", init_method=Path(init_file).as_uri(), rank=rank, world_size=2
     )
     try:
+<<<<<<< HEAD
         receiver = _receiver(tp_size=2)
+=======
+        receiver = _receiver()
+>>>>>>> upstream/main
         object.__setattr__(receiver, "tp_cpu_group", torch.distributed.group.WORLD)
         torch.distributed.barrier()
         torch.distributed.all_reduce(torch.zeros(1))
@@ -179,7 +195,11 @@ def _run_image_receiver(rank, init_file, pipe):
             ),
             patch(
                 "sglang.srt.managers.scheduler_components.request_receiver.get_parallel",
+<<<<<<< HEAD
                 return_value=SimpleNamespace(enable_dp_attention=False),
+=======
+                return_value=SimpleNamespace(enable_dp_attention=False, tp_size=2),
+>>>>>>> upstream/main
             ),
         ):
             for base in [30, 90]:
@@ -382,7 +402,11 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_local_materialization_failure_becomes_request_error(self):
         req = _request(_failed_pointer())
+<<<<<<< HEAD
         parallel = SimpleNamespace(enable_dp_attention=False)
+=======
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
+>>>>>>> upstream/main
 
         with (
             patch(
@@ -406,7 +430,11 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
 
     def test_peer_failure_rejects_the_local_request(self):
         req = _request(torch.zeros(1))
+<<<<<<< HEAD
         parallel = SimpleNamespace(enable_dp_attention=False)
+=======
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=2)
+>>>>>>> upstream/main
 
         def inject_peer_failure(mask, **kwargs):
             mask.fill_(1)
@@ -429,7 +457,11 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
                 side_effect=inject_peer_failure,
             ) as all_reduce,
         ):
+<<<<<<< HEAD
             _receiver(tp_size=2)._finalize_shm_features([req])
+=======
+            _receiver()._finalize_shm_features([req])
+>>>>>>> upstream/main
 
         all_reduce.assert_called_once()
         self.assertIsInstance(req.mm_inputs, MMInputsProcessError)
@@ -438,7 +470,11 @@ class TestShmRequestFailureConsensus(unittest.TestCase):
         failed_req = _request(torch.zeros(1), rid="failed")
         healthy_req = _request(torch.zeros(1), rid="healthy")
         batch = BatchTokenizedEmbeddingReqInput(batch=[failed_req, healthy_req])
+<<<<<<< HEAD
         parallel = SimpleNamespace(enable_dp_attention=False)
+=======
+        parallel = SimpleNamespace(enable_dp_attention=False, tp_size=1)
+>>>>>>> upstream/main
 
         def materialize(req):
             if req.rid == "failed":

@@ -33,14 +33,20 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     engram_hash_ids_and_commit,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+<<<<<<< HEAD
 from sglang.srt.distributed.parallel_state import get_tp_group
+=======
+>>>>>>> upstream/main
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
+<<<<<<< HEAD
     get_attention_dp_size,
+=======
+>>>>>>> upstream/main
     get_global_dp_buffer_len,
     is_dp_gatherv_active,
 )
@@ -709,7 +715,11 @@ class EngramEmbedding(nn.Module):
             layout,
             max(1, w_bytes + s_bytes),  # mmap requires storage even for an empty shard.
             f"sglang_engram_{layer_id}",
+<<<<<<< HEAD
             get_tp_group(),
+=======
+            get_parallel().tp_group,
+>>>>>>> upstream/main
         )
         raw = self.host_table.bytes[: w_bytes + s_bytes]
         weight = raw[:w_bytes].view(torch.float8_e4m3fn).view(n, dim)
@@ -766,7 +776,11 @@ class EngramEmbedding(nn.Module):
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
+<<<<<<< HEAD
         if self.tp_size > 1 and get_attention_dp_size() > 1:
+=======
+        if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
+>>>>>>> upstream/main
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
 
@@ -832,7 +846,11 @@ class EngramEmbedding(nn.Module):
         if (
             padding is not None
             and padding.is_max_len()
+<<<<<<< HEAD
             and self.tp_size == get_attention_dp_size()
+=======
+            and self.tp_size == get_parallel().attn_dp_size
+>>>>>>> upstream/main
             and rows == self.tp_size * local.shape[0]
         ) or is_dp_gatherv_active():
             dp_reduce_scatter_tensor(local, values)

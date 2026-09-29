@@ -4,6 +4,19 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+<<<<<<< HEAD
+=======
+      name: "Anima",
+      modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
+      cookbook: "/cookbook/diffusion/CircleStone/Anima",
+    },
+    {
+      name: "Ming-Image",
+      modelIds: ["inclusionAI/Ming-Image-0.1-Design", "inclusionAI/Ming-Image-0.1-Design-Layer"],
+      cookbook: "/cookbook/diffusion/inclusionAI/Ming-Image",
+    },
+    {
+>>>>>>> upstream/main
       name: "FLUX",
       modelIds: [
         "black-forest-labs/FLUX.1-dev",
@@ -26,6 +39,14 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
+<<<<<<< HEAD
+=======
+      name: "Qwen-Image 2.1",
+      modelIds: ["Qwen/Qwen-Image-2.1"],
+      cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
+    },
+    {
+>>>>>>> upstream/main
       name: "Qwen-Image Edit / Layered",
       modelIds: [
         "Qwen/Qwen-Image-Edit",

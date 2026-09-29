@@ -24,7 +24,10 @@ from sglang.srt.disaggregation.encoder.runtime import (
 from sglang.srt.disaggregation.encoder.server import (
     BadRequestError,
     EncodeContext,
+<<<<<<< HEAD
     EncoderDelivery,
+=======
+>>>>>>> upstream/main
     EncoderMetaRegistry,
     InternalError,
     MMEncoder,
@@ -48,6 +51,10 @@ from sglang.srt.mem_cache.multimodal_cache import (
     EmbeddingResult,
     MultiModalStaticCache,
 )
+<<<<<<< HEAD
+=======
+from sglang.srt.runtime_context import get_parallel
+>>>>>>> upstream/main
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -521,6 +528,7 @@ class TestEncoderDelivery(CustomTestCase):
             str_mm_hashes=[f"hash-{i}" for i in range(num_items)],
             modality=Modality.IMAGE,
             preprocess_result=SimpleNamespace(token_counts=[2] * num_items),
+<<<<<<< HEAD
         )
 
     @staticmethod
@@ -646,6 +654,123 @@ class TestEncoderDelivery(CustomTestCase):
             },
         )
 
+=======
+        )
+
+    @staticmethod
+    def _make_prefix_cache_encoder_and_context(get_feature_fn):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.mm_cache = MultiModalStaticCache(1024 * 1024)
+        encoder.mm_cache_lock = asyncio.Lock()
+        item = SimpleNamespace(hash=123, set_pad_value=lambda: None)
+        encoder._build_model_mm_items = Mock(return_value=[item])
+        ctx = SimpleNamespace(
+            req_id="req",
+            modality=Modality.IMAGE,
+            num_items=1,
+            mm_feature=None,
+            preprocess_result=SimpleNamespace(token_counts=[2], mm_inputs={}),
+            get_feature_fn=get_feature_fn,
+            is_health_check=False,
+            items_per_req=[1],
+            aux_data={},
+        )
+        return encoder, ctx
+
+    def test_invalid_fresh_embedding_is_not_cached(self):
+        async def run():
+            for actual_tokens in (1, 3):
+                with self.subTest(actual_tokens=actual_tokens):
+                    get_feature_fn = Mock(return_value=torch.zeros((actual_tokens, 4)))
+                    encoder, ctx = self._make_prefix_cache_encoder_and_context(
+                        get_feature_fn
+                    )
+
+                    with (
+                        patch(
+                            "sglang.srt.disaggregation.encoder.server.get_mm",
+                            return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+                        ),
+                        self.assertRaisesRegex(
+                            InternalError,
+                            f"Encoder produced {actual_tokens} tokens, but "
+                            "preprocessor metadata expected 2",
+                        ),
+                    ):
+                        await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+
+                    self.assertEqual(len(encoder.mm_cache), 0)
+                    get_feature_fn.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_valid_fresh_embedding_is_cached_and_reused(self):
+        async def run():
+            get_feature_fn = Mock(return_value=torch.zeros((2, 4)))
+            encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.get_mm",
+                return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+            ):
+                first = await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+                second = await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+
+            torch.testing.assert_close(first, second)
+            self.assertEqual(len(encoder.mm_cache), 1)
+            get_feature_fn.assert_called_once()
+
+        asyncio.run(run())
+
+    def test_invalid_cached_embedding_is_evicted(self):
+        async def run():
+            get_feature_fn = Mock()
+            encoder, ctx = self._make_prefix_cache_encoder_and_context(get_feature_fn)
+            mm_hash = MultiModalStaticCache.combine_hashes([123])
+            encoder.mm_cache.set(
+                mm_hash,
+                EmbeddingResult(embedding=torch.zeros((1, 4))),
+            )
+
+            with (
+                patch(
+                    "sglang.srt.disaggregation.encoder.server.get_mm",
+                    return_value=SimpleNamespace(enable_prefix_mm_cache=True),
+                ),
+                self.assertRaisesRegex(
+                    InternalError,
+                    "Encoder produced 1 tokens, but preprocessor metadata expected 2",
+                ),
+            ):
+                await encoder._compute_direct_embedding(ctx, keep_on_gpu=False)
+
+            self.assertEqual(len(encoder.mm_cache), 0)
+            get_feature_fn.assert_not_called()
+
+        asyncio.run(run())
+
+    def test_background_task_failure_is_observed(self):
+        async def run():
+            encoder = MMEncoder.__new__(MMEncoder)
+            encoder.background_tasks = set()
+
+            async def fail():
+                raise RuntimeError("background failure")
+
+            with patch(
+                "sglang.srt.disaggregation.encoder.server.logger.exception"
+            ) as log_exception:
+                task = encoder._create_background_task(fail())
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+
+            self.assertTrue(task.done())
+            self.assertNotIn(task, encoder.background_tasks)
+            log_exception.assert_called_once_with("MMEncoder background task failed")
+
+        asyncio.run(run())
+
+>>>>>>> upstream/main
     def test_failed_staged_send_releases_request(self):
         async def run():
             encoder = SimpleNamespace(
@@ -1011,10 +1136,14 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1].copy_(torch.tensor([400, 1, 0, 0]))
 
             with (
+<<<<<<< HEAD
                 patch(
                     "sglang.srt.disaggregation.encoder.server.get_tp_group",
                     return_value=TPGroup(),
                 ),
+=======
+                get_parallel().override(tp_group=TPGroup()),
+>>>>>>> upstream/main
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
@@ -1051,10 +1180,14 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1][2] += 1
 
             with (
+<<<<<<< HEAD
                 patch(
                     "sglang.srt.disaggregation.encoder.server.get_tp_group",
                     return_value=TPGroup(),
                 ),
+=======
+                get_parallel().override(tp_group=TPGroup()),
+>>>>>>> upstream/main
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,
@@ -1095,10 +1228,14 @@ class TestEncoderDelivery(CustomTestCase):
                 statuses[1].copy_(local_status)
 
             with (
+<<<<<<< HEAD
                 patch(
                     "sglang.srt.disaggregation.encoder.server.get_tp_group",
                     return_value=TPGroup(),
                 ),
+=======
+                get_parallel().override(tp_group=TPGroup()),
+>>>>>>> upstream/main
                 patch(
                     "sglang.srt.disaggregation.encoder.server.torch.distributed.all_gather",
                     side_effect=all_gather,

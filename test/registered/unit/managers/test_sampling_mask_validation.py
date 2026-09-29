@@ -29,12 +29,25 @@ class TestSamplingMaskValidation(CustomTestCase):
         self.manager.validate_total_tokens = False
         self.manager.is_generation = True
 
+<<<<<<< HEAD
     def _validate(self, processor, return_sampling_mask=True):
+=======
+    def _validate(
+        self,
+        processor,
+        return_sampling_mask=True,
+        sampling_logprobs_mode=None,
+    ):
+>>>>>>> upstream/main
         req = GenerateReqInput(
             input_ids=[1, 2, 3],
             sampling_params={"top_k": 10},
             custom_logit_processor=processor,
             return_sampling_mask=return_sampling_mask,
+<<<<<<< HEAD
+=======
+            sampling_logprobs_mode=sampling_logprobs_mode,
+>>>>>>> upstream/main
         )
         self.manager._validate_one_request(req, req.input_ids)
 
@@ -78,6 +91,26 @@ class TestSamplingMaskValidation(CustomTestCase):
             Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
         )
 
+<<<<<<< HEAD
+=======
+    def test_sampling_logprobs_mode_requires_sampling_mask(self):
+        self._validate(None, return_sampling_mask=False)
+        for mode in ("selected", "support"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValueError, "can only be set when return_sampling_mask=true"
+                ):
+                    self._validate(
+                        None,
+                        return_sampling_mask=False,
+                        sampling_logprobs_mode=mode,
+                    )
+
+        for mode in (None, "selected", "support"):
+            with self.subTest(mode=mode):
+                self._validate(None, sampling_logprobs_mode=mode)
+
+>>>>>>> upstream/main
 
 if __name__ == "__main__":
     unittest.main()

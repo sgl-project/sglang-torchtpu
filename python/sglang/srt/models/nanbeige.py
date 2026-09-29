@@ -5,7 +5,10 @@ import torch
 from torch import nn
 
 from sglang.srt.configs import NanbeigeConfig
+<<<<<<< HEAD
 from sglang.srt.distributed import get_pp_group
+=======
+>>>>>>> upstream/main
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -262,7 +265,11 @@ class NanbeigeModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+<<<<<<< HEAD
         self.pp_group = get_pp_group()
+=======
+        self.pp_group = get_parallel().pp_group
+>>>>>>> upstream/main
         pp_size = self.pp_group.world_size
         assert pp_size == 1, (
             "The NanbeigeModel only supports a pipeline parallelism (PP) value of 1."
@@ -389,7 +396,11 @@ class NanbeigeForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+<<<<<<< HEAD
         self.pp_group = get_pp_group()
+=======
+        self.pp_group = get_parallel().pp_group
+>>>>>>> upstream/main
         self.config = config
         self.quant_config = quant_config
         self.model = NanbeigeModel(

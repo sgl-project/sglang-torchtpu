@@ -1,4 +1,7 @@
+<<<<<<< HEAD
 import argparse
+=======
+>>>>>>> upstream/main
 import concurrent.futures
 import unittest
 from types import SimpleNamespace
@@ -18,6 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+<<<<<<< HEAD
 class TestPdRoleSwitchServerArg(unittest.TestCase):
     def test_cli_flag_parses(self):
         parser = argparse.ArgumentParser()
@@ -30,6 +34,8 @@ class TestPdRoleSwitchServerArg(unittest.TestCase):
         self.assertTrue(on.enable_pd_role_switch)
 
 
+=======
+>>>>>>> upstream/main
 class TestHandlePdRoleSwitch(unittest.TestCase):
     """Cover the control-plane contract of Scheduler.handle_pd_role_switch.
 
@@ -131,7 +137,10 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_rejected_when_decode_graph_headroom_is_insufficient(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
+<<<<<<< HEAD
         s.ps = SimpleNamespace(gpu_id=0)
+=======
+>>>>>>> upstream/main
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=0.5):
             out = Scheduler.handle_pd_role_switch(
@@ -151,7 +160,10 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
     def test_decode_graph_headroom_allows_flip(self):
         s = self._scheduler(DisaggregationMode.PREFILL)
         s.device = "cuda"
+<<<<<<< HEAD
         s.ps = SimpleNamespace(gpu_id=0)
+=======
+>>>>>>> upstream/main
         s.tp_worker.get_decode_cuda_graph_bs.return_value = []
         with patch.object(role_switch, "get_available_gpu_memory", return_value=1.0):
             out = Scheduler.handle_pd_role_switch(
@@ -320,6 +332,10 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         base = dict(
             disaggregation_transfer_backend="mori",
             disaggregation_mode="prefill",
+<<<<<<< HEAD
+=======
+            disaggregation_decode_host_receive_threshold=0.0,
+>>>>>>> upstream/main
             enable_pd_role_switch=True,
             enable_dp_attention=False,
             ep_size=1,
@@ -390,6 +406,7 @@ import time  # noqa: E402
 import zmq  # noqa: E402
 
 try:
+<<<<<<< HEAD
     from sglang.srt.disaggregation.common.utils import FastQueue  # noqa: E402
     from sglang.srt.disaggregation.mori.conn import MoriKVManager  # noqa: E402
 
@@ -398,6 +415,8 @@ except Exception:  # pragma: no cover - environment dependent
     _HAS_MORI = False
 
 try:
+=======
+>>>>>>> upstream/main
     from sglang.srt.disaggregation.common.utils import (  # noqa: E402,F811
         FastQueue as _FQ,
     )
@@ -418,6 +437,7 @@ except Exception:  # pragma: no cover - environment dependent
     _HAS_ROLE_SWITCH = False
 
 
+<<<<<<< HEAD
 @unittest.skipUnless(_HAS_MORI, "mori not importable in this environment")
 class TestMoriTeardownNoThreadLeak(unittest.TestCase):
     """teardown() must stop+join the transfer workers it started, so a P->D->P
@@ -450,6 +470,8 @@ class TestMoriTeardownNoThreadLeak(unittest.TestCase):
         self.assertEqual(m._transfer_queues, [])
 
 
+=======
+>>>>>>> upstream/main
 @unittest.skipUnless(_HAS_MOONCAKE, "mooncake not importable in this environment")
 class TestMooncakeTeardownNoThreadLeak(unittest.TestCase):
     """teardown() must stop+join the transfer workers it started, so a P->D->P

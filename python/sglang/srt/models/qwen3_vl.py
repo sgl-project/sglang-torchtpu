@@ -16,6 +16,7 @@
 
 import logging
 import re
+from array import array
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -28,7 +29,6 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.compilation.support_torch_compile import support_torch_compile
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
@@ -374,7 +374,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
         self.num_position_embeddings = vision_config.num_position_embeddings
@@ -1420,7 +1420,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         language_model_cls=Qwen3LLMModel,
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
@@ -1534,7 +1534,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         if mm_inputs and mm_inputs.mm_items:
             _require_vision(self)
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -1570,6 +1570,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 pixel_values_device=self.visual.device,
                 pixel_values_dtype=self.visual.dtype,
             )
+<<<<<<< HEAD
         if _is_tpu:
             # Assemble on the host at bucket length so the encoder prologue sees
             # a static shape; forward_with_tpu_graph does the single transfer.
@@ -1585,6 +1586,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
                 items, range(len(items)), preserve_for_reprefill=True
             )
+=======
+        pixel_values, borrowed_items, packed_ready = self._materialize_visual_items(
+            items, range(len(items)), preserve_for_reprefill=True
+        )
+>>>>>>> upstream/main
         assert pixel_values.dim() == 2, pixel_values.dim()
         visual_features = self.visual(pixel_values, grid_thw=grid_thw)
         if borrowed_items:
@@ -1597,6 +1603,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self,
         items: List[MultimodalDataItem],
         indices: Iterable[int],
+<<<<<<< HEAD
         *,
         device: torch.device | None = None,
         pad_to: int | None = None,
@@ -1606,6 +1613,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         target_device = visual_device if device is None else device
         device_index = visual_device.index
         if visual_device.type == "cuda" and device_index is None:
+=======
+        preserve_for_reprefill: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, Optional[torch.cuda.Event]]]:
+        device = self.visual.device
+        device_index = device.index
+        if device.type == "cuda" and device_index is None:
+>>>>>>> upstream/main
             device_index = torch.cuda.current_device()
         if visual_device.type == "cuda":
             parallel = get_parallel()
@@ -1616,7 +1630,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         feature_offset = 0
         for index in indices:
             item = items[index]
+<<<<<<< HEAD
             if visual_device.type == "cuda":
+=======
+            if device.type == "cuda":
+>>>>>>> upstream/main
                 proxy = item.feature
                 model_specific_data = getattr(item, "model_specific_data", {})
                 pending_copy = model_specific_data.pop(
@@ -1648,10 +1666,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             feature_offset += item.feature.shape[0]
         try:
             materialized = materialize_multimodal_features(
+<<<<<<< HEAD
                 features,
                 device=target_device,
                 dtype=self.visual.dtype,
                 pad_to=pad_to,
+=======
+                features, device=device, dtype=self.visual.dtype
+>>>>>>> upstream/main
             )
         except Exception:
             for item, proxy, _, _ in borrowed_items:

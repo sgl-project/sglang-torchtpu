@@ -79,6 +79,10 @@ def _make_chunk_cache(req_to_token_pool) -> ChunkCache:
 def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s = Scheduler.__new__(Scheduler)
     s.scheduler_stage_metrics = None
+<<<<<<< HEAD
+=======
+    s.disaggregation_mode = DisaggregationMode.NULL
+>>>>>>> upstream/main
     s.dllm_config = None
     s.dllm_manager = None
     s.enable_hisparse = False

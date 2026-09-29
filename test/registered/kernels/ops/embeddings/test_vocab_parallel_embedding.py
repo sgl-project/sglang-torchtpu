@@ -12,9 +12,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+<<<<<<< HEAD
+=======
+register_amd_ci(est_time=13, suite="stage-b-test-1-gpu-small-amd")
+>>>>>>> upstream/main
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for this test."

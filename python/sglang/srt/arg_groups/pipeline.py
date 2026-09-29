@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The resolution pipeline: the ordered dispatcher every publishing entry runs.
-
-``ServerArgs.resolve_once`` is the only caller. It lives here rather than on the
-record because a step decides *about* the record; none of them is a member of
-it.
-"""
+"""Ordered configuration resolution, called by ``ServerArgs.resolve_once``."""
 
 from __future__ import annotations
 
@@ -22,9 +17,9 @@ from sglang.srt.arg_groups.resolution_hooks import run_hook
 
 
 def run_resolution_pipeline(server_args: Any) -> None:
-    """
-    Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
+    """Resolve and validate server arguments in dependency order.
 
+<<<<<<< HEAD
     Dispatcher style principles:
     1. Keep this function as an ordered dispatcher. Each step should be a
        named call into an ``arg_groups`` family; put imports, conditionals,
@@ -48,6 +43,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
        ``arg_groups/resolution_hooks.py``. This is every step's fixed
        position in the pipeline either way; registering an override changes
        what runs here, never when.
+=======
+    Keep model-independent validation before the dummy-model return. Call steps
+    through ``run_hook`` so plugins can replace them without changing their order.
+>>>>>>> upstream/main
     """
 
     # What the caller asked for, before any handler runs; this plus the
@@ -128,6 +127,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_model_source_paths, server_args)
 
+<<<<<<< HEAD
     # Validate mm_process_config.
     run_hook(handle_multimodal, server_args)
     # Validate SSL arguments early.
@@ -152,6 +152,17 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     handle_tpu_compile_tracer(server_args)
     handle_unsafe_torch_compile_bundle(server_args)
+=======
+    run_hook(handle_multimodal, server_args)
+    run_hook(handle_ssl_validation, server_args)
+    run_hook(handle_asr_validation, server_args)
+
+    run_hook(handle_deprecated_args, server_args)
+
+    run_hook(handle_prefill_delayer_env_compat, server_args)
+
+    run_hook(handle_missing_default_values, server_args)
+>>>>>>> upstream/main
 
     # expert_pack may replace a raw GGUF input with its generated local
     # model metadata before any model-specific handler calls model_config_of.
@@ -172,6 +183,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
+        handle_nvfp4_prefill_kv_dequant_dtype,
         handle_page_major_kv_layout,
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
@@ -185,6 +197,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_elastic_ep,
         handle_eplb_and_dispatch,
         handle_expert_distribution_metrics,
+<<<<<<< HEAD
+=======
+        handle_shared_experts_tp,
+>>>>>>> upstream/main
     )
 
     run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
@@ -214,7 +230,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # handle_gpu_memory_settings so the chunk size feeds memory budgeting.
     run_hook(apply_glm5_chunked_prefill_default, server_args)
 
-    # Handle device-specific backends.
     from sglang.srt.arg_groups.platform_hook import (
         handle_amd_specifics,
         handle_cpu_backends,
@@ -238,12 +253,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_platform_defaults, server_args)
 
+<<<<<<< HEAD
     # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
+=======
+>>>>>>> upstream/main
     from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
 
     run_hook(handle_gpu_memory_settings, server_args)
 
-    # Apply model-specific adjustments.
     from sglang.srt.arg_groups.model_hook import (
         handle_model_capability_adjustments,
         handle_model_specific_adjustments,
@@ -254,7 +271,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # After the model overrides: Qwen4-Exp declares the PLE offload default there.
     run_hook(handle_offload_compatibility, server_args)
 
-    # Set kernel backends.
     run_post_process_pass(server_args, _sampling_backend_default)
     # Must run before _handle_attention_backend_compatibility so the
     # deterministic backend is set before auto-detection fills it in.
@@ -266,6 +282,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     run_hook(handle_deterministic_inference, server_args)
+<<<<<<< HEAD
+=======
+    run_hook(handle_nvfp4_prefill_kv_dequant_dtype, server_args)
+>>>>>>> upstream/main
     run_hook(handle_attention_backend_compatibility, server_args)
     # Must run after the attention backend is resolved so the trtllm_mla
     # default (auto-selected for DeepseekV3ForCausalLM on sm100) is visible.
@@ -297,6 +317,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # _validate_prefill_only_disable_kv_cache_args().
     run_hook(handle_prefill_only_disable_kv_cache, server_args)
 
+<<<<<<< HEAD
     # Handle Hicache settings.
     run_hook(handle_hicache, server_args)
 
@@ -310,6 +331,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_context_parallelism, server_args)
 
     # Handle MoE configurations.
+=======
+    run_hook(handle_hicache, server_args)
+
+    run_hook(handle_data_parallelism, server_args)
+
+    run_hook(handle_load_balance_method, server_args)
+
+    run_hook(handle_context_parallelism, server_args)
+
+>>>>>>> upstream/main
     from sglang.srt.arg_groups.moe_hook import (
         handle_a2a_moe,
         handle_moe_kernel_config,
@@ -320,15 +351,16 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_moe_kernel_config, server_args)
     run_hook(handle_a2a_moe, server_args)
+<<<<<<< HEAD
+=======
+    run_hook(handle_shared_experts_tp, server_args)
+>>>>>>> upstream/main
     run_hook(handle_eplb_and_dispatch, server_args)
     run_hook(handle_expert_distribution_metrics, server_args)
     run_hook(handle_elastic_ep, server_args)
     run_hook(validate_experimental_sgl_marlin, server_args)
 
-    # Handle pipeline parallelism.
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)
-
-    # Handle speculative decoding logic.
 
     from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
@@ -342,6 +374,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
     run_hook(validate_cutedsl_a2a_token_budget, server_args)
 
+<<<<<<< HEAD
     # Handle model loading format.
     run_hook(handle_load_format, server_args)
 
@@ -359,9 +392,28 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_page_major_kv_layout, server_args)
 
+=======
+    from sglang.srt.arg_groups.mega_moe_hook import (
+        validate_mega_moe_token_budget_for_model,
+    )
+
+    run_hook(validate_mega_moe_token_budget_for_model, server_args)
+
+    run_hook(handle_load_format, server_args)
+
+    run_hook(handle_encoder_disaggregation, server_args)
+
+    run_hook(handle_tokenizer_batching, server_args)
+
+    run_hook(handle_environment_variables, server_args)
+
+    run_hook(handle_cache_compatibility, server_args)
+
+    run_hook(handle_page_major_kv_layout, server_args)
+
+>>>>>>> upstream/main
     run_hook(handle_unified_memory_pool, server_args)
 
-    # Handle diffusion LLM inference.
     from sglang.srt.arg_groups.dllm_hook import handle_dllm_inference
 
     run_hook(handle_dllm_inference, server_args)
@@ -369,6 +421,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Handle crash dump environment variables (must run before CUDA init).
     run_hook(handle_crash_dump_env, server_args)
 
+<<<<<<< HEAD
     # Handle debug utilities.
     run_hook(handle_debug_utils, server_args)
 
@@ -377,6 +430,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     # Model-capability adjustments that legacy code applied at model-load
     # time; last declarations of the resolution, mirroring that order.
+=======
+    run_hook(handle_debug_utils, server_args)
+
+    run_hook(handle_other_validations, server_args)
+
+    # Apply model-capability constraints after backend selection.
+>>>>>>> upstream/main
     run_hook(handle_model_capability_adjustments, server_args)
 
     finalize_cuda_graph_prefill_max_context(server_args)

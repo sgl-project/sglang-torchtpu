@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+<<<<<<< HEAD
 pub mod active_load;
+=======
+>>>>>>> upstream/main
 pub mod admission;
 pub mod buckets;
 pub mod cache_aware;
 pub mod decode;
+<<<<<<< HEAD
 pub mod engine_load;
+=======
+>>>>>>> upstream/main
 pub mod factory;
-pub mod kv_events;
 pub mod load_based;
 pub mod power_of_two;
 pub mod prefix_provider;
@@ -22,9 +27,13 @@ pub mod sticky;
 
 use crate::discovery::ModelId;
 use crate::policies::buckets::{BucketRequest, BucketSelector};
+<<<<<<< HEAD
 use crate::policies::engine_load::EngineLoadSnapshot;
+=======
+>>>>>>> upstream/main
 use crate::policies::scoring::{EligibilityFilter, ScoringPolicy};
 use crate::server::metrics::MetricsRegistry;
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
 use dashmap::DashMap;
@@ -176,7 +185,11 @@ pub struct SelectionContext<'a> {
     input_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     external_prefix: Option<&'a ExternalPrefixSignal>,
+<<<<<<< HEAD
     load_snapshot: Option<&'a EngineLoadSnapshot>,
+=======
+    load_snapshot: Option<&'a EngineReportedLoadSnapshot>,
+>>>>>>> upstream/main
     prefill_cache_bucket: Option<(&'a BucketSelector, BucketRequest)>,
     affinity_lookup_enabled: bool,
     affinity_assignment_enabled: bool,
@@ -254,7 +267,11 @@ impl<'a> SelectionContext<'a> {
     }
 
     /// Attaches the engine load snapshot captured at request ingress.
+<<<<<<< HEAD
     pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineLoadSnapshot) -> Self {
+=======
+    pub fn with_load_snapshot(mut self, load_snapshot: &'a EngineReportedLoadSnapshot) -> Self {
+>>>>>>> upstream/main
         self.load_snapshot = Some(load_snapshot);
         self
     }
@@ -315,7 +332,11 @@ impl<'a> SelectionContext<'a> {
         self.external_prefix
     }
 
+<<<<<<< HEAD
     pub fn load_snapshot(&self) -> Option<&EngineLoadSnapshot> {
+=======
+    pub fn load_snapshot(&self) -> Option<&EngineReportedLoadSnapshot> {
+>>>>>>> upstream/main
         self.load_snapshot
     }
 
@@ -592,10 +613,19 @@ mod tests {
         resolve_cache_candidates, resolve_prefill, CandidateRange, DecisionReason, FreshLoadLookup,
     };
     use crate::policies::cache_aware::CacheAwarePolicy;
+<<<<<<< HEAD
     use crate::policies::engine_load::{EngineLoadSnapshot, NativeCacheWorkerLoad};
     use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
     use crate::policies::round_robin::RoundRobinPolicy;
     use crate::policies::session_aware::SessionAwarePolicy;
+=======
+    use crate::policies::power_of_two::PowerOfTwoChoicesPolicy;
+    use crate::policies::round_robin::RoundRobinPolicy;
+    use crate::policies::session_aware::SessionAwarePolicy;
+    use crate::state::load_monitor::engine_reported_load::{
+        EngineReportedLoadSnapshot, EngineReportedSchedulingLoad,
+    };
+>>>>>>> upstream/main
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -810,6 +840,10 @@ mod tests {
             32,
             &loads,
             None,
+<<<<<<< HEAD
+=======
+            2,
+>>>>>>> upstream/main
         )
         .expect("the admitted backup must become Final P");
         assert_eq!(decision.selected.id, backup.id);
@@ -1221,15 +1255,24 @@ mod tests {
         assert!(proposal.backup.is_some());
     }
 
+<<<<<<< HEAD
     fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineLoadSnapshot {
         EngineLoadSnapshot::from_native_cache_workers(
+=======
+    fn snapshot(entries: &[(&Arc<Worker>, TestEngineLoad)]) -> EngineReportedLoadSnapshot {
+        EngineReportedLoadSnapshot::from_native_cache_workers(
+>>>>>>> upstream/main
             1,
             entries
                 .iter()
                 .map(|(worker, aggregate)| {
                     (
                         worker.url.clone(),
+<<<<<<< HEAD
                         NativeCacheWorkerLoad {
+=======
+                        EngineReportedSchedulingLoad {
+>>>>>>> upstream/main
                             num_running_reqs: aggregate.num_running_reqs,
                             num_waiting_reqs: aggregate.num_waiting_reqs,
                             num_waiting_uncached_tokens: aggregate
@@ -1604,7 +1647,11 @@ mod tests {
         let range = CandidateRange::global(&workers);
         let proposal = SelectionProposal::with_backup(Arc::clone(&primary), Arc::clone(&backup));
 
+<<<<<<< HEAD
         let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None)
+=======
+        let decision = resolve_prefill(&range, &proposal, 32, &snapshot, None, 2)
+>>>>>>> upstream/main
             .expect("an admitted backup must be selected");
 
         assert_eq!(decision.selected.id, backup.id);
@@ -1615,7 +1662,11 @@ mod tests {
     fn missing_engine_snapshot_does_not_hard_reject_a_registry_healthy_primary() {
         let primary = worker("primary");
         let workers = vec![Arc::clone(&primary)];
+<<<<<<< HEAD
         let snapshot = EngineLoadSnapshot::default();
+=======
+        let snapshot = EngineReportedLoadSnapshot::default();
+>>>>>>> upstream/main
 
         let decision = resolve_prefill(
             &CandidateRange::global(&workers),
@@ -1623,6 +1674,10 @@ mod tests {
             1_000_000,
             &snapshot,
             None,
+<<<<<<< HEAD
+=======
+            2,
+>>>>>>> upstream/main
         )
         .expect("disabled reporting must preserve the healthy registry candidate");
 
@@ -1661,6 +1716,10 @@ mod tests {
             80,
             &snapshot,
             None,
+<<<<<<< HEAD
+=======
+            2,
+>>>>>>> upstream/main
         )
         .expect("both candidates fit capacity");
 
@@ -1711,6 +1770,10 @@ mod tests {
             32,
             &snapshot,
             None,
+<<<<<<< HEAD
+=======
+            2,
+>>>>>>> upstream/main
         )
         .expect("an admitted range fallback must be selected");
 

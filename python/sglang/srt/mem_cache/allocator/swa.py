@@ -1,8 +1,12 @@
 import logging
+<<<<<<< HEAD
 from typing import Optional
+=======
+>>>>>>> upstream/main
 
 import torch
 
+from sglang.kernels.ops.memory.allocator import get_and_clear_swa_pages
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -27,6 +31,13 @@ if _is_tpu:
     from sglang.srt.hardware_backend.tpu.allocator_tpu import (
         TpuPagedTokenToKVPoolAllocator,
     )
+
+
+# free_swa releases whatever the mapping points at, so an entry that reads as the
+# padding slot would push slot 0 into the SWA free list and hand it out twice.
+_SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
+# free_full leaves the mapping alone, so a live entry would strand its SWA peer.
+_SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
 
 
 # free_swa releases whatever the mapping points at, so an entry that reads as the
@@ -104,12 +115,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         # Trailing -1: a last_loc of -1 (no prefix) indexes it, so alloc_extend and
         # alloc_decode see -1 on the SWA side as well.
+<<<<<<< HEAD
         # On TPU the index bookkeeping that drives this mapping (last_loc and
         # free_index) is host-resident (#29), so keep the mapping on CPU too: the
         # hot translate / free_swa / attention-metadata-host paths then gather
         # without a device round-trip. Alloc writes carry device indices and align
         # to mapping.device explicitly. NPU/CUDA keep it on the accelerator.
         mapping_device = "cpu" if _is_tpu else device
+=======
+>>>>>>> upstream/main
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -180,6 +194,33 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+<<<<<<< HEAD
+=======
+    def reclaim_for_prealloc(
+        self, tree_cache, full_tokens: int, swa_tokens: int
+    ) -> str | None:
+        """Free room for a decode-node preallocation; None means it is ready.
+
+        Returns a description of the shortfall when it cannot be met, for the
+        caller to attach to whichever request it was admitting. Separate
+        buffers make the sliding-window side the only one that needs
+        reclaiming here, since the full side is priced by the caller's budget.
+        """
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        available = self.swa_available_size()
+        if available < swa_tokens:
+            tree_cache.evict_for_alloc(
+                EvictParams(swa_num_tokens=swa_tokens - available)
+            )
+            available = self.swa_available_size()
+        if available < swa_tokens:
+            return (
+                f"SWA eviction insufficient: needed={swa_tokens}, available={available}"
+            )
+        return None
+
+>>>>>>> upstream/main
     def swa_capacity_and_available(self, *, full_capacity, swa_capacity):
         return (
             (full_capacity, self.full_available_size()),
@@ -246,6 +287,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
     ) -> torch.Tensor:
+<<<<<<< HEAD
         """Sliding-window token ids as the PD transfer engine addresses them.
 
         The sibling of `translate_kv_indices_for_transfer` for the SWA state
@@ -254,6 +296,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         A virtual-id pool must override: the transfer addresses raw bytes and
         needs PHYSICAL ids, not kernel-facing ones.
         """
+=======
+        """Map full-pool token ids to SWA-buffer token ids for PD transfer."""
+>>>>>>> upstream/main
         return self.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
@@ -517,6 +562,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         No-op for a per-request ring, which owns no paged SWA peers. Otherwise
         synchronizes at page_size > 1; kv-row segments use free_swa_segment()."""
         if self._swa_req_ring or free_index.numel() == 0:
+<<<<<<< HEAD
             return
 
         if _is_tpu:
@@ -537,6 +583,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.swa_free_group.append(swa_indices)
             else:
                 self.swa_attn_allocator.free(swa_indices)
+=======
+>>>>>>> upstream/main
             return
 
         if self.page_size == 1:
@@ -565,6 +613,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         self._free_swa_pages(free_index, start_pos=start_pos)
 
+<<<<<<< HEAD
     def _free_swa_pages(self, free_index: torch.Tensor, *, start_pos: int):
         ps = self.page_size
         assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
@@ -589,6 +638,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     torch.unique(ref[ref > 0] // ps),
                 ), "swa pages do not match the mapped pages"
         self.clear_full_to_swa_mapping(mapping_indices)
+=======
+    def _free_swa_pages(self, free_index: torch.Tensor, start_pos: int):
+        ps = self.page_size
+        assert start_pos % ps == 0, f"segment start {start_pos} is not page-aligned"
+        full_page_representatives = free_index[::ps]
+        # torch_npu's transfer_to_npu aliases Tensor.is_cuda to Tensor.is_npu.
+        if not _is_npu and free_index.is_cuda:
+            swa_pages = self._free_swa_pages_cuda(full_page_representatives)
+        else:
+            swa_pages = self._free_swa_pages_none_cuda(full_page_representatives)
+>>>>>>> upstream/main
 
         if self._swa_req_ring:
             # Ring slots are owned by the req slot, never lent by the paged
@@ -603,6 +663,55 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free_page_ids(swa_pages)
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
+<<<<<<< HEAD
+=======
+    def _free_swa_pages_none_cuda(
+        self, full_page_representatives: torch.Tensor
+    ) -> torch.Tensor:
+        ps = self.page_size
+        swa_tokens = self.full_to_swa_index_mapping[full_page_representatives]
+        expect(_SWA_PEER_MAPPED, swa_tokens > 0, msg="caller wants free_full")
+
+        if ps == 1:
+            swa_pages = swa_tokens
+            mapping_indices = full_page_representatives
+        else:
+            swa_pages = swa_tokens // ps
+            # Both pools page in step (alloc_extend / alloc_decode drive them
+            # with one seq_lens), so a rep's peer page is the whole peer page.
+            mapping_indices = self._expand_to_full_pages(full_page_representatives)
+            if self.swa_attn_allocator.debug_mode:
+                ref = self.full_to_swa_index_mapping[mapping_indices].cpu()
+                assert torch.equal(
+                    torch.sort(swa_pages.cpu())[0],
+                    torch.unique(ref[ref > 0] // ps),
+                ), "swa pages do not match the mapped pages"
+
+        self.clear_full_to_swa_mapping(mapping_indices)
+        return swa_pages
+
+    def _free_swa_pages_cuda(
+        self, full_page_representatives: torch.Tensor
+    ) -> torch.Tensor:
+        ps = self.page_size
+        check_page_mappings = ps > 1 and self.swa_attn_allocator.debug_mode
+        swa_pages, peers_mapped, page_mappings_valid = get_and_clear_swa_pages(
+            full_page_representatives,
+            self.full_to_swa_index_mapping,
+            ps,
+            check_page_mappings=check_page_mappings,
+        )
+        expect(_SWA_PEER_MAPPED, peers_mapped, msg="caller wants free_full")
+        if check_page_mappings:
+            assert page_mappings_valid is not None
+            # JIT checks within pages; sorting catches duplicate SWA pages.
+            sorted_swa_pages = torch.sort(swa_pages).values
+            assert torch.all(page_mappings_valid) & torch.all(
+                sorted_swa_pages[1:] != sorted_swa_pages[:-1]
+            ), "swa pages do not match the mapped pages"
+        return swa_pages
+
+>>>>>>> upstream/main
     def _release_swa(self, swa_indices: torch.Tensor):
         if self.page_size > 1:
             # Set-shaped frees only (see free_swa): drop the padding-slot entries

@@ -35,14 +35,21 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+<<<<<<< HEAD
 from sglang.srt.distributed import get_pp_group, tensor_model_parallel_all_reduce
+=======
+>>>>>>> upstream/main
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
+<<<<<<< HEAD
     LayerScatterModes,
+=======
+    LayerFacts,
+>>>>>>> upstream/main
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -57,7 +64,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+<<<<<<< HEAD
     should_skip_post_experts_all_reduce,
+=======
+    reduce_moe_output,
+>>>>>>> upstream/main
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -1000,7 +1011,11 @@ class XllmSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
+<<<<<<< HEAD
                 num_token_non_padded=forward_batch.num_token_non_padded,
+=======
+                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
+>>>>>>> upstream/main
                 expert_location_dispatch_info=(
                     ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
                 ),
@@ -1061,6 +1076,7 @@ class XllmSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             final_hidden_states += shared_output
+<<<<<<< HEAD
         if (
             self.tp_size > 1
             and not use_reduce_scatter
@@ -1068,6 +1084,10 @@ class XllmSparseMoeBlock(nn.Module):
             and not get_moe_a2a_backend().is_flashinfer()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+=======
+        if not use_reduce_scatter:
+            final_hidden_states = reduce_moe_output(final_hidden_states)
+>>>>>>> upstream/main
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -1511,7 +1531,11 @@ class XllmDecoderLayer(nn.Module):
         is_previous_layer_sparse = _is_sparse(layer_id - 1)
         is_next_layer_sparse = _is_sparse(layer_id + 1)
 
+<<<<<<< HEAD
         self.layer_scatter_modes = LayerScatterModes.init_new(
+=======
+        self.layer_facts = LayerFacts.init_new(
+>>>>>>> upstream/main
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -1544,11 +1568,19 @@ class XllmDecoderLayer(nn.Module):
         self.input_layernorm = _make_norm(config)
         self.post_attention_layernorm = _make_norm(config)
         self.layer_communicator = LayerCommunicator(
+<<<<<<< HEAD
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == config.num_hidden_layers - 1),
+=======
+            layer_facts=self.layer_facts,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            allow_deferred_ffn_reduction=False,
+>>>>>>> upstream/main
         )
 
     def forward(
@@ -1575,6 +1607,7 @@ class XllmDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+<<<<<<< HEAD
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -1589,6 +1622,19 @@ class XllmDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+=======
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+            use_reduce_scatter = ffn_exit.mlp_reduce_scatter
+            if isinstance(self.mlp, XllmMLP):
+                hidden_states = self.mlp(
+                    hidden_states, use_reduce_scatter=use_reduce_scatter
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, forward_batch, use_reduce_scatter
+                )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+>>>>>>> upstream/main
 
         return hidden_states, residual
 
@@ -1604,7 +1650,11 @@ class XllmModel(nn.Module):
         self.config = config
 
         self.vocab_size = config.vocab_size
+<<<<<<< HEAD
         self.pp_group = get_pp_group()
+=======
+        self.pp_group = get_parallel().pp_group
+>>>>>>> upstream/main
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1701,7 +1751,11 @@ class XllmForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+<<<<<<< HEAD
         self.pp_group = get_pp_group()
+=======
+        self.pp_group = get_parallel().pp_group
+>>>>>>> upstream/main
         self.config = config
         self.quant_config = quant_config
         _validate_mova_config(config, quant_config)

@@ -8,6 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+<<<<<<< HEAD
 
 
 class TestNgramLastCorrectStepIndices(CustomTestCase):
@@ -91,6 +92,8 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
         )
         expected = torch.tensor([0], dtype=torch.int32)
         self.assertTrue(torch.equal(result, expected))
+=======
+>>>>>>> upstream/main
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
@@ -228,149 +231,6 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                 call_kwargs["mamba_steps_to_track"],
                 torch.tensor([2, -1], dtype=torch.int32),
             )
-        )
-
-
-class TestConvWindowDedupLayout(CustomTestCase):
-    """KDA stores conv_state as (K-1, channel), unlike GDN; partial-accept
-    commits must preserve that layout in the overlapping view.
-    """
-
-    @staticmethod
-    def _build_fixed_view(channel_dim, win_len, draft_tokens, window_major, device):
-        shared_win = draft_tokens + win_len - 1
-        L, S = 1, 1
-        phys = torch.zeros(L, S, channel_dim, shared_win, device=device)
-        # Encoding both coordinates makes axis aliasing observable.
-        for c in range(channel_dim):
-            for w in range(shared_win):
-                phys[0, 0, c, w] = c * 1000 + w
-        if not window_major:
-            # GDN: view[l, s, step, d, w] = phys[l, s, d, step + w]
-            view = phys.as_strided(
-                (L, S, draft_tokens, channel_dim, win_len),
-                (
-                    phys.stride(0),
-                    phys.stride(1),
-                    phys.stride(3),
-                    phys.stride(2),
-                    phys.stride(3),
-                ),
-            )
-        else:
-            # KDA: view[l, s, step, w, d] = phys[l, s, d, step + w]
-            view = phys.as_strided(
-                (L, S, draft_tokens, win_len, channel_dim),
-                (
-                    phys.stride(0),
-                    phys.stride(1),
-                    phys.stride(3),
-                    phys.stride(3),
-                    phys.stride(2),
-                ),
-            )
-        return view, phys
-
-    @staticmethod
-    def _build_buggy_kda_view(channel_dim, win_len, draft_tokens, device):
-        """Preserve the former axis swap so the regression test distinguishes
-        the corrected view from the broken one.
-        """
-        conv_shape = (win_len, channel_dim)
-        conv_dim, win = conv_shape
-        shared_win = draft_tokens + win - 1
-        L, S = 1, 1
-        phys = torch.zeros(L, S, conv_dim, shared_win, device=device)
-        for c in range(conv_dim):
-            for w in range(shared_win):
-                phys[0, 0, c, w] = c * 1000 + w
-        view = phys.as_strided(
-            (L, S, draft_tokens, conv_dim, win),
-            (
-                phys.stride(0),
-                phys.stride(1),
-                phys.stride(3),
-                phys.stride(2),
-                phys.stride(3),
-            ),
-        )
-        return view
-
-    def test_kda_window_major_sliding_window(self):
-        channel_dim, win_len, draft_tokens = 5, 3, 4
-        view, _ = self._build_fixed_view(
-            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
-        )
-        for t in range(draft_tokens):
-            for w in range(win_len):
-                for d in range(channel_dim):
-                    got = int(view[0, 0, t, w, d].item())
-                    self.assertEqual(
-                        got,
-                        d * 1000 + (t + w),
-                        msg=f"KDA view alias at step={t} w={w} d={d}",
-                    )
-
-    def test_kda_channel_axis_independent(self):
-        channel_dim, win_len, draft_tokens = 5, 3, 4
-        view, _ = self._build_fixed_view(
-            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
-        )
-        for t in range(draft_tokens):
-            for w in range(win_len):
-                for d in range(channel_dim):
-                    self.assertEqual(int(view[0, 0, t, w, d].item()) // 1000, d)
-
-    def test_kda_window_shifts_by_one_per_step(self):
-        channel_dim, win_len, draft_tokens = 5, 3, 4
-        view, _ = self._build_fixed_view(
-            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
-        )
-        fixed_channel = 2
-        for t in range(draft_tokens - 1):
-            a = view[0, 0, t, :, fixed_channel].tolist()
-            b = view[0, 0, t + 1, :, fixed_channel].tolist()
-            self.assertEqual(a[1:], b[:-1])
-
-    def test_gdn_channel_major_unchanged(self):
-        channel_dim, win_len, draft_tokens = 5, 3, 4
-        view, _ = self._build_fixed_view(
-            channel_dim, win_len, draft_tokens, window_major=False, device="cpu"
-        )
-        for t in range(draft_tokens):
-            for d in range(channel_dim):
-                for w in range(win_len):
-                    self.assertEqual(
-                        int(view[0, 0, t, d, w].item()), d * 1000 + (t + w)
-                    )
-
-    def test_partial_accept_commit_reads_correct_window(self):
-        channel_dim, win_len, draft_tokens = 5, 3, 4
-        view, _ = self._build_fixed_view(
-            channel_dim, win_len, draft_tokens, window_major=True, device="cpu"
-        )
-        n = 1
-        committed = view[0, 0, n]
-        for w in range(win_len):
-            for d in range(channel_dim):
-                self.assertEqual(int(committed[w, d].item()), d * 1000 + (n + w))
-
-    def test_buggy_kda_view_aliases_step_onto_channel(self):
-        channel_dim, win_len, draft_tokens = 5, 3, 4
-        buggy = self._build_buggy_kda_view(
-            channel_dim, win_len, draft_tokens, device="cpu"
-        )
-        self.assertEqual(buggy.shape[3], win_len)
-        self.assertEqual(buggy.shape[4], channel_dim)
-        aliased = False
-        for c in range(buggy.shape[3]):
-            if buggy[0, 0, 0, c, :].tolist() != buggy[0, 0, 1, c, :].tolist():
-                aliased = True
-                break
-        self.assertTrue(
-            aliased,
-            "expected the buggy KDA view to alias the draft-step axis onto the "
-            "channel axis",
         )
 
 

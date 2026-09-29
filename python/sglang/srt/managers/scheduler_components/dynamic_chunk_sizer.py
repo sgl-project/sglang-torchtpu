@@ -12,21 +12,31 @@ from tqdm import tqdm
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
+<<<<<<< HEAD
     get_attention_dp_rank,
     get_attention_dp_size,
+=======
+>>>>>>> upstream/main
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+<<<<<<< HEAD
+=======
+from sglang.srt.runtime_context import get_parallel
+>>>>>>> upstream/main
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
 from sglang.srt.utils.common import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+<<<<<<< HEAD
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+=======
+>>>>>>> upstream/main
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -52,9 +62,12 @@ class DynamicChunkSizer:
         max_prefill_tokens: int,
         page_size: int,
         device: str,
+<<<<<<< HEAD
         pp_group: GroupCoordinator,
         world_group: GroupCoordinator,
         pp_rank: int,
+=======
+>>>>>>> upstream/main
     ):
         self.model_runner = model_runner
         self.model_config = model_config
@@ -66,9 +79,13 @@ class DynamicChunkSizer:
         self.max_prefill_tokens = max_prefill_tokens
         self.page_size = page_size
         self.device = device
+<<<<<<< HEAD
         self.pp_group = pp_group
         self.world_group = world_group
         self.pp_rank = pp_rank
+=======
+        self.pp_rank = get_parallel().pp_rank
+>>>>>>> upstream/main
         self.predictor = ChunkSizePredictor()
 
     def profile_and_fit(self) -> bool:
@@ -76,7 +93,12 @@ class DynamicChunkSizer:
         returns whether the predictor is ready."""
         samples: Optional[Tuple[List[int], List[float]]] = None
 
+<<<<<<< HEAD
         if self.pp_group.is_first_rank:
+=======
+        parallel = get_parallel()
+        if parallel.pp_group.is_first_rank:
+>>>>>>> upstream/main
             try:
                 samples = self._profile_prefill_latency()
             except Exception as e:
@@ -87,8 +109,14 @@ class DynamicChunkSizer:
 
         # The samples are global, so one broadcast from global rank 0 (a PP0 rank)
         # reaches every stage and attention rank; a failure travels as None.
+<<<<<<< HEAD
         samples = broadcast_pyobj(
             [samples], self.world_group.rank, self.world_group.cpu_group, src=0
+=======
+        world_group = parallel.world_group
+        samples = broadcast_pyobj(
+            [samples], world_group.rank, world_group.cpu_group, src=0
+>>>>>>> upstream/main
         )[0]
 
         if samples is None:
@@ -196,9 +224,15 @@ class DynamicChunkSizer:
 
             if is_dp_attention_enabled():
                 # Profiling runs one request on this rank; other DP ranks report 0.
+<<<<<<< HEAD
                 dp_size = get_attention_dp_size()
                 global_num_tokens = [0] * dp_size
                 dp_rank = get_attention_dp_rank()
+=======
+                dp_size = get_parallel().attn_dp_size
+                global_num_tokens = [0] * dp_size
+                dp_rank = get_parallel().attn_dp_rank
+>>>>>>> upstream/main
                 global_num_tokens[dp_rank] = current_seq_len
                 batch.global_num_tokens = global_num_tokens
                 batch.global_num_tokens_for_logprob = global_num_tokens

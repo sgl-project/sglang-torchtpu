@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Config fields of the ``serving`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
@@ -6,6 +7,9 @@ spells it exactly as before. ``ServerArgs`` composes these classes, so the
 record stays one flat object -- the split moves where declarations live, not
 how config is shaped at runtime.
 """
+=======
+"""Config fields of the ``serving`` namespace."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 
@@ -90,6 +94,14 @@ class Serving(msgspec.Struct):
         "default. In legacy --smg-grpc-mode this is the SMG server port and "
         "defaults to --port + 10000.",
     ] = None
+<<<<<<< HEAD
+=======
+    grpc_response_timeout_secs: A[
+        int,
+        "Timeout in seconds waiting for each native gRPC response chunk, "
+        "including the first. Must be positive. Defaults to 300.",
+    ] = 300
+>>>>>>> upstream/main
     # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[
@@ -158,7 +170,11 @@ class Serving(msgspec.Struct):
     ] = None
     admin_api_key: A[
         Optional[str],
+<<<<<<< HEAD
         "Set admin API key for sensitive management endpoints (e.g. /clear_hicache_storage_backend). When set, admin endpoints require this key and do NOT accept --api-key.",
+=======
+        "Set admin API key for sensitive management endpoints (e.g. /hicache/storage-backend/clear). When set, admin endpoints require this key and do NOT accept --api-key.",
+>>>>>>> upstream/main
     ] = None
     served_model_name: A[
         Optional[str],
@@ -172,6 +188,13 @@ class Serving(msgspec.Struct):
         Optional[str],
         "The buliltin chat template name or the path of the chat template file. This is only used for OpenAI-compatible API server.",
     ] = None
+<<<<<<< HEAD
+=======
+    trust_request_chat_template: A[
+        bool,
+        "Allow a request to override the server chat template via its chat_template_kwargs. Off by default for safety.",
+    ] = False
+>>>>>>> upstream/main
     hf_chat_template_name: A[
         Optional[str],
         "When the HuggingFace tokenizer has multiple chat templates (e.g., 'default', 'tool_use', 'rag'), specify which named template to use. If not set, the first available template is used.",
@@ -281,6 +304,13 @@ class Serving(msgspec.Struct):
         bool,
         "(xgrammar and llguidance backends only) Enforce compact representation in JSON constrained output.",
     ] = False
+<<<<<<< HEAD
+=======
+    constrained_json_max_whitespace_cnt: A[
+        Optional[int],
+        "(xgrammar backend only) Max consecutive whitespace chars allowed in JSON constrained output. None means unbounded.",
+    ] = None
+>>>>>>> upstream/main
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer

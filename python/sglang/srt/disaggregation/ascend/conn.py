@@ -15,7 +15,11 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
+<<<<<<< HEAD
 from sglang.srt.distributed import get_pp_group
+=======
+from sglang.srt.runtime_context import get_parallel
+>>>>>>> upstream/main
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -28,12 +32,19 @@ class AscendStateType(str, enum.Enum):
     DSV4_SWA = "dsv4_swa"
     DSV4_C4 = "dsv4_c4"
     DSV4_C128 = "dsv4_c128"
+<<<<<<< HEAD
     DSV4_INDEXER = "dsv4_indexer"
     # C4 compress-state rows (attention + indexer) addressed within each
     # req_pool_idx bank on A5 (CYCLE cache_mode). Separate from StateType.SWA
     # because each peer maps logical positions into its own local ring.
     DSV4_C4_STATE = "dsv4_c4_state"
     DSV4_C128_STATE = "dsv4_c128_state"
+=======
+    # C4 compress-state rows (attention + indexer) addressed within each
+    # req_pool_idx bank on A5 (CYCLE cache_mode).  Separate from StateType.SWA
+    # because each peer maps logical positions into its own local ring.
+    DSV4_C4_STATE = "dsv4_c4_state"
+>>>>>>> upstream/main
 
 
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
@@ -135,7 +146,11 @@ class AscendKVManager(MooncakeKVManager):
         else:
             sliced_dst_kv_ptrs = []
             start_layer = self.kv_args.prefill_start_layer
+<<<<<<< HEAD
             transfer_draft_kv = get_pp_group().is_last_rank and draft_kv_layers
+=======
+            transfer_draft_kv = get_parallel().pp_group.is_last_rank and draft_kv_layers
+>>>>>>> upstream/main
             if transfer_draft_kv:
                 end_layer = start_layer + src_layers - draft_kv_layers
             else:

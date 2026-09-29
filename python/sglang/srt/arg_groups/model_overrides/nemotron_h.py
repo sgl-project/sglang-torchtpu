@@ -1,8 +1,12 @@
+<<<<<<< HEAD
 """Config-time override declarations for nemotron_h.
 
 Architectures: NemotronHForCausalLM, NemotronHPuzzleForCausalLM,
 NemotronH_Omni_Reasoning_V3.
 """
+=======
+"""Config-time override declarations for nemotron_h."""
+>>>>>>> upstream/main
 
 import logging
 from typing import Any, Dict

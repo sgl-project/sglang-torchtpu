@@ -17,6 +17,10 @@ import torch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
+<<<<<<< HEAD
+=======
+    is_hip_runtime,
+>>>>>>> upstream/main
     load_jit,
     make_cpp_args,
 )
@@ -98,7 +102,12 @@ def c1_decode_norm_rope_store(
         freqs_cis,
         positions,
         out_loc,
+<<<<<<< HEAD
         k_cache,
+=======
+        # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
+        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+>>>>>>> upstream/main
         float(eps),
     )
     return out
@@ -176,7 +185,12 @@ def c2_decode_norm_rope_store(
         raw_out_loc,
         eps,
         freqs_cis,
+<<<<<<< HEAD
         k_cache,
+=======
+        # HIP's fp8_e4m3_t is uint8_t, so the kernel matches the fp8 pool as bytes
+        k_cache.view(torch.uint8) if is_hip_runtime() else k_cache,
+>>>>>>> upstream/main
         ring_size,
         draft_len,
     )

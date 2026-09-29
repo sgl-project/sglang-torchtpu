@@ -19,26 +19,29 @@ on:
         required: false
         type: string
         default: 'all'
-      image_a2:
-        description: 'The a2 running docker image of the test task.'
-        required: false
-        type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-910b'
       image_a3:
         description: 'The a3 running docker image of the test task.'
         required: false
         type: string
+<<<<<<< HEAD
         default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3'
       image_a3_cann910:
         description: 'The a3 running docker image of the test task with cann 9.1.0.'
         required: false
         type: string
         default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-nightly'
+=======
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
+>>>>>>> upstream/main
       image_a5:
         description: 'The a5 running docker image of the test task.'
         required: false
         type: string
+<<<<<<< HEAD
         default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-nightly'
+=======
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950'
+>>>>>>> upstream/main
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
         required: false
@@ -56,13 +59,13 @@ on:
         required: false
         type: string
         default: 'all'
-      image_a2:
-        description: 'The a2 running docker image of the test task.'
+      image_a3:
+        description: 'The a3 running docker image of the test task.'
         required: false
         type: string
         default: ''
-      image_a3:
-        description: 'The a3 running docker image of the test task.'
+      image_a5:
+        description: 'The a5 running docker image of the test task.'
         required: false
         type: string
         default: ''
@@ -90,9 +93,11 @@ jobs:
     outputs:
       ref: ${{ steps.set-vars.outputs.ref }}
       job_filter: ${{ steps.set-vars.outputs.job_filter }}
-      image_a2: ${{ steps.set-vars.outputs.image_a2 }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
+<<<<<<< HEAD
       image_a3_cann910: ${{ steps.set-vars.outputs.image_a3_cann910 }}
+=======
+>>>>>>> upstream/main
       image_a5: ${{ steps.set-vars.outputs.image_a5 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
       run_start_metadata: ${{ steps.set-vars.outputs.run_start_metadata }}
@@ -115,16 +120,12 @@ jobs:
           else
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
-          if [ -z "${{ inputs.image_a2 }}" ]; then
-            echo "image_a2=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-910b" >> $GITHUB_OUTPUT
-          else
-            echo "image_a2=${{ inputs.image_a2 }}" >> $GITHUB_OUTPUT
-          fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.0.0-a3" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
+<<<<<<< HEAD
           if [ -z "${{ inputs.image_a3_cann910 }}" ]; then
             echo "image_a3_cann910=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-nightly" >> $GITHUB_OUTPUT
           else
@@ -132,6 +133,10 @@ jobs:
           fi
           if [ -z "${{ inputs.image_a5 }}" ]; then
             echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-nightly" >> $GITHUB_OUTPUT
+=======
+          if [ -z "${{ inputs.image_a5 }}" ]; then
+            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950" >> $GITHUB_OUTPUT
+>>>>>>> upstream/main
           else
             echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
           fi
@@ -329,6 +334,7 @@ jobs:
       install_sglang_deps: false
       device_type_for_deps: 'a5'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+<<<<<<< HEAD
 
   # Suites suffixed with `-cann910` run against the CANN 9.1.0 image.
   nightly-perf-16-npu-a3-cann910:
@@ -364,6 +370,8 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
+=======
+>>>>>>> upstream/main
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
@@ -523,8 +531,11 @@ jobs:
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-16-npu-a3
+<<<<<<< HEAD
       - nightly-perf-16-npu-a3-cann910
       - nightly-acc-16-npu-a3-cann910
+=======
+>>>>>>> upstream/main
       - nightly-acc-4-npu-a5
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -552,8 +563,11 @@ jobs:
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}" \
+<<<<<<< HEAD
             "${{ needs.nightly-perf-16-npu-a3-cann910.result }}" \
             "${{ needs.nightly-acc-16-npu-a3-cann910.result }}" \
+=======
+>>>>>>> upstream/main
             "${{ needs.nightly-acc-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
@@ -585,8 +599,11 @@ jobs:
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}" \
+<<<<<<< HEAD
             "nightly-perf-16-npu-a3-cann910:${{ needs.nightly-perf-16-npu-a3-cann910.result }}" \
             "nightly-acc-16-npu-a3-cann910:${{ needs.nightly-acc-16-npu-a3-cann910.result }}" \
+=======
+>>>>>>> upstream/main
             "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
@@ -594,12 +611,19 @@ jobs:
           done
           echo "| multi-node-poc | $(group_icon ${multi_result}) ${multi_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc | $(group_icon ${mix_result}) ${mix_result} |" >> $GITHUB_STEP_SUMMARY
+<<<<<<< HEAD
           echo "| multi-node-poc-cann910 | $(group_icon ${multi_cann910_result}) ${multi_cann910_result} |" >> $GITHUB_STEP_SUMMARY
           echo "| multi-node-mix-poc-cann910 | $(group_icon ${mix_cann910_result}) ${mix_cann910_result} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
           FAIL=0
           for r in "${single_result}" "${multi_result}" "${mix_result}" "${multi_cann910_result}" "${mix_cann910_result}"; do
+=======
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          FAIL=0
+          for r in "${single_result}" "${multi_result}" "${mix_result}"; do
+>>>>>>> upstream/main
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then FAIL=1; fi
           done
           exit $FAIL

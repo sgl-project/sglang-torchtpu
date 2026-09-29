@@ -296,6 +296,7 @@ class FutureMap:
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
+<<<<<<< HEAD
 
         # On backends that bake a buffer WRITE offset as an HLO constant-shaped
         # scatter (e.g. TPU/XLA), route future-buffer writes through `_store`
@@ -304,6 +305,8 @@ class FutureMap:
         # Other backends use the plain `buf[indices] = values`. Ported from fork
         # PR #78; see `_store`.
         self._use_dynamic_index = _device_use_dynamic_index(device)
+=======
+>>>>>>> upstream/main
 
         if _DEBUG_ASSERT:
             # Poisoned init: every row must be written before its first gather.
@@ -498,6 +501,7 @@ class FutureMap:
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
 
+<<<<<<< HEAD
     def _store(
         self, buf: torch.Tensor, indices: torch.Tensor, values: torch.Tensor
     ) -> None:
@@ -520,12 +524,18 @@ class FutureMap:
         else:
             buf[indices] = values
 
+=======
+>>>>>>> upstream/main
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor
     ) -> None:
         """Write only output_tokens_buf rows; for relays carrying no draft
         extras (stash() would lazy-init the spec bufs from the payload)."""
+<<<<<<< HEAD
         self._store(self.output_tokens_buf, indices, bonus_tokens)
+=======
+        self.output_tokens_buf[indices] = bonus_tokens.to(self.output_tokens_buf.dtype)
+>>>>>>> upstream/main
 
     def resolve_mixed_spec_tails(self, batch: ScheduleBatch) -> None:
         """Late-bind a spec mixed batch's decode tails (overlap): schedule-time

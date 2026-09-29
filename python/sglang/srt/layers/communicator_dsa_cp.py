@@ -13,13 +13,13 @@
 # ==============================================================================
 
 
-from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
+<<<<<<< HEAD
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -29,6 +29,8 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+=======
+>>>>>>> upstream/main
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_active
 from sglang.srt.layers.dp_attention import (
@@ -82,6 +84,7 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
     attn_cp_reduce_scatter_tensor(hidden_states, input_hidden_states)
     return hidden_states
+<<<<<<< HEAD
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
@@ -237,3 +240,5 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         if dsa_use_prefill_cp(forward_batch) or is_mla_cp_active(forward_batch):
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
+=======
+>>>>>>> upstream/main

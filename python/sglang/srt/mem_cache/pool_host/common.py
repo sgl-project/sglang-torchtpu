@@ -103,6 +103,18 @@ def get_allocator_from_storage(allocator_type):
             return HostTensorAllocator()
     elif allocator_type == "shm":
         return ShmHostTensorAllocator()
+    elif allocator_type == "tensorcast":
+        try:
+            from sglang.srt.mem_cache.storage.tensorcast_store.host_allocator import (
+                get_tensorcast_host_allocator_from_runtime,
+            )
+
+            return get_tensorcast_host_allocator_from_runtime()
+        except ImportError:
+            logger.warning(
+                "TensorCast's tensor allocator requires tensorcast >= 0.1.1. Please install TensorCast by 'pip install tensorcast' or build from source by following https://tensorcast.ai/development/build-from-source/. Fallback to use default allocator"
+            )
+            return HostTensorAllocator()
     else:
         return HostTensorAllocator()
 
@@ -254,6 +266,7 @@ def alloc_with_pin_memory(
     return buffer
 
 
+<<<<<<< HEAD
 def alloc_tpu_host(
     dims: tuple,
     dtype: torch.dtype,
@@ -272,6 +285,8 @@ def alloc_tpu_host(
     return torch.empty(dims, dtype=dtype, device="cpu")
 
 
+=======
+>>>>>>> upstream/main
 @lru_cache(maxsize=1)
 def _resolve_device_accessible_ptr_fn():
     try:
@@ -333,6 +348,10 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+<<<<<<< HEAD
         "tpu": alloc_tpu_host,
+=======
+        "xpu": alloc_with_pin_memory,
+>>>>>>> upstream/main
     },
 )

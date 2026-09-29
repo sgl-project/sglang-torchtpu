@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Config fields of the ``exec`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
@@ -6,6 +7,9 @@ spells it exactly as before. ``ServerArgs`` composes these classes, so the
 record stays one flat object -- the split moves where declarations live, not
 how config is shaped at runtime.
 """
+=======
+"""Config fields of the ``exec`` namespace."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 
@@ -96,6 +100,18 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
     ] = False
+<<<<<<< HEAD
+=======
+    enable_encoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 encoder SWA bounded replay: cache Main KV and Indexer keys only, "
+        "rebuild request-owned SWA windows on prefix hits. Experimental; CUDA only.",
+    ] = False
+    enable_decoder_swa_bounded_replay: A[
+        bool,
+        "DeepSeek-V4.1 decoder SWA bounded replay: after the last kv_source layer, run the remaining layers over only the last window_size tokens of a prefill. Main and indexer KV stay exact; nothing is replayed. Deterministic for a fixed prompt and chunk size.",
+    ] = False
+>>>>>>> upstream/main
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -149,6 +165,24 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+<<<<<<< HEAD
+=======
+    prefill_kv_cache_dequant_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Online dequantization dtype used by prefill attention when "
+                "--kv-cache-dtype=nvfp4. 'nvfp4' reads the packed cache directly "
+                "without additional dequantization; 'fp8_e4m3' dequantizes it "
+                "into a temporary FP8 workspace. This does not change the stored "
+                "KV-cache dtype. 'auto' selects NVFP4 without additional "
+                "dequantization on SM100 and FP8 E4M3 otherwise."
+            ),
+            choices=["auto", "nvfp4", "fp8_e4m3"],
+            resolvable=True,
+        ),
+    ] = "auto"
+>>>>>>> upstream/main
     sampling_backend: A[
         Optional[str],
         Arg(
@@ -173,6 +207,7 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+<<<<<<< HEAD
     tpu_fp8_runtime: A[
         Literal["channelwise", "blockwise"],
         Arg(
@@ -181,6 +216,8 @@ class ExecKernel(msgspec.Struct):
             "'blockwise' preserves true blockwise scales and uses the TPU block-FP8 Pallas kernel.",
         ),
     ] = "channelwise"
+=======
+>>>>>>> upstream/main
     fp4_gemm_runner_backend: A[
         str,
         Arg(
@@ -494,6 +531,14 @@ class ExecGraph(msgspec.Struct):
     cuda_graph_max_bs_prefill: A[
         Optional[int], "Maximum batch size captured for the prefill cuda graph."
     ] = None
+<<<<<<< HEAD
+=======
+    cuda_graph_max_seq_len_prefill: A[
+        Optional[int],
+        "Longest sequence a prefill cuda graph replay admits; longer batches "
+        "run eager prefill. Folds into cuda_graph_config[prefill].max_seq_len.",
+    ] = None
+>>>>>>> upstream/main
     cuda_graph_bs_decode: A[
         Optional[List[int]],
         "Explicit list of batch sizes to capture for the decode cuda graph.",
@@ -556,6 +601,7 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable debug mode for torch compile",
     ] = False
+<<<<<<< HEAD
     tpu_compile_tracer: A[
         Literal["dynamo", "direct"],
         "Select the TPU compilation tracer. Dynamo provides guards and broader "
@@ -574,10 +620,13 @@ class ExecGraph(msgspec.Struct):
         "Only load bundles from trusted sources because compiler artifacts may "
         "execute arbitrary code.",
     ] = None
+=======
+>>>>>>> upstream/main
     torch_compile_max_bs: A[
         int,
         "Set the maximum batch size when using torch compile.",
     ] = 32
+<<<<<<< HEAD
     torchao_config: A[
         str,
         "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
@@ -585,6 +634,8 @@ class ExecGraph(msgspec.Struct):
     # These keep hand-written argparse registrations in ServerArgs.add_cli_args.
     tpu_compile_tokens: A[Optional[List[int]], Arg(no_cli=True)] = None
     tpu_compile_bs: A[Optional[List[int]], Arg(no_cli=True)] = None
+=======
+>>>>>>> upstream/main
 
 
 class ExecComm(msgspec.Struct):
@@ -617,7 +668,11 @@ class ExecComm(msgspec.Struct):
     ] = False
     enable_mscclpp: A[
         bool,
+<<<<<<< HEAD
         "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+=======
+        "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
+>>>>>>> upstream/main
     ] = False
     enable_torch_symm_mem: A[
         bool,
@@ -641,7 +696,11 @@ class ExecComm(msgspec.Struct):
         "Enforce disable FlashInfer allreduce fusion.",
     ] = False
     flashinfer_allreduce_fusion_backend: A[
+<<<<<<< HEAD
         Optional[Literal["auto", "trtllm", "mnnvl"]],
+=======
+        Optional[Literal["auto", "trtllm", "mnnvl", "cutedsl"]],
+>>>>>>> upstream/main
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
@@ -652,6 +711,12 @@ class ExecComm(msgspec.Struct):
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
+<<<<<<< HEAD
+=======
+                "'cutedsl': Blackwell-only bf16 MNNVL CuTe DSL backend; also "
+                "fuses the MoE finalize and the shared-expert add into the "
+                "collective when the MoE runner can defer them. "
+>>>>>>> upstream/main
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),
             resolvable=True,
@@ -660,6 +725,31 @@ class ExecComm(msgspec.Struct):
     enable_aiter_allreduce_fusion: A[
         bool, Arg(help="Enable Aiter AllReduce Fusion.", resolvable=True)
     ] = False
+<<<<<<< HEAD
+=======
+    disable_aiter_allreduce_fusion_in_prefill: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for prefill batches "
+                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
+    disable_aiter_allreduce_fusion_in_decode: A[
+        bool,
+        Arg(
+            help=(
+                "Disable Aiter AllReduce Fusion for decode batches (DECODE / "
+                "TARGET_VERIFY / draft-extend / IDLE) while keeping it for prefill. "
+                "Only meaningful with --enable-aiter-allreduce-fusion."
+            ),
+            resolvable=True,
+        ),
+    ] = False
+>>>>>>> upstream/main
 
 
 class ExecMoe(msgspec.Struct):
@@ -825,10 +915,13 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
+<<<<<<< HEAD
     elastic_ep_rejoin: A[
         bool,
         "[Deprecated] Alias for --elastic-ep-join-mode recover.",
     ] = False
+=======
+>>>>>>> upstream/main
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False

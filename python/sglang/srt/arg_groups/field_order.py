@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """The order ``ServerArgs`` presents its fields in, frozen.
 
 A dataclass turns field order into a positional constructor signature, so
@@ -9,6 +10,11 @@ A compatibility record and nothing else -- a field's namespace is the module it
 is declared in, and only ``collect_input_fields`` reads this. A name that is not
 here sorts after every name that is, which is the only backward-compatible
 position for a new field anyway.
+=======
+"""Field order preserving the ServerArgs positional constructor signature.
+
+``collect_input_fields`` appends unlisted fields after these entries.
+>>>>>>> upstream/main
 """
 
 # fmt: off
@@ -103,6 +109,10 @@ POSITIONAL_FIELD_ORDER = (
     "enable_tp_lm_head_all_to_all",
     "enable_attn_tp_input_scattered",
     "enable_shared_experts_attn_tp",
+<<<<<<< HEAD
+=======
+    "shared_experts_tp_size",
+>>>>>>> upstream/main
     "enable_dense_mlp_attn_tp",
     "enable_layernorm_sp",
     "disable_attn_tp_gather",
@@ -143,6 +153,10 @@ POSITIONAL_FIELD_ORDER = (
     "served_model_name",
     "weight_version",
     "chat_template",
+<<<<<<< HEAD
+=======
+    "trust_request_chat_template",
+>>>>>>> upstream/main
     "hf_chat_template_name",
     "completion_template",
     "file_storage_path",
@@ -204,6 +218,10 @@ POSITIONAL_FIELD_ORDER = (
     "stat_loggers",
     "constrained_json_whitespace_pattern",
     "constrained_json_disable_any_whitespace",
+<<<<<<< HEAD
+=======
+    "constrained_json_max_whitespace_cnt",
+>>>>>>> upstream/main
     "attention_backend",
     "decode_attention_backend",
     "enable_lean_attention",
@@ -213,7 +231,10 @@ POSITIONAL_FIELD_ORDER = (
     "radix_cache_backend",
     "mm_attention_backend",
     "fp8_gemm_runner_backend",
+<<<<<<< HEAD
     "tpu_fp8_runtime",
+=======
+>>>>>>> upstream/main
     "fp4_gemm_runner_backend",
     "bf16_gemm_backend",
     "dsa_prefill_backend",
@@ -263,11 +284,15 @@ POSITIONAL_FIELD_ORDER = (
     "enable_aiter_allreduce_fusion",
     "enable_torch_compile",
     "enable_torch_compile_debug_mode",
+<<<<<<< HEAD
     "tpu_compile_tracer",
     "unsafe_save_torch_compile_bundle",
     "unsafe_load_torch_compile_bundle",
     "torch_compile_max_bs",
     "torchao_config",
+=======
+    "torch_compile_max_bs",
+>>>>>>> upstream/main
     "speculative_algorithm",
     "uno_lora_path",
     "speculative_draft_model_path",
@@ -342,7 +367,10 @@ POSITIONAL_FIELD_ORDER = (
     "elastic_ep_initial_size",
     "max_ep_size",
     "elastic_ep_scale_timeout",
+<<<<<<< HEAD
     "elastic_ep_rejoin",
+=======
+>>>>>>> upstream/main
     "disable_flashinfer_cutlass_moe_fp4_allgather",
     "disable_shared_experts_fusion",
     "enforce_shared_experts_fusion",
@@ -396,7 +424,10 @@ POSITIONAL_FIELD_ORDER = (
     "mm_global_cache_backend",
     "disable_fast_image_processor",
     "mm_feature_transport",
+<<<<<<< HEAD
     "keep_mm_feature_on_device",
+=======
+>>>>>>> upstream/main
     "enable_lora",
     "enable_lora_overlap_loading",
     "max_lora_rank",
@@ -510,10 +541,33 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_timeout",
     "forward_hooks",
     "msprobe_dump_config",
+<<<<<<< HEAD
     "tpu_compile_tokens",
     "tpu_compile_bs",
     "tpu_worker_hostnames",
     "torch_tpu_slicebuilder_addresses",
     "torch_tpu_topology",
+=======
+    "ple_offload_embedding",
+    "ple_offload_backend",
+    "ple_offload_dir",
+    "disaggregation_enable_kv_checksum",
+    "enable_pd_role_switch",
+    "speculative_domino_candidate_pool_size",
+    "flashinfer_a2a_dispatch_type",
+    "cuda_graph_max_seq_len_prefill",
+    "prefill_kv_cache_dequant_dtype",
+    "dsv4_attn_backend",
+    "otlp_service_name",
+    "_radix_eviction_policy_explicitly_set",
+    "hicache_host_memory_fraction",
+    "enable_linker_mla_dedup",
+    "_swa_full_tokens_ratio_explicitly_set",
+    "swa_prefix_tails",
+    "enable_encoder_swa_bounded_replay",
+    "enable_decoder_swa_bounded_replay",
+    "enable_response_store",
+    "disaggregation_decode_host_receive_threshold",
+>>>>>>> upstream/main
 )
 # fmt: on

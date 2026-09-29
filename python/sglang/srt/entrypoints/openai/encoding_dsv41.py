@@ -66,8 +66,13 @@ REASONING_EFFORT_TEMPLATE = (
 )
 
 REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+<<<<<<< HEAD
     "low": 25,
     "high": 50,
+=======
+    "low": 50,
+    "high": 75,
+>>>>>>> upstream/main
     "xhigh": 75,
     "max": 100,
 }

@@ -124,7 +124,11 @@ __global__ __launch_bounds__(CandidateBlockTableConfig::kBlockSize, CandidateBlo
     count[j] = __popc(words[j]);
     local += count[j];
   }
+<<<<<<< HEAD
   const auto warp_inc = warp::inclusive_sum(lane_id, local);
+=======
+  const auto warp_inc = warp::inclusive_sum(local, lane_id);
+>>>>>>> upstream/main
   if (lane_id == kWarpThreads - 1) smem.warp_sum[warp_id] = warp_inc;
   __syncthreads();  // also: every thread holds its words, the bitmap may become the queue
   const auto peer_sum = smem.warp_sum[lane_id];

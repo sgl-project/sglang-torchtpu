@@ -1,14 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+<<<<<<< HEAD
 use crate::config::{
     ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides, SessionAffinityMode,
 };
+=======
+mod forward;
+mod preparation;
+mod reorg;
+
+use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
+>>>>>>> upstream/main
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::policies::selection::{
     select_decode_peer, select_prefill_worker, DecodeSelectionInputs, PrefillSelectionInputs,
+<<<<<<< HEAD
 };
 use crate::policies::{
     has_caller_input_ids, request_tokens_for, ExternalPrefixSignal, RequestTokens,
@@ -19,16 +27,31 @@ use crate::server::error::ApiError;
 use crate::server::metrics::{
     classify_stream_end, MetricsRegistry, PolicySelectionFailureReason, RequestOutcome,
     StaleRequestOutcome, WorkerModeLabel,
+=======
+>>>>>>> upstream/main
 };
-use crate::workers::{LoadGuard, Worker};
+use crate::policies::{ExternalPrefixSignal, Policy};
+use crate::server::app_context::{AppContext, ChatRouting};
+use crate::server::error::ApiError;
+use crate::server::metrics::PolicySelectionFailureReason;
+use crate::state::kv_events::{compute_block_hashes, compute_block_hashes_bigram};
+use crate::state::load_monitor::engine_reported_load::EngineReportedLoadSnapshot;
+use crate::workers::Worker;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::http::{HeaderMap, HeaderName, Response};
 use bytes::Bytes;
+<<<<<<< HEAD
 use serde::de::IgnoredAny;
 use serde::Deserialize;
+=======
+use forward::{forward_chat_request, SelectedWorkers};
+use preparation::{parse_routing_fields, PreparedChatRequest};
+>>>>>>> upstream/main
 use std::sync::Arc;
+use std::time::Instant;
 
+<<<<<<< HEAD
 /// Observability header carrying the final decode-pool URL for a
 /// PD-disaggregated request. The router fans the
 /// bootstrap-injected request body to BOTH the prefill and the decode
@@ -41,18 +64,16 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// Optional caller requirement consumed only when a static P Bucket config is enabled.
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 /// Optional caller TPS requirement consumed only when a static D Bucket config is enabled.
+=======
+const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
+>>>>>>> upstream/main
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Coarse char-count → token-count divisor used to estimate prefill load
-/// from the request body when no real tokenizer count is available. Four
-/// bytes per token is the standard SGLang upstream estimate; it
-/// overcounts ASCII and undercounts CJK but stays within an order of
-/// magnitude of the real token count, which is plenty for load
-/// scoring. The active-load counters' role is relative ordering across
-/// workers — not absolute accuracy — so the estimate is fit for
-/// purpose.
-const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
+/// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
+pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
 
+<<<<<<< HEAD
 /// Maximum buffered chat-completions body (32MiB). Sized for base64 multimodal inputs;
 /// enforced by the `DefaultBodyLimit`, and returns 413 PAYLOAD_TOO_LARGE.
 pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
@@ -451,11 +472,15 @@ fn policy_selection_failed(
 /// worker via the per-model policy, then proxy the request. If the
 /// request opts into streaming (`stream: true`), we pipe SSE bytes back;
 /// otherwise buffer.
+=======
+/// Validate, select workers, and forward a chat-completions request.
+>>>>>>> upstream/main
 pub async fn chat_completions(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+<<<<<<< HEAD
     let start = std::time::Instant::now();
     let mut probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
@@ -468,32 +493,36 @@ pub async fn chat_completions(
         .take()
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
+=======
+    match &ctx.chat_routing {
+        ChatRouting::Legacy => chat_completions_legacy(&ctx, headers, body).await,
+        ChatRouting::Reorg(resolvers) => {
+            reorg::chat_completions(&ctx, resolvers, headers, body).await
+        }
+    }
+}
+>>>>>>> upstream/main
 
-    // PD pool isolation: for PD-mode deployments, prefill traffic
-    // selects from the prefill pool only. Plain-mode deployments fall
-    // through to the full candidate set. Partial-failure errors
-    // (`no_prefill_workers_available`) are surfaced as 503 with a
-    // distinct error code so operators can alert independently.
-    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let workers = resolver
-        .prefill_candidates(&model_id)
-        .map_err(|e| match e {
-            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                model: model_str.clone(),
-            },
-            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
-                model: model_str.clone(),
-            },
-            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
-                model: model_str.clone(),
-            },
-        })?;
+async fn chat_completions_legacy(
+    ctx: &AppContext,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let mut fields = parse_routing_fields(&body)?;
+    let model = ModelId(
+        fields
+            .model
+            .take()
+            .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?,
+    );
 
     let policy = ctx
         .policies
-        .get(&model_id)
-        .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+        .get(&model)
+        .ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))?;
 
+<<<<<<< HEAD
     // Fleet-wide sampling contract (`--override-sampling-params`), applied
     // once the model is known to be served (so a request naming an unknown
     // model still gets that answer) and before anything is admitted: under
@@ -538,21 +567,206 @@ pub async fn chat_completions(
         })?)
     } else {
         None
+=======
+    // Find healthy workers: the prefill pool in PD mode, otherwise the plain pool.
+    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+    let candidates = resolver
+        .prefill_candidates(&model)
+        .map_err(|error| pool_error(error, &model))?;
+
+    let request =
+        PreparedChatRequest::prepare(ctx, model, fields, body, policy.needs_request_tokens())?;
+
+    // Pick a plain worker, or a prefill worker followed by a decode peer in PD mode.
+    let workers = select_workers(
+        ctx,
+        &request,
+        &headers,
+        policy.as_ref(),
+        &candidates,
+        &resolver,
+    )
+    .await?;
+
+    // PD sends to both workers and returns the decode response.
+    forward_chat_request(ctx, request, workers, headers, start).await
+}
+
+fn pool_error(error: PdResolveError, model: &ModelId) -> ApiError {
+    let model = model.0.clone();
+    match error {
+        PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers { model },
+        PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable { model },
+        PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable { model },
+    }
+}
+
+async fn select_workers(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    headers: &HeaderMap,
+    policy: &dyn Policy,
+    candidates: &[Arc<Worker>],
+    resolver: &PdPoolResolver,
+) -> Result<SelectedWorkers, ApiError> {
+    // Find cached prompt prefixes and capture engine load info.
+    let routing_context = RoutingContext {
+        prefix_matches: lookup_prefix_matches(ctx, request).await?,
+        load_snapshot: capture_load_snapshot(ctx, policy, candidates),
+        ..RoutingContext::from_headers(ctx, headers)?
+>>>>>>> upstream/main
     };
 
-    // The ids feed both the routing decision (cache-aware consumes them; other
-    // policies ignore them) and — when engine-equivalent — the engine itself,
-    // forwarded as `input_ids` so it skips re-tokenizing the same prompt. The
-    // ingress owns the tokenize via the shared registry, so the choice of
-    // policy never changes whether we tokenize.
-    let request_tokens = request_value
-        .as_ref()
-        .and_then(|v| request_tokens_for(&ctx.tokenizers, &model_id, v));
-    let external_prefix = match (
+    let prefill = pick_prefill_worker(ctx, request, policy, candidates, &routing_context)?;
+    let decode = pick_decode_worker(ctx, request, &prefill, resolver, &routing_context)?;
+    Ok(SelectedWorkers {
+        prefill,
+        decode,
+        track_dispatch_timestamps: policy.needs_dispatch_timestamps(),
+    })
+}
+
+fn capture_load_snapshot(
+    ctx: &AppContext,
+    policy: &dyn Policy,
+    candidates: &[Arc<Worker>],
+) -> Option<EngineReportedLoadSnapshot> {
+    let needed = policy.needs_load_snapshot()
+        || candidates
+            .iter()
+            .any(|worker| worker.mode() == WorkerMode::Prefill);
+    needed.then(|| ctx.engine_reported_load.capture_snapshot(Instant::now()))
+}
+
+struct RoutingContext<'a> {
+    prefix_matches: Option<ExternalPrefixSignal>,
+    load_snapshot: Option<EngineReportedLoadSnapshot>,
+    ttft_slo_ms: Option<u64>,
+    tps_slo: Option<f64>,
+    routing_key: Option<&'a str>,
+    session_id: Option<&'a str>,
+}
+
+impl<'a> RoutingContext<'a> {
+    /// Header-derived selection inputs; prefix and load fields start empty.
+    fn from_headers(ctx: &AppContext, headers: &'a HeaderMap) -> Result<Self, ApiError> {
+        // Buckets group workers by token limits and service targets; disabled means one pool per role.
+        let (ttft_slo_ms, tps_slo) = if ctx.bucket_selector.is_enabled() {
+            (
+                parse_optional_positive_u64_header(headers, &X_SGL_TTFT_SLO_MS, "TTFT SLO")?,
+                parse_optional_positive_f64_header(headers, &X_SGL_TPS_SLO, "TPS SLO")?,
+            )
+        } else {
+            (None, None)
+        };
+        let routing_key = ctx
+            .config
+            .model
+            .sticky
+            .as_ref()
+            .and_then(|config| nonempty_header(headers, &config.header_name));
+        let session_id = ctx
+            .config
+            .model
+            .affinity
+            .as_ref()
+            .and_then(|config| nonempty_header(headers, &config.session_id_header));
+        Ok(Self {
+            prefix_matches: None,
+            load_snapshot: None,
+            ttft_slo_ms,
+            tps_slo,
+            routing_key,
+            session_id,
+        })
+    }
+}
+
+fn nonempty_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+}
+
+fn pick_prefill_worker(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    policy: &dyn Policy,
+    candidates: &[Arc<Worker>],
+    routing: &RoutingContext<'_>,
+) -> Result<Arc<Worker>, ApiError> {
+    let affinity = ctx.config.model.affinity.as_ref();
+    select_prefill_worker(&PrefillSelectionInputs {
+        policy,
+        policy_kind: ctx.config.model.policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        metrics: ctx.metrics.as_ref(),
+        model_id: &request.model,
+        body: Some(&request.body),
+        routing_key: routing.routing_key,
+        session_id: routing.session_id,
+        request_input_tokens: request.input_token_count as u64,
+        request_tokens: request.tokens.as_ref().map(|tokens| tokens.ids.as_slice()),
+        external_prefix: routing.prefix_matches.as_ref(),
+        load_snapshot: routing.load_snapshot.as_ref(),
+        workers: candidates,
+        ttft_slo_ms: routing.ttft_slo_ms,
+        tps_slo: routing.tps_slo,
+        session_affinity_mode: affinity
+            .map(|config| config.session_affinity_mode)
+            .unwrap_or(SessionAffinityMode::Bucket),
+        worker_queue_limit: affinity.and_then(|config| config.worker_queue_limit),
+        saturation_queue_floor: affinity.and_then(|config| config.saturation_queue_floor),
+        min_load_choices: affinity
+            .map(|config| config.min_load_choices)
+            .unwrap_or(DEFAULT_MIN_LOAD_CHOICES),
+    })
+    .map_err(|reason| policy_selection_failed(ctx, &request.model.0, reason))
+}
+
+fn pick_decode_worker(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+    prefill: &Worker,
+    resolver: &PdPoolResolver,
+    routing: &RoutingContext<'_>,
+) -> Result<Option<Arc<Worker>>, ApiError> {
+    if prefill.mode() != WorkerMode::Prefill {
+        return Ok(None);
+    }
+    let candidates = resolver
+        .decode_candidates(&request.model)
+        .map_err(|error| pool_error(error, &request.model))?;
+    let decode = select_decode_peer(&DecodeSelectionInputs {
+        decode_policy_kind: ctx.config.model.decode_policy,
+        bucket_selector: ctx.bucket_selector.as_ref(),
+        model_id: &request.model,
+        prefill_url: &prefill.url,
+        decode_workers: &candidates,
+        request_input_tokens: request.input_token_count as u64,
+        requested_max_output_tokens: request.max_output_tokens,
+        ttft_slo_ms: routing.ttft_slo_ms,
+        tps_slo: routing.tps_slo,
+        load_snapshot: routing.load_snapshot.as_ref(),
+    })
+    .ok_or_else(|| ApiError::NoDecodeWorkersAvailable {
+        model: request.model.0.clone(),
+    })?;
+    Ok(Some(decode))
+}
+
+/// Ask which workers already hold a KV prefix for this prompt; not a worker pick.
+async fn lookup_prefix_matches(
+    ctx: &AppContext,
+    request: &PreparedChatRequest,
+) -> Result<Option<ExternalPrefixSignal>, ApiError> {
+    let signal = match (
         ctx.prefix_index.as_ref(),
-        request_tokens.as_ref(),
+        request.tokens.as_ref(),
         ctx.block_size_oracle.get(),
     ) {
+        // Remote indexer: hash tokens into blocks and match against the KV index.
         (Some(index), Some(tokens), Some(block_size)) => {
             let hashes = if ctx.block_size_oracle.is_bigram() {
                 compute_block_hashes_bigram(&tokens.ids, block_size as usize)
@@ -563,13 +777,14 @@ pub async fn chat_completions(
             let outcome = if hashes.is_empty() {
                 sgl_kv_indexer::PrefixOutcome::Empty
             } else {
-                resolve_prefix_query(index.match_prefix(hashes).await, &model_str)?
+                resolve_prefix_query(index.match_prefix(hashes).await, &request.model.0)?
             };
             Some(ExternalPrefixSignal {
                 outcome,
                 query_blocks,
             })
         }
+<<<<<<< HEAD
         _ => ctx
             .radix_tree_prefix_provider
             .as_ref()
@@ -597,8 +812,19 @@ pub async fn chat_completions(
         )
     } else {
         (None, None)
+=======
+        // Without usable indexer inputs, try the in-process radix tree.
+        _ => ctx
+            .radix_tree_prefix_provider
+            .as_ref()
+            .zip(request.tokens.as_ref())
+            .and_then(|(provider, tokens)| provider.match_request_tokens(&tokens.ids)),
+>>>>>>> upstream/main
     };
+    Ok(signal)
+}
 
+<<<<<<< HEAD
     // Sticky-session routing key. When the sticky policy is configured,
     // read the routing key from the operator-chosen header into the
     // selection context; the policy pins it to a worker. Other policies
@@ -1047,53 +1273,22 @@ pub async fn chat_completions(
         }
         Err(_) => RequestOutcome::Error,
     };
+=======
+fn policy_selection_failed(
+    ctx: &AppContext,
+    model: &str,
+    reason: PolicySelectionFailureReason,
+) -> ApiError {
+>>>>>>> upstream/main
     ctx.metrics
-        .record_worker_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
-
-    // Per-request access log — always on at INFO so incoming traffic and its
-    // status are visible without DEBUG. `request_id` is the client/gateway
-    // X-Request-Id (echoed end-to-end); `worker` is the engine the policy
-    // selected. The cache-aware routing rationale is logged separately at
-    // DEBUG by the policy.
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-    let http_status = match &result {
-        Ok(resp) => resp.status().as_u16(),
-        Err(e) => e.status_code().as_u16(),
-    };
-
-    // Record end-to-end latency now that the outcome is known. Non-streaming:
-    // body is buffered here, so `start.elapsed()` is true e2e — record directly.
-    // Streaming: body still pending, so the `RecordDurationOnDrop` guard in
-    // `stream_guards` records it at stream completion (not just time-to-headers).
-    // `elapsed` still feeds the access-log `latency_ms` for both.
-    //
-    // HTTP status is counted into `responses_total` by the edge middleware
-    // (app.rs), not here — the old per-handler site skipped early exits.
-    let elapsed = start.elapsed();
-    if !streaming {
-        ctx.metrics
-            .observe_request_duration(&metrics_model, elapsed.as_secs_f64());
-    }
-    let outcome_str = match outcome {
-        RequestOutcome::Success => "success",
-        RequestOutcome::Error => "error",
-        RequestOutcome::Cancelled => "cancelled",
-    };
-    tracing::info!(
-        request_id = %request_id,
-        method = "POST",
-        path = "/v1/chat/completions",
-        model = %metrics_model,
-        worker = %metrics_worker_url,
-        outcome = outcome_str,
-        http_status,
-        stream = streaming,
-        latency_ms = elapsed.as_millis() as u64,
-        "chat_completions",
+        .record_policy_selection_failure(ctx.config.model.policy, reason);
+    tracing::warn!(
+        policy = %ctx.config.model.policy,
+        reason = reason.as_str(),
+        model,
+        "prefill policy selection failed"
     );
+<<<<<<< HEAD
 
     // Mirror the upstream `x-sgl-decode-url` hint onto the response so
     // external tests / sidecars can observe the final PD Decode selection without
@@ -1121,6 +1316,10 @@ pub async fn chat_completions(
             Ok(response)
         }
         (other, _) => other,
+=======
+    ApiError::PolicySelectionFailed {
+        model: model.to_owned(),
+>>>>>>> upstream/main
     }
 }
 
@@ -1131,8 +1330,6 @@ fn resolve_prefix_query(
     use sgl_kv_indexer::PrefixIndexError;
     match result {
         Ok(outcome) => Ok(outcome),
-        // The prefix hit only improves worker choice, so an indexer that is
-        // shedding, slow, or down costs cache affinity — not availability.
         Err(
             error @ (PrefixIndexError::Overloaded
             | PrefixIndexError::Timeout
@@ -1141,16 +1338,10 @@ fn resolve_prefix_query(
             tracing::warn!(%model, error = %error, "KV Indexer unavailable; falling back to min-load routing");
             Ok(sgl_kv_indexer::PrefixOutcome::Empty)
         }
-        // A prompt too long to fit one gRPC message is still a prompt a worker
-        // can serve, so it costs cache affinity like the cases above. Logged
-        // separately because the remedy is operational — raise the indexer's
-        // message limit — rather than waiting for the indexer to recover.
         Err(error @ PrefixIndexError::QueryTooLarge) => {
             tracing::warn!(%model, error = %error, "prompt exceeds the KV Indexer query size limit; falling back to min-load routing");
             Ok(sgl_kv_indexer::PrefixOutcome::Empty)
         }
-        // A rejection means the router and the indexer disagree on the request
-        // contract; degrading would hide that from every request.
         Err(error) => {
             tracing::warn!(%model, error = %error, "KV Indexer rejected the query");
             Err(ApiError::PolicySelectionFailed {
@@ -1167,6 +1358,7 @@ fn parse_optional_positive_u64_header(
 ) -> Result<Option<u64>, ApiError> {
     let Some(value) = headers.get(name) else {
         return Ok(None);
+<<<<<<< HEAD
     };
     let raw = value
         .to_str()
@@ -1696,15 +1888,49 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     Err(ApiError::BadRequest(
         "invalid request: body must be a JSON object".to_string(),
     ))
+=======
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be ASCII")))?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be a positive integer")))?;
+    if parsed == 0 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} header must be a positive integer"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_optional_positive_f64_header(
+    headers: &HeaderMap,
+    name: &HeaderName,
+    label: &str,
+) -> Result<Option<f64>, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be ASCII")))?;
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| ApiError::BadRequest(format!("{label} header must be a positive number")))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(ApiError::BadRequest(format!(
+            "{label} header must be a finite positive number"
+        )));
+    }
+    Ok(Some(parsed))
+>>>>>>> upstream/main
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// An unavailable indexer must never fail a request that min-load routing
-    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
-    /// the query's message limit loses cache affinity, not availability.
     #[test]
     fn unavailable_indexer_degrades_to_empty_prefix_signal() {
         for error in [
@@ -1733,6 +1959,7 @@ mod tests {
             Err(ApiError::PolicySelectionFailed { .. })
         ));
     }
+<<<<<<< HEAD
 
     #[test]
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
@@ -2944,4 +3171,6 @@ mod tests {
             r#"{ "model" : "x" ,"temperature":1.0}"#
         );
     }
+=======
+>>>>>>> upstream/main
 }

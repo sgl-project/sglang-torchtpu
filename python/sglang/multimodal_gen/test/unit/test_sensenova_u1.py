@@ -380,6 +380,7 @@ def test_sensenova_u1_npu_fia_checks_operator_availability(monkeypatch, availabl
     assert npu_fia_available() is available
 
 
+<<<<<<< HEAD
 @pytest.mark.parametrize(
     ("is_npu", "uses_native"),
     [(False, True), (True, False)],
@@ -387,11 +388,18 @@ def test_sensenova_u1_npu_fia_checks_operator_availability(monkeypatch, availabl
 def test_sensenova_u1_shared_rmsnorm_dispatch(monkeypatch, is_npu, uses_native):
     monkeypatch.setattr(current_platform, "is_npu", lambda: is_npu)
 
+=======
+def test_sensenova_u1_shared_rmsnorm_uses_framework_dispatch():
+>>>>>>> upstream/main
     norm = make_qwen3_rms_norm(64, eps=1e-6)
 
     assert isinstance(norm, RMSNorm)
     assert norm.cast_x_before_out_mul
+<<<<<<< HEAD
     assert (norm._forward_method == norm.forward_native) is uses_native
+=======
+    assert norm._forward_method != norm.forward_native
+>>>>>>> upstream/main
 
 
 @torch.no_grad()
@@ -1048,6 +1056,13 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
         guidance_scale=4.5,
         num_inference_steps=30,
         num_outputs_per_prompt=2,
+<<<<<<< HEAD
+=======
+        profile=True,
+        profile_all_stages=True,
+        num_profiled_timesteps=3,
+        perf_dump_path="/tmp/sensenova-perf.json",
+>>>>>>> upstream/main
         cfg_norm="global",
         timestep_shift=9.0,
         think_mode=True,
@@ -1064,6 +1079,14 @@ def test_sensenova_u1_cli_args_expose_only_sglang_compatible_fields():
     assert "cfg_norm" not in cli_args
     assert "timestep_shift" not in cli_args
     assert "think_mode" not in cli_args
+<<<<<<< HEAD
+=======
+    request = Req(sampling_params=SenseNovaU1SamplingParams(**cli_args))
+    assert request.profile
+    assert request.profile_all_stages
+    assert request.num_profiled_timesteps == 3
+    assert request.perf_dump_path == "/tmp/sensenova-perf.json"
+>>>>>>> upstream/main
 
 
 def test_sensenova_u1_generation_stage_uses_sglang_params_and_single_model_batch():

@@ -1,8 +1,12 @@
+<<<<<<< HEAD
 """Config-time override declarations for bailing_moe_v3.
 
 Architectures: BailingMoeV3ForCausalLM,
 BailingMoeV3VLForConditionalGeneration.
 """
+=======
+"""Config-time override declarations for bailing_moe_v3."""
+>>>>>>> upstream/main
 
 import logging
 from typing import Any

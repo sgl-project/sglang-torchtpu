@@ -340,11 +340,15 @@ fn lock_without_mamba_records_the_receipt_and_leaves_mamba_evictable() {
     assert_eq!(tc.arena.node(leaf).device_lock_ref(FULL), 1);
 
     // The receipt replays exactly what was taken: FULL only.
+<<<<<<< HEAD
     let params = DecLockRefParams {
         swa_uuid_for_lock: result.swa_uuid_for_lock,
         skipped_lock_components: result.skipped_lock_components,
         ..Default::default()
     };
+=======
+    let params = result.to_dec_params();
+>>>>>>> upstream/main
     tc.dec_lock_ref(leaf_handle, &params, /* skip_swa = */ false)
         .expect("live test node");
     assert_eq!(tc.arena.node(parent).device_lock_ref(FULL), 0);
@@ -368,11 +372,15 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
 
     // The holder's early SWA release must not drop the owner's mamba lock.
+<<<<<<< HEAD
     let holder_params = DecLockRefParams {
         swa_uuid_for_lock: holder.swa_uuid_for_lock,
         skipped_lock_components: holder.skipped_lock_components,
         ..Default::default()
     };
+=======
+    let holder_params = holder.to_dec_params();
+>>>>>>> upstream/main
     let mut device_frees = HashMap::new();
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
@@ -391,11 +399,15 @@ fn swa_only_release_spares_another_holders_mamba_lock() {
     tc.dec_lock_ref(leaf_handle, &holder_params, /* skip_swa = */ true)
         .expect("live test node");
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 1);
+<<<<<<< HEAD
     let owner_params = DecLockRefParams {
         swa_uuid_for_lock: owner.swa_uuid_for_lock,
         skipped_lock_components: owner.skipped_lock_components,
         ..Default::default()
     };
+=======
+    let owner_params = owner.to_dec_params();
+>>>>>>> upstream/main
     tc.dec_lock_ref(leaf_handle, &owner_params, /* skip_swa = */ false)
         .expect("live test node");
     assert_eq!(tc.arena.node(leaf).device_lock_ref(MAMBA), 0);
@@ -1068,11 +1080,19 @@ fn backup_host_build_carries_the_device_slot() {
             MAMBA,
             tc.arena.node(a).id,
             CacheTransferPhase::BackupHost,
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
         .unwrap();
@@ -1100,11 +1120,19 @@ fn backup_host_build_carries_the_device_slot() {
             MAMBA,
             tc.arena.node(b).id,
             CacheTransferPhase::BackupHost,
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
         .is_none()
@@ -1121,11 +1149,19 @@ fn load_back_build_restores_the_host_only_node() {
             MAMBA,
             tc.arena.node(a).id,
             CacheTransferPhase::LoadBack,
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
         .unwrap();
@@ -1151,11 +1187,19 @@ fn load_back_build_skips_device_backed_and_bare_nodes() {
                 MAMBA,
                 tc.arena.node(node).id,
                 CacheTransferPhase::LoadBack,
+<<<<<<< HEAD
                 None,
                 None,
                 0,
                 0,
                 None,
+=======
+                /* host_indices = */ None,
+                /* token_ids = */ None,
+                /* prefetch_tokens = */ 0,
+                /* staging_tokens = */ 0,
+                /* last_hash = */ None,
+>>>>>>> upstream/main
             )
             .expect("live test node")
             .is_none()
@@ -1174,11 +1218,19 @@ fn load_back_build_adds_the_per_request_cow_transfer() {
             a,
             CacheTransferPhase::LoadBack,
             /* mamba_pool_idx = */ Some(Tensor::from_slice(&[3i64]).squeeze()),
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .unwrap()
         .unwrap();
@@ -1390,11 +1442,19 @@ fn backup_storage_build_keys_the_trailing_hash() {
             MAMBA,
             tc.arena.node(a).id,
             CacheTransferPhase::BackupStorage,
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
         .is_none()
@@ -1406,11 +1466,19 @@ fn backup_storage_build_keys_the_trailing_hash() {
             MAMBA,
             tc.arena.node(a).id,
             CacheTransferPhase::BackupStorage,
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
         .is_none()
@@ -1421,11 +1489,19 @@ fn backup_storage_build_keys_the_trailing_hash() {
             MAMBA,
             tc.arena.node(a).id,
             CacheTransferPhase::BackupStorage,
+<<<<<<< HEAD
             None,
             None,
             0,
             0,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ 0,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
         .unwrap();
@@ -1450,11 +1526,19 @@ fn prefetch_build_carries_a_placeholder_key_for_the_planned_slot() {
             MAMBA,
             root_id,
             CacheTransferPhase::Prefetch,
+<<<<<<< HEAD
             None,
             None,
             0,
             staging_tokens,
             None,
+=======
+            /* host_indices = */ None,
+            /* token_ids = */ None,
+            /* prefetch_tokens = */ 0,
+            /* staging_tokens = */ staging_tokens,
+            /* last_hash = */ None,
+>>>>>>> upstream/main
         )
         .expect("live test node")
     };

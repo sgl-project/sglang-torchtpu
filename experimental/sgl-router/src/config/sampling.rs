@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+<<<<<<< HEAD
 //! Fleet-wide sampling contract (`--override-sampling-params` /
 //! `--sampling-param-conflict`): the parameters an operator fixes for every
 //! request this router serves, and what a request that disagrees gets.
@@ -38,10 +39,32 @@ pub struct SamplingOverrides {
     pub params: BTreeMap<SamplingField, ParamSpec>,
     /// Applies to every configured parameter: there is deliberately no
     /// per-parameter mode, so an operator reads one knob off one manifest.
+=======
+//! Fleet sampling defaults and constraints. Custom JSON visitors preserve duplicate
+//! keys so validation can reject them and report the offending parameter.
+//!
+//! The flag is read once, at startup, on a router that crash-loops if it is wrong,
+//! so the message an operator reads out of `kubectl logs` is the whole debugging
+//! session: every rejection names the offending key, the value it saw, and the
+//! domain it violated. (A `serde_json::Map` would keep only the last of a repeated
+//! key and silently enforce a value the operator did not write.)
+
+use anyhow::{anyhow, ensure, Result};
+use std::collections::BTreeMap;
+
+/// Fleet sampling defaults. Exact values fill absent fields; [`ConflictPolicy`]
+/// determines whether differing client values are rejected or forwarded.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SamplingOverrides {
+    /// Parameters in deterministic injection order.
+    pub params: BTreeMap<SamplingField, ParamSpec>,
+    /// Conflict behavior shared by all configured parameters.
+>>>>>>> upstream/main
     pub conflict: ConflictPolicy,
 }
 
 impl SamplingOverrides {
+<<<<<<< HEAD
     /// Re-check every invariant [`parse_sampling_overrides`] enforces, on an
     /// already-built value.
     ///
@@ -53,6 +76,9 @@ impl SamplingOverrides {
     /// start with (an out-of-domain exact value, an inverted band whose
     /// `contains` rejects every value, or a band under `allow`, which names
     /// nothing to inject and rejects nothing).
+=======
+    /// Validate parsed and programmatically constructed overrides alike.
+>>>>>>> upstream/main
     pub(crate) fn validate(&self) -> Result<()> {
         for (&field, spec) in &self.params {
             validate_spec(field, spec, self.conflict)?;
@@ -65,10 +91,14 @@ impl SamplingOverrides {
 /// (`--sampling-param-conflict`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ConflictPolicy {
+<<<<<<< HEAD
     /// 400 before admission, quoting the configured value. The default: the
     /// point of declaring a fleet-wide sampling contract is usually that it
     /// holds, and silently serving something other than what the client asked
     /// for is the one behavior no client can detect.
+=======
+    /// Reject differing client values with 400 before admission.
+>>>>>>> upstream/main
     #[default]
     Reject,
     /// Forward the client's value to the engine untouched. The configured
@@ -80,6 +110,7 @@ pub enum ConflictPolicy {
 /// accepted ones.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParamSpec {
+<<<<<<< HEAD
     /// A single value: injected when the request omits the field, and under
     /// [`ConflictPolicy::Reject`] the only value a request may send.
     ///
@@ -104,6 +135,18 @@ pub enum ParamSpec {
 /// A sampling parameter that can be fixed fleet-wide. The enum is what makes a
 /// typo in the `--override-sampling-params` JSON a startup error instead of a
 /// key that silently never matches a request field.
+=======
+    /// Injected when absent; under [`ConflictPolicy::Reject`], the only accepted value.
+    /// JSON numbers preserve integer wire types.
+    Exact(serde_json::Number),
+    /// Inclusive bounds for supplied values; never injects a default.
+    /// Requires [`ConflictPolicy::Reject`]. Omitted fields use the engine default,
+    /// which may lie outside the band.
+    Range { lo: f64, hi: f64 },
+}
+
+/// Supported fleet sampling parameters.
+>>>>>>> upstream/main
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SamplingField {
     Temperature,
@@ -129,6 +172,7 @@ impl SamplingField {
         Self::N,
     ];
 
+<<<<<<< HEAD
     /// This field's slot in [`Self::ALL`], and in the request probe's
     /// fixed-size array of probed values.
     ///
@@ -138,6 +182,9 @@ impl SamplingField {
     /// `ALL`, so a field missing from it is rejected at startup as an unknown
     /// key, the failure that is invisible to any test that also iterates
     /// `ALL`.
+=======
+    /// Slot in [`Self::ALL`] and in the request probe array.
+>>>>>>> upstream/main
     pub const fn index(self) -> usize {
         self as usize
     }
@@ -190,12 +237,20 @@ pub(crate) fn parse_sampling_overrides(
              '{{\"temperature\": 1, \"top_p\": 0.95}}': {e}"
         )
     })?;
+<<<<<<< HEAD
     if entries.is_empty() {
         return Err(anyhow!(
             "--override-sampling-params is empty: pass at least one of {}, or omit the flag",
             supported_fields()
         ));
     }
+=======
+    ensure!(
+        !entries.is_empty(),
+        "--override-sampling-params is empty: pass at least one of {}, or omit the flag",
+        supported_fields()
+    );
+>>>>>>> upstream/main
     let mut params = BTreeMap::new();
     for (key, value) in entries {
         let field = SamplingField::from_wire_name(&key).ok_or_else(|| {
@@ -216,6 +271,7 @@ pub(crate) fn parse_sampling_overrides(
                 ))
             }
         };
+<<<<<<< HEAD
         if params.insert(field, spec).is_some() {
             return Err(anyhow!(
                 "--override-sampling-params: {} is set more than once",
@@ -229,13 +285,28 @@ pub(crate) fn parse_sampling_overrides(
     // (`1e2`, not `100`) and what guards `canonical_number`'s saturating
     // `as i64` cast before it runs. This pass is what a hand-built
     // `SamplingOverrides` gets, and is the only check a band's bounds see.
+=======
+        ensure!(
+            params.insert(field, spec).is_none(),
+            "--override-sampling-params: {} is set more than once",
+            field.wire_name()
+        );
+    }
+    let overrides = SamplingOverrides { params, conflict };
+    // Validate complete specs too, including bands and programmatically built overrides.
+    // The earlier exact-value check protects the integer cast in `canonical_number`.
+>>>>>>> upstream/main
     overrides.validate()?;
     Ok(overrides)
 }
 
+<<<<<<< HEAD
 /// Check one already-built spec. Shared by [`parse_sampling_overrides`] and
 /// [`SamplingOverrides::validate`] so a hand-built `SamplingOverrides` is held
 /// to exactly the domain the flag is.
+=======
+/// Validate a spec independently of how it was constructed.
+>>>>>>> upstream/main
 fn validate_spec(field: SamplingField, spec: &ParamSpec, conflict: ConflictPolicy) -> Result<()> {
     let key = field.wire_name();
     match spec {
@@ -245,6 +316,7 @@ fn validate_spec(field: SamplingField, spec: &ParamSpec, conflict: ConflictPolic
         &ParamSpec::Range { lo, hi } => {
             check_domain(field, lo, &lo.to_string())?;
             check_domain(field, hi, &hi.to_string())?;
+<<<<<<< HEAD
             if lo > hi {
                 return Err(anyhow!(
                     "--override-sampling-params: {key} band needs min <= max, got min {lo} > max {hi}"
@@ -270,6 +342,26 @@ fn validate_spec(field: SamplingField, spec: &ParamSpec, conflict: ConflictPolic
                      and a band names no value to inject"
                 ));
             }
+=======
+            ensure!(
+                lo <= hi,
+                "--override-sampling-params: {key} band needs min <= max, got min {lo} > max {hi}"
+            );
+            // `top_k = -1` disables filtering; it cannot bound a band that would admit zero.
+            ensure!(
+                field != SamplingField::TopK || lo >= 1.0,
+                "--override-sampling-params: top_k band bounds must both be >= 1 \
+                     (-1 disables top_k entirely and cannot bound a range)"
+            );
+            // A band only ever rejects, so under `allow` it would be dead config
+            // that silently accepts everything.
+            ensure!(
+                conflict == ConflictPolicy::Reject,
+                "--override-sampling-params: the {key} band requires \
+                     --sampling-param-conflict reject — under `allow` nothing is rejected \
+                     and a band names no value to inject"
+            );
+>>>>>>> upstream/main
         }
     }
     Ok(())
@@ -294,11 +386,18 @@ fn parse_band(
                 ))
             }
         };
+<<<<<<< HEAD
         if slot.is_some() {
             return Err(anyhow!(
                 "--override-sampling-params: {key} band sets \"{bound}\" more than once"
             ));
         }
+=======
+        ensure!(
+            slot.is_none(),
+            "--override-sampling-params: {key} band sets \"{bound}\" more than once"
+        );
+>>>>>>> upstream/main
         let serde_json::Value::Number(n) = v else {
             return Err(anyhow!(
                 "--override-sampling-params: {key} band needs numeric bounds, got {bound}: {v}"
@@ -312,6 +411,7 @@ fn parse_band(
              {{\"min\": LO, \"max\": HI}} with numeric bounds"
         ));
     };
+<<<<<<< HEAD
     // `lo <= hi`, `top_k`'s discontiguous domain and the band-under-`allow`
     // rule are all properties of the finished spec, so they live in
     // `validate_spec` and hold for a hand-built `SamplingOverrides` too.
@@ -341,19 +441,41 @@ fn checked_value(field: SamplingField, n: &serde_json::Number) -> Result<f64> {
     })?;
     // The operator's own literal is what the message quotes, not the parsed
     // f64: `1e2` should read back as `1e2`.
+=======
+    // Finished-spec constraints are checked by `validate_spec` for all construction paths.
+    Ok(ParamSpec::Range { lo, hi })
+}
+
+/// Validate before normalization so diagnostics retain the configured number.
+/// Domains follow the OpenAI contract plus engine-specific parameters — deliberately
+/// NARROWER than what the engine accepts: these values are injected into request
+/// bodies, and a fleet contract outside the range every OpenAI client library
+/// validates against is far more likely a typo than an intent.
+fn checked_value(field: SamplingField, n: &serde_json::Number) -> Result<f64> {
+    let name = field.wire_name();
+    // Handle conversion failure even if serde_json arbitrary precision is enabled later.
+    let v = n.as_f64().ok_or_else(|| {
+        anyhow!("--override-sampling-params: {name} ({n}) is not a finite number")
+    })?;
+>>>>>>> upstream/main
     check_domain(field, v, &n.to_string())?;
     Ok(v)
 }
 
+<<<<<<< HEAD
 /// The domain half of [`checked_value`], over an f64 that may not have come
 /// from a literal (a band's bounds are stored as f64). `shown` is what the
 /// error quotes back to the operator.
+=======
+/// Validate a numeric domain; `shown` is the value quoted in diagnostics.
+>>>>>>> upstream/main
 fn check_domain(field: SamplingField, v: f64, shown: &str) -> Result<()> {
     let name = field.wire_name();
     let (ok, domain) = match field {
         SamplingField::Temperature => ((0.0..=2.0).contains(&v), "in [0, 2]"),
         SamplingField::TopP => (v > 0.0 && v <= 1.0, "in (0, 1]"),
         SamplingField::TopK => (v >= 1.0 || v == -1.0, ">= 1, or -1 to disable"),
+<<<<<<< HEAD
         // Not an OpenAI parameter: `min_p` is the engine's own nucleus floor,
         // and 0 is its default (disabled), so the whole [0, 1] range is
         // legitimate to fix fleet-wide.
@@ -361,10 +483,16 @@ fn check_domain(field: SamplingField, v: f64, shown: &str) -> Result<()> {
         // Also engine-only. 1.0 is "no penalty"; the engine requires > 0, and
         // values above ~2 degrade output badly enough that a fleet-wide pin
         // there is far more likely a typo than an intent.
+=======
+        // Engine-specific: zero disables `min_p`.
+        SamplingField::MinP => ((0.0..=1.0).contains(&v), "in [0, 1]"),
+        // Engine-specific: one disables the penalty; cap fleet defaults at two.
+>>>>>>> upstream/main
         SamplingField::RepetitionPenalty => (v > 0.0 && v <= 2.0, "in (0, 2]"),
         SamplingField::FrequencyPenalty | SamplingField::PresencePenalty => {
             ((-2.0..=2.0).contains(&v), "in [-2, 2]")
         }
+<<<<<<< HEAD
         // OpenAI caps `n` at 128. Unbounded here, a typo'd digit would be
         // injected into every request that omits `n` and fan each one out to
         // that many sequences at the engine — the exact per-request failure
@@ -394,14 +522,37 @@ fn check_domain(field: SamplingField, v: f64, shown: &str) -> Result<()> {
                 "--override-sampling-params: {name} ({shown}) is too large to forward"
             ));
         }
+=======
+        // Bound sequence fan-out when `n` is injected into requests.
+        SamplingField::N => ((1.0..=128.0).contains(&v), "in [1, 128]"),
+    };
+    ensure!(
+        ok,
+        "--override-sampling-params: {name} ({shown}) must be {domain}"
+    );
+    if field.is_integral() {
+        ensure!(
+            v.fract() == 0.0,
+            "--override-sampling-params: {name} ({shown}) must be a whole number"
+        );
+        // Float-to-i64 casts saturate. Use [-2^63, 2^63): `i64::MAX as f64` rounds up.
+        ensure!(
+            (i64::MIN as f64..i64::MAX as f64).contains(&v),
+            "--override-sampling-params: {name} ({shown}) is too large to forward"
+        );
+>>>>>>> upstream/main
     }
     Ok(())
 }
 
+<<<<<<< HEAD
 /// Normalize an integer-typed parameter's literal so injection writes `1`
 /// rather than `1.0` for a config that spelled it `1.0` — the engine types
 /// these fields as `int`, and the forwarded body should look like what a
 /// client would have sent. Non-integral fields keep the operator's literal.
+=======
+/// Emit integer-typed parameters as integers; preserve other JSON numbers.
+>>>>>>> upstream/main
 fn canonical_number(
     field: SamplingField,
     value: f64,
@@ -423,8 +574,12 @@ fn supported_fields() -> String {
         .join(", ")
 }
 
+<<<<<<< HEAD
 /// A JSON object decoded to its entries IN ORDER, keeping a repeated key
 /// instead of collapsing it. See the module WHY note.
+=======
+/// Ordered JSON entries preserve duplicate keys for validation.
+>>>>>>> upstream/main
 struct ObjectEntries(Vec<(String, ParamValue)>);
 
 impl<'de> serde::Deserialize<'de> for ObjectEntries {
@@ -454,10 +609,14 @@ impl<'de> serde::Deserialize<'de> for ObjectEntries {
     }
 }
 
+<<<<<<< HEAD
 /// One parameter's raw value: a number, a band's entries, or anything else.
 /// `Other` keeps the offending value so the caller can name it, rather than
 /// degrading a wrong-type message into a serde type error behind the outer
 /// object's context.
+=======
+/// Raw parameter value; `Other` retains invalid values for precise diagnostics.
+>>>>>>> upstream/main
 enum ParamValue {
     Number(serde_json::Number),
     Band(Vec<(String, serde_json::Value)>),
@@ -510,9 +669,13 @@ impl<'de> serde::Deserialize<'de> for ParamValue {
                 Ok(ParamValue::Other(v.into()))
             }
 
+<<<<<<< HEAD
             /// JSON `null`. There is deliberately no `visit_none`: this type
             /// is only ever reached through `deserialize_any`, which routes
             /// null here and never to the `Option` hook.
+=======
+            /// `deserialize_any` routes JSON null to `visit_unit`.
+>>>>>>> upstream/main
             fn visit_unit<E>(self) -> Result<ParamValue, E> {
                 Ok(ParamValue::Other(serde_json::Value::Null))
             }
@@ -654,18 +817,24 @@ mod tests {
         assert_eq!(exact_of(&o, SamplingField::TopK), Some(1000.0));
     }
 
+<<<<<<< HEAD
     /// `top_k: -1` is the engine's own "disable / whole vocabulary" spelling
     /// (and its default), so a fleet may legitimately fix `top_k` to it —
     /// unlike every other parameter, whose domain is the OpenAI one.
+=======
+>>>>>>> upstream/main
     #[test]
     fn top_k_accepts_the_engines_disable_sentinel() {
         let o = parse(r#"{"top_k": -1}"#).unwrap();
         assert_eq!(exact_of(&o, SamplingField::TopK), Some(-1.0));
     }
 
+<<<<<<< HEAD
     /// An integer-typed parameter spelled as a float is normalized, so the
     /// forwarded body carries `1` and not `1.0` for a field the engine types
     /// as `int`.
+=======
+>>>>>>> upstream/main
     #[test]
     fn integral_params_are_normalized_to_integers() {
         let o = parse(r#"{"n": 1.0, "top_k": 20.0}"#).unwrap();
@@ -689,11 +858,15 @@ mod tests {
         }
         assert_eq!(SamplingField::from_wire_name("max_tokens"), None);
     }
+<<<<<<< HEAD
     /// `canonical_number` casts to `i64` and a Rust float-to-int cast
     /// SATURATES, so a literal past the i64 range must fail the launch rather
     /// than be injected as `i64::MAX`. The boundary case is the trap: `i64::MAX
     /// as f64` rounds UP to 2^63, so a `>` comparison against it admits 2^63
     /// itself.
+=======
+    /// Float-to-i64 casts saturate. Use [-2^63, 2^63): `i64::MAX as f64` rounds up.
+>>>>>>> upstream/main
     #[test]
     fn integral_literals_beyond_i64_fail_the_launch() {
         for raw in [
@@ -716,12 +889,15 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// `min_p` and `repetition_penalty` are the only two parameters besides
     /// `temperature`/`top_p`/`top_k` that the engine resolves from the model's
     /// own `generation_config`, so they are exactly the ones a fleet-wide pin
     /// exists to stop drifting when an image is swapped. Rejecting them as
     /// unknown keys would crash-loop the router for the operator who needs the
     /// flag most.
+=======
+>>>>>>> upstream/main
     #[test]
     fn governs_the_engine_defaulted_parameters() {
         let o = parse(r#"{"min_p": 0.05, "repetition_penalty": 1.1}"#).unwrap();
@@ -744,6 +920,7 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
     /// `ALL` is what `from_wire_name` and `supported_fields` iterate, so a
     /// field missing from it is silently rejected at startup as an unknown
     /// key — invisible to any test that also iterates `ALL`. Pin the length
@@ -754,6 +931,10 @@ mod tests {
         // `const _` block above `parse_sampling_overrides`); what only a test
         // can catch is a field missing from `ALL` entirely, which is why the
         // names below are written out rather than derived from it.
+=======
+    #[test]
+    fn all_covers_every_field_exactly_once() {
+>>>>>>> upstream/main
         let names: std::collections::BTreeSet<_> =
             SamplingField::ALL.iter().map(|f| f.wire_name()).collect();
         assert_eq!(names.len(), SamplingField::ALL.len(), "duplicate wire name");
@@ -771,10 +952,13 @@ mod tests {
         }
     }
 
+<<<<<<< HEAD
     /// The struct-level invariants must hold for a `SamplingOverrides` that
     /// never went through the parser — a test fixture, a future config file or
     /// admin API. An inverted band is the nastiest of these: `(lo..=hi)`
     /// contains nothing, so it would 400 every request naming the parameter.
+=======
+>>>>>>> upstream/main
     #[test]
     fn validate_rejects_hand_built_specs_the_parser_would_refuse() {
         let bad = [

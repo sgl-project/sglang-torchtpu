@@ -17,6 +17,10 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
+<<<<<<< HEAD
+=======
+from sglang.srt.configs.gigachat35 import GigaChat35Config
+>>>>>>> upstream/main
 from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hy_v4 import HYV4Config
@@ -132,6 +136,10 @@ __all__ = [
     "Dots3Config",
     "FalconH1Config",
     "FalconMambaConfig",
+<<<<<<< HEAD
+=======
+    "GigaChat35Config",
+>>>>>>> upstream/main
     "GraniteMoeHybridConfig",
     "HYV4Config",
     "MambaConfig",

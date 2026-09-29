@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Config fields of the ``mm`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
@@ -6,6 +7,9 @@ spells it exactly as before. ``ServerArgs`` composes these classes, so the
 record stays one flat object -- the split moves where declarations live, not
 how config is shaped at runtime.
 """
+=======
+"""Config fields of the ``mm`` namespace."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 
@@ -157,8 +161,11 @@ class Mm(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+<<<<<<< HEAD
     keep_mm_feature_on_device: A[
         bool,
         "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
         "multimodal feature transport.",
     ] = False
+=======
+>>>>>>> upstream/main

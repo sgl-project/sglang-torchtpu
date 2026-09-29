@@ -93,8 +93,13 @@ on:
           - nightly-8-gpu-glm51
           # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
           - nightly-8-gpu-mi35x-glm52-fp8
+<<<<<<< HEAD
           # 8-GPU GLM-5-MXFP4 (MI35x only)
           - nightly-8-gpu-mi35x-glm5-mxfp4
+=======
+          # 8-GPU GLM-5.3-Flash (MI35x)
+          - nightly-8-gpu-mi35x-glm53-flash
+>>>>>>> upstream/main
           # 4-GPU MiniMax-M2.5 (MI35x)
           - nightly-4-gpu-mi35x-minimax-m25
           # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)
@@ -579,6 +584,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
+<<<<<<< HEAD
       - name: Accuracy Test (8-GPU Grok1-FP8)
         timeout-minutes: 60
         run: |
@@ -587,6 +593,8 @@ jobs:
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-grok1-fp8 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
 
+=======
+>>>>>>> upstream/main
       # Shares this job with the accuracy step above: it already serves the same
       # two models, and an MI30x job spends ~49 min pulling the image and
       # installing dependencies before it runs anything.
@@ -2052,16 +2060,25 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU GLM-5-MXFP4 (MI35x only)
+  # 8-GPU GLM-5.3-Flash (MI35x)
   # ==============================================================================
 
+<<<<<<< HEAD
   nightly-8-gpu-mi35x-glm5-mxfp4:
     name: ${{ format('nightly-8-gpu-mi35x-glm5-mxfp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+=======
+  nightly-8-gpu-mi35x-glm53-flash:
+    name: ${{ format('nightly-8-gpu-mi35x-glm53-flash ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
+>>>>>>> upstream/main
     strategy:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+<<<<<<< HEAD
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4,'))
+=======
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm53-flash,'))
+>>>>>>> upstream/main
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -2078,17 +2095,23 @@ jobs:
           bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ matrix.rocm_version }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
+<<<<<<< HEAD
       - name: Accuracy Test MI35x ROCm (8-GPU GLM-5-MXFP4)
+=======
+      - name: Accuracy Test MI35x ROCm (8-GPU GLM-5.3-Flash DSA+KDA)
+>>>>>>> upstream/main
         timeout-minutes: 180
         run: |
-          > github_summary.md
+          > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+<<<<<<< HEAD
             -e SGLANG_USE_AITER=1 \
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
@@ -2106,6 +2129,11 @@ jobs:
             -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 registered/amd/perf/mi35x/test_glm5_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
+=======
+            -e SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm53-flash --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+>>>>>>> upstream/main
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2376,8 +2404,13 @@ jobs:
       - nightly-8-gpu-glm51
       # 8-GPU GLM-5.2-FP8 (MI35x accuracy + performance)
       - nightly-8-gpu-mi35x-glm52-fp8
+<<<<<<< HEAD
       # 8-GPU GLM-5-MXFP4 (MI35x only)
       - nightly-8-gpu-mi35x-glm5-mxfp4
+=======
+      # 8-GPU GLM-5.3-Flash (MI35x)
+      - nightly-8-gpu-mi35x-glm53-flash
+>>>>>>> upstream/main
       # 4-GPU MiniMax-M2.5 (MI35x)
       - nightly-4-gpu-mi35x-minimax-m25
       # 4-GPU MiniMax-M3 MXFP8 (MI35x accuracy + performance)

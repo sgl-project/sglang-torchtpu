@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Out-of-tree replacement for a named step of the resolution pipeline.
 
 `run_resolution_pipeline` calls its steps by name, hardcoded, with no
@@ -22,12 +23,20 @@ included -- it does not read `server_args` (see the comment at its
 definition), but it takes the parameter anyway so `run_hook` never has to
 special-case an arity. An override's own signature always matches: `def
 mine(server_args, previous)`.
+=======
+"""Plugin overrides for named resolution steps.
+
+Overrides receive ``(server_args, previous)`` and may call ``previous`` to
+wrap the existing step. Only whitelisted names are accepted. Registration
+changes the implementation at that step's existing pipeline position.
+>>>>>>> upstream/main
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, FrozenSet, List
 
+<<<<<<< HEAD
 # Every step this pipeline runs by name that a downstream package may replace.
 # Add a name here only alongside the call site's own switch to `run_hook` --
 # an entry with no matching `run_hook(...)` call is a name nothing will ever
@@ -40,6 +49,10 @@ from typing import Any, Callable, Dict, FrozenSet, List
 # its call sites). An override registered for it applies at both, identically;
 # there is no way to target "just the second call" through this mechanism,
 # because the name is all `run_hook` has to key on.
+=======
+# Names must match run_hook call sites in pipeline.py. An override applies
+# to every invocation of that name, including repeated steps.
+>>>>>>> upstream/main
 _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
         "handle_mega_moe",
@@ -79,6 +92,10 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_gpu_memory_settings",
         "handle_model_specific_adjustments",
         "handle_deterministic_inference",
+<<<<<<< HEAD
+=======
+        "handle_nvfp4_prefill_kv_dequant_dtype",
+>>>>>>> upstream/main
         "handle_attention_backend_compatibility",
         "disable_prefill_cuda_graph_for_deepseek_trtllm_mla",
         "handle_mamba_backend",
@@ -100,11 +117,19 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_a2a_moe",
         "handle_eplb_and_dispatch",
         "handle_expert_distribution_metrics",
+<<<<<<< HEAD
+=======
+        "handle_shared_experts_tp",
+>>>>>>> upstream/main
         "handle_elastic_ep",
         "validate_experimental_sgl_marlin",
         "handle_speculative_decoding",
         "handle_layernorm_sp",
         "validate_cutedsl_a2a_token_budget",
+<<<<<<< HEAD
+=======
+        "validate_mega_moe_token_budget_for_model",
+>>>>>>> upstream/main
         "handle_load_format",
         "handle_encoder_disaggregation",
         "handle_tokenizer_batching",
@@ -122,16 +147,21 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     }
 )
 
+<<<<<<< HEAD
 # name -> registered overrides, oldest first. Each takes `(server_args,
 # previous)`, where `previous` is the callable it wraps -- the built-in on
 # the first registration, the previous registrant's own wrapper on every one
 # after. Process-global as a `dict[str, list]` so a test isolates it the way
 # test_model_overrides.py isolates `_MODEL_OVERRIDE_FNS`:
 # `patch.dict(..., clear=True)`.
+=======
+# Step name -> wrappers in registration order.
+>>>>>>> upstream/main
 _HOOKS: Dict[str, List[Callable[[Any, Callable[[Any], None]], None]]] = {}
 
 
 def register_resolution_hook(name: str):
+<<<<<<< HEAD
     """Replace (or wrap) the pipeline step named ``name``.
 
     The decorated function is called as ``fn(server_args, previous)``.
@@ -158,6 +188,13 @@ def register_resolution_hook(name: str):
     does -- only readers from this position onward see them; a step that
     already ran and read the old value before this one's `previous` (or the
     built-in) declared its replacement has already made its decision on it.
+=======
+    """Register ``fn(server_args, previous)`` for a pipeline step.
+
+    ``previous(server_args)`` calls the previously registered wrapper, or the
+    built-in step for the first registration. Omitting it replaces the step.
+    The last registration runs outermost, so plugin import order matters.
+>>>>>>> upstream/main
     """
     if name not in _OVERRIDABLE_HOOKS:
         raise ValueError(
@@ -175,6 +212,7 @@ def register_resolution_hook(name: str):
 
 
 def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
+<<<<<<< HEAD
     """Run ``builtin`` -- the registered chain if anything overrode it under
     its name, ``builtin`` directly otherwise.
 
@@ -191,6 +229,12 @@ def run_hook(builtin: Callable[[Any], None], server_args: Any) -> None:
     `ServerArgs` exists) there is no `server_args` yet and the first
     registrant's `previous` cannot be bound to anything real until a call
     actually happens.
+=======
+    """Run registered wrappers for ``builtin.__name__``, or the built-in step.
+
+    ``builtin`` must be a named function. Wrappers receive the same server
+    arguments as the built-in step.
+>>>>>>> upstream/main
     """
     step = builtin
     for fn in _HOOKS.get(builtin.__name__, ()):

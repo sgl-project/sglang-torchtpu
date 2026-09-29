@@ -31,6 +31,18 @@ if not is_sm100_supported():
 GROUP_SIZE = 32  # MXFP4 block size
 
 
+<<<<<<< HEAD
+=======
+@pytest.fixture
+def stated_tp_group():
+    """Provide a TP-group placeholder for kernels with mocked symmetric memory."""
+    from sglang.srt.runtime_context import get_parallel
+
+    with get_parallel().override(tp_group=None):
+        yield
+
+
+>>>>>>> upstream/main
 class _MockLayer:
     """Hand-built ``FusedMoE`` stand-in (avoids distributed init)."""
 
@@ -283,7 +295,11 @@ def _ref_trtllm(x, layer, method, precision, top_k, router_logits):
     ],
 )
 def test_apply_trtllm_gen_matches_flashinfer_direct(
+<<<<<<< HEAD
     tokens, num_experts, hidden, inter, top_k, precision, monkeypatch
+=======
+    tokens, num_experts, hidden, inter, top_k, precision, monkeypatch, stated_tp_group
+>>>>>>> upstream/main
 ):
     """``Mxfp4MoEMethod.apply`` (SM100 branch) must produce the same output as a
     direct ``trtllm_fp4_block_scale_moe`` call fed the same inputs.
@@ -301,7 +317,10 @@ def test_apply_trtllm_gen_matches_flashinfer_direct(
         fi_trtllm_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
     monkeypatch.setattr(fi_trtllm_mod, "is_allocation_symmetric", lambda: False)
+<<<<<<< HEAD
     monkeypatch.setattr(fi_trtllm_mod, "get_tp_group", lambda: None)
+=======
+>>>>>>> upstream/main
 
     fixtures = _make_random_mxfp4(num_experts, hidden, inter)
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1

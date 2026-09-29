@@ -263,6 +263,10 @@ def _build_deepseek_v4_device_pool_group(
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _dsv4_compressed_region_buffers,
         _dsv4_indexer_regions,
+<<<<<<< HEAD
+=======
+        _require_single_row_dsv4_swa_pages,
+>>>>>>> upstream/main
         _resolve_deepseek_v4_layer_mappings,
     )
 
@@ -273,6 +277,14 @@ def _build_deepseek_v4_device_pool_group(
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     entries = []
     if not is_unified_kv:
+<<<<<<< HEAD
+=======
+        _require_single_row_dsv4_swa_pages(
+            logical_page_size=kvcache.swa_page_size,
+            physical_page_size=kvcache.swa_kv_pool.page_size,
+            consumer="DeepSeek-V4 direct external linker",
+        )
+>>>>>>> upstream/main
         if kvcache.swa_page_size != page_size:
             raise ValueError(
                 "DeepSeek V4 SWA page size must match the tree page size: "
@@ -362,7 +374,7 @@ def _build_deepseek_v4_device_pool_group(
         )
     return DevicePoolGroup(
         entries,
-        mappings.transfer_layer_num,
+        mappings.transfer_layer_id_max,
         page_size,
         rank_replicated=True,
     )

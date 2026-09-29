@@ -3,8 +3,12 @@
 import argparse
 import unittest
 
+<<<<<<< HEAD
 from sglang.srt.server_args import ServerArgs, _declared_default
 from sglang.srt.utils.common import human_readable_int
+=======
+from sglang.srt.server_args import ServerArgs
+>>>>>>> upstream/main
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,6 +20,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
     def setUpClass(cls):
         cls.parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(cls.parser)
+<<<<<<< HEAD
         cls.actions_by_option = {
             option: action
             for action in cls.parser._actions
@@ -73,6 +78,8 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "total_tokens",
             ],
         )
+=======
+>>>>>>> upstream/main
 
     def test_data_parallel_aliases_keep_old_usage(self):
         for option in ("--data-parallel-size", "--dp-size"):
@@ -81,6 +88,17 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 self.assertEqual(args.dp_size, 3)
                 self.assertEqual(ServerArgs.from_cli_args(args).dp_size, 3)
 
+<<<<<<< HEAD
+=======
+    def test_request_chat_template_requires_explicit_opt_in(self):
+        for flags, expected in (([], False), (["--trust-request-chat-template"], True)):
+            with self.subTest(flags=flags):
+                args = self.parser.parse_args(["--model", "dummy", *flags])
+                self.assertIs(
+                    ServerArgs.from_cli_args(args).trust_request_chat_template, expected
+                )
+
+>>>>>>> upstream/main
     def test_prefill_max_context_accepts_human_readable_values(self):
         for option in (
             "--cuda-graph-prefill-max-context",

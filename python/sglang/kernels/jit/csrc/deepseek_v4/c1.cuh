@@ -267,7 +267,11 @@ struct FlashCompress1Kernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
+<<<<<<< HEAD
     device_.set_options<kDLCUDA>();
+=======
+    device_.set_options<kDLGPU>();
+>>>>>>> upstream/main
 
     TensorMatcher({N, kHeadDim})  //
         .with_dtype<bf16_t>()

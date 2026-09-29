@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+<<<<<<< HEAD
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
@@ -21,10 +22,18 @@ from sglang.srt.disaggregation.fake.conn import FakeKVReceiver as DisaggFakeKVRe
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+=======
+from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVReceiver
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
+>>>>>>> upstream/main
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.separate_buffer_allocator_double import (
+    bind_separate_buffer_capacity,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -33,11 +42,15 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class FakeReceiver:
     def __init__(self):
         self.clear_called = False
+<<<<<<< HEAD
         self.calls = []
         self.conclude_state = None
 
     def abort(self):
         self.calls.append("abort")
+=======
+        self.conclude_state = None
+>>>>>>> upstream/main
 
     def clear(self):
         self.calls.append("clear")
@@ -104,6 +117,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
+<<<<<<< HEAD
     @patch("sglang.srt.disaggregation.decode.poll_and_all_reduce")
     def test_prealloc_waiting_row_still_enters_tp_cp_vote(self, reduce):
         tp_group, cp_group = object(), object()
@@ -126,6 +140,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [receiver], tp_group, additional_groups=[cp_group]
         )
 
+=======
+>>>>>>> upstream/main
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg
         # bag, so the case publishes a config instead of injecting one.
@@ -156,9 +172,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = reqs.copy()
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
+<<<<<<< HEAD
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=page_size, swa_available_size=lambda: physical_available
         )
+=======
+        queue.token_to_kv_pool_allocator = MagicMock(page_size=page_size)
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+>>>>>>> upstream/main
         queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
@@ -167,6 +188,9 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
         queue._swa_aware_allocatable_token_budgets = MagicMock(
             return_value=(physical_available, physical_available)
+        )
+        queue._allocatable_token_budgets = MagicMock(
+            side_effect=lambda **_: physical_available
         )
         queue._swa_tail_allocatable_token_budget = MagicMock(
             side_effect=lambda **_: physical_available
@@ -336,6 +360,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.retracted_queue = []
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        # `_uses_swa_reservation` consults the allocator once tail prealloc is
+        # off, so this abort path needs one even though it never allocates.
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
@@ -354,9 +382,13 @@ class TestDecodeQueueCleanup(CustomTestCase):
         ) as poll:
             preallocated, failed = queue.pop_preallocated()
 
+<<<<<<< HEAD
         poll.assert_called_once_with(
             [receiver], queue.gloo_group, additional_groups=None
         )
+=======
+        poll.assert_called_once_with([receiver], queue.gloo_group)
+>>>>>>> upstream/main
         self.assertEqual(preallocated, [])
         self.assertEqual(failed, [decode_req])
         self.assertEqual(queue.queue, [])
@@ -451,6 +483,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        # `_uses_swa_reservation` consults the allocator once tail prealloc is
+        # off, so this abort path needs one even though it never allocates.
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
 
@@ -584,12 +620,25 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         queue._match_prefix_and_lock = MagicMock(side_effect=match_prefix)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+<<<<<<< HEAD
         queue._pre_alloc = MagicMock(side_effect=allocate)
         queue.req_to_token_pool = MagicMock()
         queue.req_to_token_pool.available_size.return_value = 1
         queue.req_to_token_pool.req_to_token = torch.arange(31).reshape(1, -1)
         queue.tree_cache.req_to_token_pool = queue.req_to_token_pool
         queue.tree_cache.supports_mamba.return_value = has_mamba
+=======
+        queue._pre_alloc = MagicMock()
+        queue.token_to_kv_pool_allocator = MagicMock()
+        bind_separate_buffer_capacity(queue.token_to_kv_pool_allocator)
+        queue.tree_cache = MagicMock()
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        # Non-hybrid pools have no mamba allocator; MagicMock would otherwise
+        # auto-create one and break the `available_size() <= 0` comparison in
+        # pop_preallocated.
+        queue.req_to_token_pool.mamba_allocator = None
+>>>>>>> upstream/main
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
 
@@ -598,8 +647,12 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.enable_lora = False
+<<<<<<< HEAD
         scheduler.enable_decode_hicache = False
         scheduler.sliding_window_size = 2048
+=======
+        scheduler.server_args.disaggregation_decode_enable_radix_cache = False
+>>>>>>> upstream/main
         scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
@@ -790,9 +843,47 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req, queue.tree_cache, is_insert=False
         )
 
+<<<<<<< HEAD
     def test_fake_receiver_initializes_deferred_release_state(self):
         manager = MagicMock()
         receiver = DisaggFakeKVReceiver(manager, "")
+=======
+        receiver = MagicMock()
+        decode_req.kv_receiver = receiver
+        decode_req.host_staged = True
+        queue.enable_host_receive = True
+        queue.enable_deferred_kv_release = False
+        queue._defer_release = MagicMock()
+        queue.queue = [decode_req]
+        queue.req_to_metadata_buffer_idx_allocator.reset_mock()
+        mock_release_kv_cache.reset_mock()
+        self.assertEqual(queue.pop_transferred(), [])
+        receiver.abort.assert_called_once_with()
+        queue._defer_release.assert_called_once_with(decode_req)
+        receiver.clear.assert_not_called()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+        mock_release_kv_cache.assert_not_called()
+
+        queue.queue = [decode_req]
+        decode_req.req.finished_reason = FINISH_ABORT("cancelled")
+        with (
+            patch.object(
+                queue, "_poll_with_metadata_gate", return_value=[KVPoll.Success]
+            ),
+            patch(
+                "sglang.srt.disaggregation.decode.discard_kv_cache_backup"
+            ) as discard,
+        ):
+            self.assertEqual(queue.pop_transferred(), [])
+            discard.assert_called_once_with(req, queue.tree_cache, "host_pool")
+        receiver.clear.assert_called_once_with()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        mock_release_kv_cache.assert_not_called()
+
+    def test_fake_receiver_initializes_deferred_release_state(self):
+        manager = MagicMock()
+        receiver = FakeKVReceiver(manager, "")
+>>>>>>> upstream/main
 
         self.assertIs(receiver.kv_mgr, manager)
         self.assertFalse(receiver.abort_notified)
@@ -807,7 +898,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.enable_overlap = False
-        scheduler.ps = ParallelState.trivial()
         scheduler.running_mbs = []
         scheduler.waiting_queue = []
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
@@ -819,6 +909,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
 
         self.assertFalse(scheduler.is_fully_idle())
 

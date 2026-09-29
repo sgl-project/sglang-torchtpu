@@ -354,7 +354,11 @@ pub trait TreeComponent<K: ChildKeyType> {
         &self,
         _tree_core: &mut UnifiedTreeCore<K>,
         _node_id: NodeIdx_,
+<<<<<<< HEAD
         _swa_uuid_for_lock: Option<i64>,
+=======
+        _params: &DecLockRefParams,
+>>>>>>> upstream/main
         _device_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
         _host_frees: &mut HashMap<ComponentType, Vec<Tensor>>,
     ) {

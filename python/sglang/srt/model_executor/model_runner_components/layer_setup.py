@@ -10,7 +10,6 @@ from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class AttentionAndMoeLayers(NamedTuple):
@@ -146,7 +145,10 @@ def resolve_layer_indices(
     model: Any,
     model_config: ModelConfig,
     is_draft_worker: bool,
+<<<<<<< HEAD
     spec_algorithm: SpeculativeAlgorithm,
+=======
+>>>>>>> upstream/main
     draft_model_idx: Optional[int] = None,
 ) -> ModelLayerInfo:
     # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
@@ -155,8 +157,6 @@ def resolve_layer_indices(
     model_num_layers = _compute_model_num_layers(
         model=model, model_config=model_config, is_draft_worker=is_draft_worker
     )
-    _nnpl = model_config.num_nextn_predict_layers
-    model_has_mtp_layers = _nnpl is not None and _nnpl > 0
     pp_range = _resolve_pp_layer_range(model=model, model_num_layers=model_num_layers)
     num_effective_layers = pp_range.end_layer - pp_range.start_layer
 
@@ -165,6 +165,7 @@ def resolve_layer_indices(
     if loop_num > 1:
         num_effective_layers = num_effective_layers * loop_num
 
+<<<<<<< HEAD
     if not is_npu():
         _assert_pp_mtp_compat(
             model_has_mtp_layers=model_has_mtp_layers,
@@ -173,6 +174,8 @@ def resolve_layer_indices(
             model_num_layers=model_num_layers,
         )
 
+=======
+>>>>>>> upstream/main
     is_hybrid_swa_mtp_draft = (
         is_draft_worker
         and draft_model_idx is not None
@@ -250,6 +253,7 @@ def _resolve_pp_layer_range(*, model: Any, model_num_layers: int) -> _PPLayerRan
         start_layer=getattr(model, "start_layer", 0),
         end_layer=getattr(model, "end_layer", model_num_layers),
     )
+<<<<<<< HEAD
 
 
 def _assert_pp_mtp_compat(
@@ -269,3 +273,5 @@ def _assert_pp_mtp_compat(
             and (num_effective_layers == model_num_layers)
         )
     ), "PP is not compatible with MTP models."
+=======
+>>>>>>> upstream/main

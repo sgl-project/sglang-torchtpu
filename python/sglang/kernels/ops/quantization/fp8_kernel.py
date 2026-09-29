@@ -12,12 +12,9 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
-import json
 import logging
-import os
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -25,22 +22,21 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
+<<<<<<< HEAD
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.runtime_context import get_platform
+=======
+>>>>>>> upstream/main
 from sglang.srt.utils import (
     ceil_align,
     get_bool_env_var,
-    get_device_core_count,
-    get_device_name,
     is_cpu,
     is_cuda,
     is_gfx1250_supported,
     is_hip,
     is_musa,
     is_xpu,
-    log_info_on_rank0,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
@@ -52,12 +48,12 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.kernels.ops.quantization import (
-        per_token_group_quant,
-        sgl_per_token_quant_fp8,
-    )
+    from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
     from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
         per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
+    )
+    from sglang.kernels.ops.quantization.per_token_group_quant import (
+        per_token_group_quant,
     )
 elif _is_xpu:
     from sgl_kernel import sgl_per_tensor_quant_fp8, sgl_per_token_quant_fp8
@@ -73,25 +69,15 @@ if _is_musa:
     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
-if _is_hip:
-    _has_vllm = False
-    if _use_aiter:
-        try:
-            from aiter import (  # v0.1.3
-                dynamic_per_tensor_quant,
-                dynamic_per_token_scaled_quant,
-                static_per_tensor_quant,
-            )
-        except ImportError:
-            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        try:
-            import vllm._C  # noqa: F401
-
-            _has_vllm = True
-        except ImportError:
-            # Fallback: vllm not available, will use native PyTorch implementation
-            _has_vllm = False
+if _is_hip and _use_aiter:
+    try:
+        from aiter import (  # v0.1.3
+            dynamic_per_tensor_quant,
+            dynamic_per_token_scaled_quant,
+            static_per_tensor_quant,
+        )
+    except ImportError:
+        raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 
 if _is_musa:
 
@@ -129,28 +115,6 @@ else:
     fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
-
-
-@register_custom_op(mutates_args=["C"])
-def deep_gemm_fp8_fp8_bf16_nt(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: torch.Tensor,
-) -> None:
-    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
-
-
-@register_custom_op(mutates_args=["C"])
-def deep_gemm_mxfp8_fp8_bf16_nt(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: torch.Tensor,
-) -> None:
-    deep_gemm_wrapper.gemm_nt_mxfp8_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -938,6 +902,7 @@ def static_quant_fp8(
     return x_q, x_s
 
 
+<<<<<<< HEAD
 @triton.jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output
@@ -1768,23 +1733,9 @@ def w8a8_block_fp8_matmul_triton(
     return C
 
 
+=======
+>>>>>>> upstream/main
 # universal entry point, for testing purposes
-def w8a8_block_fp8_matmul(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: List[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        return w8a8_block_fp8_matmul_deepgemm(
-            A, B, As, Bs, block_size, output_dtype=output_dtype
-        )
-
-    return w8a8_block_fp8_matmul_triton(
-        A, B, As, Bs, block_size, output_dtype=output_dtype
-    )
 
 
 @triton.jit
@@ -2014,7 +1965,7 @@ Raises:
 if _is_hip:
 
     def _native_dynamic_per_token_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when AITER is disabled."""
         M, N = input.shape
         eps = 1e-12
         # Compute per-token scale
@@ -2027,7 +1978,7 @@ if _is_hip:
         output.copy_(output_data)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when AITER is disabled."""
         eps = 1e-12
         absmax = input.abs().max()
         absmax = torch.clamp(absmax, min=eps)
@@ -2039,7 +1990,7 @@ if _is_hip:
         output.copy_(output_data)
 
     def _native_static_quant_fp8(output, input, scale):
-        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
+        """Native PyTorch fallback for static FP8 quantization when AITER is disabled."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
         output.copy_(output_data)
@@ -2064,18 +2015,12 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_per_token_scaled_fp8_quant(
-                        output, input.contiguous(), scale, None
-                    )
                 else:
                     _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
-                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                scale = torch.empty(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
-                elif _has_vllm:
-                    torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
                     _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
@@ -2085,8 +2030,6 @@ if _is_hip:
             )
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            elif _has_vllm:
-                torch.ops._C.static_scaled_fp8_quant(output, input, scale)
             else:
                 _native_static_quant_fp8(output, input, scale)
 
@@ -2100,7 +2043,6 @@ else:
         num_token_padding: Optional[int] = None,
         use_per_token_if_dynamic: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
         shape = input.shape
         if num_token_padding:
@@ -2285,243 +2227,6 @@ def per_group_transpose(
     return trans_a
 
 
-def is_weak_contiguous(x: torch.Tensor):
-    strides = x.stride()
-    sizes = x.shape
-    is_not_transpose = strides[0] == 1 and (strides[1] >= max(1, sizes[0]))
-    is_transpose = strides[1] == 1 and (strides[0] >= max(1, sizes[1]))
-    return is_transpose or is_not_transpose
-
-
-def _as_column_scale(scale: torch.Tensor, expected_len: int) -> torch.Tensor:
-    if scale.dim() <= 1:
-        return scale.reshape(-1, 1)
-    if scale.dim() == 2:
-        if scale.shape[1] == 1:
-            return scale
-        if scale.shape[0] == 1 and scale.shape[1] == expected_len:
-            return scale.t()
-    return scale
-
-
-@triton.jit
-def scaled_mm_kernel(
-    a_ptr,
-    b_ptr,
-    scale_a_ptr,
-    scale_b_ptr,
-    c_ptr,
-    bias_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    ACCUMULATOR_DTYPE: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    BLOCK_SIZE_SCALE_A: tl.constexpr,
-    BLOCK_SIZE_SCALE_B: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    pid_m = pid // num_pid_n
-    pid_n = pid % num_pid_n
-
-    accumulator_dtype = ACCUMULATOR_DTYPE
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=accumulator_dtype)
-
-    # NOTE: Some tensor inputs are so large, they will cause int32 overflow
-    # so it is necessary to use tl.int64 for all the offsets, else SEGV will
-    # eventually occur.
-
-    # Offsets and masks.
-    offsets_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    masks_am = offsets_am < M
-
-    offsets_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    masks_bn = offsets_bn < N
-
-    offsets_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
-    offsets_a = stride_am * offsets_am[:, None] + stride_ak * offsets_k[None, :]
-    offsets_b = stride_bk * offsets_k[:, None] + stride_bn * offsets_bn[None, :]
-
-    # NOTE: BLOCK_SIZE_SCALE_A could be 1 or BLOCK_SIZE_M, so need to create
-    # appropriate offsets and masks for each case. Same goes for
-    # BLOCK_SIZE_SCALE_B.
-    offsets_scale_am = (
-        tl.arange(0, BLOCK_SIZE_SCALE_A)
-        + (BLOCK_SIZE_SCALE_A > 1) * pid_m * BLOCK_SIZE_M
-    )
-    masks_scale_am = offsets_scale_am < M
-
-    offsets_scale_bn = (
-        tl.arange(0, BLOCK_SIZE_SCALE_B)
-        + (BLOCK_SIZE_SCALE_B > 1) * pid_n * BLOCK_SIZE_N
-    )
-    masks_scale_bn = offsets_scale_bn < N
-
-    a_ptrs = a_ptr + offsets_a
-    b_ptrs = b_ptr + offsets_b
-
-    scale_a_ptrs = scale_a_ptr + offsets_scale_am
-    scale_b_ptrs = scale_b_ptr + offsets_scale_bn
-
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        masks_k = offsets_k < K
-        masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a)
-
-        masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b)
-
-        # Accumulate results.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
-
-        offsets_k += BLOCK_SIZE_K
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-
-    # Apply scale at end.
-    masks_scale_a = masks_scale_am[:, None] & (tl.arange(0, 1) < 1)[:, None]
-    scale_a = tl.load(scale_a_ptrs[:, None], masks_scale_a)
-    # Need to broadcast to the appropriate size, if scale_a is already
-    # (BLOCK_SIZE_M, 1) then it will broadcast to its own shape. Same goes
-    # for scale_b below.
-    scale_a = scale_a.broadcast_to((BLOCK_SIZE_M, 1))
-    accumulator = scale_a * accumulator.to(tl.float32)
-
-    masks_scale_b = masks_scale_bn[:, None] & (tl.arange(0, 1) < 1)[None, :]
-    scale_b = tl.load(scale_b_ptrs[:, None], masks_scale_b)
-    scale_b = scale_b.broadcast_to((BLOCK_SIZE_N, 1))
-    accumulator = scale_b.T * accumulator.to(tl.float32)
-
-    # Convert to output format.
-    c = accumulator.to(c_ptr.type.element_ty)
-
-    # Add bias, it's already in output format, so add it after conversion.
-    if bias_ptr:
-        offsets_bias = offsets_bn
-        bias_ptrs = bias_ptr + offsets_bias
-        bias_mask = offsets_bias < N
-        bias = tl.load(bias_ptrs, bias_mask)
-        c += bias
-
-    # Save output
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
-    offs_cm = offs_cm.to(tl.int64)
-    offs_cn = offs_cn.to(tl.int64)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-
-    tl.store(c_ptrs, c, mask=c_mask)
-
-
 # input  - [M, K]
 # weight - [K, N]
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/triton_scaled_mm.py
-def triton_scaled_mm(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
-    out_dtype: type[torch.dtype],
-    bias: Optional[torch.Tensor] = None,
-    block_size_m: int = 32,
-    block_size_n: int = 32,
-    block_size_k: int = 32,
-    use_heuristic=True,
-    num_warps: Optional[int] = None,
-    num_stages: Optional[int] = None,
-) -> torch.Tensor:
-    M, K = input.shape
-    N = weight.shape[1]
-
-    assert N > 0 and K > 0 and M > 0
-    assert weight.shape[0] == K
-    assert input.dtype == weight.dtype
-
-    scale_a = _as_column_scale(scale_a, M)
-    scale_b = _as_column_scale(scale_b, N)
-
-    assert scale_a.dim() == 2 and scale_b.dim() == 2
-    assert scale_a.dtype == scale_b.dtype and scale_a.is_floating_point()
-    assert scale_a.shape[1] == 1 and (scale_a.shape[0] == 1 or scale_a.shape[0] == M)
-    assert scale_b.shape[1] == 1 and (scale_b.shape[0] == 1 or scale_b.shape[0] == N)
-    assert out_dtype.is_floating_point
-    assert bias is None or bias.is_floating_point()
-    assert is_weak_contiguous(input)
-    assert is_weak_contiguous(weight)
-
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
-    )
-
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
-
-    has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
-
-    if use_heuristic:
-        is_small_N = N < 8192
-        next_power_of_2_M = max(32, triton.next_power_of_2(M))
-        if next_power_of_2_M <= 32:
-            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
-        elif next_power_of_2_M <= 64:
-            tile_shape = (64, 64, 256)
-        elif next_power_of_2_M <= 128:
-            tile_shape = (64, 128, 128)
-        else:
-            tile_shape = (128, 128, 128)
-        block_size_m, block_size_n, block_size_k = tile_shape
-    # else: use the block_size_{m,n,k} the caller passed (e.g. a tuned config).
-
-    block_size_sa = 1 if has_scalar(scale_a) else block_size_m
-    block_size_sb = 1 if has_scalar(scale_b) else block_size_n
-
-    accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
-
-    # num_warps / num_stages are triton.jit launch kwargs, and triton rejects an
-    # explicit None -- pass them only when the caller set them, so the default
-    # path keeps triton's own defaults.
-    launch_kwargs = {}
-    if num_warps is not None:
-        launch_kwargs["num_warps"] = num_warps
-    if num_stages is not None:
-        launch_kwargs["num_stages"] = num_stages
-
-    # A = input, B = weight, C = result
-    # A = M x K, B = K x N, C = M x N
-    scaled_mm_kernel[grid](
-        input,
-        weight,
-        scale_a,
-        scale_b,
-        result,
-        bias,
-        M,
-        N,
-        K,
-        input.stride(0),
-        input.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        result.stride(0),
-        result.stride(1),
-        accumulator_dtype,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        BLOCK_SIZE_SCALE_A=block_size_sa,
-        BLOCK_SIZE_SCALE_B=block_size_sb,
-        **launch_kwargs,
-    )
-
-    return result.to(out_dtype)

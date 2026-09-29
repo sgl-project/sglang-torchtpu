@@ -12,7 +12,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=4, suite="base-a-test-npu")
 
 for mod in (
     "torch_npu",
@@ -26,6 +26,7 @@ for mod in (
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
     "sglang.srt.speculative.eagle_info",
+    "sglang.srt.speculative.base_spec_worker",
 ):
     sys.modules.setdefault(mod, MagicMock())
 
@@ -712,7 +713,11 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
             kwargs = _sparse_attn_kv_quant_kwargs()
 
         self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
+<<<<<<< HEAD
         self.assertIs(attention_op, npu_ops.sparse_attn_sharedkv)
+=======
+        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
+>>>>>>> upstream/main
         self.assertEqual(kwargs, {})
 
 
@@ -963,53 +968,68 @@ class TestStepOutCacheLoc(unittest.TestCase):
         self.assertIsInstance(result, torch.Tensor)
 
 
-class TestCommonTemplate(unittest.TestCase):
-    def _make_backend(self, speculative_num_steps):
-        backend = object.__new__(DeepseekV4AscendMultiStepDraftBackend)
-        backend.speculative_num_steps = speculative_num_steps
+class TestCompressorEpilogEmptyWrite(unittest.TestCase):
+    @staticmethod
+    def _backend(*, loc, graph_mode=False):
+        backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend.graph_mode = graph_mode
+        backend.token_to_kv_pool = MagicMock()
+        backend.forward_metadata = SimpleNamespace(c4_loc=loc, c128_loc=loc)
         return backend
 
-    def test_calls_call_fn_for_each_step(self):
-        backend = self._make_backend(speculative_num_steps=4)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        # range(speculative_num_steps - 1) = range(3) -> i=0,1,2
-        self.assertEqual(call_fn.call_count, 3)
-        for i, call in enumerate(call_fn.call_args_list):
-            self.assertEqual(call.args[0], i)
-            self.assertIs(call.args[1], forward_batch)
+    @staticmethod
+    def _compressor(*, li_kv_dtype="bf16", is_in_indexer=False):
+        return SimpleNamespace(
+            ratio=128,
+            layer_id=0,
+            is_in_indexer=is_in_indexer,
+            li_kv_dtype=li_kv_dtype,
+        )
 
-    def test_single_step_no_calls(self):
-        backend = self._make_backend(speculative_num_steps=1)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 0)
+    @staticmethod
+    def _verify_batch():
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = True
+        return SimpleNamespace(forward_mode=forward_mode)
 
-    def test_two_steps_one_call(self):
-        backend = self._make_backend(speculative_num_steps=2)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 1)
-        self.assertEqual(call_fn.call_args_list[0].args[0], 0)
+    def test_all_slots_masked_skips_compress_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
+        backend._compressor_epilog_npu(
+            self._compressor(), torch.zeros(3, 512), self._verify_batch()
+        )
+        backend.token_to_kv_pool.set_compress_buffer.assert_not_called()
 
-    def test_asserts_spec_info_not_none(self):
-        backend = self._make_backend(speculative_num_steps=3)
-        forward_batch = SimpleNamespace(spec_info=None)
-        call_fn = MagicMock()
-        with self.assertRaises(AssertionError):
-            backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 0)
+    def test_partially_masked_slots_writes_surviving_rows(self):
+        backend = self._backend(loc=torch.tensor([0, 7, 0], dtype=torch.int32))
+        kv = torch.arange(12, dtype=torch.float32).view(3, 4)
+        backend._compressor_epilog_npu(self._compressor(), kv, self._verify_batch())
 
-    def test_call_fn_exception_propagates(self):
-        backend = self._make_backend(speculative_num_steps=3)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock(side_effect=RuntimeError("boom"))
-        with self.assertRaises(RuntimeError):
-            backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 1)
+        backend.token_to_kv_pool.set_compress_buffer.assert_called_once()
+        _, written_loc, written_kv, _, _ = (
+            backend.token_to_kv_pool.set_compress_buffer.call_args.args
+        )
+        self.assertEqual(written_loc.tolist(), [7])
+        self.assertEqual(written_kv.tolist(), [kv[1].tolist()])
+
+    def test_graph_mode_keeps_static_shape_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32), graph_mode=True)
+        backend._compressor_epilog_npu(
+            self._compressor(), torch.ones(3, 4), self._verify_batch()
+        )
+
+        backend.token_to_kv_pool.set_compress_buffer.assert_called_once()
+        written_kv = backend.token_to_kv_pool.set_compress_buffer.call_args.args[2]
+        self.assertEqual(written_kv.shape[0], 3)
+        self.assertEqual(written_kv.abs().sum().item(), 0.0)
+
+    def test_all_slots_masked_skips_fused_indexer_write(self):
+        backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
+        compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            backend._compressor_epilog_npu(
+                compressor, torch.zeros(3, 512), self._verify_batch()
+            )
+        custom_ops.indexer_compress_epilog.assert_not_called()
 
 
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):

@@ -92,6 +92,7 @@ class TestInitProfileBatchMode(CustomTestCase):
             self.assertEqual(fake_self._profile_bs_list, [8, 4, 2, 1])
             self.assertEqual(fake_self._profile_bs_idx, 0)
 
+<<<<<<< HEAD
     def test_profiler_built_with_trace_export_knobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, mock_profile, mock_schedule, mock_record_history = self._invoke(
@@ -134,6 +135,8 @@ class TestInitProfileBatchMode(CustomTestCase):
             os.path.join("/tmp", "graph_capture_profile"),
         )
 
+=======
+>>>>>>> upstream/main
 
 class TestInitProfileOriginalMode(CustomTestCase):
     """No flag, original flag only, or both (precedence) -> unscheduled pass with
@@ -248,14 +251,19 @@ class TestOriginalTraceExport(CustomTestCase):
 
     def test_writes_named_trace_when_flag_set(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                os.environ,
-                {"SGLANG_TORCH_PROFILER_DIR": tmp, _CAPTURE_TRACE: "1"},
-                clear=False,
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"SGLANG_TORCH_PROFILER_DIR": tmp, _CAPTURE_TRACE: "1"},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    putils, "get_parallel", return_value=SimpleNamespace(tp_rank=2)
+                ),
             ):
                 prof = mock.Mock()
                 putils.export_cuda_graph_capture_trace(
-                    prof, runner_name="DecodeCudaGraphRunner", tp_rank=2
+                    prof, runner_name="DecodeCudaGraphRunner"
                 )
                 expected = os.path.join(
                     tmp,
@@ -275,21 +283,11 @@ class TestOriginalTraceExport(CustomTestCase):
                 os.environ.pop(_CAPTURE_TRACE, None)
                 prof = mock.Mock()
                 putils.export_cuda_graph_capture_trace(
-                    prof, runner_name="DecodeCudaGraphRunner", tp_rank=0
+                    prof, runner_name="DecodeCudaGraphRunner"
                 )
                 prof.export_chrome_trace.assert_not_called()
                 self.assertFalse(
                     os.path.isdir(os.path.join(tmp, "graph_capture_profile"))
-                )
-
-    def test_dir_helper_uses_profiler_dir(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(
-                os.environ, {"SGLANG_TORCH_PROFILER_DIR": tmp}, clear=False
-            ):
-                self.assertEqual(
-                    putils.graph_capture_profile_dir(),
-                    os.path.join(tmp, "graph_capture_profile"),
                 )
 
 

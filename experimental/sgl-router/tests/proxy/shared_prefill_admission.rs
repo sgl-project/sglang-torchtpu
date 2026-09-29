@@ -7,11 +7,18 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use sgl_router::config::{
+<<<<<<< HEAD
     ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::engine_load::{LoadStat, NativeCacheRankLoad};
+=======
+    Config, DiscoveryBackend, InflightLoadConfig, ModelConfig, ObservabilityConfig, PolicyKind,
+    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+};
+use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+>>>>>>> upstream/main
 use sgl_router::policies::{
     CacheCandidate, CacheCandidateProposal, Policy, PolicyRegistry, PrefillProposal, ProposalKind,
     SelectionContext, SelectionProposal,
@@ -19,6 +26,10 @@ use sgl_router::policies::{
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+<<<<<<< HEAD
+=======
+use sgl_router::state::load_monitor::engine_reported_load::{LoadStat, NativeCacheRankLoad};
+>>>>>>> upstream/main
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{Worker, WorkerRegistry};
 use tower::ServiceExt;
@@ -160,12 +171,20 @@ fn config(policy: PolicyKind) -> Config {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
+<<<<<<< HEAD
+=======
+            default_chat_template_kwargs: Default::default(),
+>>>>>>> upstream/main
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
         }),
         proxy: ProxyConfig::default(),
+<<<<<<< HEAD
         active_load: ActiveLoadConfig::default(),
+=======
+        router_inflight_load: InflightLoadConfig::default(),
+>>>>>>> upstream/main
     }
 }
 
@@ -307,7 +326,11 @@ async fn chat_commits_the_admitted_prefill_backup() {
             total_prefill_busy_us,
         }),
     };
+<<<<<<< HEAD
     fixture.ctx.engine_load.set(
+=======
+    fixture.ctx.engine_reported_load.set(
+>>>>>>> upstream/main
         &fixture.workers[0].url,
         0,
         native_load(1, 1),
@@ -315,7 +338,11 @@ async fn chat_commits_the_admitted_prefill_backup() {
     );
     fixture
         .ctx
+<<<<<<< HEAD
         .engine_load
+=======
+        .engine_reported_load
+>>>>>>> upstream/main
         .set(&fixture.workers[0].url, 0, native_load(2, 2), now);
 
     assert_eq!(send_chat(&fixture.ctx).await, StatusCode::OK);
@@ -351,7 +378,11 @@ async fn capacity_exhaustion_does_not_return_503() {
     })
     .await;
     for worker in &fixture.workers {
+<<<<<<< HEAD
         fixture.ctx.engine_load.set(
+=======
+        fixture.ctx.engine_reported_load.set(
+>>>>>>> upstream/main
             &worker.url,
             0,
             LoadStat {
@@ -434,7 +465,11 @@ async fn chat_records_cache_candidates_exhausted() {
         })
     })
     .await;
+<<<<<<< HEAD
     fixture.ctx.engine_load.set(
+=======
+    fixture.ctx.engine_reported_load.set(
+>>>>>>> upstream/main
         &fixture.workers[0].url,
         0,
         LoadStat {

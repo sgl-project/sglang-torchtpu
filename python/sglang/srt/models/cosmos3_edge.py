@@ -19,6 +19,10 @@ Arcee causal-LM structure used by SGLang, while the vision path uses the native
 SigLIP2 implementation and an Edge-specific spatial-merge projector.
 """
 
+<<<<<<< HEAD
+=======
+from array import array
+>>>>>>> upstream/main
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -212,9 +216,13 @@ class Cosmos3EdgeForConditionalGeneration(ArceeForCausalLM):
                 prefix=add_prefix("projector", prefix),
             )
 
+<<<<<<< HEAD
     def pad_input_ids(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
+=======
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+>>>>>>> upstream/main
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Config fields of the ``disagg`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
@@ -6,6 +7,9 @@ spells it exactly as before. ``ServerArgs`` composes these classes, so the
 record stays one flat object -- the split moves where declarations live, not
 how config is shaped at runtime.
 """
+=======
+"""Config fields of the ``disagg`` namespace."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 
@@ -97,9 +101,17 @@ class Disagg(msgspec.Struct):
                 "Storage backend for KV preserved across PD decode retraction. "
                 "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
                 "a reserved HiCache pool and does not fall back on exhaustion. "
+<<<<<<< HEAD
                 "If omitted, the backend is inferred from the decode KV pool."
             ),
             choices=["cpu_tensor", "host_pool"],
+=======
+                "'none' keeps no backup: a retracted request is aborted with "
+                "503 for the client to retry. "
+                "If omitted, the backend is inferred from the decode KV pool."
+            ),
+            choices=["cpu_tensor", "host_pool", "none"],
+>>>>>>> upstream/main
         ),
     ] = None
     num_reserved_decode_tokens: A[
@@ -175,3 +187,10 @@ class Disagg(msgspec.Struct):
         "The path of the PD-Multiplexing config file.",
     ] = None
     sm_group_num: A[int, "Number of sm partition groups."] = 8
+<<<<<<< HEAD
+=======
+    disaggregation_decode_host_receive_threshold: A[
+        float,
+        "Device token usage fraction at which incoming KV is received in the decode retraction host pool, excluding evictable cache pages. Range [0, 1]; 0 disables host receive. Size with --hicache-size or --hicache-ratio; requires dense MHA and a transfer backend that supports host destinations. No built-in backend currently supports this.",
+    ] = 0.0
+>>>>>>> upstream/main

@@ -5,8 +5,13 @@
 //! (`_server`) and the classes exposed to the scheduler — the boot config
 //! ([`ServerArgs`] and its parts, constructed by keyword from Python; their
 //! `#[pyclass]`es and constructors live in `message::config`), [`Server`]
+<<<<<<< HEAD
 //! (boot, `recv_requests`/`wait_request`, `push_*`, MM results, shutdown),
 //! [`RequestBatch`] and [`MmEncodedResult`]. Everything behind that boundary —
+=======
+//! (boot, `recv_requests`/`wait_request`, `push_*`, shutdown),
+//! [`IngressRequest`] and [`ShmBuffer`]. Everything behind that boundary --
+>>>>>>> upstream/main
 //! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
 //! SSE streaming, and so on — is implemented purely in Rust and never touches
 //! a `PyObject`.
@@ -22,6 +27,7 @@ pub use message::config::{
     RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::MmItem;
+<<<<<<< HEAD
 pub use message::request::{MmWorkItem, ProcessorExtensions};
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
 pub use multi_modality::result_store::{
@@ -32,6 +38,17 @@ pub use sglang_mm::pipeline::{Tensor, TensorData};
 pub use tokenizer_manager::tokenizer::TextTokenizer;
 
 use std::collections::BTreeMap;
+=======
+pub use message::request::{MmData, ProcessorExtensions};
+pub use message::types::TokenIds;
+pub use multi_modality::encoded::{
+    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
+};
+pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
+pub use multi_modality::worker::{MmProcessOutput, MmProcessor};
+pub use sglang_mm::pipeline::{Tensor, TensorData};
+
+>>>>>>> upstream/main
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -40,6 +57,7 @@ use pyo3::types::PyBytes;
 
 use crate::message::config::RuntimeConfig;
 use crate::utils::startup::{listen_addr, value_error};
+<<<<<<< HEAD
 use crate::utils::{logging, runtime};
 
 /// One drained MM result (see [`Server::take_mm_result`]).
@@ -196,6 +214,117 @@ pub struct RequestBatch {
     data: Py<PyBytes>,
     /// Per-request token count (0 for control requests).
     lengths: Vec<u32>,
+=======
+use crate::utils::{logging, runtime, shm::ShmSegment};
+
+/// One drained request handed to Python by [`Server::recv_requests`]: the
+/// msgpack scalar header plus every non-scalar payload as a named buffer --
+/// `input_ids`, `token_ids_logprob`, and for a multimodal request the
+/// `mm.*` set (`mm.feature.{i}` per item, `mm.mrope`, and the `mm.meta`
+/// msgpack sidecar) that `RustMmProcessor.wrap_encoded` or an external
+/// package's wrapper consumes. An inline buffer is a numpy array, shaped, that
+/// **owns** the Rust vector (no copy); a shm buffer is a [`ShmBuffer`] naming
+/// the segment to map. `frozen`: immutable snapshot, so field access never
+/// contends on a borrow.
+#[pyclass(frozen, get_all)]
+pub struct IngressRequest {
+    header: Py<PyBytes>,
+    /// `(name, numpy array | ShmBuffer)` in producer order; empty for control
+    /// requests.
+    buffers: Vec<(String, Py<PyAny>)>,
+}
+
+/// A buffer parked in a POSIX shared-memory segment: `name` is what Python's
+/// `SharedMemory(name=...)` opens, `dtype` the numpy dtype to view it with,
+/// `shape` its logical shape.
+///
+/// The unlink duty stays on this side until Python has admitted the request.
+/// `release()` hands it to `ShmPointerMMData` (whose `materialize()` unlinks
+/// after the post-broadcast open) once every item of the request wrapped;
+/// `discard()` unlinks at once when the request is rejected; and a `ShmBuffer`
+/// dropped with neither call (a header that never decoded, so the buffers were
+/// never looked at) unlinks on drop. So no rejection path can leak a segment.
+#[pyclass]
+pub struct ShmBuffer {
+    /// `Some` while this side still owns the unlink.
+    segment: Option<ShmSegment>,
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    dtype: &'static str,
+    #[pyo3(get)]
+    shape: Vec<usize>,
+}
+
+impl ShmBuffer {
+    fn new(segment: ShmSegment, dtype: &'static str, shape: Vec<usize>) -> Self {
+        Self {
+            name: segment.name().to_owned(),
+            segment: Some(segment),
+            dtype,
+            shape,
+        }
+    }
+
+    /// Whether this side still owns the unlink.
+    #[cfg(test)]
+    fn owns_segment(&self) -> bool {
+        self.segment.is_some()
+    }
+}
+
+#[pymethods]
+impl ShmBuffer {
+    /// Hand the unlink duty to Python: the request was admitted and its
+    /// `ShmPointerMMData` stubs now own the segment. Idempotent.
+    fn release(&mut self) {
+        if let Some(segment) = self.segment.take() {
+            let _ = segment.into_name();
+        }
+    }
+
+    /// Unlink now: the request was rejected before Python took the segment.
+    /// Idempotent, and a no-op after `release`.
+    fn discard(&mut self) {
+        self.segment.take();
+    }
+}
+
+/// Hand one buffer across: the inline vector becomes a numpy array owning it,
+/// viewed with the buffer's shape; the shm segment becomes its name.
+fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(String, Py<PyAny>)> {
+    use message::buffers::{BufferData, BufferStore};
+    use numpy::{IntoPyArray, PyArrayMethods};
+
+    fn shaped<T: numpy::Element>(
+        py: Python<'_>,
+        v: Vec<T>,
+        shape: &[usize],
+    ) -> PyResult<Py<PyAny>> {
+        let array = v.into_pyarray(py);
+        Ok(if shape.len() == 1 {
+            array.into_any().unbind()
+        } else {
+            array.reshape(shape.to_vec())?.into_any().unbind()
+        })
+    }
+
+    let shape = buffer.shape;
+    let value = match buffer.store {
+        BufferStore::Inline(data) => match data {
+            BufferData::I64(v) => shaped(py, v, &shape)?,
+            BufferData::F32(v) => shaped(py, v, &shape)?,
+            BufferData::U32(v) => shaped(py, v, &shape)?,
+            BufferData::U64(v) => shaped(py, v, &shape)?,
+            BufferData::U16(v) => shaped(py, v, &shape)?,
+            BufferData::U8(v) => shaped(py, v, &shape)?,
+        },
+        BufferStore::Shm { segment, dtype } => {
+            Py::new(py, ShmBuffer::new(segment, dtype.numpy(), shape))?.into_any()
+        }
+    };
+    Ok((buffer.name, value))
+>>>>>>> upstream/main
 }
 
 /// Handle owned by the Python scheduler process. Construct once via
@@ -255,10 +384,11 @@ impl Server {
         Ok(Self { rt })
     }
 
-    /// Non-blocking drain of the to_scheduler channel, returned **columnar** as an
-    /// [`RequestBatch`] so the large `input_ids` tensor never goes through
-    /// msgpack (see the field docs for the layout).
+    /// Non-blocking drain of the to_scheduler channel: one [`IngressRequest`]
+    /// per request, its buffers moved out of Rust rather than copied (see the
+    /// type docs for the layout).
     #[pyo3(signature = (max = 256))]
+<<<<<<< HEAD
     pub fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<RequestBatch> {
         let cols = self.rt.to_scheduler_rx.drain(max);
         let headers = cols
@@ -275,6 +405,24 @@ impl Server {
             data: data.unbind(),
             lengths: cols.lengths,
         })
+=======
+    pub fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<Vec<IngressRequest>> {
+        self.rt
+            .to_scheduler_rx
+            .drain(max)
+            .into_iter()
+            .map(|req| {
+                Ok(IngressRequest {
+                    header: PyBytes::new(py, &req.header).unbind(),
+                    buffers: req
+                        .buffers
+                        .into_iter()
+                        .map(|b| buffer_to_py(py, b))
+                        .collect::<PyResult<_>>()?,
+                })
+            })
+            .collect()
+>>>>>>> upstream/main
     }
 
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
@@ -322,12 +470,19 @@ impl Server {
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the
     /// resolved processor config; see `RustMmProcessor.resolve_spec` and
     /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
+<<<<<<< HEAD
     /// in Rust and parked for [`Server::take_mm_result`]; anything the pipeline
     /// cannot serve is rejected back to the client — there is no Python fallback.
+=======
+    /// in Rust; their buffers ride the ring with the request (the `mm.*` set of
+    /// [`IngressRequest::buffers`]). Anything the pipeline cannot serve is
+    /// rejected back to the client -- there is no Python fallback.
+>>>>>>> upstream/main
     pub fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
         self.rt
             .start_mm_workers(spec, workers)
             .map_err(|e| value_error("mm spec", e))
+<<<<<<< HEAD
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
@@ -344,6 +499,8 @@ impl Server {
             .take(rid)
             .map(|entry| MmEncodedResult::from_entry(py, entry))
             .transpose()
+=======
+>>>>>>> upstream/main
     }
 
     /// Signal all threads to stop (best effort).
@@ -355,8 +512,21 @@ impl Server {
 impl Server {
     /// Start the shared worker pool with a processor supplied by an external
     /// model package. The default Python API retains the built-in Qwen path.
+<<<<<<< HEAD
     pub fn start_mm_workers_with_processor(&self, processor: Arc<dyn MmProcessor>, workers: usize) {
         self.rt.start_mm_workers_with_processor(processor, workers);
+=======
+    /// `feature_shm` is the package's own `_use_feature_shm` answer: place
+    /// feature tensors in POSIX shm for the TP broadcast.
+    pub fn start_mm_workers_with_processor(
+        &self,
+        processor: Arc<dyn MmProcessor>,
+        workers: usize,
+        feature_shm: bool,
+    ) {
+        self.rt
+            .start_mm_workers_with_processor(processor, workers, feature_shm);
+>>>>>>> upstream/main
     }
 
     /// Hand one already-framed message to the ring. Shared by every push path —
@@ -384,6 +554,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MmFamily>()?;
     m.add_class::<MmResample>()?;
     m.add_class::<MmSpec>()?;
+<<<<<<< HEAD
     m.add_class::<RequestBatch>()?;
     m.add_class::<MmEncodedResult>()?;
     m.add_class::<ExternalMmItemResult>()?;
@@ -396,5 +567,62 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
 fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Server>()?;
     register_boundary_types(m)?;
+=======
+    m.add_class::<IngressRequest>()?;
+    m.add_class::<ShmBuffer>()?;
+>>>>>>> upstream/main
     Ok(())
+}
+
+#[pymodule]
+fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Server>()?;
+    register_boundary_types(m)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod shm_buffer_tests {
+    use super::ShmBuffer;
+    use crate::utils::shm::{ShmSegment, shm_path, unique_name};
+
+    fn buffer() -> (ShmBuffer, String) {
+        let name = unique_name("test");
+        let segment = ShmSegment::create(name.clone(), &[1, 2, 3, 4]).unwrap();
+        (ShmBuffer::new(segment, "float32", vec![1]), name)
+    }
+
+    /// Neither `release` nor `discard` (the header never decoded): dropping
+    /// the handle unlinks, so a rejected request cannot leak its segment.
+    #[test]
+    fn drop_without_admission_unlinks() {
+        let (buffer, name) = buffer();
+        assert_eq!(buffer.name, name);
+        assert!(buffer.owns_segment());
+        drop(buffer);
+        assert!(!shm_path(&name).exists());
+    }
+
+    /// `release` moves the unlink duty to Python: the segment must outlive the
+    /// handle so the TP receivers can still open it.
+    #[test]
+    fn release_keeps_the_segment_for_python() {
+        let (mut buffer, name) = buffer();
+        buffer.release();
+        assert!(!buffer.owns_segment());
+        buffer.discard(); // no-op after release
+        drop(buffer);
+        assert!(shm_path(&name).exists(), "released: Python unlinks later");
+        let _ = rustix::shm::unlink(format!("/{name}"));
+    }
+
+    /// `discard` unlinks at once (a rejected request), and is idempotent.
+    #[test]
+    fn discard_unlinks_immediately() {
+        let (mut buffer, name) = buffer();
+        buffer.discard();
+        assert!(!shm_path(&name).exists());
+        buffer.discard();
+        drop(buffer);
+    }
 }

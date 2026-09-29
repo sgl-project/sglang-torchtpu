@@ -4,7 +4,10 @@ from typing import Iterable, Tuple
 import torch
 from torch import nn
 
+<<<<<<< HEAD
 from sglang.srt.distributed import get_pp_group
+=======
+>>>>>>> upstream/main
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
@@ -170,7 +173,11 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+<<<<<<< HEAD
         self.pp_group = get_pp_group()
+=======
+        self.pp_group = get_parallel().pp_group
+>>>>>>> upstream/main
         nextn_quant_config = _mtp_quant_config(quant_config)
         self.model = HYV4ModelNextN(
             config, nextn_quant_config, prefix=f"{prefix}.model"

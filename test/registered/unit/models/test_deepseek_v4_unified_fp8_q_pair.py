@@ -78,6 +78,10 @@ class _Harness(deepseek_v4.MQALayer):
         self._attn_sink_local = None
         self.alt_streams = None
         self.dsa_enable_prefill_cp = False
+<<<<<<< HEAD
+=======
+        self.use_fused_wo_a = False
+>>>>>>> upstream/main
         self.use_npu_arch35_mxfp8_wo_a = False
         self.compressor = object()
         self.wo_a = SimpleNamespace(
@@ -88,7 +92,11 @@ class _Harness(deepseek_v4.MQALayer):
                 dtype=torch.bfloat16,
             )
         )
+<<<<<<< HEAD
         self.wo_b = lambda value: (value, None)
+=======
+        self.wo_b = lambda value, skip_all_reduce=False: (value, None)
+>>>>>>> upstream/main
         self.prepare_kwargs = None
 
     def _forward_prepare(

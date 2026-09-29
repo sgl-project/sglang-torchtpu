@@ -8,6 +8,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import SGL_EVAL_BENCHMARKS, run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -43,6 +44,7 @@ class AccuracyTestParams:
     extra_eval_args: Optional[dict] = None  # merged into run_eval's namespace
     label: Optional[str] = None  # display/metric name; defaults to `dataset`
     seed: Optional[int] = None  # pin for reproducibility when temperature > 0
+<<<<<<< HEAD
     # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
     # of letting _run_sgl_eval infer it from the model name.
     sgl_eval_thinking: Optional[bool] = None
@@ -54,6 +56,8 @@ class AccuracyTestParams:
     # feeds dashboards, so only declared gates are ever plotted; the backends' own
     # dump_metric calls stay as stored-but-unplotted detail.
     metric_labels: Optional[dict] = None
+=======
+>>>>>>> upstream/main
     num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
     # Report a completed score without comparing it to a quality floor.
     report_only: bool = False
@@ -98,13 +102,7 @@ def write_accuracy_github_summary(
     dataset: str,
     results: List[AccuracyTestResult],
 ) -> None:
-    """Write accuracy test results to GitHub step summary.
-
-    Args:
-        test_name: Name of the test
-        dataset: Dataset name used for evaluation
-        results: List of AccuracyTestResult objects
-    """
+    """Write accuracy test results to GitHub step summary."""
     summary = f"#### {test_name} - Accuracy ({dataset})\n"
     summary += "| config | status | score | baseline | error |\n"
     summary += "| ------ | ------ | ----- | -------- | ----- |\n"
@@ -203,6 +201,7 @@ def _run_simple_eval(
     repeat: Optional[int] = None,
     api: Optional[str] = None,
     seed: Optional[int] = None,
+<<<<<<< HEAD
     sgl_eval_thinking: Optional[bool] = None,
     extra_eval_args: Optional[dict] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
@@ -211,6 +210,11 @@ def _run_simple_eval(
     Returns:
         Tuple of (success, error_message, metrics_dict)
     """
+=======
+) -> Tuple[bool, Optional[str], Optional[dict]]:
+    """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval."""
+    process = None
+>>>>>>> upstream/main
     try:
         args = SimpleNamespace(
             base_url=base_url,
@@ -250,6 +254,7 @@ def _run_simple_eval(
         if seed is not None:
             args.seed = seed
 
+<<<<<<< HEAD
         if sgl_eval_thinking is not None:
             args.sgl_eval_thinking = sgl_eval_thinking
 
@@ -257,6 +262,10 @@ def _run_simple_eval(
             setattr(args, key, value)
 
         result = run_eval(args)
+=======
+        evaluate = run_sgl_eval if dataset in SGL_EVAL_BENCHMARKS else run_eval
+        result = evaluate(args)
+>>>>>>> upstream/main
 
         # Handle result format (run_eval can return metrics or (metrics, latency))
         if return_latency and isinstance(result, tuple):
@@ -611,20 +620,12 @@ def run_accuracy_test(
     params: AccuracyTestParams,
     base_url: Optional[str] = None,
 ) -> AccuracyTestResult:
-    """Run accuracy test for a single model.
-
-    Args:
-        model: ModelLaunchSettings with model config
-        params: AccuracyTestParams with dataset, baseline, and optional settings
-        base_url: Server base URL (default: DEFAULT_URL_FOR_TEST)
-
-    Returns:
-        AccuracyTestResult with test outcome
-    """
+    """Run accuracy test for a single model."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
     print(f"\n{'=' * 60}")
     print(f"Running ACCURACY test for {model.model_path}")
+<<<<<<< HEAD
     print(f"  Eval: {params.name}")
     if params.floor is not None:
         print(f"  Baseline: {params.baseline_accuracy}  atol: {params.atol}")
@@ -641,6 +642,29 @@ def run_accuracy_test(
                 spec_accept_lengths = _get_avg_spec_accept_lengths(base_url)
             except (TypeError, ValueError, requests.RequestException) as exc:
                 spec_accept_length_error = str(exc)
+=======
+    print(f"  Dataset: {params.dataset}")
+    print(f"  Baseline: {params.baseline_accuracy}")
+    print(f"{'=' * 60}\n")
+
+    success, error, metrics = _run_simple_eval(
+        model=model,
+        base_url=base_url,
+        dataset=params.dataset,
+        num_examples=params.num_examples,
+        num_threads=params.num_threads,
+        num_shots=params.num_shots,
+        max_tokens=params.max_tokens,
+        return_latency=params.return_latency,
+        thinking_mode=params.thinking_mode,
+        temperature=params.temperature,
+        top_p=params.top_p,
+        top_k=params.top_k,
+        repeat=params.repeat,
+        api=params.api,
+        seed=params.seed,
+    )
+>>>>>>> upstream/main
 
     if not success:
         print(f"✗ Accuracy test failed for {model.model_path}: {error}")

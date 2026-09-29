@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    model_config_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -23,6 +24,90 @@ from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+_PP_EAGLE_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        # Qwen3.5 (dense / MoE, text and multimodal); folded in from #39602.
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
+    }
+)
+
+
+def validate_response_store(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-response-store is not supported with "
+            "--disaggregation-mode=prefill or decode; response storage must "
+            "remain disabled in PD mode."
+        )
+
+
+def check_pipeline_parallel_compat(
+    cfg: Any, *, model_architecture: Optional[str] = None
+) -> None:
+    """Validate features used with pipeline parallelism."""
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+    if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.disaggregation_mode == "prefill", (
+            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+        )
+        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+        )
+    elif cfg.speculative_algorithm is not None:
+        assert (
+            cfg.speculative_algorithm.upper() == "EAGLE"
+            and not cfg.enable_multi_layer_eagle
+        ), (
+            "Pipeline parallelism currently only supports EAGLE "
+            "(non-multi-layer) speculative decoding"
+        )
+        if envs.SGLANG_ENABLE_PP_SPEC.get():
+            # The aggregate relay carries an EAGLE-shaped tree and only
+            # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
+            # topk_index / hidden states through RelayPayload; the gated
+            # flow replaces that relay with its own and does not carry
+            # those fields.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            )
+            # The PP relay slices spec results with the configured
+            # num_draft_tokens; adaptive spec changes it at runtime.
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            # Every stage rebuilds the same verify input from the relayed
+            # per-request state, so all stages must see the same batch.
+            # DP attention partitions it per DP rank.
+            assert not cfg.enable_dp_attention, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+            )
+        else:
+            assert cfg.disaggregation_mode == "prefill", (
+                "PP + speculative decoding (MTP) is only supported on prefill nodes "
+                "(disaggregation-mode=prefill)"
+            )
+            assert model_architecture in _PP_EAGLE_SUPPORTED_ARCHITECTURES, (
+                "PP + speculative decoding is only supported for DeepSeek/GLM/Qwen3.5 "
+                "models whose last pipeline stage supplies the EAGLE draft "
+                f"embedding; got architecture={model_architecture}"
+            )
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
 
 
 def validate_response_store(server_args: Any) -> None:
@@ -47,7 +132,11 @@ def check_server_args(server_args: Any):
         "nnodes=0 (auto-detect) is only valid with --use-ray on TPU"
     )
     if cfg.ep_join_mode != "scale":
+<<<<<<< HEAD
         assert cfg.nnodes == 0 or (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
+=======
+        assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
+>>>>>>> upstream/main
             "tp_size must be divisible by number of nodes"
         )
 
@@ -65,6 +154,7 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
+<<<<<<< HEAD
         if get_platform().is_npu:
             # NPU: allow PP + EAGLE speculative decoding
             assert cfg.disable_overlap_schedule, (
@@ -122,6 +212,12 @@ def check_server_args(server_args: Any):
             "parallelism: allocatable slots per microbatch are bounded by "
             "pp-max-micro-batch-size, so the threshold may never be reached"
         )
+=======
+        model_architecture = None
+        if cfg.speculative_algorithm is not None:
+            model_architecture = model_config_of(server_args).hf_config.architectures[0]
+        check_pipeline_parallel_compat(cfg, model_architecture=model_architecture)
+>>>>>>> upstream/main
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
         "multi-node data parallel is not supported unless dp attention!"
@@ -271,6 +367,8 @@ def check_server_args(server_args: Any):
     if cfg.enable_quant_communications and cfg.device != "npu":
         raise ValueError("Communications quantization is only supported for NPU device")
 
+    validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
     if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
@@ -387,6 +485,18 @@ def check_load_publish_args(server_args: Any):
     )
     if reason:
         raise ValueError(reason)
+
+
+def validate_device_sampling_backend(
+    sampling_backend: Optional[str], device: str
+) -> None:
+    # sampler.py binds the intel_xpu kernels only under is_xpu(), so on another
+    # device the backend either aliases to flashinfer's names or NameErrors on
+    # the first non-greedy decode.
+    if sampling_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
 
 
 def validate_ib_devices(device_str: Optional[str]) -> Optional[str]:

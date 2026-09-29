@@ -95,8 +95,15 @@ class TestPtxKDATrackRouting(CustomTestCase):
         kernel = self._make_kernel()
         kernel._triton = _RejectTriton()
         h = torch.zeros(3, 2, 128, 128, dtype=torch.float32)
+<<<<<<< HEAD
 
         def fake_fwd(*args, **kwargs):
+=======
+        beta_flags = []
+
+        def fake_fwd(*args, **kwargs):
+            beta_flags.append(kwargs["use_beta_sigmoid_in_kernel"])
+>>>>>>> upstream/main
             return [
                 args[2].clone(),  # out == v
                 kwargs["initial_state"].clone(),  # final_state
@@ -107,6 +114,7 @@ class TestPtxKDATrackRouting(CustomTestCase):
         kernel._fwd = fake_fwd
         x = self._inputs()
 
+<<<<<<< HEAD
         out, h_out = kernel.extend(
             x["q"],
             x["k"],
@@ -125,6 +133,18 @@ class TestPtxKDATrackRouting(CustomTestCase):
 
         self.assertEqual(tuple(out.shape), (1, 164, 2, 128))
         self.assertIs(h_out, h)
+=======
+        for beta_kwargs in ({"beta_is_raw": True}, {}, {"beta_is_raw": False}):
+            out, h_out = kernel.extend(
+                **x,
+                **beta_kwargs,
+                return_intermediate_states=True,
+                track_ssm_h_src=torch.empty(0, dtype=torch.long),
+            )
+            self.assertEqual(tuple(out.shape), (1, 164, 2, 128))
+            self.assertIs(h_out, h)
+        self.assertEqual(beta_flags, [True, False, False])
+>>>>>>> upstream/main
 
 
 if __name__ == "__main__":

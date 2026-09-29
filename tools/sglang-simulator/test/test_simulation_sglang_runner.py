@@ -78,7 +78,11 @@ def make_sglang_runner(tmp_path: Path):
             hicache_ratio=2,
             hicache_storage_backend="file",
             hicache_storage_prefetch_policy="wait_complete",
+<<<<<<< HEAD
             max_total_tokens=10 * 1024,
+=======
+            max_total_tokens=4 * 1024,
+>>>>>>> upstream/main
             page_size=256,
             skip_tokenizer_init=True,
         )

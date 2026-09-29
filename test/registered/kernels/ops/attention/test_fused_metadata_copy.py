@@ -1,15 +1,6 @@
-"""
-Comprehensive tests for JIT-compiled fused metadata copy kernels.
-
-This test suite verifies:
-1. Single-backend fused kernel (fused_metadata_copy_cuda) - all forward modes
-2. Multi-backend fused kernel (fused_metadata_copy_multi_cuda) - 3 backends at once
-3. Correctness against reference implementations
-4. Performance benchmarks and speedup measurements
-"""
+"""Compare single- and multi-backend metadata copies with PyTorch references."""
 
 import sys
-import time
 
 import pytest
 import torch
@@ -151,62 +142,6 @@ def reference_copy_decode(src, dst, max_len):
         dst["flashmla_metadata"].copy_(src["flashmla_metadata"])
 
 
-def reference_copy_target_verify(src, dst, max_seqlen_k, seqlens_expanded_size):
-    """Reference implementation: individual .copy_() for TARGET_VERIFY mode."""
-    bs = src["cache_seqlens"].shape[0]
-    dst["cache_seqlens"].copy_(src["cache_seqlens"])
-    dst["cu_seqlens_k"][1:].copy_(src["cu_seqlens_k"][1:])
-
-    rows, cols = src["page_indices"].shape
-    dst["page_table_1"][:rows, :cols].copy_(src["page_indices"])
-    dst["dsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
-    dst["dsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["dsa_cache_seqlens"])
-    dst["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
-        src["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
-    )
-
-    if src["real_page_table"] is not None:
-        rows, cols = src["real_page_table"].shape
-        dst["real_page_table"][:rows, :cols].copy_(src["real_page_table"])
-
-    if src["flashmla_num_splits"] is not None:
-        flashmla_size = seqlens_expanded_size + 1
-        dst["flashmla_num_splits"][:flashmla_size].copy_(
-            src["flashmla_num_splits"][:flashmla_size]
-        )
-
-    if src["flashmla_metadata"] is not None:
-        dst["flashmla_metadata"].copy_(src["flashmla_metadata"])
-
-
-def reference_copy_draft_extend(src, dst, max_seqlen_k, seqlens_expanded_size):
-    """Reference implementation: individual .copy_() for DRAFT_EXTEND mode."""
-    bs = src["cache_seqlens"].shape[0]
-    dst["cache_seqlens"].copy_(src["cache_seqlens"])
-    dst["cu_seqlens_k"][1:].copy_(src["cu_seqlens_k"][1:])
-
-    rows, cols = src["page_indices"].shape
-    dst["page_table_1"][:rows, :cols].copy_(src["page_indices"])
-    dst["dsa_seqlens_expanded"][:seqlens_expanded_size].copy_(src["seqlens_expanded"])
-    dst["dsa_cache_seqlens"][:seqlens_expanded_size].copy_(src["dsa_cache_seqlens"])
-    dst["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1].copy_(
-        src["dsa_cu_seqlens_k"][1 : seqlens_expanded_size + 1]
-    )
-
-    if src["real_page_table"] is not None:
-        rows, cols = src["real_page_table"].shape
-        dst["real_page_table"][:rows, :cols].copy_(src["real_page_table"])
-
-    if src["flashmla_num_splits"] is not None:
-        flashmla_size = seqlens_expanded_size + 1
-        dst["flashmla_num_splits"][:flashmla_size].copy_(
-            src["flashmla_num_splits"][:flashmla_size]
-        )
-
-    if src["flashmla_metadata"] is not None:
-        dst["flashmla_metadata"].copy_(src["flashmla_metadata"])
-
-
 # =============================================================================
 # Single-Backend Kernel Tests
 # =============================================================================
@@ -321,13 +256,17 @@ def test_fused_metadata_copy_dtype_validation():
         )
 
 
-@pytest.mark.parametrize("bs", [1, 2, 4, 8])
 @pytest.mark.parametrize(
-    "forward_mode", [0]
-)  # DECODE mode only (other modes not fully tested yet)
-@pytest.mark.parametrize("has_real_page_table", [False, True])
-@pytest.mark.parametrize("has_flashmla", [False, True])
-def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla):
+    "bs,has_real_page_table,has_flashmla",
+    [
+        (bs, page, mla)
+        for bs in (1, 2, 4, 8)
+        for page in (False, True)
+        for mla in (False, True)
+    ]
+    + [(16, True, True), (32, True, True)],
+)
+def test_fused_metadata_copy(bs, has_real_page_table, has_flashmla):
     """Test fused metadata copy kernel against reference implementation."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
@@ -336,9 +275,10 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         fused_metadata_copy_cuda,
     )
 
+    forward_mode = 0  # DECODE
     max_len = 128
     max_seqlen_k = 256
-    seqlens_expanded_size = bs if forward_mode == 0 else bs * 2
+    seqlens_expanded_size = bs
 
     # Create test data
     data = create_test_metadata(
@@ -356,17 +296,7 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         k: v.clone() if v is not None else None for k, v in data["dst"].items()
     }
 
-    # Run reference implementation
-    if forward_mode == 0:  # DECODE
-        reference_copy_decode(data["src"], dst_ref, max_len)
-    elif forward_mode == 1:  # TARGET_VERIFY
-        reference_copy_target_verify(
-            data["src"], dst_ref, max_seqlen_k, seqlens_expanded_size
-        )
-    else:  # DRAFT_EXTEND
-        reference_copy_draft_extend(
-            data["src"], dst_ref, max_seqlen_k, seqlens_expanded_size
-        )
+    reference_copy_decode(data["src"], dst_ref, max_len)
 
     # Run fused kernel
     fused_metadata_copy_cuda(
@@ -395,6 +325,7 @@ def test_fused_metadata_copy(bs, forward_mode, has_real_page_table, has_flashmla
         seqlens_expanded_size,
     )
 
+<<<<<<< HEAD
     # Compare results
     assert torch.equal(dst_ref["cache_seqlens"], dst_fused["cache_seqlens"]), (
         "cache_seqlens mismatch"
@@ -490,6 +421,13 @@ def test_fused_metadata_copy_large_batch(bs):
     for key in dst_ref:
         if dst_ref[key] is not None:
             assert torch.equal(dst_ref[key], dst_fused[key]), f"{key} mismatch"
+=======
+    for key, expected in dst_ref.items():
+        if expected is not None:
+            torch.testing.assert_close(
+                dst_fused[key], expected, rtol=0, atol=0, msg=key
+            )
+>>>>>>> upstream/main
 
 
 # =============================================================================
@@ -725,9 +663,16 @@ def test_fused_metadata_copy_multi_dtype_validation():
         )
 
 
-@pytest.mark.parametrize("bs", [1, 2, 4, 8, 16])
-@pytest.mark.parametrize("has_real_page_table", [False, True])
-@pytest.mark.parametrize("has_flashmla", [False, True])
+@pytest.mark.parametrize(
+    "bs,has_real_page_table,has_flashmla",
+    [
+        (bs, page, mla)
+        for bs in (1, 2, 4, 8, 16)
+        for page in (False, True)
+        for mla in (False, True)
+    ]
+    + [(32, True, True), (64, True, True)],
+)
 def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
     """Test fused multi-backend metadata copy kernel against for-loop version."""
     if not torch.cuda.is_available():
@@ -749,38 +694,16 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         has_flashmla=has_flashmla,
     )
 
-    # Create separate destination tensors for reference (for-loop) and fused kernel
-    dst_ref_0 = {
-        k: v.clone() if v is not None else None for k, v in data["dst0"].items()
-    }
-    dst_ref_1 = {
-        k: v.clone() if v is not None else None for k, v in data["dst1"].items()
-    }
-    dst_ref_2 = {
-        k: v.clone() if v is not None else None for k, v in data["dst2"].items()
-    }
+    dst_ref = [
+        {k: v.clone() if v is not None else None for k, v in data[f"dst{i}"].items()}
+        for i in range(3)
+    ]
+    dst_fused = [
+        {k: v.clone() if v is not None else None for k, v in data[f"dst{i}"].items()}
+        for i in range(3)
+    ]
+    reference_copy_for_loop(data["src"], dst_ref, bs, max_len)
 
-    dst_fused_0 = {
-        k: v.clone() if v is not None else None for k, v in data["dst0"].items()
-    }
-    dst_fused_1 = {
-        k: v.clone() if v is not None else None for k, v in data["dst1"].items()
-    }
-    dst_fused_2 = {
-        k: v.clone() if v is not None else None for k, v in data["dst2"].items()
-    }
-
-    # Run reference implementation (for-loop)
-    torch.cuda.synchronize()
-    loop_start = time.perf_counter()
-    reference_copy_for_loop(data["src"], [dst_ref_0, dst_ref_1, dst_ref_2], bs, max_len)
-    torch.cuda.synchronize()
-    loop_end = time.perf_counter()
-    loop_time = loop_end - loop_start
-
-    # Run fused kernel
-    torch.cuda.synchronize()
-    fused_start = time.perf_counter()
     fused_metadata_copy_multi_cuda(
         # Source tensors
         data["src"]["cache_seqlens"],
@@ -792,37 +715,38 @@ def test_fused_metadata_copy_multi(bs, has_real_page_table, has_flashmla):
         data["src"]["flashmla_num_splits"],
         data["src"]["flashmla_metadata"],
         # Destination tensors for backend 0
-        dst_fused_0["cache_seqlens_int32"],
-        dst_fused_0["cu_seqlens_k"],
-        dst_fused_0["page_table_1"],
-        dst_fused_0["dsa_cache_seqlens_int32"],
-        dst_fused_0["dsa_cu_seqlens_k"],
-        dst_fused_0["real_page_table"],
-        dst_fused_0["flashmla_num_splits"],
-        dst_fused_0["flashmla_metadata"],
+        dst_fused[0]["cache_seqlens_int32"],
+        dst_fused[0]["cu_seqlens_k"],
+        dst_fused[0]["page_table_1"],
+        dst_fused[0]["dsa_cache_seqlens_int32"],
+        dst_fused[0]["dsa_cu_seqlens_k"],
+        dst_fused[0]["real_page_table"],
+        dst_fused[0]["flashmla_num_splits"],
+        dst_fused[0]["flashmla_metadata"],
         # Destination tensors for backend 1
-        dst_fused_1["cache_seqlens_int32"],
-        dst_fused_1["cu_seqlens_k"],
-        dst_fused_1["page_table_1"],
-        dst_fused_1["dsa_cache_seqlens_int32"],
-        dst_fused_1["dsa_cu_seqlens_k"],
-        dst_fused_1["real_page_table"],
-        dst_fused_1["flashmla_num_splits"],
-        dst_fused_1["flashmla_metadata"],
+        dst_fused[1]["cache_seqlens_int32"],
+        dst_fused[1]["cu_seqlens_k"],
+        dst_fused[1]["page_table_1"],
+        dst_fused[1]["dsa_cache_seqlens_int32"],
+        dst_fused[1]["dsa_cu_seqlens_k"],
+        dst_fused[1]["real_page_table"],
+        dst_fused[1]["flashmla_num_splits"],
+        dst_fused[1]["flashmla_metadata"],
         # Destination tensors for backend 2
-        dst_fused_2["cache_seqlens_int32"],
-        dst_fused_2["cu_seqlens_k"],
-        dst_fused_2["page_table_1"],
-        dst_fused_2["dsa_cache_seqlens_int32"],
-        dst_fused_2["dsa_cu_seqlens_k"],
-        dst_fused_2["real_page_table"],
-        dst_fused_2["flashmla_num_splits"],
-        dst_fused_2["flashmla_metadata"],
+        dst_fused[2]["cache_seqlens_int32"],
+        dst_fused[2]["cu_seqlens_k"],
+        dst_fused[2]["page_table_1"],
+        dst_fused[2]["dsa_cache_seqlens_int32"],
+        dst_fused[2]["dsa_cu_seqlens_k"],
+        dst_fused[2]["real_page_table"],
+        dst_fused[2]["flashmla_num_splits"],
+        dst_fused[2]["flashmla_metadata"],
         # Parameters
         bs,
         max_len,
         seqlens_expanded_size,
     )
+<<<<<<< HEAD
     torch.cuda.synchronize()
     fused_end = time.perf_counter()
     fused_time = fused_end - fused_start
@@ -1083,6 +1007,18 @@ def test_fused_metadata_copy_multi_large_batch(bs):
                 assert torch.equal(dst_ref[key], dst_fused[key]), (
                     f"Backend {backend_idx} {key} mismatch"
                 )
+=======
+    for backend_idx, (expected, actual) in enumerate(zip(dst_ref, dst_fused)):
+        for key, tensor in expected.items():
+            if tensor is not None:
+                torch.testing.assert_close(
+                    actual[key],
+                    tensor,
+                    rtol=0,
+                    atol=0,
+                    msg=f"Backend {backend_idx} {key}",
+                )
+>>>>>>> upstream/main
 
 
 if __name__ == "__main__":

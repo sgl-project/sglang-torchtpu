@@ -242,6 +242,10 @@ class TestDSV4PoolAssembly(CustomTestCase):
             c4_kv_pool=SimpleNamespace(kernel_page_size=32),
             c4_indexer_kv_pool=indexer_pool,
             unified_region_buffers=lambda ratio: (c4_buffer, 256),
+<<<<<<< HEAD
+=======
+            unified_rope_region_buffers=lambda ratio: None,
+>>>>>>> upstream/main
         )
         params = SimpleNamespace(
             page_size=128,
@@ -253,7 +257,11 @@ class TestDSV4PoolAssembly(CustomTestCase):
             pp_cache_group=None,
         )
         mappings = assembler._DeepSeekV4LayerMappings(
+<<<<<<< HEAD
             transfer_layer_num=1,
+=======
+            transfer_layer_id_max=1,
+>>>>>>> upstream/main
             full={0: 0},
             swa={},
             c4={0: 0},

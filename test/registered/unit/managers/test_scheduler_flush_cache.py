@@ -16,6 +16,7 @@ from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
+<<<<<<< HEAD
 
 
 class _FakeTokenizerManager(TokenizerControlMixin):
@@ -61,6 +62,8 @@ class TestTokenizerFlushCache(unittest.TestCase):
         self.assertTrue(output.success)
         self.assertEqual(manager.requests[0].timeout_s, 5.0)
         manager.mm_processor.clear_preprocess_cache.assert_called_once_with()
+=======
+>>>>>>> upstream/main
 
 
 class TestSchedulerFlushCache(unittest.TestCase):

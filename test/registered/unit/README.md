@@ -2,7 +2,11 @@
 
 CPU-only component tests that do **not** launch a server, load model weights,
 or require an accelerator. GPU operator correctness belongs under
+<<<<<<< HEAD
 `test/registered/kernel/<subsystem>/`.
+=======
+`test/registered/kernels/ops/<group>/`.
+>>>>>>> upstream/main
 
 ## Quick Start
 

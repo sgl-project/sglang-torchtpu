@@ -43,6 +43,7 @@ def test_dp_leaders_reuse_node_local_ports(
         for dp_rank, tp_rank in enumerate(ranks):
             scheduler = SimpleNamespace(
                 server_args=SimpleNamespace(),
+<<<<<<< HEAD
                 ps=SimpleNamespace(
                     tp_rank=tp_rank,
                     tp_size=parallel.tp_size,
@@ -55,6 +56,17 @@ def test_dp_leaders_reuse_node_local_ports(
                 model_config=SimpleNamespace(is_multimodal=False),
             )
             ports.append(rust_server.RustServer.launch(scheduler).http_port)
+=======
+                model_config=SimpleNamespace(is_multimodal=False),
+            )
+            with parallel.override(
+                tp_rank=tp_rank,
+                attn_dp_rank=dp_rank,
+                attn_tp_rank=tp_rank % parallel.attn_tp_size,
+                attn_cp_rank=0,
+            ):
+                ports.append(rust_server.RustServer.launch(scheduler).http_port)
+>>>>>>> upstream/main
 
         calls = extension.return_value.Server.call_args_list
         assert [c.kwargs["port_offset"] for c in calls] == expected

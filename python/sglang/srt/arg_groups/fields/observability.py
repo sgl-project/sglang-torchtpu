@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Config fields of the ``observability`` namespace.
 
 One class per namespace. The class *is* the namespace: a field declared here
@@ -6,6 +7,9 @@ spells it exactly as before. ``ServerArgs`` composes these classes, so the
 record stays one flat object -- the split moves where declarations live, not
 how config is shaped at runtime.
 """
+=======
+"""Config fields of the ``observability`` namespace."""
+>>>>>>> upstream/main
 
 from __future__ import annotations
 

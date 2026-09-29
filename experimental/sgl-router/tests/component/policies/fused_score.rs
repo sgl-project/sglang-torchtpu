@@ -12,15 +12,25 @@
 //! and the idlest at 1.0, so every assertion below holds either way.
 
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+<<<<<<< HEAD
 use sgl_router::policies::engine_load::{EngineLoadSnapshot, EngineWorkerLoad};
 use sgl_router::policies::kv_events::{
     compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId,
 };
+=======
+>>>>>>> upstream/main
 use sgl_router::policies::load_based::LoadBasedPolicy;
 use sgl_router::policies::scoring::{
     prefix_cache::PrefixCachePolicy, FusedScorePolicy, ScorePolicy,
 };
 use sgl_router::policies::{Policy, SelectionContext};
+<<<<<<< HEAD
+=======
+use sgl_router::state::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId};
+use sgl_router::state::load_monitor::engine_reported_load::{
+    EngineReportedLoadSnapshot, EngineReportedWorkerLoad,
+};
+>>>>>>> upstream/main
 use sgl_router::workers::Worker;
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
@@ -82,12 +92,20 @@ fn fused_load_based_term_uses_the_request_snapshot() {
     let ws = vec![worker("w0"), worker("w1")];
     // Local counters changed after the request snapshot and prefer w0.
     let _after_snapshot: Vec<_> = (0..10).map(|_| ws[1].load_guard()).collect();
+<<<<<<< HEAD
     let snapshot = EngineLoadSnapshot::from_workers(
+=======
+    let snapshot = EngineReportedLoadSnapshot::from_workers(
+>>>>>>> upstream/main
         29,
         HashMap::from([
             (
                 ws[0].url.clone(),
+<<<<<<< HEAD
                 EngineWorkerLoad {
+=======
+                EngineReportedWorkerLoad {
+>>>>>>> upstream/main
                     num_running_reqs: 50,
                     num_waiting_reqs: 0,
                     num_tokens: 0,
@@ -97,7 +115,11 @@ fn fused_load_based_term_uses_the_request_snapshot() {
             ),
             (
                 ws[1].url.clone(),
+<<<<<<< HEAD
                 EngineWorkerLoad {
+=======
+                EngineReportedWorkerLoad {
+>>>>>>> upstream/main
                     num_running_reqs: 1,
                     num_waiting_reqs: 0,
                     num_tokens: 0,
@@ -123,12 +145,20 @@ fn fused_load_based_term_uses_the_request_snapshot() {
 fn score_policy_forwards_the_request_snapshot_to_load_based() {
     let ws = vec![worker("w0"), worker("w1")];
     let _after_snapshot: Vec<_> = (0..10).map(|_| ws[1].load_guard()).collect();
+<<<<<<< HEAD
     let snapshot = EngineLoadSnapshot::from_workers(
+=======
+    let snapshot = EngineReportedLoadSnapshot::from_workers(
+>>>>>>> upstream/main
         31,
         HashMap::from([
             (
                 ws[0].url.clone(),
+<<<<<<< HEAD
                 EngineWorkerLoad {
+=======
+                EngineReportedWorkerLoad {
+>>>>>>> upstream/main
                     num_running_reqs: 50,
                     num_waiting_reqs: 0,
                     num_tokens: 0,
@@ -138,7 +168,11 @@ fn score_policy_forwards_the_request_snapshot_to_load_based() {
             ),
             (
                 ws[1].url.clone(),
+<<<<<<< HEAD
                 EngineWorkerLoad {
+=======
+                EngineReportedWorkerLoad {
+>>>>>>> upstream/main
                     num_running_reqs: 1,
                     num_waiting_reqs: 0,
                     num_tokens: 0,

@@ -35,6 +35,7 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 
 // ---- interface types ----
 
+<<<<<<< HEAD
 /// Result of `inc_lock_ref`, handed back to the matching `dec_lock_ref`.
 ///
 /// The receipt a release needs is per-component lock evidence: the SWA
@@ -43,12 +44,16 @@ fn next_coexist_reclaim_digest(current: i64, node_id: NodeId, component_idx: usi
 /// out). Locks count every node in their contiguous segment, so no
 /// per-node skip state exists. Receipt fields default to nothing-acquired;
 /// `inc_lock_ref` stamps what it actually took.
+=======
+/// Receipt returned by `inc_lock_ref` and replayed by `dec_lock_ref`.
+>>>>>>> upstream/main
 #[derive(Default)]
 pub struct IncLockRefResult {
     /// Tokens newly protected (moved out of evictable) by this lock.
     pub delta: Option<usize>,
     /// The node the lock was taken on; a release replays the receipt there only.
     pub node_id: Option<NodeId>,
+<<<<<<< HEAD
     /// SWA lock-window uuid minted/reused by the device lock walk.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid minted/reused by the host lock walk.
@@ -60,17 +65,65 @@ pub struct IncLockRefResult {
 /// Params for `dec_lock_ref`. Receipt fields default to nothing-acquired so
 /// a lost receipt under-releases (a leak sanity checks report) instead of
 /// releasing a lock another holder owns.
+=======
+    /// Components the acquire left untaken; the release skips them too.
+    pub skipped_lock_components: ComponentSet,
+    /// A recorded None means the segment reaches the root; absence means no receipt.
+    pub component_lock_uuids: HashMap<u8, Option<i64>>,
+    pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
+}
+
+impl IncLockRefResult {
+    pub fn set_lock_uuid(&mut self, component: u8, uuid: Option<i64>, lock_host: bool) {
+        let uuids = if lock_host {
+            &mut self.component_host_lock_uuids
+        } else {
+            &mut self.component_lock_uuids
+        };
+        uuids.insert(component, uuid);
+    }
+
+    pub fn to_dec_params(&self) -> DecLockRefParams {
+        DecLockRefParams {
+            node_id: self.node_id,
+            skipped_lock_components: self.skipped_lock_components,
+            component_lock_uuids: self.component_lock_uuids.clone(),
+            component_host_lock_uuids: self.component_host_lock_uuids.clone(),
+        }
+    }
+}
+
+/// Receipt required by `dec_lock_ref`.
+>>>>>>> upstream/main
 #[derive(Default)]
 pub struct DecLockRefParams {
     /// The node the matching acquire locked; None only for receipts that did
     /// not come from this core (a mispaired anchor is a protocol violation).
     pub node_id: Option<NodeId>,
+<<<<<<< HEAD
     /// SWA lock-window uuid the device unlock stops at, from the matching acquire.
     pub swa_uuid_for_lock: Option<i64>,
     /// SWA lock-window uuid the host unlock stops at, from the matching acquire.
     pub swa_uuid_for_host_lock: Option<i64>,
     /// Components the matching acquire left untaken.
     pub skipped_lock_components: ComponentSet,
+=======
+    /// Components the matching acquire left untaken.
+    pub skipped_lock_components: ComponentSet,
+    pub component_lock_uuids: HashMap<u8, Option<i64>>,
+    pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
+}
+
+impl DecLockRefParams {
+    pub fn get_lock_uuid(&self, component: u8, lock_host: bool) -> Option<i64> {
+        let uuids = if lock_host {
+            &self.component_host_lock_uuids
+        } else {
+            &self.component_lock_uuids
+        };
+        uuids[&component]
+    }
+>>>>>>> upstream/main
 }
 
 /// Result of `dec_lock_ref`.
@@ -348,6 +401,11 @@ pub enum PoolName {
     DeepseekV4C2,
     DeepseekV4C2Indexer,
     DeepseekV4C2IndexerScale,
+<<<<<<< HEAD
+=======
+    DeepseekV4C4Rope,
+    DeepseekV4C128Rope,
+>>>>>>> upstream/main
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
     DeepseekV4C128State,
@@ -960,6 +1018,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         let Some(swa) = self.try_component_by_type_(SWA) else {
             return Ok(());
         };
+<<<<<<< HEAD
         swa.release_window_lock(
             self,
             node_idx,
@@ -967,6 +1026,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             device_frees,
             host_frees,
         );
+=======
+        swa.release_window_lock(self, node_idx, params, device_frees, host_frees);
+>>>>>>> upstream/main
 
         // Drop strictly-lower-priority locks co-located on the node, skipping
         // any the paired inc never took.
@@ -4362,6 +4424,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                 // states must match the host LRU; never both at once.
                 let mut device_count = 0;
                 let mut host_only_count = 0;
+<<<<<<< HEAD
+=======
+                // A host lock delists its node, so locked nodes are exempt.
+                let mut host_locked_listed = 0;
+>>>>>>> upstream/main
                 for &node_id in &all_nodes {
                     if self.arena.node(node_id).is_root() {
                         continue;
@@ -4375,17 +4442,31 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         ));
                     }
                     let host_only = !has_device && node.has_host_value(ct);
+<<<<<<< HEAD
                     if host_only != host_lru.in_list(Some(node_id)) {
                         errors.push(format!(
                             "{ct:?} host LRU mismatch at node {node_id}: host_only={host_only} in_lru={}",
                             host_lru.in_list(Some(node_id))
+=======
+                    let host_listed = host_lru.in_list(Some(node_id));
+                    let host_locked = node.host_lock_ref(ct) > 0;
+                    if host_locked {
+                        host_locked_listed += host_listed as usize;
+                    } else if host_only != host_listed {
+                        errors.push(format!(
+                            "{ct:?} host LRU mismatch at node {node_id}: host_only={host_only} in_lru={host_listed}"
+>>>>>>> upstream/main
                         ));
                     }
                     if lru.in_list(Some(node_id)) && host_lru.in_list(Some(node_id)) {
                         errors.push(format!("{ct:?} node {node_id} in both device and host LRU"));
                     }
                     device_count += has_device as usize;
+<<<<<<< HEAD
                     host_only_count += host_only as usize;
+=======
+                    host_only_count += (host_only && !host_locked) as usize;
+>>>>>>> upstream/main
                 }
                 if device_count != lru.len() {
                     errors.push(format!(
@@ -4393,10 +4474,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                         lru.len()
                     ));
                 }
+<<<<<<< HEAD
                 if host_only_count != host_lru.len() {
                     errors.push(format!(
                         "{ct:?} host LRU: tree={host_only_count} != lru={}",
                         host_lru.len()
+=======
+                let host_listed_count = host_lru.len().saturating_sub(host_locked_listed);
+                if host_only_count != host_listed_count {
+                    errors.push(format!(
+                        "{ct:?} host LRU: tree={host_only_count} != lru={host_listed_count}"
+>>>>>>> upstream/main
                     ));
                 }
                 // Linked-list integrity

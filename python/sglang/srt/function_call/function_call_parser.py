@@ -23,6 +23,10 @@ from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
+<<<<<<< HEAD
+=======
+from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
+>>>>>>> upstream/main
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
     GlmSpecialTokenConfig,
@@ -109,6 +113,7 @@ class FunctionCallParser:
         "hermes": HermesDetector,
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
+        "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
     }

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import warnings
 from abc import ABC
 from collections.abc import Callable
 from enum import Enum, IntEnum, auto
@@ -136,6 +135,17 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
+<<<<<<< HEAD
+=======
+    def supports_prefill_shared_read_done(self) -> bool:
+        """Whether target EXTEND has no later speculative shared-buffer reader.
+
+        The backend must still declare a pre-replay read end. Other algorithms
+        must stage their draft's shared reads before publishing the target event.
+        """
+        return self.is_none() or self.is_dflash_family()
+
+>>>>>>> upstream/main
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
 
@@ -296,20 +306,6 @@ class SpeculativeAlgorithm(Enum):
             return num_draft_tokens - 1
         return num_draft_tokens
 
-    def get_num_tokens_per_bs_for_target_verify(
-        self, num_draft_tokens: int, is_draft_worker: bool
-    ) -> int:
-        # Deprecated alias; remove together with the FIXME above.
-        warnings.warn(
-            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
-            "get_num_tokens_per_req_for_target_verify instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.get_num_tokens_per_req_for_target_verify(
-            num_draft_tokens, is_draft_worker
-        )
-
     def create_worker(
         self, server_args: ServerArgs
     ) -> type[BaseSpecWorker | TpModelWorker | NGRAMWorker] | None:
@@ -390,6 +386,7 @@ class SpecInputType(IntEnum):
     # every stage rebuilds its verify input from. Neither a draft nor a verify
     # input -- no forward ever runs on it.
     PP_SPEC_RELAY = auto()
+<<<<<<< HEAD
 
 
 class SpecPaddingState(msgspec.Struct, frozen=True):
@@ -399,6 +396,8 @@ class SpecPaddingState(msgspec.Struct, frozen=True):
     physical_batch_size: int
     logical_num_tokens: int
     physical_num_tokens: int
+=======
+>>>>>>> upstream/main
 
 
 class SpecInput(ABC):
@@ -415,6 +414,10 @@ class SpecInput(ABC):
     # (ragged forwards carry 1 there). -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
+
+    # Dataclasses assign fields before __post_init__ calls this base's __init__;
+    # assigning None there would overwrite the constructor's custom_mask.
+    custom_mask: Optional[torch.Tensor] = None
 
     # DSA MTP IndexShare seed relay. Class-level defaults (same rationale as
     # ragged_verify_layout) so scheduler/relay/attention code reads them
@@ -470,6 +473,13 @@ class SpecInput(ABC):
             SpecInputType.NGRAM_VERIFY,
             SpecInputType.UNO_VERIFY,
         }
+
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        return None
 
 
 def spec_scale_global_num_tokens(

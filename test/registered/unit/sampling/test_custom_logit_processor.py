@@ -27,7 +27,14 @@ from sglang.srt.sampling.custom_logit_processor import (
     Qwen3ThinkingBudgetLogitProcessor,
     _cache_from_str,
 )
+<<<<<<< HEAD
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+=======
+from sglang.srt.sampling.sampling_batch_info import (
+    ProcessorEntry,
+    SamplingBatchInfo,
+)
+>>>>>>> upstream/main
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -66,7 +73,15 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             vocab_size=4,
             has_custom_logit_processor=True,
             custom_params=params,
+<<<<<<< HEAD
             custom_logit_processor={0: (processor, torch.tensor([True, False, True]))},
+=======
+            custom_logit_processor={
+                0: ProcessorEntry(
+                    processor=processor, rows=[0, 2], indices=torch.tensor([0, 2])
+                )
+            },
+>>>>>>> upstream/main
             device="cpu",
         )
         logits = torch.zeros(batch_size * num_tokens, 4)

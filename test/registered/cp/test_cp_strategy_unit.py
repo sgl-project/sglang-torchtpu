@@ -120,6 +120,7 @@ class TestCPStrategyUnit(CustomTestCase):
             ),
         ):
             self.assertFalse(is_dsa_enable_prefill_cp())
+<<<<<<< HEAD
 
     def test_disabled_dsa_cp_skips_platform_probes(self):
         parallel = SimpleNamespace(attn_cp_size=1)
@@ -136,6 +137,8 @@ class TestCPStrategyUnit(CustomTestCase):
 
         mock_is_hip.assert_not_called()
         mock_is_musa.assert_not_called()
+=======
+>>>>>>> upstream/main
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):

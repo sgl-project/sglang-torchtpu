@@ -104,6 +104,7 @@ def _install_meta_allocators() -> None:
 _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES = 1 << 60
 
 
+<<<<<<< HEAD
 class _PsutilProxy:
     def __init__(self, psutil_module):
         self._psutil_module = psutil_module
@@ -135,6 +136,14 @@ def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
     finally:
         if init_globals.get("psutil") is proxy:
             init_globals["psutil"] = psutil_module
+=======
+def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
+    """Bypass physical host-payload checks while meta allocation is active."""
+    from sglang.srt.mem_cache.pool_host.base import host_memory_budget_scope
+
+    with host_memory_budget_scope(_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES):
+        return original_init(self, *args, **kwargs)
+>>>>>>> upstream/main
 
 
 @lru_cache(maxsize=256)

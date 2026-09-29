@@ -1,7 +1,7 @@
 import copy
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -68,7 +68,9 @@ def _draft_runner_of(worker):
 @dataclass
 class EagleVerifyInput(SpecInput):
     draft_token: torch.Tensor
-    custom_mask: torch.Tensor
+    # Keep this dataclass argument required despite SpecInput's None default;
+    # otherwise the required positions field would follow a defaulted field.
+    custom_mask: torch.Tensor = field()
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
@@ -731,6 +733,7 @@ class EagleDraftInput(SpecInput):
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
+<<<<<<< HEAD
     def prepare_for_extend(self, batch: ScheduleBatch):
 
         if batch.forward_mode.is_idle():
@@ -762,6 +765,15 @@ class EagleDraftInput(SpecInput):
         if worker.speculative_algorithm.is_standalone():
             return None
         return _draft_runner_of(worker).model_config.dtype
+=======
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.draft_probs is not None:
+            self.draft_probs = pad_tensor_to_size(self.draft_probs, batch_size)
+>>>>>>> upstream/main
 
     @classmethod
     def create_idle_input(
@@ -924,6 +936,19 @@ class EagleDraftExtendInput(SpecInput):
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
+
+    def pad_batch(
+        self,
+        pad_tensor_to_size: Callable[..., torch.Tensor],
+        batch_size: int,
+    ) -> None:
+        if self.num_correct_drafts is not None:
+            self.num_correct_drafts = pad_tensor_to_size(
+                self.num_correct_drafts, batch_size
+            )
+            self.num_accept_tokens = pad_tensor_to_size(
+                self.num_accept_tokens, batch_size
+            )
 
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:

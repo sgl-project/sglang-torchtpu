@@ -234,6 +234,7 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
             "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 6))
+<<<<<<< HEAD
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -313,6 +314,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
             "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices_for(range(4, 8))
+=======
+>>>>>>> upstream/main
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
@@ -344,6 +347,7 @@ STAGING_ENV = {
 }
 
 
+<<<<<<< HEAD
 class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
     """Prefill TP=4 -> Decode TP=2 with staging buffer enabled (MHA model)."""
 
@@ -425,6 +429,8 @@ class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+=======
+>>>>>>> upstream/main
 class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
     """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MHA model)."""
 

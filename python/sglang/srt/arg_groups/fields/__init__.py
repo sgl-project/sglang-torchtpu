@@ -1,9 +1,16 @@
+<<<<<<< HEAD
 """Config field declarations, one module per top-level namespace.
 
 Each class carries the ``_NS_PATH`` it stands for, so the module a field is
 declared in *is* its namespace. ``ServerArgs`` is assembled from the classes
 that declare **operator input**; the derived fields, which nobody can type,
 are declared beside them but are not collected into the record.
+=======
+"""Namespace declarations for input and derived configuration.
+
+``ServerArgs`` collects input fields from classes carrying ``_NS_PATH``.
+Derived declarations stay on those classes for publication into config bags.
+>>>>>>> upstream/main
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from sglang.srt.arg_groups.field_order import POSITIONAL_FIELD_ORDER
 def collect_input_fields(
     sources: List[type],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, str]]:
+<<<<<<< HEAD
     """The annotations and defaults of every field these classes declare.
 
     Each source's annotations are resolved **in its own module** and handed on
@@ -44,6 +52,13 @@ def collect_input_fields(
     field. Anything the record declares that the frozen order does not name
     goes after it, in declaration order -- the only backward-compatible place
     for a new field.
+=======
+    """Return resolved annotations, defaults, and a field-to-namespace map.
+
+    Resolve annotations in their declaring module so imported type names remain
+    available. Preserve ``POSITIONAL_FIELD_ORDER`` for constructor compatibility;
+    append new fields in declaration order.
+>>>>>>> upstream/main
     """
     annotations: Dict[str, Any] = {}
     defaults: Dict[str, Any] = {}

@@ -404,8 +404,8 @@ class DeepseekV2WeightLoaderMixin:
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
-                        # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        # The last PP stage also owns an embedding for its NextN draft.
+                        if ".embed_tokens." in name and name not in params_dict:
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
@@ -584,12 +584,15 @@ class DeepseekV2WeightLoaderMixin:
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
 
+<<<<<<< HEAD
             # GPU binds kv_b_proj at forward prepare
             # TPU whole-graph compile traces the forward graph during warmup and
             # can't bound kv_b_proj at forward prepare, so we bind it here for TPU.
             if _is_tpu and getattr(self_attn.attn_mha, "kv_b_proj", None) is None:
                 self_attn.attn_mha.kv_b_proj = self_attn.kv_b_proj
 
+=======
+>>>>>>> upstream/main
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
                 awq_dequantize_f = awq_dequantize_func()
@@ -636,8 +639,12 @@ class DeepseekV2WeightLoaderMixin:
                         else self_attn.kv_b_proj.weight_scale_inv
                     )
                     is_ue8m0_uint8 = (
+<<<<<<< HEAD
                         getattr(weight_scale, "format_ue8m0", False)
                         and weight_scale.dtype == torch.uint8
+=======
+                        weight_scale.format_ue8m0 and weight_scale.dtype == torch.uint8
+>>>>>>> upstream/main
                     )
                     if _is_fp8_fnuz and not is_ue8m0_uint8:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
@@ -652,6 +659,17 @@ class DeepseekV2WeightLoaderMixin:
                     if is_ue8m0_uint8:
                         weight_scale = (weight_scale.to(torch.int32) << 23).view(
                             torch.float32
+<<<<<<< HEAD
+=======
+                        )
+                    elif (
+                        should_deepgemm_weight_requant_ue8m0(
+                            weight_block_size=(
+                                self.quant_config.weight_block_size
+                                if self.quant_config is not None
+                                else None
+                            )
+>>>>>>> upstream/main
                         )
                     elif should_deepgemm_weight_requant_ue8m0(
                         weight_block_size=(

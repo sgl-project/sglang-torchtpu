@@ -29,6 +29,7 @@ class TestRustServerExtension(CustomTestCase):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
         scheduler = SimpleNamespace(
+<<<<<<< HEAD
             ps=SimpleNamespace(
                 dp_size=2,
                 attn_dp_rank=1,
@@ -38,6 +39,8 @@ class TestRustServerExtension(CustomTestCase):
                 attn_tp_size=1,
                 attn_cp_size=1,
             ),
+=======
+>>>>>>> upstream/main
             model_config=SimpleNamespace(is_multimodal=True),
         )
         with (
@@ -49,7 +52,22 @@ class TestRustServerExtension(CustomTestCase):
                 ),
             ),
             patch.object(
+<<<<<<< HEAD
                 server_module, "get_parallel", return_value=SimpleNamespace(nnodes=1)
+=======
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    nnodes=1,
+                    pp_size=1,
+                    dp_size=2,
+                    attn_dp_rank=1,
+                    tp_size=2,
+                    tp_rank=1,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                ),
+>>>>>>> upstream/main
             ),
             patch.object(ModelServer, "_partition_cores", return_value=(None, None)),
             patch.object(

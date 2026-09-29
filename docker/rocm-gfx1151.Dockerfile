@@ -113,7 +113,11 @@ from pathlib import Path
 project = tomllib.loads(Path("python/pyproject.toml").read_text())["project"]
 extras = project["optional-dependencies"]
 requirements = list(project["dependencies"])
+<<<<<<< HEAD
 for group in ("runtime_base", "runtime_common", "srt_hip"):
+=======
+for group in ("runtime_base", "runtime_common", "srt_hip", "diffusion_common"):
+>>>>>>> upstream/main
     requirements.extend(
         "compressed-tensors==0.15.0"
         if requirement == "compressed-tensors"
@@ -121,6 +125,20 @@ for group in ("runtime_base", "runtime_common", "srt_hip"):
         for requirement in extras[group]
         if not requirement.startswith("sglang[") and requirement != "torch"
     )
+<<<<<<< HEAD
+=======
+# diffusion_hip's pure-Python packages, needed by sglang.multimodal_gen
+# (Wan2.2/video-gen) at import time. st_attn/vsa are deliberately left out:
+# they're prebuilt CUDA-oriented wheels of unverified gfx1151 compatibility,
+# same posture as skipping aiter's compiled CDNA kernels below.
+requirements.extend(
+    requirement
+    for requirement in extras["diffusion_hip"]
+    if not requirement.startswith("sglang[")
+    and not requirement.startswith("st_attn")
+    and not requirement.startswith("vsa")
+)
+>>>>>>> upstream/main
 requirements = list(dict.fromkeys(requirements))
 subprocess.check_call(
     [sys.executable, "-m", "pip", "install", "--no-cache-dir", *requirements]

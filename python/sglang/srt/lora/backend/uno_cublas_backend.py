@@ -49,6 +49,11 @@ class UnoCublasLoRABackend(TritonLoRABackend):
     """
 
     name = "uno_cublas"
+<<<<<<< HEAD
+=======
+    # UNO's explicit draft-row routing does not participate in DPA collectives.
+    supports_dp_attention = False
+>>>>>>> upstream/main
     supports_lora_a_overlap = True
     # K2's runners prepare base-only LoRA metadata whenever any internal
     # manager exists. UNO never exposes request-selectable adapters, so those

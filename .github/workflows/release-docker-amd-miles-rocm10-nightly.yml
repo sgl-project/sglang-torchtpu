@@ -1,4 +1,12 @@
+<<<<<<< HEAD
+<<<<<<<< HEAD:.github/workflows/release-docker-amd-miles-rocm10-nightly.yml
 name: Release Docker Images Nightly Miles ROCm10 (AMD)
+========
+name: Release Docker Images Nightly Miles ROCm7.2.4 (AMD)
+>>>>>>>> upstream/main:.github/workflows/release-docker-amd-miles-rocm724-nightly.yml
+=======
+name: Release Docker Images Nightly Miles ROCm10 (AMD)
+>>>>>>> upstream/main
 
 on:
   workflow_dispatch:
@@ -20,7 +28,15 @@ jobs:
       fail-fast: false
       matrix:
         variant:
+<<<<<<< HEAD
+<<<<<<<< HEAD:.github/workflows/release-docker-amd-miles-rocm10-nightly.yml
           - rocm10-mi35x
+========
+          - rocm724-mi35x
+>>>>>>>> upstream/main:.github/workflows/release-docker-amd-miles-rocm724-nightly.yml
+=======
+          - rocm10-mi35x
+>>>>>>> upstream/main
     steps:
       - name: Checkout miles repository
         uses: actions/checkout@v4

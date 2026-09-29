@@ -13,7 +13,11 @@ from sglang.test.test_utils import (
 )
 
 # Per-commit: TP=2 EP=2 baseline.
+<<<<<<< HEAD
 # DeepGEMM/FP8 variant moved to test_moe_ep_nightly.py.
+=======
+# DeepGEMM/FP8 variant: test_moe_ep_extra.py (extra-a).
+>>>>>>> upstream/main
 register_cuda_ci(est_time=93, stage="base-b", runner_config="2-gpu-large")
 
 

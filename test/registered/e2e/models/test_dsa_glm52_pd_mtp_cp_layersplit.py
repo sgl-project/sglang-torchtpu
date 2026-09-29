@@ -20,7 +20,11 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
+<<<<<<< HEAD
 register_cuda_ci(est_time=898, stage="base-c", runner_config="8-gpu-b300")
+=======
+register_cuda_ci(est_time=898, stage="extra-b", runner_config="8-gpu-b300")
+>>>>>>> upstream/main
 
 MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 6}'
 

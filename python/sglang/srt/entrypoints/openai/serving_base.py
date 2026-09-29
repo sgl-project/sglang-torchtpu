@@ -36,7 +36,11 @@ class OpenAIServingBase(ABC):
         )
         self.allowed_custom_labels = (
             set(get_observability().tokenizer_metrics_allowed_custom_labels)
+<<<<<<< HEAD
             if isinstance(server_args, ServerArgs)
+=======
+            if isinstance(self.tokenizer_manager.server_args, ServerArgs)
+>>>>>>> upstream/main
             and get_observability().tokenizer_metrics_allowed_custom_labels
             else None
         )

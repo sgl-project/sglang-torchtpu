@@ -31,7 +31,10 @@ def estimate_swa_kv_tokens(
     page_size: int,
     allocation_limit: Optional[int] = None,
     host_hit_length: int = 0,
+<<<<<<< HEAD
     additive_chunk: bool = False,
+=======
+>>>>>>> upstream/main
 ) -> int:
     """Peak SWA reservation for one prefill/decode request."""
     if sliding_window_size is None or sliding_window_size <= 0:
@@ -42,11 +45,15 @@ def estimate_swa_kv_tokens(
             if allocation_limit is None
             else min(extend_input_len, allocation_limit)
         )
+<<<<<<< HEAD
         allocated_tail = (
             allocated
             if additive_chunk and allocation_limit is not None
             else max(allocated - sliding_window_size, 0)
         )
+=======
+        allocated_tail = max(allocated - sliding_window_size, 0)
+>>>>>>> upstream/main
         # With a roughly two-window SWA pool, a cached prefix can already lock
         # one window. Charging another whole window for a short resume can then
         # block admission forever on an idle pool. Reserve only its uncached
@@ -163,7 +170,10 @@ class SWAPrefillBudget(PrefillBudget):
         super().__init__(*args, **kwargs)
         self.all_swa = all_swa
         self.req_ring = is_swa_req_ring(self.allocator)
+<<<<<<< HEAD
         self.additive_chunk = True
+=======
+>>>>>>> upstream/main
 
     def _available_and_evictable(self):
         if self.all_swa:
@@ -197,7 +207,10 @@ class SWAPrefillBudget(PrefillBudget):
             page_size=self.page_size,
             allocation_limit=chunk_limit,
             host_hit_length=swa_host_hit_length,
+<<<<<<< HEAD
             additive_chunk=self.additive_chunk,
+=======
+>>>>>>> upstream/main
         )
 
     def swa_never_fits(self, extend_input_len, max_new_tokens, **kwargs):
@@ -217,6 +230,7 @@ class SWAPrefillBudget(PrefillBudget):
         cap = int(self.remaining_swa) - headroom
         return max(0, cap // self.page_size * self.page_size)
 
+<<<<<<< HEAD
     def _continuation_chunk_cap(self):
         # With overlap scheduling, the preceding chunk's retained window can
         # still appear evictable until its result commits. A continuation must
@@ -226,6 +240,8 @@ class SWAPrefillBudget(PrefillBudget):
         cap = int(self.remaining_swa) - headroom
         return max(0, cap // self.page_size * self.page_size)
 
+=======
+>>>>>>> upstream/main
     def check_prefill(
         self,
         *,
@@ -275,6 +291,7 @@ class SWAPrefillBudget(PrefillBudget):
             available = min(available, int(self.remaining_swa) - self.page_size)
         return available if available > 0 else None
 
+<<<<<<< HEAD
     def fit_chunk(
         self,
         *,
@@ -287,6 +304,8 @@ class SWAPrefillBudget(PrefillBudget):
         cap = self._continuation_chunk_cap()
         return min(chunk_limit, cap) if cap > 0 else None
 
+=======
+>>>>>>> upstream/main
     def can_allocate_prefill(
         self,
         *,
@@ -335,7 +354,10 @@ class SharedSWAPrefillBudget(SWAPrefillBudget):
             *args, num_mixed_decode_tokens=num_mixed_decode_tokens, **kwargs
         )
         self.swa_offset = num_mixed_decode_tokens
+<<<<<<< HEAD
         self.additive_chunk = False
+=======
+>>>>>>> upstream/main
 
     def _fits(self, full_tokens, swa_tokens, *, empty_pool=False):
         return self.allocator.can_reserve(

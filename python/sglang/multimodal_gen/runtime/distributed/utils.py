@@ -25,12 +25,15 @@ from sglang.multimodal_gen.runtime import platforms
 
 try:
     from torch.distributed import all_gather_single as _all_gather_single
+    from torch.distributed import reduce_scatter_single as _reduce_scatter_single
 except ImportError:
     from torch.distributed import all_gather_into_tensor as _all_gather_single
+    from torch.distributed import reduce_scatter_tensor as _reduce_scatter_single
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 all_gather_single = _all_gather_single
+reduce_scatter_single = _reduce_scatter_single
 
 logger = init_logger(__name__)
 
@@ -263,7 +266,11 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
+<<<<<<< HEAD
             serialized_data = _dumps(data)
+=======
+            serialized_data = pickle.dumps(data)
+>>>>>>> upstream/main
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(

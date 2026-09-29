@@ -23,7 +23,11 @@ impl Overloaded {
 impl EligibilityFilter for Overloaded {
     fn keep(&self, workers: &[Arc<Worker>], _ctx: &SelectionContext<'_>) -> Vec<bool> {
         (workers.iter())
+<<<<<<< HEAD
             .map(|w| w.active_load() < self.max_in_flight)
+=======
+            .map(|w| w.router_inflight_load() < self.max_in_flight)
+>>>>>>> upstream/main
             .collect()
     }
 
@@ -42,7 +46,11 @@ impl Policy for Overloaded {
             .collect();
         eligible
             .iter()
+<<<<<<< HEAD
             .min_by_key(|w| w.active_load())
+=======
+            .min_by_key(|w| w.router_inflight_load())
+>>>>>>> upstream/main
             .map(Arc::clone)
     }
 

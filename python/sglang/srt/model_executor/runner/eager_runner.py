@@ -59,7 +59,10 @@ from sglang.srt.model_executor.runner_utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+<<<<<<< HEAD
     get_parallel,
+=======
+>>>>>>> upstream/main
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -83,7 +86,7 @@ if TYPE_CHECKING:
 
 
 class EagerRunner(BaseRunner):
-    def __init__(self, model_runner: ModelRunner) -> None:
+    def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
         mr = model_runner
         sa = mr.server_args
@@ -151,10 +154,10 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        self.warmup()
+        if run_warmup:
+            self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
@@ -309,7 +312,7 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
+            if model_runner.attn_dcp_size > 1 and hasattr(
                 model_runner.model, "prepare_context_parallel_metadata_for_dcp"
             ):
                 # prepare kv cache buffer for dcp to gather kv cache

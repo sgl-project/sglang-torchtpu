@@ -144,6 +144,10 @@ class TestMultiOutputGrouping(unittest.TestCase):
                     output_file_name="image.png",
                     num_outputs_per_prompt=2,
                     seed=[100, 101],
+<<<<<<< HEAD
+=======
+                    generator_device="cpu",
+>>>>>>> upstream/main
                 )
             )
             return req
@@ -182,6 +186,17 @@ class TestMultiOutputGrouping(unittest.TestCase):
                 for req in sequential_outputs
             )
         )
+<<<<<<< HEAD
+=======
+        self.assertEqual(
+            [req.generator[0].initial_seed() for req in sequential_outputs],
+            [100, 101],
+        )
+        self.assertEqual([req.seeds for req in sequential_outputs], [[100], [101]])
+        self.assertIsNot(
+            sequential_outputs[0].generator[0], sequential_outputs[1].generator[0]
+        )
+>>>>>>> upstream/main
 
     def test_split_batched_latents_uses_original_batched_tensor(self):
         stage = LatentPreparationStage.__new__(LatentPreparationStage)

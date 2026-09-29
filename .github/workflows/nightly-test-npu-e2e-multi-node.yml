@@ -142,11 +142,39 @@ jobs:
           mkdir -p ${test_data_output_path}
           tc_name=${test_case##*/}
           tc_name=${tc_name%.*}
+<<<<<<< HEAD
           # Keep results from different CANN/device images in separate paths.
           image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
           metrics_data_path=${test_data_output_path}/${image_label}/${tc_name}
           mkdir -p ${metrics_data_path}
           echo "Metrics file path: ${metrics_data_path}"
+=======
+
+          # Provided automatically by the GitHub server.
+          # run_id is the unique identifier for the workflow run,
+          # attempt represents the re‑run attempt count of the job.
+          run_id=${{ github.run_id }}
+          run_attempt=${{ github.run_attempt }}
+
+          # Parse run metadata (branch_label / workflow_name / create_time)
+          # from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.
+          branch_label=$(echo "${{ fromJson(inputs.run_start_metadata).branch_label }}" | tr '/:' '--')
+          workflow_name=$(echo "${{ fromJson(inputs.run_start_metadata).workflow_name }}" | tr ' ' '_' | tr -d '()')
+          create_time="${{ fromJson(inputs.run_start_metadata).create_time }}"
+          if [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi
+          # Append the image tag to the workflow-name segment so that runs with
+          # different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,
+          # image-tagged output/log directories.
+          image_label=$(echo "${{ inputs.image }}" | sed 's#.*[/:]##')
+          workflow_name="${workflow_name}--${image_label}"
+
+          # Print persistence‑directory‑prefix variables
+          echo "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"
+
+          sglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/${{ inputs.test_type }}/${tc_name}
+          mkdir -p ${sglang_test_results_output_path}
+          echo "Metrics file path: ${sglang_test_results_output_path}"
+>>>>>>> upstream/main
 
           prefill_decode_deployment="${{ inputs.prefill_decode_deployment }}"
           kube_job_type=""

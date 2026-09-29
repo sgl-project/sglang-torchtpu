@@ -297,7 +297,11 @@ impl TreeComponent<Vec<i64>> for LowPriorityComponentForTest {
         lock_host: bool,
     ) {
         assert!(!lock_host);
+<<<<<<< HEAD
         assert!(params.swa_uuid_for_lock.is_some());
+=======
+        assert!(params.component_lock_uuids[&(SWA.idx() as u8)].is_some());
+>>>>>>> upstream/main
         panic!("low-priority release dispatched");
     }
 }
@@ -639,7 +643,11 @@ fn dec_swa_lock_only_dispatches_lower_priority_releases() {
     let _ = tc.dec_swa_lock_only(
         tc.arena.node(root).id,
         &DecLockRefParams {
+<<<<<<< HEAD
             swa_uuid_for_lock: Some(7),
+=======
+            component_lock_uuids: HashMap::from([(SWA.idx() as u8, Some(7))]),
+>>>>>>> upstream/main
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
@@ -683,11 +691,15 @@ fn dec_swa_lock_only_returns_device_frees_in_the_device_dict() {
     let mut host_frees = HashMap::new();
     tc.dec_swa_lock_only(
         tc.arena.node(a).id,
+<<<<<<< HEAD
         &DecLockRefParams {
             swa_uuid_for_lock: result.swa_uuid_for_lock,
             skipped_lock_components: ComponentSet::EMPTY,
             ..Default::default()
         },
+=======
+        &result.to_dec_params(),
+>>>>>>> upstream/main
         &mut device_frees,
         &mut host_frees,
     )
@@ -710,8 +722,13 @@ fn next_swa_uuid_counts_up_from_two() {
 #[test]
 fn inc_lock_ref_result_defaults_carry_no_uuids() {
     let result = IncLockRefResult::default();
+<<<<<<< HEAD
     assert_eq!(result.swa_uuid_for_lock, None);
     assert_eq!(result.swa_uuid_for_host_lock, None);
+=======
+    assert!(result.component_lock_uuids.is_empty());
+    assert!(result.component_host_lock_uuids.is_empty());
+>>>>>>> upstream/main
 }
 
 // A tree with the Swa stub registered and a node carrying an SWA device value.
@@ -7820,6 +7837,7 @@ fn sanity_check_reports_a_cyclic_child_map_without_hanging() {
     tc.sanity_check(&[], &[]);
 }
 
+<<<<<<< HEAD
 #[test]
 #[should_panic(expected = "host LRU mismatch")]
 fn sanity_check_detects_a_host_locked_value_missing_from_the_lru() {
@@ -7847,6 +7865,8 @@ fn sanity_check_detects_a_host_locked_value_missing_from_the_lru() {
     tc.sanity_check(&[], &[]);
 }
 
+=======
+>>>>>>> upstream/main
 // A backed-up leaf whose unlocked Swa value is host-only (no device value).
 fn host_only_aux_leaf(tc: &mut UnifiedTreeCore<Vec<i64>>) -> NodeIdx_ {
     let leaf = tc
@@ -7890,6 +7910,20 @@ fn sanity_check_detects_a_host_only_value_missing_from_the_lru() {
     tc.sanity_check(&[], &[]);
 }
 
+<<<<<<< HEAD
+=======
+// A host lock delists its node: missing from the LRU is the in-flight state.
+#[test]
+fn sanity_check_accepts_a_host_locked_value_missing_from_the_lru() {
+    let mut tc = sane_tree();
+    let leaf = host_only_aux_leaf(&mut tc);
+    tc.arena
+        .node_mut(leaf)
+        .set_lock_ref_(ValueSlotIdx::host(SWA), 1);
+    tc.sanity_check(&[], &[]);
+}
+
+>>>>>>> upstream/main
 #[test]
 #[should_panic(expected = "EvictLayer::All is not a single layer")]
 fn for_each_component_lru_rejects_the_all_layer() {
@@ -8543,12 +8577,16 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                 let lock = tc
                     .inc_lock_ref(anchor, ComponentSet::EMPTY)
                     .expect("live match anchor");
+<<<<<<< HEAD
                 let params = DecLockRefParams {
                     node_id: None,
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
                     skipped_lock_components: lock.skipped_lock_components,
                 };
+=======
+                let params = lock.to_dec_params();
+>>>>>>> upstream/main
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }
@@ -8567,12 +8605,16 @@ fn run_random_op_sequence(mut tc: UnifiedTreeCore<Vec<i64>>, page: usize, mamba:
                     &mut mamba_next,
                     mamba,
                 ));
+<<<<<<< HEAD
                 let params = DecLockRefParams {
                     node_id: None,
                     swa_uuid_for_lock: lock.swa_uuid_for_lock,
                     swa_uuid_for_host_lock: lock.swa_uuid_for_host_lock,
                     skipped_lock_components: lock.skipped_lock_components,
                 };
+=======
+                let params = lock.to_dec_params();
+>>>>>>> upstream/main
                 tc.dec_lock_ref(anchor, &params, /* skip_swa = */ false)
                     .expect("live match anchor");
             }

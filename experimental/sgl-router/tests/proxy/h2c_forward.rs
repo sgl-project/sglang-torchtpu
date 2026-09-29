@@ -72,6 +72,10 @@ async fn h2c_client_reaches_http2_only_worker() {
             "/v1/chat/completions",
             &axum::http::HeaderMap::new(),
             Bytes::from_static(b"{}"),
+<<<<<<< HEAD
+=======
+            None,
+>>>>>>> upstream/main
         )
         .await
         .expect("h2c client must reach an HTTP/2-only worker");
@@ -96,6 +100,10 @@ async fn http1_client_cannot_reach_http2_only_worker() {
             "/v1/chat/completions",
             &axum::http::HeaderMap::new(),
             Bytes::from_static(b"{}"),
+<<<<<<< HEAD
+=======
+            None,
+>>>>>>> upstream/main
         )
         .await;
     assert!(
@@ -164,10 +172,18 @@ async fn h2c_client_streams_sse_from_http2_only_worker() {
             &axum::http::HeaderMap::new(),
             Bytes::from_static(b"{}"),
             None,
+<<<<<<< HEAD
+=======
+            None,
+>>>>>>> upstream/main
             Some(Box::new(move || {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })),
             None,
+<<<<<<< HEAD
+=======
+            None,
+>>>>>>> upstream/main
         )
         .await
         .expect("h2c client must stream from an HTTP/2-only worker");

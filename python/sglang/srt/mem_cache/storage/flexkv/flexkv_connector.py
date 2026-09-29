@@ -586,6 +586,7 @@ class FlexKVConnector:
         if self._sync_ctx.needs_sync:
             completed_handles = self._sync_ctx.scatter(completed_handles)
         return completed_handles
+<<<<<<< HEAD
 
     def wait_store(self, handle: CacheRequestHandle, timeout: float = 30.0) -> bool:
         """Block until a single store task identified by ``handle`` finishes."""
@@ -602,6 +603,8 @@ class FlexKVConnector:
         return (
             fkv_task_id in resp and resp[fkv_task_id].status == KVResponseStatus.SUCCESS
         )
+=======
+>>>>>>> upstream/main
 
     # ------------------------------------------------------------------
     # Public API — prefetch

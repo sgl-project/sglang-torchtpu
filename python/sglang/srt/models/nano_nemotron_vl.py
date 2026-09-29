@@ -16,6 +16,10 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/nano_nemotron_vl.py
 
 import logging
+<<<<<<< HEAD
+=======
+from array import array
+>>>>>>> upstream/main
 from collections import deque
 from typing import Iterable
 
@@ -116,7 +120,7 @@ class NemotronH_Nano_VL_V2(EVS):
 
         self.config = config
 
-    def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         im_start_id: int = mm_inputs.im_start_id
         im_end_id: int = mm_inputs.im_end_id
 

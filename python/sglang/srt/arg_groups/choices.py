@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """Enumerated choices shared by the config field declarations.
 
 These lived in ``server_args.py`` beside the fields that name them. The fields
@@ -5,6 +6,9 @@ moved to ``arg_groups/fields/``, and ``server_args`` imports the field modules,
 so the lists cannot stay there without a cycle. ``server_args`` re-exports them
 for the handful of modules that import them from their old home.
 """
+=======
+"""Shared config choices, re-exported by server_args for plugin compatibility."""
+>>>>>>> upstream/main
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -96,11 +100,14 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+<<<<<<< HEAD
     # TPU specific
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
+=======
+>>>>>>> upstream/main
     # Other platforms
     "intel_amx",
     "ascend",
@@ -116,11 +123,14 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "triton",
     "ascend",
     "trtllm_mha",
+<<<<<<< HEAD
     "torch_native",
     "pallas_tpu_flash",
     "pallas_tpu_rpa_v3",
     "pallas_tpu_rpa_batched",
     "pallas_tpu_mla",
+=======
+>>>>>>> upstream/main
     "intel_xpu",
 ]
 
@@ -137,8 +147,11 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake",
     "nixl",
     "ascend",
+<<<<<<< HEAD
     "tpu",
     "raiden",
+=======
+>>>>>>> upstream/main
     "fake",
     "mori",
     "mooncake_tcp",
@@ -146,7 +159,11 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
+<<<<<<< HEAD
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "tpu"}
+=======
+SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
+>>>>>>> upstream/main
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -166,8 +183,11 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "humming",
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+<<<<<<< HEAD
     "pallas_tpu",
     "pallas_tpu_fused_rs",
+=======
+>>>>>>> upstream/main
     "megamoe",
     "intel_xpu",
 ]

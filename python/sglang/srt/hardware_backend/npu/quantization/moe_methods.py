@@ -282,6 +282,19 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     def __init__(self, dynamic_quant_kwargs=_DEFAULT_DYNAMIC_QUANT):
         super().__init__(quant_config=None)
         self.dynamic_quant_kwargs = dynamic_quant_kwargs
+<<<<<<< HEAD
+=======
+        # Fused gmm1 (matmul + swiglu + requant in one aclnn kernel). The v2 op
+        # accepts FP4 weights via weight_scale/weight_dtype — verified on A5
+        # (llm/probe_mxfp4_gmm_swiglu_quant.py: same numerics as the unfused
+        # chain modulo the output fp8 requant, which the unfused chain also
+        # applies before gmm2).
+        self.use_fused_gmm1 = True
+        self.fused_matmul = GroupedMatmulSwigluQuant()
+        self.hidden_states_quantizer = HiddenStatesDynamicQuant(
+            quant_dtype=torch.float8_e4m3fn
+        )
+>>>>>>> upstream/main
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -298,10 +311,17 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             weight.data, weight_scale.data
         )
 
-        # The refactored NPU dispatchers currently support BF16 and INT8.
-        # Keep dispatch in BF16 and quantize to MXFP8 immediately before GMM.
-        if weight_prefix == "w13":
-            self._set_dispatcher_output_dtype(layer, "bf16")
+        # A5 DeepEP low-latency dispatch quantizes the valid received rows to
+        # MXFP8 and returns the matching E8M0 block scales.  Keep normal mode
+        # in BF16 because A5 MXFP8 normal dispatch is intranode-only; this also
+        # preserves multi-node prefill when ``deepep-mode=auto``.
+        if weight_prefix == "w13" and hasattr(layer, "dispatcher"):
+            layer.dispatcher.set_quant_config(
+                {
+                    "normal_dispatcher_output_dtype": "bf16",
+                    "low_latency_dispatcher_output_dtype": "mxfp8",
+                }
+            )
 
     def apply(
         self,
@@ -314,6 +334,8 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
         group_list_type: int,
     ) -> torch.Tensor:
         if pertoken_scale is not None:
+<<<<<<< HEAD
+=======
             pertoken_scale = pertoken_scale.reshape(
                 hidden_states.shape[0], hidden_states.shape[1] // 64, 2
             )
@@ -331,6 +353,74 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             group_list=expert_tokens,
             output_dtype=output_dtype,
             dynamic_quant_kwargs=dynamic_quant_kwargs,
+        )
+
+    def apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: torch.Tensor,
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """gmm1 + swiglu + requant in one kernel (fused MXFP4 path).
+
+        Mirrors NPUMXFP8MoEMethod.apply_fused_gmm1_swiglu but passes the FP4
+        weight dtype and the e8m0 weight_scale. Returns (e4m3 activations,
+        e8m0 block scale) ready for the w2 gmm.
+
+        The dispatcher hands over BF16 (see process_weights_after_loading), so
+        pertoken_scale is normally None and the activation quant happens here.
+        """
+        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
+        if fp4_dtype is None:
+            raise RuntimeError("NPU W4A8 MXFP MoE requires float4 support.")
+        e8m0_dtype = _require_e8m0_dtype()
+
+        if pertoken_scale is None:
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        else:
+            # flat [T, K//32] -> pair form [T, K//64, 2]; identity if already
+            # pair-split.
+>>>>>>> upstream/main
+            pertoken_scale = pertoken_scale.reshape(
+                hidden_states.shape[0], hidden_states.shape[1] // 64, 2
+            )
+
+<<<<<<< HEAD
+        dynamic_quant_kwargs = self.dynamic_quant_kwargs
+        if dynamic_quant_kwargs is _DEFAULT_DYNAMIC_QUANT:
+            dynamic_quant_kwargs = {"dst_type": torch.float8_e4m3fn}
+
+        return w4a8_mxfp_gmm(
+            input=hidden_states,
+            input_scale=pertoken_scale,
+            weight=getattr(quant_info, f"{weight_prefix}_weight"),
+            weight_scale=getattr(quant_info, f"{weight_prefix}_weight_scale"),
+            group_list_type=group_list_type,
+            group_list=expert_tokens,
+            output_dtype=output_dtype,
+            dynamic_quant_kwargs=dynamic_quant_kwargs,
+=======
+        return self.fused_matmul.forward(
+            quant_info,
+            "w13",
+            hidden_states,
+            expert_tokens.to(torch.int64),
+            group_list_type=group_list_type,
+            transposed=True,
+            weight_scale=[quant_info.w13_weight_scale],
+            x_scale=pertoken_scale,
+            dequant_mode=2,
+            quant_mode=2,
+            dequant_dtype=torch.float32,
+            quant_dtype=torch.float8_e4m3fn,
+            # e4m3 is implicit for x; FP4 must be passed for the weight.
+            x_dtype=None,
+            weight_dtype=fp4_dtype,
+            weight_scale_dtype=e8m0_dtype,
+            x_scale_dtype=e8m0_dtype,
+>>>>>>> upstream/main
         )
 
 

@@ -436,11 +436,19 @@ class EncoderPreprocessor:
         vr,
         video_config,
         *,
+<<<<<<< HEAD
         tp_rank: int,
         tp_size: int,
         video_processor_kwargs: dict,
         precomputed_indices: Optional[List[int]] = None,
     ):
+=======
+        video_processor_kwargs: dict,
+        precomputed_indices: Optional[List[int]] = None,
+    ):
+        parallel = get_parallel()
+        tp_rank, tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
+>>>>>>> upstream/main
         video_config = video_config or {}
         video_fps = vr.avg_fps
         duration = len(vr) / video_fps if video_fps else 0
@@ -596,8 +604,11 @@ class EncoderPreprocessor:
                     result = await self._dp_sharded_decode_single_video(
                         video_items[0],
                         video_configs[0],
+<<<<<<< HEAD
                         tp_rank=parallel.attn_tp_rank,
                         tp_size=tp_size,
+=======
+>>>>>>> upstream/main
                         video_processor_kwargs=video_processor_kwargs,
                         precomputed_indices=sampled,
                     )

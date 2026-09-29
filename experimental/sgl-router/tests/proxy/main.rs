@@ -23,6 +23,10 @@ mod pd_bootstrap_injection;
 mod pd_pool_isolation;
 mod pd_protocol_binding;
 mod radix_tree_routing;
+<<<<<<< HEAD
+=======
+mod reorg_launch;
+>>>>>>> upstream/main
 mod roundrobin_input_ids;
 mod sampling_overrides;
 mod shared_prefill_admission;

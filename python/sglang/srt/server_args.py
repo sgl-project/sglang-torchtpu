@@ -11,25 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Server argument declarations, resolution, and CLI registration.
-
-Keep this file in the following top-level order:
-
-1. Imports and the module logger.
-2. Public extension-point choice lists, with each legacy ``add_*`` alias
-   immediately below the choice list it extends.
-3. Shared (non-extensible) choice lists, scalar defaults, and deprecated
-   aliases. A choice list used by only one field belongs inline in that field.
-4. ``ServerArgs``: fields first, then resolution/validation helpers, then CLI
-   registration and small query helpers. New resolution steps are appended at
-   the end of ``arg_groups.pipeline.run_resolution_pipeline``, immediately
-   marked complete, unless an earlier dependency is documented explicitly.
-5. Module-level ``ServerArgs`` construction/runtime shims.
-6. Networking constants and ``PortArgs``.
-
-Model- or vendor-specific utilities belong in ``sglang.srt.arg_groups`` (or
-their owning subsystem), not before ``ServerArgs`` in this module.
-"""
+"""Server argument construction, resolution, CLI registration, and network ports."""
 
 from __future__ import annotations
 
@@ -37,14 +19,25 @@ import argparse
 import copy
 import dataclasses
 import functools
+<<<<<<< HEAD
+=======
+import importlib
+>>>>>>> upstream/main
 import logging
+import sys
 import tempfile
 import uuid
 from typing import Any, NoReturn
+<<<<<<< HEAD
 
 import msgspec
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+=======
+
+import msgspec
+
+>>>>>>> upstream/main
 from sglang.srt.arg_groups.arg_utils import (
     add_cli_args_from_dataclass,
     is_record,
@@ -60,14 +53,18 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
+<<<<<<< HEAD
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+=======
+>>>>>>> upstream/main
 from sglang.srt.runtime_context import get_platform, publish
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
 logger = logging.getLogger(__name__)
 
+<<<<<<< HEAD
 # Re-exported. These were importable from this module while the field
 # declarations that used them lived here; the declarations moved to
 # `arg_groups/fields/` but out-of-tree code -- and `tokenizer_control_mixin`
@@ -78,6 +75,42 @@ from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 # Re-exported for out-of-tree plugins, which have always reached these
 # through `sglang.srt.server_args`. The lists and their adders moved to
 # `arg_groups/choices.py` with the field declarations that name them.
+=======
+
+def _reasoning_parser_choices():
+    # Importing the registry here costs seconds in every process that parses
+    # arguments; a plugin that registered a parser has already imported it.
+    module = sys.modules.get("sglang.srt.parser.reasoning_parser")
+    if module is not None:
+        return list(module.ReasoningParser.DetectorMap)
+    from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+    return list(REASONING_PARSER_NAMES)
+
+
+def _tool_call_parser_choices():
+    module = sys.modules.get("sglang.srt.function_call.function_call_parser")
+    if module is not None:
+        return list(module.FunctionCallParser.ToolCallParserEnum)
+    from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
+
+    return list(TOOL_CALL_PARSER_NAMES)
+
+
+def _real_kv_hash_modes():
+    # Lazy: this pulls the whole sglang.kernels package (~2 s) into every
+    # process that imports server_args, most of which never use it.
+    from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+
+    return list(RealKvHashMode)
+
+
+# Compatibility re-exports for callers importing through server_args.
+from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
+from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
+
+# Public choice lists and plugin registration helpers.
+>>>>>>> upstream/main
 from sglang.srt.arg_groups.choices import (  # noqa: F401
     ATTENTION_BACKEND_CHOICES,
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
@@ -171,6 +204,7 @@ from sglang.srt.utils.common import (  # noqa: F401
     json_list_type,
     nullable_str,
 )
+<<<<<<< HEAD
 
 
 def _plain(value: Any) -> Any:
@@ -192,9 +226,47 @@ def _plain(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-class ServerArgs:
-    """Server-wide configuration for SGLang.
+=======
 
+# Re-exported like the imports above, but resolved on first use: importing them
+# eagerly is what the choices helpers avoid, and most processes never read them.
+_LAZY_REEXPORTS = {
+    "FunctionCallParser": "sglang.srt.function_call.function_call_parser",
+    "ReasoningParser": "sglang.srt.parser.reasoning_parser",
+    "RealKvHashMode": "sglang.kernels.ops.kv_canary.consts",
+}
+
+
+def __getattr__(name: str) -> Any:
+    module_name = _LAZY_REEXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def _plain(value: Any) -> Any:
+    """Convert nested Structs and dataclasses to dicts, copying all values."""
+    if not isinstance(value, type) and is_record(value):
+        return {
+            field.name: _plain(getattr(value, field.name))
+            for field in record_fields(type(value))
+        }
+    if isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        return type(value)(*(_plain(item) for item in value))
+    if isinstance(value, (list, tuple)):
+        return type(value)(_plain(item) for item in value)
+    if isinstance(value, dict):
+        return type(value)((_plain(k), _plain(v)) for k, v in value.items())
+    return copy.deepcopy(value)
+
+
+>>>>>>> upstream/main
+class ServerArgs:
+    """Raw server configuration, sealed when resolution starts.
+
+<<<<<<< HEAD
     Adding new arguments
     --------------------
     1. **Place the field in the right section.** Arguments are grouped by
@@ -238,29 +310,23 @@ class ServerArgs:
     is one readable call and not a property of a base-class list. The order
     they appear in is ``POSITIONAL_FIELD_ORDER``, not the order the namespaces
     are listed in: field order *is* the positional constructor signature.
+=======
+    Add fields to the matching namespace in ``arg_groups/fields/`` using
+    ``A[T, help]`` or ``A[T, Arg(...)]``; see ``arg_utils.Arg`` for CLI metadata.
+    Only dynamic choices, deprecated flags, and ``--config`` need manual
+    registration in ``add_cli_args``. ``POSITIONAL_FIELD_ORDER`` preserves
+    the positional constructor signature when these namespaces are assembled.
+>>>>>>> upstream/main
     """
 
     def __post_init__(self):
-        """Construction leaves the record at what the caller asked for.
-
-        Resolution is a separate act, entered through ``resolve_once``: the
-        launcher runs it once per engine, and every publishing process asks the
-        gate on the way in. A record that is only constructed -- a fixture, a
-        config being inspected, one being handed to a subprocess that will
-        resolve it itself -- stays raw.
-        """
+        """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
 
     def resolve_once(self) -> None:
-        """Run the resolution pipeline, unless this record has been through it.
+        """Resolve once, preserving declarations across pickling to child processes.
 
-        Resolution is a deterministic function of the raw inputs -- two records
-        built from the same arguments declare the same things -- but the
-        handlers do not survive a second pass over their own output: DP
-        attention halves ``chunked_prefill_size`` again on every re-entry.
-
-        The publishing entry of every process calls this. In a child the record
-        arrived by pickle and brought its declarations along, so the child has
-        nothing left to derive and projects what the parent decided.
+        Handlers are not idempotent over their own output. A failed resolution
+        cannot be retried on the same record.
         """
         if getattr(self, "_resolution_finished", False):
             return
@@ -273,26 +339,32 @@ class ServerArgs:
             )
         from sglang.srt.arg_groups.pipeline import run_resolution_pipeline
 
+<<<<<<< HEAD
         # Sealed for the duration, not just afterwards: everything below this
         # line reads the input and declares against it. No exceptions -- even a
         # resolver from outside this tree assigns onto a stand-in, not here.
+=======
+>>>>>>> upstream/main
         self._input_frozen = True
         try:
             run_resolution_pipeline(self)
         except BaseException:
-            # The handlers that ran already declared, and they are not
-            # idempotent over their own output.
             self._resolution_failed = True
             raise
         finally:
             self._input_frozen = False
+<<<<<<< HEAD
         # Set here too, because the dummy/absent-model path returns before the
         # end of the pipeline that normally sets it: the gate is about whether
         # the handlers ran, not how far they got.
+=======
+        # Also mark the dummy/absent-model path, which returns early from the pipeline.
+>>>>>>> upstream/main
         self._resolution_finished = True
 
     @property
     def launch_command(self) -> str | None:
+<<<<<<< HEAD
         """How this record was created, verbatim.
 
         `resolved_dict` answers with what resolution decided; this answers with
@@ -318,18 +390,28 @@ class ServerArgs:
         the way `asdict` expands them; the private resolution bookkeeping and the
         `model_config` memo are not fields and do not appear.
         """
+=======
+        """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
+        return getattr(self, "_launch_command", None)
+
+    def resolved_dict(self) -> dict[str, Any]:
+        """Serialize resolved field values, expanding nested records and excluding bookkeeping."""
+>>>>>>> upstream/main
 
         return {
             field.name: _plain(resolution_result(self, field.name))
             for field in record_fields(type(self))
         }
 
+<<<<<<< HEAD
     # ------------------------------------------------------------------
     # CUDA graph configuration resolution
     # ------------------------------------------------------------------
 
     # ===== END TO BE REFACTORED ====
 
+=======
+>>>>>>> upstream/main
     LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
@@ -341,10 +423,12 @@ class ServerArgs:
     # _handle_page_major_kv_layout); the model-family gate is enforced at pool
     # construction in model_runner_kv_cache_mixin._init_pools.
 
+    def _unified_memory_pd_transfer_backends(self) -> set[str]:
+        return {"mooncake"}
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
-        # Auto-derived from Annotated[..., Arg(...)] field metadata.
         add_cli_args_from_dataclass(parser, ServerArgs)
 
         # --- Fields with dynamic choices (computed at add_cli_args time) ---
@@ -359,7 +443,7 @@ class ServerArgs:
             help="Choose the kernels for sampling layers.",
         )
 
-        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
+        reasoning_parser_choices = _reasoning_parser_choices()
         parser.add_argument(
             "--reasoning-parser",
             type=str,
@@ -369,7 +453,7 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
+        tool_call_parser_choices = _tool_call_parser_choices()
         parser.add_argument(
             "--tool-call-parser",
             type=str,
@@ -383,7 +467,11 @@ class ServerArgs:
             "--kv-canary-real-data",
             type=str,
             default=_declared_default("kv_canary_real_data"),
+<<<<<<< HEAD
             choices=[m.name.lower() for m in RealKvHashMode],
+=======
+            choices=[m.name.lower() for m in _real_kv_hash_modes()],
+>>>>>>> upstream/main
             help=(
                 "Check the real KV-cache in the canary. "
                 "'none' (default) disables the feature. "
@@ -493,6 +581,7 @@ class ServerArgs:
         return self.url(port=self.engine_info_bootstrap_port)
 
     def __setattr__(self, name, value):
+<<<<<<< HEAD
         # The record holds the operator's input. It is writable while the
         # caller is still assembling it and sealed from the moment resolution
         # starts: a resolver that writes a field would overwrite the very thing
@@ -504,6 +593,9 @@ class ServerArgs:
         # -- which resolution writes on purpose. A *field* spelled that way is
         # still configuration, so the test cannot be on spelling alone or that
         # one leaf stays writable on a read-only record.
+=======
+        # Seal configuration fields, including underscore-prefixed ones, but allow bookkeeping.
+>>>>>>> upstream/main
         if not name.startswith("_") or name in _underscore_field_names():
             if getattr(self, "_input_frozen", False):
                 raise AttributeError(
@@ -527,6 +619,7 @@ class ServerArgs:
         msgspec.Struct.__setattr__(self, name, value)
 
     def __reduce__(self):
+<<<<<<< HEAD
         """Pickle the record *and* what resolution left on it.
 
         A Struct pickles its fields; everything else lives in the `dict=True`
@@ -535,6 +628,11 @@ class ServerArgs:
         reason a child can publish what its parent decided without resolving
         again. Reconstruction restores the fields first and the bookkeeping
         after, so the seal is re-armed only once the fields are in place.
+=======
+        """Preserve resolution bookkeeping as well as Struct fields when pickling.
+
+        Restore fields before bookkeeping so the write seal is re-armed last.
+>>>>>>> upstream/main
         """
         return (
             _rebuild_server_args,
@@ -552,12 +650,16 @@ class ServerArgs:
         return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
 
+<<<<<<< HEAD
 # The namespaces whose *input* fields make up the record. A namespace declares
 # its input and derived fields side by side; only the input half is collected,
 # which is why this is a call and not a base-class list.
 #
 # A set, not an order: `collect_input_fields` orders by `field_order.py`, which
 # is what keeps the positional constructor stable.
+=======
+# Collect input fields only; field_order.py preserves positional argument order.
+>>>>>>> upstream/main
 
 
 _INPUT_NAMESPACES = [
@@ -586,6 +688,7 @@ _INPUT_NAMESPACES = [
 
 _annotations, _defaults, _namespaces = collect_input_fields(_INPUT_NAMESPACES)
 ServerArgs.__annotations__ = {**_annotations, **ServerArgs.__annotations__}
+<<<<<<< HEAD
 # The assembled record has no base classes, so it carries the map the classes
 # used to answer through their `_NS_PATH`.
 ServerArgs._NS_BY_FIELD = _namespaces
@@ -596,6 +699,11 @@ ServerArgs._NAMESPACES = _INPUT_NAMESPACES
 # snapshot, the declaration stash, the resolution flags, the memo slots. A
 # Struct has no `__dict__` without it, and those are exactly the underscore
 # names `_underscore_field_names()` is careful *not* to include.
+=======
+ServerArgs._NS_BY_FIELD = _namespaces
+ServerArgs._NAMESPACES = _INPUT_NAMESPACES
+# dict=True retains resolution bookkeeping and memoized values outside the fields.
+>>>>>>> upstream/main
 ServerArgs = msgspec.defstruct(
     "ServerArgs",
     [
@@ -661,14 +769,7 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
 
 @functools.lru_cache(maxsize=1)
 def _underscore_field_names() -> frozenset:
-    """Real dataclass fields whose names start with an underscore.
-
-    The read-only guard exempts underscore names because they are the record's
-    own bookkeeping (the stash, the flags, the cache keys). A *field* that
-    happens to start with an underscore is still resolved configuration --
-    `_speculative_draft_quantization_explicitly_set` is one -- and exempting it
-    by spelling would leave exactly one leaf writable on a read-only record.
-    """
+    """Configuration fields that must stay sealed despite their underscore prefix."""
     return frozenset(
         field.name for field in record_fields(ServerArgs) if field.name.startswith("_")
     )
@@ -695,6 +796,7 @@ def set_global_server_args_for_tokenizer(server_args: ServerArgs):
 
 
 def get_global_server_args() -> NoReturn:
+<<<<<<< HEAD
     """Retired. It raises, because what it used to return is the problem: the
     record answers with the operator's *input*, so a caller reading a field
     resolution decided got a stale value and no error.
@@ -704,6 +806,9 @@ def get_global_server_args() -> NoReturn:
     checker rejects the call rather than accepting the attribute access after
     it. The message lives once, in the exception.
     """
+=======
+    """Retired accessor retained to raise a migration error for existing imports."""
+>>>>>>> upstream/main
     raise RuntimeError(
         "get_global_server_args() is retired. Read the value that is in effect "
         "from its namespace bag -- `get_exec().kernel.attention_backend`, "
@@ -721,6 +826,7 @@ def _rebuild_server_args(cls, fields, bookkeeping):
 
 
 def _declared_default(name: str):
+<<<<<<< HEAD
     """The declared default of a field, for a manual `add_argument`.
 
     `ServerArgs.<field>` used to answer with it. The record is a Struct now, so
@@ -728,6 +834,9 @@ def _declared_default(name: str):
     happily stores as the default, and the first reader gets a
     `member_descriptor` where it expected a string.
     """
+=======
+    """Return a field default; Struct class attributes are slot descriptors."""
+>>>>>>> upstream/main
     return next(
         field.default
         for field in msgspec.structs.fields(ServerArgs)

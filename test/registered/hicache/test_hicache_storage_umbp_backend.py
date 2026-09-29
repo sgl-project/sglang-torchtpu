@@ -126,7 +126,10 @@ class TestHiCacheStorageUMBPBackend(CustomTestCase):
             {
                 "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
+<<<<<<< HEAD
                 "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+=======
+>>>>>>> upstream/main
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
                 "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
                 "SGLANG_USE_ROCM700A": "0",

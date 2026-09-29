@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+<<<<<<< HEAD
 from sglang.srt.runtime_context import get_context, get_disagg
+=======
+from sglang.srt.runtime_context import get_context, get_device, get_disagg
+>>>>>>> upstream/main
 from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
@@ -95,7 +99,11 @@ def handle_pd_role_switch(
             )
         try:
             available_graph_gb = get_available_gpu_memory(
+<<<<<<< HEAD
                 scheduler.device, scheduler.ps.gpu_id
+=======
+                scheduler.device, get_device().gpu_id
+>>>>>>> upstream/main
             )
         except Exception as e:
             return _fail(

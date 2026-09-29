@@ -9,7 +9,11 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from sglang.srt.environ import envs
+<<<<<<< HEAD
 from sglang.srt.runtime_context import get_context
+=======
+from sglang.srt.runtime_context import get_context, get_parallel
+>>>>>>> upstream/main
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -201,10 +205,17 @@ class TestRegisterToBootstrap(CustomTestCase):
         self.assertIn("10.0.0.1", url_used)
 
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
+<<<<<<< HEAD
     @patch("sglang.srt.disaggregation.common.conn.get_world_group")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
         self, mock_world_group, mock_put
     ):
+=======
+    def test_rust_attention_dp_replicates_complete_topology_across_hosts(
+        self, mock_put
+    ):
+        mock_world_group = MagicMock()
+>>>>>>> upstream/main
         success_resp = MagicMock()
         success_resp.status_code = 200
         mock_put.return_value = success_resp
@@ -228,9 +239,18 @@ class TestRegisterToBootstrap(CustomTestCase):
                 for dp_rank, tp_rank, host, rank_port, _ in schedulers
             ]
 
+<<<<<<< HEAD
         mock_world_group.return_value.all_gather_object.side_effect = gather_topology
 
         with envs.SGLANG_RUST_SERVER.override(True):
+=======
+        mock_world_group.all_gather_object.side_effect = gather_topology
+
+        with (
+            get_parallel().override(world_group=mock_world_group),
+            envs.SGLANG_RUST_SERVER.override(True),
+        ):
+>>>>>>> upstream/main
             for dp_rank, tp_rank, local_ip, _, rust_http_port in schedulers:
                 manager = self._make_manager()
                 manager.attn_dp_size = 2
@@ -275,7 +295,11 @@ class TestRegisterToBootstrap(CustomTestCase):
                     gather_call.args[0]["attn_dp_rank"],
                     gather_call.args[0]["attn_tp_rank"],
                 )
+<<<<<<< HEAD
                 for gather_call in mock_world_group.return_value.all_gather_object.call_args_list
+=======
+                for gather_call in mock_world_group.all_gather_object.call_args_list
+>>>>>>> upstream/main
             ],
             [(dp, tp) for dp, tp, _, _, _ in schedulers],
         )

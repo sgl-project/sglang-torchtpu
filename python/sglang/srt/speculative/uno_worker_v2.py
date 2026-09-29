@@ -46,7 +46,10 @@ from sglang.srt.utils.common import (
 )
 
 if TYPE_CHECKING:
+<<<<<<< HEAD
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+=======
+>>>>>>> upstream/main
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.server_args import ServerArgs
@@ -62,7 +65,10 @@ class UnoWorkerV2(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
+<<<<<<< HEAD
         ps: ParallelState,
+=======
+>>>>>>> upstream/main
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -70,7 +76,10 @@ class UnoWorkerV2(BaseSpecWorker):
 
         self.server_args = server_args
         self.gpu_id = gpu_id
+<<<<<<< HEAD
         self.ps = ps
+=======
+>>>>>>> upstream/main
         self.nccl_port = nccl_port
 
         self._target_worker = target_worker
@@ -789,6 +798,7 @@ class UnoWorkerV2(BaseSpecWorker):
             f"UNO expected an EXTEND or DECODE batch, got {batch.forward_mode}."
         )
 
+<<<<<<< HEAD
     def update_weights_from_disk(self, recv_req):
         # The scheduler updates the target worker before calling the spec worker.
         return True, "UNO has no separate draft weights."
@@ -801,6 +811,8 @@ class UnoWorkerV2(BaseSpecWorker):
         # This update route selects the spec worker instead of updating both.
         return self.target_worker.update_weights_from_tensor(recv_req)
 
+=======
+>>>>>>> upstream/main
     @contextlib.contextmanager
     def _bind_uno_draft_runtime(self):
         target_attn_backend = self.model_runner.attn_backend

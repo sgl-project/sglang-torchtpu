@@ -104,6 +104,7 @@ def test_flux2_qkv_epilogue_is_bit_exact(
     )
 
 
+<<<<<<< HEAD
 def test_flux2_qkv_epilogue_rejects_compile() -> None:
     tensor = torch.empty((1, 1, 1, HEAD_DIM), device=DEVICE, dtype=DTYPE)
     weight = torch.empty((HEAD_DIM,), device=DEVICE, dtype=DTYPE)
@@ -146,6 +147,22 @@ def test_flux2_qkv_epilogue_rejects_cuda_graph_capture() -> None:
                 weight,
                 weight,
                 weight,
+=======
+@pytest.mark.parametrize(
+    "guard",
+    ["torch.compiler.is_compiling", "torch.cuda.is_current_stream_capturing"],
+    ids=["compile", "capture"],
+)
+def test_flux2_qkv_epilogue_rejects_unsafe_execution(guard) -> None:
+    tensor = torch.empty((1, 1, 1, HEAD_DIM), device=DEVICE, dtype=DTYPE)
+    weight = torch.empty((HEAD_DIM,), device=DEVICE, dtype=DTYPE)
+    cache = torch.empty((2, HEAD_DIM), device=DEVICE, dtype=torch.float32)
+    with patch(guard, return_value=True):
+        assert (
+            try_fused_flux2_qkv_epilogue(
+                *([tensor] * 6),
+                *([weight] * 4),
+>>>>>>> upstream/main
                 cache,
                 1e-6,
                 1e-6,

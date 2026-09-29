@@ -20,10 +20,17 @@ def enabled() -> bool:
 
 def _ops():
     try:
+<<<<<<< HEAD
         from sglang.kernels.ops.kimi_k3.flydsl.source import load_module
 
         module = load_module(
             "sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode",
+=======
+        from sglang.kernels.ops.attention.kda_flydsl.source import load_module
+
+        module = load_module(
+            "sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode",
+>>>>>>> upstream/main
             "aiter.ops.flydsl.kimi_k3_kda_decode",
         )
     except (ImportError, ModuleNotFoundError):

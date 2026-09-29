@@ -28,13 +28,13 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.srt.distributed import (
-    get_pp_group,
-    tensor_model_parallel_all_reduce,
-)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import (
+    LayerCommunicator,
+    LayerFacts,
+    reduce_output,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -47,7 +47,11 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+<<<<<<< HEAD
     should_skip_post_experts_all_reduce,
+=======
+    reduce_moe_output,
+>>>>>>> upstream/main
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -77,7 +81,6 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
-    get_forward,
     get_parallel,
     get_platform,
 )
@@ -338,10 +341,14 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
+<<<<<<< HEAD
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+=======
+        final_hidden_states = reduce_moe_output(final_hidden_states)
+>>>>>>> upstream/main
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
         # padded width as `origin_hidden_states_dim` and skipped its own
@@ -571,13 +578,12 @@ class GptOssDecoderLayer(nn.Module):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
 
-        # GptOss all layers are sparse and have no nextn now
+        # GptOss all layers are sparse
         self.is_layer_sparse = True
-        self.is_nextn = False
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
-        self.layer_scatter_modes = LayerScatterModes.init_new(
+        self.layer_facts = LayerFacts.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
@@ -614,13 +620,16 @@ class GptOssDecoderLayer(nn.Module):
         )
 
         self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
+            layer_facts=self.layer_facts,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+<<<<<<< HEAD
             is_last_layer=(
                 self.is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
             ),
+=======
+>>>>>>> upstream/main
         )
         self._is_layer_to_capture = False
 
@@ -652,6 +661,7 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+<<<<<<< HEAD
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -666,15 +676,11 @@ class GptOssDecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
+=======
+        with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
+>>>>>>> upstream/main
             hidden_states = self.mlp(hidden_states, forward_batch)
-
-        if fuse_mlp_allreduce:
-            hidden_states._sglang_needs_allreduce_fusion = True
-
-        if not fuse_mlp_allreduce:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
@@ -690,7 +696,7 @@ class GptOssModel(nn.Module):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         if _is_npu:
             config.hidden_act = "npu_swiglu_oai"
@@ -772,6 +778,20 @@ class GptOssModel(nn.Module):
                         else None
                     ),
                 )
+<<<<<<< HEAD
+=======
+                if i + 1 in self.layers_to_capture:
+                    hidden_states = reduce_output(hidden_states)
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
+        last_layer = self.layers[self.end_layer - 1]
+        hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
+            hidden_states, residual, forward_batch
+        )
+>>>>>>> upstream/main
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -808,7 +828,7 @@ class GptOssForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         self.model = GptOssModel(
@@ -993,7 +1013,11 @@ class GptOssForCausalLM(nn.Module):
                     normal_weights.append((name, _own_if_runai_streamed(weight)))
 
         mxfp4_loaded_params = self._load_mxfp4_experts_weights(experts(weights))
+<<<<<<< HEAD
         normal_loaded_params = self._load_normal_weights(
+=======
+        self._load_normal_weights(
+>>>>>>> upstream/main
             normal_weights,
             is_nextn=is_nextn,
             weight_name_mapping=weight_name_mapping,
@@ -1055,12 +1079,15 @@ class GptOssForCausalLM(nn.Module):
         weight_device = next(iter(params_dict.values())).device
 
         for name, weight in weights:
+<<<<<<< HEAD
             layer_id = get_layer_id(name)
             if layer_id is not None and not (
                 self.start_layer <= layer_id < self.end_layer
             ):
                 # Another pipeline stage holds this layer.
                 continue
+=======
+>>>>>>> upstream/main
             weight = weight.to(weight_device)
 
             if "gate_up_proj_blocks" in name:

@@ -14,6 +14,10 @@
 """Legacy Bailing multimodal wrappers for image and video inference."""
 
 import logging
+<<<<<<< HEAD
+=======
+from array import array
+>>>>>>> upstream/main
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -21,7 +25,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+<<<<<<< HEAD
 from sglang.srt.distributed import get_pp_group
+=======
+>>>>>>> upstream/main
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.mm_utils import (
@@ -37,7 +44,11 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe import BailingMoeV2ForCausalLM
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+<<<<<<< HEAD
 from sglang.srt.runtime_context import get_mm
+=======
+from sglang.srt.runtime_context import get_mm, get_parallel
+>>>>>>> upstream/main
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
@@ -53,7 +64,11 @@ class BailingMMNativeForConditionalGeneration(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+<<<<<<< HEAD
         self.pp_group = get_pp_group()
+=======
+        self.pp_group = get_parallel().pp_group
+>>>>>>> upstream/main
         self.config = config
         self.quant_config = quant_config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
@@ -123,7 +138,11 @@ class BailingMMNativeForConditionalGeneration(nn.Module):
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
 
+<<<<<<< HEAD
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+=======
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
+>>>>>>> upstream/main
         return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def _get_vision_feature(

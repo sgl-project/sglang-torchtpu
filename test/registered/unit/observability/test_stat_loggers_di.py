@@ -3,9 +3,6 @@
 These tests cover the small, in-process pieces of the ``stat_loggers``
 dependency injection feature:
 
-* The four DI hook class attributes (``_counter_cls``/``_gauge_cls``/
-  ``_histogram_cls``/``_summary_cls``) default to ``None`` on every
-  collector, so the existing prometheus_client backend is used unchanged.
 * ``resolve_collector_class()`` returns the registered subclass when a role
   is present in ``stat_loggers`` and falls back to the default otherwise.
 * Without any subclass override, collectors instantiate the real
@@ -33,7 +30,6 @@ from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_SCHEDULER,
     STAT_LOGGER_ROLE_STORAGE,
     STAT_LOGGER_ROLE_TOKENIZER,
-    ExpertDispatchCollector,
     RadixCacheMetricsCollector,
     SchedulerMetricsCollector,
     StorageMetricsCollector,
@@ -48,6 +44,7 @@ class _BoundRecordingMetric:
     def __init__(self, metric, labels):
         self.metric = metric
         self.labels = labels
+<<<<<<< HEAD
 
     def inc(self, value=1):
         self.metric.increments.append((self.labels, value))
@@ -89,27 +86,44 @@ class _RecordingStorageMetricsCollector(StorageMetricsCollector):
 class TestCollectorClassAttrs(unittest.TestCase):
     """All five collectors expose four DI hook class attrs, all defaulting to
     None so the existing prometheus_client backend is used unchanged."""
+=======
+>>>>>>> upstream/main
 
-    def test_scheduler_collector_attrs_default_none(self):
-        self.assertIsNone(SchedulerMetricsCollector._counter_cls)
-        self.assertIsNone(SchedulerMetricsCollector._gauge_cls)
-        self.assertIsNone(SchedulerMetricsCollector._histogram_cls)
-        self.assertIsNone(SchedulerMetricsCollector._summary_cls)
+    def inc(self, value=1):
+        self.metric.increments.append((self.labels, value))
 
-    def test_tokenizer_collector_attrs_default_none(self):
-        self.assertIsNone(TokenizerMetricsCollector._counter_cls)
-        self.assertIsNone(TokenizerMetricsCollector._histogram_cls)
+    def observe(self, value):
+        self.metric.observations.append((self.labels, value))
 
-    def test_storage_collector_attrs_default_none(self):
-        self.assertIsNone(StorageMetricsCollector._counter_cls)
-        self.assertIsNone(StorageMetricsCollector._histogram_cls)
+    def set(self, value):
+        self.metric.sets.append((self.labels, value))
 
-    def test_expert_dispatch_collector_attrs_default_none(self):
-        self.assertIsNone(ExpertDispatchCollector._histogram_cls)
 
-    def test_radix_cache_collector_attrs_default_none(self):
-        self.assertIsNone(RadixCacheMetricsCollector._counter_cls)
-        self.assertIsNone(RadixCacheMetricsCollector._histogram_cls)
+class _RecordingMetric:
+    """Small prometheus_client-compatible metric that preserves labels."""
+
+    def __init__(self, *args, name=None, labelnames=(), **kwargs):
+        self.name = name if name is not None else args[0]
+        self.labelnames = tuple(labelnames)
+        self.increments = []
+        self.observations = []
+        self.sets = []
+
+    def labels(self, *values, **labels):
+        if values:
+            labels = dict(zip(self.labelnames, values, strict=True))
+        return _BoundRecordingMetric(self, labels)
+
+
+class _RecordingTokenizerMetricsCollector(TokenizerMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _gauge_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
+
+
+class _RecordingStorageMetricsCollector(StorageMetricsCollector):
+    _counter_cls = _RecordingMetric
+    _histogram_cls = _RecordingMetric
 
 
 class TestResolveCollectorClass(unittest.TestCase):

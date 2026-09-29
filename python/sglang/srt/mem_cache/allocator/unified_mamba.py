@@ -127,6 +127,14 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.mamba_allocator.available_size(),
         )
 
+<<<<<<< HEAD
+=======
+        # HiCache indexes the full sub-pool's per-layer views with kernel-facing IDs.
+        kvcache.full_kv_pool.host_transfer_translate = (
+            self.full_attn_allocator.translate_kv_loc_for_kernel
+        )
+
+>>>>>>> upstream/main
     # -- size: dynamic --
     @property
     def size(self) -> int:
@@ -307,6 +315,33 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return self.full_attn_allocator.translate_kv_loc(kv_indices.to(torch.int64))
 
+<<<<<<< HEAD
+=======
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        """Retraction backup for the FULL + mamba pair.
+
+        `Req.offload_kv_cache` hands over `req_to_token` rows, which hold
+        VIRTUAL ids here; both unified full pools index their host copy by
+        PHYSICAL ids. The mamba side is already slot-addressed and is
+        translated by the pool.
+        """
+        return self._kvcache.get_cpu_copy(
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu,
+            self.full_attn_allocator.translate_kv_loc(indices.to(torch.int64)),
+            mamba_indices=mamba_indices,
+            req_pool_index=req_pool_index,
+        )
+
+>>>>>>> upstream/main
     def _move_gate_targets(self):
         """Every member a compaction gate must cover. The mamba end is gated
         even where its state is not itself transferred: the gate is about the
@@ -322,6 +357,19 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             lazy_compaction=self.lazy_compaction,
         )
 
+<<<<<<< HEAD
+=======
+    def set_host_transfer_move_gate(self, gate: Callable[[], bool]) -> None:
+        """Block page relocation while host transfers use resolved device indices."""
+        install_move_gate(
+            self._move_gate_targets(),
+            slot="host_transfer_move_gate",
+            gate=gate,
+            feature="HiCache",
+            lazy_compaction=self.lazy_compaction,
+        )
+
+>>>>>>> upstream/main
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
 

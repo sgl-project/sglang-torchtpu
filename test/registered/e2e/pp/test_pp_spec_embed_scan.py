@@ -10,7 +10,15 @@ import torch
 from transformers import MistralConfig, PretrainedConfig
 
 from sglang.test.ci.ci_register import register_cuda_ci
+<<<<<<< HEAD
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
+=======
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    CustomTestCase,
+    publish_build_topology,
+)
+>>>>>>> upstream/main
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 
@@ -77,7 +85,12 @@ class TestDraftEmbedScan(CustomTestCase):
         init_distributed_environment(
             world_size=1, rank=0, local_rank=0, distributed_init_method="env://"
         )
+<<<<<<< HEAD
         initialize_model_parallel(tensor_model_parallel_size=1)
+=======
+        publish_build_topology(tp_size=1)
+        initialize_model_parallel()
+>>>>>>> upstream/main
         torch.set_default_dtype(torch.bfloat16)
         torch.cuda.set_device(0)
 
