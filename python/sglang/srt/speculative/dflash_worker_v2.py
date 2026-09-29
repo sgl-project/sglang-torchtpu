@@ -2,7 +2,7 @@ import logging
 import math
 import os
 from dataclasses import replace
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -22,7 +22,6 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.dflash_utils_tpu import (
-    EMPTY_TPU_DRAFT_EXTEND,
     DeviceVerifyBlockSelector,
     build_tpu_draft_extend_metadata,
     dflash_verify_argmax_torch,
@@ -80,7 +79,6 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_block_spec_info,
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
-    resolve_req_pool_indices_cpu,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -2866,6 +2864,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
 
+        # Only the Pallas RPA backend plans the draft block as an extend, so
+        # the split is TPU-only; ForwardBatch leaves the fields None elsewhere.
+        extend_split: dict[str, Any] = {}
         if _is_tpu:
             tpu_extend = build_tpu_draft_extend_metadata(
                 bs=bs,
@@ -2875,12 +2876,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                 extend_seq_lens_buf=self._draft_extend_seq_lens_buf,
             )
             draft_seq_lens = tpu_extend.seq_lens
-        else:
-            tpu_extend = EMPTY_TPU_DRAFT_EXTEND
+            extend_split = {
+                "extend_prefix_lens": tpu_extend.extend_prefix_lens,
+                "extend_seq_lens": tpu_extend.extend_seq_lens,
+                "extend_prefix_lens_cpu": tpu_extend.extend_prefix_lens_cpu,
+                "extend_seq_lens_cpu": tpu_extend.extend_seq_lens_cpu,
+                "extend_num_tokens": tpu_extend.extend_num_tokens,
+            }
 
-        req_pool_indices_cpu = resolve_req_pool_indices_cpu(
-            req_pool_indices=batch.req_pool_indices,
-            req_pool_indices_cpu=batch.req_pool_indices_cpu,
+        req_pool_indices_cpu = (
+            batch.req_pool_indices_cpu
+            if isinstance(batch.req_pool_indices_cpu, torch.Tensor)
+            else (
+                torch.tensor(
+                    batch.req_pool_indices_cpu, dtype=torch.int32, device="cpu"
+                )
+                if batch.req_pool_indices_cpu is not None
+                else batch.req_pool_indices.to("cpu", dtype=torch.int32)
+            )
         )
 
         forward_batch = ForwardBatch(
@@ -2898,11 +2911,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
-            extend_prefix_lens=tpu_extend.extend_prefix_lens,
-            extend_seq_lens=tpu_extend.extend_seq_lens,
-            extend_prefix_lens_cpu=tpu_extend.extend_prefix_lens_cpu,
-            extend_seq_lens_cpu=tpu_extend.extend_seq_lens_cpu,
-            extend_num_tokens=tpu_extend.extend_num_tokens,
+            **extend_split,
             num_token_non_padded=(
                 torch.tensor(bs * block_size, dtype=torch.int32, device=device)
                 if enable_num_token_non_padded()

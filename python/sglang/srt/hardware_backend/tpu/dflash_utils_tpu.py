@@ -10,7 +10,7 @@ choice to the device. page_aligned_decode_alloc_lens already reserves
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -28,15 +28,16 @@ from sglang.srt.hardware_backend.tpu.top_k import (
     distributed_tpu_top_k,
     supports_distributed_tpu_top_k,
 )
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class TpuDraftExtendMetadata(msgspec.Struct, frozen=True):
     """Extend split for a fixed-width draft block.
 
     The Pallas RPA backend plans the block as an extend from the host, so the
-    draft forward carries the split explicitly. Off TPU every field is None;
-    see EMPTY_TPU_DRAFT_EXTEND.
+    draft forward carries the split explicitly; it is built on TPU only.
 
     Attributes:
       seq_lens: Post-block sequence lengths, [bs] on device, dtype of the
@@ -55,9 +56,6 @@ class TpuDraftExtendMetadata(msgspec.Struct, frozen=True):
     extend_prefix_lens_cpu: Optional[list[int]] = None
     extend_seq_lens_cpu: Optional[list[int]] = None
     extend_num_tokens: Optional[int] = None
-
-
-EMPTY_TPU_DRAFT_EXTEND = TpuDraftExtendMetadata()
 
 
 def build_tpu_draft_extend_metadata(
