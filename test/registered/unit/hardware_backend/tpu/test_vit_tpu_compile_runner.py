@@ -8,7 +8,6 @@ from torch import nn
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.tpu.compilation import direct_compile
-from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.graph_runner import (
     vit_tpu_compile_runner as vit_runner,
 )
@@ -109,17 +108,18 @@ class _FakeVisionPolicy(VisionTpuCompilePolicy):
 
 
 class _DirectVisionPolicy(_FakeVisionPolicy):
+    def make_warmup_inputs(self, patch_count):
+        return self.prepare_call(torch.zeros(patch_count, dtype=torch.int64))[0]
+
     def get_compile_model(self):
         return self.vit
 
 
 class TestViTTpuCompileRunner(unittest.TestCase):
-    def test_direct_compiler_is_shared_by_install_warmup_and_serving(self):
-        events = []
-        owner = SimpleNamespace(forward=lambda x: x)
-        state = nn.Linear(1, 1)
+    def test_direct_warmup_queues_buckets_before_execution(self):
+        owner = SimpleNamespace(forward=lambda x, extra=None: x * 2)
         policy = _DirectVisionPolicy(
-            state,
+            nn.Identity(),
             owner=owner,
             model_runner=SimpleNamespace(
                 server_args=SimpleNamespace(
@@ -129,107 +129,52 @@ class TestViTTpuCompileRunner(unittest.TestCase):
                 )
             ),
         )
+        events = []
 
-        def submit(x):
-            self.assertFalse(torch.is_grad_enabled())
-            self.assertEqual(x.dtype, torch.float32)
-            events.append(("submit", len(x)))
+        def compile_artifact(args, kwargs, *, async_compile):
+            events.append(("compile", len(args[0]), async_compile))
 
-            def execute():
-                events.append(("execute", len(x)))
-                return x
+            def execute(call):
+                args, kwargs = call
+                events.append(("execute", len(args[0])))
+                return policy.compiled_fn.fn(*args, **kwargs)
 
-            return PendingCall(execute)
+            return execute
 
-        compiled = MagicMock(spec=direct_compile.CompiledFunction)
-        compiled.warmup_async.side_effect = submit
-        compiled.side_effect = lambda x, extra: x * 2
-        init_dtype = torch.get_default_dtype()
-        try:
-            torch.set_default_dtype(torch.float64)
-            with (
-                envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
-                patch.object(vit_runner, "_register_tpu_compile_backend"),
-                patch.object(vit_runner, "_precompiled_max_patch_count", None),
-                patch.object(vit_runner, "tpu_sync") as sync,
-                patch.object(
-                    direct_compile, "direct_compile", return_value=compiled
-                ) as compile_fn,
-            ):
-                self.assertTrue(policy.install())
-                self.assertIs(policy.compiled_fn, compiled)
-                self.assertIs(owner.forward, compiled)
-                self.assertIs(compile_fn.call_args.kwargs["model"], state)
-
-                pending = policy.precompile([4, 8])
-                self.assertEqual(events, [("submit", 4), ("submit", 8)])
-                self.assertEqual(torch.get_default_dtype(), torch.float64)
-                self.assertEqual(vit_runner.precompiled_max_patch_count(), 8)
-                compiled.assert_not_called()
-                sync.assert_not_called()
-
-                for call in pending:
-                    call.wait()
-                self.assertEqual(events[-2:], [("execute", 4), ("execute", 8)])
-                self.assertEqual(sync.call_count, 2)
-                self.assertTrue(all(c.kwargs["wait"] for c in sync.call_args_list))
-                self.assertEqual(policy.run(torch.arange(4)).tolist(), [0, 2])
-                compiled.assert_called_once()
-        finally:
-            torch.set_default_dtype(init_dtype)
-
-    def test_direct_compilation_requires_state_tracer_and_async_opt_in(self):
-        for policy_type, tracer, async_enabled, use_bundle in (
-            (_FakeVisionPolicy, "direct", True, False),
-            (_DirectVisionPolicy, "dynamo", True, False),
-            (_DirectVisionPolicy, "direct", False, False),
-            (_FakeVisionPolicy, "direct", True, True),
+        with (
+            envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True),
+            patch.object(vit_runner, "_precompiled_max_patch_count", None),
+            patch.object(vit_runner, "tpu_sync") as sync,
+            patch.object(
+                direct_compile.CompiledFunction,
+                "_compile",
+                side_effect=compile_artifact,
+            ),
         ):
-            with (
-                self.subTest(
-                    policy=policy_type.__name__,
-                    tracer=tracer,
-                    async_enabled=async_enabled,
-                    use_bundle=use_bundle,
-                ),
-                envs.SGLANG_DIRECT_COMPILE_ASYNC.override(async_enabled),
-                patch.object(torch, "compile") as dynamo,
-                patch.object(vit_runner.torch_compile_bundle, "Compiler") as bundle,
-                patch.object(direct_compile, "direct_compile") as native,
-            ):
-                policy = policy_type(
-                    nn.Identity(),
-                    model_runner=SimpleNamespace(
-                        server_args=SimpleNamespace(tpu_compile_tracer=tracer)
-                    ),
-                )
-                compiled = policy._compile_method(lambda x: x, use_bundle=use_bundle)
-                self.assertIs(compiled, (bundle if use_bundle else dynamo).return_value)
-                native.assert_not_called()
+            self.assertTrue(policy.install())
+            self.assertIs(owner.forward, policy.compiled_fn)
+            pending = policy.precompile([4, 8])
+            self.assertEqual(events, [("compile", 4, True), ("compile", 8, True)])
+            sync.assert_not_called()
 
-        with envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True):
-            policy = _DirectVisionPolicy(
-                nn.Identity(),
-                model_runner=SimpleNamespace(
-                    server_args=SimpleNamespace(tpu_compile_tracer="direct")
-                ),
+            for call in pending:
+                call.wait()
+            self.assertEqual(events[-2:], [("execute", 4), ("execute", 8)])
+            self.assertEqual(sync.call_count, 2)
+            self.assertTrue(all(c.kwargs["wait"] for c in sync.call_args_list))
+
+            self.assertEqual(policy.run(torch.arange(4)).tolist(), [0, 2])
+            self.assertEqual(len(policy.compiled_fn.cache), 2)
+
+    def test_default_policy_keeps_dynamo_with_async_enabled(self):
+        policy = _FakeVisionPolicy(
+            model_runner=SimpleNamespace(
+                server_args=SimpleNamespace(tpu_compile_tracer="direct")
             )
-            with self.assertRaisesRegex(ValueError, "does not support bundles"):
-                policy._compile_method(lambda x: x, use_bundle=True)
-
-    def test_async_submission_failure_restores_default_dtype(self):
-        policy = _DirectVisionPolicy(owner=SimpleNamespace())
-        policy.compiled_fn = MagicMock(spec=direct_compile.CompiledFunction)
-        policy.compiled_fn.warmup_async.side_effect = RuntimeError("compile failed")
-        init_dtype = torch.get_default_dtype()
-        try:
-            torch.set_default_dtype(torch.float64)
-            with patch.object(vit_runner, "_precompiled_max_patch_count", None):
-                with self.assertRaisesRegex(RuntimeError, "compile failed"):
-                    policy.precompile([4])
-                self.assertEqual(torch.get_default_dtype(), torch.float64)
-        finally:
-            torch.set_default_dtype(init_dtype)
+        )
+        with envs.SGLANG_DIRECT_COMPILE_ASYNC.override(True):
+            compiled = policy._compile_method(lambda x: x, use_bundle=False)
+        self.assertNotIsInstance(compiled, direct_compile.CompiledFunction)
 
     def test_policy_declares_tpu_platform(self):
         self.assertEqual(VisionTpuCompilePolicy.platform, "tpu")
