@@ -140,7 +140,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w13_weight_scale_inv=w13_scale_inv,
             w2_weight_scale_inv=w2_scale_inv,
             _tpu_fused_rs_tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
-            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
         )
 
         with patch(
@@ -176,7 +176,7 @@ class TestFp8MoeFusedRs(CustomTestCase):
             w13_weight_scale=torch.ones(1, 1, 1, 2 * hidden),
             w2_weight_scale=torch.ones(1, 1, 1, hidden),
             _tpu_fused_rs_tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
-            _tpu_fused_rs_group_offset=torch.tensor([0, 0], dtype=torch.int32),
+            _tpu_fused_rs_group_offset=torch.tensor([0], dtype=torch.int32),
         )
 
         with patch(

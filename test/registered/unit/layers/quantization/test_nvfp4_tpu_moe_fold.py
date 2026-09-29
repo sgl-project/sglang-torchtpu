@@ -490,7 +490,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 [0], dtype=torch.int32
             )
             prepared_layer._tpu_fused_rs_group_offset = torch.tensor(
-                [0, 0], dtype=torch.int32
+                [0], dtype=torch.int32
             )
 
         hidden_states = torch.randn(3, HIDDEN_SIZE, dtype=torch.bfloat16)
@@ -550,7 +550,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
-        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
         layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor([0], dtype=torch.int32)
         from sglang.srt.layers.moe.pallas import fused_moe_rs_op
 
@@ -600,7 +600,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
                 layer = _make_block512_layer(include_unused_params=False)
                 layer._tpu_fused_rs_has_post_expert_norm = False
                 layer._tpu_fused_rs_group_offset = torch.tensor(
-                    [0, 0], dtype=torch.int32
+                    [0], dtype=torch.int32
                 )
                 layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
                     [0], dtype=torch.int32
@@ -667,7 +667,7 @@ class TestNvfp4Block512Contract(CustomTestCase):
         )
         layer = _make_block512_layer(include_unused_params=False)
         layer._tpu_fused_rs_has_post_expert_norm = False
-        layer._tpu_fused_rs_group_offset = torch.tensor([0, 0], dtype=torch.int32)
+        layer._tpu_fused_rs_group_offset = torch.tensor([0], dtype=torch.int32)
         layer._tpu_fused_rs_tp_rank_to_device_id = torch.tensor(
             [0, 1], dtype=torch.int32
         )

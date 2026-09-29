@@ -64,10 +64,7 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
     moe_ep_rank = get_parallel().moe_ep_rank
     _, tp_rank_to_device_id = _get_tp_rank_to_device_id_mapping()
     group_offset = torch.tensor(
-        [
-            moe_ep_rank * layer.num_local_experts,
-            moe_ep_rank,
-        ],
+        [moe_ep_rank * layer.num_local_experts],
         dtype=torch.int32,
         device=layer.w13_weight.device,
     )

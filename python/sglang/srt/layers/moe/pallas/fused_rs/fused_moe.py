@@ -149,11 +149,10 @@ def moe_gmm_local_rs_nodedup(
     chunk_size = num_tokens // ep_size
     num_experts = w1.shape[0] * ep_size  # global num_experts
     num_local_experts = w1.shape[0]
-    my_id = (
-        group_offset[1]
-        if group_offset.shape[0] > 1
-        else jax.lax.axis_index(ep_axis_name)
-    )
+    # Experts are assigned in contiguous, equal-sized blocks by logical rank.
+    # Derive the rank from the offset already needed for routing instead of
+    # carrying a second scalar through every compiled MoE call.
+    my_id = group_offset[0] // num_local_experts
 
     # Compiler workaround for the non-SP fused remote-DMA graph: materialize
     # IDs and weights from physical device 0 in one BF16 psum and feed both

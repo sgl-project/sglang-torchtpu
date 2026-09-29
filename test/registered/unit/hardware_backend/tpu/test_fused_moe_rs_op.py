@@ -58,7 +58,7 @@ class TestFusedMoeRsOp(CustomTestCase):
         )
         torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
-            torch.tensor([32, 2], dtype=torch.int32),
+            torch.tensor([32], dtype=torch.int32),
         )
         self.assertIn("_tpu_fused_rs_tp_rank_to_device_id", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
