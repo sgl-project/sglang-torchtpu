@@ -12,6 +12,8 @@ export EP_SIZE=${EP_SIZE:-16}
 
 # --- attention / precision ---
 export ATTENTION_BACKEND=pallas_tpu_mla   # required; the default rpa_v3 is not MLA
+# MoE permute on the TensorCore below 1024 routed rows (SparseCore above); measured crossover for this geometry.
+export SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS=${SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS:-1024}
 export KV_CACHE_DTYPE=""                  # required; pallas_tpu_mla raises on fp8 KV
 export QUANTIZATION=${QUANTIZATION:-fp8}
 

@@ -46,6 +46,8 @@ export KV_CACHE_DTYPE=
 # --- attention ---
 # Kimi is an MLA model.
 export ATTENTION_BACKEND=${ATTENTION_BACKEND:-pallas_tpu_mla}
+# MoE permute on the TensorCore below 1024 routed rows (SparseCore above); measured crossover for this geometry.
+export SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS=${SGLANG_TPU_FUSED_MOE_SC_GATHER_MIN_ROWS:-1024}
 
 # --- memory / shapes ---
 export MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.6}
