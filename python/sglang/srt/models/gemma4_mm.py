@@ -80,6 +80,18 @@ def _mm_features_out(features: torch.Tensor) -> torch.Tensor:
     return features.to("cpu") if _is_tpu else features
 
 
+def _pad_image_patches(
+    pixel_values: torch.Tensor, position_ids: torch.Tensor, num_patches: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pad [batch, patches, ...] to num_patches; position -1 marks padding."""
+    pad = num_patches - pixel_values.shape[-2]
+    if pad <= 0:
+        return pixel_values, position_ids
+    pixel_values = torch.nn.functional.pad(pixel_values, (0, 0, 0, pad))
+    position_ids = torch.nn.functional.pad(position_ids, (0, 0, 0, pad), value=-1)
+    return pixel_values, position_ids
+
+
 cached_get_processor = lru_cache(get_processor)
 
 
@@ -239,6 +251,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.audio_tower = None
             self.embed_audio = None
 
+        # TPU pads every image to this many patches (max soft tokens x pooling^2).
+        self._max_image_patches = (
+            config.vision_soft_tokens_per_image
+            * config.vision_config.pooling_kernel_size**2
+        )
         self.vocab_size = config.text_config.vocab_size
         self.vocab_size_per_layer_input = getattr(
             config.text_config,
@@ -476,12 +493,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 if pp.dim() == 2:
                     pp = pp.unsqueeze(0)
 
+                if _is_tpu:
+                    # Eager torch_tpu compiles each op per input shape, and patch
+                    # counts vary with aspect ratio: pad to one fixed shape.
+                    pv, pp = _pad_image_patches(pv, pp, self._max_image_patches)
                 pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
                 pp = pp.to(device=vt.device)
 
                 pooled, pooler_mask = vt(pv, pp)
 
                 for hs, mask in zip(pooled, pooler_mask):
+                    if _is_tpu:
+                        # embed_vision is per-token: run it at the padded shape.
+                        embedded = self.embed_vision(inputs_embeds=hs.unsqueeze(0))
+                        all_embeds.append(embedded.squeeze(0)[mask])
+                        continue
                     real_tokens = hs[mask]
                     all_embeds.append(
                         self.embed_vision(
