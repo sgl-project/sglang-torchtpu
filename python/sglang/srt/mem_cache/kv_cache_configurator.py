@@ -1776,6 +1776,10 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             swa_head_num=swa_head_num,
+            # SWA layers may use a different head dim (Gemma4: 256 SWA vs 512
+            # full); V rides at the qk width in the fused buffer.
+            swa_head_dim=self.model_config.swa_head_dim,
+            swa_v_head_dim=self.model_config.swa_head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             device=self.device,

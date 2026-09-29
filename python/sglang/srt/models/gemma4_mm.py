@@ -65,13 +65,20 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_tpu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_tpu = is_tpu()
+
+
+def _mm_features_out(features: torch.Tensor) -> torch.Tensor:
+    # TPU places multimodal rows on the host (mm_embed_tpu), like the ViT runner's output.
+    return features.to("cpu") if _is_tpu else features
+
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -179,6 +186,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     embedding_modules = {}
     embedding_padding_modules = []
     supports_lora = True
+    # Read by the TPU VL compile policy: decode feeds input_embeds, not input_ids.
+    decode_embeds_in_language_model = False
 
     def __init__(
         self,
@@ -243,6 +252,23 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+
+        # TPU: compile only the text model, so the vision tower and the embed
+        # merge run eagerly (mirrors Kimi-K2.5). PLE variants (E2B/E4B) pass a
+        # per_layer_inputs tensor the VL policy does not warm; they keep the
+        # whole-model compile.
+        has_ple = (text_config.hidden_size_per_layer_input or 0) > 0
+        if _is_tpu and not has_ple:
+            from sglang.srt.compilation.support_torch_compile import (
+                support_torch_compile,
+            )
+            from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
+                Qwen3VLDecoderTpuCompilePolicy,
+            )
+
+            support_torch_compile(
+                self.language_model, policy=Qwen3VLDecoderTpuCompilePolicy
+            )
 
         # Tied embeddings: under PP the embed_tokens lives on the first rank
         # while logits run on the last rank, so we can't reuse the embedding
@@ -464,7 +490,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _mm_features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -527,7 +553,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _mm_features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -573,7 +599,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 all_embeds.append(enc[~mask])
 
         if all_embeds:
-            return torch.cat(all_embeds, dim=0)
+            return _mm_features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
