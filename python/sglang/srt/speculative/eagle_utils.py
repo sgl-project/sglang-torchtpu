@@ -1364,30 +1364,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         prepare_device_accept_tpu(batch, bs=bs, double_alloc=double_alloc)
 
 
-def _top_k_renorm_prob_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
-    """Keep the top-k probabilities per row and renormalize (torch fallback)."""
-    vocab = probs.shape[-1]
-    ks = top_ks.clamp(min=1, max=vocab).to(torch.long).reshape(-1, 1)
-    sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
-    kth = sorted_probs.gather(-1, ks - 1)  # k-th largest prob per row
-    kept = torch.where(probs >= kth, probs, torch.zeros_like(probs))
-    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-
-def _top_p_renorm_prob_torch(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
-    """Keep the nucleus (top-p) per row and renormalize (torch fallback)."""
-    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
-    cumsum = torch.cumsum(sorted_probs, dim=-1)
-    ps = top_ps.to(probs.dtype).reshape(-1, 1)
-    # Keep a token if the prefix mass *before* it is still below p (so the token
-    # that crosses the threshold is included).
-    keep_sorted = (cumsum - sorted_probs) < ps
-    keep = torch.zeros_like(probs, dtype=torch.bool)
-    keep.scatter_(-1, sorted_idx, keep_sorted)
-    kept = torch.where(keep, probs, torch.zeros_like(probs))
-    return kept / kept.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-
 def top_k_renorm_prob_func(
     probs: torch.Tensor,
     top_ks: torch.Tensor,
