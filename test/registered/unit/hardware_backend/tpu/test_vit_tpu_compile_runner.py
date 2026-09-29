@@ -131,8 +131,8 @@ class TestViTTpuCompileRunner(unittest.TestCase):
         )
         events = []
 
-        def compile_artifact(args, kwargs, *, async_compile):
-            events.append(("compile", len(args[0]), async_compile))
+        def compile_artifact(args, kwargs, **options):
+            events.append(("compile", len(args[0]), options["async_compile"]))
 
             def execute(call):
                 args, kwargs = call
