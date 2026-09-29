@@ -93,23 +93,26 @@ class BaseSpecDecodeCompilePolicyMixin:
         assert self.b_bucketer is not None
         draft_token_num = self.draft_token_num
         bs_buckets = list(self.b_bucketer.buckets)
+        variants = self._target_verify_input_variants()
+        compile_items = [(bs, variant) for bs in bs_buckets for variant in variants]
         logger.info(
             "[spec compile policy] TARGET_VERIFY: %d shapes "
-            "(bs=%s, draft_token_num=%d)",
-            len(bs_buckets),
+            "(bs=%s, draft_token_num=%d, variants=%s)",
+            len(compile_items),
             bs_buckets,
             draft_token_num,
+            list(variants),
         )
         compile_range = (
             tqdm.tqdm(
-                bs_buckets,
+                compile_items,
                 desc="Compiling TARGET_VERIFY",
                 bar_format=_COMPILE_BAR_FORMAT,
             )
             if get_parallel().tp_rank == 0
-            else bs_buckets
+            else compile_items
         )
-        for bs in compile_range:
+        for bs, variant in compile_range:
             num_tokens = bs * draft_token_num
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
@@ -117,6 +120,7 @@ class BaseSpecDecodeCompilePolicyMixin:
                 num_tokens=num_tokens,
                 bs=bs,
                 mode=ForwardMode.TARGET_VERIFY,
+                variant=variant,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_verify_spec_info(),
             )
@@ -125,7 +129,8 @@ class BaseSpecDecodeCompilePolicyMixin:
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled TARGET_VERIFY (bs={bs}, tokens={num_tokens})"
+                    f"Compiled TARGET_VERIFY (bs={bs}, tokens={num_tokens}, "
+                    f"variant={variant})"
                     f" in {elapsed:.1f}s{hbm_str}"
                 )
 
@@ -133,12 +138,10 @@ class BaseSpecDecodeCompilePolicyMixin:
         """Compile target prefill with and without speculative input state."""
         assert self.t_bucketer is not None
         assert self.b_bucketer is not None
-        bs = self._extend_compile_cap()
         variants = self._extend_input_variants()
         valid_shapes = [
-            (t, bs, has_spec_info, variant)
-            for t in self.t_bucketer.buckets
-            if t >= bs
+            (t, bs, mode, has_spec_info, variant)
+            for t, bs, mode in self._extend_compile_cases()
             for has_spec_info in (False, True)
             for variant in variants
         ]
@@ -146,7 +149,7 @@ class BaseSpecDecodeCompilePolicyMixin:
             "[spec compile policy] EXTEND(FULL): %d shapes (bs=%d, token_buckets=%s, "
             "variants=%s)",
             len(valid_shapes),
-            bs,
+            self._extend_compile_cap(),
             list(self.t_bucketer.buckets),
             list(variants),
         )
@@ -159,13 +162,13 @@ class BaseSpecDecodeCompilePolicyMixin:
             if get_parallel().tp_rank == 0
             else valid_shapes
         )
-        for num_tokens, bs, has_spec_info, variant in compile_range:
+        for num_tokens, bs, mode, has_spec_info, variant in compile_range:
             hbm_before = _get_hbm_usage_mb()
             start = time.perf_counter()
             self._run_one(
                 num_tokens=num_tokens,
                 bs=bs,
-                mode=ForwardMode.EXTEND,
+                mode=mode,
                 variant=variant,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 spec_info=self.make_null_spec_info() if has_spec_info else None,
@@ -175,7 +178,7 @@ class BaseSpecDecodeCompilePolicyMixin:
                 hbm_after = _get_hbm_usage_mb()
                 hbm_str = _hbm_delta_str(hbm_before, hbm_after)
                 compile_range.set_description(
-                    f"Compiled EXTEND(FULL) (tokens={num_tokens}, bs={bs}, "
+                    f"Compiled {mode.name}(FULL) (tokens={num_tokens}, bs={bs}, "
                     f"variant={variant}, "
                     f"spec_info={'set' if has_spec_info else 'none'})"
                     f" in {elapsed:.1f}s{hbm_str}"

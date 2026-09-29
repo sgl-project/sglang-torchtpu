@@ -1779,19 +1779,48 @@ class TestSpecPrecompileLoops(_SpecPolicyTestCase):
         )
 
     def test_target_precompiles_all_spec_modes(self):
-        mr = _spec_model_runner()  # draft_token_num = 4
-        policy = _make_spec_policy(mr, token_buckets=(8, 64), bs_buckets=(1, 4))
-        # precompile() spans two modules: the base EXTEND/DECODE warmup lives in
-        # decoder_compile_policy (via super()), the spec TARGET_VERIFY/EXTEND(FULL)
-        # in spec_decode_compile_policy. One topology override serves both.
-        with get_parallel().override(tp_rank=1):
-            policy.precompile()
-        # EXTEND (8,4),(64,4)=2  DECODE (1,1),(4,4)=2
-        # TARGET_VERIFY buckets bs: (4,1),(16,4)=2. EXTEND(FULL) covers two
-        # token buckets and both real serving spec-info states, so 4.
-        self.assertEqual(mr.model.forward.call_count, 10)
-        self.assertIn((16, 4), mr.attn_backend.calls)
-        self.assertIn((4, 1), mr.attn_backend.calls)
+        for disagg_mode in ("null", "prefill", "decode"):
+            for draft_token_num in (1, 4):
+                with self.subTest(disagg=disagg_mode, draft_tokens=draft_token_num):
+                    self.publish_config(
+                        speculative_num_steps=draft_token_num - 1,
+                        speculative_num_draft_tokens=draft_token_num,
+                    )
+                    mr = _spec_model_runner()
+                    policy = _make_spec_policy(
+                        mr, token_buckets=(8, 64), bs_buckets=(1, 4)
+                    )
+                    with (
+                        get_parallel().override(tp_rank=1),
+                        get_disagg().override(disaggregation_mode=disagg_mode),
+                    ):
+                        policy.precompile()
+                    batches = [c.args[2] for c in mr.model.forward.call_args_list]
+                    expected = []
+                    if disagg_mode != "decode":
+                        expected += [
+                            (ForwardMode.EXTEND, tokens, 4)
+                            for tokens in (8, 64)
+                            for _ in range(2)
+                        ]
+                    if disagg_mode != "prefill":
+                        expected += [
+                            (ForwardMode.TARGET_VERIFY, bs * draft_token_num, bs)
+                            for bs in (1, 4)
+                        ]
+                    self.assertEqual(
+                        [
+                            (b.forward_mode, b.input_ids.shape[0], b.batch_size)
+                            for b in batches
+                        ],
+                        expected,
+                    )
+                    self.assertTrue(
+                        all(
+                            b.capture_hidden_mode == CaptureHiddenMode.FULL
+                            for b in batches
+                        )
+                    )
 
     def test_draft_worker_skips_precompile(self):
         mr = _spec_model_runner(is_draft_worker=True)

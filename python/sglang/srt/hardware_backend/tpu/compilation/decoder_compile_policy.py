@@ -889,6 +889,10 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         """Input signatures an extend graph must be compiled for."""
         return ("plain",)
 
+    def _target_verify_input_variants(self) -> tuple[str, ...]:
+        """Input signatures a speculative target verification graph needs."""
+        return ("plain",)
+
     def _precompile_extend(self) -> None:
         """Compile extend at each token bucket and the fixed batch cap."""
         assert self.t_bucketer is not None

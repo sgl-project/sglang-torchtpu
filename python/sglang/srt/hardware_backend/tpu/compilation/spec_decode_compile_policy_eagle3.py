@@ -41,7 +41,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import get_forward_context
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel, get_spec, process_model_config
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_spec,
+    process_model_config,
+)
 from sglang.srt.speculative.eagle_info import (
     EagleDraftExtendInput,
     EagleDraftInput,
@@ -215,6 +220,23 @@ class Eagle3SpecDecodeCompilePolicyMixin(BaseSpecDecodeCompilePolicyMixin):
         # draft's own model_config is the text-only EAGLE3 checkpoint, so read
         # the target's.
         self.target_is_multimodal = process_model_config().is_multimodal
+
+    def precompile(self) -> None:
+        if self.is_draft_worker:
+            return super().precompile()
+
+        start = time.perf_counter()
+        # EagleWorkerV2 requests FULL capture for target prefill and routes all
+        # decoding, including its zero-step fallback, through TARGET_VERIFY.
+        disagg_mode = get_disagg().disaggregation_mode
+        if disagg_mode != "decode":
+            self._precompile_extend_full()
+        if disagg_mode != "prefill":
+            self._precompile_target_verify()
+        logger.info(
+            "[spec compile policy] TARGET precompile done in %.1fs.",
+            time.perf_counter() - start,
+        )
 
     def install(self) -> bool:
         """Capture EAGLE's eager regions before the base policy replaces them."""
