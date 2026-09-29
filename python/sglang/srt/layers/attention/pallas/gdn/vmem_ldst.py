@@ -14,7 +14,6 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py
-# Revision: fde6c39944a4234e5c45863311df8ae535b9f598.
 
 import math
 

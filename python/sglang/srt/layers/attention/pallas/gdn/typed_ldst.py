@@ -14,7 +14,6 @@
 #
 # Adapted for SGLang-TorchTPU from vllm-project/vllm-torchtpu (Apache-2.0).
 # Source: src/vllm_torchtpu/kernels/typed_ldst.py
-# Revision: fde6c39944a4234e5c45863311df8ae535b9f598.
 """Typed views of raw byte blocks inside Pallas TPU kernels.
 
 A block ref holds bytes in the layout of its owning buffer (e.g. one
