@@ -863,7 +863,9 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         if isinstance(forward_batch.out_cache_loc, torch.Tensor):
             forward_batch.out_cache_loc = torch.zeros(
                 num_tokens,
-                dtype=forward_batch.out_cache_loc.dtype,
+                # Scheduler idle batches carry empty int64 locations even when
+                # the live allocator and precompiled extend graph use int32.
+                dtype=self._dummy_out_cache_loc_dtype(forward_batch.forward_mode),
                 device=device,
             )
         if isinstance(forward_batch.req_pool_indices, torch.Tensor):

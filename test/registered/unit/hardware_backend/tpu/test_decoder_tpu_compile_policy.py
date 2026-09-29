@@ -2631,7 +2631,8 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
             global_num_tokens_cpu=[0, 300],
             input_ids=torch.empty((0,), dtype=torch.int64),
             seq_lens=torch.empty((0,), dtype=torch.int32),
-            out_cache_loc=torch.empty((0,), dtype=torch.int32),
+            # Match ScheduleBatch.prepare_for_idle, not the allocator's dtype.
+            out_cache_loc=torch.empty((0,), dtype=torch.int64),
             req_pool_indices=torch.empty((0,), dtype=torch.int32),
             req_pool_indices_cpu=torch.empty((0,), dtype=torch.int32),
             seq_lens_cpu=None,
@@ -2643,6 +2644,7 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.batch_size, 1)
         self.assertEqual(forward_batch.seq_lens.tolist(), [300])
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [300])
+        self.assertEqual(forward_batch.out_cache_loc.dtype, torch.int32)
 
 
 class TestDpSyncNumTokens(_SpecPolicyTestCase):
