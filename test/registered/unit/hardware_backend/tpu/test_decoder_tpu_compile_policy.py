@@ -2630,11 +2630,11 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
             spec_info=spec_info,
             global_num_tokens_cpu=[0, 300],
             input_ids=torch.empty((0,), dtype=torch.int64),
-            seq_lens=torch.empty((0,), dtype=torch.int32),
+            seq_lens=torch.empty((0,), dtype=torch.int64),
             # Match ScheduleBatch.prepare_for_idle, not the allocator's dtype.
             out_cache_loc=torch.empty((0,), dtype=torch.int64),
-            req_pool_indices=torch.empty((0,), dtype=torch.int32),
-            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int32),
+            req_pool_indices=torch.empty((0,), dtype=torch.int64),
+            req_pool_indices_cpu=torch.empty((0,), dtype=torch.int64),
             seq_lens_cpu=None,
         )
         with _dp_attention(True):
@@ -2645,6 +2645,11 @@ class TestSpecDraftDecodePadding(_SpecPolicyTestCase):
         self.assertEqual(forward_batch.seq_lens.tolist(), [300])
         self.assertEqual(forward_batch.extend_seq_lens.tolist(), [300])
         self.assertEqual(forward_batch.out_cache_loc.dtype, torch.int32)
+
+        for name in ("extend_seq_lens", "extend_prefix_lens", "extend_start_loc"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int32, name)
+        for name in ("seq_lens", "req_pool_indices", "req_pool_indices_cpu"):
+            self.assertEqual(getattr(forward_batch, name).dtype, torch.int64, name)
 
 
 class TestDpSyncNumTokens(_SpecPolicyTestCase):

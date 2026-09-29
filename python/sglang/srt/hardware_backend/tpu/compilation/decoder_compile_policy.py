@@ -839,7 +839,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             [num_tokens], dtype=torch.int32, device=device
         )
         forward_batch.extend_prefix_lens = torch.zeros(
-            1, dtype=seq_dtype, device=device
+            1, dtype=torch.int32, device=device
         )
         forward_batch.extend_start_loc = torch.zeros(
             1, dtype=torch.int32, device=device
