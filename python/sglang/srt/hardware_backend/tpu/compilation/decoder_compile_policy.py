@@ -818,6 +818,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         forward_batch.forward_mode = ForwardMode.DECODE
+        # Scheduler idle locations are int64; active decode and warmup use
+        # the allocator dtype. Normalize before padding materializes KV slots.
+        forward_batch.out_cache_loc = forward_batch.out_cache_loc.to(
+            dtype=self._dummy_out_cache_loc_dtype(ForwardMode.DECODE)
+        )
 
     def materialize_dp_idle_extend(
         self, forward_batch: ForwardBatch, num_tokens: int
