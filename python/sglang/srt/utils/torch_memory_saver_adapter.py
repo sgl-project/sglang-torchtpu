@@ -16,8 +16,9 @@ try:
     _memory_saver = torch_memory_saver.torch_memory_saver
     import_error = None
 except ImportError as e:
-    import_error = e
-    pass
+    # Only the message is kept: a kept exception's traceback links through f_back
+    # to the first importer's frames, pinning their locals for the process lifetime.
+    import_error = str(e)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class TorchMemorySaverAdapter(ABC):
                     "torch-memory-saver is not installed. Please install it "
                     "via `pip3 install torch-memory-saver`. "
                 )
-            raise import_error
+            raise ImportError(import_error)
         return (
             _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
         )

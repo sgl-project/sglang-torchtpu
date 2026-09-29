@@ -12,12 +12,13 @@ own page-id space, and an EAGLE-style 1-layer draft sidecar riding the
 anchor's indices — each backed by its own raiden manager (real DMA), and
 checks bit-exact data movement on all three pools.
 
-Like test_tpu_raiden_roundtrip_ondevice.py, the KV buffers are seeded with
-eager writes BEFORE the host pools register them with raiden and never written
-again (eager writes reallocate the PJRT buffer and would orphan the
-registration; production updates KV in place via kernel donation). The load
-round therefore targets DIFFERENT device pages instead of evicting the source
-pages: source pages -> host -> destination pages, verify the destination.
+The KV buffers are seeded with eager writes BEFORE the host pools register them
+with raiden and never written again (as in
+test/registered/tpu/unit/test_tpu_raiden_roundtrip.py): eager writes reallocate
+the PJRT buffer and would orphan the registration, while production updates KV
+in place via kernel donation. The load round therefore targets DIFFERENT device
+pages instead of evicting the source pages: source pages -> host -> destination
+pages, verify the destination.
 """
 
 import time

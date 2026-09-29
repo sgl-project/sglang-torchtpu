@@ -5,8 +5,8 @@ prefill replies with its block ids plus a raiden endpoint, and decode then issue
 the read. Raiden's DMA engine moves the bytes; SGLang only owns the rendezvous.
 These tests cover the part SGLang owns -- the handshake, its ordering, the aux
 sidecar, and what gets registered with the engine -- with the engine faked, so
-they need no TPU and no tpu_raiden. The on-device transfer itself is covered by
-``test/manual/tpu/test_tpu_raiden_roundtrip_ondevice.py``.
+they need no TPU and no tpu_raiden. Raiden's local D2H/H2D on a real TPU buffer
+is exercised by ``test_tpu_raiden_roundtrip.py``; the cross-host pull is not.
 
 The companion file ``test_disagg_tpu_transfer.py`` covers the ZMQ (tpu)
 connector, which raiden is replacing. The two share very little: that one drives
