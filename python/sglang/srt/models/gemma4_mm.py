@@ -256,8 +256,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("language_model", prefix),
         )
 
-        ple_unwarmed_by_vl_policy = (text_config.hidden_size_per_layer_input or 0) > 0
-        if _is_tpu and not ple_unwarmed_by_vl_policy:
+        if _is_tpu:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
