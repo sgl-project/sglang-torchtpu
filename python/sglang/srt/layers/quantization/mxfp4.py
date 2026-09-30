@@ -711,7 +711,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_tpu_mxfp4_moe_weights,
             )
 
-            prepare_tpu_mxfp4_moe_weights(layer)
+            prepare_tpu_mxfp4_moe_weights(layer, with_bias=self.with_bias)
             return
         if self.use_flashinfer:
             # Per-expert buffers are local (create_weights uses num_local_experts);
@@ -1591,10 +1591,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        # TODO(qinghan): once the packed-FP4 fast path lands, gate this on a
-        # config flag instead of unconditionally taking the BF16 triage path.
         if is_tpu():
-            # TODO(qinghan): support native packed-MXFP4 here
+            # forward_tpu reads the packed-FP4 scales when the loader kept them.
             from sglang.srt.layers.quantization.unquant import (
                 UnquantizedFusedMoEMethod,
             )

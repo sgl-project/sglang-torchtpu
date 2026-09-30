@@ -169,6 +169,8 @@ class TestUnquantGlobalRouting(CustomTestCase):
                                 num_fused_shared_experts=0,
                                 no_combine=no_combine,
                                 activation="silu",
+                                gemm1_alpha=None,
+                                gemm1_clamp_limit=None,
                             )
                         )
                         dispatch = SimpleNamespace(

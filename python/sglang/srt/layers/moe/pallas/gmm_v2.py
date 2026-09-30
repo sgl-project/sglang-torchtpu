@@ -1,7 +1,8 @@
 # Uses the latest torchtpu-vllm gmm_v2 kernel
 #   (https://github.com/google-pytorch/torchtpu-vllm/blob/main/src/vllm_torchtpu/kernels/megablox/gmm_v2.py).
 # This cut adds in-kernel fused activation (``fuse_act``: silu / gelu /
-# swigluoai) and fused gate+up weight support over the prior sglang-jax vendor.
+# swigluoai / situ) and fused gate+up weight support over the prior sglang-jax
+# vendor.
 # The Pallas fused-MoE bridge (``fused_moe_op.py``) passes ``fuse_act`` so the
 # GMM1 gated activation runs in-kernel instead of as a separate JAX pass.
 # The ``swigluoai`` activation in particular is required for GPT-OSS.
@@ -56,6 +57,27 @@ def swigluoai(
     return (up + 1.0) * glu
 
 
+def situ(
+    gate: jax.Array, up: jax.Array, *, beta: float, linear_beta: float | None
+) -> jax.Array:
+    """SiTU gated activation used by Kimi-K3 (see SituAndMul in activation.py)."""
+    gate_act = beta * jnp.tanh(gate / beta) * jax.nn.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * jnp.tanh(up / linear_beta)
+    return gate_act * up
+
+
+def _dequantize_rhs_tile(rhs, block_scales, *, quant_block_size):
+    """Scale a [tile_k, tile_n] rhs by [tile_k / block, 1, tile_n] block scales."""
+    tile_k, tile_n = rhs.shape
+    num_blocks = tile_k // quant_block_size
+    # E8M0-derived scales are powers of two, so the product is exact in bf16.
+    scaled = rhs.reshape(num_blocks, quant_block_size, tile_n) * block_scales.astype(
+        rhs.dtype
+    )
+    return scaled.reshape(tile_k, tile_n)
+
+
 def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
     """Applies a fused activation function to the accumulator.
 
@@ -67,7 +89,8 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
       acc: The accumulator array, with the last dimension being 2 * tile_n.
       tile_n: The size of the 'n' dimension for a single projection (gate or up).
       fuse_act: The name of the activation function to apply. Supported values are
-        "silu", "gelu", and "swigluoai". If None, no activation is applied.
+        "silu", "gelu", "swigluoai", and "situ:{beta}:{linear_beta|none}". If
+        None, no activation is applied.
 
     Returns:
       The result of applying the activation function.
@@ -87,6 +110,10 @@ def apply_act_fn(acc: jax.Array, tile_n: int, fuse_act: str | None):
             return jax.nn.gelu(acc_gate) * acc_up
         case "swigluoai":
             return swigluoai(acc_gate, acc_up)
+        case str() if fuse_act.startswith("situ:"):
+            _, beta, linear_beta = fuse_act.split(":")
+            linear_beta = None if linear_beta == "none" else float(linear_beta)
+            return situ(acc_gate, acc_up, beta=float(beta), linear_beta=linear_beta)
         case _:
             raise NotImplementedError(f"Unsupported activation function: {fuse_act}")
 
@@ -137,6 +164,10 @@ class WeightsRef:
             s = jnp.repeat(s, scale_block_n, axis=-1)
         return s
 
+    def get_block_scales(self):
+        # [num_quant_blocks_per_tile_k, 1, tile_n]
+        return self.scale[...]
+
     def get_bias(self):
         b = self.bias[...]
         return b
@@ -181,6 +212,9 @@ class FusedWeightsRef:
             s_up = jnp.repeat(s_up, scale_block_n, axis=-1)
         s = jnp.concatenate([s, s_up], axis=-1)
         return s
+
+    def get_block_scales(self):
+        return jnp.concatenate([self.gate.scale[...], self.up.scale[...]], axis=-1)
 
     def get_bias(self):
         b = self.gate.bias[...]
@@ -285,6 +319,19 @@ class GmmConfigs:
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
         return pl.cdiv(self.tiles.tile_k, self.rhs_cfgs.quant_block_size)
+
+    @property
+    def dequantize_rhs_before_matmul(self) -> bool:
+        # Blocks narrower than the MXU would each issue a K=block matmul; scale
+        # the fp4 rhs in VMEM instead and run one full-tile_k matmul.
+        rhs = self.rhs_cfgs
+        return (
+            self.lhs_cfgs.quant_dtype is None
+            and rhs.has_scale
+            and rhs.scale_block_n == 1
+            and rhs.quant_dtype == jnp.float4_e2m1fn.dtype
+            and rhs.quant_block_size < pltpu.get_tpu_info().mxu_column_size
+        )
 
 
 TileFn = Callable[[Dimensions, InputConfigs, InputConfigs, int, str | None], TileSizes]
@@ -489,6 +536,16 @@ def inner_kernel(
             acc_list = []
             mxu_size = pltpu.get_tpu_info().mxu_column_size
             rhs_qbs = cfgs.rhs_cfgs.quant_block_size
+            apply_rhs_scale = cfgs.rhs_cfgs.has_scale
+            if cfgs.dequantize_rhs_before_matmul:
+                tiled_rhs = _dequantize_rhs_tile(
+                    tiled_rhs,
+                    tiled_rhs_ref.get_block_scales(),
+                    quant_block_size=rhs_qbs,
+                )
+                rhs_qbs = cfgs.tiles.tile_k
+                num_quant_blocks_per_tile_k = 1
+                apply_rhs_scale = False
             rhs_cols = tiled_rhs.shape[1]
             for start_n in range(0, rhs_cols, mxu_size):
                 end_n = min(rhs_cols, start_n + mxu_size)
@@ -503,7 +560,7 @@ def inner_kernel(
                         tiled_rhs[k_start:k_end, start_n:end_n],
                         preferred_element_type=jnp.float32,
                     )
-                    if cfgs.rhs_cfgs.has_scale:
+                    if apply_rhs_scale:
                         tiled_rhs_scale = tiled_rhs_ref.get_scale(
                             b_id, cfgs.rhs_cfgs.scale_block_n
                         )
@@ -1152,9 +1209,11 @@ def validate_inputs(
             f"size_n {size_n} should be divisible by 2 when fuse_act is not None"
             " since we need to split n dimension for gate and up projection"
         )
-        assert fuse_act in ("gelu", "silu", "swigluoai"), (
+        assert fuse_act in ("gelu", "silu", "swigluoai") or fuse_act.startswith(
+            "situ:"
+        ), (
             f"Unsupported fuse_act {fuse_act}. Supported values are 'gelu', 'silu',"
-            " and 'swigluoai'."
+            " 'swigluoai', and 'situ:{beta}:{linear_beta|none}'."
         )
         size_n //= 2
 
@@ -1297,9 +1356,10 @@ def make_gmm_configs(
     )
 
     lhs_quant_block_size = 512
-    if packed_fp4 and block_size != lhs_quant_block_size:
+    if packed_fp4 and block_size not in (32, lhs_quant_block_size):
         raise NotImplementedError(
-            f"Packed FP4 GMM requires quantization block size 512, got {block_size}."
+            "Packed FP4 GMM requires quantization block size 32 (MXFP4) or 512 "
+            f"(NVFP4), got {block_size}."
         )
 
     lhs_q_dtype = None
@@ -1315,9 +1375,9 @@ def make_gmm_configs(
             if tpu_info.int8_ops_per_second > 0:
                 lhs_q_dtype = jnp.int8.dtype
 
-    if packed_fp4 and lhs_q_dtype != jnp.float8_e4m3fn.dtype:
+    if packed_fp4 and lhs_q_dtype not in (None, jnp.float8_e4m3fn.dtype):
         raise NotImplementedError(
-            "Packed FP4 GMM requires TPU FP8 activation quantization support."
+            f"Packed FP4 GMM supports bf16 or fp8 activations only, got {lhs_q_dtype}."
         )
 
     if lhs_q_dtype is not None and num_blocks > 1:

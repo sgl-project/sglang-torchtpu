@@ -295,8 +295,10 @@ def process_mxfp4_moe_weights_native(
     # Convert e8m0 → fp32.
     w13_s = _e8m0_to_fp32(w13_s)  # (E, 2*N_padded, num_blocks) fp32
     # Transpose to (E, num_blocks, 2*N_padded) and add the size-1 mid dim.
+    # Unsqueeze before contiguous: torch_tpu re-materializes a rank-4 view of a
+    # rank-3 buffer on every compiled call.
     w13_s = (
-        w13_s.permute(0, 2, 1).contiguous().unsqueeze(2)
+        w13_s.permute(0, 2, 1).unsqueeze(2).contiguous()
     )  # (E, num_blocks, 1, 2*N_padded)
     assert w13_s.shape == (E_w13, num_blocks_hidden, 1, two_N_int_padded)
 
@@ -348,7 +350,7 @@ def process_mxfp4_moe_weights_native(
     w2_s = _pad_last_axis(w2_scale, pad_k_num_blocks)  # (E, hidden, num_blocks_padded)
     w2_s = _e8m0_to_fp32(w2_s)  # fp32
     w2_s = (
-        w2_s.permute(0, 2, 1).contiguous().unsqueeze(2)
+        w2_s.permute(0, 2, 1).unsqueeze(2).contiguous()
     )  # (E, num_blocks_padded, 1, hidden)
     assert w2_s.shape == (E_w2, num_blocks_inter_padded, 1, hidden)
 
@@ -392,25 +394,32 @@ def _process_mxfp4_moe_weights_in_chunks(layer: torch.nn.Module, w13_interleaved
     return tuple(results)
 
 
-def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
-    """Format GPT-OSS MXFP4 MoE weights for the TPU Pallas gmm_v2 backend.
+def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module, *, with_bias: bool) -> None:
+    """Format MXFP4 MoE weights for the TPU Pallas gmm_v2 backend.
 
-    Dequantizes MXFP4 -> bf16 at load (matches torchtpu-vllm). The fused-MoE
-    kernel then runs the plain bf16 path (no in-kernel FP4 dequant, no per-block
-    scales). ~4x more weight HBM than the packed W4A16 path, in exchange for a
-    simpler kernel path and no shared-kernel scale handling.
-
-    The lossless packed-FP4 alternative
-    (:func:`process_mxfp4_moe_weights_native`) feeds the same gmm_v2
-    block-scale path FP8 uses; it is not wired yet — switching to it is a
-    numerics-affecting change tracked separately from the FP8 redesign merge.
+    Non-interleaved checkpoints (e.g. Kimi-K3) keep packed FP4 + per-32 scales
+    and dequantize in-kernel (:func:`process_mxfp4_moe_weights_native`).
+    Interleaved GPT-OSS (SWIGLUOAI) stays on the bf16 dequant-at-load path.
     """
-    # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...]; a
-    # non-interleaved MXFP4 MoE checkpoint would not. Mirrors tpu-inference's
-    # ``w13_interleave = layer.activation == MoEActivation.SWIGLUOAI`` — sglang
-    # carries the activation as a string on the MoE runner config.
+    # GPT-OSS (SWIGLUOAI) ships w13 interleaved as [gate_0, up_0, ...]. Mirrors
+    # tpu-inference's ``w13_interleave = layer.activation == SWIGLUOAI``.
     w13_interleaved = layer.moe_runner_config.activation == "swigluoai"
-    if 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
+    w13_scale = w2_scale = None
+    if not w13_interleaved:
+        w13, w13_scale, w13_bias, w2, w2_scale, w2_bias = (
+            process_mxfp4_moe_weights_native(
+                layer.w13_weight.data,
+                layer.w13_weight_scale.data,
+                layer.w13_weight_bias.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale.data,
+                layer.w2_weight_bias.data,
+                w13_interleaved=False,
+            )
+        )
+        w13_scale = Parameter(w13_scale, requires_grad=False)
+        w2_scale = Parameter(w2_scale, requires_grad=False)
+    elif 2 * layer.w13_weight.data.numel() > _MAX_DEQUANT_ELEMENTS:
         # All 128 experts of gpt-oss-120b on one device (a pipeline stage:
         # 2.1e9 values before padding) are processed a few at a time.
         w13, w13_bias, w2, w2_bias = _process_mxfp4_moe_weights_in_chunks(
@@ -427,8 +436,12 @@ def prepare_tpu_mxfp4_moe_weights(layer: torch.nn.Module) -> None:
             w13_interleaved=w13_interleaved,
         )
     layer.w13_weight = Parameter(w13, requires_grad=False)
-    layer.w13_weight_scale = None
+    layer.w13_weight_scale = w13_scale
     layer.w13_weight_bias = Parameter(w13_bias, requires_grad=False)
     layer.w2_weight = Parameter(w2, requires_grad=False)
-    layer.w2_weight_scale = None
+    layer.w2_weight_scale = w2_scale
     layer.w2_weight_bias = Parameter(w2_bias, requires_grad=False)
+    # Without checkpoint biases create_weights zero-fills them; skip the adds.
+    if not with_bias:
+        layer.w13_weight_bias = None
+        layer.w2_weight_bias = None

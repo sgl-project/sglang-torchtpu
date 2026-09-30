@@ -1297,11 +1297,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # process_weights_after_loading above. Per-expert biases are optional:
         # present for GPT-OSS (MXFP4 dequantized to bf16, which reuses this
         # forward) and absent for plain-bf16 models like Qwen3, so read them via
-        # getattr (mirrors the XPU path).
+        # getattr (mirrors the XPU path). Block scales exist only for MXFP4 kept
+        # as packed FP4, which runs W4A16: activations stay bf16.
         output = fused_moe_call(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
+            w1_scale=getattr(layer, "w13_weight_scale", None),
+            w2_scale=getattr(layer, "w2_weight_scale", None),
             w1_bias=getattr(layer, "w13_weight_bias", None),
             w2_bias=getattr(layer, "w2_weight_bias", None),
             topk_weights=kernel_topk_weights,
@@ -1311,6 +1314,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             no_combine=no_combine,
             global_num_experts=global_num_experts,
             expert_group_offset=expert_group_offset,
+            quantize_lhs=False,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
         )
         if no_combine:
             # The kernel masks non-local groups, but invalid IDs mapped to

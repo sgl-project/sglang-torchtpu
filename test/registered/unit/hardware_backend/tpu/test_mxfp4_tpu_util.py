@@ -14,13 +14,16 @@ from sglang.srt.layers.quantization.mxfp4_tpu_util import (
     _EXPERTS_PER_CHUNK,
     prepare_tpu_mxfp4_moe_weights,
     process_mxfp4_moe_weights_bf16,
+    process_mxfp4_moe_weights_native,
 )
 from sglang.test.test_utils import CustomTestCase
 
 HIDDEN, INTER = 64, 96
 
 
-def _fake_layer(num_experts: int, seed: int = 0) -> types.SimpleNamespace:
+def _fake_layer(
+    num_experts: int, seed: int = 0, activation: str = "swigluoai"
+) -> types.SimpleNamespace:
     g = torch.Generator().manual_seed(seed)
     u8 = lambda *shape: torch.randint(0, 256, shape, dtype=torch.uint8, generator=g)
     # e8m0 scales near 1.0 keep the dequantized values finite.
@@ -46,7 +49,7 @@ def _fake_layer(num_experts: int, seed: int = 0) -> types.SimpleNamespace:
         torch.randn(num_experts, HIDDEN, generator=g, dtype=torch.bfloat16),
         requires_grad=False,
     )
-    layer.moe_runner_config = types.SimpleNamespace(activation="swigluoai")
+    layer.moe_runner_config = types.SimpleNamespace(activation=activation)
     return layer
 
 
@@ -66,7 +69,7 @@ class TestChunkedExpertPreparation(CustomTestCase):
             layer.w2_weight_bias.data,
             w13_interleaved=True,
         )
-        prepare_tpu_mxfp4_moe_weights(layer)
+        prepare_tpu_mxfp4_moe_weights(layer, with_bias=True)
         got = (
             layer.w13_weight,
             layer.w13_weight_bias,
@@ -79,6 +82,35 @@ class TestChunkedExpertPreparation(CustomTestCase):
             self.assertTrue(torch.equal(a, b), name)
         self.assertIsNone(layer.w13_weight_scale)
         self.assertIsNone(layer.w2_weight_scale)
+
+
+class TestPackedPreparation(CustomTestCase):
+    def test_non_interleaved_keeps_packed_fp4_and_scales(self):
+        layer = _fake_layer(num_experts=4, activation="situ")
+        expected = process_mxfp4_moe_weights_native(
+            layer.w13_weight.data,
+            layer.w13_weight_scale.data,
+            layer.w13_weight_bias.data,
+            layer.w2_weight.data,
+            layer.w2_weight_scale.data,
+            layer.w2_weight_bias.data,
+            w13_interleaved=False,
+        )
+        prepare_tpu_mxfp4_moe_weights(layer, with_bias=False)
+        got = (
+            layer.w13_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight,
+            layer.w2_weight_scale,
+        )
+        for a, b in zip(expected[0:2] + expected[3:5], got):
+            self.assertEqual(a.dtype, b.dtype)
+            self.assertTrue(torch.equal(a, b))
+        self.assertEqual(layer.w13_weight.dtype, torch.uint8)
+        self.assertTrue(layer.w13_weight_scale.is_contiguous())
+        self.assertTrue(layer.w2_weight_scale.is_contiguous())
+        self.assertIsNone(layer.w13_weight_bias)
+        self.assertIsNone(layer.w2_weight_bias)
 
 
 if __name__ == "__main__":

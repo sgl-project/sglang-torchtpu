@@ -53,6 +53,8 @@ class _MethodWithFakeRunnerConfig(UnquantizedFusedMoEMethod):
             apply_router_weight_on_input=apply_router_weight_on_input,
             no_combine=False,
             num_fused_shared_experts=0,
+            gemm1_alpha=None,
+            gemm1_clamp_limit=None,
         )
 
 
@@ -511,24 +513,16 @@ class TestForwardTpuContract(CustomTestCase):
         self.runner.tpu_forward(layer, d_out)
 
         kw = self.runner.kernel_kwargs
-        # No quantization scales may leak into the kernel call, and for a
-        # bias-less layer the bias kwargs (which unquant forward_tpu now
-        # forwards explicitly) must resolve to None.
-        for forbidden in ("w1_scale", "w2_scale"):
-            self.assertNotIn(
-                forbidden,
-                kw,
-                f"unquant forward_tpu must not pass {forbidden}",
-            )
-        for bias_kw in ("w1_bias", "w2_bias"):
+        # A bf16 layer has no weight scales or biases; each must resolve to None.
+        for name in ("w1_scale", "w2_scale", "w1_bias", "w2_bias"):
             self.assertIn(
-                bias_kw,
+                name,
                 kw,
-                f"unquant forward_tpu must forward {bias_kw} explicitly",
+                f"unquant forward_tpu must forward {name} explicitly",
             )
             self.assertIsNone(
-                kw[bias_kw],
-                f"{bias_kw} must be None for a bias-less layer",
+                kw[name],
+                f"{name} must be None for a bf16 layer",
             )
 
 

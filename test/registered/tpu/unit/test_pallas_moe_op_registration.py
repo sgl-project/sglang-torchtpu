@@ -151,6 +151,9 @@ class TestPallasMoeCallContract(CustomTestCase):
             1,  # use_sc_gather (int(True))
             0,  # w_quant_bits (0 => not weight-only quantized)
             128,  # permute_dense_threshold
+            True,  # quantize_lhs
+            0.0,  # gemm1_alpha (None)
+            0.0,  # gemm1_clamp_limit (None)
         )
 
 
