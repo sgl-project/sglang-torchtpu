@@ -10,7 +10,7 @@ name: Nightly Test (External TPU)
 
 on:
   schedule:
-    - cron: "30 10 * * *"   # 10:30 UTC daily; staggered after the in-project nightly (09:00)
+    - cron: "30 10 * * *"   # 10:30 UTC daily; staggered after the in-project nightly (00:30 PT)
   workflow_dispatch:
     inputs:
       ref:
