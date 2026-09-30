@@ -70,6 +70,12 @@ ${POOL_AFFINITY}
                   emptyDir:
                     medium: Memory
                     sizeLimit: 64Gi  # tier-2 compile cache lives here; R1's reaches ~57GB
+                # Unmounted, /tmp is the container writable layer: unbounded node
+                # ephemeral-storage. Overrunning it evicts whoever the kubelet picks,
+                # so a pod's own logs took out unrelated jobs on the same node.
+                - name: tmp
+                  emptyDir:
+                    sizeLimit: 64Gi
 ${WEIGHTS_VOLUME}
               containers:
                 - name: test
@@ -93,6 +99,9 @@ ${WEIGHTS_VOLUME}
                       set -uo pipefail
                       cd /sgl-workspace/sglang
                       export HF_HOME=/tmp/hf SGLANG_PLATFORM=tpu SGLANG_IS_IN_CI=true PYTHONUNBUFFERED=1
+                      # torch_tpu's tier-3 cache defaults to $HOME, on the pod's ephemeral
+                      # overlay; warmup fills the node disk and the kubelet evicts the pod.
+                      export TORCH_TPU_TIER3_ROOT=/dev/shm/torch_tpu_tier3
                       NNODES=$(awk -F, '{print NF}' <<<"${TPU_WORKER_HOSTNAMES:-x}")
                       RANK="${TPU_WORKER_ID:-0}"
                       echo "run=${RUN_NAME} nnodes=$NNODES rank=$RANK"
@@ -104,6 +113,20 @@ ${WEIGHTS_VOLUME}
                       # lines, which the dashboard scrapes from this job's log.
                       export TPU_CI_BENCH_OUTPUT_ROOT=/tmp/tpu-perf-bench
                       mkdir -p "$TPU_CI_BENCH_OUTPUT_ROOT"
+
+                      # Print /tmp usage to debug a disk eviction after the fact: the
+                      # kubelet only reports a total, and the container log is unreadable
+                      # by then. Past 20 GiB each line grows a du breakdown.
+                      #   == /tmp 24K ==
+                      #   == /tmp 3220292K ==
+                      # Backgrounded, not trapped -- the single-host path ends in exec.
+                      if [ "$RANK" = "0" ]; then
+                        ( while sleep 120; do
+                            tot=$(du -sxk /tmp 2>/dev/null | cut -f1)
+                            echo "== /tmp ${tot:-?}K =="
+                            [ "${tot:-0}" -gt 20971520 ] && du -xhd2 /tmp 2>/dev/null | sort -rh | head -10
+                          done ) &
+                      fi
 
                       # Exec mode (render_jobset.py --exec): every host runs the same
                       # command; pod exit codes gate the JobSet. Empty unless --exec.
@@ -207,11 +230,16 @@ ${WEIGHTS_VOLUME}
                       google.com/tpu: "4"
                       cpu: "4"
                       memory: 32Gi
+                      # No ephemeral-storage here: kueue-tpu.yaml's coveredResources
+                      # omit it, and Kueue silently never admits a workload asking
+                      # for a resource the ClusterQueue does not cover.
                     limits:
                       google.com/tpu: "4"
                   volumeMounts:
                     - name: dshm
                       mountPath: /dev/shm
+                    - name: tmp
+                      mountPath: /tmp
 ${WEIGHTS_MOUNT}
                   securityContext:
                     privileged: true
