@@ -34,6 +34,16 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
+# The taxonomy ratchet (scripts/lint/check_registered_tests.py) only admits NEW
+# registered tests under test/registered/<kind>/<subsystem>/, so a new TPU
+# accuracy or perf file lands outside the grandfathered tree above. Both are in
+# scope here: watching only one of them would let the contract lapse silently
+# for every test written from now on, which is the failure mode this file exists
+# to prevent.
+TAXONOMY_TPU_TESTS = {
+    "nightly-accuracy": REPO / "test" / "registered" / "accuracy" / "tpu",
+    "nightly-perf": REPO / "test" / "registered" / "perf" / "tpu",
+}
 TPU_CI = REPO / ".github" / "tpu-ci"
 WORKFLOWS = REPO / ".github" / "workflows"
 ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
@@ -65,7 +75,8 @@ def _nightly_registered() -> dict:
 
     files = [
         str(p)
-        for p in TPU_TESTS.rglob("*.py")
+        for root in (TPU_TESTS, *TAXONOMY_TPU_TESTS.values())
+        for p in root.rglob("*.py")
         if "__pycache__" not in p.parts and p.name not in ("conftest.py", "__init__.py")
     ]
     registered: dict = {}
@@ -82,8 +93,9 @@ def _nightly_registered() -> dict:
 
 
 def _config_modules(subdir: str):
-    """Load every MODEL_CONFIG module under test/registered/tpu/<subdir>."""
-    for path in sorted((TPU_TESTS / subdir).glob("test_*.py")):
+    """Load every MODEL_CONFIG module of a category, old tree and new."""
+    roots = (TPU_TESTS / subdir, TAXONOMY_TPU_TESTS[subdir])
+    for path in sorted(p for root in roots for p in root.glob("test_*.py")):
         spec = importlib.util.spec_from_file_location(f"dc_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -346,6 +358,7 @@ class TestReservedKindValues(CustomTestCase):
 
     SCAN_ROOTS = (
         TPU_TESTS,
+        *TAXONOMY_TPU_TESTS.values(),
         REPO / "python" / "sglang" / "test" / "tpu",
     )
 
