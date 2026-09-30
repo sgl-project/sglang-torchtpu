@@ -1,13 +1,13 @@
-"""Gemma-4-31B TPU MMMU-Pro nightly score, all 1,730 standard-10 questions."""
+"""Gemma-4-26B-A4B TPU AIME 2026 nightly score, mean of four passes."""
 
 import unittest
 from typing import ClassVar
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
-from sglang.test.tpu.gemma4_31b_eval_common import (
+from sglang.test.tpu.gemma4_eval_common import (
     BASE_URL,
-    CONFIG_MODULE,
+    GEMMA4_26B_A4B,
     HEALTH_TIMEOUT,
     RUNTIME_ENVS,
     make_model_config,
@@ -16,33 +16,33 @@ from sglang.test.tpu.gemma4_31b_eval_common import (
 from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
-    est_time=7200,
-    suite="nightly-tpu-accuracy-gemma4-31b-mmmupro",
+    est_time=4500,
+    suite="nightly-tpu-accuracy-gemma4-26b-a4b-aime",
     nightly=True,
-    labels=["singlehost", "gemma4-31b", "accuracy"],
+    labels=["singlehost", "gemma4-26b-a4b", "accuracy"],
 )
 
 GATE = {
-    "dataset": "mmmu_pro",
-    # sgl-eval's own grader; 31B answers "Answer: $X", which it misses (0.46 vs 0.76 lenient).
-    "label": "mmmu_pro_strict",
-    "runner": make_runner("mmmu_pro"),
+    "dataset": "aime26",
+    "label": "aime26",
+    "runner": make_runner(GEMMA4_26B_A4B, "aime26", n_repeats=4),
     "report_only": True,
 }
 
 MODEL_CONFIG = make_model_config(
-    test_name="gemma4-31b-mmmupro",
-    series_id="accuracy-gemma4-31b-mmmupro",
+    GEMMA4_26B_A4B,
+    test_name="gemma4-26b-a4b-aime",
+    series_id="accuracy-gemma4-26b-a4b-aime",
     gate=GATE,
 )
 
 
-class TestGemma4MMMUPro(TPULauncherTestCase):
-    config_module = CONFIG_MODULE
+class TestGemma26BA4BAIME(TPULauncherTestCase):
+    config_module = GEMMA4_26B_A4B["config_module"]
     base_url = BASE_URL
     health_timeout = HEALTH_TIMEOUT
     health_endpoint = "/health_generate"
-    tag = "gemma4-mmmupro-e2e"
+    tag = "gemma4-26b-a4b-aime-e2e"
     runtime_envs: ClassVar[dict[str, str | None]] = RUNTIME_ENVS
 
     def test_accuracy(self):

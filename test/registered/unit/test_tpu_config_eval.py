@@ -92,6 +92,7 @@ class TestAccuracyRecipes(unittest.TestCase):
     SINGLE_HOST = (
         "recipe/configs/gpt_oss_20b/accuracy.py",
         "recipe/configs/gemma4_31b/accuracy.py",
+        "recipe/configs/gemma4_26b_a4b/accuracy.py",
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):

@@ -9,10 +9,19 @@
 #
 # Single-host models go through run_suite; multihost accuracy uses JobSets.
 # Each model uses the same serving recipe for scheduled and manual runs.
+# MMMU-Pro (the Kimi shards, both Gemma 4 sizes, Qwen3.5-397B) is kept out of the
+# nightly's slices; it runs in the two daytime slots below.
 name: Accuracy Test (TPU)
 run-name: "Accuracy Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }}"
 
 on:
+  # Pacific time, DST-aware like the nightly. `plan` maps each cron to its tests,
+  # so a changed cron must change there too.
+  schedule:
+    - cron: "0 10 * * *"  # mmmu-kimi: both Kimi shards, one 2-host slice each
+      timezone: "America/Los_Angeles"
+    - cron: "0 17 * * *"  # mmmu-gemma4-qwen35: two 1-host slices and one 2-host slice
+      timezone: "America/Los_Angeles"
   workflow_dispatch:
     inputs:
       ref:
@@ -20,12 +29,13 @@ on:
         required: false
         default: main
       model:
-        # `nightly` selects scheduled single-host and multihost accuracy suites.
+        # `nightly` is what the nightly runs (no MMMU-Pro); `mmmu-*` are the two
+        # daytime slots; `all` and `full-set` are everything.
         description: "Which model to evaluate"
         required: false
         default: all
         type: choice
-        options: [all, nightly, full-set, gpt-oss-120b, gpt-oss-20b, gemma4-31b, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b]
+        options: [all, nightly, full-set, mmmu-kimi, mmmu-gemma4-qwen35, gpt-oss-120b, gpt-oss-20b, gemma4, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -56,13 +66,40 @@ on:
         type: string
 
 concurrency:
-  # Only governs standalone dispatches (a called workflow rides the caller's
-  # group). Keyed on ref so runs for different branches proceed in parallel; same
-  # ref still serializes, so a re-dispatch cannot race the previous run's scores.
-  group: tpu-accuracy-${{ inputs.ref || github.ref }}
+  # Only governs standalone runs (a called workflow rides the caller's group).
+  # Keyed on ref so runs for different branches proceed in parallel; same ref
+  # still serializes, so a re-dispatch cannot race the previous run's scores.
+  # Each schedule slot gets its own group: a late Kimi run must not hold 5 PM back.
+  group: tpu-accuracy-${{ github.event.schedule || inputs.ref || github.ref }}
   cancel-in-progress: false
 
 jobs:
+  # The selection every job below filters on: the input when given (a dispatch, or
+  # the nightly's `nightly`), else the schedule slot that fired. A called workflow
+  # sees its caller's event, so the input must win over github.event.schedule.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      model: ${{ steps.p.outputs.model }}
+    steps:
+      - id: p
+        env:
+          MODEL: ${{ inputs.model }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MODEL" ]; then
+            case "$SCHEDULE" in
+              "0 10 * * *") MODEL=mmmu-kimi ;;
+              "0 17 * * *") MODEL=mmmu-gemma4-qwen35 ;;
+              "") MODEL=all ;;
+              # Never fall back to `all`: that would put every eval on the slices.
+              *) echo "::error::no selection for schedule '$SCHEDULE'"; exit 1 ;;
+            esac
+          fi
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "selection: $MODEL"
+
   # Standalone runs build their own image; the nightly passes one in so every
   # stage of the run tests a single build.
   build:
@@ -75,11 +112,11 @@ jobs:
       id-token: write
 
   accuracy:
-    needs: build
+    needs: [build, plan]
     # `build` may be skipped (image passed in); !cancelled() keeps this alive then.
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","gpt-oss-120b"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","gpt-oss-120b"]'), needs.plan.outputs.model) }}
     strategy:
       # A broken benchmark must not cancel the others' scores.
       fail-fast: false
@@ -119,10 +156,10 @@ jobs:
       id-token: write
 
   accuracy-gpt-oss-20b:
-    needs: build
+    needs: [build, plan]
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","full-set","gpt-oss-20b"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","gpt-oss-20b"]'), needs.plan.outputs.model) }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
       ref: ${{ inputs.ref || 'main' }}
@@ -138,25 +175,24 @@ jobs:
       contents: read
       id-token: write
 
-  accuracy-gemma4-31b:
-    needs: build
+  accuracy-gemma4:
+    needs: [build, plan]
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","full-set","gemma4-31b"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","gemma4"]'), needs.plan.outputs.model) }}
     strategy:
       fail-fast: false
       matrix:
-        # One suite per benchmark; timeout_per_file follows each one's measured wall time.
+        # One suite per benchmark and checkpoint, each with a 90-minute budget.
         include:
           - suite: nightly-tpu-accuracy-gemma4-31b-aime
             run_name: accuracy-gemma4-31b-aime
-            timeout_per_file: 5400
           - suite: nightly-tpu-accuracy-gemma4-31b-gpqa
             run_name: accuracy-gemma4-31b-gpqa
-            timeout_per_file: 5400
-          - suite: nightly-tpu-accuracy-gemma4-31b-mmmupro
-            run_name: accuracy-gemma4-31b-mmmupro
-            timeout_per_file: 9000
+          - suite: nightly-tpu-accuracy-gemma4-26b-a4b-aime
+            run_name: accuracy-gemma4-26b-a4b-aime
+          - suite: nightly-tpu-accuracy-gemma4-26b-a4b-gpqa
+            run_name: accuracy-gemma4-26b-a4b-gpqa
     name: ${{ matrix.suite }}
     uses: ./.github/workflows/_tpu-test.yml
     with:
@@ -168,17 +204,47 @@ jobs:
       run_name: ${{ matrix.run_name }}
       nightly: true
       weights_pvc: model-weights
-      timeout_per_file: ${{ matrix.timeout_per_file }}
+      timeout_per_file: 5400
+    permissions:
+      contents: read
+      id-token: write
+
+  # The 5 PM slot, not the nightly: 77 min (31B) and 98 min (26B) measured.
+  accuracy-gemma4-mmmupro:
+    needs: [build, plan]
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","full-set","gemma4","mmmu-gemma4-qwen35"]'), needs.plan.outputs.model) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: nightly-tpu-accuracy-gemma4-31b-mmmupro
+            run_name: accuracy-gemma4-31b-mmmupro
+          - suite: nightly-tpu-accuracy-gemma4-26b-a4b-mmmupro
+            run_name: accuracy-gemma4-26b-a4b-mmmupro
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      timeout_per_file: 9000
     permissions:
       contents: read
       id-token: write
 
   # Scheduled and manually dispatched accuracy share the same multihost suite.
   discover-multihost:
-    needs: build
+    needs: [build, plan]
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","full-set","deepseek-r1-0528","deepseek-v3-1","kimi-k26","qwen3-5-397b"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","mmmu-kimi","mmmu-gemma4-qwen35","deepseek-r1-0528","deepseek-v3-1","kimi-k26","qwen3-5-397b"]'), needs.plan.outputs.model) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -190,7 +256,7 @@ jobs:
           ref: ${{ inputs.ref || 'main' }}
       - id: d
         env:
-          MODEL: ${{ inputs.model || 'all' }}
+          MODEL: ${{ needs.plan.outputs.model }}
           TEST_FILTER: ${{ inputs.test_filter }}
           UPDATE_DASHBOARD: ${{ inputs.update-dashboard }}
         run: |
@@ -201,10 +267,15 @@ jobs:
           fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
                       --suite nightly-tpu-multihost-accuracy)"
-          if [ "$MODEL" != "all" ] && [ "$MODEL" != "nightly" ] && [ "$MODEL" != "full-set" ]; then
-            groups="$(jq -c --arg m "$MODEL" \
-                        '[.[] | select(.name | contains($m | gsub("-"; "_")))]' <<< "$groups")"
-          fi
+          # Rows are named after their test file; every MMMU-Pro file has "mmmu" in it.
+          case "$MODEL" in
+            all|full-set) keep='.' ;;
+            nightly) keep='map(select(.name | contains("mmmu") | not))' ;;
+            mmmu-kimi) keep='map(select(.name | contains("kimi_k26_mmmu")))' ;;
+            mmmu-gemma4-qwen35) keep='map(select(.name | contains("qwen3_5_397b_mmmu")))' ;;
+            *) keep='map(select(.name | contains($m | gsub("-"; "_"))))' ;;
+          esac
+          groups="$(jq -c --arg m "$MODEL" "$keep" <<< "$groups")"
           if [ -n "$TEST_FILTER" ]; then
             groups="$(jq -c --arg f "$TEST_FILTER" \
                         '[.[] | select(.files | contains($f))]' <<< "$groups")"
@@ -217,7 +288,7 @@ jobs:
           echo "discovered groups: $groups"
 
   accuracy-multihost:
-    needs: [build, discover-multihost]
+    needs: [build, plan, discover-multihost]
     if: >-
       ${{ !cancelled() && needs.discover-multihost.result == 'success'
           && needs.discover-multihost.outputs.groups != '[]' }}

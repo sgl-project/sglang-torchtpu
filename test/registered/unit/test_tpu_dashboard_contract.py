@@ -34,8 +34,6 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
-# Accuracy nightlies: the grandfathered tpu/ tree, then the <kind>/<subsystem> layout.
-ACCURACY_DIRS = (TPU_TESTS / "nightly-accuracy", REPO / "test/registered/accuracy/tpu")
 TPU_CI = REPO / ".github" / "tpu-ci"
 WORKFLOWS = REPO / ".github" / "workflows"
 ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
@@ -85,8 +83,7 @@ def _nightly_registered() -> dict:
 
 def _config_modules(subdir: str):
     """Load every MODEL_CONFIG module under test/registered/tpu/<subdir>."""
-    dirs = ACCURACY_DIRS if subdir == "nightly-accuracy" else (TPU_TESTS / subdir,)
-    for path in sorted(p for d in dirs for p in d.glob("test_*.py")):
+    for path in sorted((TPU_TESTS / subdir).glob("test_*.py")):
         spec = importlib.util.spec_from_file_location(f"dc_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -169,42 +166,84 @@ class TestJobMapsToOneTest(CustomTestCase):
                 len(row["files"].split()), 1, f"group {row['name']} bundles files"
             )
 
-    def test_scheduled_accuracy_discovers_every_model(self):
+    @staticmethod
+    def _run_step(step, env):
+        """Run one workflow step's bash; return what it wrote to GITHUB_OUTPUT."""
         import os
         import tempfile
 
+        with tempfile.NamedTemporaryFile() as output:
+            done = subprocess.run(
+                ["bash", "-c", step["run"]],
+                cwd=REPO,
+                env={**os.environ, **env, "GITHUB_OUTPUT": output.name},
+                capture_output=True,
+                text=True,
+            )
+            written = Path(output.name).read_text()
+        return done.returncode, dict(
+            line.split("=", 1) for line in written.splitlines() if line
+        )
+
+    def test_each_schedule_slot_selects_its_tests(self):
+        # A cron edited without its `plan` case would run nothing, or everything.
+        import yaml
+
+        workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
+        plan = workflow["jobs"]["plan"]["steps"][0]
+        crons = [entry["cron"] for entry in workflow[True]["schedule"]]
+        selected = {}
+        for cron in crons:
+            rc, out = self._run_step(plan, {"MODEL": "", "SCHEDULE": cron})
+            self.assertEqual(rc, 0, cron)
+            selected[cron] = out["model"]
+        self.assertEqual(
+            selected,
+            {"0 10 * * *": "mmmu-kimi", "0 17 * * *": "mmmu-gemma4-qwen35"},
+        )
+        # A called run sees its caller's schedule; the nightly's input must win.
+        _, out = self._run_step(plan, {"MODEL": "nightly", "SCHEDULE": "0 1 * * *"})
+        self.assertEqual(out["model"], "nightly")
+        rc, _ = self._run_step(plan, {"MODEL": "", "SCHEDULE": "0 3 * * *"})
+        self.assertNotEqual(rc, 0, "an unknown schedule must not fall back to all")
+
+    def test_scheduled_accuracy_discovers_every_model(self):
         import yaml
 
         workflow = yaml.safe_load((WORKFLOWS / "accuracy-test-tpu.yml").read_text())
         job = workflow["jobs"]["discover-multihost"]
-        self.assertIn('"nightly"', job["if"])
         step = next(s for s in job["steps"] if s.get("id") == "d")
-        with tempfile.NamedTemporaryFile() as output:
-            subprocess.run(
-                ["bash", "-c", step["run"]],
-                cwd=REPO,
-                env={
-                    **os.environ,
-                    "MODEL": "nightly",
-                    "TEST_FILTER": "",
-                    "UPDATE_DASHBOARD": "false",
-                    "GITHUB_OUTPUT": output.name,
-                },
-                check=True,
-                capture_output=True,
-                text=True,
+
+        def discover(model):
+            self.assertIn(f'"{model}"', job["if"])
+            rc, out = self._run_step(
+                step, {"MODEL": model, "TEST_FILTER": "", "UPDATE_DASHBOARD": "false"}
             )
-            groups = json.loads(Path(output.name).read_text().removeprefix("groups="))
+            self.assertEqual(rc, 0, model)
+            return json.loads(out["groups"])
+
+        names = {
+            model: {g["name"] for g in discover(model)}
+            for model in ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35", "full-set")
+        }
         self.assertEqual(
-            {g["name"] for g in groups},
+            names["nightly"],
             {
                 "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
                 "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
-                "test_tpu_kimi_k26_mmmu_shard0",
-                "test_tpu_kimi_k26_mmmu_shard1",
-                "test_tpu_qwen3_5_397b_mmmupro",
             },
         )
+        self.assertEqual(
+            names["mmmu-kimi"],
+            {"test_tpu_kimi_k26_mmmu_shard0", "test_tpu_kimi_k26_mmmu_shard1"},
+        )
+        self.assertEqual(names["mmmu-gemma4-qwen35"], {"test_tpu_qwen3_5_397b_mmmupro"})
+        # Every multihost accuracy file runs in exactly one scheduled selection.
+        scheduled = [names[m] for m in ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35")]
+        self.assertEqual(set().union(*scheduled), names["full-set"])
+        self.assertEqual(sum(map(len, scheduled)), len(names["full-set"]))
+
+        groups = discover("full-set")
         recipes = [g["launch_script"] for g in groups]
         self.assertEqual(recipes.count("recipe/deepseek_r1_0528_fp8kv_mh.sh"), 1)
         self.assertEqual(recipes.count("recipe/kimi_k26_mmmu.sh"), 2)
@@ -217,14 +256,27 @@ class TestJobMapsToOneTest(CustomTestCase):
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
         self.assertIn('"nightly"', gpt["if"])
         self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
-        gemma = workflow["jobs"]["accuracy-gemma4-31b"]
-        self.assertIn('"nightly"', gemma["if"])
+
+        def suites(job_name):
+            legs = workflow["jobs"][job_name]["strategy"]["matrix"]["include"]
+            return {leg["suite"] for leg in legs}
+
+        sizes = ("31b", "26b-a4b")
+        self.assertIn('"nightly"', workflow["jobs"]["accuracy-gemma4"]["if"])
         self.assertEqual(
-            {leg["suite"] for leg in gemma["strategy"]["matrix"]["include"]},
+            suites("accuracy-gemma4"),
             {
-                f"nightly-tpu-accuracy-gemma4-31b-{bench}"
-                for bench in ("aime", "gpqa", "mmmupro")
+                f"nightly-tpu-accuracy-gemma4-{size}-{bench}"
+                for size in sizes
+                for bench in ("aime", "gpqa")
             },
+        )
+        mmmu = workflow["jobs"]["accuracy-gemma4-mmmupro"]["if"]
+        self.assertNotIn('"nightly"', mmmu)
+        self.assertIn('"mmmu-gemma4-qwen35"', mmmu)
+        self.assertEqual(
+            suites("accuracy-gemma4-mmmupro"),
+            {f"nightly-tpu-accuracy-gemma4-{size}-mmmupro" for size in sizes},
         )
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertEqual(nightly["jobs"]["accuracy"]["with"]["model"], "nightly")

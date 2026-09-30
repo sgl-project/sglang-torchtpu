@@ -97,8 +97,8 @@ jobs:
       contents: read
       id-token: write
 
-  # Stage [2]: scheduled single-host and multihost accuracy suites.
-  # Uses the same serving recipes as manually dispatched accuracy runs.
+  # Stage [2]: scheduled single-host and multihost accuracy suites, minus MMMU-Pro,
+  # which accuracy-test-tpu.yml runs on its own 10 AM / 5 PM schedule.
   accuracy:
     needs: build
     if: ${{ contains(fromJSON('["all","accuracy"]'), inputs.only || 'all') }}

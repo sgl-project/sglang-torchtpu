@@ -608,7 +608,7 @@ class TestPerfConfigsAreValid(CustomTestCase):
     """
 
     def _perf_modules(self):
-        found = list(_config_modules("tpu/nightly-perf", "test_tpu_perf_*.py"))
+        found = list(_config_modules("nightly-perf", "test_tpu_perf_*.py"))
         self.assertTrue(found, "no perf test files found; did they move?")
         yield from found
 
@@ -658,11 +658,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
     """
 
     def _accuracy_modules(self):
-        # The grandfathered tpu/ tree, then the <kind>/<subsystem> layout.
-        found = [
-            *_config_modules("tpu/nightly-accuracy", "test_tpu_*.py"),
-            *_config_modules("accuracy/tpu", "test_tpu_*.py"),
-        ]
+        found = list(_config_modules("nightly-accuracy", "test_tpu_*.py"))
         self.assertTrue(found, "no accuracy test files found; did they move?")
         yield from found
 
@@ -772,11 +768,13 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
 
 
 def _config_modules(subdir, pattern):
-    """Load every matching MODEL_CONFIG module under test/registered/<subdir>."""
+    """Load every matching MODEL_CONFIG module under test/registered/tpu/<subdir>."""
     import importlib.util
     from pathlib import Path
 
-    for path in sorted((Path(__file__).resolve().parents[1] / subdir).glob(pattern)):
+    for path in sorted(
+        (Path(__file__).resolve().parents[1] / "tpu" / subdir).glob(pattern)
+    ):
         spec = importlib.util.spec_from_file_location(f"cfg_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)

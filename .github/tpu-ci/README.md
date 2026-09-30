@@ -630,8 +630,17 @@ template + `_tpu-build`/`_tpu-test`.
 ### Full accuracy runs from an unmerged branch
 
 The scheduled accuracy suite includes R1-0528 (GPQA, AIME25, full MMLU-Redux
-2.0), V3.1, GPT-OSS-20B, Gemma-4-31B (AIME26, GPQA, MMMU-Pro), Qwen3.5-397B
-(MMMU-Pro) and two Kimi MMMU-Pro shards. Each Kimi shard uses its
+2.0), V3.1, GPT-OSS-20B, Gemma-4-31B and Gemma-4-26B-A4B (AIME26, GPQA,
+MMMU-Pro each), Qwen3.5-397B (MMMU-Pro) and two Kimi MMMU-Pro shards.
+
+MMMU-Pro stays off the nightly's slices. `accuracy-test-tpu.yml` runs it on its
+own schedule, in Pacific time: the Kimi shards at 10:00 (`model=mmmu-kimi`, both
+2-host slices for up to ~5 h), and both Gemma 4 sizes plus Qwen3.5 at 17:00
+(`model=mmmu-gemma4-qwen35`, two 1-host slices and one 2-host slice). Scheduled
+runs reach the dashboard like the nightly's; they appear after the next daily
+sync (12:00 UTC). `model=nightly` is everything else.
+
+Each Kimi shard uses its
 own two-host 2x2x2 slice and evaluates 865 distinct questions, one pass at 98,304
 output tokens. The two independent TP16/EP16 servers provide data parallelism
 by splitting requests; each uses DP size 1 with DP attention disabled, 128
@@ -648,12 +657,11 @@ admits up to 128 requests. V3.1 also retains a single 250-question MMLU subset.
 These gates use the existing pinned sgl-eval harness, not the OpenAI CLI used
 by the separate manual tpu-inference comparison.
 
-Gemma-4-31B runs one single-host job per benchmark, and Qwen3.5-397B one
-two-host job; both score all 1,730 MMMU-Pro questions with sgl-eval's own grader,
-thinking on through `enable_thinking`. Gemma-4-31B's score is published as
-`mmmu_pro_strict`: the model answers `Answer: $X`, which that grader misses.
-New files live in `test/registered/accuracy/tpu/` (the registered-test
-taxonomy); the older ones stay in `tpu/nightly-accuracy/`.
+Each Gemma 4 size runs one single-host job per benchmark, and Qwen3.5-397B one
+two-host job; all score the 1,730 MMMU-Pro questions with sgl-eval's own grader,
+thinking on through `enable_thinking`. Gemma 4 publishes it as `mmmu_pro_strict`,
+apart from the lenient manual re-grades: 31B answers `Answer: $X`, which that
+grader misses.
 
 Redux generates all 5,700 rows at 65,536 output tokens, scoring only rows marked
 `ok` or with an unambiguous corrected answer key (5,431 rows in the pinned
@@ -668,7 +676,7 @@ gh workflow run accuracy-test-tpu.yml --ref test/deepseek-r1-0528-dpa \
 ```
 
 `model=full-set` selects one serving configuration each for R1-0528, V3.1,
-GPT-OSS-20B, Gemma-4-31B, Qwen3.5-397B and Kimi. Kimi has two jobs using the same recipe, solely to split
+GPT-OSS-20B, both Gemma 4 sizes, Qwen3.5-397B and Kimi. Kimi has two jobs using the same recipe, solely to split
 MMMU-Pro into disjoint halves. The former R1 DPA variant and older on-demand
 R1/Kimi accuracy entries are removed. Feature-specific tests remain separate.
 

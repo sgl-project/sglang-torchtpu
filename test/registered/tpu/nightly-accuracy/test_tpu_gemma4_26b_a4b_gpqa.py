@@ -1,13 +1,13 @@
-"""Gemma-4-31B TPU GPQA Diamond nightly score, mean of four passes."""
+"""Gemma-4-26B-A4B TPU GPQA Diamond nightly score, mean of four passes."""
 
 import unittest
 from typing import ClassVar
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
-from sglang.test.tpu.gemma4_31b_eval_common import (
+from sglang.test.tpu.gemma4_eval_common import (
     BASE_URL,
-    CONFIG_MODULE,
+    GEMMA4_26B_A4B,
     HEALTH_TIMEOUT,
     RUNTIME_ENVS,
     make_model_config,
@@ -17,31 +17,32 @@ from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=4500,
-    suite="nightly-tpu-accuracy-gemma4-31b-gpqa",
+    suite="nightly-tpu-accuracy-gemma4-26b-a4b-gpqa",
     nightly=True,
-    labels=["singlehost", "gemma4-31b", "accuracy"],
+    labels=["singlehost", "gemma4-26b-a4b", "accuracy"],
 )
 
 GATE = {
     "dataset": "gpqa",
     "label": "gpqa_diamond",
-    "runner": make_runner("gpqa", n_repeats=4),
+    "runner": make_runner(GEMMA4_26B_A4B, "gpqa", n_repeats=4),
     "report_only": True,
 }
 
 MODEL_CONFIG = make_model_config(
-    test_name="gemma4-31b-gpqa",
-    series_id="accuracy-gemma4-31b-gpqa",
+    GEMMA4_26B_A4B,
+    test_name="gemma4-26b-a4b-gpqa",
+    series_id="accuracy-gemma4-26b-a4b-gpqa",
     gate=GATE,
 )
 
 
-class TestGemma4GPQA(TPULauncherTestCase):
-    config_module = CONFIG_MODULE
+class TestGemma26BA4BGPQA(TPULauncherTestCase):
+    config_module = GEMMA4_26B_A4B["config_module"]
     base_url = BASE_URL
     health_timeout = HEALTH_TIMEOUT
     health_endpoint = "/health_generate"
-    tag = "gemma4-gpqa-e2e"
+    tag = "gemma4-26b-a4b-gpqa-e2e"
     runtime_envs: ClassVar[dict[str, str | None]] = RUNTIME_ENVS
 
     def test_accuracy(self):
