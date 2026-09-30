@@ -17,21 +17,6 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 
-from sglang.kernels.ops.activation.activation import (
-    silu_and_mul_with_activation_rounding_,
-)
-from sglang.kernels.ops.diffusion import (
-    can_use_fused_inplace_qknorm_rope,
-    can_use_mxfp8_swizzled,
-    can_use_silu_mul_mxfp8,
-    fused_inplace_qknorm_rope,
-    indexed_gate_bf16,
-    indexed_gate_bf16_,
-    indexed_scale_shift_bf16_,
-    indexed_scale_shift_mxfp8_,
-    silu_mul_mxfp8,
-)
-from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -82,6 +67,12 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     native_adaln_weight_files,
+)
+from sglang.multimodal_gen.runtime.models.dits.minimax_h3_ops import (
+    _apply_qk_norm,
+    _modulate_gate,
+    _modulate_scale_shift,
+    _silu_mul,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn_attention import (
     MiniMaxH3VDNHybridAttention,
@@ -373,98 +364,6 @@ def _accepts_mxfp8_input(linear: nn.Module) -> bool:
     return linear.quant_method is not None and linear.quant_method.accepts_mxfp8_input(
         linear
     )
-
-
-def _modulate_scale_shift(
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
-    # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
-    if (
-        x.is_cuda
-        and x.dtype == _BF16_DTYPE
-        and dtype == _BF16_DTYPE
-        and shift.dtype == _BF16_DTYPE
-        and scale.dtype == _BF16_DTYPE
-        and x.is_contiguous()
-    ):
-        return indexed_scale_shift_bf16_(x, shift, scale, indices)
-    return (
-        x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
-    ).to(dtype)
-
-
-def _modulate_gate(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    other: torch.Tensor,
-    indices: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    allow_inplace: bool = True,
-) -> torch.Tensor:
-    """Apply an indexed gated residual, optionally reusing the input buffer."""
-    # Apply the per-index gated residual: x + gate[idx] * other.
-    if (
-        x.is_cuda
-        and x.dtype == _BF16_DTYPE
-        and dtype == _BF16_DTYPE
-        and gate.dtype == _BF16_DTYPE
-        and other.dtype == _BF16_DTYPE
-        and x.is_contiguous()
-        and other.is_contiguous()
-    ):
-        if allow_inplace:
-            return indexed_gate_bf16_(x, gate, other, indices)
-        return indexed_gate_bf16(x, gate, other, indices)
-    return (x + gate.index_select(0, indices) * other).to(dtype)
-
-
-def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
-    if (
-        reuse_input
-        and hidden.is_cuda
-        and hidden.dtype == _BF16_DTYPE
-        and hidden.is_contiguous()
-        and hidden.shape[-1] % 16 == 0
-    ):
-        return silu_and_mul_with_activation_rounding_(hidden)
-    gate, up = hidden.chunk(2, dim=-1)
-    return nn.functional.silu(gate) * up
-
-
-def _apply_qk_norm(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_norm: nn.RMSNorm,
-    k_norm: nn.RMSNorm,
-    head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        q.is_cuda
-        and q.dtype == _BF16_DTYPE
-        and q.dtype == k.dtype == q_norm.weight.dtype == k_norm.weight.dtype
-        and q.stride(-1) == k.stride(-1) == 1
-        and q.stride(-2) == k.stride(-2) == head_dim
-        and q_norm.eps == k_norm.eps
-        and not torch.compiler.is_compiling()
-        and current_platform.is_cuda()
-    ):
-        fused_inplace_qknorm(
-            q,
-            k,
-            q_norm.weight,
-            k_norm.weight,
-            eps=q_norm.eps,
-            head_dim=head_dim,
-        )
-        return q, k
-    return q_norm(q), k_norm(k)
 
 
 class MiniMaxH3Rope(nn.Module):
@@ -808,9 +707,11 @@ class MiniMaxH3Attention(nn.Module):
         self.k_norm = _norm(arch.attention_head_dim, eps=arch.qk_norm_eps)
         # cache width covers cos/sin for temporal, height, and width frequencies
         rope_dim = 6 * arch.rope_inv_freq_len
-        self._use_fused_qknorm_rope = (
-            current_platform.is_cuda()
-            and can_use_fused_inplace_qknorm_rope(
+        self._use_fused_qknorm_rope = False
+        if current_platform.is_cuda():
+            from sglang.kernels.ops.diffusion import can_use_fused_inplace_qknorm_rope
+
+            self._use_fused_qknorm_rope = can_use_fused_inplace_qknorm_rope(
                 arch.attention_head_dim,
                 rope_dim,
                 True,
@@ -818,7 +719,6 @@ class MiniMaxH3Attention(nn.Module):
                 cache_dtype=_BF16_DTYPE,
                 round_norm_before_rope=True,
             )
-        )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
             arch.hidden_size,
@@ -1104,10 +1004,13 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm,
                 self.k_norm,
                 self.head_dim,
+                cuda_platform=current_platform.is_cuda(),
             )
         else:
             cos_sin_cache, positions = rope_cache
             if self._use_fused_qknorm_rope and not torch.compiler.is_compiling():
+                from sglang.kernels.ops.diffusion import fused_inplace_qknorm_rope
+
                 fused_inplace_qknorm_rope(
                     q,
                     k,
@@ -1128,6 +1031,7 @@ class MiniMaxH3Attention(nn.Module):
                     self.q_norm,
                     self.k_norm,
                     self.head_dim,
+                    cuda_platform=current_platform.is_cuda(),
                 )
                 q, k = _apply_rope_qk(q, k, cos_sin_cache, positions)
 
@@ -1211,9 +1115,15 @@ class MiniMaxH3MLP(nn.Module):
                 torch.mps.empty_cache()
             return out
         hidden, _ = self.fc1(x)
-        if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):
-            out, _ = self.fc2(silu_mul_mxfp8(hidden))
-            return out
+        if _accepts_mxfp8_input(self.fc2):
+            from sglang.kernels.ops.diffusion import (
+                can_use_silu_mul_mxfp8,
+                silu_mul_mxfp8,
+            )
+
+            if can_use_silu_mul_mxfp8(hidden):
+                out, _ = self.fc2(silu_mul_mxfp8(hidden))
+                return out
         hidden = _silu_mul(hidden, reuse_input=self.reuse_fc1_activation)
         out, _ = self.fc2(hidden)
         return out
@@ -1426,7 +1336,16 @@ class MiniMaxH3DiTBlock(nn.Module):
         residual = x
         h = self.norm1(x)
         h_prequant = None
-        if _accepts_mxfp8_input(self.attn.qkv_proj) and can_use_mxfp8_swizzled(h):
+        if _accepts_mxfp8_input(self.attn.qkv_proj):
+            from sglang.kernels.ops.diffusion import (
+                can_use_mxfp8_swizzled,
+                indexed_scale_shift_mxfp8_,
+            )
+
+            use_mxfp8_qkv = can_use_mxfp8_swizzled(h)
+        else:
+            use_mxfp8_qkv = False
+        if use_mxfp8_qkv:
             # the bf16 modulated rows stay in h for the VDN branch projections
             h, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
                 h, shift_msa, scale_msa, combined_indices, keep_bf16=True
@@ -1458,7 +1377,16 @@ class MiniMaxH3DiTBlock(nn.Module):
 
         residual = x
         h = self.norm2(x)
-        if _accepts_mxfp8_input(self.mlp.fc1) and can_use_mxfp8_swizzled(h):
+        if _accepts_mxfp8_input(self.mlp.fc1):
+            from sglang.kernels.ops.diffusion import (
+                can_use_mxfp8_swizzled,
+                indexed_scale_shift_mxfp8_,
+            )
+
+            use_mxfp8_mlp = can_use_mxfp8_swizzled(h)
+        else:
+            use_mxfp8_mlp = False
+        if use_mxfp8_mlp:
             _, h_fp8, h_scales = indexed_scale_shift_mxfp8_(
                 h, shift_mlp, scale_mlp, combined_indices, keep_bf16=False
             )
