@@ -253,6 +253,87 @@ class TestGDNAttentionOp(CustomTestCase):
             rec_t.cpu().numpy(), np.asarray(rec_ref), rtol=2e-2, atol=2e-2
         )
 
+    def _kda_case(self):
+        # KDA runs without GQA: n_kq == n_v, per-channel gate and dt_bias.
+        n_v, d_k, d_v, K = 4, self.D_K, self.D_V, self.K
+        lengths = [1, 1, 64]
+        rng = np.random.default_rng(1)
+
+        def rn(*shape):
+            return rng.standard_normal(shape).astype(np.float32)
+
+        num_tokens, num_blocks = sum(lengths), len(lengths) + 1
+        conv_dim = 2 * n_v * d_k + n_v * d_v
+        args = (
+            rn(num_tokens, conv_dim),
+            rn(num_tokens, n_v),
+            rn(num_tokens, n_v * d_k),
+            np.zeros((num_blocks, K - 1, conv_dim), np.float32),
+            np.zeros((num_blocks, n_v, d_k, d_v), np.float32),
+            rn(conv_dim, 1, K),
+            rn(conv_dim),
+            rn(n_v),
+            rn(n_v, d_k),
+            np.array([0, 1, 2, 66], np.int32),
+            np.arange(1, len(lengths) + 1, dtype=np.int32),
+            np.array([2, 3, 3], np.int32),
+            np.array(lengths, np.int32),
+        )
+        return args, (n_v, n_v, d_k, d_v, K)
+
+    def test_kda_op_lowers_under_cpu_export_pin(self):
+        """KDA mode through the op, in the server's CPU-pinned export config."""
+        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+
+        args, dims = self._kda_case()
+        dev = torch.device("tpu")
+        t = [torch.from_numpy(np.ascontiguousarray(x)).to(dev) for x in args]
+        out = build_gdn_pallas_op()(*t, *dims, True, -5.0)
+
+        n_v, d_v = dims[1], dims[3]
+        out_np = out.cpu().numpy()
+        self.assertEqual(out_np.shape, (args[0].shape[0], n_v * d_v))
+        self.assertTrue(np.isfinite(out_np).all(), "output has NaN/Inf")
+        self.assertTrue((t[3].cpu().numpy() != 0).any(), "conv_state not written")
+        self.assertTrue((t[4].cpu().numpy() != 0).any(), "recurrent_state not written")
+
+    @unittest.skipUnless(_has_tpu_via_jax(), _SKIP_REASON_JAX_TPU)
+    def test_kda_op_matches_kernel(self):
+        """The op forwards KDA mode and the gate bound to the kernel unchanged."""
+        from sglang.srt.hardware_backend.tpu.attention_gdn_pallas import (
+            build_gdn_pallas_op,
+        )
+        from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+        from sglang.srt.layers.attention.pallas.gdn.config import AttentionMode
+
+        args, (n_kq, n_v, d_k, d_v, K) = self._kda_case()
+        (conv_ref, rec_ref), out_ref = fused_conv1d_gdn(
+            *[jnp.asarray(x) for x in args],
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=K,
+            attention_mode=AttentionMode.KDA,
+            gate_lower_bound=-5.0,
+        )
+
+        dev = torch.device("tpu")
+        t = [torch.from_numpy(np.ascontiguousarray(x)).to(dev) for x in args]
+        out_t = build_gdn_pallas_op()(*t, n_kq, n_v, d_k, d_v, K, True, -5.0)
+
+        np.testing.assert_allclose(
+            out_t.cpu().numpy(), np.asarray(out_ref), rtol=2e-2, atol=5e-3
+        )
+        np.testing.assert_allclose(
+            t[3].cpu().numpy(), np.asarray(conv_ref), rtol=2e-2, atol=2e-2
+        )
+        np.testing.assert_allclose(
+            t[4].cpu().numpy(), np.asarray(rec_ref), rtol=2e-2, atol=2e-2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

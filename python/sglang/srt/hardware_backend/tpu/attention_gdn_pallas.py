@@ -57,7 +57,8 @@ def build_gdn_pallas_op():
 
         gdn(qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias,
             a_log, dt_bias, query_start_loc, state_indices, distribution,
-            seq_lens, n_kq, n_v, d_k, d_v, kernel_size) -> output
+            seq_lens, n_kq, n_v, d_k, d_v, kernel_size, kda=False,
+            gate_lower_bound=None) -> output
 
     ``conv_state`` and ``recurrent_state`` are updated in place (declared as
     ``mutates_args``); the returned tensor is the fused attention output of
@@ -72,6 +73,7 @@ def build_gdn_pallas_op():
 
     from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
     from sglang.srt.layers.attention.pallas.gdn import fused_conv1d_gdn
+    from sglang.srt.layers.attention.pallas.gdn.config import AttentionMode
 
     # Shapes whose kernel is already compiled, so the export guard below can be
     # skipped on the hot path. Per-op (this builder runs once).
@@ -98,6 +100,8 @@ def build_gdn_pallas_op():
         d_k: int,
         d_v: int,
         kernel_size: int,
+        kda: bool,
+        gate_lower_bound: Optional[float],
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         # The GDN kernel sizes its tiling from `pltpu.get_tpu_info().num_lanes`
         # (gdn/wrapper.py), but distributed Pallas programs are exported through
@@ -126,6 +130,8 @@ def build_gdn_pallas_op():
                 d_k=d_k,
                 d_v=d_v,
                 kernel_size=kernel_size,
+                attention_mode=AttentionMode.KDA if kda else AttentionMode.GDN,
+                gate_lower_bound=gate_lower_bound,
             )
         # Flatten the ((conv, rec), out) return so the bridge can alias the two
         # state buffers (outputs 0, 1) back onto the donated inputs (args 3, 4).
@@ -140,8 +146,8 @@ def build_gdn_pallas_op():
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
-        # n_kq, n_v, d_k, d_v, kernel_size are compile-time static.
-        static_argnums=(13, 14, 15, 16, 17),
+        # n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound are static.
+        static_argnums=(13, 14, 15, 16, 17, 18, 19),
         donate_argnums=(3, 4),
         input_output_aliases={3: 0, 4: 1},
         warn_deprecated=False,
@@ -171,6 +177,8 @@ def build_gdn_pallas_op():
         d_k: int,
         d_v: int,
         kernel_size: int,
+        kda: bool = False,
+        gate_lower_bound: Optional[float] = None,
     ) -> torch.Tensor:
         # Second half of the CPU-mesh export guard (see `_wrapped`). Mosaic
         # lowering queries TPU metadata again (`_check_block_mappings` ->
@@ -183,7 +191,7 @@ def build_gdn_pallas_op():
         # them (pallas_jax_op.py guards the same way). Keyed by shape rather
         # than a one-shot flag because each token/batch bucket compiles
         # separately.
-        key = (qkv.shape[0], n_kq, n_v, d_k, d_v, kernel_size)
+        key = (qkv.shape[0], n_kq, n_v, d_k, d_v, kernel_size, kda, gate_lower_bound)
         if key in _exported_shapes:
             _new_conv, _new_rec, output = jax_kernel(
                 qkv,
@@ -204,6 +212,8 @@ def build_gdn_pallas_op():
                 d_k,
                 d_v,
                 kernel_size,
+                kda,
+                gate_lower_bound,
             )
         else:
             with (
@@ -229,6 +239,8 @@ def build_gdn_pallas_op():
                     d_k,
                     d_v,
                     kernel_size,
+                    kda,
+                    gate_lower_bound,
                 )
             _exported_shapes.add(key)
         return output
@@ -252,6 +264,8 @@ def build_gdn_pallas_op():
         d_k: int,
         d_v: int,
         kernel_size: int,
+        kda: bool = False,
+        gate_lower_bound: Optional[float] = None,
     ) -> torch.Tensor:
         num_tokens = qkv.shape[0]
         return qkv.new_empty((num_tokens, n_v * d_v))

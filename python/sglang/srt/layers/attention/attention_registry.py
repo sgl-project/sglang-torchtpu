@@ -522,6 +522,15 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
                 linear_attn_backend = AscendKDAAttnBackend(runner)
                 hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            elif is_tpu():
+                from sglang.srt.hardware_backend.tpu.attention_kda_pallas import (
+                    TpuKDAAttnBackend,
+                )
+
+                logger.info(
+                    "Using TPU KDA linear-attention backend for Kimi linear models."
+                )
+                linear_attn_backend = TpuKDAAttnBackend(runner)
             else:
                 linear_attn_backend = KDAAttnBackend(runner)
         elif glm5_next_config(runner.model_config) is not None:

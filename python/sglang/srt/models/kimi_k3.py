@@ -1759,6 +1759,17 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
 
+    def _bind_tpu_attn_weights(self) -> None:
+        # TPU weight materialization re-creates these parameters after __init__
+        # bound them; rebind once post-load, never inside the compiled forward.
+        self.attn.conv_weights = self.qkv_conv1d.weight.squeeze(1)
+        self.attn.bias = self.qkv_conv1d.bias
+        # The kernel takes A_log as [n_v].
+        self.attn.A_log = nn.Parameter(
+            self.A_log.detach().reshape(-1).clone(), requires_grad=False
+        )
+        self.attn.dt_bias = self.dt_bias
+
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
         one GEMM covers the whole in-proj, and take _bfa_w as a tail view of
@@ -2010,9 +2021,9 @@ class KimiK3DeltaAttention(nn.Module):
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unflatten(-1, (-1, self.head_dim))
-            if not forward_batch.forward_mode.is_target_verify():
+            if not (_is_tpu or forward_batch.forward_mode.is_target_verify()):
                 # Only chunk_kda (extend) wants pre-activated beta; the verify
-                # kernel sigmoids it in-kernel like decode.
+                # kernel and the TPU fused kernel sigmoid it in-kernel like decode.
                 beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -3372,6 +3383,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                     bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
+                if _is_tpu:
+                    layer.self_attn._bind_tpu_attn_weights()
                 layer.self_attn._prepare_fused_decode()
 
         for layer in self.model.layers:

@@ -29,10 +29,14 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
 )
+from sglang.srt.utils.common import is_tpu
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+_is_tpu = is_tpu()
 
 
 class RadixLinearAttention(nn.Module):
@@ -113,8 +117,12 @@ class RadixLinearAttention(nn.Module):
 
         # Target verify rebuilds query_start_loc from the physical padded input,
         # unlike ordinary extend where it retains the logical sequence ends.
+        # TPU backends mask padding via query_start_loc inside a compiled bucket;
+        # trimming to the real length would respecialize the graph per request.
         should_trim_padded_extend = (
-            is_extend and not forward_batch.forward_mode.is_target_verify()
+            is_extend
+            and not _is_tpu
+            and not forward_batch.forward_mode.is_target_verify()
         )
         real_num_tokens = (
             getattr(forward_batch, "global_num_token_non_padded_cpu", None)
