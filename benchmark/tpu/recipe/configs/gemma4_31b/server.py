@@ -14,8 +14,8 @@ from benchmark.tpu.recipe.configs.base import _FP8_BASE_CONFIG
 
 INPUT_TOKENS = 8192
 OUTPUT_TOKENS = 1024
-# Largest concurrency this server is sized for; max_running_requests and
-# torch_compile_max_bs follow it so one boot covers c=1..CONCURRENCY.
+# max_running_requests and torch_compile_max_bs follow it, so one boot covers
+# c=1..CONCURRENCY.
 CONCURRENCY = 64
 CONTEXT_LENGTH = INPUT_TOKENS + OUTPUT_TOKENS
 
@@ -24,9 +24,8 @@ CONFIG["server_args"].update(
     {
         "model_path": "google/gemma-4-31B-it",
         "tp_size": 8,
-        # bf16 checkpoint. "unquant" is the explicit opt-out rather than None:
-        # it also sets _quantization_explicitly_unset, so the model overrides
-        # cannot re-detect a quant method.
+        # "unquant", not None: it also sets _quantization_explicitly_unset, so
+        # the model overrides cannot re-detect a quant method.
         "quantization": "unquant",
         "kv_cache_dtype": "bfloat16",
         "max_running_requests": CONCURRENCY,
@@ -34,16 +33,15 @@ CONFIG["server_args"].update(
         "context_length": CONTEXT_LENGTH,
         "chunked_prefill_size": INPUT_TOKENS,
         "max_prefill_tokens": INPUT_TOKENS,
-        # Bounds the hybrid pool: 10 global layers at head_dim 512, 50 sliding
-        # at 256. Compile materializes the KV pool as graph args + outputs, so
-        # an unbounded pool doubles the precompile footprint.
+        # Compile materializes the KV pool as graph args + outputs, so an
+        # unbounded pool doubles the precompile footprint.
         "max_total_tokens": 131072,
         "mem_fraction_static": 0.35,
-        # The EXTEND/decode graph captures outlast the 300s default and trip
-        # the watchdog into repeated stack dumps mid-compile.
+        # The EXTEND/decode captures outlast the 300s default and trip the
+        # watchdog into repeated stack dumps mid-compile.
         "watchdog_timeout": 3600,
     }
 )
-# The multimodal wrapper runs eagerly around the compiled text model; bump the
-# positions out of place rather than mutating the batch's tensor in place.
+# The wrapper runs eagerly around the compiled text model, so the position bump
+# must not mutate the batch's tensor in place.
 CONFIG["runtime_env"].update({"SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION": "1"})

@@ -30,6 +30,10 @@ from transformers import (
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.tpu.vision_shapes import (
+    pad_patches_to_bucket,
+    patch_count_buckets,
+)
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -78,18 +82,6 @@ _is_tpu = is_tpu()
 def _mm_features_out(features: torch.Tensor) -> torch.Tensor:
     # TPU places multimodal rows on the host (mm_embed_tpu), like the ViT runner's output.
     return features.to("cpu") if _is_tpu else features
-
-
-def _pad_image_patches(
-    pixel_values: torch.Tensor, position_ids: torch.Tensor, num_patches: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pad [batch, patches, ...] to num_patches; position -1 marks padding."""
-    pad = num_patches - pixel_values.shape[-2]
-    if pad <= 0:
-        return pixel_values, position_ids
-    pixel_values = torch.nn.functional.pad(pixel_values, (0, 0, 0, pad))
-    position_ids = torch.nn.functional.pad(position_ids, (0, 0, 0, pad), value=-1)
-    return pixel_values, position_ids
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -251,10 +243,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.audio_tower = None
             self.embed_audio = None
 
-        # TPU pads every image to this many patches (max soft tokens x pooling^2).
-        self._max_image_patches = (
-            config.vision_soft_tokens_per_image
-            * config.vision_config.pooling_kernel_size**2
+        # Patch counts follow the image aspect ratio, so the eager TPU tower is
+        # fed a bounded ladder of shapes instead of one per image.
+        pooling_window = config.vision_config.pooling_kernel_size**2
+        self._patch_buckets = (
+            patch_count_buckets(
+                config.vision_soft_tokens_per_image * pooling_window,
+                align=pooling_window,
+            )
+            if _is_tpu
+            else []
         )
         self.vocab_size = config.text_config.vocab_size
         self.vocab_size_per_layer_input = getattr(
@@ -270,10 +268,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("language_model", prefix),
         )
 
-        # TPU: compile only the text model, so the vision tower and the embed
-        # merge run eagerly (mirrors Kimi-K2.5). PLE variants (E2B/E4B) pass a
-        # per_layer_inputs tensor the VL policy does not warm; they keep the
-        # whole-model compile.
+        # Compile the text model only, leaving the tower and embed merge eager
+        # (mirrors Kimi-K2.5). PLE variants pass a per_layer_inputs tensor the
+        # VL policy does not warm, so they keep the whole-model compile.
         has_ple = (text_config.hidden_size_per_layer_input or 0) > 0
         if _is_tpu and not has_ple:
             from sglang.srt.compilation.support_torch_compile import (
@@ -494,9 +491,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     pp = pp.unsqueeze(0)
 
                 if _is_tpu:
-                    # Eager torch_tpu compiles each op per input shape, and patch
-                    # counts vary with aspect ratio: pad to one fixed shape.
-                    pv, pp = _pad_image_patches(pv, pp, self._max_image_patches)
+                    pv, pp = pad_patches_to_bucket(pv, pp, self._patch_buckets)
                 pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
                 pp = pp.to(device=vt.device)
 
@@ -504,7 +499,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
                 for hs, mask in zip(pooled, pooler_mask):
                     if _is_tpu:
-                        # embed_vision is per-token: run it at the padded shape.
+                        # Per-token, so it runs at the padded shape and unpads after.
                         embedded = self.embed_vision(inputs_embeds=hs.unsqueeze(0))
                         all_embeds.append(embedded.squeeze(0)[mask])
                         continue

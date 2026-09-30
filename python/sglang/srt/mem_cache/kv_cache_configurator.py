@@ -1776,14 +1776,10 @@ class KVCacheConfigurator:
             ),
             head_dim=self.model_config.head_dim,
             swa_head_num=swa_head_num,
-            # ``head_dim`` above sizes the FULL sub-pool. When the SWA layers
-            # have their own head dim (Gemma4: 256 SWA vs 512 full), the SWA
-            # sub-pool must be built at that dim, or the kernel DMAs 256-wide
-            # K/V into a 512-wide buffer. ``swa_v_head_dim`` is not redundant:
-            # the pool resolves V as swa_v_head_dim -> v_head_dim -> head_dim,
-            # and that last fallback is the FULL 512, which then trips its own
-            # ``v_head_dim <= head_dim`` check. Both are no-ops when the model
-            # has no SWA override (ModelConfig defaults them to head_dim).
+            # ``head_dim`` above sizes the FULL sub-pool; Gemma4's SWA layers are
+            # 256 against 512. V is passed too because the pool resolves it as
+            # swa_v_head_dim -> v_head_dim -> head_dim, and that last fallback is
+            # the full width, which trips its own v_head_dim <= head_dim check.
             swa_head_dim=self.model_config.swa_head_dim,
             swa_v_head_dim=self.model_config.swa_v_head_dim,
             swa_attention_layer_ids=swa_attention_layer_ids,
