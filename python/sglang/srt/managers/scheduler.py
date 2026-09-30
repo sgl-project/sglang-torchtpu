@@ -2106,6 +2106,11 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
+            if current_platform.is_tpu() and self.spec_algorithm.is_dflash():
+                # The verify window spans a single commit, so a second
+                # unprocessed forward would silently address the wrong KV slots.
+                assert len(self.result_queue) <= 1
+
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch

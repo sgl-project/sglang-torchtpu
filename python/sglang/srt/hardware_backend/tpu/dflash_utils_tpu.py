@@ -288,12 +288,11 @@ def _dflash_device_accept_eligible(
 ) -> bool:
     """Whether this batch may address its verify block without a host sync.
 
-    Both family members honor the single bounded offset: DFLASH commits at most
-    one block, and DSpark's commit_lens is correct_len + 1 with correct_len
-    capped at verify_lens - 1 <= block_size - 1. Grammar is excluded because
-    grammar_retained_tokens can be shorter than commit_lens, which breaks that
-    invariant. The compact draft cache rebuilds its own windowed mapping from
-    host lengths and is left on the synchronizing path.
+    DFLASH commits at most one block, which is the single bounded offset the
+    window enumerates. Grammar is excluded because grammar_retained_tokens can
+    be shorter than commit_lens, which breaks that bound. The compact draft
+    cache rebuilds its own windowed mapping from host lengths and is left on
+    the synchronizing path.
 
     Args:
       batch: Batch being prepared for decode.
@@ -307,7 +306,7 @@ def _dflash_device_accept_eligible(
         bs > 0
         and not compact_draft_cache
         and batch.enable_overlap
-        and batch.spec_algorithm.is_dflash_family()
+        and batch.spec_algorithm.is_dflash()
         and batch.req_to_token_pool.host_resident
         and not batch.return_logprob
         and not batch.has_grammar
@@ -334,6 +333,8 @@ def _select_verify_cache_locs(
       Slot ids, [bs, block_size].
     """
     device = candidates.device
+    # Binds only on the uninitialized bucket-padding rows; live rows stay inside
+    # [0, block_size] by the one-commit lag.
     offsets = (seq_lens.to(torch.int64) - committed_lens.to(torch.int64)).clamp_(
         0, block_size
     )

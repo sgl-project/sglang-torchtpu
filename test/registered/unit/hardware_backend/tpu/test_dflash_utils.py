@@ -202,20 +202,17 @@ def test_padded_rows_do_not_disturb_live_rows():
     torch.testing.assert_close(padded[:2], live)
 
 
-def _resolve_stub(
-    new_seq_lens_buf: torch.Tensor,
-    *,
-    spec_algo: SpeculativeAlgorithm = SpeculativeAlgorithm.DFLASH,
-) -> SimpleNamespace:
+def _resolve_stub(new_seq_lens_buf: torch.Tensor) -> SimpleNamespace:
     return SimpleNamespace(
         publish_ready=None,
         new_seq_lens_buf=new_seq_lens_buf,
-        spec_algo=spec_algo,
+        spec_algo=SpeculativeAlgorithm.DFLASH,
         needs_cpu_seq_lens=True,
         fwd_prepare_d2h_stream=None,
-        # EAGLE-only device-accept routing runs first and reads this; without it
-        # resolve raises before reaching the branch under test.
+        # The EAGLE-only device-accept paths run first and read these; without
+        # them resolve raises before reaching the branch under test.
         need_topk=False,
+        tpu_direct_handoff=None,
     )
 
 
@@ -232,11 +229,7 @@ def _resolve_batch(committed_base: torch.Tensor, committed: bool):
     )
 
 
-def _run_resolve(
-    committed: bool,
-    committed_base: torch.Tensor,
-    spec_algo: SpeculativeAlgorithm = SpeculativeAlgorithm.DFLASH,
-):
+def _run_resolve(committed: bool, committed_base: torch.Tensor):
     published = _DeviceTensor(torch.tensor([31, 42], dtype=torch.int64))
     batch = _resolve_batch(committed_base, committed=committed)
     with (
@@ -250,9 +243,7 @@ def _run_resolve(
         ),
         TransferRecorder() as log,
     ):
-        FutureMap.resolve_seq_lens_cpu(
-            _resolve_stub(published, spec_algo=spec_algo), batch
-        )
+        FutureMap.resolve_seq_lens_cpu(_resolve_stub(published), batch)
     return batch, log
 
 
@@ -271,16 +262,6 @@ def test_resolve_seq_lens_cpu_makes_no_host_transfer_on_tpu():
     assert batch.seq_lens_sum == int(committed_base.sum())
 
 
-def test_resolve_seq_lens_cpu_skips_the_sync_for_dspark_too():
-    """The early-out is family-wide; narrowing it silently restores the D2H."""
-    _, log = _run_resolve(
-        committed=True,
-        committed_base=torch.tensor([28, 39], dtype=torch.int64),
-        spec_algo=SpeculativeAlgorithm.DSPARK,
-    )
-    assert log.d2h == [], f"unexpected device-to-host transfer: {log.d2h}"
-
-
 def test_resolve_seq_lens_cpu_still_syncs_without_the_committed_flag():
     """Guards the test above: without the flag the D2H really is recorded."""
     _, log = _run_resolve(
@@ -289,11 +270,7 @@ def test_resolve_seq_lens_cpu_still_syncs_without_the_committed_flag():
     assert log.d2h, "recorder failed to observe the legacy host copy"
 
 
-def _prepare_batch(
-    req_to_token: torch.Tensor,
-    *,
-    spec_algorithm: SpeculativeAlgorithm = SpeculativeAlgorithm.DFLASH,
-):
+def _prepare_batch(req_to_token: torch.Tensor):
     reqs = [
         SimpleNamespace(
             kv=SimpleNamespace(kv_allocated_len=64, kv_committed_len=committed),
@@ -316,7 +293,7 @@ def _prepare_batch(
         device=torch.device("cpu"),
         maybe_evict_swa=Mock(),
         enable_overlap=True,
-        spec_algorithm=spec_algorithm,
+        spec_algorithm=SpeculativeAlgorithm.DFLASH,
         return_logprob=False,
         has_grammar=False,
     )
@@ -352,31 +329,6 @@ def test_prepare_for_decode_pregathers_the_window_and_keeps_the_committed_mirror
     torch.testing.assert_close(
         info.tpu_verify_cache_candidates[1], req_to_token[0, 7 : 7 + 2 * BLOCK_SIZE]
     )
-
-
-def test_prepare_for_decode_pregathers_for_dspark_too():
-    """DSpark honors the same bound, so the gate must stay family-wide.
-
-    Its commit_lens is correct_len + 1 with correct_len capped at
-    verify_lens - 1 <= block_size - 1, which is the offset range the window
-    enumerates. Narrowing the gate back to DFLASH-only restores the D2H with
-    nothing else failing.
-    """
-    batch = _prepare_batch(_req_to_token(2), spec_algorithm=SpeculativeAlgorithm.DSPARK)
-    info = DFlashDraftInputV2.create_idle_input(device=torch.device("cpu"))
-    spec_mock = SimpleNamespace(
-        speculative_num_draft_tokens=BLOCK_SIZE, speculative_draft_window_size=None
-    )
-
-    with (
-        patch.object(dflash_info_v2, "_is_tpu", True),
-        patch.object(dflash_info_v2, "get_spec", return_value=spec_mock),
-        patch.object(dflash_info_v2, "allocate_and_assign_decode_cache", Mock()),
-    ):
-        info.prepare_for_decode(batch)
-
-    assert info.tpu_host_seq_lens_is_committed
-    assert info.tpu_verify_cache_candidates.shape == (2, 2 * BLOCK_SIZE)
 
 
 def test_selector_pads_to_the_bucket_and_regrows():
