@@ -30,10 +30,6 @@ from transformers import (
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.tpu.vision_shapes import (
-    pad_patches_to_bucket,
-    patch_count_buckets,
-)
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -78,10 +74,16 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_tpu = is_tpu()
 
+if _is_tpu:
+    from sglang.srt.hardware_backend.tpu.mm_embed_tpu import encoder_output_to_host
+    from sglang.srt.hardware_backend.tpu.vision_shapes import (
+        pad_patches_to_bucket,
+        patch_count_buckets,
+    )
 
-def _mm_features_out(features: torch.Tensor) -> torch.Tensor:
-    # TPU places multimodal rows on the host (mm_embed_tpu), like the ViT runner's output.
-    return features.to("cpu") if _is_tpu else features
+
+def _features_out(features: torch.Tensor) -> torch.Tensor:
+    return encoder_output_to_host(features) if _is_tpu else features
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -511,7 +513,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return _mm_features_out(torch.cat(all_embeds, dim=0))
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -574,7 +576,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return _mm_features_out(torch.cat(all_embeds, dim=0))
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
@@ -620,7 +622,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 all_embeds.append(enc[~mask])
 
         if all_embeds:
-            return _mm_features_out(torch.cat(all_embeds, dim=0))
+            return _features_out(torch.cat(all_embeds, dim=0))
         else:
             return torch.empty(
                 0,
