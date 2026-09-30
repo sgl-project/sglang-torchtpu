@@ -92,6 +92,16 @@ class SRTPlatform(DeviceMixin):
 
         return MambaPool
 
+    def get_dflash_backend_cls(self) -> type:
+        """Return the DFlash draft-loop backend class for this platform.
+
+        Default: the host-addressed draft loop. Platforms override this to keep
+        verify addressing on device.
+        """
+        from sglang.srt.speculative.dflash_backend import DFlashBackend
+
+        return DFlashBackend
+
     def get_mla_kv_pool_cls(self) -> type:
         """Return the MLA KV pool class for this platform."""
         raise NotImplementedError
