@@ -74,16 +74,13 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_tpu = is_tpu()
 
-if _is_tpu:
-    from sglang.srt.hardware_backend.tpu.mm_embed_tpu import encoder_output_to_host
-    from sglang.srt.hardware_backend.tpu.vision_shapes import (
-        pad_patches_to_bucket,
-        patch_count_buckets,
-    )
 
-
-def _features_out(features: torch.Tensor) -> torch.Tensor:
-    return encoder_output_to_host(features) if _is_tpu else features
+def _encode(vision_tower, pixel_values, position_ids):
+    """Run the vision tower, through its TPU compile runner when it has one."""
+    runner = getattr(vision_tower, "graph_runners", None)
+    if runner is not None:
+        return runner.run(pixel_values, position_ids)
+    return vision_tower(pixel_values, position_ids)
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -245,17 +242,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             self.audio_tower = None
             self.embed_audio = None
 
-        # Patch counts follow the image aspect ratio, so the eager TPU tower is
-        # fed a bounded ladder of shapes instead of one per image.
-        pooling_window = config.vision_config.pooling_kernel_size**2
-        self._patch_buckets = (
-            patch_count_buckets(
-                config.vision_soft_tokens_per_image * pooling_window,
-                align=pooling_window,
-            )
-            if _is_tpu
-            else []
-        )
         self.vocab_size = config.text_config.vocab_size
         self.vocab_size_per_layer_input = getattr(
             config.text_config,
@@ -489,19 +475,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 if pp.dim() == 2:
                     pp = pp.unsqueeze(0)
 
-                if _is_tpu:
-                    pv, pp = pad_patches_to_bucket(pv, pp, self._patch_buckets)
                 pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
                 pp = pp.to(device=vt.device)
 
-                pooled, pooler_mask = vt(pv, pp)
+                pooled, pooler_mask = _encode(vt, pv, pp)
 
                 for hs, mask in zip(pooled, pooler_mask):
-                    if _is_tpu:
-                        # Per-token, so it runs at the padded shape and unpads after.
-                        embedded = self.embed_vision(inputs_embeds=hs.unsqueeze(0))
-                        all_embeds.append(embedded.squeeze(0)[mask])
-                        continue
                     real_tokens = hs[mask]
                     all_embeds.append(
                         self.embed_vision(
@@ -510,7 +489,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return _features_out(torch.cat(all_embeds, dim=0))
+            return torch.cat(all_embeds, dim=0)
         else:
             return torch.empty(
                 0,
@@ -573,7 +552,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     )
 
         if all_embeds:
-            return _features_out(torch.cat(all_embeds, dim=0))
+            return torch.cat(all_embeds, dim=0)
         else:
             return torch.empty(
                 0,
@@ -619,7 +598,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 all_embeds.append(enc[~mask])
 
         if all_embeds:
-            return _features_out(torch.cat(all_embeds, dim=0))
+            return torch.cat(all_embeds, dim=0)
         else:
             return torch.empty(
                 0,

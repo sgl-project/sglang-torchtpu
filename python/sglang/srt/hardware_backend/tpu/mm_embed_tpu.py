@@ -12,20 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
-
-
-def encoder_output_to_host(features: torch.Tensor) -> torch.Tensor:
-    """Land an encoder output on the host, the placement below assumes.
-
-    A compiled tower does this in its runner while the shape is still a bucket
-    (``graph_runner/vit_tpu_compile_runner.py``); an eager one has no runner to
-    do it, so it calls this. Honors the device-placement opt-in.
-    """
-    if envs.SGLANG_TPU_MM_EMBED_ON_DEVICE.get():
-        return features
-    return features.to("cpu")
 
 
 def _place_mm_rows(
