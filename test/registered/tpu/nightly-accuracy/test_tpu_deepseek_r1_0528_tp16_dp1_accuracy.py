@@ -20,7 +20,7 @@ register_tpu_ci(
 MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/deepseek_r1_0528_fp8kv_mh.sh",
-    "weights_pvc": "model-weights-rox",
+    "weights_pvc": "model-weights",
     "timeout_per_file": 14400,
 }
 

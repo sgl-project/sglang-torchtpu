@@ -17,6 +17,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -560,6 +561,78 @@ def aime25_openai_runner(
             labels={"model": model, "eval": "gpt_oss.evals"},
         )
         return {"score": result.score}
+
+    return run
+
+
+def sgl_eval_runner(
+    eval_name: str,
+    *,
+    model: str,
+    max_tokens: int,
+    num_threads: int,
+    temperature: float,
+    top_p: float,
+    n_repeats: int = 1,
+    chat_template_kwargs: dict[str, Any] | None = None,
+):
+    """Score a gate with ``sgl-eval run <eval_name>`` over its full dataset.
+
+    run_eval's sgl-eval path can only toggle ``chat_template_kwargs.thinking``;
+    templates that read another key (Gemma 4 and Qwen3.5: ``enable_thinking``)
+    need ``chat_template_kwargs``. It also sends ``mmmu_pro`` through sgl-eval,
+    where the shared runner takes NeMo-Skills' 500-sample subset.
+    """
+
+    def run(base_url: str) -> dict[str, Any]:
+        out_dir = Path(tempfile.mkdtemp(prefix=f"sgl-eval-{eval_name}-"))
+        cmd = [
+            "sgl-eval",
+            "run",
+            eval_name,
+            "--base-url",
+            base_url.rstrip("/") + "/v1",
+            "--model",
+            model,
+            "--max-tokens",
+            str(max_tokens),
+            "--num-threads",
+            str(num_threads),
+            "--temperature",
+            str(temperature),
+            "--top-p",
+            str(top_p),
+            "--n-repeats",
+            str(n_repeats),
+            "--out-dir",
+            str(out_dir),
+        ]
+        for key, value in (chat_template_kwargs or {}).items():
+            cmd += ["--chat-template-kwarg", f"{key}={json.dumps(value)}"]
+        print("Running: " + shlex.join(cmd), flush=True)
+        subprocess.run(cmd, check=True)
+
+        metrics_files = list(out_dir.glob(f"sgl_eval_{eval_name}_*/metrics.json"))
+        if len(metrics_files) != 1:
+            raise RuntimeError(
+                f"Expected one sgl-eval metrics.json, found {metrics_files}"
+            )
+        payload = json.loads(metrics_files[0].read_text())
+        print(
+            f"{eval_name} (sgl-eval, n_repeats={n_repeats}): "
+            f"score={payload['aggregate']['score']:.4f} "
+            f"examples={payload.get('num_examples')} metrics={payload['aggregate']}"
+        )
+        dump_metric(
+            f"{eval_name}_sgl_eval",
+            payload["aggregate"]["score"],
+            labels={"model": model, "eval": eval_name},
+        )
+        return {
+            **payload["aggregate"],
+            "latency": payload.get("latency_seconds", 0.0),
+            "output_throughput": payload.get("output_throughput_tps", 0.0),
+        }
 
     return run
 

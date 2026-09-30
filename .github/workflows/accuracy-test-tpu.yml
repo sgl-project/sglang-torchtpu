@@ -25,7 +25,7 @@ on:
         required: false
         default: all
         type: choice
-        options: [all, nightly, full-set, gpt-oss-120b, gpt-oss-20b, deepseek-r1-0528, deepseek-v3-1, kimi-k26]
+        options: [all, nightly, full-set, gpt-oss-120b, gpt-oss-20b, gemma4-31b, deepseek-r1-0528, deepseek-v3-1, kimi-k26, qwen3-5-397b]
       test_filter:
         description: "Substring of a multihost test file path; runs only matching tests"
         required: false
@@ -132,8 +132,43 @@ jobs:
       suite: nightly-tpu-accuracy-gpt-oss-20b
       run_name: accuracy-gpt-oss-20b
       nightly: true
-      weights_pvc: model-weights-rox
+      weights_pvc: model-weights
       timeout_per_file: 10800
+    permissions:
+      contents: read
+      id-token: write
+
+  accuracy-gemma4-31b:
+    needs: build
+    if: >-
+      ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
+          && contains(fromJSON('["all","nightly","full-set","gemma4-31b"]'), inputs.model || 'all') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One suite per benchmark; timeout_per_file follows each one's measured wall time.
+        include:
+          - suite: nightly-tpu-accuracy-gemma4-31b-aime
+            run_name: accuracy-gemma4-31b-aime
+            timeout_per_file: 5400
+          - suite: nightly-tpu-accuracy-gemma4-31b-gpqa
+            run_name: accuracy-gemma4-31b-gpqa
+            timeout_per_file: 5400
+          - suite: nightly-tpu-accuracy-gemma4-31b-mmmupro
+            run_name: accuracy-gemma4-31b-mmmupro
+            timeout_per_file: 9000
+    name: ${{ matrix.suite }}
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ inputs.ref || 'main' }}
+      image: ${{ inputs.image || needs.build.outputs.digest }}
+      lane: nightly
+      hosts: 1
+      suite: ${{ matrix.suite }}
+      run_name: ${{ matrix.run_name }}
+      nightly: true
+      weights_pvc: model-weights
+      timeout_per_file: ${{ matrix.timeout_per_file }}
     permissions:
       contents: read
       id-token: write
@@ -143,7 +178,7 @@ jobs:
     needs: build
     if: >-
       ${{ !cancelled() && (inputs.image != '' || needs.build.result == 'success')
-          && contains(fromJSON('["all","nightly","full-set","deepseek-r1-0528","deepseek-v3-1","kimi-k26"]'), inputs.model || 'all') }}
+          && contains(fromJSON('["all","nightly","full-set","deepseek-r1-0528","deepseek-v3-1","kimi-k26","qwen3-5-397b"]'), inputs.model || 'all') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -78,6 +78,51 @@ class TestThinkingGate(CustomTestCase):
         )
 
 
+class TestSglEvalRunner(CustomTestCase):
+    def test_template_kwargs_reach_sgl_eval_and_metrics_are_read_back(self):
+        from pathlib import Path
+
+        def fake_run(cmd, check):
+            out = Path(cmd[cmd.index("--out-dir") + 1]) / "sgl_eval_aime26_1"
+            out.mkdir(parents=True)
+            (out / "metrics.json").write_text(
+                json.dumps(
+                    {
+                        "aggregate": {"score": 0.875},
+                        "num_examples": 30,
+                        "latency_seconds": 12.0,
+                        "output_throughput_tps": 3.5,
+                    }
+                )
+            )
+
+        runner = eval_support.sgl_eval_runner(
+            "aime26",
+            model="gemma4-31b",
+            max_tokens=32768,
+            num_threads=64,
+            temperature=1.0,
+            top_p=0.95,
+            n_repeats=4,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        with (
+            patch.object(eval_support.subprocess, "run", side_effect=fake_run) as run,
+            patch.object(eval_support, "dump_metric"),
+        ):
+            result = runner("http://127.0.0.1:30000/")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[:3], ["sgl-eval", "run", "aime26"])
+        self.assertEqual(cmd[cmd.index("--base-url") + 1], "http://127.0.0.1:30000/v1")
+        self.assertEqual(
+            cmd[cmd.index("--chat-template-kwarg") + 1], "enable_thinking=true"
+        )
+        self.assertEqual(cmd[cmd.index("--n-repeats") + 1], "4")
+        self.assertNotIn("--thinking", cmd)
+        self.assertEqual(result["score"], 0.875)
+        self.assertEqual(result["latency"], 12.0)
+
+
 class TestBoundedGptOssSampler(CustomTestCase):
     @staticmethod
     def _module(sleeps):
@@ -563,7 +608,7 @@ class TestPerfConfigsAreValid(CustomTestCase):
     """
 
     def _perf_modules(self):
-        found = list(_config_modules("nightly-perf", "test_tpu_perf_*.py"))
+        found = list(_config_modules("tpu/nightly-perf", "test_tpu_perf_*.py"))
         self.assertTrue(found, "no perf test files found; did they move?")
         yield from found
 
@@ -613,15 +658,43 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
     """
 
     def _accuracy_modules(self):
-        found = list(_config_modules("nightly-accuracy", "test_tpu_*.py"))
+        # The grandfathered tpu/ tree, then the <kind>/<subsystem> layout.
+        found = [
+            *_config_modules("tpu/nightly-accuracy", "test_tpu_*.py"),
+            *_config_modules("accuracy/tpu", "test_tpu_*.py"),
+        ]
         self.assertTrue(found, "no accuracy test files found; did they move?")
         yield from found
+
+    def _assert_fixture_owns_the_server(self, path, mod):
+        # Without a launch entry, the file's TPULauncherTestCase boots the recipe.
+        from pathlib import Path
+
+        from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
+
+        fixtures = [
+            value
+            for value in vars(mod).values()
+            if isinstance(value, type)
+            and issubclass(value, TPULauncherTestCase)
+            and value is not TPULauncherTestCase
+        ]
+        self.assertEqual(len(fixtures), 1, f"{path.name} needs one launcher fixture")
+        recipe = (
+            Path(__file__).resolve().parents[3]
+            / "benchmark/tpu"
+            / fixtures[0].config_module
+        )
+        self.assertTrue(recipe.is_file(), f"{path.name}: no {recipe}")
 
     def test_every_config_builds(self):
         names, suites = set(), set()
         for path, mod in self._accuracy_modules():
             config = mod.MODEL_CONFIG
-            model_config.build_model(config)  # rejects unknown launch keys
+            if "launch" in config:
+                model_config.build_model(config)  # rejects unknown launch keys
+            else:
+                self._assert_fixture_owns_the_server(path, mod)
             self.assertTrue(model_config.build_gates(config))
             case = model_config.build_test_case(config)
             self.assertNotIn(case.__name__, names, f"{path.name} duplicates a case")
@@ -699,13 +772,11 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
 
 
 def _config_modules(subdir, pattern):
-    """Load every matching MODEL_CONFIG module under test/registered/tpu/<subdir>."""
+    """Load every matching MODEL_CONFIG module under test/registered/<subdir>."""
     import importlib.util
     from pathlib import Path
 
-    for path in sorted(
-        (Path(__file__).resolve().parents[1] / "tpu" / subdir).glob(pattern)
-    ):
+    for path in sorted((Path(__file__).resolve().parents[1] / subdir).glob(pattern)):
         spec = importlib.util.spec_from_file_location(f"cfg_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)

@@ -34,6 +34,8 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 REPO = Path(__file__).resolve().parents[3]
 TPU_TESTS = REPO / "test" / "registered" / "tpu"
+# Accuracy nightlies: the grandfathered tpu/ tree, then the <kind>/<subsystem> layout.
+ACCURACY_DIRS = (TPU_TESTS / "nightly-accuracy", REPO / "test/registered/accuracy/tpu")
 TPU_CI = REPO / ".github" / "tpu-ci"
 WORKFLOWS = REPO / ".github" / "workflows"
 ALIASES_FILE = TPU_CI / "dashboard_aliases.json"
@@ -83,7 +85,8 @@ def _nightly_registered() -> dict:
 
 def _config_modules(subdir: str):
     """Load every MODEL_CONFIG module under test/registered/tpu/<subdir>."""
-    for path in sorted((TPU_TESTS / subdir).glob("test_*.py")):
+    dirs = ACCURACY_DIRS if subdir == "nightly-accuracy" else (TPU_TESTS / subdir,)
+    for path in sorted(p for d in dirs for p in d.glob("test_*.py")):
         spec = importlib.util.spec_from_file_location(f"dc_{path.stem}", path)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -166,7 +169,7 @@ class TestJobMapsToOneTest(CustomTestCase):
                 len(row["files"].split()), 1, f"group {row['name']} bundles files"
             )
 
-    def test_scheduled_accuracy_discovers_deepseek_models(self):
+    def test_scheduled_accuracy_discovers_every_model(self):
         import os
         import tempfile
 
@@ -199,11 +202,13 @@ class TestJobMapsToOneTest(CustomTestCase):
                 "test_tpu_deepseek_v3_1_tp16_dp1_accuracy",
                 "test_tpu_kimi_k26_mmmu_shard0",
                 "test_tpu_kimi_k26_mmmu_shard1",
+                "test_tpu_qwen3_5_397b_mmmupro",
             },
         )
         recipes = [g["launch_script"] for g in groups]
         self.assertEqual(recipes.count("recipe/deepseek_r1_0528_fp8kv_mh.sh"), 1)
         self.assertEqual(recipes.count("recipe/kimi_k26_mmmu.sh"), 2)
+        self.assertEqual(recipes.count("recipe/qwen3_5_397b_mh.sh"), 1)
         for group in groups:
             self.assertTrue((REPO / "benchmark/tpu" / group["launch_script"]).is_file())
             # A hosted runner has six hours, including startup and cleanup.
@@ -212,6 +217,15 @@ class TestJobMapsToOneTest(CustomTestCase):
         gpt = workflow["jobs"]["accuracy-gpt-oss-20b"]
         self.assertIn('"nightly"', gpt["if"])
         self.assertEqual(gpt["with"]["suite"], "nightly-tpu-accuracy-gpt-oss-20b")
+        gemma = workflow["jobs"]["accuracy-gemma4-31b"]
+        self.assertIn('"nightly"', gemma["if"])
+        self.assertEqual(
+            {leg["suite"] for leg in gemma["strategy"]["matrix"]["include"]},
+            {
+                f"nightly-tpu-accuracy-gemma4-31b-{bench}"
+                for bench in ("aime", "gpqa", "mmmupro")
+            },
+        )
         nightly = yaml.safe_load((WORKFLOWS / "nightly-test-tpu.yml").read_text())
         self.assertEqual(nightly["jobs"]["accuracy"]["with"]["model"], "nightly")
 

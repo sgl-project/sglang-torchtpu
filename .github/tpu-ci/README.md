@@ -101,8 +101,9 @@ manifests must still name the actual cluster resources; changing `weights.yaml`
 selects a claim, it does not create one.
 
 `launch_script` is a shell recipe relative to `benchmark/tpu/`. The accuracy
-recipes apply their Python configuration and execute the existing
-`launch_server.sh`. `discover_multihost.py` emits one JobSet per registered test
+recipes exec `python3 -m benchmark.tpu.launch_server --config
+recipe/configs/<model>/<name>.py`, which resolves each host's rank from the
+JobSet topology. `discover_multihost.py` emits one JobSet per registered test
 file, even when multiple files use the same recipe. This lets the two Kimi
 MMMU-Pro shards use independent slices with identical serving settings.
 
@@ -629,7 +630,8 @@ template + `_tpu-build`/`_tpu-test`.
 ### Full accuracy runs from an unmerged branch
 
 The scheduled accuracy suite includes R1-0528 (GPQA, AIME25, full MMLU-Redux
-2.0), V3.1, GPT-OSS-20B, and two Kimi MMMU-Pro shards. Each Kimi shard uses its
+2.0), V3.1, GPT-OSS-20B, Gemma-4-31B (AIME26, GPQA, MMMU-Pro), Qwen3.5-397B
+(MMMU-Pro) and two Kimi MMMU-Pro shards. Each Kimi shard uses its
 own two-host 2x2x2 slice and evaluates 865 distinct questions, one pass at 98,304
 output tokens. The two independent TP16/EP16 servers provide data parallelism
 by splitting requests; each uses DP size 1 with DP attention disabled, 128
@@ -646,6 +648,13 @@ admits up to 128 requests. V3.1 also retains a single 250-question MMLU subset.
 These gates use the existing pinned sgl-eval harness, not the OpenAI CLI used
 by the separate manual tpu-inference comparison.
 
+Gemma-4-31B runs one single-host job per benchmark, and Qwen3.5-397B one
+two-host job; both score all 1,730 MMMU-Pro questions with sgl-eval's own grader,
+thinking on through `enable_thinking`. Gemma-4-31B's score is published as
+`mmmu_pro_strict`: the model answers `Answer: $X`, which that grader misses.
+New files live in `test/registered/accuracy/tpu/` (the registered-test
+taxonomy); the older ones stay in `tpu/nightly-accuracy/`.
+
 Redux generates all 5,700 rows at 65,536 output tokens, scoring only rows marked
 `ok` or with an unambiguous corrected answer key (5,431 rows in the pinned
 revision). This preserves the September experiment's protocol; it is not the
@@ -659,11 +668,11 @@ gh workflow run accuracy-test-tpu.yml --ref test/deepseek-r1-0528-dpa \
 ```
 
 `model=full-set` selects one serving configuration each for R1-0528, V3.1,
-GPT-OSS-20B, and Kimi. Kimi has two jobs using the same recipe, solely to split
+GPT-OSS-20B, Gemma-4-31B, Qwen3.5-397B and Kimi. Kimi has two jobs using the same recipe, solely to split
 MMMU-Pro into disjoint halves. The former R1 DPA variant and older on-demand
 R1/Kimi accuracy entries are removed. Feature-specific tests remain separate.
 
-Model settings are Python `ENV` dictionaries applied by a small adapter to the
-existing `benchmark/tpu/launch_server.sh`; no unmerged Python launcher framework
-is required. Kimi uses main's native W4A16 path; this PR does not add #725's
+Model settings are Python `CONFIG` recipes under `benchmark/tpu/recipe/configs/`,
+launched by `benchmark/tpu/launch_server.py`; single-host tests boot them through
+`TPULauncherTestCase`. Kimi uses main's native W4A16 path; this PR does not add #725's
 optimized kernel or claim its previously measured performance.

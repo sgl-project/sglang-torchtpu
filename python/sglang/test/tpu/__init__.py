@@ -9,6 +9,7 @@ from sglang.test.tpu.eval_support import (
     emit_result_payload,
     gpqa_openai_runner,
     lm_eval_runner,
+    sgl_eval_runner,
     wait_for_health,
 )
 from sglang.test.tpu.model_config import (
@@ -33,5 +34,6 @@ __all__ = [
     "lm_eval_runner",
     "model_config_main",
     "run_model_config",
+    "sgl_eval_runner",
     "wait_for_health",
 ]

@@ -5,7 +5,6 @@ import sys
 import unittest
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -14,7 +13,8 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
-from benchmark.tpu.recipe.configs import accuracy, config_eval
+from benchmark.tpu.launch_server import load_recipe, plan_launch
+from benchmark.tpu.recipe.configs import config_eval
 from benchmark.tpu.recipe.configs.base import CONFIG as BASE_CONFIG
 from benchmark.tpu.recipe.configs.qwen3_0_6b import CONFIG
 
@@ -82,57 +82,70 @@ class TestTpuConfigEval(unittest.TestCase):
         self.assertEqual(json.loads(args[3]), {"adapter": "/tmp/adapter"})
 
 
-class TestAccuracyRecipe(unittest.TestCase):
-    def test_model_override_preserves_ci_host_discovery(self):
-        inherited = {
-            "MODEL": "/local weights/R1",
-            "TPU_WORKER_ID": "1",
-            "TPU_WORKER_HOSTNAMES": "rank0,rank1",
-            "DIST_INIT_ADDR": "rank0:10011",
-            "MAX_RUNNING": "1",
-        }
-        original = inherited.copy()
-        env = accuracy.recipe_env("deepseek_r1_0528_fp8kv_mh", inherited)
-        for key in ("MODEL", "TPU_WORKER_ID", "TPU_WORKER_HOSTNAMES", "DIST_INIT_ADDR"):
-            self.assertEqual(env[key], inherited[key])
-        self.assertEqual(env["MAX_RUNNING"], "128")
-        self.assertEqual(env["DP_SIZE"], "1")
-        self.assertEqual(env["SGLANG_TPU_FP8_MOE_FP32_SCALES"], "1")
-        self.assertEqual(inherited, original)
+class TestAccuracyRecipes(unittest.TestCase):
+    MULTIHOST = (
+        "recipe/configs/deepseek_r1_0528/accuracy.py",
+        "recipe/configs/deepseek_v3_1/accuracy.py",
+        "recipe/configs/kimi_k26/mmmu.py",
+        "recipe/configs/qwen3_5_397b/server.py",
+    )
+    SINGLE_HOST = (
+        "recipe/configs/gpt_oss_20b/accuracy.py",
+        "recipe/configs/gemma4_31b/accuracy.py",
+    )
 
-    def test_empty_model_uses_recipe_default(self):
+    def test_multihost_rank_resolves_from_jobset_topology(self):
+        topology = {"TPU_WORKER_ID": "1", "TPU_WORKER_HOSTNAMES": "rank0,rank1"}
+        for recipe in self.MULTIHOST:
+            with self.subTest(recipe=recipe):
+                plan = plan_launch(load_recipe(recipe), inherited=topology)
+                args = plan.config.server_args
+                self.assertEqual((args["nnodes"], args["node_rank"]), (2, 1))
+                self.assertEqual(args["dist_init_addr"], "rank0:10011")
+                self.assertEqual((args["tp_size"], args["ep_size"]), (16, 16))
+                self.assertNotIn("--dp-size", plan.command)
+
+    def test_derived_recipe_does_not_mutate_its_base(self):
+        from benchmark.tpu.recipe.configs.deepseek_r1_0528.accuracy import CONFIG as R1
+        from benchmark.tpu.recipe.configs.deepseek_v3_1.accuracy import CONFIG as V31
+
+        self.assertEqual(R1["server_args"]["model_path"], "/weights/DeepSeek-R1-0528")
+        self.assertEqual(R1["server_args"]["reasoning_parser"], "deepseek-r1")
+        self.assertEqual(V31["server_args"]["reasoning_parser"], "deepseek-v3")
         self.assertEqual(
-            accuracy.recipe_env("gpt_oss_20b_accuracy", {"MODEL": ""})["MODEL"],
-            "openai/gpt-oss-20b",
+            {
+                k: v
+                for k, v in V31["server_args"].items()
+                if k not in ("model_path", "reasoning_parser")
+            },
+            {
+                k: v
+                for k, v in R1["server_args"].items()
+                if k not in ("model_path", "reasoning_parser")
+            },
         )
 
-    def test_recipe_results_do_not_mutate_shared_defaults(self):
-        env = accuracy.recipe_env("deepseek_v3_1_fp8kv_mh", {})
-        env["MODEL"] = "modified"
-        for recipe, expected in (
-            ("deepseek_v3_1_fp8kv_mh", "/weights/DeepSeek-V3.1"),
-            ("deepseek_r1_0528_fp8kv_mh", "/weights/DeepSeek-R1-0528"),
-        ):
-            self.assertEqual(accuracy.recipe_env(recipe, {})["MODEL"], expected)
+    def test_recipes_include_shell_runtime_defaults(self):
+        for recipe in self.MULTIHOST + self.SINGLE_HOST:
+            with self.subTest(recipe=recipe):
+                plan = plan_launch(load_recipe(recipe), inherited={})
+                self.assertEqual(plan.env["TORCH_LOGS"], "+recompiles")
+                self.assertEqual(plan.env["SGLANG_TPU_PRELOAD_TELEMETRY_STUB"], "1")
+                self.assertIn("--enable-torch-compile", plan.command)
 
-    def test_rejects_recipe_paths(self):
-        for name in ("../base", "base.py", "a/b"):
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                accuracy.recipe_env(name, {})
-
-    def test_executes_existing_launcher(self):
-        with (
-            patch.object(sys, "argv", ["accuracy", "--config", "kimi_k26_mmmu"]),
-            patch.object(accuracy.os, "execvpe") as execute,
-        ):
-            accuracy.main()
-        executable, args, env = execute.call_args.args
-        self.assertEqual(executable, "bash")
-        self.assertEqual(args, ["bash", str(ROOT / "benchmark/tpu/launch_server.sh")])
-        self.assertEqual(env["QUANTIZATION"], "")
-        self.assertEqual(
-            (env["TP_SIZE"], env["EP_SIZE"], env["DP_SIZE"]), ("16", "16", "1")
-        )
+    def test_multihost_shell_recipes_exec_their_python_config(self):
+        for recipe in self.MULTIHOST:
+            name = {
+                "deepseek_r1_0528": "deepseek_r1_0528_fp8kv_mh.sh",
+                "deepseek_v3_1": "deepseek_v3_1_fp8kv_mh.sh",
+                "kimi_k26": "kimi_k26_mmmu.sh",
+                "qwen3_5_397b": "qwen3_5_397b_mh.sh",
+            }[recipe.split("/")[2]]
+            with self.subTest(script=name):
+                script = (ROOT / "benchmark/tpu/recipe" / name).read_text()
+                self.assertIn(
+                    "-m benchmark.tpu.launch_server --config " + recipe, script
+                )
 
 
 if __name__ == "__main__":
