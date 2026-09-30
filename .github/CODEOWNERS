@@ -1,5 +1,3 @@
-* @alexnails @Bob-Chen222 @hlFu @yliu120 @angelayi @colin2328 @zou3519 @qizzzh @wyzhang @pyc96
-
 .github @merrymercy @Fridge003 @ispobock @Kangyan-Zhou @HaiShaw @bingxche
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani @yctseng0211 @sogalin
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname @whybeyoung
@@ -114,6 +112,11 @@
 /python/sglang/srt/models/laguna.py @Jiminator
 /python/sglang/srt/configs/laguna.py @Jiminator
 /tools/sglang-simulator @littlefatfat @hzh0425 @zhuzi-z @LinSiyuan814
+
+# Fork-wide default owners. CODEOWNERS is last-match-wins: this line sits below the
+# upstream block so upstream-only owners (no write access here) never shadow it, and
+# above the fork-specific TPU lines, which repeat this list on purpose.
+* @alexnails @Bob-Chen222 @hlFu @yliu120 @angelayi @colin2328 @zou3519 @qizzzh @wyzhang @pyc96
 
 # ---- TPU area owners (fork-only, TPU-specific paths only). Keep below the upstream block; last match wins. ----
 
