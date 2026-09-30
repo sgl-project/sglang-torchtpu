@@ -270,11 +270,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             prefix=add_prefix("language_model", prefix),
         )
 
-        # Compile the text model only, leaving the tower and embed merge eager
-        # (mirrors Kimi-K2.5). PLE variants pass a per_layer_inputs tensor the
-        # VL policy does not warm, so they keep the whole-model compile.
-        has_ple = (text_config.hidden_size_per_layer_input or 0) > 0
-        if _is_tpu and not has_ple:
+        ple_unwarmed_by_vl_policy = (text_config.hidden_size_per_layer_input or 0) > 0
+        if _is_tpu and not ple_unwarmed_by_vl_policy:
             from sglang.srt.compilation.support_torch_compile import (
                 support_torch_compile,
             )
