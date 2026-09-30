@@ -20,7 +20,7 @@ run-name: "Nightly Test (TPU)${{ inputs.update-dashboard && ' [publish]' || '' }
 
 on:
   schedule:
-    - cron: "30 0 * * *"
+    - cron: "0 1 * * *"
       timezone: "America/Los_Angeles"  # Quality evals run inside this run (stage [2]).
   workflow_dispatch:
     inputs:
