@@ -13,10 +13,93 @@ from torch_tpu._internal.pallas import pallas as pallas_impl
 from sglang.srt.hardware_backend.tpu.pallas_export import tpu_info_for_cpu_export
 
 
+def _partition_axis_size(mesh: Mesh, axes: str | Sequence[str] | None) -> int:
+    if axes is None:
+        return 1
+    if isinstance(axes, str):
+        axes = (axes,)
+
+    size = 1
+    for axis in axes:
+        size *= mesh.shape[axis]
+    return size
+
+
+def _convert_partitioned_shape(
+    shape: Sequence[int],
+    mesh: Mesh | None,
+    partition_spec: PartitionSpec | None,
+    operation: Callable[[int, int], int],
+) -> tuple[int, ...]:
+    if mesh is None or partition_spec is None:
+        return tuple(shape)
+
+    converted = tuple(
+        operation(size, _partition_axis_size(mesh, axes))
+        for size, axes in zip(shape, partition_spec)
+    )
+    return converted + tuple(shape[len(partition_spec) :])
+
+
+def _jax_placeholder_with_sharding(
+    tensor: torch.Tensor,
+    mesh: Mesh | None,
+    partition_spec: PartitionSpec | None,
+) -> jax.ShapeDtypeStruct:
+    if not isinstance(tensor, torch.Tensor):
+        return tensor
+
+    jax_dtype = pallas_impl.TORCH_TO_JAX_DTYPE_MAP.get(tensor.dtype)
+    if jax_dtype is None:
+        raise NotImplementedError(
+            f"Unsupported dtype for Pallas kernels: {tensor.dtype}"
+        )
+
+    jax_shape = tuple(tensor.shape)
+    if tensor.dtype == torch.float4_e2m1fn_x2 and jax_shape:
+        if tensor.stride(-1) != 1:
+            raise ValueError(
+                "expected packed dimension of float4_e2m1fn_x2 tensor to be "
+                f"contiguous (stride 1), got stride {tensor.stride(-1)} "
+                f"(all strides: {tensor.stride()})"
+            )
+        jax_shape = jax_shape[:-1] + (jax_shape[-1] * 2,)
+
+    if mesh is None:
+        return jax.ShapeDtypeStruct(jax_shape, jax_dtype)
+    return jax.ShapeDtypeStruct(
+        _convert_partitioned_shape(
+            jax_shape,
+            mesh,
+            partition_spec,
+            lambda size, axis_size: size * axis_size,
+        ),
+        jax_dtype,
+        sharding=NamedSharding(mesh, partition_spec),
+    )
+
+
+def _jax_placeholders(
+    tensors: Sequence[torch.Tensor] | torch.Tensor,
+    mesh: Mesh | None,
+    partition_specs: Sequence[PartitionSpec] | PartitionSpec | None,
+):
+    if isinstance(tensors, torch.Tensor):
+        return _jax_placeholder_with_sharding(tensors, mesh, partition_specs)
+    if mesh is None:
+        return [
+            _jax_placeholder_with_sharding(tensor, None, None) for tensor in tensors
+        ]
+    return [
+        _jax_placeholder_with_sharding(tensor, mesh, partition_spec)
+        for tensor, partition_spec in zip(tensors, partition_specs)
+    ]
+
+
 def _torch_placeholder_with_sharding(
     aval: jax.core.ShapedArray | None,
     sharding: NamedSharding | None,
-    mesh: Mesh,
+    mesh: Mesh | None,
 ) -> torch.Tensor | None:
     if not isinstance(aval, jax.core.ShapedArray):
         return aval
@@ -26,16 +109,24 @@ def _torch_placeholder_with_sharding(
     spec = getattr(sharding, "spec", None)
     if spec is None:
         spec = getattr(getattr(aval, "sharding", None), "spec", None)
-    return torch.empty(
-        pallas_impl.get_local_shape(aval.shape, mesh, spec),
-        dtype=torch_dtype,
-        device="tpu",
+    torch_shape = _convert_partitioned_shape(
+        aval.shape,
+        mesh,
+        spec,
+        lambda size, axis_size: size // axis_size,
     )
+    if torch_dtype == torch.float4_e2m1fn_x2 and torch_shape:
+        if torch_shape[-1] % 2 != 0:
+            raise ValueError(
+                "expected last dimension of JAX local shape to be even to convert "
+                f"to packed PyTorch dtype {torch_dtype}, got {torch_shape[-1]} "
+                f"(local shape: {torch_shape}, global: {aval.shape})"
+            )
+        torch_shape = torch_shape[:-1] + (torch_shape[-1] // 2,)
+    return torch.empty(torch_shape, dtype=torch_dtype, device="tpu")
 
 
 def _torch_placeholder(aval, sharding, mesh):
-    if sharding is None:
-        return pallas_impl.torch_placeholder(aval, mesh=mesh)
     return _torch_placeholder_with_sharding(aval, sharding, mesh)
 
 
@@ -59,7 +150,7 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
             )
         )
         if not output_shapes or not kernel_exists:
-            jax_args = pallas_impl.jax_placeholders(
+            jax_args = _jax_placeholders(
                 args,
                 mesh=self.mesh,
                 partition_specs=self.input_partition_specs,
@@ -163,7 +254,7 @@ def cpu_export_jax_op(
     custom_op = torch.library.custom_op(name, wrapped, mutates_args=())
 
     def fake_function(*args, **kwargs):
-        jax_args = pallas_impl.jax_placeholders(
+        jax_args = _jax_placeholders(
             args,
             mesh=mesh,
             partition_specs=tuple(input_partition_specs),

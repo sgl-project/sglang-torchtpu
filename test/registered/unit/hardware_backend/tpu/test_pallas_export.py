@@ -441,6 +441,39 @@ class TestPallasExportEnvironment(CustomTestCase):
         result = json.loads(completed.stdout.strip().splitlines()[-1])
         self.assertEqual(result["result"], [float(value) for value in range(1, 9)])
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_partitioned_shape_supports_multiple_mesh_axes(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import PartitionSpec as P
+
+        from sglang.srt.hardware_backend.tpu.pallas_jax_op import (
+            _convert_partitioned_shape,
+        )
+
+        mesh = SimpleNamespace(shape={"chip": 4, "core": 2})
+        partition_spec = P(("chip", "core"), None)
+
+        global_shape = _convert_partitioned_shape(
+            (16, 32),
+            mesh,
+            partition_spec,
+            lambda size, axis_size: size * axis_size,
+        )
+        self.assertEqual(global_shape, (128, 32))
+        self.assertEqual(
+            _convert_partitioned_shape(
+                global_shape,
+                mesh,
+                partition_spec,
+                lambda size, axis_size: size // axis_size,
+            ),
+            (16, 32),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
