@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import time
 from collections import deque
 from concurrent.futures import Future
@@ -2185,6 +2186,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     Store the requests that is polling kv
     """
 
+    # Nothing tells the decode side when a prefill peer gives up on a transfer,
+    # so a receiver that never reaches Success stays in this queue for the life
+    # of the process, holding its KV pages and inflating
+    # num_prealloc_ready_requests until the router vetoes the engine. The
+    # deadline matches raiden's own, which is what the peer released against.
+    # Class-level so instances built with __new__ -- which the unit tests do,
+    # the real constructor wanting a scheduler and process groups -- still have it.
+    _transfer_deadline_s: float = float(
+        os.environ.get("SGLANG_RAIDEN_TIMEOUT_S", "120")
+    )
+
     def __init__(
         self,
         gloo_group: ProcessGroup,
@@ -2400,7 +2412,31 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
+    def _fail_transfers_past_deadline(self) -> None:
+        """Abort receivers whose peer has certainly released their KV by now.
+
+        Aborting is all this needs to do: the receiver then polls Failed and the
+        existing failure path logs, releases and reaps it.
+        """
+        if not self._transfer_deadline_s:
+            return
+        now = time.perf_counter()
+        for decode_req in self.queue:
+            entered = decode_req.req.time_stats.decode_transfer_queue_entry_time
+            if not entered or now - entered <= self._transfer_deadline_s:
+                continue
+            receiver = decode_req.kv_receiver
+            if receiver is None or receiver.conclude_state is not None:
+                continue
+            logger.error(
+                f"Decode transfer timed out after {now - entered:.1f}s for request "
+                f"rank={self.tp_rank} {decode_req.req.rid=} "
+                f"{decode_req.req.bootstrap_room=}"
+            )
+            receiver.abort()
+
     def _poll_with_metadata_gate(self) -> List[int]:
+        self._fail_transfers_past_deadline()
         pollers = (
             [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
             if self.scheduler.enable_decode_hicache
@@ -2418,6 +2454,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _poll_with_staging(self) -> list:
+        self._fail_transfers_past_deadline()
         attn_cp_cpu_group = getattr(self, "attn_cp_cpu_group", None)
         return poll_and_all_reduce_with_staging(
             self.queue,

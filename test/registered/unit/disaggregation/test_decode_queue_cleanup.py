@@ -73,7 +73,12 @@ class TestHiCacheReceiverCapabilityProxy(CustomTestCase):
     def test_decode_poll_keeps_hicache_gate_and_reduces_tp_then_cp(self):
         tp_group, cp_group = object(), object()
         inner = SimpleNamespace(group_failure_requires_drain=True)
-        decode_req = SimpleNamespace(kv_receiver=inner)
+        decode_req = SimpleNamespace(
+            kv_receiver=inner,
+            req=SimpleNamespace(
+                time_stats=SimpleNamespace(decode_transfer_queue_entry_time=0.0)
+            ),
+        )
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.gloo_group = tp_group
@@ -726,6 +731,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             rid="failed-transfer",
             bootstrap_room=7,
             return_logprob=False,
+            time_stats=SimpleNamespace(decode_transfer_queue_entry_time=0.0),
         )
         decode_req = SimpleNamespace(
             req=req,
