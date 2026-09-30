@@ -141,7 +141,12 @@ PD_DP=2                         # -> attn_tp = 8/2 = 4
 # healthy -- "ran out of memory on HBM, HLO temporaries (110.23G) exceeds
 # available HBM (94.74G)". Pinning makes the pool independent of DP, so this
 # cannot silently return the next time the parallelism changes.
-MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-877440}
+#
+# 524288 = 4096 pages of 128, ~2x the sweep's measured working set (it peaked at
+# 0.27 of the previous 877440). The pool also has a host-side cost per compiled
+# executable, and at 877440 libtpu 0.0.47 OOMKills the pod during startup while
+# HBM still has ~39 GB free.
+MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-524288}
 export MAX_TOTAL_TOKENS
 
 # ===== CONTRACT DEFAULT: prefill chunking =====

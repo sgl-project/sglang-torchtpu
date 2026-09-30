@@ -3951,6 +3951,32 @@ class Scheduler(
 
         return res
 
+    def _align_prefix_across_attn_tp(self, reqs: List[Req]) -> None:
+        """Truncate each request to the shortest prefix any attention-TP peer matched."""
+        if not self.enable_dp_attention or self.ps.attn_tp_size <= 1 or not reqs:
+            return
+
+        # The ranks are shards of one batch but evict from their own radix
+        # caches, so they can match different prefix lengths. The mlp-sync
+        # gather publishes only rank 0's token count (dp_attn.py, tp0_info_cpu),
+        # and under MAX_LEN a rank that matched less prefix -- and so holds more
+        # tokens -- pads to it by a negative amount.
+        # Unguarded collective: the ranks admit the same reqs in the same order.
+        local = torch.tensor([len(r.prefix_indices) for r in reqs], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            local, op=torch.distributed.ReduceOp.MIN, group=self.attn_tp_cpu_group
+        )
+
+        for req, agreed in zip(reqs, local.tolist()):
+            if agreed >= len(req.prefix_indices):
+                continue
+            # The extend range moves earlier and keeps its length: a grown chunk
+            # would outrun the budget the adder reserved, and the tokens pushed
+            # off the end are picked up by the next chunk.
+            req.prefix_indices = req.prefix_indices[:agreed]
+            req.kv.cache_protected_len = min(req.kv.cache_protected_len, agreed)
+            req.set_extend_range(agreed, agreed + req.extend_range.length)
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -4231,6 +4257,8 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+
+        self._align_prefix_across_attn_tp(can_run_list)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
