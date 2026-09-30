@@ -54,6 +54,11 @@ from sglang.srt.disaggregation.raiden.receiver import (
     RaidenKVReceiver,
     RaidenReceiverMixin,
 )
+from sglang.srt.disaggregation.raiden.runtime_monitor import (
+    assert_raiden_self_transition,
+    assert_raiden_transition,
+    discard_raiden_trace,
+)
 from sglang.srt.disaggregation.raiden.sender import RaidenKVSender, RaidenSenderMixin
 from sglang.srt.disaggregation.raiden.serde import (
     Blocks,
@@ -596,12 +601,26 @@ class RaidenKVManager(
     def update_status(self, bootstrap_room: int, status: KVPoll) -> None:
         """Make CommonKVManager's sticky terminal transition atomic for Raiden."""
         with self._status_lock:
-            return super().update_status(bootstrap_room, status)
+            super().update_status(bootstrap_room, status)
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                discard_raiden_trace(bootstrap_room)
+                return
+            assert_raiden_transition(
+                bootstrap_room,
+                "update_status",
+                current,
+            )
 
     def clear_status(self, bootstrap_room: int) -> None:
         """Serialize room cleanup with every Raiden status transition."""
         with self._status_lock:
-            return super().clear_status(bootstrap_room)
+            super().clear_status(bootstrap_room)
+            assert_raiden_transition(
+                bootstrap_room,
+                "clear_status",
+                None,
+            )
 
     def _mark_aborted_locked(self, room: int) -> None:
         now = time.time()
@@ -844,7 +863,9 @@ class RaidenKVManager(
         An abort tombstone survives the room: frames for it can still arrive
         and must stay rejected. Tombstones age out on their own.
         """
+        assert_raiden_self_transition(room, "clear_room")
         self._drop_room_state(room, clear_failure_record=True)
+        discard_raiden_trace(room)
 
     def _drop_room_state(
         self, room: int, *, clear_failure_record: bool = False

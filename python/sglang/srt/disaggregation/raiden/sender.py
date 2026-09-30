@@ -30,6 +30,9 @@ from sglang.srt.disaggregation.raiden.common import (
     _tcp_endpoint,
     logger,
 )
+from sglang.srt.disaggregation.raiden.runtime_monitor import (
+    assert_raiden_self_transition,
+)
 from sglang.srt.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -124,6 +127,7 @@ class RaidenSenderMixin:
             accumulated.extend(block_ids)
             if swa_block_ids is not None:
                 self._prefill.send_swa_blocks[room] = list(swa_block_ids)
+            assert_raiden_self_transition(room, "append_send_blocks")
         return start
 
     def offer_chunk(
@@ -141,6 +145,7 @@ class RaidenSenderMixin:
         with self._state_lock:
             if room in self._aborted:
                 return
+            assert_raiden_self_transition(room, "offer_chunk")
             self._prefill.send_total[room] = total_pages
             p_start, p_blocks = self._prefill.pending_offer.get(room, (start, []))
             p_blocks = p_blocks + list(block_ids)
@@ -244,6 +249,7 @@ class RaidenSenderMixin:
                 )
             self._prefill.reshard_finalized.add(room)
             is_reshard = room in self._prefill.reshard_req
+            assert_raiden_self_transition(room, "finalize_send")
             self.update_status(room, KVPoll.Transferring)
         # The request type is selected by the decode handshake, not by whether
         # reshard support is globally enabled. Symmetric TP uses PULL_REQ even
@@ -296,6 +302,7 @@ class RaidenSenderMixin:
                 "waiting for the decode to ask for its KV",
             )
             self.update_status(room, KVPoll.Failed)
+            assert_raiden_self_transition(room, "fail_decode_silence")
         return True
 
     def _register_sender_read(
@@ -1021,6 +1028,15 @@ class RaidenKVSender(CommonKVSender):
             )
 
     def poll(self) -> KVPoll:
+        state = self._poll_impl()
+        assert_raiden_self_transition(
+            self.bootstrap_room,
+            "raiden_sender_poll",
+            label_param=state,
+        )
+        return state
+
+    def _poll_impl(self) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
         if self.kv_mgr.is_dummy_cp_rank:

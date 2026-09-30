@@ -21,6 +21,9 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
 from sglang.srt.disaggregation.raiden.chunk_plan import chunk_pull_window
 from sglang.srt.disaggregation.raiden.common import _tcp_endpoint, logger
+from sglang.srt.disaggregation.raiden.runtime_monitor import (
+    assert_raiden_self_transition,
+)
 from sglang.srt.disaggregation.raiden.serde import (
     Blocks,
     Chunk,
@@ -154,6 +157,7 @@ class RaidenReceiverMixin:
         aux_index: Optional[int],
         bootstrap_infos: List[dict],
     ) -> None:
+        assert_raiden_self_transition(room, "register_decode_request")
         if len(bootstrap_infos) != 1:
             # Asymmetric attention TP (decode attn TP < prefill attn TP): one
             # decode rank is fed by several prefill ranks, each pushing its
@@ -355,8 +359,11 @@ class RaidenReceiverMixin:
         return is a retry: the caller polls again on the next scheduler pass.
         """
         if self.chunked_transfer:
-            return self._start_chunked_pull(room)
-        return self._start_whole_pull(room)
+            started = self._start_chunked_pull(room)
+        else:
+            started = self._start_whole_pull(room)
+        assert_raiden_self_transition(room, "maybe_start_pull")
+        return started
 
     def _start_chunked_pull(self, room: int) -> bool:
         """Issue the next announced chunk once the pool can seat it.
@@ -1116,6 +1123,15 @@ class RaidenKVReceiver(CommonKVReceiver):
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
+        state = self._poll_impl()
+        assert_raiden_self_transition(
+            self.bootstrap_room,
+            "raiden_receiver_poll",
+            label_param=state,
+        )
+        return state
+
+    def _poll_impl(self) -> KVPoll:
         """Every terminal condition is checked before any native read is
         issued, so a room that just failed (peer heartbeat, native failure,
         or its own deadline) can never start a transfer in the same poll and

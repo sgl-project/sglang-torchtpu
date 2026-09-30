@@ -36,6 +36,7 @@ jobs:
       pull-requests: read
     outputs:
       run: ${{ steps.gate.outputs.run }}
+      raiden_runtime_verification: ${{ steps.paths.outputs.raiden_runtime_verification }}
     steps:
       - name: Fetch latest PR state
         id: pr
@@ -56,6 +57,7 @@ jobs:
         with:
           filters: |
             tpu:
+              - 'python/sglang/srt/disaggregation/raiden/**'
               - 'python/sglang/srt/hardware_backend/tpu/**'
               - 'python/sglang/srt/layers/attention/pallas/**'
               - 'python/sglang/srt/layers/moe/pallas/**'
@@ -90,6 +92,9 @@ jobs:
               - '.github/workflows/feature-validation-tpu.yml'
               - '.github/workflows/accuracy-test-tpu.yml'
               - '.github/workflows/perf-test-tpu.yml'
+            raiden_runtime_verification:
+              - 'python/sglang/srt/disaggregation/raiden/**'
+              - 'test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py'
       - name: Gate on readiness and TPU relevance
         id: gate
         run: |
@@ -150,11 +155,37 @@ jobs:
       contents: read
       id-token: write
 
+  # Exercise the real Raiden P/D path with runtime verification enabled.
+  raiden-runtime-verification-e2e:
+    name: raiden-runtime-verification-e2e
+    needs: [decide, build]
+    if: >-
+      needs.build.result == 'success'
+      && needs.decide.outputs.raiden_runtime_verification == 'true'
+    uses: ./.github/workflows/_tpu-test.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      image: ${{ needs.build.outputs.digest }}
+      display_name: test_tpu_raiden_runtime_verification_pd_singlehost
+      lane: pr-gate
+      hosts: 1
+      pd_prefill_hosts: 1
+      pd_decode_hosts: 1
+      exec_cmd: >-
+        env SGLANG_TPU_ENABLE_RAIDEN_RUNTIME_VERIFICATION=1
+        python3 test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py integration
+      files: test/registered/tpu/e2e/test_tpu_gpt_oss_120b_pd_singlehost.py
+      weights_pvc: model-weights-rox
+      run_name: raiden-rv-pd-sh-gpt-120b
+    permissions:
+      contents: read
+      id-token: write
+
   # Aggregator finish job for branch protection / required status checks.
   # If tests are skipped (non-TPU PR), this finishes green immediately.
   # If tests are run, it blocks until all TPU stages finish and fails if any fail.
   pr-test-tpu-finish:
-    needs: [decide, build, unit, e2e]
+    needs: [decide, build, unit, e2e, raiden-runtime-verification-e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
