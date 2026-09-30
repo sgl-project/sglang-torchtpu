@@ -2,6 +2,7 @@
 
 """Unit tests for the TPU fused-RS Torch wrapper."""
 
+import importlib.util
 import unittest
 from unittest.mock import Mock, patch
 
@@ -15,6 +16,76 @@ register_tpu_ci(est_time=5, suite="stage-a-test-tpu-unit")
 
 
 class TestFusedMoeRsOp(CustomTestCase):
+    @unittest.skipUnless(
+        importlib.util.find_spec("jax") and importlib.util.find_spec("torch_tpu"),
+        "requires JAX and TorchTPU",
+    )
+    def test_native_execution_preserves_mesh_assignment_and_local_shapes(self):
+        from torch_tpu._internal.pallas import pallas
+
+        from sglang.test.cpu_test_utils import get_cpu_export_mesh
+
+        device_ids = (8, 9, 12, 13, 14, 15, 10, 11, 0, 1, 4, 5, 6, 7, 2, 3)
+        mesh = get_cpu_export_mesh(("data", "model"), (1, 16), device_ids)
+
+        def tensor(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, dtype=dtype, device="meta")
+
+        inputs = (
+            tensor((256, 4096)),
+            tensor((16, 4096, 8192), torch.float8_e4m3fn),
+            tensor((16, 4096, 4096), torch.float8_e4m3fn),
+            tensor((16, 1, 1, 8192)),
+            tensor((16, 1, 1, 4096)),
+            tensor((256, 8)),
+            tensor((256, 8), torch.int32),
+            tensor((1,)),
+            tensor((2,), torch.int32),
+            8,
+            "silu",
+            False,
+            False,
+            tensor((16,), torch.int32),
+        )
+
+        def placeholder(aval, mesh=None, partition_spec=None):
+            return tensor(
+                pallas.get_local_shape(aval.shape, mesh, partition_spec),
+                pallas.JAX_TO_TORCH_DTYPE_MAP[aval.dtype],
+            )
+
+        with (
+            patch.object(fused_moe_rs_op, "_FUSED_MOE_RS_OP", None),
+            patch.object(fused_moe_rs_op, "_get_mesh", return_value=mesh),
+            patch.object(torch.library, "custom_op", return_value=Mock()) as register,
+            patch.object(pallas, "torch_placeholder", side_effect=placeholder),
+            patch.object(pallas.tpu_torch_pallas, "register_custom_kernel"),
+            patch.object(
+                pallas.tpu_torch_pallas,
+                "call_custom_kernel",
+                side_effect=lambda *_, **kwargs: kwargs["output_shapes"],
+            ) as execute,
+        ):
+            fused_moe_rs_op._build_fused_moe_rs_op()
+            native_call = register.call_args.args[1]
+            placeholders = pallas.jax_placeholders(
+                inputs,
+                mesh=native_call.mesh,
+                partition_specs=native_call.input_partition_specs,
+            )
+            self.assertEqual(len(placeholders), len(inputs))
+            for original, converted in zip(inputs, placeholders):
+                if isinstance(original, torch.Tensor):
+                    self.assertEqual(converted.shape, original.shape)
+            output = native_call(*inputs)
+
+        self.assertEqual(output.shape, (16, 4096))
+        self.assertEqual(output.dtype, torch.bfloat16)
+        execute.assert_called_once()
+        self.assertEqual(
+            execute.call_args.kwargs["device_assignment"], list(device_ids)
+        )
+
     def test_padding_satisfies_ep_and_routed_row_alignment(self):
         cases = (
             # num_tokens, topk, ep_size, padded_tokens

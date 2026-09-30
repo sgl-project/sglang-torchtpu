@@ -52,18 +52,6 @@ _OP_NAME = "sglang_tpu::pp_permute"
 _OPS: dict[tuple[int, ...], Any] = {}
 
 
-def pp_rank_to_physical_device(pp_group: Any) -> tuple[int, ...]:
-    """Physical TPU device id of every pipeline rank, gathered over the
-    group's host channel."""
-    from torch_tpu._internal.distributed import tpu_distributed
-
-    ids: list = [None] * int(pp_group.world_size)
-    torch.distributed.all_gather_object(
-        ids, int(tpu_distributed.global_device_id()), group=pp_group.cpu_group
-    )
-    return tuple(int(x) for x in ids)
-
-
 def build_pp_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
     """Torch op ``x_out = pp_permute(x)``: one collective-permute over the
     slice's devices moving a [rows, hidden] block along ``perm`` (mesh
@@ -73,17 +61,12 @@ def build_pp_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
     if op is not None:
         return op
     import jax
-    import numpy as np
     from jax.experimental.shard_map import shard_map
-    from jax.sharding import Mesh, PartitionSpec
-    from torch_tpu._internal.pallas import jax_op
-
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        get_torchtpu_export_devices,
-    )
+    from jax.sharding import PartitionSpec
+    from torch_tpu._internal.pallas import get_pallas_mesh, jax_op
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    mesh = Mesh(np.asarray(get_torchtpu_export_devices(world_size)), ("pp",))
+    mesh = get_pallas_mesh(("pp",), (world_size,))
     spec = PartitionSpec()
 
     def shift(x: jax.Array) -> jax.Array:
@@ -98,7 +81,13 @@ def build_pp_permute_op(perm: tuple[tuple[int, int], ...]) -> Any:
             check_rep=False,
         )(x)
 
-    op = jax_op(f"{_OP_NAME}_{len(_OPS)}", shift)
+    op = jax_op(
+        f"{_OP_NAME}_{len(_OPS)}",
+        shift,
+        mesh=mesh,
+        input_partition_specs=(spec,),
+        output_partition_specs=(spec,),
+    )
     _OPS[key] = op
     return op
 
@@ -309,7 +298,7 @@ def build_pp_wave(
 ) -> PPWave:
     """Create the stage's wave on the device and verify the hand-off routing.
 
-    The permute is routed by mesh position, which follows physical device
+    The permute is routed by mesh position, which follows distributed rank
     order; the cycle closes from the last stage back to the first.
     """
     rank = int(pp_group.rank_in_group)
@@ -320,8 +309,8 @@ def build_pp_wave(
             f"the pipeline wave needs the pipeline group to span the whole slice "
             f"(pp {size}, world {world_size}); run pipeline stages at tp 1"
         )
-    physical = pp_rank_to_physical_device(pp_group)
-    perm = tuple((physical[r], physical[(r + 1) % size]) for r in range(size))
+    ranks = tuple(pp_group.ranks)
+    perm = tuple((ranks[r], ranks[(r + 1) % size]) for r in range(size))
     op = build_pp_permute_op(perm)
     wave = PPWave(
         rank=rank,
@@ -339,13 +328,13 @@ def build_pp_wave(
     if not all(verdicts):
         raise RuntimeError(
             f"pipeline wave stage {rank}: the hand-off probe failed "
-            f"(stage verdicts {verdicts}, devices {physical})"
+            f"(stage verdicts {verdicts}, ranks {ranks})"
         )
     logger.info(
-        "pipeline wave stage %d/%d: hand-off cycle over devices %s, buffer [%d, %d] %s",
+        "pipeline wave stage %d/%d: hand-off cycle over ranks %s, buffer [%d, %d] %s",
         rank,
         size,
-        physical,
+        ranks,
         rows,
         hidden,
         dtype,

@@ -88,16 +88,10 @@ def prepare_fused_moe_rs(layer: torch.nn.Module) -> None:
 
 @functools.cache
 def _get_mesh():
-    import numpy as np
-    from jax.sharding import Mesh
-
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        get_torchtpu_export_devices,
-    )
+    from torch_tpu._internal.pallas import get_pallas_mesh
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    export_devices = np.asarray(get_torchtpu_export_devices(world_size)).reshape(1, -1)
-    return Mesh(export_devices, ("data", "model"))
+    return get_pallas_mesh(("data", "model"), (1, world_size))
 
 
 def _build_fused_moe_rs_op():
@@ -107,6 +101,7 @@ def _build_fused_moe_rs_op():
 
     import jax
     import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
     from torch_tpu._internal.pallas import jax_op
 
     from sglang.srt.layers.moe.pallas.fused_rs.fused_moe import fused_moe_func_rs
@@ -168,8 +163,16 @@ def _build_fused_moe_rs_op():
             result = result + post_expert_norm_weight[0].astype(result.dtype) * 0
         return result
 
-    # Bridge the JAX kernel into Torch as clean non-sharded custom op.
-    custom_op = jax_op(_FUSED_MOE_RS_OP_NAME, _wrapped)
+    # Forward the mesh's device assignment while preserving the Torch-local
+    # shapes: the kernel already consumes local expert weights and returns a
+    # local token shard.
+    custom_op = jax_op(
+        _FUSED_MOE_RS_OP_NAME,
+        _wrapped,
+        mesh=mesh,
+        input_partition_specs=(P(),) * 9 + (None,) * 4 + (P(),),
+        output_partition_specs=(P(),),
+    )
 
     def _fake_impl(
         hidden_states: torch.Tensor,

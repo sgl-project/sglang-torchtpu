@@ -20,14 +20,9 @@ _OPS_LOCK = Lock()
 
 @functools.cache
 def _get_mesh(world_size: int):
-    import numpy as np
-    from jax.sharding import Mesh
+    from torch_tpu._internal.pallas import get_pallas_mesh
 
-    from sglang.srt.hardware_backend.tpu.pallas_export import (
-        get_torchtpu_export_devices,
-    )
-
-    return Mesh(np.asarray(get_torchtpu_export_devices(world_size)), ("model",))
+    return get_pallas_mesh(("model",), (world_size,))
 
 
 def _build_op(world_size: int) -> Callable:

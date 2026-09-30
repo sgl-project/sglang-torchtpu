@@ -265,7 +265,6 @@ def moe_gmm_local_rs_nodedup(
         caller_tile_m=tile_m,
         top_k=topk,
         fp8_direct_write=fp8_direct_write,
-        tp_rank_to_device_id=tp_rank_to_device_id,
     )
 
     # Post-kernel: apply topk weights and reduce over top_k. Stay in bf16
