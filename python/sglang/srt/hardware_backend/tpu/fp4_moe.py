@@ -334,7 +334,7 @@ def apply_tpu_nvfp4_moe(
         if post_expert_norm_weight is None:
             post_expert_norm_weight = hidden_states.new_zeros((1,))
 
-        tp_world_size = int(layer._tpu_fused_rs_tp_rank_to_device_id.numel())
+        tp_world_size = layer.moe_ep_size
         if keep_output_shard:
             expected_global_rows = prepared_input.output_token_count * tp_world_size
             if hidden_states.shape[0] != expected_global_rows:
@@ -390,7 +390,7 @@ def apply_tpu_nvfp4_moe(
                 # Blocks 16-128 use W4A16; block-256/512 already quantize the
                 # GMM activation. A direct FP8 write would add another loss.
                 fp8_direct_write=False,
-                tp_rank_to_device_id=layer._tpu_fused_rs_tp_rank_to_device_id,
+                world_size=layer.moe_ep_size,
                 keep_token_shard=keep_output_shard,
             )
             outputs.append(output[:output_rows])

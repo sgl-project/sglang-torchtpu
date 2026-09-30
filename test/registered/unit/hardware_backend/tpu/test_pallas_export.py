@@ -167,9 +167,13 @@ class TestPallasExportEnvironment(CustomTestCase):
         import jax
         import torch
         from jax.experimental import pallas as pl
+        from jax.sharding import PartitionSpec as P
 
         from sglang.srt.hardware_backend.tpu import pallas_jax_op
+        from sglang.test.cpu_test_utils import get_cpu_export_mesh
 
+        device_ids = (3, 1, 0, 2)
+        mesh = get_cpu_export_mesh(("model",), (4,), device_ids)
         registered = set()
         fingerprints = []
         native_keys = []
@@ -211,8 +215,18 @@ class TestPallasExportEnvironment(CustomTestCase):
 
                 wrapped = pallas_jax_op._CpuExportJaxCallable(
                     name="sglang_tpu_test::body_identity",
-                    jit_fn=jax.jit(add),
+                    jit_fn=jax.jit(
+                        jax.shard_map(
+                            add,
+                            mesh=mesh,
+                            in_specs=(P(),),
+                            out_specs=P(),
+                            check_vma=False,
+                        )
+                    ),
                     trace_key=trace_key,
+                    mesh=mesh,
+                    input_partition_specs=(P(),),
                 )
                 wrapped.sglang_output_shardings = ()
                 with patch.object(
@@ -226,9 +240,15 @@ class TestPallasExportEnvironment(CustomTestCase):
                     native_key = f"{kernel_key};mlir={fingerprint}"
                     self.assertEqual(register.call_args.args[1], native_key)
                     self.assertEqual(call.call_args.args[1], native_key)
+                    self.assertEqual(
+                        call.call_args.kwargs["device_assignment"], list(device_ids)
+                    )
                     wrapped(value)
                     lookup.assert_called_with(wrapped.name, native_key)
                     self.assertEqual(call.call_args.args[1], native_key)
+                    self.assertEqual(
+                        call.call_args.kwargs["device_assignment"], list(device_ids)
+                    )
                     export.assert_called_once()
                 fingerprints.append(fingerprint)
                 native_keys.append(native_key)

@@ -264,7 +264,6 @@ def argmax_draft_tokens_tpu(
             TpuVocabShard.from_lm_head(lm_head),
             k=1,
             group=get_tp_group(),
-            lm_head=lm_head,
         )
         tokens = global_token_ids.squeeze(-1).to(torch.long)
         return tokens.view(bs, block_size - 1)

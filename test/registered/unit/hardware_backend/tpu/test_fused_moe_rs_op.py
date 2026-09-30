@@ -45,7 +45,6 @@ class TestFusedMoeRsOp(CustomTestCase):
             "silu",
             False,
             False,
-            tensor((16,), torch.int32),
         )
 
         def placeholder(aval, mesh=None, partition_spec=None):
@@ -103,17 +102,12 @@ class TestFusedMoeRsOp(CustomTestCase):
                 self.assertEqual(actual % ep_size, 0)
                 self.assertEqual((actual * topk) % 16, 0)
 
-    def test_prepare_sets_physical_rank_metadata(self):
+    def test_prepare_sets_logical_expert_ownership(self):
         layer = torch.nn.Module()
         layer.num_local_experts = 16
         layer.w13_weight = torch.empty(1)
 
         with (
-            patch.object(
-                fused_moe_rs_op,
-                "_get_tp_rank_to_device_id_mapping",
-                return_value=(4, (0, 1, 6, 7, 2, 3, 4, 5)),
-            ),
             patch(
                 "sglang.srt.runtime_context.get_parallel",
                 return_value=Mock(moe_ep_rank=2),
@@ -124,24 +118,15 @@ class TestFusedMoeRsOp(CustomTestCase):
             fused_moe_rs_op.prepare_fused_moe_rs(layer)
 
         torch.testing.assert_close(
-            layer._tpu_fused_rs_tp_rank_to_device_id,
-            torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int32),
-        )
-        torch.testing.assert_close(
             layer._tpu_fused_rs_group_offset,
             torch.tensor([32, 2], dtype=torch.int32),
         )
-        self.assertIn("_tpu_fused_rs_tp_rank_to_device_id", layer._buffers)
         self.assertIn("_tpu_fused_rs_group_offset", layer._buffers)
-        self.assertIn(
-            "_tpu_fused_rs_tp_rank_to_device_id", layer._non_persistent_buffers_set
-        )
         self.assertIn("_tpu_fused_rs_group_offset", layer._non_persistent_buffers_set)
         self.assertEqual(build.call_count, 2)
 
-    def test_gather_reorders_tp_ranks_to_physical_device_order(self):
+    def test_gather_preserves_logical_rank_order(self):
         rank_order_shards = torch.tensor([[0], [1], [2], [3], [4], [5], [6], [7]])
-        tp_rank_to_device_id = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5], dtype=torch.int32)
         tp_group = Mock(
             world_size=8,
             all_gather=Mock(return_value=rank_order_shards),
@@ -173,7 +158,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=True,
-                tp_rank_to_device_id=tp_rank_to_device_id,
+                world_size=8,
             )
 
         torch.testing.assert_close(output, torch.arange(8).reshape(8, 1))
@@ -205,7 +190,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=False,
-                tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
+                world_size=8,
                 keep_token_shard=True,
             )
 
@@ -237,7 +222,7 @@ class TestFusedMoeRsOp(CustomTestCase):
                 activation="silu",
                 has_post_expert_norm=False,
                 fp8_direct_write=False,
-                tp_rank_to_device_id=torch.arange(8, dtype=torch.int32),
+                world_size=8,
                 keep_token_shard=True,
             )
 

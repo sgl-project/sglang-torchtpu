@@ -668,22 +668,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "Target model must have an lm_head for DFLASH TPU draft sampling."
             )
         self.draft_model.lm_head = target_model.lm_head
-        # The draft's distributed-TopK path borrows this head but never runs the
-        # target's capability negotiation, so publish the kernel's rank operand
-        # here -- it has to be a graph input before the draft graphs below are
-        # captured. Same guard as the draft's use site, so heads that cannot take
-        # the path do not gain an unused buffer (and a changed graph signature).
-        from sglang.srt.distributed import get_tp_group
-        from sglang.srt.hardware_backend.tpu.top_k import (
-            register_distributed_top_k_rank,
-            supports_distributed_tpu_top_k,
-        )
-
-        tp_group = get_tp_group()
-        if int(tp_group.world_size) > 1 and supports_distributed_tpu_top_k(
-            target_model.lm_head, top_k=1
-        ):
-            register_distributed_top_k_rank(target_model.lm_head, group=tp_group)
         self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         compile_policy = getattr(self.draft_model_runner, "compile_policy", None)
         if compile_policy is not None:

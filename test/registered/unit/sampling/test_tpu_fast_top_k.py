@@ -23,13 +23,11 @@ from sglang.srt.hardware_backend.tpu.sampler import (
     select_logits_output_mode,
 )
 from sglang.srt.hardware_backend.tpu.top_k import (
-    DISTRIBUTED_TOP_K_RANK_BUFFER,
     PallasDistributedTopKConfig,
     PallasDistributedTopKNegotiation,
     TpuVocabShard,
     distributed_tpu_top_k,
     negotiate_pallas_distributed_top_k_config,
-    register_distributed_top_k_rank,
     supports_distributed_tpu_top_k,
     tpu_top_k,
 )
@@ -129,50 +127,6 @@ def _distributed_top_k_model(shard_width=202_048 // 16):
         )
     )
     return SimpleNamespace(logits_processor=processor, lm_head=lm_head)
-
-
-class TestDistributedTopKRankOperand(CustomTestCase):
-    """The kernel's rank operand has to reach the graph as a model buffer.
-
-    direct_compile lifts parameters, buffers, explicit arguments and KV-pool
-    state into graph inputs, and TraverseAndCompile rejects any other device
-    tensor reachable from the outputs. Building the operand inside the traced
-    region instead aborted all eight schedulers during extend precompile with
-    "identified an argument that was not provided: ... int32[1]", which is what
-    reddened test_tpu_gpt_oss_120b_singlehost_prefix_cache_kv_offload from
-    2026-09-06 (nightly run 34105159302).
-    """
-
-    def test_registration_publishes_the_rank_as_a_named_buffer(self):
-        lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
-        register_distributed_top_k_rank(lm_head, group=SimpleNamespace(rank_in_group=3))
-
-        buffers = dict(lm_head.named_buffers())
-        self.assertIn(DISTRIBUTED_TOP_K_RANK_BUFFER, buffers)
-        rank = buffers[DISTRIBUTED_TOP_K_RANK_BUFFER]
-        self.assertEqual(rank.dtype, torch.int32)
-        self.assertEqual(rank.tolist(), [3])
-        # Non-persistent: a new entry in the checkpoint would break weight
-        # loading for every model that takes this path.
-        self.assertNotIn(DISTRIBUTED_TOP_K_RANK_BUFFER, lm_head.state_dict())
-
-    def test_registration_is_idempotent(self):
-        # Negotiation runs per logits processor, and a model can reach it more
-        # than once; re-registering would rebind the buffer and invalidate the
-        # placeholder direct_compile already captured for it.
-        lm_head = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
-        group = SimpleNamespace(rank_in_group=2)
-        register_distributed_top_k_rank(lm_head, group=group)
-        first = getattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER)
-        register_distributed_top_k_rank(lm_head, group=group)
-        self.assertIs(getattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER), first)
-
-    def test_a_non_module_head_is_skipped(self):
-        # Negotiation test doubles are plain namespaces; only an nn.Module can
-        # hold a buffer, and only an nn.Module can be part of a captured model.
-        lm_head = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
-        register_distributed_top_k_rank(lm_head, group=SimpleNamespace(rank_in_group=1))
-        self.assertFalse(hasattr(lm_head, DISTRIBUTED_TOP_K_RANK_BUFFER))
 
 
 class TestDistributedTopKEligibility(CustomTestCase):
