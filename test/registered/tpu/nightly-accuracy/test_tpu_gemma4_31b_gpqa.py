@@ -4,14 +4,14 @@ import unittest
 from typing import ClassVar
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import run_model_config
-from sglang.test.tpu.eval_models import (
+from sglang.test.tpu import (
     BASE_URL,
     GEMMA4_31B,
     HEALTH_TIMEOUT,
+    fixture_runtime_envs,
     make_model_config,
     make_runner,
-    runtime_envs,
+    run_model_config,
 )
 from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
@@ -43,7 +43,7 @@ class TestGemma31BGPQA(TPULauncherTestCase):
     health_timeout = HEALTH_TIMEOUT
     health_endpoint = "/health_generate"
     tag = "gemma4-31b-gpqa-e2e"
-    runtime_envs: ClassVar[dict[str, str | None]] = runtime_envs()
+    runtime_envs: ClassVar[dict[str, str | None]] = fixture_runtime_envs()
 
     def test_accuracy(self):
         run_model_config(MODEL_CONFIG, base_url=self.base_url)

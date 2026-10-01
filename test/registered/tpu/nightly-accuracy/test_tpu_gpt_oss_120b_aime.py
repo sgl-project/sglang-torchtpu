@@ -1,12 +1,13 @@
 """GPT-OSS 120B TPU AIME 2025 nightly score."""
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import aime25_openai_runner, model_config_main
-from sglang.test.tpu.eval_models import (
+from sglang.test.tpu import (
     BASE_URL,
     GPT_OSS_120B,
+    aime25_openai_runner,
     make_launch_env,
     make_model_config,
+    model_config_main,
 )
 
 register_tpu_ci(
