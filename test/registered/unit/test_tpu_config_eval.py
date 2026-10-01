@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
@@ -133,6 +133,30 @@ class TestAccuracyRecipes(unittest.TestCase):
                 self.assertEqual(plan.env["TORCH_LOGS"], "+recompiles")
                 self.assertEqual(plan.env["SGLANG_TPU_PRELOAD_TELEMETRY_STUB"], "1")
                 self.assertIn("--enable-torch-compile", plan.command)
+
+    def test_every_recipe_still_parses_as_server_args(self):
+        """Every flag a recipe emits must exist on ServerArgs at this revision.
+
+        An upstream rename leaves the recipe emitting a flag the server no
+        longer takes, and the job dies in bring-up on the slice: the sync that
+        split --cuda-graph-bs into -decode/-prefill made the bare flag an
+        ambiguous prefix, which argparse rejects.
+        """
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        topology = {"TPU_WORKER_ID": "0", "TPU_WORKER_HOSTNAMES": "h0,h1"}
+        for recipe in self.MULTIHOST + self.SINGLE_HOST:
+            with self.subTest(recipe=recipe):
+                plan = plan_launch(load_recipe(recipe), inherited=topology)
+                argv = plan.command[plan.command.index("sglang.launch_server") + 1 :]
+                parser = argparse.ArgumentParser()
+                ServerArgs.add_cli_args(parser)
+                try:
+                    parser.parse_args(argv)
+                except SystemExit as exit_code:
+                    self.fail(f"{recipe}: server rejects its own flags ({exit_code})")
 
     def test_every_multihost_accuracy_test_launches_one_of_these_recipes(self):
         """The JobSet runs MULTIHOST_LAUNCH["launch_script"] on every host.

@@ -25,7 +25,6 @@ CONFIG["server_args"].update(
         "quantization": None,
         "max_running_requests": CONCURRENCY,
         "torch_compile_max_bs": CONCURRENCY,
-        "cuda_graph_bs": [1, 8, 32, 64, CONCURRENCY],
         "tpu_compile_bs": [1, 8, 32, 64, CONCURRENCY],
         "tpu_compile_tokens": [PREFILL_TOKENS],
         "context_length": CONTEXT_LENGTH,
