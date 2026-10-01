@@ -2,9 +2,9 @@
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import gpqa_openai_runner, model_config_main
-from sglang.test.tpu.gpt_oss_120b_eval_common import (
+from sglang.test.tpu.eval_models import (
     BASE_URL,
-    SERVED_MODEL_NAME,
+    GPT_OSS_120B,
     make_launch_env,
     make_model_config,
 )
@@ -19,6 +19,7 @@ register_tpu_ci(
 MAX_TOKENS = 65536
 
 LAUNCH_ENV = make_launch_env(
+    GPT_OSS_120B,
     MAX_TOTAL_TOKENS="1114112",
     OSL=str(MAX_TOKENS),
     CONCUR="16",
@@ -30,7 +31,7 @@ GATE = {
     "dataset": "gpqa",
     "label": "gpqa_diamond_high",
     "runner": gpqa_openai_runner(
-        model=SERVED_MODEL_NAME,
+        model=GPT_OSS_120B["served_model_name"],
         n_repeats=1,
         reasoning_effort="high",
         max_tokens=MAX_TOKENS,
@@ -41,6 +42,7 @@ GATE = {
 }
 
 MODEL_CONFIG = make_model_config(
+    GPT_OSS_120B,
     test_name="gpt-oss-120b-gpqa",
     series_id="accuracy-gpt-oss-120b-gpqa",
     tag="gpqa-e2e",
