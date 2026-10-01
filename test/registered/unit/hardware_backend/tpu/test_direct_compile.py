@@ -227,26 +227,107 @@ class TestDirectCompile(CustomTestCase):
                 specialization_key=lambda value: tuple(value.shape),
             )
 
-        value = torch.ones(2, device="tpu")
-        expected = torch.full((2,), 2.0)
-        torch.tpu._clear_cache()
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+        def run(compiled_fn, value, async_compile):
+            if async_compile:
+                return compiled_fn.warmup_async(value).wait()
+            return compiled_fn(value)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
+        for async_compile in (False, True):
+            with self.subTest(async_compile=async_compile):
+                value = torch.ones(2, device="tpu")
+                expected = torch.full((2,), 2.0)
+                torch.tpu._clear_cache()
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
 
-        requests_before = torch.tpu._get_cache_requests()
-        hits_before = torch.tpu._get_cache_hits()
-        misses_before = torch.tpu._get_cache_misses()
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before + 1)
 
-        torch.testing.assert_close(new_compiled_fn()(value).cpu(), expected)
-        self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
-        self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
-        self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+                requests_before = torch.tpu._get_cache_requests()
+                hits_before = torch.tpu._get_cache_hits()
+                misses_before = torch.tpu._get_cache_misses()
+
+                result = run(new_compiled_fn(), value, async_compile)
+                torch.testing.assert_close(result.cpu(), expected)
+                self.assertEqual(torch.tpu._get_cache_requests(), requests_before + 1)
+                self.assertEqual(torch.tpu._get_cache_hits(), hits_before + 1)
+                self.assertEqual(torch.tpu._get_cache_misses(), misses_before)
+
+    @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
+    def test_native_async_grid_preserves_model_kv_and_callbacks(self):
+        model = _ModelWithObjectTensorState().to("tpu")
+        model.object_state.value = model.object_state.value.to("tpu")
+        model.object_state.weight_alias = model.weight
+        pool = _KVPool(torch.zeros(2, device="tpu"))
+        original_pool = pool.value
+        callbacks = []
+
+        def fn(value):
+            pool.value.add_(value.sum(dim=0))
+            out = value + model.weight + model.object_state.value
+            direct_compile.insert_callback(out[0], callbacks.append)
+            return out
+
+        compiled = direct_compile.direct_compile(
+            fn,
+            specialization_key=lambda value: tuple(value.shape),
+            model=model,
+            model_extra_tensor_attrs=(
+                "object_state.value",
+                "object_state.weight_alias",
+            ),
+            kv_pool=pool,
+        )
+        values = [torch.full((bs, 2), float(bs), device="tpu") for bs in (1, 2, 4)]
+        compiler = direct_compile.tpu_torch_compile
+        with (
+            torch.no_grad(),
+            patch.object(compiler, "execute", wraps=compiler.execute) as execute,
+        ):
+            pending = [compiled.warmup_async(value) for value in values]
+            execute.assert_not_called()
+            self.assertEqual(len(compiled.cache), 3)
+            self.assertEqual(callbacks, [])
+            self.assertIs(pool.value, original_pool)
+            self.assertTrue(torch.equal(pool.value.cpu(), torch.zeros(2)))
+
+            expected_pool = torch.zeros(2)
+            for warmup, value in zip(pending, values):
+                actual = warmup.wait()
+                expected = value.cpu() + 3
+                expected_pool += value.cpu().sum(dim=0)
+                self.assertTrue(torch.equal(actual.cpu(), expected))
+                self.assertTrue(torch.equal(pool.value.cpu(), expected_pool))
+                self.assertTrue(torch.equal(callbacks[-1].cpu(), expected[0]))
+                self.assertIs(pool.value, original_pool)
+
+            replacement = torch.full((2, 2), 7.0, device="tpu")
+            self.assertTrue(
+                torch.equal(compiled(replacement).cpu(), torch.full((2, 2), 10.0))
+            )
+            self.assertEqual(len(compiled.cache), 3)
+            self.assertEqual(execute.call_count, 4)
+            self.assertEqual(len(callbacks), 4)
+            self.assertTrue(torch.equal(pool.value.cpu(), expected_pool + 14))
+            self.assertTrue(
+                all(
+                    artifact.pending_compile is None
+                    for artifact in compiled.cache.values()
+                )
+            )
+
+    def test_native_async_failure_propagates_before_execution(self):
+        artifact = _make_artifact(((2,),))
+        artifact.pending_compile = MagicMock()
+        artifact.pending_compile.get.side_effect = RuntimeError("native compile failed")
+        with patch.object(direct_compile.tpu_torch_compile, "execute") as execute:
+            with self.assertRaisesRegex(RuntimeError, "native compile failed"):
+                artifact(((torch.ones(2),), {}))
+            execute.assert_not_called()
 
     @unittest.skipUnless(torch.tpu.is_available(), "requires TPU")
     def test_preserves_model_and_argument_layouts(self):

@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.tpu.compilation.decoder_compile_policy import (
     _materialize_out,
     _unpad_decoder_outputs,
 )
+from sglang.srt.hardware_backend.tpu.compilation.pending_call import PendingCall
 from sglang.srt.hardware_backend.tpu.compilation.spec_decode_compile_policy_dflash import (
     DFlashSpecDecoderTpuCompilePolicy,
     _kv_appender_specialization_key,
@@ -50,6 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     LogitsOutputMode,
     PPProxyTensors,
 )
+from sglang.srt.observability.compile_timing import CompileTimingRecorder
 from sglang.srt.runtime_context import get_context, get_disagg, get_parallel, get_spec
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -1215,6 +1217,48 @@ class TestPrecompileLoops(_PolicyTestCase):
     EXTEND covers token buckets at the fixed batch cap, and DECODE varies bs
     (tokens == bs)."""
 
+    def test_compile_timings_include_waits_without_counting_other_queued_work(self):
+        for async_warmup in (False, True):
+            with self.subTest(async_warmup=async_warmup):
+                policy = _make_policy()
+                policy.model_runner.draft_model_idx = None
+                policy.compile_timing_recorder = CompileTimingRecorder()
+                clock = [100.0]
+
+                def run_one(**kwargs):
+                    clock[0] += 2.0
+
+                    def execute():
+                        clock[0] += 3.0
+
+                    if async_warmup:
+                        return PendingCall(execute)
+                    execute()
+                    return None
+
+                with (
+                    patch.object(policy, "_run_one", side_effect=run_one),
+                    patch(
+                        "sglang.srt.hardware_backend.tpu.compilation."
+                        "decoder_compile_policy.time.perf_counter",
+                        side_effect=lambda: clock[0],
+                    ),
+                    get_parallel().override(tp_rank=1),
+                ):
+                    pending = policy._precompile_decode()
+                    if async_warmup:
+                        self.assertEqual(policy.compile_timing_recorder.snapshot(), [])
+                        self.assertEqual(len(pending), 2)
+                    clock[0] += 1000.0
+                    for call in pending:
+                        call.wait()
+
+                steps = policy.compile_timing_recorder.snapshot()
+                self.assertEqual([step["batch_size"] for step in steps], [1, 4])
+                self.assertEqual(
+                    [step["duration_seconds"] for step in steps], [5.0, 5.0]
+                )
+
     def test_extend_iterates_token_buckets_at_fixed_batch_cap(self):
         mr = _model_runner()
         policy = _make_policy(mr, token_buckets=(8, 64, 256), bs_buckets=(1, 4))
@@ -1471,6 +1515,35 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
     serving uses: ``prepare_forward_batch`` → ``init_forward_metadata``
     → compiled ``forward``."""
 
+    def test_pipeline_profile_executes_outer_model_synchronously(self):
+        mr = _model_runner()
+        policy = _make_policy(mr)
+        policy.tracer = "direct"
+        policy.owner = SimpleNamespace(forward=MagicMock())
+        with (
+            patch.object(envs.SGLANG_DIRECT_COMPILE_ASYNC, "get", return_value=True),
+            patch.object(policy, "_supports_async_warmup", return_value=True),
+            patch(
+                "sglang.srt.hardware_backend.tpu.pp_profile.set_profile_inputs",
+                side_effect=lambda policy, batch, args, kwargs, tokens, prefix: (
+                    args,
+                    kwargs,
+                ),
+            ),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "decoder_compile_policy.time.perf_counter",
+                side_effect=[10.0, 10.25],
+            ),
+        ):
+            elapsed_ms = policy._run_one(
+                num_tokens=64, bs=4, mode=ForwardMode.EXTEND, profile_prefix=0
+            )
+        self.assertEqual(elapsed_ms, 250.0)
+        mr.model.forward.assert_called_once()
+        policy.owner.forward.assert_not_called()
+        policy.owner.forward.warmup_async.assert_not_called()
+
     def test_run_one_calls_prepare_then_metadata_then_forward(self):
         mr = _model_runner()
 
@@ -1563,6 +1636,16 @@ class TestRunOneCallsCompiledForward(_SpecPolicyTestCase):
         self.assertEqual(kwargs, {"wait": True})
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[0].args, (2,))
         self.assertEqual(pool.get_fused_kv_buffer.call_args_list[1].args, (3,))
+
+        for result in (kv0, (kv0, {"aux": kv1})):
+            with self.subTest(result_type=type(result).__name__):
+                with (
+                    patch.dict(sys.modules, stubs),
+                    patch("torch_tpu._internal.sync.sync.synchronize") as sync,
+                ):
+                    _materialize_out(result, SimpleNamespace(), None)
+                expected = [kv0] if isinstance(result, torch.Tensor) else [kv0, kv1]
+                sync.assert_called_once_with(expected, wait=True)
 
 
 def _spec_model_runner(device="cpu", is_draft_worker=False):
@@ -3223,10 +3306,17 @@ class TestDraftPrecompile(_SpecPolicyTestCase):
             )
             return torch.zeros(forward_batch.batch_size)
 
-        with get_parallel().override(tp_rank=1):
+        with (
+            get_parallel().override(tp_rank=1),
+            patch(
+                "sglang.srt.hardware_backend.tpu.compilation."
+                "spec_decode_compile_policy_eagle3._materialize_out"
+            ) as materialize,
+        ):
             policy._precompile_fused_draft_decode(
                 FakeDraftBackend(), fused_draft_forward
             )
+        self.assertEqual(materialize.call_count, 2)
 
         self.assertEqual(
             seen_shapes,

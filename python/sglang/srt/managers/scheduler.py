@@ -1126,9 +1126,17 @@ class Scheduler(
             if load_bundle_dir is not None:
                 torch_compile_bundle.load(bundle_path)
 
-        self.tp_worker.init_cuda_graphs()
-        if self.draft_worker is not None:
-            self.draft_worker.init_cuda_graphs()
+        warmup_scope = nullcontext()
+        if current_platform.is_tpu() and envs.SGLANG_DIRECT_COMPILE_ASYNC.get():
+            from sglang.srt.hardware_backend.tpu.compilation.warmup_queue import (
+                collect_warmups,
+            )
+
+            warmup_scope = collect_warmups()
+        with warmup_scope:
+            self.tp_worker.init_cuda_graphs()
+            if self.draft_worker is not None:
+                self.draft_worker.init_cuda_graphs()
 
         # Independent DP groups repeat distributed ranks but run identical model
         # replicas. DP0 writes their shared bundles; DP-attention ranks are unique.

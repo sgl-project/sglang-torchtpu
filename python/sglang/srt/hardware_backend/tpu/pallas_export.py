@@ -67,19 +67,32 @@ class ExportAbstractDevice:
 
 
 def get_torchtpu_export_devices(world_size: int | None = None):
-    """Return the ordered abstract TPU devices for global partitions without calling jax.devices()."""
+    """Return rank-ordered physical devices without initializing JAX's TPU client."""
+    import torch.distributed as dist
+
     if world_size is None:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if dist.is_initialized():
+        from torch_tpu._internal.distributed.device_mesh import get_device_assignment
+
+        device_ids = get_device_assignment()
+        if len(device_ids) != world_size or len(set(device_ids)) != world_size:
+            raise RuntimeError(
+                f"Expected {world_size} distinct world devices, got {device_ids}"
+            )
+    else:
+        # Standalone CPU exports have no runtime placement to bind yet.
+        device_ids = range(world_size)
     device_kind = get_pallas_tpu_device_kind()
     abstract_devices = [
         ExportAbstractDevice(
             device_kind=device_kind,
             num_cores=1,
             platform="tpu",
-            id=i,
-            process_index=0,
+            id=device_id,
+            process_index=rank,
         )
-        for i in range(world_size)
+        for rank, device_id in enumerate(device_ids)
     ]
     return tuple(abstract_devices)
 

@@ -103,6 +103,11 @@ class _CpuExportJaxCallable(pallas_impl.JaxCallable):
             inputs=tensor_args,
             output_shapes=output_shapes,
             donate_argnums=self.donate_argnums,
+            device_assignment=(
+                [int(device.id) for device in self.mesh.devices.flat]
+                if self.mesh is not None
+                else []
+            ),
         )
         for input_index, output_index in self.input_output_aliases.items():
             tensor_args[input_index].copy_(results[output_index])
