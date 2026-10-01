@@ -20,6 +20,8 @@ MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/configs/deepseek_r1_0528/accuracy.py",
     "weights_pvc": "model-weights",
+    # Which accuracy-test-tpu.yml lane runs this file.
+    "schedule": "nightly",
     "timeout_per_file": 10800,
 }
 

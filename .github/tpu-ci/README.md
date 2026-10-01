@@ -634,6 +634,9 @@ template + `_tpu-build`/`_tpu-test`.
 `benchmark/tpu/launch_server.py` -- single-host through `TPULauncherTestCase`,
 multi-host by the JobSet, which runs the same config on every host.
 
+A multihost file declares its lane in `MULTIHOST_LAUNCH["schedule"]`, so it runs
+where it says rather than where its name sorts.
+
 | when | `model` | evals |
 |---|---|---|
 | nightly 00:30 PT (stage [2]) | `nightly` | R1-0528, V3.1, GPT-OSS-20B, Gemma 4 31B + 26B-A4B (AIME/GPQA) |
@@ -646,9 +649,11 @@ daily sync (12:00 UTC).
 
 Three scoring facts the configs do not carry:
 
-- **Kimi MMMU-Pro is sharded** across two servers, 865 questions each.
-  `collect_full_evals.py` rejects a missing or duplicated id and reports the
-  combined 1,730-question score; a shard alone is not the benchmark.
+- **Kimi MMMU-Pro is sharded** across two servers, 865 questions each, because
+  one server cannot finish 1,730 inside a job. sgl-eval's own loader and grader
+  still build and score every row, so a shard is comparable with an unsharded
+  run; `collect_full_evals.py` rejects a missing or duplicated id and reports
+  the combined score. A shard alone is not the benchmark.
 - **Gemma 4 publishes `mmmu_pro_strict`**, a series of its own: 31B answers
   `Answer: $X`, which sgl-eval's grader scores wrong, so these numbers sit far
   below the lenient manual re-grades.

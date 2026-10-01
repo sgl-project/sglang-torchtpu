@@ -6,6 +6,7 @@ from sglang.test.tpu.evals.eval_support import (
     GEMMA4_31B,
     GPT_OSS_120B,
     HEALTH_TIMEOUT,
+    KIMI_K26,
     ExternalServerLauncher,
     RecipeLauncher,
     TpuModelLaunchSettings,
@@ -18,6 +19,7 @@ from sglang.test.tpu.evals.eval_support import (
     make_launch_env,
     make_model_config,
     make_runner,
+    sgl_eval_args,
     sgl_eval_runner,
     wait_for_health,
 )
@@ -35,6 +37,7 @@ __all__ = [
     "GEMMA4_31B",
     "GPT_OSS_120B",
     "HEALTH_TIMEOUT",
+    "KIMI_K26",
     "ExternalServerLauncher",
     "RecipeLauncher",
     "TpuModelLaunchSettings",
@@ -52,6 +55,7 @@ __all__ = [
     "make_runner",
     "model_config_main",
     "run_model_config",
+    "sgl_eval_args",
     "sgl_eval_runner",
     "wait_for_health",
 ]

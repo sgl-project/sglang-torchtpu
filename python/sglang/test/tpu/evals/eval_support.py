@@ -566,6 +566,50 @@ def aime25_openai_runner(
     return run
 
 
+def sgl_eval_args(
+    eval_name: str,
+    *,
+    base_url: str,
+    model: str,
+    out_dir: str,
+    max_tokens: int,
+    num_threads: int,
+    temperature: float,
+    top_p: float,
+    n_repeats: int = 1,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> list[str]:
+    """The sgl-eval argv for one gate, shared by the runner and the sharder.
+
+    One builder so a sharded eval sends the same prompt and sampling as an
+    unsharded one; only the row list differs.
+    """
+    args = [
+        "run",
+        eval_name,
+        "--base-url",
+        base_url.rstrip("/") + "/v1",
+        "--model",
+        model,
+        "--max-tokens",
+        str(max_tokens),
+        "--num-threads",
+        str(num_threads),
+        "--temperature",
+        str(temperature),
+        "--top-p",
+        str(top_p),
+        "--n-repeats",
+        str(n_repeats),
+        "--out-dir",
+        str(out_dir),
+    ]
+    for key, value in (chat_template_kwargs or {}).items():
+        # --thinking is the same thing: both land in chat_template_kwargs.
+        args += ["--chat-template-kwarg", f"{key}={json.dumps(value)}"]
+    return args
+
+
 def sgl_eval_runner(
     eval_name: str,
     *,
@@ -589,27 +633,19 @@ def sgl_eval_runner(
         out_dir = Path(tempfile.mkdtemp(prefix=f"sgl-eval-{eval_name}-"))
         cmd = [
             "sgl-eval",
-            "run",
-            eval_name,
-            "--base-url",
-            base_url.rstrip("/") + "/v1",
-            "--model",
-            model,
-            "--max-tokens",
-            str(max_tokens),
-            "--num-threads",
-            str(num_threads),
-            "--temperature",
-            str(temperature),
-            "--top-p",
-            str(top_p),
-            "--n-repeats",
-            str(n_repeats),
-            "--out-dir",
-            str(out_dir),
+            *sgl_eval_args(
+                eval_name,
+                base_url=base_url,
+                model=model,
+                out_dir=str(out_dir),
+                max_tokens=max_tokens,
+                num_threads=num_threads,
+                temperature=temperature,
+                top_p=top_p,
+                n_repeats=n_repeats,
+                chat_template_kwargs=chat_template_kwargs,
+            ),
         ]
-        for key, value in (chat_template_kwargs or {}).items():
-            cmd += ["--chat-template-kwarg", f"{key}={json.dumps(value)}"]
         print("Running: " + shlex.join(cmd), flush=True)
         subprocess.run(cmd, check=True)
 
@@ -682,6 +718,21 @@ GEMMA4_31B = {
     "variant": "TP8",
     "config_module": "recipe/configs/gemma4_31b/accuracy.py",
     "sampling": _GEMMA4_SAMPLING,
+}
+
+KIMI_K26 = {
+    "served_model_name": "/weights/Kimi-K2.6",
+    "display_name": "Kimi K2.6",
+    "variant": "2host-TP16+EP16+DPA4",
+    "config_module": "recipe/configs/kimi_k26/mmmu.py",
+    # The 2026-09-23 full-set run's settings; its template reads `thinking`.
+    "sampling": {
+        "max_tokens": 98304,
+        "num_threads": 256,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "chat_template_kwargs": {"thinking": True},
+    },
 }
 
 GEMMA4_26B_A4B = {

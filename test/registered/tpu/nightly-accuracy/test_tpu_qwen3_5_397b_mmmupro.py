@@ -22,6 +22,8 @@ MULTIHOST_LAUNCH = {
     "launch_script": "recipe/configs/qwen3_5_397b/server.py",
     "weights_pvc": "model-weights",
     # Measured 2 h 13 min for the full set at 128 concurrent requests.
+    # Which accuracy-test-tpu.yml lane runs this file.
+    "schedule": "mmmu-gemma4-qwen35",
     "timeout_per_file": 10800,
 }
 

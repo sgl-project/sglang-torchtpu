@@ -267,12 +267,11 @@ jobs:
           fi
           groups="$(python3 .github/tpu-ci/discover_multihost.py \
                       --suite nightly-tpu-multihost-accuracy)"
-          # Rows are named after their test file; every MMMU-Pro file has "mmmu" in it.
+          # Each file declares its lane in MULTIHOST_LAUNCH["schedule"]; a model
+          # name still selects by file name, for a one-off dispatch.
           case "$MODEL" in
             all|full-set) keep='.' ;;
-            nightly) keep='map(select(.name | contains("mmmu") | not))' ;;
-            mmmu-kimi) keep='map(select(.name | contains("kimi_k26_mmmu")))' ;;
-            mmmu-gemma4-qwen35) keep='map(select(.name | contains("qwen3_5_397b_mmmu")))' ;;
+            nightly|mmmu-kimi|mmmu-gemma4-qwen35) keep='map(select(.schedule == $m))' ;;
             *) keep='map(select(.name | contains($m | gsub("-"; "_"))))' ;;
           esac
           groups="$(jq -c --arg m "$MODEL" "$keep" <<< "$groups")"

@@ -8,20 +8,24 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+# MMMU-Pro standard (10 options). A shard that silently loses rows must not be
+# reported as the benchmark, so the count is asserted rather than inferred.
+MMMU_PRO_QUESTIONS = 1730
 
-def combine_shards(shards):
-    if len(shards) != 2 or {s["shard"] for s in shards} != {0, 1}:
-        raise ValueError("Expected both MMMU-Pro shards")
+
+def combine_shards(shards, total=MMMU_PRO_QUESTIONS):
+    count = shards[0]["shards"] if shards else 0
+    if len(shards) != count or {s["shard"] for s in shards} != set(range(count)):
+        raise ValueError(f"Expected all {count} MMMU-Pro shards, got {len(shards)}")
     ids = [qid for shard in shards for qid in shard["ids"]]
-    if len(ids) != 1730 or len(set(ids)) != 1730:
+    if len(ids) != total or len(set(ids)) != total:
         raise ValueError("MMMU-Pro coverage is incomplete or contains duplicates")
-    if any(
-        s["questions"] != 865 or len(s["ids"]) != 865 or s["shards"] != 2
-        for s in shards
-    ):
-        raise ValueError("Unexpected shard sizes")
+    for shard in shards:
+        expected = len(range(shard["shard"], total, count))
+        if shard["questions"] != expected or len(shard["ids"]) != expected:
+            raise ValueError(f"shard {shard['shard']} has {shard['questions']} rows")
     correct = sum(s["correct"] for s in shards)
-    return {"questions": 1730, "correct": correct, "score": correct / 1730}
+    return {"questions": total, "correct": correct, "score": correct / total}
 
 
 def main():
@@ -38,10 +42,10 @@ def main():
     )
     jobs = [job for page in json.loads(data) for job in page["jobs"]]
     shards = {}
-    kimi_jobs = [j for j in jobs if "test_tpu_kimi_k26_mmmu_shard" in j["name"]]
+    shard_jobs = [j for j in jobs if "mmmu_shard" in j["name"]]
     for job in jobs:
-        # Only the Kimi shards archive predictions; every other eval reports a score.
-        if "test_tpu_kimi_k26_mmmu_shard" not in job["name"]:
+        # Only sharded evals archive predictions; the rest report a score.
+        if "mmmu_shard" not in job["name"]:
             continue
         log = subprocess.check_output(
             [
@@ -74,7 +78,7 @@ def main():
                 ) as archive:
                     archive.extractall(output, filter="data")
                 chunks = None
-    if kimi_jobs:
+    if shard_jobs:
         result = combine_shards(list(shards.values()))
         output = Path("full-eval-results")
         output.mkdir(exist_ok=True)

@@ -1,7 +1,12 @@
 """Full MMMU-Pro, split deterministically across independent serving instances.
 
-Only dataset transport changes: retain numbered references and prepend each
-image once, in column order. The pinned sgl-eval prompt and scorer are unchanged.
+Only the row list changes: sgl-eval's own loader builds every example and its
+own grader scores it, so a shard is comparable with an unsharded run of the
+same benchmark. The shards partition the set by stride, and the collector
+rejects a missing or duplicated id before reporting the combined score.
+
+A model too slow to finish the set inside one CI job runs it in shards; any
+model can, so nothing here names one.
 """
 
 import argparse
@@ -11,37 +16,28 @@ import sys
 import tempfile
 from pathlib import Path
 
+SHARD_RESULT_PREFIX = "MMMU_SHARD_RESULT "
+
 
 def shard_rows(rows, shard, shards):
     if shards < 1 or not 0 <= shard < shards:
         raise ValueError("Invalid shard index/count")
-    return list(enumerate(rows))[shard::shards]
+    return list(rows)[shard::shards]
 
 
-def build_example(row, index):
-    from sgl_eval.evals import _mmmu_pro as loader
-    from sgl_eval.types import Example
-
-    options = loader._parse_options(row)
-    text = "\n".join([row["question"], *map(str, options)])
-    for match in loader._IMAGE_REF_RE.finditer(text):
-        if row.get(f"image_{int(match.group(1))}") is None:
-            raise ValueError(f"Missing image in {row.get('id', index)}")
-    images = [
-        row[f"image_{n}"] for n in range(1, 8) if row.get(f"image_{n}") is not None
-    ]
-    if not images:
-        raise ValueError(f"No images in {row.get('id', index)}")
-    return Example(
-        id=row.get("id") or f"mmmu_pro-{index}",
-        inputs={"problem": loader.get_mcq_fields(row["question"], options)["problem"]},
-        target=loader._normalize_answer(row["answer"]),
-        media=loader._image_media(images),
-        meta={"subject": row.get("subject")},
-    )
-
-
-def run_shard(base_url, *, shard, shards=2):
+def run_shard(
+    base_url: str,
+    *,
+    shard: int,
+    shards: int,
+    model: str,
+    max_tokens: int,
+    num_threads: int,
+    temperature: float,
+    top_p: float,
+    chat_template_kwargs: dict | None = None,
+) -> dict:
+    """Score one shard of MMMU-Pro and print its summary for the collector."""
     output = Path(tempfile.mkdtemp(prefix=f"mmmu-pro-shard-{shard}-"))
     subprocess.run(
         [
@@ -56,6 +52,17 @@ def run_shard(base_url, *, shard, shards=2):
             str(shards),
             "--output",
             str(output),
+            "--sampling",
+            json.dumps(
+                {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "num_threads": num_threads,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "chat_template_kwargs": chat_template_kwargs or {},
+                }
+            ),
         ],
         check=True,
     )
@@ -63,24 +70,27 @@ def run_shard(base_url, *, shard, shards=2):
     if len(files) != 1:
         raise RuntimeError(f"Expected one metrics file, found {files}")
     result = json.loads(files[0].read_text())
-    expected = len(range(shard, 1730, shards))
-    if result["num_examples"] != expected or result["aggregate"]["error_rate"] != 0:
-        raise RuntimeError("Incomplete MMMU-Pro shard or request errors")
+    ids = [
+        json.loads(line)["id"]
+        for line in (files[0].parent / "output-rs0.jsonl").read_text().splitlines()
+    ]
+    if result["aggregate"]["error_rate"] != 0:
+        raise RuntimeError("MMMU-Pro shard contains request errors")
+    if result["num_examples"] != len(ids):
+        raise RuntimeError("MMMU-Pro shard is incomplete")
+
     from sglang.test.tpu.evals.full_eval_artifacts import archive_results
 
     archive_results(files[0].parent)
     summary = {
         "shard": shard,
         "shards": shards,
-        "questions": expected,
+        "questions": result["num_examples"],
         "score": result["aggregate"]["score"],
-        "correct": round(result["aggregate"]["score"] * expected),
-        "ids": [
-            json.loads(line)["id"]
-            for line in (files[0].parent / "output-rs0.jsonl").read_text().splitlines()
-        ],
+        "correct": round(result["aggregate"]["score"] * result["num_examples"]),
+        "ids": ids,
     }
-    print("MMMU_SHARD_RESULT " + json.dumps(summary), flush=True)
+    print(SHARD_RESULT_PREFIX + json.dumps(summary), flush=True)
     return {
         **result["aggregate"],
         "latency": result["latency_seconds"],
@@ -94,46 +104,33 @@ def main():
     parser.add_argument("--shard", type=int, required=True)
     parser.add_argument("--shards", type=int, default=2)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--sampling", type=json.loads, required=True)
     args = parser.parse_args()
-    from datasets import load_dataset
+
     from sgl_eval.cli import main as eval_main
     from sgl_eval.evals import _registry
+    from sgl_eval.evals._mmmu_pro import load_mmmu_pro
 
-    def load_examples(split="test", num_examples=None):
+    from sglang.test.tpu.evals.eval_support import sgl_eval_args
+
+    def load_shard(split="test", num_examples=None):
         if num_examples is not None:
             raise ValueError("Full-set evaluation cannot have a sample limit")
-        rows = load_dataset("MMMU/MMMU_Pro", "standard (10 options)", split=split)
-        if len(rows) != 1730:
-            raise ValueError(f"Expected 1730 questions, got {len(rows)}")
-        return [
-            build_example(row, index)
-            for index, row in shard_rows(rows, args.shard, args.shards)
-        ]
+        examples = load_mmmu_pro(split)
+        if not examples:
+            raise ValueError("MMMU-Pro loaded no examples")
+        return shard_rows(examples, args.shard, args.shards)
 
-    # Process-local adapter; no installed package or other benchmark is modified.
-    _registry.load_mmmu_pro = load_examples
+    # Process-local: no installed package or other benchmark is modified.
+    _registry.load_mmmu_pro = load_shard
     return eval_main(
-        [
-            "run",
+        sgl_eval_args(
             "mmmu_pro",
-            "--base-url",
-            args.base_url.rstrip("/") + "/v1",
-            "--model",
-            "/weights/Kimi-K2.6",
-            "--thinking",
-            "--num-threads",
-            "128",
-            "--temperature",
-            "1",
-            "--top-p",
-            "1",
-            "--max-tokens",
-            "98304",
-            "--n-repeats",
-            "1",
-            "--out-dir",
-            args.output,
-        ]
+            base_url=args.base_url,
+            out_dir=args.output,
+            n_repeats=1,
+            **args.sampling,
+        )
     )
 
 

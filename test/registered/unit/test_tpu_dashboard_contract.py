@@ -239,9 +239,14 @@ class TestJobMapsToOneTest(CustomTestCase):
         )
         self.assertEqual(names["mmmu-gemma4-qwen35"], {"test_tpu_qwen3_5_397b_mmmupro"})
         # Every multihost accuracy file runs in exactly one scheduled selection.
-        scheduled = [names[m] for m in ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35")]
+        slots = ("nightly", "mmmu-kimi", "mmmu-gemma4-qwen35")
+        scheduled = [names[m] for m in slots]
         self.assertEqual(set().union(*scheduled), names["full-set"])
         self.assertEqual(sum(map(len, scheduled)), len(names["full-set"]))
+        # The lane comes from MULTIHOST_LAUNCH["schedule"], not from the filename:
+        # a file whose name says nothing about its benchmark still runs somewhere.
+        for row in discover("full-set"):
+            self.assertIn(row["schedule"], slots, row["name"])
 
         groups = discover("full-set")
         recipes = [g["launch_script"] for g in groups]

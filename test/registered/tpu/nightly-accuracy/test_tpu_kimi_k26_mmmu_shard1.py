@@ -4,7 +4,7 @@ import os
 from functools import partial
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang.test.tpu import KIMI_K26, model_config_main
 from sglang.test.tpu.evals.mmmu_full import run_shard
 
 register_tpu_ci(
@@ -17,6 +17,8 @@ MULTIHOST_LAUNCH = {
     "hosts": 2,
     "launch_script": "recipe/configs/kimi_k26/mmmu.py",
     "weights_pvc": "model-weights",
+    # Which accuracy-test-tpu.yml lane runs this file.
+    "schedule": "mmmu-kimi",
     "timeout_per_file": 14400,
 }
 MODEL_CONFIG = {
@@ -24,9 +26,9 @@ MODEL_CONFIG = {
     "display_name": "Kimi K2.6 MMMU-Pro shard 1/2",
     "dashboard": "accuracy",
     "dashboard_model": "kimi-k26-mmmu-shard1",
-    "model": "/weights/Kimi-K2.6",
+    "model": KIMI_K26["served_model_name"],
     "test_name": "Kimi-K2.6-MMMU-shard1",
-    "variant": "TP16-EP16-DP1",
+    "variant": KIMI_K26["variant"],
     "launch": {"external": True, "health_timeout": 3600},
     "skip_unless": (
         os.environ.get("SGLANG_TPU_USE_LIVE_SERVER") == "1",
@@ -37,7 +39,13 @@ MODEL_CONFIG = {
             "dataset": "mmmu_pro",
             "label": "mmmu_pro_shard1",
             "report_only": True,
-            "runner": partial(run_shard, shard=1, shards=2),
+            "runner": partial(
+                run_shard,
+                shard=1,
+                shards=2,
+                model=KIMI_K26["served_model_name"],
+                **KIMI_K26["sampling"],
+            ),
         }
     ],
 }

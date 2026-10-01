@@ -104,7 +104,18 @@ class TestAccuracyRecipes(unittest.TestCase):
                 self.assertEqual((args["nnodes"], args["node_rank"]), (2, 1))
                 self.assertEqual(args["dist_init_addr"], "rank0:10011")
                 self.assertEqual((args["tp_size"], args["ep_size"]), (16, 16))
-                self.assertNotIn("--dp-size", plan.command)
+                # DP attention is all-or-nothing: --dp-size without
+                # --enable-dp-attention silently serves one attention group.
+                dp_size = args.get("dp_size", 1)
+                if dp_size > 1:
+                    self.assertTrue(args.get("enable_dp_attention"), recipe)
+                    self.assertEqual(args["tp_size"] % dp_size, 0, recipe)
+                    # attention TP > 1 needs the LM head split the same way.
+                    self.assertTrue(args.get("enable_dp_lm_head"), recipe)
+                    self.assertIn("--dp-size", plan.command)
+                else:
+                    self.assertNotIn("--dp-size", plan.command)
+                    self.assertNotIn("--enable-dp-attention", plan.command)
 
     def test_derived_recipe_does_not_mutate_its_base(self):
         from benchmark.tpu.recipe.configs.deepseek_r1_0528.accuracy import CONFIG as R1
