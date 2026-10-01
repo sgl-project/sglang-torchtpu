@@ -13,14 +13,21 @@ one costs it its measurement.
 What the MoE checkpoint changes: EP = TP, because 704-wide expert intermediates
 are not lane-splittable 8 ways, so each rank owns whole experts (128/8).
 
+Serving config lives in recipe/configs/gemma4_26b_a4b/perf.py, which imports the
+31B perf config.
+
 DEPENDS ON #944 (Gemma 4 TPU support) AND on the 26B MoE padding work, which is
 not yet in a PR. Until both land this job has nothing to boot.
 """
 
 import os
+import unittest
+from typing import ClassVar
+from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu import model_config_main
+from sglang.test.tpu import run_model_config
+from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=3600,
@@ -29,9 +36,13 @@ register_tpu_ci(
     labels=["singlehost", "gemma4-26b-a4b", "perf"],
 )
 
+LAUNCH_CONFIG_MODULE = "recipe/configs/gemma4_26b_a4b/perf.py"
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
+# Weight load plus the EXTEND/decode captures for BOTH hybrid KV pools.
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", "3600"))
 
+# 8192 in + 1024 out, the same shape the other models on this lane are measured
+# at, so they sit on one axis of the Workload dropdown.
 WORKLOAD = "8k1k"
 # CONCUR must match CONCURRENCY in the launch config: the server is sized for
 # it, and a client driving more would measure a pool-bound shape.
@@ -47,12 +58,6 @@ MODEL_CONFIG = {
     "id": "perf-gemma4-26b-a4b",
     "display_name": "Gemma 4 26B-A4B",
     "variant": "TP8+EP8",
-    "launch": {
-        "config": "recipe/configs/gemma4_26b_a4b/perf.py",
-        "env": {"MODEL": WEIGHTS},
-        "health_timeout": HEALTH_TIMEOUT,
-        "tag": "perf-gemma4-26b-a4b",
-    },
     "gates": [
         {
             "dataset": "bench_serving",
@@ -66,8 +71,13 @@ MODEL_CONFIG = {
                 }
             ],
             "bench_env": {
+                # random-ids + exact input_ids, matching the InferenceX harness
+                # the published TPU numbers come from; a tokenizer round-trip
+                # would otherwise move the real ISL.
                 "DATASET_NAME": "random-ids",
                 "TOKENIZE_PROMPT": "1",
+                # Tokenizer from the local checkpoint (no HF fetch in the pod);
+                # requests still carry the name the server serves under.
                 "MODEL": WEIGHTS,
                 "SERVED_MODEL_NAME": MODEL,
             },
@@ -76,5 +86,22 @@ MODEL_CONFIG = {
 }
 
 
+class TestGemma426BA4BPerfSingleHost(TPULauncherTestCase):
+    config_module = LAUNCH_CONFIG_MODULE
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    tag = "perf-gemma4-26b-a4b"
+    runtime_envs: ClassVar[dict[str, str | None]] = {
+        # The config serves the HF id; CI mounts the checkpoint at /weights.
+        "MODEL": WEIGHTS,
+        "HOST": urlsplit(BASE_URL).hostname,
+        "PORT": str(urlsplit(BASE_URL).port),
+    }
+
+    def test_throughput(self):
+        run_model_config(MODEL_CONFIG, base_url=self.base_url)
+
+
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    unittest.main()

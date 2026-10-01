@@ -52,18 +52,13 @@ Top level
     skip_unless   (condition, reason) -- the config form of @unittest.skipUnless.
 
 launch
-    config        Python recipe module under benchmark/tpu/, e.g.
-                  "recipe/configs/gpt_oss_120b/server.py", served through
-                  benchmark.tpu.launch_server. Preferred over `recipe`: the serving
-                  settings are a CONFIG dict another recipe imports and overrides,
-                  so a measurement's deltas never restate the serve.
-    recipe        Shell script under benchmark/tpu/ that brings the server up, e.g.
-                  "recipe/gpt_oss_120b/server.sh". The older form, kept for the recipes
-                  that are still shell. One of `config` or `recipe`, not both.
-    env           Environment for the launch. The launcher logs it on boot, so a red run
+    recipe        Script under benchmark/tpu/ that brings the server up, e.g.
+                  "recipe/gpt_oss_120b/eval.sh". It is also what a human runs to
+                  reproduce a CI failure, so the serving config stays one copy: point at
+                  the model's recipe, or at a wrapper that execs it with the eval delta.
+    env           Environment for the recipe. The launcher logs it on boot, so a red run
                   stays reproducible by hand. Config describing *how* the model is
-                  served belongs in the recipe; a `config` launch reads only MODEL, HOST
-                  and PORT from here.
+                  served belongs in the recipe.
     external      True -> attach to a server an external orchestrator already started
                   (the multi-host JobSets). Takes no recipe/env.
     tag           Prefix on this model's progress lines, e.g. "gpqa-e2e".
@@ -133,13 +128,11 @@ from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 from sglang.test.tpu.eval_support import (
     DEFAULT_HEALTH_TIMEOUT,
-    REPO_ROOT,
     ExternalServerLauncher,
     RecipeLauncher,
     TpuModelLaunchSettings,
     bench_serving_runner,
     lm_eval_runner,
-    python_launcher_command,
 )
 
 _TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
@@ -156,7 +149,7 @@ _CONFIG_KEYS = {
     "dashboard_model",
     "skip_unless",
 }
-_LAUNCH_KEYS = {"recipe", "config", "env", "tag", "health_timeout", "external"}
+_LAUNCH_KEYS = {"recipe", "env", "tag", "health_timeout", "external"}
 # Gate keys that map straight onto AccuracyTestParams.
 _GATE_PASSTHROUGH = {
     "dataset",
@@ -199,31 +192,13 @@ def _build_launcher(launch: dict[str, Any]):
     tag = launch.get("tag", "tpu-e2e")
 
     if launch.get("external"):
-        if {"recipe", "config", "env"} & launch.keys():
-            raise ValueError(
-                "external launch takes no recipe/config/env: the JobSet owns it"
-            )
+        if "recipe" in launch or "env" in launch:
+            raise ValueError("external launch takes no recipe/env: the JobSet owns it")
         return ExternalServerLauncher(health_timeout=timeout, tag=tag)
 
-    recipe, config = launch.get("recipe"), launch.get("config")
-    if recipe and config:
-        raise ValueError('launch takes "recipe" or "config", not both')
-    if config:
-        return RecipeLauncher(
-            command=python_launcher_command(
-                config, repo_root=REPO_ROOT, working_directory=_TPU_BENCH_DIR
-            ),
-            env=launch.get("env"),
-            # The launcher module is not part of the installed package.
-            cwd=str(REPO_ROOT),
-            health_timeout=timeout,
-            tag=tag,
-            start_new_session=True,
-            # Leave room for the supervisor's own 30s child shutdown.
-            terminate_timeout=60,
-        )
+    recipe = launch.get("recipe")
     if not recipe:
-        raise ValueError('launch needs "config", "recipe" or "external": True')
+        raise ValueError('launch needs either "recipe" or "external": True')
     script = Path(recipe)
     if not script.is_absolute():
         script = _TPU_BENCH_DIR / script

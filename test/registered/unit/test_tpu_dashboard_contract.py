@@ -284,19 +284,32 @@ class TestNightlyConfigLabelLint(CustomTestCase):
                     path.name,
                 )
 
+    @staticmethod
+    def _fixture_config_module(mod) -> str:
+        """The recipe a TPULauncherTestCase subclass in this module serves."""
+        return next(
+            (
+                obj.config_module
+                for obj in vars(mod).values()
+                if isinstance(obj, type) and getattr(obj, "config_module", "")
+            ),
+            "",
+        )
+
     def test_perf_measures_through_recipe_and_bench_serving_only(self):
-        # RecipeLauncher + bench_serving.sh is what puts the server/bench config
-        # panels on the dashboard; a hand-booted server or hand-rolled bench
-        # produces a chart nobody can reproduce from. Either launch form goes
-        # through RecipeLauncher and dumps launch_meta.json: `config` is a Python
-        # recipe served by benchmark.tpu.launch_server, `recipe` a shell script.
+        # A recipe launch plus bench_serving.sh is what puts the server/bench
+        # config panels on the dashboard; a hand-booted server or hand-rolled
+        # bench produces a chart nobody can reproduce from. Two launch forms
+        # qualify: MODEL_CONFIG's own `launch.recipe`, and the unified launcher,
+        # where a TPULauncherTestCase subclass serves a Python recipe module and
+        # the config carries gates only.
         for path, mod in self.perf:
             config = mod.MODEL_CONFIG
             launch = config.get("launch") or {}
             self.assertTrue(
-                launch.get("recipe") or launch.get("config"),
-                f"{path.name}: perf must launch through a recipe or a launcher "
-                "config (RecipeLauncher)",
+                launch.get("recipe") or self._fixture_config_module(mod),
+                f"{path.name}: perf must serve through a recipe -- launch.recipe, "
+                "or a TPULauncherTestCase subclass with config_module",
             )
             self.assertFalse(launch.get("external"), path.name)
             for gate in config["gates"]:
