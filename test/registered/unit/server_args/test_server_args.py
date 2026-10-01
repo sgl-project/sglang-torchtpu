@@ -1851,8 +1851,8 @@ class TestHiCacheArgs(unittest.TestCase):
         # batched is admitted on both the fused and the seq-along-lane pool,
         # by both io backends. Every prefill/decode backend must still be an RPA
         # backend (the reload-commit hook lives there) that reads the base
-        # backend's pool, and mxint8 KV is refused because neither io backend
-        # copies the scale buffers.
+        # backend's pool. The KV dtype is not checked separately: mxint8 keeps
+        # its scales inside the paged buffer, so the pool's declaration covers it.
         class RaidenOnlyPool:
             kv_offload_io_backends = frozenset({"raiden"})
 
@@ -1931,11 +1931,11 @@ class TestHiCacheArgs(unittest.TestCase):
                 message="TpuFusedMHATokenToKVPool",
                 prefill_attention_backend="pallas_tpu_rpa_v3",
             )
-            check("raiden", "oot_backend", message="mxint8", kv_cache_dtype="mxint8")
+            check("raiden", "oot_backend", kv_cache_dtype="mxint8")
             check(
                 "torch_tpu",
-                "pallas_tpu_rpa_v3",
-                message="mxint8",
+                "oot_backend",
+                message="RaidenOnlyPool",
                 kv_cache_dtype="mxint8",
             )
 

@@ -193,13 +193,6 @@ def resolve_layout_io_compatibility(server_args: Any):
                     "backends that use the same KV pool, or disable KV offload."
                 )
 
-        if cfg.kv_cache_dtype == "mxint8":
-            raise ValueError(
-                f"{cfg.hicache_io_backend} KV offloading does not support "
-                "--kv-cache-dtype mxint8: it copies only the KV pages, not the "
-                "separate MXINT8 scale buffers, so reloaded KV would be corrupt."
-            )
-
         if (
             cfg.hicache_io_backend == "torch_tpu"
             and model_config_of(server_args).is_hybrid_swa
