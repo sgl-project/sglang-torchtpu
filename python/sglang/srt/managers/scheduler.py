@@ -1367,6 +1367,7 @@ class Scheduler(
         )
 
         self._tpu_pp_chunk_cost = None
+        self._tpu_pp_cached_prefix = {}
         if current_platform.is_tpu() and get_parallel().pp_size > 1:
             from sglang.srt.hardware_backend.tpu.pp_chunk_scheduler import (
                 profile_and_install_cost_model,

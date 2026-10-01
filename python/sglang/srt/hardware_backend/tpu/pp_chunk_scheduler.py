@@ -17,7 +17,12 @@ from sglang.srt.hardware_backend.tpu.pp_chunks import (
     profile_points,
     uses_dynamic_chunks,
 )
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.managers.schedule_policy import (
+    MAX_PREFIX_MATCHED_WAITING_REQS,
+    AddReqResult,
+    PrefillAdder,
+    matched_prefix_len,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel
 
@@ -37,14 +42,32 @@ def pending_step_limit(scheduler):
     requests = list(scheduler.waiting_queue)
     if scheduler.chunked_req is not None:
         requests.append(scheduler.chunked_req)
+    cached_prefix = scheduler._tpu_pp_cached_prefix
+    waiting = {req.rid for req in scheduler.waiting_queue}
+    for rid in [rid for rid in cached_prefix if rid not in waiting]:
+        del cached_prefix[rid]
     seen = set()
     pending = 0
+    matches_left = MAX_PREFIX_MATCHED_WAITING_REQS
     for req in requests:
         if req.rid in seen:
             continue
         seen.add(req.rid)
-        tokens = len(req.origin_input_ids) + len(req.output_ids)
-        pending += max(tokens - len(req.prefix_indices), 0)
+        # The policy's match counts host hits; a partial request's computed
+        # chunks extend prefix_indices past that match.
+        cached = max(len(req.prefix_indices), req.num_matched_prefix_tokens)
+        if cached == 0 and req.rid in cached_prefix:
+            cached = cached_prefix[req.rid]
+        elif cached == 0 and matches_left > 0:
+            # Matched once per waiting request; its cached prefix is not pending work,
+            # and the match refreshes that prefix's recency ahead of admission.
+            matches_left -= 1
+            cached = matched_prefix_len(scheduler.tree_cache, req)
+            cached_prefix[req.rid] = cached
+        pending += max(len(req.origin_input_ids) + len(req.output_ids) - cached, 0)
+        if pending >= get_parallel().pp_size * cost.buckets[-1]:
+            # The limit saturates at a full step; the rest need no match.
+            break
     # A micro-batch slot holds its batch until the result is processed, when
     # the same batch is recorded as the slot's last batch.
     for batch, done in zip(scheduler.mbs, scheduler.last_mbs):
@@ -216,4 +239,6 @@ def profile_and_install_cost_model(scheduler):
                 f"lower --context-length from {context_len} to {longest}."
             )
     scheduler._tpu_pp_chunk_cost = cost
+    # Cached prefix tokens of each waiting request, matched once.
+    scheduler._tpu_pp_cached_prefix = {}
     logger.info("TPU pipeline chunks: %s; stage samples %s", cost.describe(), samples)
