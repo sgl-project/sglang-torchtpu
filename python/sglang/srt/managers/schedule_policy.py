@@ -1349,7 +1349,11 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        has_chunked_req: bool,
+        truncation_align_size: Optional[int],
+        chunk_tokens_cap: Optional[int] = None,
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
@@ -1384,6 +1388,7 @@ class PrefillAdder:
                 host_hit_length=req.host_hit_length,
                 swa_host_hit_length=req.swa_host_hit_length,
                 truncation_align_size=truncation_align_size,
+                chunk_tokens_cap=chunk_tokens_cap,
                 has_chunked_req=has_chunked_req,
             )
             if isinstance(admission, AddReqResult):
@@ -1451,6 +1456,7 @@ class PrefillAdder:
                         host_hit_length=0,
                         swa_host_hit_length=0,
                         truncation_align_size=truncation_align_size,
+                        chunk_tokens_cap=chunk_tokens_cap,
                         has_chunked_req=has_chunked_req,
                     )
                     if isinstance(admission, AddReqResult):
@@ -1468,6 +1474,9 @@ class PrefillAdder:
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
+        if chunk_tokens_cap is not None and self.new_chunked_req is req:
+            # The scheduler tracks one partial request, so a capped one ends the batch.
+            self.rem_chunk_tokens = 0
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
 
@@ -1479,6 +1488,7 @@ class PrefillAdder:
         host_hit_length: int,
         swa_host_hit_length: int,
         truncation_align_size: Optional[int],
+        chunk_tokens_cap: Optional[int] = None,
         has_chunked_req: bool = False,
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
@@ -1497,6 +1507,9 @@ class PrefillAdder:
         )
         if not can_admit:
             return AddReqResult.NO_TOKEN
+        if chunk_tokens_cap is not None and chunk_tokens_limit is not None:
+            # Per-request cap from dynamic chunking, below the batch budget.
+            chunk_tokens_limit = min(chunk_tokens_limit, chunk_tokens_cap)
 
         # Without chunking, allow the first request even above the input cap.
         if (

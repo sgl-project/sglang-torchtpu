@@ -369,5 +369,33 @@ class TestChunkedAbortNativeReadDrain(CustomTestCase):
         scheduler.process_batch_result.assert_not_called()
 
 
+class TestDynamicFirstChunkCap(CustomTestCase):
+    def _scheduler(self, predicted: int = 1024):
+        s = Scheduler.__new__(Scheduler)
+        s.dynamic_chunk_sizer = MagicMock(predict=MagicMock(return_value=predicted))
+        return s
+
+    def _req(self, *, prefix_len: int, host_hit_length: int = 0):
+        return SimpleNamespace(
+            prefix_indices=[0] * prefix_len, host_hit_length=host_hit_length
+        )
+
+    def test_no_cap_without_matched_prefix(self):
+        # A cold request keeps the static chunk; only a prefix adds attention cost.
+        s = self._scheduler()
+        self.assertIsNone(s._dynamic_first_chunk_cap(self._req(prefix_len=0)))
+        s.dynamic_chunk_sizer.predict.assert_not_called()
+
+    def test_cap_sized_by_prefix_and_host_hit(self):
+        # A host-tier hit is loaded back, not recomputed, but it is still KV
+        # history the first chunk attends over.
+        s = self._scheduler(predicted=1024)
+        cap = s._dynamic_first_chunk_cap(
+            self._req(prefix_len=4096, host_hit_length=512)
+        )
+        self.assertEqual(cap, 1024)
+        s.dynamic_chunk_sizer.predict.assert_called_once_with(4608)
+
+
 if __name__ == "__main__":
     unittest.main()

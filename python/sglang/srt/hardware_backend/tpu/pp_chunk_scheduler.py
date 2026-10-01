@@ -138,7 +138,9 @@ class TpuPipelinePrefillAdder(PrefillAdder):
                 return req
             return super().add_chunked_req(req)
 
-    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+    def add_one_req(
+        self, req, has_chunked_req, truncation_align_size, chunk_tokens_cap=None
+    ):
         before = len(self.can_run_list)
         with self._request_budget(req) as cap:
             if cap <= 0:
@@ -148,7 +150,12 @@ class TpuPipelinePrefillAdder(PrefillAdder):
                 remaining -= req.host_hit_length
             if has_chunked_req and cap < remaining:
                 return AddReqResult.OTHER
-            result = super().add_one_req(req, has_chunked_req, truncation_align_size)
+            result = super().add_one_req(
+                req=req,
+                has_chunked_req=has_chunked_req,
+                truncation_align_size=truncation_align_size,
+                chunk_tokens_cap=chunk_tokens_cap,
+            )
         if self.new_chunked_req is not None:
             return AddReqResult.OTHER
         return self.budget_state() if len(self.can_run_list) > before else result

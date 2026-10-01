@@ -129,11 +129,11 @@ def test_decode_rows_are_not_pending_prefill():
 
 
 def test_finished_request_leaves_budget_for_next_request(monkeypatch):
-    def admit(self, request, *_):
-        tokens = len(request.full_untruncated_fill_ids)
+    def admit(self, *, req, **_):
+        tokens = len(req.full_untruncated_fill_ids)
         assert tokens <= self.rem_chunk_tokens
-        request.extend_range = NS(length=tokens)
-        self.can_run_list.append(request)
+        req.extend_range = NS(length=tokens)
+        self.can_run_list.append(req)
         self.rem_chunk_tokens -= tokens
         return self.budget_state()
 
@@ -148,7 +148,7 @@ def test_finished_request_leaves_budget_for_next_request(monkeypatch):
 
 def test_rejected_request_does_not_charge_time_or_tokens(monkeypatch):
     monkeypatch.setattr(
-        PrefillAdder, "add_one_req", lambda *args: AddReqResult.NO_TOKEN
+        PrefillAdder, "add_one_req", lambda *args, **kwargs: AddReqResult.NO_TOKEN
     )
     obj = adder()
     assert obj.add_one_req(req(4096), False, None) == AddReqResult.NO_TOKEN
@@ -177,10 +177,10 @@ def test_host_prefix_is_included_before_chunk_is_sized():
 
 
 def test_new_partial_request_stops_admission(monkeypatch):
-    def admit(self, request, *_):
-        request.extend_range = NS(length=self.rem_chunk_tokens)
-        self.can_run_list.append(request)
-        self.new_chunked_req = request
+    def admit(self, *, req, **_):
+        req.extend_range = NS(length=self.rem_chunk_tokens)
+        self.can_run_list.append(req)
+        self.new_chunked_req = req
         self.rem_chunk_tokens = 0
         return AddReqResult.OTHER
 
@@ -193,7 +193,7 @@ def test_new_partial_request_stops_admission(monkeypatch):
 
 
 def test_existing_partial_request_cannot_be_replaced(monkeypatch):
-    def unexpected(*args):
+    def unexpected(*args, **kwargs):
         raise AssertionError("A second partial request was admitted")
 
     monkeypatch.setattr(PrefillAdder, "add_one_req", unexpected)
@@ -254,7 +254,16 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
     request.set_extend_range.side_effect = lambda start, end: setattr(
         request, "extend_range", NS(length=end - start)
     )
-    assert obj.add_one_req(request, has_chunked_req, None) == AddReqResult.CONTINUE
+    # Called the way the scheduler calls every prefill adder.
+    assert (
+        obj.add_one_req(
+            request,
+            has_chunked_req=has_chunked_req,
+            truncation_align_size=None,
+            chunk_tokens_cap=None,
+        )
+        == AddReqResult.CONTINUE
+    )
     assert obj.can_run_list == [request]
     assert obj.new_chunked_req is None
     assert request.extend_range.length == tokens
@@ -263,7 +272,7 @@ def test_real_admission_finishes_unaligned_prompt(tokens, has_chunked_req):
 
 
 def test_page_reservation_cannot_overrun_remaining_budget(monkeypatch):
-    def unexpected(*args):
+    def unexpected(*args, **kwargs):
         raise AssertionError("A second partial request was admitted")
 
     monkeypatch.setattr(PrefillAdder, "add_one_req", unexpected)
