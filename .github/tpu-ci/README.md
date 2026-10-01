@@ -100,12 +100,12 @@ claims; an empty value mounts no weights. The container mount remains `/weights`
 manifests must still name the actual cluster resources; changing `weights.yaml`
 selects a claim, it does not create one.
 
-`launch_script` is a shell recipe relative to `benchmark/tpu/`. The accuracy
-recipes exec `python3 -m benchmark.tpu.launch_server --config
-recipe/configs/<model>/<name>.py`, which resolves each host's rank from the
-JobSet topology. `discover_multihost.py` emits one JobSet per registered test
-file, even when multiple files use the same recipe. This lets the two Kimi
-MMMU-Pro shards use independent slices with identical serving settings.
+`launch_script` is relative to `benchmark/tpu/`: a shell recipe, or a `.py`
+recipe config the JobSet hands to `benchmark/tpu/launch_server.py`, which
+resolves each host's rank from the JobSet topology. `discover_multihost.py`
+emits one JobSet per registered test file, even when several name the same
+recipe -- which is how the two Kimi MMMU-Pro shards get independent slices with
+identical serving settings.
 
 To add a **single-host** suite: `register_*_ci(..., suite="…")`, add it to `run_suite.py`,
 and call `_tpu-test` with that `suite`. To add a **multi-host** test: drop a file with a
@@ -626,49 +626,3 @@ python3 .github/tpu-ci/discover_multihost.py --suite nightly-tpu-multihost   # -
 The old per-manifest files (`job-integration.yaml`, `job-nightly.yaml`,
 `jobset-nightly.yaml`) and `_tpu-test-stage.yml` were replaced by the unified
 template + `_tpu-build`/`_tpu-test`.
-
-### Accuracy evals: what runs when
-
-`accuracy-test-tpu.yml` owns every accuracy model. Serving settings are Python
-`CONFIG` recipes under `benchmark/tpu/recipe/configs/<model>/`, launched by
-`benchmark/tpu/launch_server.py` -- single-host through `TPULauncherTestCase`,
-multi-host by the JobSet, which runs the same config on every host. A benchmark
-that needs a different server gets its own recipe module (GPT-OSS-120B has one
-per eval) rather than env patched in at launch, so the shape a score was
-measured at stays with the score.
-
-A multihost file declares its lane in `MULTIHOST_LAUNCH["schedule"]`, so it runs
-where it says rather than where its name sorts.
-
-| when | `model` | evals |
-|---|---|---|
-| nightly 00:30 PT (stage [2]) | `nightly` | R1-0528, V3.1, GPT-OSS-20B, Gemma 4 31B + 26B-A4B (AIME/GPQA) |
-| 10:00 PT | `mmmu-kimi` | both Kimi K2.6 MMMU-Pro shards (2 x 2-host) |
-| 17:00 PT | `mmmu-gemma4-qwen35` | Gemma 4 MMMU-Pro (2 x 1-host), Qwen3.5-397B MMMU-Pro (2-host) |
-
-MMMU-Pro has its own slots because it is the long pole; everything else stays in
-the nightly. Scheduled runs reach the dashboard without opting in, at the next
-daily sync (12:00 UTC).
-
-Three scoring facts the configs do not carry:
-
-- **Kimi MMMU-Pro is sharded** across two servers, 865 questions each, because
-  one server cannot finish 1,730 inside a job. sgl-eval's own loader and grader
-  still build and score every row, so a shard is comparable with an unsharded
-  run; `collect_full_evals.py` rejects a missing or duplicated id and reports
-  the combined score. A shard alone is not the benchmark.
-- **Gemma 4 publishes `mmmu_pro_strict`**, a series of its own: 31B answers
-  `Answer: $X`, which sgl-eval's grader scores wrong, so these numbers sit far
-  below the lenient manual re-grades.
-- **MMLU is capped at 250 questions** for every model that runs it (R1-0528,
-  V3.1, GPT-OSS-20B). sgl-eval pins the archive revision and samples with
-  `sample_seed=0`, so that is the same 250 of 14,042 rows every night and across
-  models -- comparable between them, but not a model-card reproduction.
-
-Run the whole set from an unmerged branch (`full-set` is every model, both
-schedules included):
-
-```sh
-gh workflow run accuracy-test-tpu.yml --ref <branch> \
-  -f ref=<branch> -f model=full-set -f update-dashboard=false
-```
