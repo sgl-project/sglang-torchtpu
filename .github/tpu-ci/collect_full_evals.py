@@ -40,13 +40,8 @@ def main():
     shards = {}
     kimi_jobs = [j for j in jobs if "test_tpu_kimi_k26_mmmu_shard" in j["name"]]
     for job in jobs:
-        if not any(
-            name in job["name"]
-            for name in (
-                "test_tpu_kimi_k26_mmmu_shard",
-                "test_tpu_deepseek_r1_0528_tp16_dp1_accuracy",
-            )
-        ):
+        # Only the Kimi shards archive predictions; every other eval reports a score.
+        if "test_tpu_kimi_k26_mmmu_shard" not in job["name"]:
             continue
         log = subprocess.check_output(
             [

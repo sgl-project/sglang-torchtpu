@@ -652,9 +652,10 @@ Three scoring facts the configs do not carry:
 - **Gemma 4 publishes `mmmu_pro_strict`**, a series of its own: 31B answers
   `Answer: $X`, which sgl-eval's grader scores wrong, so these numbers sit far
   below the lenient manual re-grades.
-- **Redux scores 5,431 of 5,700 rows** -- those marked `ok`, plus the ones whose
-  corrected answer key is unambiguous. It is neither the original
-  14,042-question MMLU nor an exact model-card reproduction.
+- **MMLU is capped at 250 questions** for every model that runs it (R1-0528,
+  V3.1, GPT-OSS-20B). sgl-eval pins the archive revision and samples with
+  `sample_seed=0`, so that is the same 250 of 14,042 rows every night and across
+  models -- comparable between them, but not a model-card reproduction.
 
 Run the whole set from an unmerged branch (`full-set` is every model, both
 schedules included):

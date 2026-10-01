@@ -706,14 +706,17 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
                 self.assertNotIn(suite, suites, f"{path.name} shares a suite")
                 suites.add(suite)
 
+    # R1-0528 keeps the two regression floors it was relocated with; its MMLU
+    # subset has no measured baseline, like every other model's.
+    R1_GATED = {
+        ("accuracy-deepseek-r1-0528", "gpqa"),
+        ("accuracy-deepseek-r1-0528", "aime25"),
+    }
+
     def test_every_gate_declares_its_accuracy_policy(self):
         for path, mod in self._accuracy_modules():
             for gate in mod.MODEL_CONFIG["gates"]:
-                if (
-                    mod.MODEL_CONFIG["id"] == "accuracy-deepseek-r1-0528"
-                    and gate["dataset"] != "mmlu-redux-2.0"
-                ):
-                    # Preserve R1's existing regression floors after relocation.
+                if (mod.MODEL_CONFIG["id"], gate["dataset"]) in self.R1_GATED:
                     self.assertFalse(gate.get("report_only"), path.name)
                     self.assertIn("baseline", gate, path.name)
                     self.assertIn("atol", gate, path.name)
