@@ -1,14 +1,19 @@
 """GPT-OSS 120B TPU AIME 2025 nightly score."""
 
+import unittest
+from typing import ClassVar
+
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import (
     BASE_URL,
     GPT_OSS_120B,
+    HEALTH_TIMEOUT,
     aime25_openai_runner,
-    make_launch_env,
+    fixture_runtime_envs,
     make_model_config,
-    model_config_main,
+    run_model_config,
 )
+from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=4500,
@@ -18,15 +23,6 @@ register_tpu_ci(
 )
 
 MAX_TOKENS = 65536
-
-LAUNCH_ENV = make_launch_env(
-    GPT_OSS_120B,
-    MAX_TOTAL_TOKENS="1064960",
-    OSL=str(MAX_TOKENS),
-    CONCUR="16",
-    CONTEXT_LEN="66560",
-    TPU_COMPILE_BS="1 2 4 8 16",
-)
 
 GATE = {
     "dataset": "aime25",
@@ -45,10 +41,21 @@ MODEL_CONFIG = make_model_config(
     GPT_OSS_120B,
     test_name="gpt-oss-120b-aime",
     series_id="accuracy-gpt-oss-120b-aime",
-    tag="aime-e2e",
-    launch_env=LAUNCH_ENV,
     gate=GATE,
 )
 
+
+class TestGptOss120bAIME(TPULauncherTestCase):
+    config_module = "recipe/configs/gpt_oss_120b/accuracy_aime.py"
+    base_url = BASE_URL
+    health_timeout = HEALTH_TIMEOUT
+    health_endpoint = "/health_generate"
+    tag = "gpt-oss-120b-aime-e2e"
+    runtime_envs: ClassVar[dict[str, str | None]] = fixture_runtime_envs()
+
+    def test_accuracy(self):
+        run_model_config(MODEL_CONFIG, base_url=self.base_url)
+
+
 if __name__ == "__main__":
-    model_config_main(MODEL_CONFIG, base_url=BASE_URL)
+    unittest.main()

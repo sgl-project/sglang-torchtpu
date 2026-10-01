@@ -93,6 +93,10 @@ class TestAccuracyRecipes(unittest.TestCase):
         "recipe/configs/gpt_oss_20b/accuracy.py",
         "recipe/configs/gemma4_31b/accuracy.py",
         "recipe/configs/gemma4_26b_a4b/accuracy.py",
+        "recipe/configs/gpt_oss_120b/accuracy_aime.py",
+        "recipe/configs/gpt_oss_120b/accuracy_gpqa.py",
+        "recipe/configs/gpt_oss_120b/accuracy_gsm8k.py",
+        "recipe/configs/gpt_oss_120b/accuracy_mmlupro.py",
     )
 
     def test_multihost_rank_resolves_from_jobset_topology(self):

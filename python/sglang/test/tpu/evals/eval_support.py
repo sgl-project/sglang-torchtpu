@@ -677,9 +677,10 @@ def sgl_eval_runner(
 # --- accuracy models ----------------------------------------------------------
 # Per-model identity for the accuracy nightlies, as data: a new model is an entry
 # here, not a module of its own. An entry says how its server starts -- either a
-# `config_module` its test's TPULauncherTestCase boots, or a `recipe` plus the
-# `launch_env` a benchmark resizes through make_launch_env. `sampling` is the
-# model card's decoding settings for gates scored through sgl-eval.
+# `config_module` recipe its test's TPULauncherTestCase boots. Serving settings
+# are NOT here: a benchmark that needs a different server gets its own recipe
+# rather than env patched in at launch, so the shape a score was measured at
+# stays with the score. `sampling` is the model card's decoding settings.
 
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:30000")
 HEALTH_TIMEOUT = float(os.environ.get("HEALTH_TIMEOUT", DEFAULT_HEALTH_TIMEOUT))
@@ -688,18 +689,8 @@ GPT_OSS_120B = {
     "served_model_name": "gpt-oss-120b",
     "display_name": "GPT-OSS 120B",
     "variant": "TP8+EP8",
-    "recipe": "recipe/gpt_oss_120b/server.sh",
-    "launch_env": {
-        "MODEL": "/weights/gpt-oss-120b",
-        "EXTRA_ARGS": ("--reasoning-parser gpt-oss --served-model-name gpt-oss-120b"),
-        "KV_CACHE_DTYPE": "",
-        "PAGE_SIZE": "128",
-        "DISABLE_RADIX_CACHE": "1",
-        "MEM_FRACTION_STATIC": "0.60",
-        "ISL": "4096",
-        "TPU_COMPILE_TOKENS": "4096",
-        "ENABLE_PROFILER_ENDPOINT": "0",
-    },
+    # Per benchmark: recipe/configs/gpt_oss_120b/accuracy_<benchmark>.py.
+    "config_module": "recipe/configs/gpt_oss_120b/accuracy.py",
 }
 
 # Both Gemma 4 checkpoints take the same card sampling; only the recipe differs.
@@ -753,11 +744,6 @@ def fixture_runtime_envs(base_url: str = BASE_URL) -> dict[str, str | None]:
     }
 
 
-def make_launch_env(model: dict[str, Any], **overrides: str) -> dict[str, str]:
-    """A fresh launch environment for one benchmark's sizing."""
-    return {**model["launch_env"], **overrides}
-
-
 def make_runner(model: dict[str, Any], eval_name: str, *, n_repeats: int = 1):
     """Score one benchmark through sgl-eval with this model's card sampling."""
     return sgl_eval_runner(
@@ -774,12 +760,10 @@ def make_model_config(
     test_name: str,
     series_id: str,
     gate: dict[str, Any],
-    tag: str | None = None,
-    launch_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build one isolated model configuration for one benchmark."""
     served = model["served_model_name"]
-    config = {
+    return {
         "model": served,
         "test_name": test_name,
         # The dashboard's series join key: never renamed, never shown. A forced
@@ -793,14 +777,6 @@ def make_model_config(
         "dashboard_model": served,
         "gates": [gate],
     }
-    if "recipe" in model:
-        config["launch"] = {
-            "recipe": model["recipe"],
-            "env": launch_env if launch_env is not None else dict(model["launch_env"]),
-            "health_timeout": HEALTH_TIMEOUT,
-            "tag": tag,
-        }
-    return config
 
 
 # --- perf ---------------------------------------------------------------------

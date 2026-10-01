@@ -632,7 +632,10 @@ template + `_tpu-build`/`_tpu-test`.
 `accuracy-test-tpu.yml` owns every accuracy model. Serving settings are Python
 `CONFIG` recipes under `benchmark/tpu/recipe/configs/<model>/`, launched by
 `benchmark/tpu/launch_server.py` -- single-host through `TPULauncherTestCase`,
-multi-host by the JobSet, which runs the same config on every host.
+multi-host by the JobSet, which runs the same config on every host. A benchmark
+that needs a different server gets its own recipe module (GPT-OSS-120B has one
+per eval) rather than env patched in at launch, so the shape a score was
+measured at stays with the score.
 
 A multihost file declares its lane in `MULTIHOST_LAUNCH["schedule"]`, so it runs
 where it says rather than where its name sorts.
