@@ -290,51 +290,44 @@ class TestRaidenHostPoolPaging(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "uniform full KV block counts"):
             get_raiden_kv_caches(_Pool())
 
-    def test_hybrid_swa_caches_are_grouped_by_page_namespace(self):
+    @staticmethod
+    def _member_pool(*buffers):
         class _Pool:
             start_layer = 0
-            layer_num = 4
-            layers_mapping = {
-                0: (0, False),
-                1: (0, True),
-                2: (1, False),
-                3: (1, True),
-            }
-            buffers = [
-                torch.empty(3, 4),
-                torch.empty(2, 4),
-                torch.empty(3, 4),
-                torch.empty(2, 4),
-            ]
+            layer_num = len(buffers)
 
             def get_fused_kv_buffer(self, layer_id):
-                return self.buffers[layer_id]
+                return buffers[layer_id]
 
-        groups = get_raiden_kv_caches(_Pool())
-        self.assertEqual(groups.full, [_Pool.buffers[0], _Pool.buffers[2]])
-        self.assertEqual(groups.swa, [_Pool.buffers[1], _Pool.buffers[3]])
+        return _Pool()
+
+    @staticmethod
+    def _swa_pool(full, swa):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        pool = SWAKVPool.__new__(SWAKVPool)
+        pool.full_kv_pool = full
+        pool.swa_kv_pool = swa
+        return pool
+
+    def test_hybrid_swa_caches_are_grouped_by_page_namespace(self):
+        full = [torch.empty(3, 4), torch.empty(3, 4)]
+        swa = [torch.empty(2, 4), torch.empty(2, 4)]
+        pool = self._swa_pool(self._member_pool(*full), self._member_pool(*swa))
+
+        groups = get_raiden_kv_caches(pool)
+        self.assertEqual(groups.full, full)
+        self.assertEqual(groups.swa, swa)
 
     def test_speculative_draft_caches_join_target_page_namespaces(self):
-        class _TargetPool:
-            start_layer = 0
-            layer_num = 2
-            layers_mapping = {0: (0, False), 1: (0, True)}
-            buffers = [torch.empty(3, 4), torch.empty(2, 4)]
+        full = [torch.empty(3, 4)]
+        swa = [torch.empty(2, 4)]
+        draft = [torch.empty(3, 4)]
+        target = self._swa_pool(self._member_pool(*full), self._member_pool(*swa))
 
-            def get_fused_kv_buffer(self, layer_id):
-                return self.buffers[layer_id]
-
-        class _DraftPool:
-            start_layer = 0
-            layer_num = 1
-            buffers = [torch.empty(3, 4)]
-
-            def get_fused_kv_buffer(self, layer_id):
-                return self.buffers[layer_id]
-
-        groups = get_raiden_kv_caches(_TargetPool(), draft_pool=_DraftPool())
-        self.assertEqual(groups.full, [_TargetPool.buffers[0], _DraftPool.buffers[0]])
-        self.assertEqual(groups.swa, [_TargetPool.buffers[1]])
+        groups = get_raiden_kv_caches(target, draft_pool=self._member_pool(*draft))
+        self.assertEqual(groups.full, full + draft)
+        self.assertEqual(groups.swa, swa)
 
     def test_hybrid_swa_max_blocks_is_sized_from_sliding_window(self):
         mgr = object.__new__(RaidenKVManager)

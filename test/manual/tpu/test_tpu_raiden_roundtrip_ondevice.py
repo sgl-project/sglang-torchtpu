@@ -52,6 +52,9 @@ class _SingleBufferPool:
     def get_fused_kv_buffer(self, layer_id):
         return self._buf
 
+    def page_buffers(self):
+        return [self._buf]
+
 
 def test_raiden_dma_roundtrip():
     """D2h device pages -> host, H2d host -> DIFFERENT device pages, verify."""

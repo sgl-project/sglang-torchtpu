@@ -174,6 +174,7 @@ class TestPallasRpaSlidingWindowAdapter(CustomTestCase):
             k_scale,
             v_scale,
             decode_query_size=1,
+            layer_idx=None,
         ):
             captured["sliding_window"] = sliding_window
             return torch.zeros_like(q)
@@ -742,6 +743,7 @@ class TestFixedWidthAsDecode(CustomTestCase):
             k_scale,
             v_scale,
             decode_query_size=1,
+            layer_idx=None,
         ):
             captured["width"] = decode_query_size
 

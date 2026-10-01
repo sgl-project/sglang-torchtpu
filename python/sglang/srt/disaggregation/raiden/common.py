@@ -62,18 +62,26 @@ class RaidenKVCacheGroups:
 def get_raiden_kv_caches(
     pool: KVCache, draft_pool: Optional[KVCache] = None
 ) -> RaidenKVCacheGroups:
-    """Group per-layer device KV tensors by their page-index namespace.
+    """Group registered device KV tensors by page-index namespace to prevent aliasing.
 
-    The TPU fused KV pool stores one [num_blocks, page_size, ...] tensor per
-    layer in ``kv_buffer`` and exposes them via ``get_fused_kv_buffer``. Hybrid
-    SWA pools allocate full-attention and sliding-window pages independently, so
-    they must not share one Raiden block-id list. Speculative decoding uses the
-    same page indices for target and draft KV, so append the draft tensors to
-    the matching namespace and move them in the same Raiden transfer.
+    Raiden block IDs index dim 0; SWA pools allocate pages independently,
+    while speculative draft KV shares target page indices.
     """
 
+    from sglang.srt.hardware_backend.tpu.kv_pool import TpuFusedMHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
     def group_one(current_pool: KVCache) -> RaidenKVCacheGroups:
-        if hasattr(current_pool, "get_fused_kv_buffer"):
+        if isinstance(current_pool, SWAKVPool):
+            return RaidenKVCacheGroups(
+                full=group_one(current_pool.full_kv_pool).full,
+                swa=group_one(current_pool.swa_kv_pool).full,
+            )
+        if isinstance(current_pool, TpuFusedMHATokenToKVPool):
+            buffers = current_pool.page_buffers()
+        elif hasattr(current_pool, "get_fused_kv_buffer"):
+            # Wrappers such as HybridLinearKVPool proxy the underlying
+            # full-attention pool layer by layer.
             start = current_pool.start_layer
             buffers = [
                 current_pool.get_fused_kv_buffer(start + i)
@@ -86,14 +94,6 @@ def get_raiden_kv_caches(
                 "Raiden backend requires a fused KV pool exposing kv_buffer; got "
                 f"{type(current_pool).__name__}"
             )
-        layers_mapping = getattr(current_pool, "layers_mapping", None)
-        if layers_mapping:
-            full = []
-            swa = []
-            for offset, buf in enumerate(buffers):
-                layer_id = current_pool.start_layer + offset
-                (swa if layers_mapping[layer_id][1] else full).append(buf)
-            return RaidenKVCacheGroups(full=full, swa=swa)
         return RaidenKVCacheGroups(full=buffers, swa=[])
 
     groups = group_one(pool)

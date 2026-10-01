@@ -87,6 +87,51 @@ def _rpa_kernel_spec(backend: str | None):
     return spec
 
 
+def _uses_block_major_kv() -> bool:
+    from sglang.srt.environ import envs
+
+    return envs.SGLANG_TPU_USE_BLOCK_MAJOR_KV.get()
+
+
+def _check_block_major_supported(server_args) -> None:
+    """Refuses configurations whose consumers read the KV pool layer by layer."""
+    from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    cfg = resolving_view(server_args)
+    if cfg.attention_backend != "pallas_tpu_rpa_v3":
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV requires --attention-backend "
+            f"pallas_tpu_rpa_v3; got {cfg.attention_backend!r}."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support speculative "
+            f"decoding; got --speculative-algorithm "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if (
+        cfg.disaggregation_mode != "null"
+        and cfg.disaggregation_transfer_backend != "raiden"
+    ):
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports P/D over the raiden "
+            "transfer backend only; got --disaggregation-transfer-backend "
+            f"{cfg.disaggregation_transfer_backend!r}."
+        )
+    if cfg.enable_hierarchical_cache and cfg.hicache_io_backend == "torch_tpu":
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV supports KV offload over the raiden "
+            "HiCache backend only; got --hicache-io-backend "
+            f"{cfg.hicache_io_backend!r}."
+        )
+    if mambaish_config(model_config_of(server_args)) is not None:
+        raise ValueError(
+            "SGLANG_TPU_USE_BLOCK_MAJOR_KV does not support hybrid "
+            "linear-attention models."
+        )
+
+
 def _uses_seq_along_lane_kv() -> bool:
     """Ask the backend, so the pool cannot disagree with the kernel."""
     from sglang.srt.hardware_backend.tpu.attention_pallas_rpa_batched import (
@@ -104,6 +149,13 @@ def _mha_kv_pool_cls(backend: str | None) -> type:
     so the two cannot disagree. A plugin that routes its backend to its own
     pool patches this function.
     """
+    if _uses_block_major_kv():
+        # _check_block_major_supported ensured the backend is rpa_v3.
+        from sglang.srt.hardware_backend.tpu.kv_pool import (
+            TpuBlockMajorMHATokenToKVPool,
+        )
+
+        return TpuBlockMajorMHATokenToKVPool
     if backend == "pallas_tpu_rpa_batched" and _uses_seq_along_lane_kv():
         # SEQ_ALONG_LANE puts the token index on the lane axis, so the
         # buffer shape differs from the fused one the other backends read.
@@ -419,6 +471,8 @@ class TpuSRTPlatform(SRTPlatform):
 
         _apply_page_size_default(server_args)
         _apply_kv_cache_dtype_default(server_args)
+        if _uses_block_major_kv():
+            _check_block_major_supported(server_args)
 
     # ------------------------------------------------------------------
     # Subsystem factory methods

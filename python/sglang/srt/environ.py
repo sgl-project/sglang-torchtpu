@@ -1831,6 +1831,11 @@ class Envs:
     # token against 512, which is what lets long context and large batches fit.
     # Opt-in: it changes the KV pool's buffer shape.
     SGLANG_TPU_USE_SEQ_ALONG_LANE_KV = EnvBool(False)
+    # Allocates RPA v3 MHA KV as [num_blocks, layer_num, page_size, ...],
+    # so all layers for a page form one row for single-DMA Raiden P/D transfers.
+    # Both P/D servers must agree; tpu_platform refuses the configurations that
+    # read layer by layer.
+    SGLANG_TPU_USE_BLOCK_MAJOR_KV = EnvBool(False)
     # Pin the RPA prefill/MIXED k-block instead of deriving it from the VMEM
     # budget. Escape hatch for a shape or a chip where that derivation is
     # wrong: too large and the kernel fails to allocate at startup, too small
