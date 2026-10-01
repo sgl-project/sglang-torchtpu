@@ -5,7 +5,7 @@ from functools import partial
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.mmmu_full import run_shard
+from sglang.test.tpu.evals.mmmu_full import run_shard
 
 register_tpu_ci(
     est_time=14400,

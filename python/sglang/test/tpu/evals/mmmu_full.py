@@ -66,7 +66,7 @@ def run_shard(base_url, *, shard, shards=2):
     expected = len(range(shard, 1730, shards))
     if result["num_examples"] != expected or result["aggregate"]["error_rate"] != 0:
         raise RuntimeError("Incomplete MMMU-Pro shard or request errors")
-    from sglang.test.tpu.full_eval_artifacts import archive_results
+    from sglang.test.tpu.evals.full_eval_artifacts import archive_results
 
     archive_results(files[0].parent)
     summary = {

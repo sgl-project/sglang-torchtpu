@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import ClassVar
 
-from sglang.test.tpu.eval_support import RecipeLauncher, wait_for_health
+from sglang.test.tpu.evals.eval_support import RecipeLauncher, wait_for_health
 
 
 class TPULauncherTestCase(unittest.TestCase):
@@ -29,7 +29,7 @@ class TPULauncherTestCase(unittest.TestCase):
     health_timeout: ClassVar[float] = 3600
     health_endpoint: ClassVar[str] = "/health"
     health_generate_timeout: ClassVar[float | None] = None
-    repo_root: ClassVar[Path] = Path(__file__).absolute().parents[4]
+    repo_root: ClassVar[Path] = Path(__file__).absolute().parents[5]
     cwd: ClassVar[str | None] = None
     log_path: ClassVar[str | None] = None
     keep_up: ClassVar[bool] = False

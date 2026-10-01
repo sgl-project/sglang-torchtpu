@@ -6,7 +6,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import model_config_main
-from sglang.test.tpu.server_test_suite import resolve_tpu_model_path
+from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 register_tpu_ci(
     est_time=1800,

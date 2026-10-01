@@ -127,7 +127,7 @@ from typing import Any
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
-from sglang.test.tpu.eval_support import (
+from sglang.test.tpu.evals.eval_support import (
     DEFAULT_HEALTH_TIMEOUT,
     ExternalServerLauncher,
     RecipeLauncher,
@@ -136,7 +136,7 @@ from sglang.test.tpu.eval_support import (
     lm_eval_runner,
 )
 
-_TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
+_TPU_BENCH_DIR = Path(__file__).resolve().parents[5] / "benchmark" / "tpu"
 
 _CONFIG_KEYS = {
     "model",

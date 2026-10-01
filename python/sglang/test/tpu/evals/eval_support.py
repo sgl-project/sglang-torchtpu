@@ -759,7 +759,7 @@ def make_model_config(
 # cannot serve here -- it launches with popen_launch_server, and a TPU server only
 # comes up through launch_server.sh (chiplet visibility, compile cache, topology).
 
-_TPU_BENCH_DIR = Path(__file__).resolve().parents[4] / "benchmark" / "tpu"
+_TPU_BENCH_DIR = Path(__file__).resolve().parents[5] / "benchmark" / "tpu"
 
 
 # bench_serving.sh's own per-point file stem. Its tag and this must agree, or the

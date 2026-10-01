@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tpu import eval_support, model_config
+from sglang.test.tpu.evals import eval_support, model_config
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -666,7 +666,7 @@ class TestAccuracyConfigsAreValid(CustomTestCase):
         # Without a launch entry, the file's TPULauncherTestCase boots the recipe.
         from pathlib import Path
 
-        from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
+        from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
         fixtures = [
             value

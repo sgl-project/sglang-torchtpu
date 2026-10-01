@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from sglang.test.ci.ci_register import register_tpu_ci
 from sglang.test.tpu import run_model_config
-from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
+from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 register_tpu_ci(
     est_time=3600,

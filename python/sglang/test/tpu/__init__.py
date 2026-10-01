@@ -1,6 +1,6 @@
 """TPU-specific test support for this fork."""
 
-from sglang.test.tpu.eval_support import (
+from sglang.test.tpu.evals.eval_support import (
     BASE_URL,
     GEMMA4_26B_A4B,
     GEMMA4_31B,
@@ -21,7 +21,7 @@ from sglang.test.tpu.eval_support import (
     sgl_eval_runner,
     wait_for_health,
 )
-from sglang.test.tpu.model_config import (
+from sglang.test.tpu.evals.model_config import (
     build_gates,
     build_model,
     build_test_case,

@@ -28,7 +28,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
 )
 from sglang.test.ci.ci_register import register_tpu_ci
-from sglang.test.tpu.server_test_suite import resolve_tpu_model_path
+from sglang.test.tpu.utils.server_test_suite import resolve_tpu_model_path
 
 logger = logging.getLogger(__name__)
 

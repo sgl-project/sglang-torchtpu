@@ -6,7 +6,7 @@ import signal
 from pathlib import Path
 from typing import Any, ClassVar
 
-from sglang.test.tpu.launcher_test_case import TPULauncherTestCase
+from sglang.test.tpu.utils.launcher_test_case import TPULauncherTestCase
 
 
 def peer_hostname(hostname: str, *, from_role: str, to_role: str) -> str:
