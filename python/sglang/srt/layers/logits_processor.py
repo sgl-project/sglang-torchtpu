@@ -1040,16 +1040,6 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        # TPU: use fp32 for target verification because the bf16 vocab-parallel
-        # collective is not bit-reproducible across TP ranks. Different logits can
-        # produce different EAGLE accept counts and deadlock subsequent collectives.
-        if (
-            _is_tpu
-            and self.do_tensor_parallel_all_gather
-            and logits_metadata.forward_mode == ForwardMode.TARGET_VERIFY
-            and logits.dtype != torch.float32
-        ):
-            logits = logits.float()
         # FIXME: Without this change, TPU v7 will crash at warming up:
         # https://gist.github.com/junyanxu/164a6246b01253ad3bddbec724ad192e.
         # Need to investigate exactly why. Disable the env var to debug.
